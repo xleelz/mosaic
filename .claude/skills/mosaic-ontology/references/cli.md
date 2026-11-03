@@ -17,7 +17,9 @@ These commands are specified in docs/DESIGN.md §7. The output shapes come from 
 ## Global behavior
 
 - Server: `--server URL` or `MOSAIC_SERVER` (default `http://127.0.0.1:7878`). Token: `--token T`
-  or `MOSAIC_TOKEN`, needed only when `mosaicd` was started with one.
+  or `MOSAIC_TOKEN`, needed only when `mosaicd` was started with one. Timeout: `--timeout D` or
+  `MOSAIC_TIMEOUT` (default `60s`) per request; raise it (`--timeout 10m`) for `mosaic test` on an
+  ontology with thousands of scenarios.
 - Output is indented JSON by default, ready for `jq`. `--format text` (or `summary`/`trace` where
   listed) prints a human summary.
 - Exit codes: **0** success; **1** refusal, validation failure, or failed test; **2** usage error;

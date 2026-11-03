@@ -15,6 +15,7 @@ import (
 	"net/url"
 	"os"
 	"strings"
+	"time"
 
 	"github.com/xleelz/mosaic/internal/model"
 	"github.com/xleelz/mosaic/pkg/client"
@@ -42,6 +43,7 @@ type env struct {
 	ctx            context.Context
 	stdout, stderr io.Writer
 	server, token  string
+	timeout        time.Duration // per request; 0 means the client default
 	fs             *flag.FlagSet // the running command's flags, for --help
 }
 
@@ -84,10 +86,20 @@ func run(args []string, stdout, stderr io.Writer) int {
 	if e.server == "" {
 		e.server = defaultServer
 	}
+	e.timeout = client.DefaultTimeout
+	if v := getenv("MOSAIC_TIMEOUT"); v != "" {
+		d, err := time.ParseDuration(v)
+		if err != nil || d <= 0 {
+			fmt.Fprintf(stderr, "mosaic: MOSAIC_TIMEOUT must be a positive duration such as 10m, got %q\n", v)
+			return exitUsage
+		}
+		e.timeout = d
+	}
 	gfs := flag.NewFlagSet("mosaic", flag.ContinueOnError)
 	gfs.SetOutput(io.Discard)
 	gfs.StringVar(&e.server, "server", e.server, "")
 	gfs.StringVar(&e.token, "token", e.token, "")
+	gfs.DurationVar(&e.timeout, "timeout", e.timeout, "")
 	if err := gfs.Parse(args); err != nil {
 		if err == flag.ErrHelp {
 			writeMainUsage(stdout)
@@ -169,12 +181,13 @@ func (e *env) help(args []string) int {
 }
 
 // flags returns the flag set of a command. Every command also accepts the
-// global --server and --token.
+// global --server, --token and --timeout.
 func (e *env) flags(c *command) *flag.FlagSet {
 	fs := flag.NewFlagSet("mosaic "+c.name, flag.ContinueOnError)
 	fs.SetOutput(io.Discard)
 	fs.StringVar(&e.server, "server", e.server, "mosaicd `URL` (env MOSAIC_SERVER, default "+defaultServer+")")
 	fs.StringVar(&e.token, "token", e.token, "bearer token `T` (env MOSAIC_TOKEN)")
+	fs.DurationVar(&e.timeout, "timeout", e.timeout, "per-request `D`uration, such as 10m (env MOSAIC_TIMEOUT, default 60s)")
 	e.fs = fs
 	return fs
 }
@@ -200,7 +213,10 @@ func (e *env) client() (*client.Client, error) {
 	if err != nil || (u.Scheme != "http" && u.Scheme != "https") || u.Host == "" {
 		return nil, usageErrorf("--server must be an http(s) URL such as %s, got %q", defaultServer, e.server)
 	}
-	return client.New(e.server, e.token, client.WithUserAgent("mosaic-cli")), nil
+	if e.timeout <= 0 {
+		return nil, usageErrorf("--timeout must be a positive duration such as 10m, got %s", e.timeout)
+	}
+	return client.New(e.server, e.token, client.WithUserAgent("mosaic-cli"), client.WithTimeout(e.timeout)), nil
 }
 
 // exit prints err and returns the exit code for it.
@@ -281,7 +297,7 @@ func printJSON(w io.Writer, v any) error {
 func writeMainUsage(w io.Writer) {
 	fmt.Fprint(w, `mosaic is the CLI of mosaicd, the mosaic ontology store and simulator.
 
-usage: mosaic [--server URL] [--token T] <command> [arguments]
+usage: mosaic [--server URL] [--token T] [--timeout D] <command> [arguments]
 
 commands:
 `)
@@ -296,6 +312,8 @@ Output is indented JSON unless a --format says otherwise.
 global flags (also accepted after the command):
   --server URL   mosaicd URL (env MOSAIC_SERVER, default `+defaultServer+`)
   --token T      bearer token (env MOSAIC_TOKEN)
+  --timeout D    per-request timeout, such as 10m (env MOSAIC_TIMEOUT, default 60s); raise it to
+                 run every scenario of a large ontology with mosaic test
 
 exit codes: 0 success; 1 refusal, validation failure or failed test; 2 usage error;
 3 server unreachable.

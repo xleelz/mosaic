@@ -226,7 +226,8 @@ derived edges (`model.Graph`). Wire types live in `pkg/api`; TypeScript mirrors 
 The CLI calls `mosaicd` through `pkg/client`. Data is printed as indented JSON by default, so agents
 can parse it. The exceptions are `sim run` and `sim get`, which default to `--format summary`, and
 `test`, which defaults to `--format text`; pass `--format json` to parse them. The server comes from `--server`
-or `MOSAIC_SERVER` (default `http://127.0.0.1:7878`), and the token from `--token` or `MOSAIC_TOKEN`.
+or `MOSAIC_SERVER` (default `http://127.0.0.1:7878`), the token from `--token` or `MOSAIC_TOKEN`, and
+the per-request timeout from `--timeout` or `MOSAIC_TIMEOUT` (a Go duration, default `60s`).
 Exit codes: 0 success; 1 refusal, validation failure or failed test; 2 usage error; 3 server
 unreachable.
 

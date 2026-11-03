@@ -228,6 +228,28 @@ func TestHealthAndToken(t *testing.T) {
 	mustCLI(t, f, 0, "health")
 }
 
+func TestTimeout(t *testing.T) {
+	f := newFake(t)
+	mustCLI(t, f, 0, "--timeout", "10m", "health")
+	mustCLI(t, f, 0, "health", "--timeout", "90s")
+	if _, errOut := mustCLI(t, f, 2, "health", "--timeout", "0s"); !strings.Contains(errOut, "--timeout must be a positive duration") {
+		t.Errorf("--timeout 0s: stderr = %q", errOut)
+	}
+	if _, _, code := cli(t, f, "health", "--timeout", "soon"); code != 2 {
+		t.Errorf("--timeout soon: exit %d, want 2", code)
+	}
+	getenv = func(k string) string {
+		if k == "MOSAIC_TIMEOUT" {
+			return "nope"
+		}
+		return ""
+	}
+	defer func() { getenv = func(string) string { return "" } }()
+	if _, errOut, code := cli(t, f, "health"); code != 2 || !strings.Contains(errOut, "MOSAIC_TIMEOUT must be a positive duration") {
+		t.Errorf("MOSAIC_TIMEOUT=nope: exit %d, stderr %q", code, errOut)
+	}
+}
+
 func TestOntologyCommands(t *testing.T) {
 	f := newFake(t)
 	out, _ := mustCLI(t, f, 0, "ontology", "list")
