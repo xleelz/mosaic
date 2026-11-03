@@ -3,7 +3,8 @@
 import { useCallback, useEffect, useMemo, useState } from "react";
 import type { Document, Graph, SimulationRun } from "@/lib/api/types";
 import { buildPlayback, activeFor, eventTone, laneComponent, openSpans } from "@/lib/sim/playback";
-import { ArchitectureMap, useColorScale, type MapHighlight } from "@/components/map/ArchitectureMap";
+import { ArchitectureMap, COLLAPSE_ABOVE, useColorScale, type MapHighlight } from "@/components/map/ArchitectureMap";
+import { runGraph } from "@/lib/model/rungraph";
 import { Panel, cx } from "@/components/ui";
 import { Inspector } from "./Inspector";
 import { SequenceDiagram } from "./SequenceDiagram";
@@ -140,6 +141,12 @@ export function Playback({
     };
   }, [current, playback, cursor]);
 
+  // A large ontology's map draws only the run's components (and their groups): see runGraph.
+  const involvedKey = playback.lifelines.map(laneComponent).sort().join("\n");
+  const mapGraph = useMemo(
+    () => (graph && graph.nodes.length > COLLAPSE_ABOVE ? runGraph(graph, new Set(involvedKey.split("\n"))) : graph),
+    [graph, involvedKey],
+  );
   const nodesById = useMemo(() => new Map((graph?.nodes ?? []).map((n) => [n.id, n])), [graph]);
   const colorKey = useCallback((c: string) => nodesById.get(laneComponent(c))?.layer, [nodesById]);
 
@@ -193,7 +200,7 @@ export function Playback({
                 </button>
               }
             >
-              {mapOpen && <ArchitectureMap graph={graph} highlight={highlight} ariaLabel="Architecture map highlighting the current event" />}
+              {mapOpen && mapGraph && <ArchitectureMap graph={mapGraph} highlight={highlight} ariaLabel="Architecture map highlighting the current event" />}
             </Panel>
           )}
         </div>
