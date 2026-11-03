@@ -19,13 +19,51 @@ is the contract: the meta-model, the behavior language, simulation semantics, th
 
 ## Quick start
 
-Requires Go 1.27, Dolt 2.x and Node 22.
+### Install
+
+Requires Go 1.27 or newer and Node 20.9 or newer. Install those yourself; the install script
+checks for them and stops if either is missing or too old. Mosaic also needs Dolt 2.x, which the
+script installs when it's missing.
 
 ```sh
-go build -o bin/mosaicd ./cmd/mosaicd
-go build -o bin/mosaic ./cmd/mosaic
+scripts/install.sh               # checks Go and Node, installs Dolt if needed, builds bin/, installs the web UI's dependencies
+scripts/install.sh --go-install  # the same, and also installs mosaic and mosaicd into Go's bin folder
+```
 
-./bin/mosaicd --data-dir ~/.mosaic &          # supervises its own dolt sql-server
+Without the script, you need Dolt on your `PATH`; see the
+[Dolt installation guide](https://docs.dolthub.com/introduction/installation).
+
+**Dolt.** The script uses Homebrew on macOS when it's available. Otherwise it downloads the latest
+release into `~/.local/bin`, without sudo; pass `--prefix DIR` to choose another folder. Run
+`scripts/install.sh --help` for every option.
+
+**Running `mosaic` and `mosaicd` from anywhere.** `--go-install` puts both binaries in Go's bin
+folder: `$GOBIN` if set, else `$(go env GOPATH)/bin`, usually `~/go/bin`. Make sure that folder is
+on your `PATH`, for example in `~/.zshrc` or `~/.bashrc`:
+
+```sh
+export PATH="$(go env GOPATH)/bin:$PATH"
+```
+
+To do it without the script, from a clone:
+
+```sh
+go install ./cmd/mosaic ./cmd/mosaicd
+```
+
+The repository is private, so installing straight from GitHub needs Go to fetch it with your git
+credentials:
+
+```sh
+GOPRIVATE=github.com/xleelz/mosaic go install github.com/xleelz/mosaic/cmd/mosaic@latest github.com/xleelz/mosaic/cmd/mosaicd@latest
+```
+
+### Run
+
+The commands below use `./bin/`. If you installed with `--go-install`, drop the `./bin/`.
+
+```sh
+./bin/mosaicd --data-dir ~/.mosaic &          # supervises its own dolt sql-server, on 127.0.0.1:7878
 
 ./bin/mosaic ontology create gateway-demo --name "Inference gateway"
 ./bin/mosaic apply gateway-demo -f internal/testdata/gateway/ontology.yaml -m "Model the gateway"
@@ -35,8 +73,14 @@ go build -o bin/mosaic ./cmd/mosaic
     --fault upstream-a.chat:timeout --state ledger.free=1 --format summary
 ```
 
-The web UI lives in [web/](web/README.md). Run it against `mosaicd`, or set
-`NEXT_PUBLIC_MOSAIC_FIXTURES=1` to use fixtures generated from the engine.
+Then start the web UI against the running `mosaicd`, and open http://localhost:3000:
+
+```sh
+cd web && pnpm dev
+```
+
+The web UI lives in [web/](web/README.md). Set `MOSAIC_SERVER` if `mosaicd` listens somewhere else,
+or set `NEXT_PUBLIC_MOSAIC_FIXTURES=1` to use fixtures generated from the engine, with no daemon.
 
 ## The example
 
