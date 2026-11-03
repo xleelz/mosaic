@@ -18,7 +18,7 @@ export default function RootLayout({ children }: LayoutProps<"/">) {
         >
           Skip to content
         </a>
-        <header className="sticky top-0 z-40 flex h-11 shrink-0 items-center justify-between border-b border-line bg-bg/95 px-4 backdrop-blur">
+        <header className="app-topbar sticky top-0 z-40 flex h-11 shrink-0 items-center justify-between border-b border-line bg-bg/95 px-4 backdrop-blur">
           <div className="flex items-center gap-3">
             <Link href="/" className="flex items-center gap-2 rounded text-[15px] font-bold tracking-tight text-ink">
               <svg width="18" height="18" viewBox="0 0 18 18" aria-hidden>

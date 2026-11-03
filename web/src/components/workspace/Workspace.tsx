@@ -2,7 +2,7 @@
 
 import Link from "next/link";
 import { useParams, usePathname, useRouter, useSearchParams } from "next/navigation";
-import { createContext, useCallback, useContext, useMemo, type ReactNode } from "react";
+import { createContext, useCallback, useContext, useEffect, useMemo, useState, type ReactNode } from "react";
 import type { CommitDetail, CommitList, Document, Graph, OntologyDetail, RevisionList } from "@/lib/api/types";
 import { useQuery, type QueryState } from "@/lib/hooks";
 import { Badge, ErrorBox, Select, Spinner, cx } from "@/components/ui";
@@ -23,6 +23,12 @@ export interface WorkspaceCtx {
   revisions: QueryState<RevisionList>;
   /** Builds an href inside the workspace that keeps ?rev. */
   href: (sub: string, extra?: Record<string, string>) => string;
+  /**
+   * On the run page, an element at the bottom of the hidden header overlay:
+   * the run's title and meta lines render into it (through a portal), so they
+   * hide and reveal with the rest of the header. Null elsewhere.
+   */
+  chromeSlot: HTMLElement | null;
 }
 
 const Ctx = createContext<WorkspaceCtx | null>(null);
@@ -117,16 +123,24 @@ export function WorkspaceShell({ children }: { children: ReactNode }) {
     [pathname, router, search],
   );
 
-  const ctx = useMemo<WorkspaceCtx>(() => ({ id, rev, dataRev, setRev, detail, revisions, href }), [id, rev, dataRev, setRev, detail, revisions, href]);
-
   const activeSub = pathname.replace(base, "").replace(/^\//, "").split("/")[0];
+  // The run page gives the run the whole viewport: the app bar, this header and
+  // the run's title hide, and reveal as one overlay from the top edge.
+  const focus = activeSub === "runs";
+  const [chromeSlot, setChromeSlot] = useState<HTMLElement | null>(null);
+
+  const ctx = useMemo<WorkspaceCtx>(
+    () => ({ id, rev, dataRev, setRev, detail, revisions, href, chromeSlot: focus ? chromeSlot : null }),
+    [id, rev, dataRev, setRev, detail, revisions, href, focus, chromeSlot],
+  );
   const revs = revisions.data?.revisions ?? [];
   const latest = detail.data?.latest_revision ?? 0;
 
   return (
     <Ctx.Provider value={ctx}>
-      <div className="flex h-[calc(100dvh-2.75rem)] min-h-[560px] flex-col">
-        <div className="shrink-0 border-b border-line bg-panel/60">
+      {focus && <ChromeHandle />}
+      <div className={cx("flex flex-col", focus ? "h-dvh min-h-[480px]" : "h-[calc(100dvh-2.75rem)] min-h-[560px]")}>
+        <div className={cx("shrink-0 border-b border-line", focus ? "run-chrome-ws bg-panel shadow-[0_8px_24px_rgba(0,0,0,0.45)]" : "bg-panel/60")}>
           <div className="flex flex-wrap items-center gap-x-4 gap-y-2 px-4 pt-2.5">
             <div className="flex min-w-0 items-baseline gap-2">
               <Link href="/" className="text-[12px] text-faint hover:text-ink">
@@ -189,8 +203,9 @@ export function WorkspaceShell({ children }: { children: ReactNode }) {
               );
             })}
           </nav>
+          {focus && <div ref={setChromeSlot} className="border-t border-line-soft px-4 py-2 empty:hidden" />}
         </div>
-        <div className="min-h-0 flex-1 overflow-auto">
+        <div className={cx("min-h-0 flex-1", focus ? "overflow-hidden" : "overflow-auto")}>
           {detail.error ? (
             <div className="p-4">
               <ErrorBox error={detail.error} onRetry={detail.reload} />
@@ -203,5 +218,36 @@ export function WorkspaceShell({ children }: { children: ReactNode }) {
         </div>
       </div>
     </Ctx.Provider>
+  );
+}
+
+/**
+ * The run page's hot zone along the top edge, with a visible handle. Hovering
+ * the zone (or focusing anything in the header) reveals the header overlay;
+ * the handle pins it open, and Escape unpins it. See .run-chrome-* in globals.css.
+ */
+function ChromeHandle() {
+  const [pinned, setPinned] = useState(false);
+  useEffect(() => {
+    if (!pinned) return;
+    const onKey = (ev: KeyboardEvent) => {
+      if (ev.key === "Escape") setPinned(false);
+    };
+    window.addEventListener("keydown", onKey);
+    return () => window.removeEventListener("keydown", onKey);
+  }, [pinned]);
+  return (
+    <div className="run-chrome-zone fixed inset-x-0 top-0 z-[60] h-2.5" data-pinned={pinned || undefined}>
+      <button
+        type="button"
+        onClick={() => setPinned((p) => !p)}
+        aria-expanded={pinned}
+        aria-label={pinned ? "Hide the header" : "Show the header"}
+        title={pinned ? "Hide the header (Esc)" : "Show the header (or hover the top edge)"}
+        className="absolute left-1/2 top-0 flex h-2.5 w-16 -translate-x-1/2 items-center justify-center rounded-b-md border border-t-0 border-line bg-panel-2 hover:bg-panel-3 focus-visible:h-4"
+      >
+        <span className="h-[2px] w-7 rounded bg-faint" aria-hidden />
+      </button>
+    </div>
   );
 }

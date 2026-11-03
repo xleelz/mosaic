@@ -2,12 +2,14 @@
 
 import Link from "next/link";
 import type { ReactNode } from "react";
+import { createPortal } from "react-dom";
 import type { SimulationRun } from "@/lib/api/types";
 import { formatDate } from "@/lib/model/format";
 import { useQuery } from "@/lib/hooks";
 import { docIndex } from "@/lib/model/docindex";
 import { Badge, ErrorBox, Spinner, StatusBadge } from "@/components/ui";
-import { Playback } from "./Playback";
+import { useWorkspace } from "@/components/workspace/Workspace";
+import { Playback, type PlaybackLayout } from "./Playback";
 
 export function RunHeader({ run, scenarioName, actions }: { run: SimulationRun; scenarioName?: string; actions?: ReactNode }) {
   const req = run.request;
@@ -50,7 +52,19 @@ export function RunHeader({ run, scenarioName, actions }: { run: SimulationRun; 
 }
 
 /** Loads the document and graph at the run's revision and plays it back. */
-export function RunPlayback({ run, ontology, initialCursor, className }: { run: SimulationRun; ontology: string; initialCursor?: number; className?: string }) {
+export function RunPlayback({
+  run,
+  ontology,
+  initialCursor,
+  layout,
+  className,
+}: {
+  run: SimulationRun;
+  ontology: string;
+  initialCursor?: number;
+  layout?: PlaybackLayout;
+  className?: string;
+}) {
   const rev = run.revision || "draft";
   const doc = useQuery(`doc:${ontology}:${rev}`, (c) => c.getDocument(ontology, rev));
   const graph = useQuery(`graph:${ontology}:${rev}`, (c) => c.getGraph(ontology, rev));
@@ -58,29 +72,35 @@ export function RunPlayback({ run, ontology, initialCursor, className }: { run: 
   return (
     <>
       {(doc.error || graph.error) ? <ErrorBox error={doc.error || graph.error} className="mb-2" /> : null}
-      <Playback run={run} doc={doc.data} graph={graph.data} initialCursor={initialCursor} className={className} />
+      <Playback run={run} doc={doc.data} graph={graph.data} initialCursor={initialCursor} layout={layout} className={className} />
     </>
   );
 }
 
 export function RunPage({ ontology, runId, at }: { ontology: string; runId: string; at?: number }) {
+  const { chromeSlot } = useWorkspace();
   const run = useQuery(`run:${runId}`, (c) => c.getRun(runId));
   const doc = useQuery(run.data ? `doc:${ontology}:${run.data.revision || "draft"}` : null, (c) => c.getDocument(ontology, run.data?.revision || "draft"));
   if (run.error) return <div className="p-4"><ErrorBox error={run.error} onRetry={run.reload} /></div>;
   if (!run.data) return <Spinner label="Loading run" />;
   const sc = doc.data && run.data.scenario ? docIndex(doc.data).scenariosById.get(run.data.scenario) : undefined;
+  const header = (
+    <RunHeader
+      run={run.data}
+      scenarioName={sc?.name}
+      actions={
+        <Link href={`/o/${encodeURIComponent(ontology)}/simulate?flow=${encodeURIComponent(run.data.flow)}${run.data.scenario ? `&scenario=${encodeURIComponent(run.data.scenario)}` : ""}`} className="rounded border border-line px-1.5 py-0.5 text-link hover:bg-panel-2">
+          Configure a new run
+        </Link>
+      }
+    />
+  );
+  // The title and meta lines live in the workspace's hidden header overlay, so
+  // the summary, transport and diagrams get the whole viewport.
   return (
-    <div className="flex h-full min-h-[760px] flex-col gap-2 p-3">
-      <RunHeader
-        run={run.data}
-        scenarioName={sc?.name}
-        actions={
-          <Link href={`/o/${encodeURIComponent(ontology)}/simulate?flow=${encodeURIComponent(run.data.flow)}${run.data.scenario ? `&scenario=${encodeURIComponent(run.data.scenario)}` : ""}`} className="rounded border border-line px-1.5 py-0.5 text-link hover:bg-panel-2">
-            Configure a new run
-          </Link>
-        }
-      />
-      <RunPlayback run={run.data} ontology={ontology} initialCursor={at !== undefined ? at - 1 : undefined} className="min-h-0 flex-1" />
+    <div className="flex h-full flex-col gap-2 p-3">
+      {chromeSlot ? createPortal(header, chromeSlot) : header}
+      <RunPlayback run={run.data} ontology={ontology} initialCursor={at !== undefined ? at - 1 : undefined} layout="page" className="min-h-0 flex-1" />
     </div>
   );
 }

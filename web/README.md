@@ -208,7 +208,16 @@ PATH=/usr/local/go/bin:$PATH go run ./internal/devtools/fixtures -out web/fixtur
     `?from=&to=` preselects the diff.
   - **Tests.** **Run all** sends `POST /test`. You get a pass/fail table, per-assertion details and
     a link to each run.
-- **`/o/<id>/runs/<run>`: Playback.** `?at=<seq>` opens at a given event. The page has:
+- **`/o/<id>/runs/<run>`: Playback.** `?at=<seq>` opens at a given event. The page fills the
+  viewport with no page scroll. The app bar, the workspace header and tabs, and the run's title and
+  meta lines are hidden; they reveal together as an overlay while you hover the top edge (or the
+  handle at its centre, which also pins them open until Esc), or focus anything inside them. Below
+  the summary and the scrubber the sequence diagram fills the stage. The inspector and state ledger
+  float in a right panel and the map along the bottom, each **hidden** (a tab or a slim bar),
+  **open** (docked: about 420px wide, or 30% of the height) or **expanded** (60% of the width, or
+  75% of the height, over the diagram). Both states are remembered in localStorage. The inline
+  playback in Simulate and Exploration keeps the grid layout (`Playback`'s `layout="embedded"`).
+  The page has:
   - a **summary** card: status, result or error, duration, calls (with a per-interface table),
     retries, faults, assertions ✓/✗ (with details), warnings and, for a repeated flow entry, a
     per-pass table (start, duration, result);
@@ -237,6 +246,8 @@ PATH=/usr/local/go/bin:$PATH go run ./internal/devtools/fixtures -out web/fixtur
 | Space | Play or pause playback |
 | ← / → | Step one event (Shift: 10) |
 | Home / End | Jump to the first or last event |
+| i | Run page: cycle the inspector panel (open, expanded, hidden) |
+| m | Run page: cycle the map (open, expanded, hidden) |
 | Tab, Enter, Space | Move between and activate every control; Enter on a focused map node opens it |
 
 Playback shortcuts are ignored while you type in an input, select or text area.
