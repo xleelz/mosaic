@@ -1,8 +1,10 @@
 # Modeling recipes
 
-These are proven patterns. Unless marked otherwise, the snippets come from a model of an LLM
-inference gateway whose 14 scenarios pass with no warnings; its test-fixture form, with shorter
-names, is `internal/testdata/gateway/ontology.yaml`. Snippets
+These are proven patterns. The worked example to read alongside them is the Envoy proxy model,
+`examples/envoy/ontology.yaml`, whose 22 scenarios pass with no warnings: its router retries
+through `retry.when`, its local rate limit is a limiter, and its hosts are instances. Unless
+marked otherwise, the snippets below come from a model of an LLM inference gateway; its
+test-fixture form, with shorter names, is `internal/testdata/gateway/ontology.yaml`. Snippets
 marked *(verified)* were checked against the engine separately. Each recipe gives the behavior,
 then the scenario that exercises it.
 

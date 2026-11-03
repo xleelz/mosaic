@@ -3,8 +3,9 @@
 The shapes below come from `internal/sim` and `pkg/api`. The examples are real engine output for
 the gateway test fixture (`internal/testdata/gateway/ontology.yaml`); write its runs with
 `go run ./internal/devtools/fixtures -in internal/testdata/gateway/ontology.yaml -out /tmp/fx`.
-The tracked runs in `web/fixtures/language-demo/runs/*.json` and `web/fixtures/shop/runs/*.json`
-are real engine output too.
+The worked example's runs are tracked in `web/fixtures/envoy/runs/*.json` (from
+`examples/envoy/ontology.yaml`), and `web/fixtures/language-demo/runs/*.json` and
+`web/fixtures/shop/runs/*.json` are real engine output too.
 
 ## Contents
 

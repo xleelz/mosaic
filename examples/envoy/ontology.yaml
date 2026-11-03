@@ -1,0 +1,1431 @@
+# Envoy proxy, v1.36.2: one downstream HTTP/1.1 request through a listener,
+# the HTTP connection manager, two HTTP filters (local rate limit, RBAC) and
+# the router filter, out to a round-robin cluster of three hosts and back.
+#
+# The deployed configuration this models is a small edge proxy:
+#
+#   listener 0.0.0.0:10000, one filter chain for private source ranges
+#   http_connection_manager (http1), filters: local_ratelimit, rbac, router
+#   virtual host api.example.com:
+#     /healthz         direct_response 200 "ok"
+#     /account/        redirect {https_redirect: true}
+#     /api/ + header x-canary: "true"   -> cluster canary (no retry policy)
+#     /api/            -> cluster backend, retry_policy {retry_on:
+#                         connect-failure,reset,retriable-status-codes,
+#                         retriable_status_codes: [503], per_try_timeout: 2s}
+#     /admin/          -> cluster backend (denied by RBAC)
+#   cluster backend: ROUND_ROBIN over h1..h3, default circuit breakers,
+#     outlier_detection {max_ejection_percent: 50}
+#   cluster canary: one host
+#
+# Every value the YAML leaves out is Envoy's code default, held in `configs`
+# with a citation. Every outcome is reached through a different mechanism:
+# request data (filter chain, header size, virtual host, route, header
+# match, RBAC), component state (rate-limit tokens, pending requests,
+# active retries, an ejected host, the consecutive-5xx count), the load
+# balancer's random seed (a choice), and injected upstream faults (a 503,
+# a 500, a hang, a reset, refused connections).
+schema_version: 1
+id: envoy
+name: Envoy proxy
+description: >-
+  A downstream HTTP request through Envoy 1.36.2: filter chain match, the HTTP
+  connection manager and its codec limits, local rate limiting and RBAC, the
+  route table (virtual host, then route, with a direct response and a
+  redirect), and the router filter with its timeouts and retry policy, over
+  the cluster manager's round-robin load balancer, circuit breakers, outlier
+  detection and connection pool, to upstream hosts modeled as instances. The
+  response returns through the connection manager, which writes the access
+  log with Envoy's response flags. Outlier ejections are delivered after the
+  request, as Envoy posts them to the main thread.
+source:
+  repo: envoyproxy/envoy
+  sha: dc2d3098ae5641555f15c71d5bb5ce0060a8015c
+  url: https://github.com/envoyproxy/envoy/tree/v1.36.2
+
+components:
+  - id: downstream-client
+    name: Downstream client
+    kind: client
+    layer: clients
+    summary: An HTTP/1.1 client calling the proxy.
+
+  - id: envoy
+    name: Envoy
+    kind: service
+    layer: proxy
+    summary: The proxy process; one worker thread handles the connection.
+    sources: ["source/exe/main.cc"]
+
+  - id: listener
+    name: Listener
+    kind: module
+    parent: envoy
+    layer: proxy
+    summary: Accepts the connection and picks a filter chain by the connection's addresses.
+    sources: ["source/common/listener_manager/active_stream_listener_base.cc:27-40", "source/common/listener_manager/filter_chain_manager_impl.cc:543-575"]
+    state:
+      initial:
+        address: "0.0.0.0:10000"
+        filter_chains:
+          - {name: private-http, source_prefix_ranges: [10.0.0.0/8, 192.168.0.0/16]}
+        default_filter_chain: null
+
+  - id: http-connection-manager
+    name: HTTP connection manager
+    kind: module
+    parent: envoy
+    layer: proxy
+    summary: The network filter that turns bytes into streams, resolves the route, runs the HTTP filters and logs the stream.
+    sources: ["source/common/http/conn_manager_impl.cc:1288-1300", "source/common/http/conn_manager_impl.cc:1486-1535"]
+
+  - id: http1-codec
+    name: HTTP/1 codec
+    kind: module
+    parent: http-connection-manager
+    layer: proxy
+    summary: Parses request headers and enforces the header size limit.
+    sources: ["source/common/http/http1/codec_impl.cc:607-618"]
+
+  - id: filter-manager
+    name: Filter manager
+    kind: module
+    parent: http-connection-manager
+    layer: proxy
+    summary: Runs the decoder filters in order until one stops iteration.
+    sources: ["source/common/http/filter_manager.cc:569-600"]
+
+  - id: local-ratelimit
+    name: Local rate limit filter
+    kind: module
+    parent: filter-manager
+    layer: filters
+    summary: A token bucket shared by the worker's requests; an empty bucket answers 429.
+    sources: ["source/extensions/filters/http/local_ratelimit/local_ratelimit.cc:140-198"]
+    limiters:
+      - id: token_bucket
+        kind: token_bucket
+        limit: "= config['local-rl-tokens-per-fill']"
+        period_ms: "= config['local-rl-fill-interval-ms']"
+        burst: "= config['local-rl-max-tokens']"
+
+  - id: rbac
+    name: RBAC filter
+    kind: module
+    parent: filter-manager
+    layer: filters
+    summary: Role-based access control; a DENY policy that matches answers 403.
+    sources: ["source/extensions/filters/http/rbac/rbac_filter.cc:196-245"]
+    state:
+      initial:
+        action: DENY
+        policies:
+          deny-admin: {path_prefix: /admin/}
+
+  - id: router
+    name: Router filter
+    kind: module
+    parent: filter-manager
+    layer: filters
+    summary: The terminal filter. Sends direct responses and redirects, sets the timeouts and forwards to the cluster, retrying per the route's policy.
+    sources: ["source/common/router/router.cc:465-527", "source/common/router/router.cc:761-781"]
+
+  - id: retry-state
+    name: Retry state
+    kind: module
+    parent: router
+    layer: filters
+    summary: Decides each retry from retry_on, the retries left and the cluster's retry circuit breaker.
+    sources: ["source/common/router/retry_state_impl.cc:269-334"]
+
+  - id: upstream-request
+    name: Upstream request
+    kind: module
+    parent: router
+    layer: filters
+    summary: One attempt. Picks a host, gets a stream from the pool, sends, and reports the outcome to outlier detection and the retry state.
+    sources: ["source/common/router/upstream_request.cc:516-590"]
+
+  - id: route-matcher
+    name: Route matcher
+    kind: module
+    parent: http-connection-manager
+    layer: routing
+    summary: Finds the virtual host by the authority header, then asks it for the first matching route.
+    sources: ["source/common/router/config_impl.cc:1826-1885"]
+    state:
+      initial:
+        virtual_hosts:
+          - name: api
+            domains: [api.example.com]
+            routes:
+              - name: healthz
+                match: {path: /healthz}
+                direct_response: {status: 200, body: ok}
+              - name: account-https
+                match: {prefix: /account/}
+                redirect: {https_redirect: true}
+              - name: api-canary
+                match:
+                  prefix: /api/
+                  headers: [{name: x-canary, exact: "true"}]
+                route: {cluster: canary}
+              - name: api
+                match: {prefix: /api/}
+                route:
+                  cluster: backend
+                  retry_policy:
+                    retry_on: [connect-failure, reset, retriable-status-codes]
+                    retriable_status_codes: [503]
+                    per_try_timeout_ms: 2000
+              - name: admin
+                match: {prefix: /admin/}
+                route: {cluster: backend}
+
+  - id: virtual-host
+    name: Virtual host
+    kind: module
+    parent: route-matcher
+    layer: routing
+    summary: Walks its routes in order and returns the first whose path and header matchers match.
+    sources: ["source/common/router/config_impl.cc:1657-1745"]
+
+  - id: cluster-manager
+    name: Cluster manager
+    kind: module
+    parent: envoy
+    layer: upstream
+    summary: The worker's thread-local clusters, their host sets and host health.
+    sources: ["source/common/router/router.cc:510-527"]
+    state:
+      initial:
+        clusters:
+          backend: {hosts: [h1, h2, h3], lb_policy: ROUND_ROBIN}
+          canary: {hosts: [c1], lb_policy: ROUND_ROBIN}
+        addresses: {h1: "10.1.0.11:8080", h2: "10.1.0.12:8080", h3: "10.1.0.13:8080", c1: "10.1.9.21:8080"}
+        ejected: []
+
+  - id: load-balancer
+    name: Round-robin load balancer
+    kind: module
+    parent: cluster-manager
+    layer: upstream
+    summary: Picks hosts in turn from the healthy set, starting at a random index.
+    sources: ["source/extensions/load_balancing_policies/round_robin/round_robin_lb.h:28-82"]
+    state:
+      initial: {rr: {}}
+
+  - id: circuit-breakers
+    name: Circuit breakers
+    kind: limiter
+    parent: cluster-manager
+    layer: upstream
+    summary: The cluster's resource manager. Counts connections, pending requests, requests and retries against their maximums.
+    sources: ["source/common/upstream/upstream_impl.cc:2033-2041", "source/common/common/basic_resource_impl.h:29-31"]
+    state:
+      initial: {connections: 0, pending: 0, requests: 0, retries: 0}
+
+  - id: conn-pool
+    name: Connection pool
+    kind: module
+    parent: cluster-manager
+    layer: upstream
+    summary: Per-host HTTP/1 pool. Attaches to a ready connection, or queues a pending stream and connects.
+    sources: ["source/common/conn_pool/conn_pool_base.cc:320-360"]
+    state:
+      initial:
+        ready_clients: {h1: 1, h2: 1, h3: 1, c1: 1}
+
+  - id: outlier-detector
+    name: Outlier detector
+    kind: module
+    parent: cluster-manager
+    layer: upstream
+    summary: Counts consecutive 5xx per host and ejects a host at the threshold, within max_ejection_percent.
+    sources: ["source/common/upstream/outlier_detection_impl.cc:68-95", "source/common/upstream/outlier_detection_impl.cc:476-520"]
+    state:
+      initial:
+        clusters: [backend]
+        consecutive_5xx: {h1: 0, h2: 0, h3: 0}
+        ejections_active: 0
+
+  - id: access-log
+    name: Access log
+    kind: queue
+    parent: envoy
+    layer: proxy
+    summary: The stream's access log line, written when the stream ends.
+    sources: ["source/common/http/conn_manager_impl.cc:350-362"]
+    state:
+      initial: {count: 0, last: null}
+
+  - id: backend
+    name: Cluster backend
+    kind: pool
+    layer: upstream-hosts
+    summary: Three interchangeable application hosts.
+
+  - id: backend-host
+    name: Backend host
+    kind: engine
+    parent: backend
+    layer: upstream-hosts
+    summary: One host of cluster backend; its instances are h1, h2 and h3.
+
+  - id: canary
+    name: Cluster canary
+    kind: pool
+    layer: upstream-hosts
+    summary: A single canary host, selected by header.
+
+  - id: canary-host
+    name: Canary host
+    kind: engine
+    parent: canary
+    layer: upstream-hosts
+    summary: The canary host, instance c1.
+
+configs:
+  - {id: route-timeout-ms, type: integer, value: 15000, default: 15000, summary: "Route timeout; the routes set none, so the default applies.", sources: ["source/common/router/config_impl.h:873", "source/common/router/config_impl.cc:429", "api/envoy/config/route/v3/route_components.proto:1316-1327"]}
+  - {id: retry-num-retries, type: integer, value: 1, default: 1, summary: "num_retries when a retry policy leaves it out.", sources: ["source/common/router/retry_policy_impl.cc:39", "api/envoy/config/route/v3/route_components.proto:1648-1652"]}
+  - {id: retry-base-interval-ms, type: integer, value: 25, default: 25, summary: "Retry back-off base interval.", sources: ["source/common/router/retry_state_impl.cc:90-94", "api/envoy/config/route/v3/route_components.proto:1712-1715"]}
+  - {id: retry-max-interval-ms, type: integer, value: 250, default: 250, summary: "Retry back-off cap, 10 times the base.", sources: ["source/common/router/retry_state_impl.cc:96-101"]}
+  - {id: cb-max-connections, type: integer, value: 1024, default: 1024, sources: ["source/common/upstream/upstream_impl.cc:2038", "api/envoy/config/cluster/v3/circuit_breaker.proto:58"]}
+  - {id: cb-max-pending, type: integer, value: 1024, default: 1024, sources: ["source/common/upstream/upstream_impl.cc:2039", "api/envoy/config/cluster/v3/circuit_breaker.proto:62"]}
+  - {id: cb-max-requests, type: integer, value: 1024, default: 1024, sources: ["source/common/upstream/upstream_impl.cc:2040", "api/envoy/config/cluster/v3/circuit_breaker.proto:67"]}
+  - {id: cb-max-retries, type: integer, value: 3, default: 3, sources: ["source/common/upstream/upstream_impl.cc:2041", "api/envoy/config/cluster/v3/circuit_breaker.proto:72"]}
+  - {id: outlier-consecutive-5xx, type: integer, value: 5, default: 5, sources: ["source/common/upstream/outlier_detection_impl.h:350", "api/envoy/config/cluster/v3/outlier_detection.proto:31-32"]}
+  - {id: outlier-enforcing-consecutive-5xx, type: integer, value: 100, default: 100, summary: "Percent of detected consecutive-5xx ejections that are enforced.", sources: ["source/common/upstream/outlier_detection_impl.h:359"]}
+  - {id: outlier-base-ejection-time-ms, type: integer, value: 30000, default: 30000, sources: ["source/common/upstream/outlier_detection_impl.h:349", "api/envoy/config/cluster/v3/outlier_detection.proto:42-43"]}
+  - {id: outlier-max-ejection-percent, type: integer, value: 50, default: 10, summary: "Deployed at 50: at the default 10%, one host of three (33%) could never be ejected.", sources: ["source/common/upstream/outlier_detection_impl.h:352", "source/common/upstream/outlier_detection_impl.cc:476-487", "api/envoy/config/cluster/v3/outlier_detection.proto:44-47"]}
+  - {id: healthy-panic-threshold, type: integer, value: 50, default: 50, summary: "Below this healthy percentage the load balancer uses every host.", sources: ["source/extensions/load_balancing_policies/common/load_balancer_impl.cc:636-649", "api/envoy/config/cluster/v3/cluster.proto:630-636"]}
+  - {id: max-request-headers-kb, type: integer, value: 60, default: 60, sources: ["envoy/http/codec_runtime_overrides.h:9", "source/extensions/filters/network/http_connection_manager/config.cc:382-385", "api/envoy/extensions/filters/network/http_connection_manager/v3/http_connection_manager.proto:498-499"]}
+  - {id: local-rl-max-tokens, type: integer, value: 100, summary: "token_bucket.max_tokens; required, no default.", sources: ["api/envoy/type/v3/token_bucket.proto:26"]}
+  - {id: local-rl-tokens-per-fill, type: integer, value: 100, default: 1, sources: ["source/extensions/filters/http/local_ratelimit/local_ratelimit.cc:32", "api/envoy/type/v3/token_bucket.proto:30"]}
+  - {id: local-rl-fill-interval-ms, type: integer, value: 1000, summary: "token_bucket.fill_interval; refilled continuously at tokens_per_fill per interval.", sources: ["source/extensions/filters/common/local_ratelimit/local_ratelimit_impl.cc:77-83"]}
+  - {id: local-rl-filter-enabled-percent, type: integer, value: 100, default: 0, summary: "Deployed at 100%; unset, the filter checks nothing.", sources: ["source/extensions/filters/http/local_ratelimit/local_ratelimit.cc:128-130", "api/envoy/extensions/filters/http/local_ratelimit/v3/local_rate_limit.proto:60-61"]}
+  - {id: local-rl-filter-enforced-percent, type: integer, value: 100, default: 0, summary: "Deployed at 100%; unset, an over-limit request is only counted.", sources: ["source/extensions/filters/http/local_ratelimit/local_ratelimit.cc:132-134", "api/envoy/extensions/filters/http/local_ratelimit/v3/local_rate_limit.proto:67-68"]}
+  - {id: local-rl-status, type: integer, value: 429, default: 429, summary: "Local rate limit status; anything under 400 becomes 429.", sources: ["source/extensions/filters/http/local_ratelimit/local_ratelimit.h:135-141", "api/envoy/extensions/filters/http/local_ratelimit/v3/local_rate_limit.proto:33-37"]}
+
+fixtures:
+  - id: three-hosts
+    name: Three backend hosts and a canary
+    topology:
+      backend-host: [h1, h2, h3]
+      canary-host: [c1]
+
+schemas:
+  - id: DownstreamRequest
+    schema:
+      type: object
+      required: [source_ip, method, scheme, authority, path]
+      properties:
+        source_ip: {type: string, examples: [10.0.3.17]}
+        method: {type: string, examples: [GET]}
+        scheme: {type: string, examples: [http]}
+        authority: {type: string, examples: [api.example.com]}
+        path: {type: string, examples: [/api/orders]}
+        headers:
+          type: object
+          properties:
+            user-agent: {type: string, examples: [curl/8.5.0]}
+        header_bytes: {type: integer, minimum: 0, examples: [612]}
+
+  - id: HttpResponse
+    schema:
+      type: object
+      properties:
+        status: {type: integer}
+        headers: {type: object}
+        body: {type: string}
+
+  - id: UpstreamResponse
+    schema:
+      type: object
+      required: [status]
+      properties:
+        status: {type: integer, const: 200}
+        body: {type: string, examples: ['{"orders":[]}']}
+
+  - id: RouteResult
+    schema:
+      type: object
+      properties:
+        matched: {type: boolean}
+        virtual_host: {type: string}
+        entry: {description: "The matched route entry, or null"}
+
+  - id: AccessLogEntry
+    schema:
+      type: object
+      properties:
+        method: {type: string}
+        path: {type: string}
+        protocol: {type: string}
+        response_code: {type: integer}
+        response_flags: {type: string}
+        response_code_details: {type: string}
+        upstream_host: {type: string}
+        authority: {type: string}
+        x_envoy_upstream_service_time: {type: string}
+
+interfaces:
+  - component: listener
+    name: accept
+    kind: tcp
+    summary: A new downstream connection on 0.0.0.0:10000.
+    sources: ["source/common/listener_manager/active_stream_listener_base.cc:27-40"]
+    request: DownstreamRequest
+    response: HttpResponse
+    errors: [{code: connection_closed}]
+    behavior:
+      - title: Match a filter chain
+        detail: Without a destination-port sub-tree, the catch-all port is searched by source address; with no match and no default chain, nothing serves the connection.
+        source: "source/common/listener_manager/filter_chain_manager_impl.cc:565-574"
+        set:
+          vars.chains: "= state.filter_chains.filter(c, inAnyCidr(input.source_ip, c.source_prefix_ranges))"
+      - if: "size(vars.chains) == 0 && state.default_filter_chain == null"
+        then:
+          - title: Close the connection
+            detail: No filter chain matches, so the listener sets NR, writes its access log and closes the socket; no HTTP response is sent.
+            source: "source/common/listener_manager/active_stream_listener_base.cc:31-40"
+            set: {ctx.filterChain: none, ctx.responseFlags: [NR], ctx.responseCodeDetails: filter_chain_not_found}
+          - emit: access-log.log
+            input:
+              method: "-"
+              path: "-"
+              protocol: "-"
+              response_code: 0
+              response_flags: NR
+              response_code_details: filter_chain_not_found
+              upstream_host: "-"
+              authority: "-"
+              x_envoy_upstream_service_time: "-"
+          - fail: {code: connection_closed, message: no matching filter chain found}
+      - set: {ctx.filterChain: "= vars.chains[0].name"}
+      - call: http-connection-manager.on-request
+        input: "= input"
+        as: response
+      - return: "= vars.response.value"
+
+  - component: http-connection-manager
+    name: on-request
+    kind: http
+    summary: One HTTP stream, from request headers to the access log.
+    sources: ["source/common/http/conn_manager_impl.cc:1288-1535"]
+    request: DownstreamRequest
+    response: HttpResponse
+    errors:
+      - {code: route_not_found, status: 404}
+      - {code: local_rate_limited, status: 429}
+      - {code: rbac_access_denied, status: 403}
+      - {code: headers_too_large, status: 431}
+      - {code: upstream_response, status: 503}
+      - {code: upstream_timeout, status: 504}
+      - {code: upstream_reset, status: 503}
+      - {code: upstream_overflow, status: 503}
+    behavior:
+      - set:
+          ctx.responseFlags: []
+          ctx.responseCodeDetails: via_upstream
+          ctx.upstreamHost: "-"
+          ctx.attempts: 0
+          ctx.hostsTried: []
+      - call: http1-codec.decode-headers
+        input: {header_bytes: "= has(input.header_bytes) ? input.header_bytes : 0"}
+        as: reply
+        on_error: continue
+      - if: "vars.reply.ok"
+        then:
+          - title: Resolve the route
+            detail: The route is resolved once, before the first filter, and cached for the stream.
+            source: "source/common/http/conn_manager_impl.cc:1486-1487"
+            call: route-matcher.route
+            input:
+              authority: "= input.authority"
+              path: "= input.path"
+              scheme: "= input.scheme"
+              headers: "= has(input.headers) ? input.headers : {}"
+            as: route
+          - call: filter-manager.decode-headers
+            input: {request: "= input", route: "= vars.route.value"}
+            as: reply
+            on_error: continue
+      - title: Write the access log
+        detail: The stream's log line is written when the stream is destroyed, with its response flags joined by commas, or "-" when there are none.
+        source: "source/common/stream_info/utility.cc:33-50"
+        emit: access-log.log
+        input:
+          method: "= input.method"
+          path: "= input.path"
+          protocol: HTTP/1.1
+          response_code: "= vars.reply.ok ? vars.reply.value.status : vars.reply.error.status"
+          response_flags: "= size(ctx.responseFlags) == 0 ? '-' : ctx.responseFlags.join(',')"
+          response_code_details: "= ctx.responseCodeDetails"
+          upstream_host: "= ctx.upstreamHost"
+          authority: "= input.authority"
+          x_envoy_upstream_service_time: "= vars.reply.ok && 'x-envoy-upstream-service-time' in vars.reply.value.headers ? vars.reply.value.headers['x-envoy-upstream-service-time'] : (!vars.reply.ok && 'x-envoy-upstream-service-time' in vars.reply.error.headers ? vars.reply.error.headers['x-envoy-upstream-service-time'] : '-')"
+      - if: "!vars.reply.ok"
+        then:
+          - title: Encode the error response
+            detail: Every response, local or upstream, gets the server header.
+            source: "source/common/http/conn_manager_impl.cc:1844-1851"
+            fail:
+              code: "= vars.reply.error.code"
+              status: "= vars.reply.error.status"
+              message: "= vars.reply.error.message"
+              headers: "= merge(vars.reply.error.headers, {'server': 'envoy'})"
+      - return:
+          status: "= vars.reply.value.status"
+          headers: "= merge(vars.reply.value.headers, {'server': 'envoy'})"
+          body: "= vars.reply.value.body"
+
+  - component: http1-codec
+    name: decode-headers
+    kind: function
+    summary: Parses the request headers against max_request_headers_kb.
+    sources: ["source/common/http/http1/codec_impl.cc:607-618"]
+    request: {type: object, properties: {header_bytes: {type: integer}}}
+    errors: [{code: headers_too_large, status: 431}]
+    behavior:
+      - if: "input.header_bytes > config['max-request-headers-kb'] * 1024"
+        then:
+          - title: Reject oversized headers
+            detail: The codec answers 431 itself, and the connection manager marks the stream DPE (downstream protocol error) and closes the connection.
+            source: "source/common/http/http1/codec_impl.cc:1376-1393"
+            set: {ctx.responseFlags: [DPE], ctx.responseCodeDetails: http1.headers_too_large}
+          - fail:
+              code: headers_too_large
+              status: 431
+              message: Request Header Fields Too Large
+              headers: {content-type: text/plain, connection: close}
+      - return: {parsed: true}
+
+  - component: filter-manager
+    name: decode-headers
+    kind: function
+    summary: local_ratelimit, then rbac, then router; a filter that sends a local reply stops the chain.
+    sources: ["source/common/http/filter_manager.cc:569-600"]
+    request: {type: object, properties: {request: {$ref: DownstreamRequest}, route: {$ref: RouteResult}}}
+    response: HttpResponse
+    behavior:
+      - call: local-ratelimit.decode-headers
+      - call: rbac.decode-headers
+        input: {path: "= input.request.path"}
+      - call: router.decode-headers
+        input: "= input"
+        as: response
+      - return: "= vars.response.value"
+
+  - component: local-ratelimit
+    name: decode-headers
+    kind: function
+    summary: Takes one token from the bucket, or answers 429 local_rate_limited.
+    sources: ["source/extensions/filters/http/local_ratelimit/local_ratelimit.cc:140-198"]
+    errors: [{code: local_rate_limited, status: 429}, {code: rate_limited, status: 429}]
+    behavior:
+      - if: "config['local-rl-filter-enabled-percent'] == 0"
+        then:
+          - return: {enabled: false}
+      - admit: {limiter: token_bucket, as: bucket}
+        on_error: continue
+      - if: "vars.bucket.ok"
+        then:
+          - return: {allowed: true}
+      - if: "config['local-rl-filter-enforced-percent'] == 0"
+        then:
+          - title: Count but don't enforce
+            source: "source/extensions/filters/http/local_ratelimit/local_ratelimit.cc:181-184"
+            return: {allowed: true, shadow: true}
+      - title: Answer 429
+        detail: The filter sends a local reply with body local_rate_limited and sets RL.
+        source: "source/extensions/filters/http/local_ratelimit/local_ratelimit.cc:186-195"
+        set:
+          ctx.responseFlags: "= ctx.responseFlags + ['RL']"
+          ctx.responseCodeDetails: local_rate_limited
+      - fail:
+          code: local_rate_limited
+          status: "= config['local-rl-status'] >= 400 ? config['local-rl-status'] : 429"
+          message: local_rate_limited
+          headers: {content-type: text/plain}
+
+  - component: rbac
+    name: decode-headers
+    kind: function
+    summary: Evaluates the enforced engine; a matched DENY policy answers 403.
+    sources: ["source/extensions/filters/http/rbac/rbac_filter.cc:196-245"]
+    request: {type: object, properties: {path: {type: string}}}
+    errors: [{code: rbac_access_denied, status: 403}]
+    behavior:
+      - set:
+          vars.matched: "= state.policies.filter(p, input.path.startsWith(state.policies[p].path_prefix))"
+      - title: Apply the action
+        detail: ALLOW allows when a policy matches; DENY allows when none does.
+        source: "source/extensions/filters/common/rbac/engine_impl.cc:73-92"
+        set:
+          vars.allowed: "= state.action == 'ALLOW' ? size(vars.matched) > 0 : size(vars.matched) == 0"
+      - if: "vars.allowed"
+        then:
+          - return: {allowed: true}
+      - title: Answer 403
+        detail: The details name the matched policy; RBAC sets no response flag.
+        source: "source/extensions/filters/common/rbac/utility.cc:33-38"
+        set: {ctx.responseCodeDetails: "= 'rbac_access_denied_matched_policy[' + vars.matched[0] + ']'"}
+      - fail:
+          code: rbac_access_denied
+          status: 403
+          message: "RBAC: access denied"
+          headers: {content-type: text/plain}
+
+  - component: route-matcher
+    name: route
+    kind: function
+    summary: Picks the virtual host by exact domain, then delegates to its routes.
+    sources: ["source/common/router/config_impl.cc:1874-1885"]
+    request:
+      type: object
+      properties:
+        authority: {type: string}
+        path: {type: string}
+        scheme: {type: string}
+        headers: {type: object}
+    response: RouteResult
+    behavior:
+      - title: Find the virtual host
+        detail: The host header is lower-cased and looked up among the domains; there are no wildcard domains and no default virtual host here.
+        source: "source/common/router/config_impl.cc:1826-1871"
+        set:
+          vars.vhosts: "= state.virtual_hosts.filter(v, input.authority.lowerAscii() in v.domains)"
+      - if: "size(vars.vhosts) == 0"
+        then:
+          - set: {ctx.virtualHost: none}
+          - return: {matched: false, virtual_host: ""}
+      - set: {ctx.virtualHost: "= vars.vhosts[0].name"}
+      - call: virtual-host.get-route
+        input:
+          routes: "= vars.vhosts[0].routes"
+          path: "= input.path"
+          scheme: "= input.scheme"
+          headers: "= input.headers"
+        as: route
+      - return:
+          matched: "= vars.route.value.matched"
+          virtual_host: "= vars.vhosts[0].name"
+          entry: "= vars.route.value.entry"
+
+  - component: virtual-host
+    name: get-route
+    kind: function
+    summary: The first route, in order, whose path and headers match.
+    sources: ["source/common/router/config_impl.cc:1657-1690"]
+    request:
+      type: object
+      properties:
+        routes: {type: array, items: {type: object}}
+        path: {type: string}
+        scheme: {type: string}
+        headers: {type: object}
+    behavior:
+      - set: {vars.found: null}
+      - foreach: "= input.routes"
+        as: r
+        steps:
+          - title: Match path, then headers
+            detail: A prefix or exact path must match, and every header matcher must match.
+            source: "source/common/router/config_impl.cc:1296-1303"
+            if: >-
+              (has(vars.r.match.path) ? input.path == vars.r.match.path : input.path.startsWith(vars.r.match.prefix)) &&
+              (!has(vars.r.match.headers) || vars.r.match.headers.all(h, h.name in input.headers && input.headers[h.name] == h.exact))
+            then:
+              - set: {vars.found: "= vars.r"}
+              - break: true
+      - if: "vars.found == null"
+        then:
+          - set: {ctx.route: none}
+          - return: {matched: false, entry: null}
+      - set: {ctx.route: "= vars.found.name"}
+      - return: {matched: true, entry: "= vars.found"}
+
+  - component: router
+    name: decode-headers
+    kind: function
+    summary: Direct response, redirect, or forward to the route's cluster with its timeout and retry policy.
+    sources: ["source/common/router/router.cc:465-781"]
+    request: {type: object, properties: {request: {$ref: DownstreamRequest}, route: {$ref: RouteResult}}}
+    response: HttpResponse
+    errors:
+      - {code: route_not_found, status: 404}
+      - {code: upstream_response, status: 503}
+      - {code: upstream_timeout, status: 504}
+      - {code: upstream_reset, status: 503}
+      - {code: upstream_overflow, status: 503}
+    behavior:
+      - if: "!input.route.matched"
+        then:
+          - title: No route
+            detail: The router answers 404 with an empty body and sets NR.
+            source: "source/common/router/router.cc:470-479"
+            set:
+              ctx.responseFlags: "= ctx.responseFlags + ['NR']"
+              ctx.responseCodeDetails: route_not_found
+          - fail: {code: route_not_found, status: 404, message: "", headers: {}}
+      - set: {vars.entry: "= input.route.entry"}
+      - if: "has(vars.entry.direct_response)"
+        then:
+          - title: Direct response
+            source: "source/common/router/router.cc:481-507"
+            set: {ctx.responseCodeDetails: direct_response}
+          - return:
+              status: "= vars.entry.direct_response.status"
+              headers: {content-type: text/plain}
+              body: "= vars.entry.direct_response.body"
+      - if: "has(vars.entry.redirect)"
+        then:
+          - title: Redirect
+            detail: A redirect is a direct response with a Location header; https_redirect swaps the scheme and the default code is 301.
+            source: "source/common/http/utility.cc:1576-1590"
+            set: {ctx.responseCodeDetails: direct_response}
+          - return:
+              status: 301
+              headers: {location: "= (vars.entry.redirect.https_redirect ? 'https' : input.request.scheme) + '://' + input.request.authority + input.request.path"}
+              body: ""
+      - title: Set the timeouts and retry policy
+        detail: The route timeout defaults to 15 s; a per-try timeout at or above it is ignored; num_retries defaults to 1 when a policy is present.
+        source: "source/common/router/router.cc:177-252"
+        set:
+          vars.timeoutMs: "= has(vars.entry.route.timeout_ms) ? vars.entry.route.timeout_ms : config['route-timeout-ms']"
+          ctx.hasRetryPolicy: "= has(vars.entry.route.retry_policy)"
+          ctx.retryOn: "= has(vars.entry.route.retry_policy) ? vars.entry.route.retry_policy.retry_on : []"
+          ctx.retriableStatusCodes: "= has(vars.entry.route.retry_policy) && has(vars.entry.route.retry_policy.retriable_status_codes) ? vars.entry.route.retry_policy.retriable_status_codes : []"
+          ctx.retriesRemaining: "= has(vars.entry.route.retry_policy) ? (has(vars.entry.route.retry_policy.num_retries) ? vars.entry.route.retry_policy.num_retries : config['retry-num-retries']) : 0"
+          ctx.retryArmed: false
+          ctx.retryStatus: "no"
+          ctx.cluster: "= vars.entry.route.cluster"
+          ctx.deadlineAt: "= now + (has(vars.entry.route.timeout_ms) ? vars.entry.route.timeout_ms : config['route-timeout-ms'])"
+      - set:
+          vars.perTryMs: "= has(vars.entry.route.retry_policy) && has(vars.entry.route.retry_policy.per_try_timeout_ms) && vars.entry.route.retry_policy.per_try_timeout_ms < vars.timeoutMs ? vars.entry.route.retry_policy.per_try_timeout_ms : 0"
+          vars.maxAttempts: "= ctx.retriesRemaining + 1"
+      - call: upstream-request.send
+        input: {cluster: "= ctx.cluster", per_try_timeout_ms: "= vars.perTryMs"}
+        retry:
+          max_attempts: "= vars.maxAttempts"
+          backoff_ms: 25
+          multiplier: 2
+          max_backoff_ms: 250
+          jitter: full
+          on_codes: [upstream_response, connect_failure, remote_reset, per_try_timeout]
+          when: "ctx.retryStatus == 'yes'"
+          title: Retry with back-off
+          detail: A fully jittered exponential back-off from 25 ms, capped at 250 ms, then a new host pick.
+          source: "source/common/router/retry_state_impl.cc:166-187"
+        as: upstream
+        on_error:
+          - call: retry-state.reset
+          - set:
+              vars.retried: "= ctx.attempts > 1 ? 'retried and the latest ' : ''"
+          - if: "error.code == 'per_try_timeout' || error.code == 'upstream_timeout'"
+            then:
+              - title: Upstream request timeout
+                detail: The router answers 504 "upstream request timeout" and sets UT.
+                source: "source/common/router/router.cc:1407-1421"
+                set:
+                  ctx.responseFlags: "= ctx.responseFlags + ['UT']"
+                  ctx.responseCodeDetails: "= error.code == 'per_try_timeout' ? 'upstream_per_try_timeout' : 'upstream_response_timeout'"
+              - fail: {code: upstream_timeout, status: 504, message: upstream request timeout, headers: {content-type: text/plain}}
+          - if: "error.code == 'overflow'"
+            then:
+              - title: Dropped by a circuit breaker
+                detail: An overflow reset is cluster-wide, so it is neither retried nor charged to the host; the 503 carries x-envoy-overloaded.
+                source: "source/common/router/router.cc:1507-1520"
+                set:
+                  ctx.responseFlags: "= ctx.responseFlags + ['UO']"
+                  ctx.responseCodeDetails: "upstream_reset_before_response_started{overflow}"
+              - fail:
+                  code: upstream_overflow
+                  status: 503
+                  message: "= 'upstream connect error or disconnect/reset before headers. ' + vars.retried + 'reset reason: overflow'"
+                  headers: {content-type: text/plain, x-envoy-overloaded: "true"}
+          - title: Reset before headers
+            detail: A connection failure sets UF, a remote reset UR; the 503 body names the latest reset reason.
+            source: "source/common/router/router.cc:1543-1612"
+            set:
+              ctx.responseFlags: "= ctx.responseFlags + [error.code == 'connect_failure' ? 'UF' : 'UR']"
+              ctx.responseCodeDetails: "= 'upstream_reset_before_response_started{' + (error.data.reason + (error.data.transport != '' ? '|' + error.data.transport : '')).replace(' ', '_') + '}'"
+          - fail:
+              code: upstream_reset
+              status: 503
+              message: "= 'upstream connect error or disconnect/reset before headers. ' + vars.retried + 'reset reason: ' + error.data.reason + (error.data.transport != '' ? ', transport failure reason: ' + error.data.transport : '')"
+              headers: {content-type: text/plain}
+      - title: Forward the upstream response
+        detail: The router adds x-envoy-upstream-service-time, measured from the end of the downstream request to the upstream headers.
+        source: "source/common/router/router.cc:1813-1825"
+        set:
+          vars.headers: {x-envoy-upstream-service-time: "= string(vars.upstream.duration_ms)"}
+      - if: "vars.upstream.value.status >= 400"
+        then:
+          - fail:
+              code: upstream_response
+              status: "= vars.upstream.value.status"
+              message: "= vars.upstream.value.body"
+              headers: "= vars.headers"
+      - return:
+          status: "= vars.upstream.value.status"
+          headers: "= vars.headers"
+          body: "= vars.upstream.value.body"
+
+  - component: upstream-request
+    name: send
+    kind: function
+    summary: One attempt against one host.
+    sources: ["source/common/router/router.cc:676-740", "source/common/router/router.cc:2166-2236"]
+    request:
+      type: object
+      properties:
+        cluster: {type: string}
+        per_try_timeout_ms: {type: integer}
+    response: {type: object, properties: {status: {type: integer}, body: {type: string}}}
+    errors:
+      - {code: overflow, status: 503}
+      - {code: connect_failure, status: 503}
+      - {code: remote_reset, status: 503}
+      - {code: per_try_timeout, status: 504}
+      - {code: upstream_timeout, status: 504}
+      - {code: upstream_response, status: 503}
+    behavior:
+      - if: "now >= ctx.deadlineAt"
+        then:
+          - title: Route timeout during back-off
+            detail: The global timer fired while the retry was waiting; no attempt is made.
+            source: "source/common/router/router.cc:1230-1273"
+            set: {ctx.retryStatus: "no"}
+          - fail: {code: upstream_timeout, status: 504}
+      - call: cluster-manager.choose-host
+        input: {cluster: "= input.cluster"}
+        as: host
+      - set:
+          ctx.attempts: "= ctx.attempts + 1"
+          ctx.upstreamHost: "= vars.host.value.address"
+          ctx.hostsTried: "= ctx.hostsTried + [vars.host.value.host]"
+      - call: conn-pool.new-stream
+        input: {host: "= vars.host.value.host"}
+        on_error:
+          - call: retry-state.should-retry
+            input: {kind: reset, reason: overflow}
+          - fail: {code: overflow, status: 503, data: {reason: overflow}}
+      - title: Send to the host
+        detail: The per-try timeout, when set, bounds this attempt; the route timeout, armed when the request completed, bounds every attempt together.
+        source: "source/common/router/upstream_request.cc:516-523"
+        call: "= input.cluster + '-host.handle'"
+        targets: [backend-host.handle, canary-host.handle]
+        on: "= vars.host.value.host"
+        timeout_ms: "= input.per_try_timeout_ms > 0 && input.per_try_timeout_ms < ctx.deadlineAt - now ? input.per_try_timeout_ms : ctx.deadlineAt - now"
+        as: resp
+        on_error: continue
+      - call: conn-pool.release-stream
+      - if: "!vars.resp.ok && vars.resp.error.code == 'timeout' && now >= ctx.deadlineAt"
+        then:
+          - title: Route timeout
+            detail: The global timeout fired; it is recorded as a local-origin timeout and never retried.
+            source: "source/common/router/router.cc:1230-1273"
+            call: outlier-detector.put-result
+            input: {cluster: "= input.cluster", host: "= vars.host.value.host", code: 504}
+          - call: retry-state.reset
+          - set: {ctx.retryStatus: "no"}
+          - fail: {code: upstream_timeout, status: 504}
+      - if: "!vars.resp.ok && vars.resp.error.code == 'timeout'"
+        then:
+          - title: Per-try timeout
+            detail: The attempt is reset locally, recorded as a timeout, and offered to the retry state as a local reset.
+            source: "source/common/router/router.cc:1325-1352"
+            call: outlier-detector.put-result
+            input: {cluster: "= input.cluster", host: "= vars.host.value.host", code: 504}
+          - call: retry-state.should-retry
+            input: {kind: reset, reason: local reset}
+          - fail: {code: per_try_timeout, status: 504, data: {reason: local reset}}
+      - if: "!vars.resp.ok && (vars.resp.error.code == 'unavailable' || vars.resp.error.code == 'reset')"
+        then:
+          - title: Connection failure or reset
+            detail: A refused connection is a pool failure (remote connection failure) whose transport reason is the connect errno; a reset is a remote reset. Both count as a connect failure, a 503, for outlier detection.
+            source: "source/common/network/connection_impl.cc:822-826"
+            set:
+              vars.reason: "= vars.resp.error.code == 'unavailable' ? 'remote connection failure' : 'remote reset'"
+              vars.transport: "= vars.resp.error.code == 'unavailable' ? 'delayed connect error: Connection refused' : ''"
+          - call: outlier-detector.put-result
+            input: {cluster: "= input.cluster", host: "= vars.host.value.host", code: 503}
+          - call: retry-state.should-retry
+            input: {kind: reset, reason: "= vars.reason"}
+          - fail:
+              code: "= vars.resp.error.code == 'unavailable' ? 'connect_failure' : 'remote_reset'"
+              status: 503
+              data: {reason: "= vars.reason", transport: "= vars.transport"}
+      - title: Response headers
+        detail: The status goes to outlier detection, then to the retry state.
+        source: "source/common/router/router.cc:1724-1784"
+        set:
+          vars.status: "= vars.resp.ok ? vars.resp.value.status : vars.resp.error.status"
+          vars.body: "= vars.resp.ok ? vars.resp.value.body : vars.resp.error.message"
+      - call: outlier-detector.put-result
+        input: {cluster: "= input.cluster", host: "= vars.host.value.host", code: "= vars.status"}
+      - call: retry-state.should-retry
+        input: {kind: headers, status: "= vars.status"}
+      - if: "ctx.retryStatus == 'yes'"
+        then:
+          - fail: {code: upstream_response, status: "= vars.status", message: "= vars.body"}
+      - return: {status: "= vars.status", body: "= vars.body"}
+
+  - component: retry-state
+    name: should-retry
+    kind: function
+    summary: shouldRetryHeaders and shouldRetryReset. Sets ctx.retryStatus to yes, no, limit_exceeded or overflow.
+    sources: ["source/common/router/retry_state_impl.cc:269-334"]
+    request:
+      type: object
+      properties:
+        kind: {type: string, enum: [headers, reset]}
+        status: {type: integer}
+        reason: {type: string}
+    behavior:
+      - call: circuit-breakers.release
+        when: "ctx.retryArmed"
+        input: {resource: retries}
+      - set: {ctx.retryArmed: false}
+      - if: "!ctx.hasRetryPolicy"
+        then:
+          - set: {ctx.retryStatus: "no"}
+          - return: {status: "no"}
+      - title: Would this be retried?
+        detail: A status retries under 5xx, gateway-error or a listed retriable status code. An overflow reset never retries; a connection failure retries under connect-failure, and any other reset under reset, 5xx or gateway-error.
+        source: "source/common/router/retry_state_impl.cc:383-519"
+        set:
+          vars.would: >-
+            = input.kind == 'headers'
+              ? (('5xx' in ctx.retryOn && input.status >= 500) ||
+                 ('gateway-error' in ctx.retryOn && input.status in [502, 503, 504]) ||
+                 ('retriable-status-codes' in ctx.retryOn && input.status in ctx.retriableStatusCodes))
+              : (input.reason != 'overflow' &&
+                 ((input.reason == 'remote connection failure' && 'connect-failure' in ctx.retryOn) ||
+                  'reset' in ctx.retryOn || '5xx' in ctx.retryOn || 'gateway-error' in ctx.retryOn))
+      - if: "!vars.would"
+        then:
+          - set: {ctx.retryStatus: "no"}
+          - return: {status: "no"}
+      - if: "ctx.retriesRemaining == 0"
+        then:
+          - title: Retries exhausted
+            detail: The policy's retries are spent; the response or reset goes downstream with URX.
+            source: "source/common/router/retry_state_impl.cc:289-299"
+            set:
+              ctx.retryStatus: limit_exceeded
+              ctx.responseFlags: "= ctx.responseFlags + ['URX']"
+          - return: {status: limit_exceeded}
+      - set: {ctx.retriesRemaining: "= ctx.retriesRemaining - 1"}
+      - call: circuit-breakers.try-acquire
+        input: {resource: retries}
+        as: budget
+      - if: "!vars.budget.value.granted"
+        then:
+          - title: Retry circuit breaker open
+            detail: The cluster already has max_retries retries outstanding; this one is not attempted and the stream gets UO.
+            source: "source/common/router/retry_state_impl.cc:304-313"
+            set:
+              ctx.retryStatus: overflow
+              ctx.responseFlags: "= ctx.responseFlags + ['UO']"
+          - return: {status: overflow}
+      - set: {ctx.retryStatus: "yes", ctx.retryArmed: true}
+      - return: {status: "yes"}
+
+  - component: retry-state
+    name: reset
+    kind: function
+    summary: Gives back the retry circuit-breaker slot held by an armed retry.
+    sources: ["source/common/router/retry_state_impl.cc:257-266"]
+    behavior:
+      - call: circuit-breakers.release
+        when: "ctx.retryArmed"
+        input: {resource: retries}
+      - set: {ctx.retryArmed: false}
+      - return: {released: true}
+
+  - component: cluster-manager
+    name: choose-host
+    kind: function
+    summary: The thread-local cluster's healthy hosts, or all of them in panic, handed to the load balancer.
+    sources: ["source/extensions/load_balancing_policies/common/load_balancer_impl.cc:795-813"]
+    request: {type: object, properties: {cluster: {type: string}}}
+    behavior:
+      - set:
+          vars.hosts: "= state.clusters[input.cluster].hosts"
+          vars.healthy: "= state.clusters[input.cluster].hosts.filter(h, !(h in state.ejected))"
+      - title: Healthy hosts, unless in panic
+        detail: Below the healthy panic threshold (50%) the load balancer uses every host.
+        source: "source/extensions/load_balancing_policies/common/load_balancer_impl.cc:636-649"
+        set:
+          vars.pool: "= size(vars.healthy) * 100 < config['healthy-panic-threshold'] * size(vars.hosts) ? vars.hosts : vars.healthy"
+      - call: load-balancer.pick
+        input: {cluster: "= input.cluster", hosts: "= vars.pool"}
+        as: pick
+      - return: {host: "= vars.pick.value.host", address: "= state.addresses[vars.pick.value.host]"}
+
+  - component: cluster-manager
+    name: eject-host
+    kind: event
+    summary: The main thread marks the host FAILED_OUTLIER_CHECK and pushes the new host set to the workers.
+    sources: ["source/common/upstream/outlier_detection_impl.cc:51-57"]
+    request: {type: object, properties: {host: {type: string}}}
+    behavior:
+      - set: {state.ejected: "= state.ejected + [input.host]"}
+
+  - component: load-balancer
+    name: pick
+    kind: function
+    summary: Round robin over the given hosts from a per-source index seeded at random.
+    sources: ["source/extensions/load_balancing_policies/round_robin/round_robin_lb.h:69-79"]
+    request: {type: object, properties: {cluster: {type: string}, hosts: {type: array, items: {type: string}}}}
+    behavior:
+      - if: "!(input.cluster in state.rr)"
+        then:
+          - title: Seed the index
+            detail: The index starts at the load balancer's random seed, so the first host differs between workers and restarts.
+            source: "source/extensions/load_balancing_policies/common/load_balancer_impl.cc:915"
+            choice: seed
+            default: "0"
+            options:
+              "0":
+                - set: {vars.seed: 0}
+              "1":
+                - set: {vars.seed: 1}
+              "2":
+                - set: {vars.seed: 2}
+          - set: {state.rr: "= merge(state.rr, {input.cluster: vars.seed})"}
+      - set:
+          vars.index: "= state.rr[input.cluster]"
+      - set:
+          state.rr: "= merge(state.rr, {input.cluster: vars.index + 1})"
+          ctx.lbIndex: "= vars.index"
+      - return: {host: "= input.hosts[vars.index % size(input.hosts)]"}
+
+  - component: circuit-breakers
+    name: try-acquire
+    kind: function
+    summary: canCreate, then inc, for one resource.
+    sources: ["source/common/common/basic_resource_impl.h:29-31"]
+    request: {type: object, properties: {resource: {type: string, enum: [connections, pending, requests, retries]}}}
+    behavior:
+      - set:
+          vars.current: "= input.resource == 'connections' ? state.connections : input.resource == 'pending' ? state.pending : input.resource == 'requests' ? state.requests : state.retries"
+          vars.max: "= config['cb-max-' + input.resource]"
+      - if: "vars.current >= vars.max"
+        then:
+          - set: {ctx.circuitOpen: "= input.resource"}
+          - return: {granted: false, resource: "= input.resource", current: "= vars.current", max: "= vars.max"}
+      - set:
+          state.connections: "= input.resource == 'connections' ? state.connections + 1 : state.connections"
+          state.pending: "= input.resource == 'pending' ? state.pending + 1 : state.pending"
+          state.requests: "= input.resource == 'requests' ? state.requests + 1 : state.requests"
+          state.retries: "= input.resource == 'retries' ? state.retries + 1 : state.retries"
+      - return: {granted: true, resource: "= input.resource"}
+
+  - component: circuit-breakers
+    name: release
+    kind: function
+    summary: dec for one resource.
+    sources: ["source/common/common/basic_resource_impl.h:33-38"]
+    request: {type: object, properties: {resource: {type: string}}}
+    behavior:
+      - set:
+          state.connections: "= input.resource == 'connections' && state.connections > 0 ? state.connections - 1 : state.connections"
+          state.pending: "= input.resource == 'pending' && state.pending > 0 ? state.pending - 1 : state.pending"
+          state.requests: "= input.resource == 'requests' && state.requests > 0 ? state.requests - 1 : state.requests"
+          state.retries: "= input.resource == 'retries' && state.retries > 0 ? state.retries - 1 : state.retries"
+      - return: {released: "= input.resource"}
+
+  - component: conn-pool
+    name: new-stream
+    kind: function
+    summary: A stream on a ready connection, or a pending stream and a new connection, each gated by a circuit breaker.
+    sources: ["source/common/conn_pool/conn_pool_base.cc:320-360"]
+    request: {type: object, properties: {host: {type: string}}}
+    errors: [{code: overflow, status: 503}]
+    behavior:
+      - if: "state.ready_clients[input.host] == 0"
+        then:
+          - title: Queue a pending stream
+            detail: No connection is ready, so the stream waits for one, under max_pending_requests.
+            source: "source/common/conn_pool/conn_pool_base.cc:347-353"
+            call: circuit-breakers.try-acquire
+            input: {resource: pending}
+            as: pending
+          - if: "!vars.pending.value.granted"
+            then:
+              - fail: {code: overflow, status: 503, message: max pending streams overflow}
+          - title: Connect
+            detail: A host with no connections always gets one, even at max_connections.
+            source: "source/common/conn_pool/conn_pool_base.cc:198-206"
+            call: circuit-breakers.try-acquire
+            input: {resource: connections}
+          - wait: 1
+          - call: circuit-breakers.release
+            input: {resource: pending}
+      - title: Attach the stream
+        detail: Attaching a stream to a connection needs a slot under max_requests.
+        source: "source/common/conn_pool/conn_pool_base.cc:240-245"
+        call: circuit-breakers.try-acquire
+        input: {resource: requests}
+        as: req
+      - if: "!vars.req.value.granted"
+        then:
+          - fail: {code: overflow, status: 503, message: max streams overflow}
+      - return: {connection: "= state.ready_clients[input.host] == 0 ? 'new' : 'ready'"}
+
+  - component: conn-pool
+    name: release-stream
+    kind: function
+    summary: The stream ends and its request slot is freed.
+    sources: ["source/common/conn_pool/conn_pool_base.cc:278-288"]
+    behavior:
+      - call: circuit-breakers.release
+        input: {resource: requests}
+      - return: {released: true}
+
+  - component: outlier-detector
+    name: put-result
+    kind: function
+    summary: putHttpResponseCode. A 5xx adds to the host's consecutive count; anything else resets it.
+    sources: ["source/common/upstream/outlier_detection_impl.cc:68-95"]
+    request:
+      type: object
+      properties:
+        cluster: {type: string}
+        host: {type: string}
+        code: {type: integer}
+    behavior:
+      - if: "!(input.cluster in state.clusters)"
+        then:
+          - return: {tracked: false}
+      - if: "input.code < 500"
+        then:
+          - if: "state.consecutive_5xx[input.host] != 0"
+            then:
+              - set: {state.consecutive_5xx: "= merge(state.consecutive_5xx, {input.host: 0})"}
+          - return: {tracked: true, consecutive_5xx: 0}
+      - set: {vars.n: "= state.consecutive_5xx[input.host] + 1"}
+      - if: "vars.n < config['outlier-consecutive-5xx']"
+        then:
+          - set: {state.consecutive_5xx: "= merge(state.consecutive_5xx, {input.host: vars.n})"}
+          - return: {tracked: true, consecutive_5xx: "= vars.n"}
+      - title: Consecutive 5xx threshold
+        detail: The host is ejected only if one more ejection stays within max_ejection_percent; the count resets either way.
+        source: "source/common/upstream/outlier_detection_impl.cc:476-487"
+        set:
+          vars.percent: "= 100 * (state.ejections_active + 1) / size(state.consecutive_5xx)"
+          state.consecutive_5xx: "= merge(state.consecutive_5xx, {input.host: 0})"
+      - if: "vars.percent <= config['outlier-max-ejection-percent'] && config['outlier-enforcing-consecutive-5xx'] >= 100"
+        then:
+          - title: Eject the host
+            detail: The worker posts the ejection to the main thread, which updates the host set for later requests.
+            source: "source/common/upstream/outlier_detection_impl.cc:574-605"
+            set:
+              state.ejections_active: "= state.ejections_active + 1"
+              ctx.ejected: "= input.host"
+          - emit: cluster-manager.eject-host
+            input: {host: "= input.host"}
+          - return: {tracked: true, ejected: true}
+      - return: {tracked: true, ejected: false}
+
+  - component: access-log
+    name: log
+    kind: queue
+    summary: One access log line.
+    sources: ["source/common/formatter/http_formatter_context.cc:45-49"]
+    request: AccessLogEntry
+    behavior:
+      - title: Write the line
+        detail: The default format carries the response code, flags, upstream service time and upstream host.
+        set:
+          state.last: "= input"
+          state.count: "= state.count + 1"
+
+  - component: backend-host
+    name: handle
+    kind: http
+    summary: The application. A stub; responses come from its schema.
+    attributes: {method: GET, path: /api/*}
+    response: UpstreamResponse
+    latency_ms: {min: 8, max: 30}
+
+  - component: canary-host
+    name: handle
+    kind: http
+    summary: The canary build of the application. A stub.
+    attributes: {method: GET, path: /api/*}
+    response: UpstreamResponse
+    latency_ms: {min: 8, max: 30}
+
+flows:
+  - id: downstream-request
+    name: Downstream HTTP request
+    description: One HTTP/1.1 request from a client on a private network, through the listener, connection manager, filters and router to an upstream host and back.
+    sources: ["source/common/http/conn_manager_impl.cc:1288-1535"]
+    entry:
+      caller: downstream-client
+      interface: listener.accept
+      input:
+        source_ip: 10.0.3.17
+        method: GET
+        scheme: http
+        authority: api.example.com
+        path: /api/orders
+        header_bytes: 612
+    tags: [http]
+
+scenarios:
+  - id: happy-path
+    flow: downstream-request
+    name: Routed to the first host
+    fixtures: [three-hosts]
+    state:
+      outlier-detector: {consecutive_5xx: {h1: 2}}
+    expect:
+      - "result.ok && result.value.status == 200"
+      - "result.value.headers['server'] == 'envoy' && 'x-envoy-upstream-service-time' in result.value.headers"
+      - "calls_by_instance['backend-host.handle@h1'] == 1 && retries == 0"
+      - "state['access-log'].last.response_flags == '-' && state['access-log'].last.upstream_host == '10.1.0.11:8080'"
+      - "state['load-balancer'].rr.backend == 1 && state['circuit-breakers'].requests == 0"
+      - "state['outlier-detector'].consecutive_5xx.h1 == 0"
+
+  - id: lb-seed-starts-at-h2
+    flow: downstream-request
+    name: "Load balancer: the random seed starts at h2"
+    fixtures: [three-hosts]
+    choices: {load-balancer.pick.seed: "1"}
+    expect:
+      - "result.ok && result.value.status == 200"
+      - "calls_by_instance['backend-host.handle@h2'] == 1 && calls_by_instance['backend-host.handle@h1'] == 0"
+      - "state['load-balancer'].rr.backend == 2"
+      - "state['access-log'].last.upstream_host == '10.1.0.12:8080'"
+
+  - id: canary-by-header
+    flow: downstream-request
+    name: "x-canary: true routes to the canary cluster"
+    fixtures: [three-hosts]
+    input: {headers: {x-canary: "true"}}
+    expect:
+      - "result.ok && result.value.status == 200"
+      - "calls['canary-host.handle'] == 1 && calls['backend-host.handle'] == 0"
+      - "ctx.route == 'api-canary' && state['load-balancer'].rr.canary == 1"
+      - "state['access-log'].last.upstream_host == '10.1.9.21:8080'"
+
+  - id: no-virtual-host
+    flow: downstream-request
+    name: "Unknown authority: 404 NR"
+    fixtures: [three-hosts]
+    input: {authority: shop.example.org}
+    expect:
+      - "!result.ok && result.error.status == 404 && result.error.message == ''"
+      - "ctx.virtualHost == 'none' && calls['upstream-request.send'] == 0"
+      - "state['access-log'].last.response_flags == 'NR' && state['access-log'].last.response_code_details == 'route_not_found'"
+
+  - id: no-route
+    flow: downstream-request
+    name: "No route for the path: 404 NR"
+    fixtures: [three-hosts]
+    input: {path: /metrics}
+    expect:
+      - "!result.ok && result.error.status == 404"
+      - "ctx.virtualHost == 'api' && ctx.route == 'none' && calls['upstream-request.send'] == 0"
+      - "state['access-log'].last.response_flags == 'NR'"
+
+  - id: direct-response-healthz
+    flow: downstream-request
+    name: "/healthz answered by a direct response"
+    fixtures: [three-hosts]
+    input: {path: /healthz}
+    expect:
+      - "result.ok && result.value.status == 200 && result.value.body == 'ok'"
+      - "calls['upstream-request.send'] == 0"
+      - "state['access-log'].last.response_code_details == 'direct_response' && state['access-log'].last.upstream_host == '-'"
+
+  - id: https-redirect
+    flow: downstream-request
+    name: "/account/ redirected to https with 301"
+    fixtures: [three-hosts]
+    input: {path: /account/settings}
+    expect:
+      - "result.ok && result.value.status == 301"
+      - "result.value.headers['location'] == 'https://api.example.com/account/settings'"
+      - "calls['upstream-request.send'] == 0 && state['access-log'].last.response_code == 301"
+
+  - id: no-filter-chain
+    flow: downstream-request
+    name: "Public source address: no filter chain, connection closed"
+    fixtures: [three-hosts]
+    input: {source_ip: 203.0.113.7}
+    expect:
+      - "!result.ok && result.error.code == 'connection_closed'"
+      - "calls['http-connection-manager.on-request'] == 0"
+      - "state['access-log'].last.response_flags == 'NR' && state['access-log'].last.response_code_details == 'filter_chain_not_found'"
+
+  - id: headers-too-large
+    flow: downstream-request
+    name: "70 KiB of request headers: 431 DPE"
+    fixtures: [three-hosts]
+    input: {header_bytes: 71680}
+    expect:
+      - "!result.ok && result.error.status == 431"
+      - "calls['route-matcher.route'] == 0 && calls['local-ratelimit.decode-headers'] == 0"
+      - "state['access-log'].last.response_flags == 'DPE' && state['access-log'].last.response_code_details == 'http1.headers_too_large'"
+
+  - id: local-rate-limited
+    flow: downstream-request
+    name: "Token bucket empty: 429 RL"
+    fixtures: [three-hosts]
+    limiters:
+      local-ratelimit.token_bucket:
+        "": {tokens: 0, updated_ms: 0}
+    expect:
+      - "!result.ok && result.error.status == 429 && result.error.message == 'local_rate_limited'"
+      - "calls['rbac.decode-headers'] == 0 && calls['upstream-request.send'] == 0"
+      - "state['access-log'].last.response_flags == 'RL'"
+
+  - id: rbac-denied
+    flow: downstream-request
+    name: "/admin/ denied by RBAC: 403"
+    fixtures: [three-hosts]
+    input: {path: /admin/users}
+    expect:
+      - "!result.ok && result.error.status == 403 && result.error.message == 'RBAC: access denied'"
+      - "calls['router.decode-headers'] == 0"
+      - "state['access-log'].last.response_code_details == 'rbac_access_denied_matched_policy[deny-admin]' && state['access-log'].last.response_flags == '-'"
+
+  - id: pending-overflow
+    flow: downstream-request
+    name: "Pending requests at max: 503 UO with x-envoy-overloaded"
+    fixtures: [three-hosts]
+    state:
+      circuit-breakers: {pending: 1024}
+      conn-pool: {ready_clients: {h1: 0, h2: 0, h3: 0, c1: 0}}
+    expect:
+      - "!result.ok && result.error.status == 503 && result.error.headers['x-envoy-overloaded'] == 'true'"
+      - "result.error.message == 'upstream connect error or disconnect/reset before headers. reset reason: overflow'"
+      - "calls['backend-host.handle'] == 0 && retries == 0"
+      - "state['access-log'].last.response_flags == 'UO' && state['outlier-detector'].consecutive_5xx.h1 == 0"
+
+  - id: ejected-host-skipped
+    flow: downstream-request
+    name: "h1 ejected by outlier detection: skipped"
+    fixtures: [three-hosts]
+    state:
+      cluster-manager: {ejected: [h1]}
+    expect:
+      - "result.ok && result.value.status == 200"
+      - "calls_by_instance['backend-host.handle@h1'] == 0 && calls_by_instance['backend-host.handle@h2'] == 1"
+      - "state['access-log'].last.upstream_host == '10.1.0.12:8080' && state['load-balancer'].rr.backend == 1"
+
+  - id: upstream-503-retried
+    flow: downstream-request
+    name: "h1 answers 503: retried on h2"
+    fixtures: [three-hosts]
+    faults:
+      - {target: backend-host.handle, type: error, code: service_unavailable, status: 503, instance: h1}
+    expect:
+      - "result.ok && result.value.status == 200 && retries == 1"
+      - "calls_by_instance['backend-host.handle@h1'] == 1 && calls_by_instance['backend-host.handle@h2'] == 1"
+      - "state['outlier-detector'].consecutive_5xx.h1 == 1 && state['circuit-breakers'].retries == 0"
+      - "state['access-log'].last.response_flags == '-' && state['access-log'].last.upstream_host == '10.1.0.12:8080'"
+
+  - id: upstream-500-not-retried
+    flow: downstream-request
+    name: "h1 answers 500: not a retriable status, passed through"
+    fixtures: [three-hosts]
+    faults:
+      - {target: backend-host.handle, type: error, code: internal_error, status: 500, message: internal error, instance: h1}
+    expect:
+      - "!result.ok && result.error.status == 500 && retries == 0"
+      - "'x-envoy-upstream-service-time' in result.error.headers"
+      - "state['outlier-detector'].consecutive_5xx.h1 == 1 && state['access-log'].last.response_flags == '-'"
+
+  - id: retries-exhausted
+    flow: downstream-request
+    name: "Every host answers 503: num_retries 1 spent, 503 URX"
+    fixtures: [three-hosts]
+    faults:
+      - {target: backend-host.handle, type: error, code: service_unavailable, status: 503, message: no healthy backend}
+    expect:
+      - "!result.ok && result.error.status == 503 && retries == 1"
+      - "calls['backend-host.handle'] == 2 && calls_by_instance['backend-host.handle@h3'] == 0"
+      - "state['access-log'].last.response_flags == 'URX' && state['access-log'].last.upstream_host == '10.1.0.12:8080'"
+      - "state['circuit-breakers'].retries == 0 && state['circuit-breakers'].requests == 0"
+
+  - id: retry-overflow
+    flow: downstream-request
+    name: "Retry circuit breaker at max_retries: 503 UO, not retried"
+    fixtures: [three-hosts]
+    state:
+      circuit-breakers: {retries: 3}
+    faults:
+      - {target: backend-host.handle, type: error, code: service_unavailable, status: 503, instance: h1}
+    expect:
+      - "!result.ok && result.error.status == 503 && retries == 0"
+      - "calls_by_instance['backend-host.handle@h2'] == 0"
+      - "state['access-log'].last.response_flags == 'UO' && state['circuit-breakers'].retries == 3"
+
+  - id: per-try-timeout-retried
+    flow: downstream-request
+    name: "h1 hangs: per-try timeout after 2 s, retried on h2"
+    fixtures: [three-hosts]
+    faults:
+      - {target: backend-host.handle, type: timeout, instance: h1}
+    expect:
+      - "result.ok && result.value.status == 200 && retries == 1"
+      - "duration_ms >= 2000 && duration_ms < 3000"
+      - "state['outlier-detector'].consecutive_5xx.h1 == 1 && state['access-log'].last.upstream_host == '10.1.0.12:8080'"
+
+  - id: canary-timeout
+    flow: downstream-request
+    name: "Canary hangs: the 15 s route timeout gives 504 UT"
+    fixtures: [three-hosts]
+    input: {headers: {x-canary: "true"}}
+    faults:
+      - {target: canary-host.handle, type: timeout}
+    expect:
+      - "!result.ok && result.error.status == 504 && result.error.message == 'upstream request timeout'"
+      - "duration_ms >= 15000 && retries == 0"
+      - "state['access-log'].last.response_flags == 'UT' && state['access-log'].last.response_code_details == 'upstream_response_timeout'"
+
+  - id: upstream-reset-retried
+    flow: downstream-request
+    name: "h1 resets the stream: retried on h2"
+    fixtures: [three-hosts]
+    faults:
+      - {target: backend-host.handle, type: error, code: reset, instance: h1}
+    expect:
+      - "result.ok && result.value.status == 200 && retries == 1"
+      - "state['outlier-detector'].consecutive_5xx.h1 == 1 && state['access-log'].last.response_flags == '-'"
+
+  - id: connect-failure-exhausted
+    flow: downstream-request
+    name: "Every host refuses connections: 503 URX,UF"
+    fixtures: [three-hosts]
+    state:
+      conn-pool: {ready_clients: {h1: 0, h2: 0, h3: 0, c1: 0}}
+    faults:
+      - {target: backend-host.handle, type: unavailable}
+    expect:
+      - "!result.ok && result.error.status == 503 && retries == 1"
+      - "result.error.message == 'upstream connect error or disconnect/reset before headers. retried and the latest reset reason: remote connection failure, transport failure reason: delayed connect error: Connection refused'"
+      - "state['access-log'].last.response_flags == 'URX,UF'"
+      - "state['access-log'].last.response_code_details == 'upstream_reset_before_response_started{remote_connection_failure|delayed_connect_error:_Connection_refused}'"
+      - "state['outlier-detector'].consecutive_5xx.h1 == 1 && state['outlier-detector'].consecutive_5xx.h2 == 1"
+
+  - id: outlier-ejects-h1
+    flow: downstream-request
+    name: "h1's fifth consecutive 5xx ejects it; the retry lands on h2"
+    fixtures: [three-hosts]
+    state:
+      outlier-detector: {consecutive_5xx: {h1: 4}}
+    faults:
+      - {target: backend-host.handle, type: error, code: service_unavailable, status: 503, instance: h1}
+    expect:
+      - "result.ok && result.value.status == 200 && retries == 1"
+      - "ctx.ejected == 'h1' && state['outlier-detector'].ejections_active == 1"
+      - "state['outlier-detector'].consecutive_5xx.h1 == 0 && state['cluster-manager'].ejected == ['h1']"

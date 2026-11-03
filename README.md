@@ -51,26 +51,44 @@ To do it without the script, from a clone:
 go install ./cmd/mosaic ./cmd/mosaicd
 ```
 
-The repository is private, so installing straight from GitHub needs Go to fetch it with your git
-credentials:
+Or install straight from GitHub:
 
 ```sh
-GOPRIVATE=github.com/xleelz/mosaic go install github.com/xleelz/mosaic/cmd/mosaic@latest github.com/xleelz/mosaic/cmd/mosaicd@latest
+go install github.com/xleelz/mosaic/cmd/mosaic@latest github.com/xleelz/mosaic/cmd/mosaicd@latest
 ```
+
+### Model your own repo
+
+The preferred way to model a repository is with Claude, using the skills in
+[.claude/skills](.claude/skills). Claude Code, or any Claude agent that loads them, picks them up
+when started in this repository:
+
+- `mosaic-generate` drives the whole multi-agent pipeline for a large repository: inventory,
+  skeleton and contracts, fixtures, fan-out to area agents, reconciliation, a test oracle from the
+  repository's own tests, and blind judging. Its runbook is [docs/PIPELINE.md](docs/PIPELINE.md).
+- `mosaic-ontology` and `mosaic-simulation` cover a small system, or hand edits to a model:
+  components, interfaces, behaviors, scenarios and simulation runs.
+
+With `mosaicd` running, start `claude` in a mosaic checkout and ask, for example, "Use the
+mosaic-generate skill to build an ontology of ~/src/<repo>", or, for a small project, "model this
+service with mosaic". Writing the YAML by hand and applying it with `-f`, as in Run below, is the
+manual path, for small models and edits.
 
 ### Run
 
-The commands below use `./bin/`. If you installed with `--go-install`, drop the `./bin/`.
+The commands below assume `mosaic` and `mosaicd` are on your `PATH`: install them with
+`scripts/install.sh --go-install` or `go install`, and add Go's bin folder to `PATH` as shown above.
 
 ```sh
-./bin/mosaicd --data-dir ~/.mosaic &          # supervises its own dolt sql-server, on 127.0.0.1:7878
+mosaicd --data-dir ~/.mosaic &          # supervises its own dolt sql-server, on 127.0.0.1:7878
 
-./bin/mosaic ontology create gateway-demo --name "Inference gateway"
-./bin/mosaic apply gateway-demo -f internal/testdata/gateway/ontology.yaml -m "Model the gateway"
-./bin/mosaic test gateway-demo          # runs all 14 scenarios' expectations
-./bin/mosaic sim run gateway-demo --scenario retry-before-commit --format summary
-./bin/mosaic sim run gateway-demo --flow chat-stream \
-    --fault upstream-a.chat:timeout --state ledger.free=1 --format summary
+mosaic ontology create envoy-demo --name "Envoy proxy"
+mosaic apply envoy-demo -f examples/envoy/ontology.yaml -m "Model Envoy 1.36.2"
+mosaic test envoy-demo                  # runs all 22 scenarios' expectations
+mosaic sim run envoy-demo --scenario upstream-503-retried --format summary
+# h1 hangs past the 2 s per-try timeout and the retry circuit breaker is full: 504, flags UO,UT
+mosaic sim run envoy-demo --flow downstream-request --fixture three-hosts \
+    --fault backend-host.handle:timeout --state circuit-breakers.retries=3 --format summary
 ```
 
 Then start the web UI against the running `mosaicd`, and open http://localhost:3000:
@@ -84,15 +102,30 @@ or set `NEXT_PUBLIC_MOSAIC_FIXTURES=1` to use fixtures generated from the engine
 
 ## The example
 
-[internal/testdata/gateway](internal/testdata/gateway/ontology.yaml) models a synthetic LLM
-inference gateway: admission, routing and retries. It has 20 components, 20 interfaces, one flow
-(`chat-stream`) and 14 scenarios whose expectations pass. Each outcome is driven by a different
-mechanism:
+[examples/envoy](examples/envoy/ontology.yaml) models one downstream HTTP request through the
+[Envoy](https://github.com/envoyproxy/envoy) proxy at v1.36.2: the listener's filter chain match,
+the HTTP connection manager and its header size limit, the local rate limit and RBAC filters, the
+route table (virtual host, then route, with a direct response and a redirect), and the router
+filter's timeouts and retry policy, over a round-robin cluster with circuit breakers and outlier
+detection. Each claim cites the Envoy source line it comes from, and every default the
+configuration leaves out (the 15 s route timeout, `num_retries` 1, circuit breakers at 1024, 1024,
+1024 and 3) is a config entity with its citation.
 
-- input data: an unknown key, an oversized prompt;
-- component state: the balance floor, the key budget, free slots;
-- choice points: the rate limit, model policy, a stream breaking after commit;
-- injected faults: the account store down, the slot ledger down, an upstream error or timeout before commit.
+It has 23 components, 23 interfaces, 20 configs, one fixture (`three-hosts`, the upstream hosts
+`h1` to `h3` and `c1` as instances), one flow (`downstream-request`) and 22 scenarios whose
+expectations pass. Each response carries Envoy's codes, `x-envoy-*` headers and access-log response
+flags, and each outcome is driven by a different mechanism:
+
+- input data: a public source address with no filter chain, oversized headers, an unknown host
+  or path (404 `NR`), `/healthz` and `/account/` (a direct response and a redirect), the
+  `x-canary` header route, an RBAC-denied path;
+- component state: an empty token bucket (429 `RL`), pending requests at the circuit-breaker
+  maximum (503 `UO` with `x-envoy-overloaded`), the retry circuit breaker full, an ejected host
+  skipped, a host's fifth consecutive 5xx ejecting it;
+- choice points: the load balancer's random round-robin start;
+- injected faults: an upstream 503 retried on the next host, a 500 passed through, a per-try
+  timeout retried, the canary hanging past the route timeout (504 `UT`), a reset retried, every
+  host answering 503 (`URX`) or refusing connections (`URX,UF`).
 
 ## Development
 

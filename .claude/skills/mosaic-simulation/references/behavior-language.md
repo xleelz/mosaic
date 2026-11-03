@@ -1,7 +1,8 @@
 # Behavior language reference
 
 These are the exact semantics, taken from `internal/model/validate.go` and `internal/sim/sim.go`.
-The examples come from a model of an LLM inference gateway (its test-fixture form is
+The worked example to read alongside it is the Envoy proxy model, `examples/envoy/ontology.yaml`.
+The snippets here come from a model of an LLM inference gateway (its test-fixture form is
 `internal/testdata/gateway/ontology.yaml`) or are verified against the engine.
 
 ## Contents

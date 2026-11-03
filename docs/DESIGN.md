@@ -289,7 +289,8 @@ SIGINT or SIGTERM it stops the child before exiting.
 | `pkg/api`, `pkg/client`, `cmd/mosaic` | Wire types, Go client, CLI |
 | `web/` | Next.js UI (`web/fixtures` has API-shaped fixtures from the engine) |
 | `.claude/skills/` | Agent skills for ontology CRUD and simulation |
-| `internal/testdata/gateway` | A synthetic inference gateway as an ontology, the acceptance fixture |
+| `examples/envoy` | The worked example: one HTTP request through the Envoy proxy (v1.36.2), cited to Envoy's source |
+| `internal/testdata/gateway` | A synthetic inference gateway as an ontology, the test suite's acceptance fixture |
 
 ## 10. Commits and per-commit revisions
 

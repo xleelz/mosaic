@@ -1,6 +1,6 @@
 // Command fixtures writes API-shaped JSON for the example ontologies so the web
 // UI can be developed and tested without a running mosaicd. By default it
-// writes the §11 language demo and the gateway test fixture; -in (repeatable)
+// writes the §11 language demo and the Envoy worked example; -in (repeatable)
 // picks other documents. ontologies.json lists every generated ontology.
 //
 //	go run ./internal/devtools/fixtures -out web/fixtures [-in doc.yaml]...
@@ -27,11 +27,11 @@ func (f *inputs) Set(v string) error { *f = append(*f, v); return nil }
 
 func main() {
 	var in inputs
-	flag.Var(&in, "in", "ontology document; repeatable (default: the language demo and the gateway test fixture)")
+	flag.Var(&in, "in", "ontology document; repeatable (default: the language demo and the Envoy example)")
 	out := flag.String("out", "web/fixtures", "output directory")
 	flag.Parse()
 	if len(in) == 0 {
-		in = inputs{"examples/language-demo/ontology.yaml", "internal/testdata/gateway/ontology.yaml"}
+		in = inputs{"examples/language-demo/ontology.yaml", "examples/envoy/ontology.yaml"}
 	}
 	list := api.OntologyList{Ontologies: []api.OntologySummary{}}
 	for _, path := range in {

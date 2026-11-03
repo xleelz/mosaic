@@ -2,9 +2,10 @@
 
 The goal is a model that is **true to the code at message level** and **useful to simulate**:
 every gate, store, retry and fallback that changes a request's outcome is present, each claim
-cites the line that proves it, and fake data looks like real traffic. The reference model is
-`internal/testdata/gateway/ontology.yaml` (20 components, one flow and 14 scenarios). The snippets
-below come from a fuller model of the same kind of gateway, so some names differ from it.
+cites the line that proves it, and fake data looks like real traffic. The reference model is the
+Envoy proxy, `examples/envoy/ontology.yaml` (23 components, 20 configs, one flow and 22 scenarios,
+every claim cited to Envoy v1.36.2). The first snippet below comes from it; the others come from a
+model of an LLM inference gateway, whose test-fixture form is `internal/testdata/gateway/ontology.yaml`.
 
 ## Contents
 
@@ -40,18 +41,18 @@ Use the hierarchy to mirror how the code is organized, and use leaves for the un
 simulation needs:
 
 ```yaml
-- id: inference-gateway          # the deployable service
+- id: envoy                      # the deployable service
   kind: service
-  layer: inference
-  sources: [gateway/main.go]
-- id: throttle                   # a gate inside it: its own leaf because it can refuse
+  layer: proxy
+  sources: ["source/exe/main.cc"]
+- id: rbac                       # a filter inside it: its own leaf because it can refuse
   kind: module
-  parent: inference-gateway
-  sources: [gateway/throttle.go:274]
-- id: redis-ledger               # a dependency: a separate component so it can be faulted
-  kind: datastore
-  layer: data
-  attributes: {technology: redis}
+  parent: filter-manager
+  sources: ["source/extensions/filters/http/rbac/rbac_filter.cc:196-245"]
+- id: backend-host               # an upstream: a separate component so it can be faulted
+  kind: engine                   # its hosts h1..h3 are instances, from the three-hosts fixture
+  parent: backend
+  layer: upstream-hosts
 ```
 
 Split a unit into its own component when any of these holds:
