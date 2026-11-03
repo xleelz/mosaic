@@ -1,0 +1,45 @@
+schema_version: 1
+id: vllm
+scenarios:
+  - id: bench-x1-tp1-step
+    name: "X1: one engine step on TP 1 (deployed: async scheduling, V2 model runner, uni executor)"
+    description: >
+      Deployed config resolves async_scheduling=True (vllm/config/vllm.py:1585-1644), so the busy loop
+      uses step_with_batch_queue (vllm/v1/engine/core.py:697-800): iteration 1 schedules, launches
+      execute_model and sample_tokens, queues the futures and returns None; iteration 2 schedules the
+      next batch, the queue is full (size 2) so it pops the first batch and calls update_from_output.
+    fixtures: [full-tp1-llama-8b]
+    steps:
+      - interface: async-llm.add-request
+        caller: api-server
+        input: {prompt_token_ids: [128000, 9906, 11, 856, 836, 374], request_id: chatcmpl-x1, sampling_params: {max_tokens: 4, n: 1}}
+        as: add
+      - flow: engine-core-busy-loop
+        input: {iterations: 2}
+        as: loop
+    expect:
+      - "steps.loop.result.ok"
+      # deployed path: step_with_batch_queue on the uni executor, never the sync step
+      - "calls['engine-core.step-with-batch-queue'] == 2 && calls['engine-core.step'] == 0"
+      - "calls['uni-proc-executor.execute-model'] == 2 && calls['multiproc-executor.execute-model'] == 0"
+      # only rank0 runs the worker
+      - "trace.filter(e, e.type == 'call.start' && e.interface == 'gpu-worker-impl.execute-model').all(e, e.instance == 'rank0')"
+      # the order of the first step: schedule -> executor -> worker -> runner prepares inputs -> attention metadata -> forward
+      # (paged KV write + flash attention) -> sample -> update_from_output
+      - >
+        trace.filter(e, e.type == 'call.start' && e.interface in ['scheduler.schedule', 'executor.execute-model',
+        'gpu-worker-impl.execute-model', 'gpu-model-runner.prepare-inputs', 'flash-attention-metadata-builder.build',
+        'llama-for-causal-lm.forward', 'custom-ops.reshape-and-cache-flash', 'flash-attention-impl.forward',
+        'gpu-model-runner.sample-tokens', 'sampler.sample']).map(e, e.interface).slice(0, 10) ==
+        ['scheduler.schedule', 'executor.execute-model', 'gpu-worker-impl.execute-model', 'gpu-model-runner.prepare-inputs',
+         'flash-attention-metadata-builder.build', 'llama-for-causal-lm.forward', 'custom-ops.reshape-and-cache-flash',
+         'flash-attention-impl.forward', 'gpu-model-runner.sample-tokens', 'sampler.sample']
+      # V2 runner: execute_model returns None, so sample_tokens follows on every step (not the V1 runner)
+      - "calls['gpu-model-runner.sample-tokens'] == 2 && calls['gpu-model-runner-v1.execute-model'] == 0"
+      # batch queue: update_from_output runs only once, after the second schedule (queue full)
+      - "calls['scheduler.update-from-output'] == 1"
+      - >
+        trace.filter(e, e.type == 'call.start' && e.interface == 'scheduler.schedule')[1].seq <
+        trace.filter(e, e.type == 'call.start' && e.interface == 'scheduler.update-from-output')[0].seq
+      # the sampled token reached the scheduler's request
+      - "state.scheduler.requests.exists(k, k.startsWith('chatcmpl-x1') && size(state.scheduler.requests[k].output_token_ids) == 1)"

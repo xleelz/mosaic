@@ -1,0 +1,246 @@
+# models-layers fix round: EP/EPLB on the MoE path, ModelOpt (NVFP4) detection, LoRA remove/pin.
+components:
+  - id: model-opt-quant-config-base
+    name: ModelOptQuantConfigBase (ModelOpt FP8 / NVFP4 / MXFP8 / mixed configs)
+    kind: module
+    parent: quantization
+    layer: quantization
+    summary: "ModelOpt checkpoint configs: each class claims a checkpoint whose quant_algo it recognises (override_quantization_method)."
+    sources: ["vllm/model_executor/layers/quantization/modelopt.py:171-180", "vllm/model_executor/layers/quantization/modelopt.py:284-301"]
+  - id: model-opt-linear-method
+    name: ModelOptLinearMethod
+    kind: module
+    parent: quantization
+    layer: quantization
+    summary: "Format-agnostic ModelOpt linear method (FP8, NVFP4, MXFP8, mixed): the kernel is selected from the weight/activation scheme pair."
+    sources: ["vllm/model_executor/layers/quantization/modelopt.py:2523-2540"]
+
+interfaces:
+  # ---------------------------------------------------------------- ModelOpt / NVFP4 detection
+  - component: model-opt-quant-config-base
+    name: override-quantization-method
+    kind: function
+    summary: "The ModelOpt classes' override_quantization_method, in ModelConfig's override order: quant_algo FP8 -> modelopt, NVFP4/FP4 -> modelopt_fp4, MXFP8 -> modelopt_mxfp8, MIXED_PRECISION -> modelopt_mixed; a non-ModelOpt checkpoint gets none."
+    sources:
+      - "vllm/model_executor/layers/quantization/modelopt.py:449-455"
+      - "vllm/model_executor/layers/quantization/modelopt.py:772-778"
+      - "vllm/model_executor/layers/quantization/modelopt.py:1205-1211"
+      - "vllm/model_executor/layers/quantization/modelopt.py:1627-1633"
+    request:
+      type: object
+      required: [hf_quant_cfg]
+      properties:
+        hf_quant_cfg: {type: object}
+    response: {type: object, properties: {quantization: {type: [string, "null"]}, quant_algo: {type: [string, "null"]}}}
+    behavior:
+      - title: _extract_modelopt_quant_algo - only quant_method modelopt*; quant_algo is upper-cased, nested under `quantization` in the hf_quant_config.json layout
+        source: "vllm/model_executor/layers/quantization/modelopt.py:292-301"
+        if: "!has(input.hf_quant_cfg.quant_method) || !input.hf_quant_cfg.quant_method.lowerAscii().startsWith('modelopt')"
+        then:
+          - return: {quantization: null, quant_algo: null}
+      - set:
+          vars.algo: "= (has(input.hf_quant_cfg.quantization) ? (has(input.hf_quant_cfg.quantization.quant_algo) ? string(input.hf_quant_cfg.quantization.quant_algo) : '') : (has(input.hf_quant_cfg.quant_algo) ? string(input.hf_quant_cfg.quant_algo) : '')).upperAscii()"
+      - title: ModelOptFp8Config claims quant_algo == FP8
+        source: "vllm/model_executor/layers/quantization/modelopt.py:452-455"
+        if: "vars.algo == 'FP8'"
+        then:
+          - return: {quantization: modelopt, quant_algo: "= vars.algo"}
+      - title: ModelOptNvFp4Config claims NVFP4 / FP4
+        source: "vllm/model_executor/layers/quantization/modelopt.py:775-778"
+        if: "vars.algo.contains('NVFP4') || vars.algo.contains('FP4')"
+        then:
+          - return: {quantization: modelopt_fp4, quant_algo: "= vars.algo"}
+      - title: ModelOptMxFp8Config claims MXFP8
+        source: "vllm/model_executor/layers/quantization/modelopt.py:1208-1211"
+        if: "vars.algo.contains('MXFP8')"
+        then:
+          - return: {quantization: modelopt_mxfp8, quant_algo: "= vars.algo"}
+      - title: ModelOptMixedPrecisionConfig claims MIXED_PRECISION
+        source: "vllm/model_executor/layers/quantization/modelopt.py:1630-1633"
+        if: "vars.algo == 'MIXED_PRECISION'"
+        then:
+          - return: {quantization: modelopt_mixed, quant_algo: "= vars.algo"}
+      - return: {quantization: null, quant_algo: "= vars.algo"}
+
+  - component: model-opt-linear-method
+    name: apply
+    kind: kernel
+    summary: "ModelOptLinearMethod.apply: the format scheme wraps the selected kernel's apply_weights; roofline latency with packed NVFP4 (0.5 B/weight, 4x the BF16 peak) or FP8 (1 B, 2x)."
+    sources: ["vllm/model_executor/layers/quantization/modelopt.py:2661-2667"]
+    request: ModelsLinearInput
+    response: {type: object, properties: {owner_ms: {type: integer}}}
+    latency_ms: "= math.greatest((double(input.in_features) * double(input.out_features) * double(input.bytes_per_weight) + 2.0 * double(input.num_tokens) * double(input.in_features + input.out_features)) / (double(config['gpu-hbm-bandwidth-gbps']) * 1000000.0), 2.0 * double(input.num_tokens) * double(input.in_features) * double(input.out_features) / (double(config['gpu-dense-bf16-tflops']) * (double(input.bytes_per_weight) < 1.0 ? 4.0 : 2.0) * 1000000000.0))"
+    behavior:
+      - title: fmt.apply(layer, x, bias, kernel.apply_weights)
+        source: "vllm/model_executor/layers/quantization/modelopt.py:2662-2667"
+        set: {ctx.modelopt_linear_bytes_per_weight: "= input.bytes_per_weight"}
+      - return: {owner_ms: 0}
+
+  # ---------------------------------------------------------------- EPLB on the MoE model
+  - component: mixtral-for-causal-lm
+    name: set-eplb-state
+    kind: function
+    summary: "MixtureOfExperts.set_eplb_state: EplbState.add_model hands the model views of the expert-load, logical-to-physical and replica-count tensors; every MoE layer passes them to its router's EplbLayerState."
+    sources: ["vllm/model_executor/models/interfaces.py:1039-1072", "vllm/model_executor/layers/fused_moe/runner/moe_runner.py:1023-1041"]
+    request:
+      type: object
+      required: [logical_to_physical_map, logical_replica_count]
+      properties:
+        logical_to_physical_map: {type: array, items: {type: array, items: {type: integer}}}
+        logical_replica_count: {type: array, items: {type: integer}}
+    response: {type: object, properties: {registered_layers: {type: integer}}}
+    errors:
+      - {code: attribute-error, status: 0, retryable: false}
+    behavior:
+      - if: "!state.loaded"
+        then:
+          - fail: {code: attribute-error, status: 0, message: "model weights are not loaded on this rank"}
+      - title: self.expert_weights collects every layer's expert weights; layer.set_eplb_state
+        source: "vllm/model_executor/models/interfaces.py:1061-1072"
+        call: fused-top-k-router.set-eplb-layer-state
+        input:
+          enabled: "= state.cfg.enable_eplb"
+          num_physical_experts: "= state.cfg.num_physical_experts"
+          logical_to_physical_map: "= input.logical_to_physical_map"
+          logical_replica_count: "= input.logical_replica_count"
+        as: reg
+      - set: {state.eplb_registered: "= vars.reg.value.registered"}
+      - return: {registered_layers: "= vars.reg.value.registered ? state.cfg.num_layers : 0"}
+
+  - component: mixtral-for-causal-lm
+    name: update-physical-experts-metadata
+    kind: function
+    summary: "update_physical_experts_metadata: after an EPLB rearrangement the local physical expert count must not change; the physical and redundant counts are updated and every MoE layer rebuilds its expert map."
+    sources: ["vllm/model_executor/models/mixtral.py:445-460"]
+    tags: [writes]
+    request:
+      type: object
+      required: [num_physical_experts, num_local_physical_experts]
+      properties:
+        num_physical_experts: {type: integer, examples: [10]}
+        num_local_physical_experts: {type: integer, examples: [5]}
+    errors:
+      - {code: assertion-error, status: 0, retryable: false}
+    behavior:
+      - source: "vllm/model_executor/models/mixtral.py:450"
+        if: "state.cfg.num_local_physical_experts != input.num_local_physical_experts"
+        then:
+          - fail: {code: assertion-error, status: 0, message: "assert self.num_local_physical_experts == num_local_physical_experts"}
+      - source: "vllm/model_executor/models/mixtral.py:451-453"
+        set:
+          state.cfg: "= merge(state.cfg, {'num_physical_experts': input.num_physical_experts, 'num_redundant_experts': input.num_physical_experts - state.cfg.num_experts})"
+      - title: moe.experts.update_expert_map() on every MoE layer
+        source: "vllm/model_executor/models/mixtral.py:454-460"
+        call: expert-map-manager.determine-expert-map
+        input: {ep_size: "= state.cfg.ep_size", ep_rank: "= self == '' ? 0 : int(self.substring(4))", global_num_experts: "= input.num_physical_experts", expert_placement_strategy: linear}
+        as: em
+      - return: {num_redundant_experts: "= state.cfg.num_redundant_experts", local_num_experts: "= vars.em.value.local_num_experts"}
+
+  - component: fused-top-k-router
+    name: set-eplb-layer-state
+    kind: function
+    summary: "EplbLayerState.set_layer_state via MoERunner.set_eplb_state: only routers built with an EPLB state (enable_eplb) keep the views; otherwise the call is a no-op."
+    sources: ["vllm/model_executor/layers/fused_moe/runner/moe_runner.py:1035-1041"]
+    request:
+      type: object
+      required: [enabled, num_physical_experts]
+      properties:
+        enabled: {type: boolean}
+        num_physical_experts: {type: integer}
+        logical_to_physical_map: {type: array, items: {type: array, items: {type: integer}}}
+        logical_replica_count: {type: array, items: {type: integer}}
+    response: {type: object, properties: {registered: {type: boolean}}}
+    behavior:
+      - title: self.router.eplb_state is None without enable_eplb
+        source: "vllm/model_executor/layers/fused_moe/runner/moe_runner.py:1035"
+        if: "!input.enabled"
+        then:
+          - return: {registered: false}
+      - source: "vllm/model_executor/layers/fused_moe/runner/moe_runner.py:1036-1041"
+        set:
+          state.eplb:
+            logical_to_physical_map: "= input.logical_to_physical_map"
+            logical_replica_count: "= input.logical_replica_count"
+            expert_load: "= lists.range(input.num_physical_experts).map(i, 0)"
+            recorded_slots: 0
+      - return: {registered: true}
+
+  - component: fused-top-k-router
+    name: eplb-map-to-physical-and-record
+    kind: kernel
+    summary: "eplb_map_to_physical_and_record: one Triton kernel maps each logical expert id to one of its physical replicas (token-hashed) and atomically adds to the physical expert's load counter while recording is on."
+    sources: ["vllm/model_executor/layers/fused_moe/router/base_router.py:95-142", "vllm/model_executor/layers/fused_moe/router/base_router.py:203-222"]
+    request:
+      type: object
+      required: [num_tokens, top_k]
+      properties: {num_tokens: {type: integer}, top_k: {type: integer}, record: {type: boolean, default: true}}
+    latency_ms: "= double(input.num_tokens * input.top_k) * 8.0 / (double(config['gpu-hbm-bandwidth-gbps']) * 1000000.0)"
+    errors:
+      - {code: value-error, status: 0, retryable: false}
+    behavior:
+      - title: _validate_eplb_state - every view must be set
+        source: "vllm/model_executor/layers/fused_moe/router/base_router.py:188-201"
+        if: "!has(state.eplb) || state.eplb == null || size(state.eplb.logical_to_physical_map) == 0"
+        then:
+          - fail: {code: value-error, status: 0, message: "EPLB requires logical_to_physical_map != None"}
+      - title: "Triton kernel _eplb_map_and_record_i32_kernel: replica = hash(token) % replica_count; atomic_add on the physical id's load"
+        source: "vllm/model_executor/layers/fused_moe/router/base_router.py:18-93"
+      - title: Recording adds this step's routed slots to the expert-load view (the per-expert split depends on routing values, not modeled)
+        source: "vllm/model_executor/layers/fused_moe/router/base_router.py:111-126"
+        when: "input.record"
+        set:
+          state.eplb: "= merge(state.eplb, {'recorded_slots': state.eplb.recorded_slots + input.num_tokens * input.top_k})"
+      - return: {mapped: true}
+
+  # ---------------------------------------------------------------- LoRA remove / pin (worker-runner's calls)
+  - component: lru-cache-worker-lora-manager
+    name: remove-adapter
+    kind: function
+    summary: "WorkerLoRAManager.remove_adapter: deactivate it and drop it from the CPU cache."
+    sources: ["vllm/lora/worker_manager.py:235-236"]
+    tags: [writes]
+    request: {type: object, properties: {lora_int_id: {type: integer, examples: [1]}}}
+    response: {type: object, properties: {removed: {type: boolean}}}
+    behavior:
+      - call: lru-cache-lora-model-manager.remove-adapter
+        input: {adapter_id: "= input.lora_int_id"}
+        as: rm
+      - return: {removed: "= vars.rm.value.removed"}
+
+  - component: lru-cache-worker-lora-manager
+    name: pin-adapter
+    kind: function
+    summary: "WorkerLoRAManager.pin_adapter: pin the adapter in both LRU caches so it is never evicted."
+    sources: ["vllm/lora/worker_manager.py:192-193"]
+    tags: [writes]
+    request: {type: object, properties: {lora_int_id: {type: integer, examples: [1]}}}
+    response: {type: object, properties: {pinned: {type: boolean}}}
+    errors:
+      - {code: value-error, status: 0, retryable: false}
+    behavior:
+      - call: lru-cache-lora-model-manager.pin-adapter
+        input: {adapter_id: "= input.lora_int_id"}
+      - return: {pinned: true}
+
+  - component: lru-cache-lora-model-manager
+    name: pin-adapter
+    kind: function
+    summary: "LRUCacheLoRAModelManager.pin_adapter: pin in the CPU cache (must be registered), activate into a GPU slot if needed, pin there too."
+    sources: ["vllm/lora/model_manager.py:1413-1433"]
+    request: {type: object, required: [adapter_id], properties: {adapter_id: {type: integer}}}
+    errors:
+      - {code: value-error, status: 0, retryable: false}
+    behavior:
+      - title: _pin_lora_in_cpu_cache - LRUCache.pin refuses a key it doesn't hold
+        source: "vllm/lora/model_manager.py:1419-1425"
+        if: "!(input.adapter_id in state.registered)"
+        then:
+          - fail: {code: value-error, status: 0, message: "= 'Pinning failed. LoRA ' + string(input.adapter_id) + ' is not registered.'"}
+      - title: _pin_lora_in_gpu_cache - activate if not active
+        source: "vllm/lora/model_manager.py:1427-1430"
+        when: "!(input.adapter_id in state.active)"
+        call: lru-cache-lora-model-manager.activate-adapter
+        input: {adapter_id: "= input.adapter_id"}
+      - source: "vllm/lora/model_manager.py:1432"
+        set: {state.pinned: "= (has(state.pinned) ? state.pinned.filter(i, i != input.adapter_id) : []) + [input.adapter_id]"}
+      - return: {pinned: true}

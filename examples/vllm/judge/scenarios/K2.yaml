@@ -1,0 +1,43 @@
+schema_version: 1
+id: vllm
+scenarios:
+  - id: bench-k2-deployed-budget
+    name: "K2 (corrected) deployed vllm serve on H100: budget 8192, so a 5000-token prompt prefills in one step"
+    fixtures: [full-tp1-llama-8b]
+    steps:
+      - {flow: scheduler-add-request, as: add, input: {request_id: chatcmpl-long, prompt_segments: [{key: doc-5k, num_tokens: 5000}], sampling_params: {max_tokens: 64}}}
+      - {flow: scheduler-schedule, as: s1, input: {}}
+    expect:
+      - "config['max-num-batched-tokens'] == 8192"
+      - "steps.s1.result.value.num_scheduled_tokens == {'chatcmpl-long': 5000}"
+      - "size(steps.s1.result.value.scheduled_new_reqs[0].block_ids) == 313"
+      - "!state.scheduler.requests['chatcmpl-long'].is_prefill_chunk"
+
+  - id: bench-k2-chunked-2048
+    name: "K2 with --max-num-batched-tokens 2048: a running decode is scheduled first, the 5000-token prompt gets the rest of each step's budget"
+    fixtures: [full-tp1-llama-8b]
+    config: {max-num-batched-tokens: 2048}
+    steps:
+      - {flow: scheduler-add-request, as: ad, input: {request_id: chatcmpl-dec, prompt_token_ids: [128000, 9906, 1917, 13, 3639, 374, 279, 6864], sampling_params: {max_tokens: 100}}}
+      - {flow: scheduler-schedule, as: s0, input: {}}
+      - {flow: scheduler-update-from-output, as: u0, input: {scheduler_output: "= steps.s0.result.value", model_runner_output: {req_ids: [chatcmpl-dec], sampled_token_ids: [[791]]}}}
+      - {flow: scheduler-add-request, as: al, input: {request_id: chatcmpl-long, prompt_segments: [{key: doc-5k, num_tokens: 5000}], sampling_params: {max_tokens: 64}}}
+      - {flow: scheduler-schedule, as: s1, input: {}}
+      - {flow: scheduler-update-from-output, as: u1, input: {scheduler_output: "= steps.s1.result.value", model_runner_output: {req_ids: [chatcmpl-dec, chatcmpl-long], sampled_token_ids: [[11], []]}}}
+      - {flow: scheduler-schedule, as: s2, input: {}}
+      - {flow: scheduler-update-from-output, as: u2, input: {scheduler_output: "= steps.s2.result.value", model_runner_output: {req_ids: [chatcmpl-dec, chatcmpl-long], sampled_token_ids: [[12], []]}}}
+      - {flow: scheduler-schedule, as: s3, input: {}}
+      - {flow: scheduler-update-from-output, as: u3, input: {scheduler_output: "= steps.s3.result.value", model_runner_output: {req_ids: [chatcmpl-dec, chatcmpl-long], sampled_token_ids: [[13], [500]]}}}
+    expect:
+      - "steps.s1.result.value.num_scheduled_tokens == {'chatcmpl-dec': 1, 'chatcmpl-long': 2047}"
+      - "steps.s2.result.value.num_scheduled_tokens == {'chatcmpl-dec': 1, 'chatcmpl-long': 2047}"
+      - "steps.s3.result.value.num_scheduled_tokens == {'chatcmpl-dec': 1, 'chatcmpl-long': 906}"
+      - "[steps.s1, steps.s2, steps.s3].all(s, s.result.value.total_num_scheduled_tokens <= 2048)"
+      # partial prefills emit nothing for the long request; the final chunk samples its first token
+      - "!steps.u1.result.value.outputs.exists(o, o.request_id == 'chatcmpl-long')"
+      - "!steps.u2.result.value.outputs.exists(o, o.request_id == 'chatcmpl-long')"
+      - "steps.u3.result.value.outputs.exists(o, o.request_id == 'chatcmpl-long' && o.new_token_ids == [500])"
+      - "state.scheduler.requests['chatcmpl-long'].num_computed_tokens == 5000 && state.scheduler.requests['chatcmpl-long'].output_token_ids == [500]"
+      # path: in every step the running decode is allocated before the long prompt
+      - "trace.filter(e, e.type == 'call.start' && e.interface == 'kv-cache-manager.allocate-slots').map(e, e.input.request_id) == ['chatcmpl-dec', 'chatcmpl-dec', 'chatcmpl-long', 'chatcmpl-dec', 'chatcmpl-long', 'chatcmpl-dec', 'chatcmpl-long']"
+      - "trace.filter(e, e.type == 'call.start' && e.interface == 'kv-cache-manager.allocate-slots' && e.input.request_id == 'chatcmpl-long').map(e, [e.input.status, e.input.num_new_tokens]) == [['WAITING', 2047], ['RUNNING', 2047], ['RUNNING', 906]]"

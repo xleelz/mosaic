@@ -1,0 +1,492 @@
+components:
+  # ---- worker process entry points ----
+  - id: worker-wrapper-base
+    name: WorkerWrapperBase
+    kind: module
+    parent: gpu-worker
+    layer: worker
+    summary: "Lazily constructs the worker class named by parallel_config.worker_cls inside each worker process and forwards collective_rpc calls to it."
+    sources: ["vllm/v1/worker/worker_base.py:198-377"]
+  - id: worker-base
+    name: WorkerBase
+    kind: module
+    parent: gpu-worker
+    layer: worker
+    summary: "Base worker: KV cache layout negotiation, device sync, model inspection and other RPCs every worker inherits."
+    sources: ["vllm/v1/worker/worker_base.py:58-195"]
+  - id: gpu-worker-impl
+    name: Worker (GPU)
+    kind: module
+    parent: gpu-worker
+    layer: worker
+    capacity: {concurrency: 1}
+    description: "Every Worker method runs on the worker process's one RPC thread: WorkerProc.worker_busy_loop dequeues one RPC at a time and runs it to completion (vllm/v1/executor/multiproc_executor.py:1037-1068), so calls on one rank are serialized (capacity 1)."
+    summary: "vllm.v1.worker.gpu_worker.Worker: the per-rank collective_rpc target. Initializes the device, loads the model, sizes and allocates the KV cache, captures CUDA graphs, runs execute_model/sample_tokens, sleep mode, weight transfer, LoRA and profiling."
+    sources: ["vllm/v1/worker/gpu_worker.py:194-1637"]
+    state:
+      schema:
+        type: object
+        properties:
+          device_initialized: {type: boolean}
+          runner: {type: string}
+          init_free_memory: {type: integer}
+          requested_memory: {type: integer}
+          total_consumed: {type: integer}
+          peak_activation_memory: {type: integer}
+          cudagraph_memory_estimate: {type: integer}
+          available_kv_cache_memory_bytes: {type: integer}
+          num_gpu_blocks: {type: integer}
+          bytes_per_block: {type: integer}
+          sleep_level: {type: integer}
+          saved_buffers: {type: boolean}
+          weight_transfer_engine: {type: boolean}
+          profiler_running: {type: boolean}
+          shut_down: {type: boolean}
+          is_pooling_model: {type: boolean}
+      initial:
+        is_pooling_model: false
+        pp_rank: 0
+        is_first_pp_rank: true
+        is_last_pp_rank: true
+        pp_send_pending: false
+        device_initialized: true
+        runner: v2
+        init_free_memory: 85899345920
+        requested_memory: 79027398247
+        total_consumed: 0
+        peak_activation_memory: 0
+        cudagraph_memory_estimate: 0
+        available_kv_cache_memory_bytes: 0
+        num_gpu_blocks: 0
+        bytes_per_block: 2097152
+        sleep_level: 0
+        saved_buffers: false
+        weight_transfer_engine: false
+        profiler_running: false
+        shut_down: false
+  - id: weight-update-session
+    name: Worker weight-update session flags
+    kind: datastore
+    parent: gpu-worker-impl
+    layer: worker
+    summary: "Worker._weight_update_active and _weight_update_is_draft: one RL weight-update session at a time per worker."
+    sources: ["vllm/v1/worker/gpu_worker.py:223-227"]
+    state:
+      schema: {type: object, properties: {sessions: {type: object}}}
+      initial: {sessions: {}}
+  - id: alloc-conf
+    name: alloc_conf.py
+    kind: module
+    parent: gpu-worker
+    layer: memory
+    summary: "Reads and edits PyTorch's allocator config string (torch resets every option absent from the string it is handed)."
+    sources: ["vllm/device_allocator/alloc_conf.py:1-119"]
+  - id: worker-utils
+    name: vllm/v1/worker/utils.py
+    kind: module
+    parent: gpu-worker
+    layer: worker
+    summary: "Worker helpers: request_memory (the gpu_memory_utilization budget check) and KV cache bookkeeping."
+    sources: ["vllm/v1/worker/utils.py:716-772"]
+  - id: worker-sentinel
+    name: WorkerSentinel
+    kind: module
+    parent: gpu-worker
+    layer: worker
+    summary: "Fault-tolerance sentinel that executes engine-core FT commands (retry, pause) on the worker; built only with enable_fault_tolerance."
+    sources: ["vllm/v1/worker/sentinel/gpu_worker_sentinel.py:29-80"]
+  - id: cu-mem-allocator
+    name: CuMemAllocator
+    kind: module
+    parent: gpu-worker
+    layer: memory
+    summary: "Sleep-mode allocator: tags allocations (weights, kv_cache, runtime, cudagraph, workspace) so sleep can offload some to host and discard the rest; resumed by wake_up."
+    sources: ["vllm/device_allocator/cumem.py:233-360", "vllm/device_allocator/sleep_mode_backend.py:116-155"]
+    state:
+      schema: {type: object, properties: {offloaded: {type: array, items: {type: string}}, discarded: {type: array, items: {type: string}}}}
+      initial: {offloaded: [], discarded: []}
+
+  # ---- V2 model runner (deployed) ----
+  - id: gpu-model-runner
+    name: GPUModelRunner (V2)
+    kind: module
+    parent: gpu-worker
+    layer: runner
+    summary: "vllm/v1/worker/gpu/model_runner.py: the deployed model runner. Keeps a persistent batch of request slots, prepares inputs, dispatches CUDA graphs, runs the model, samples and proposes drafts."
+    sources: ["vllm/v1/worker/gpu/model_runner.py:193-2400"]
+    state:
+      schema:
+        type: object
+        properties:
+          model_loaded: {type: boolean}
+          model_memory_usage: {type: integer}
+          model: {type: object}
+          kv_cache_initialized: {type: boolean}
+          num_blocks: {type: integer}
+          slots: {type: object}
+          free_slots: {type: array}
+          fresh_slots_used: {type: integer}
+          execute_model_state: {type: ["object", "null"]}
+          draft_tokens: {type: object}
+          draft_handler: {type: ["object", "null"]}
+          speculator: {type: string}
+          is_pooling_model: {type: boolean}
+          max_model_len: {type: integer}
+      initial:
+        model_loaded: true
+        model_memory_usage: 16060522496
+        model:
+          name: meta-llama/Llama-3.1-8B-Instruct
+          architecture: LlamaForCausalLM
+          num_hidden_layers: 32
+          num_kv_heads: 8
+          num_attention_heads: 32
+          head_size: 128
+          dtype_bytes: 2
+          torch_dtype: bfloat16
+          vocab_size: 128256
+          hidden_size: 4096
+          max_position_embeddings: 131072
+          weights_bytes: 16060522496
+          eos_token_id: 128009
+          is_hybrid: false
+          uses_mrope: false
+          uses_prompt_embeds: false
+        kv_cache_initialized: true
+        num_blocks: 28488
+        slots: {}
+        free_slots: []
+        fresh_slots_used: 0
+        execute_model_state: null
+        draft_tokens: {}
+        draft_handler: null
+        speculator: ""
+        is_pooling_model: false
+        max_model_len: 131072
+        pp_rank: 0
+        is_first_pp_rank: true
+        is_last_pp_rank: true
+  - id: input-batch
+    name: input_batch.py
+    kind: module
+    parent: gpu-model-runner
+    layer: runner
+    summary: "InputBatch and the Triton kernels that build input_ids, positions, seq_lens and logits indices on the GPU."
+    sources: ["vllm/v1/worker/gpu/input_batch.py:1-728"]
+  - id: block-tables
+    name: BlockTables
+    kind: module
+    parent: gpu-model-runner
+    layer: runner
+    summary: "GPU mirror of the scheduler's per-request block ids (appended from each SchedulerOutput) and the slot-mapping kernels. The scheduler owns the blocks; this is the device copy attention reads."
+    sources: ["vllm/v1/worker/gpu/block_table.py:17-230"]
+    state:
+      schema: {type: object, properties: {rows: {type: object}}}
+      initial: {rows: {}}
+  - id: staged-write-tensor
+    name: StagedWriteTensor
+    kind: module
+    parent: gpu-model-runner
+    layer: runner
+    summary: "Batches per-request CPU writes and applies them to GPU tensors in one kernel."
+    sources: ["vllm/v1/worker/gpu/buffer_utils.py:132-235"]
+  - id: cuda-graph-manager
+    name: ModelCudaGraphManager
+    kind: module
+    parent: gpu-model-runner
+    layer: runner
+    summary: "Chooses FULL, PIECEWISE or no CUDA graph per batch (by padded token count and uniformity), captures graphs at startup and replays them."
+    sources: ["vllm/v1/worker/gpu/cudagraph_utils.py:145-785"]
+    state:
+      schema: {type: object, properties: {graphs_captured: {type: boolean}, capture_sizes: {type: array}}}
+      initial: {graphs_captured: true, capture_sizes: [1, 2, 4, 8, 16, 24, 32, 40, 48, 56, 64, 72, 80, 88, 96, 104, 112, 120, 128, 136, 144, 152, 160, 168, 176, 184, 192, 200, 208, 216, 224, 232, 240, 248, 256, 272, 288, 304, 320, 336, 352, 368, 384, 400, 416, 432, 448, 464, 480, 496, 512]}
+  - id: pp-handler
+    name: PPHandler
+    kind: module
+    parent: gpu-model-runner
+    layer: runner
+    summary: "Pipeline-parallel sampled-token relay: the last PP rank broadcasts sampled tokens on a side stream; each non-last rank records a pending receive that is consumed pp_size steps later."
+    sources: ["vllm/v1/worker/gpu/pp_utils.py:55-280"]
+    state:
+      schema: {type: object, properties: {queue: {type: array}}}
+      initial: {queue: []}
+  - id: pcp-manager
+    name: PCPManager
+    kind: module
+    parent: gpu-model-runner
+    layer: runner
+    summary: "Prefill context parallel: partitions each step's tokens across PCP ranks and keeps the global batch for sampling and PP feedback (built only when prefill_context_parallel_size > 1)."
+    sources: ["vllm/v1/worker/gpu/pcp_manager.py:38-470", "vllm/v1/worker/gpu/pcp_manager.py:830-845"]
+    state:
+      schema: {type: object, properties: {global_batch: {type: ["array", "null"]}}}
+      initial: {global_batch: null}
+  - id: eplb-controller
+    name: EPLBController
+    kind: module
+    parent: gpu-model-runner
+    layer: runner
+    summary: "Creates the EPLB state when enable_eplb, registers the MoE model (and MoE drafter) and starts the async rebalancing loop."
+    sources: ["vllm/v1/worker/gpu/eplb_utils.py:80-165"]
+  - id: attn-utils
+    name: attn_utils.py
+    kind: module
+    parent: gpu-model-runner
+    layer: runner
+    summary: "Builds KV cache specs per attention layer, initializes attention backends and allocates the KV cache tensors."
+    sources: ["vllm/v1/worker/gpu/attn_utils.py:139-605"]
+  - id: kv-block-zeroer
+    name: KVBlockZeroer
+    kind: module
+    parent: gpu-model-runner
+    layer: runner
+    summary: "Zeroes newly allocated KV blocks the scheduler lists in new_block_ids_to_zero."
+    sources: ["vllm/v1/worker/utils.py:105-260"]
+  - id: cp-utils
+    name: cp_utils.py
+    kind: module
+    parent: gpu-model-runner
+    layer: runner
+    summary: "Decode context parallel helpers."
+    sources: ["vllm/v1/worker/gpu/cp_utils.py:1-84"]
+  - id: rope-state
+    name: RopeState
+    kind: module
+    parent: gpu-model-runner
+    layer: runner
+    summary: "M-RoPE position state for multimodal models."
+    sources: ["vllm/v1/worker/gpu/mm/rope.py:14-192"]
+  - id: mamba-hybrid-model-state
+    name: MambaHybridModelState
+    kind: module
+    parent: gpu-model-runner
+    layer: runner
+    summary: "Model state for hybrid attention/Mamba models: aligns recurrent state with KV blocks before and after each forward."
+    sources: ["vllm/v1/worker/gpu/model_states/interface.py:42-60", "vllm/v1/worker/gpu/model_states/mamba_hybrid.py:74-429"]
+  - id: mamba-utils
+    name: mamba_utils.py
+    kind: module
+    parent: gpu-worker
+    layer: runner
+    summary: "Mamba state copy kernels shared by the V1 and V2 runners."
+    sources: ["vllm/v1/worker/mamba_utils.py:1-1280"]
+  - id: prompt-embeds-state
+    name: PromptEmbedsState
+    kind: module
+    parent: gpu-model-runner
+    layer: runner
+    summary: "Overlays prompt embeddings passed in requests."
+    sources: ["vllm/v1/worker/gpu/model_states/prompt_embeds.py:14-152"]
+  - id: recover-ssm-state
+    name: RecoverSSMState
+    kind: module
+    parent: gpu-model-runner
+    layer: runner
+    summary: "RecoverSSM commit for KDA models."
+    sources: ["vllm/v1/worker/gpu/model_states/recoverssm.py:13-101"]
+  - id: pooling-runner
+    name: PoolingRunner
+    kind: module
+    parent: gpu-model-runner
+    layer: runner
+    summary: "Runs the pooler over hidden states for pooling models (embeddings, scores)."
+    sources: ["vllm/v1/worker/gpu/pool/pooling_runner.py:25-200"]
+  - id: late-interaction-runner
+    name: LateInteractionRunner
+    kind: module
+    parent: gpu-worker
+    layer: runner
+    summary: "Late-interaction (ColBERT-style) MaxSim scoring over cached query embeddings."
+    capacity: {concurrency: 1}
+    description: "Lives in the model runner and is only called from the worker's one RPC thread (multiproc_executor.py:1037-1068), so its calls are serialized (capacity 1)."
+    sources: ["vllm/v1/pool/late_interaction_runner.py:19-230"]
+
+  # ---- sampling ----
+  - id: sampler
+    name: Sampler (V2)
+    kind: module
+    parent: gpu-model-runner
+    layer: sampling
+    summary: "V2 sampler: per-slot sampling params, the logits processor pipeline (logit bias, penalties, bad words, custom), temperature, min_p, top-k/top-p and Gumbel sampling, plus logprobs."
+    sources: ["vllm/v1/worker/gpu/sample/sampler.py:42-356"]
+    state:
+      schema: {type: object, properties: {slots: {type: object}, vocab_size: {type: integer}, custom_processors: {type: array, items: {type: string}, description: "the custom logits processor classes the loader built (build_custom_logits_processors)"}}}
+      initial: {slots: {}, vocab_size: 128256, custom_processors: []}
+  - id: gumbel
+    name: gumbel.py
+    kind: module
+    parent: sampler
+    layer: sampling
+    summary: "Temperature and Gumbel-max sampling kernels."
+    sources: ["vllm/v1/worker/gpu/sample/gumbel.py:1-390"]
+  - id: min-p
+    name: min_p.py
+    kind: module
+    parent: sampler
+    layer: sampling
+    summary: "min_p masking kernel."
+    sources: ["vllm/v1/worker/gpu/sample/min_p.py:1-60"]
+  - id: topk-topp-triton
+    name: topk_topp_triton.py
+    kind: module
+    parent: sampler
+    layer: sampling
+    summary: "Triton top-k / top-p truncation, shared with the V1 sampler."
+    sources: ["vllm/v1/sample/ops/topk_topp_triton.py:1613-1717"]
+  - id: penalties-state
+    name: PenaltiesState
+    kind: module
+    parent: sampler
+    layer: sampling
+    summary: "Repetition, frequency and presence penalties."
+    sources: ["vllm/v1/worker/gpu/sample/penalties.py:23-200"]
+  - id: logit-bias-state
+    name: LogitBiasState
+    kind: module
+    parent: sampler
+    layer: sampling
+    summary: "allowed_token_ids, logit_bias and min_tokens."
+    sources: ["vllm/v1/worker/gpu/sample/logit_bias.py:25-330"]
+  - id: bad-words-state
+    name: BadWordsState
+    kind: module
+    parent: sampler
+    layer: sampling
+    summary: "Per-slot bad words; masks a bad word's last token where the context ends with its prefix. A recycled slot is overwritten by add_request (no removal hook)."
+    sources: ["vllm/v1/worker/gpu/sample/bad_words.py:21-98"]
+    state:
+      schema: {type: object, properties: {bad_words: {type: object}, num_bad_words: {type: object}}}
+      initial: {bad_words: {}, num_bad_words: {}}
+  - id: logprob
+    name: logprob.py
+    kind: module
+    parent: sampler
+    layer: sampling
+    summary: "Top-k logprobs, sampled-token ranks and per-request logprob token ids."
+    sources: ["vllm/v1/worker/gpu/sample/logprob.py:1-271"]
+  - id: prompt-logprobs-worker
+    name: PromptLogprobsWorker
+    kind: module
+    parent: gpu-model-runner
+    layer: sampling
+    summary: "Prompt logprobs for requests that ask for them."
+    sources: ["vllm/v1/worker/gpu/sample/prompt_logprob.py:31-275"]
+  - id: sampling-mask-tensors
+    name: SamplingMaskTensors
+    kind: module
+    parent: sampler
+    layer: sampling
+    summary: "Compacted kept-token mask returned when return_sampling_mask is set."
+    sources: ["vllm/v1/worker/gpu/sample/output.py:86-130"]
+  - id: gpu-logits-metrics
+    name: metrics/logits.py
+    kind: module
+    parent: sampler
+    layer: sampling
+    summary: "NaN counting in logits."
+    sources: ["vllm/v1/worker/gpu/metrics/logits.py:1-35"]
+  - id: structured-outputs-worker
+    name: StructuredOutputsWorker
+    kind: module
+    parent: gpu-model-runner
+    layer: sampling
+    summary: "Applies the scheduler's grammar bitmask to structured-output requests' logits."
+    sources: ["vllm/v1/worker/gpu/structured_outputs.py:75-160"]
+  - id: thinking-budget-state
+    name: ThinkingBudgetState
+    kind: module
+    parent: sampler
+    layer: sampling
+    summary: "Enforces per-request thinking_token_budget for reasoning models."
+    sources: ["vllm/v1/worker/gpu/sample/thinking_budget.py:22-410"]
+  - id: trace-replay-state
+    name: TraceReplayState
+    kind: module
+    parent: sampler
+    layer: sampling
+    summary: "Replays a token trace instead of sampling (enable_trace_replay)."
+    sources: ["vllm/v1/worker/gpu/sample/trace_replay.py:11-110"]
+  - id: gpu-watermark-sampler
+    name: GPUWatermarkSampler
+    kind: module
+    parent: gpu-model-runner
+    layer: sampling
+    summary: "Sampler subclass used when watermark_config is set: Philox-keyed Gumbel sampling."
+    sources: ["vllm/v1/watermarking/gpu_sampler.py:20-120", "vllm/v1/worker/gpu/sample/watermark.py:706-780"]
+  - id: batch-sharder
+    name: BatchSharder
+    kind: module
+    parent: gpu-model-runner
+    layer: sampling
+    summary: "Batch-sharded sampling across TP ranks (enable_batch_sharded_sampling)."
+    sources: ["vllm/v1/worker/gpu/sample/batch_shard.py:145-660"]
+  - id: logits-processor-loader
+    name: logits_processor/loader.py (V2)
+    kind: module
+    parent: gpu-model-runner
+    layer: sampling
+    summary: "Loads custom logits processors for the V2 runner: entry-point plugins first, then the configured classes and FQCNs; rejects V1-interface classes."
+    sources: ["vllm/v1/worker/gpu/sample/logits_processor/loader.py:1-211"]
+    state:
+      schema: {type: object, properties: {installed_plugins: {type: array}, classes: {type: object}}}
+      initial:
+        installed_plugins: []
+        classes: {}
+  - id: logits-processor-v1-loader
+    name: v1/sample/logits_processor (V1 loader)
+    kind: module
+    parent: gpu-worker
+    layer: sampling
+    summary: "V1 runner's logits processor builder: built-ins plus plugins and FQCNs; rejected with pooling models or speculative decoding."
+    sources: ["vllm/v1/sample/logits_processor/__init__.py:57-228"]
+    state:
+      schema: {type: object, properties: {installed_plugins: {type: array}}}
+      initial: {installed_plugins: []}
+
+  # ---- speculative decoding (V2) ----
+  - id: spec-decode
+    name: gpu/spec_decode/__init__.py
+    kind: module
+    parent: gpu-model-runner
+    layer: spec-decode
+    summary: "init_speculator: picks the speculator class from speculative_config.method."
+    sources: ["vllm/v1/worker/gpu/spec_decode/__init__.py:13-86"]
+  - id: rejection-sampler
+    name: RejectionSampler (V2)
+    kind: module
+    parent: gpu-model-runner
+    layer: spec-decode
+    summary: "Verifies draft tokens against the target logits and resamples the first rejected position."
+    sources: ["vllm/v1/worker/gpu/spec_decode/rejection_sampler.py:147-470"]
+  - {id: target-dependent-ar-speculator, name: TargetDependentARSpeculator (EAGLE/EAGLE3), kind: module, parent: gpu-model-runner, layer: spec-decode, summary: "Autoregressive drafter fed the target's hidden states (EagleSpeculator subclasses it).", sources: ["vllm/v1/worker/gpu/spec_decode/target_dependent_ar/speculator.py:26-660", "vllm/v1/worker/gpu/spec_decode/eagle/speculator.py:12-18"], state: {schema: {type: object, properties: {draft_model: {type: object, description: "the loaded drafter: returns_tuple when its forward returns (logits_hidden, feedback_hidden), as some MTP models do"}}}, initial: {draft_model: {returns_tuple: false}}}}
+  - {id: standalone-ar-speculator, name: StandaloneARSpeculator, kind: module, parent: gpu-model-runner, layer: spec-decode, summary: "Independent draft model speculator.", sources: ["vllm/v1/worker/gpu/spec_decode/standalone_ar/speculator.py:29-530"]}
+  - {id: dflash-speculator, name: DFlashSpeculator, kind: module, parent: gpu-model-runner, layer: spec-decode, summary: "DFlash block-parallel drafter.", sources: ["vllm/v1/worker/gpu/spec_decode/dflash/speculator.py:35-780"]}
+  - {id: dflash2-speculator, name: DFlash2Speculator, kind: module, parent: gpu-model-runner, layer: spec-decode, summary: "DFlash2 drafter with a candidate selector.", sources: ["vllm/v1/worker/gpu/spec_decode/dflash2/speculator.py:111-260"]}
+  - {id: multi-module-mtp-speculator, name: MultiModuleMTPSpeculator, kind: module, parent: gpu-model-runner, layer: spec-decode, summary: "Multi-module MTP drafter.", sources: ["vllm/v1/worker/gpu/spec_decode/multi_module_mtp/speculator.py:27-1105"]}
+  - {id: ngram-gpu-speculator, name: NgramGPUSpeculator, kind: module, parent: gpu-model-runner, layer: spec-decode, summary: "Prompt-lookup n-gram drafter on the GPU.", sources: ["vllm/v1/worker/gpu/spec_decode/ngram/speculator.py:151-270"]}
+  - {id: online-acceptance-estimator, name: OnlineAcceptanceEstimator, kind: module, parent: gpu-model-runner, layer: spec-decode, summary: "Online acceptance-rate model used by the DSpark speculator to size drafts.", sources: ["vllm/v1/worker/gpu/spec_decode/acceptance_estimator.py:313-490"]}
+
+  # ---- V1 model runner (selected when the V2 runner is not) ----
+  - {id: gpu-model-runner-v1, name: GPUModelRunner (V1), kind: module, parent: gpu-worker, layer: runner, summary: "vllm/v1/worker/gpu_model_runner.py: the V1 runner, used when VLLM_USE_V2_MODEL_RUNNER=0 or a feature V2 lacks is configured.", sources: ["vllm/v1/worker/gpu_model_runner.py:3940-4302"], state: {schema: {type: object, properties: {pending: {type: ["object", "null"]}, hybrid: {type: boolean}}}, initial: {pending: null, hybrid: false}}}
+  - {id: block-table, name: BlockTable (V1), kind: module, parent: gpu-model-runner-v1, layer: runner, summary: "V1 per-group block table and slot mapping.", sources: ["vllm/v1/worker/block_table.py:49-439"]}
+  - {id: rejection-sampler-v1, name: RejectionSampler (V1), kind: module, parent: gpu-model-runner-v1, layer: spec-decode, summary: "V1 rejection sampler.", sources: ["vllm/v1/sample/rejection_sampler.py:45-1115"]}
+  - {id: spec-decode-utils, name: v1/spec_decode/utils.py, kind: module, parent: gpu-model-runner-v1, layer: spec-decode, summary: "V1 EAGLE/DFlash proposer kernels.", sources: ["vllm/v1/spec_decode/utils.py:39-790"]}
+
+  # ---- boundary components owned by other areas ----
+  - {id: model-executor, name: model_executor package, kind: module, parent: gpu-worker, sources: ["vllm/model_executor/__init__.py"], summary: "Model executor package (owned by models-layers).", attributes: {boundary: true, owner: models-layers}}
+  - {id: model-loader, name: model_loader package, kind: module, parent: model-executor, sources: ["vllm/model_executor/model_loader/__init__.py"], summary: "Loader selection (owned by models-layers).", attributes: {boundary: true, owner: models-layers}}
+  - {id: lora, name: vllm/lora package, kind: module, parent: model-executor, sources: ["vllm/lora/__init__.py"], summary: "LoRA (owned by models-layers).", attributes: {boundary: true, owner: models-layers}}
+  - {id: llama-for-causal-lm, name: LlamaForCausalLM, kind: module, parent: model-executor, sources: ["vllm/model_executor/models/llama.py"], summary: "Llama model forward and compute_logits (owned by models-layers).", attributes: {boundary: true, owner: models-layers}}
+  - {id: base-model-loader, name: BaseModelLoader, kind: module, parent: model-loader, sources: ["vllm/model_executor/model_loader/base_loader.py"], summary: "Builds the model on the device and loads its weights (owned by models-layers).", attributes: {boundary: true, owner: models-layers}}
+  - {id: weight-checksum, name: weight_checksum.py, kind: module, parent: gpu-worker, sources: ["vllm/model_executor/model_loader/weight_checksum.py"], summary: "Weight digests and zeroing (owned by models-layers).", attributes: {boundary: true, owner: models-layers}}
+  - {id: sharded-state-loader, name: ShardedStateLoader, kind: module, parent: gpu-worker, sources: ["vllm/model_executor/model_loader/sharded_state_loader.py"], summary: "Per-rank sharded checkpoint save (owned by models-layers).", attributes: {boundary: true, owner: models-layers}}
+  - {id: tensorizer-loader, name: TensorizerLoader, kind: module, parent: gpu-worker, sources: ["vllm/model_executor/model_loader/tensorizer_loader.py"], summary: "Tensorizer save (owned by models-layers).", attributes: {boundary: true, owner: models-layers}}
+  - {id: lru-cache-worker-lora-manager, name: LRUCacheWorkerLoRAManager, kind: module, parent: lora, sources: ["vllm/lora/worker_manager.py"], summary: "Worker-side LoRA adapter cache (owned by models-layers).", attributes: {boundary: true, owner: models-layers}}
+  - {id: flash-attention-metadata-builder, name: FlashAttentionMetadataBuilder, kind: module, parent: gpu-worker, sources: ["vllm/v1/attention/backends/flash_attn.py"], summary: "Builds per-step attention metadata from block tables and slot mappings (owned by attention).", attributes: {boundary: true, owner: attention}}
+  - {id: parallel-state, name: parallel_state.py, kind: module, parent: gpu-worker, sources: ["vllm/distributed/parallel_state.py"], summary: "Process groups for TP/PP/DP (owned by distributed).", attributes: {boundary: true, owner: distributed}}
+  - {id: weight-transfer-engine, name: WeightTransferEngine, kind: module, parent: gpu-worker, sources: ["vllm/distributed/weight_transfer/base.py"], summary: "Receives trainer weights for RL weight sync (owned by distributed).", attributes: {boundary: true, owner: distributed}}
+  - {id: elastic-ep-scaling-executor, name: ElasticEPScalingExecutor, kind: module, parent: gpu-worker, sources: ["vllm/distributed/elastic_ep/elastic_execute.py"], summary: "Elastic expert-parallel reconfiguration steps (owned by distributed).", attributes: {boundary: true, owner: distributed}}
+  - {id: plugins, name: vllm/plugins, kind: module, parent: control, sources: ["vllm/plugins/__init__.py"], summary: "General plugin loading (owned by config-platform).", attributes: {boundary: true, owner: config-platform}}
+  - {id: executor, name: Executor, kind: module, parent: engine-core, sources: ["vllm/v1/executor/abstract.py"], summary: "Executor base (owned by engine-core).", attributes: {boundary: true, owner: engine-core}}
+  - {id: mixtral-for-causal-lm, name: MixtralForCausalLM, kind: module, parent: model-executor, sources: ["vllm/model_executor/models/mixtral.py"], summary: "Mixtral MoE model (owned by models-layers).", attributes: {boundary: true, owner: models-layers}}
+  - {id: eplb-state, name: EplbState, kind: module, parent: gpu-worker, sources: ["vllm/distributed/eplb/eplb_state.py"], summary: "Expert load-balancing state (owned by distributed).", attributes: {boundary: true, owner: distributed}}
+  - {id: attention-backend-utils, name: v1/attention/backends/utils.py, kind: module, parent: gpu-worker, sources: ["vllm/v1/attention/backends/utils.py"], summary: "KV cache layout helpers (owned by attention).", attributes: {boundary: true, owner: attention}}

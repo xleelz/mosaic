@@ -1,0 +1,85 @@
+schema_version: 1
+id: vllm
+scenarios:
+  - id: bench-l3-5a
+    name: "(a) API-server SIGTERM: stop the engine client (mode=drain timeout=30), then let uvicorn exit"
+    description: >
+      launcher.py:251-283: the API server's signal handler sets shutdown_event; handle_shutdown calls
+      engine_client.shutdown(timeout=vllm_config.shutdown_timeout) and only then sets
+      server.should_exit. The model has no API-server signal entry; the closest is engine-shutdown
+      (operator -> async-llm.shutdown) with the timeout given by hand. Asserts uvicorn is told to exit.
+    fixtures: [full-tp1-llama-8b]
+    config: {shutdown-timeout: 30}
+    steps:
+      - {flow: engine-core-busy-loop, input: {iterations: 50}, as: loop, await: false}
+      - {flow: engine-shutdown, input: {timeout: 30}, at_ms: 5, as: sd}
+    expect:
+      - "steps.sd.result.ok && !steps.sd.result.value.killed"
+      - "state.launcher.server_should_exit == true"
+  - id: bench-l3-5b
+    name: "(b) shutdown_timeout 30 drains the in-flight request; a new add during the drain gets an abort output"
+    fixtures: [full-tp1-llama-8b]
+    config: {shutdown-timeout: 30}
+    max_events: 200000
+    max_iterations: 100000
+    steps:
+      - {flow: engine-core-busy-loop, input: {iterations: 2000}, as: loop, await: false}
+      - flow: async-llm-generate
+        input: {prompt_token_ids: [128000, 9906], request_id: chatcmpl-a, sampling_params: {max_tokens: 280, n: 1, ignore_eos: true}}
+        at_ms: 0
+        as: gen
+        await: false
+      - {flow: engine-shutdown, input: {timeout: 30}, at_ms: 30, as: sd, await: false}
+      - flow: async-llm-generate
+        input: {prompt_token_ids: [128000, 9906], request_id: chatcmpl-b, sampling_params: {max_tokens: 16, n: 1}}
+        at_ms: 60
+        as: late
+    expect:
+      - "steps.gen.result.ok && steps.gen.result.value.items[steps.gen.result.value.items.size() - 1].finish_reason == 'length'"
+      - "steps.gen.result.value.items[steps.gen.result.value.items.size() - 1].completions[0].token_ids.size() + 0 >= 1"
+      - "steps.sd.result.ok && !steps.sd.result.value.killed && !trace.exists(e, e.type == 'kill')"
+      - "ctx.shutdown_mode == 'drain'"
+      - "steps.gen.result.value.value.token_ids.size() == 280"
+      - "steps.late.result.value.items[steps.late.result.value.items.size() - 1].finish_reason == 'abort'"
+      - "trace.filter(e, e.type == 'call.start' && e.interface == 'engine-core-proc.handle-add').size() == 2"
+      - "trace.filter(e, e.type == 'call.start' && e.interface == 'engine-core.add-request').size() == 1"
+      - "trace.exists(e, e.type == 'call.start' && e.interface == 'engine-core-proc.send-finish-outputs-to-client' && e.input.finish_reason == 'abort' && e.input.request_ids.size() == 1 && e.input.request_ids[0].startsWith('chatcmpl-b'))"
+      - "!trace.exists(e, e.type == 'call.start' && e.interface == 'scheduler.finish-requests' && has(e.input.finished_status) && e.input.finished_status == 'FINISHED_ABORTED' && e.t >= 30 && e.input.request_ids == null)"
+  - id: bench-l3-5c
+    name: "(c) [5 s deadline stands in for 30 s] a request outliving the drain deadline: the process manager force-kills the engine core"
+    fixtures: [full-tp1-llama-8b]
+    config: {shutdown-timeout: 5}
+    max_events: 400000
+    max_iterations: 200000
+    steps:
+      - {flow: engine-core-busy-loop, input: {iterations: 2000}, as: loop, await: false}
+      - flow: async-llm-generate
+        input: {prompt_token_ids: [128000, 9906], request_id: chatcmpl-a, sampling_params: {max_tokens: 280, n: 1, ignore_eos: true}}
+        at_ms: 0
+        as: gen
+        await: false
+      - {flow: engine-shutdown, input: {timeout: 5}, at_ms: 30, as: sd}
+    expect:
+      - "steps.sd.result.ok && steps.sd.result.value.killed"
+      - "trace.exists(e, e.type == 'kill')"
+      - "steps.sd.duration_ms >= 5000 && steps.sd.duration_ms < 5100"
+      - "ctx.shutdown_mode == 'drain'"
+  - id: bench-l3-5d
+    name: "(d) default shutdown_timeout 0: SIGTERM then an immediate force-kill of the still-alive core (CUDA)"
+    fixtures: [full-tp1-llama-8b]
+    max_events: 200000
+    max_iterations: 100000
+    steps:
+      - {flow: engine-core-busy-loop, input: {iterations: 2000}, as: loop, await: false}
+      - flow: async-llm-generate
+        input: {prompt_token_ids: [128000, 9906], request_id: chatcmpl-a, sampling_params: {max_tokens: 280, n: 1, ignore_eos: true}}
+        at_ms: 0
+        as: gen
+        await: false
+      - {flow: engine-shutdown, input: {timeout: 0}, at_ms: 30, as: sd}
+    expect:
+      - "config['shutdown-timeout'] == 0"
+      - "steps.sd.result.ok && steps.sd.result.value.killed && steps.sd.duration_ms < 100"
+      - "trace.exists(e, e.type == 'call.start' && e.interface == 'engine-core-proc.signal-handler')"
+      - "trace.exists(e, e.type == 'kill')"
+      - "!(has(steps.gen.result) && steps.gen.result.ok && steps.gen.result.value.items[steps.gen.result.value.items.size() - 1].finish_reason == 'length')"

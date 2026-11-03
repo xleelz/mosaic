@@ -1,0 +1,87 @@
+schema_version: 1
+id: vllm
+scenarios:
+- id: oracle-engine-core-kv-cache-group-metadata-dcp
+  name: KV cache group metadata reports the DCP-scaled attention block size and the unscaled Mamba one
+  description: >-
+    tests/v1/engine/test_kv_cache_group_metadata.py::test_kv_cache_group_metadata_uses_effective_dcp_block_sizes.
+    EngineCore.get_kv_cache_group_metadata (vllm/v1/engine/core.py:482) reports, per KV cache group,
+    group_idx, kind and the single-type manager's block_size. With DCP world size 8 an MLA group of
+    block 1536 reports 12288 while the Mamba group stays 1536.
+  fixtures: [full-tp1-llama-8b]
+  config:
+    decode-context-parallel-size: 8
+  state:
+    kv-cache-manager:
+      kv_cache_groups:
+      - {block_size: 1536, kind: mla_attention}
+      - {block_size: 1536, kind: mamba}
+  steps:
+  - interface: engine-core.get-kv-cache-group-metadata
+    caller: python-user
+    as: meta
+  expect:
+  - "steps.meta.result.ok"
+  - "steps.meta.result.value.map(m, m.block_size) == [12288, 1536]"
+  - "steps.meta.result.value.map(m, m.kind) == ['mla_attention', 'mamba']"
+  - "steps.meta.result.value.map(m, m.group_idx) == [0, 1]"
+
+- id: oracle-engine-core-step-invalidates-mm-cache-misses
+  name: LLMEngine.step invalidates every mm hash the engine core reported as a cache miss
+  description: >-
+    tests/v1/engine/test_llm_engine.py::test_step_invalidates_mm_processor_cache_misses.
+    LLMEngine.step (vllm/v1/engine/llm_engine.py:341-346) calls renderer.mm_processor_cache.invalidate
+    for each hash in each EngineCoreOutput.mm_cache_miss_hashes, in order, and returns the processed
+    request outputs ([] here). The MagicMock'd engine core output is seeded into the real
+    SyncMPClient outputs queue; the mock cache is the real P0 sender cache, seeded with both hashes.
+  fixtures: [full-tp1-llama-8b]
+  state:
+    llm-engine: {log_stats: false, should_execute_dummy_batch: false, profile_session_active: false}
+    sync-mp-client:
+      engine_dead: false
+      outputs_queue:
+      - outputs:
+          timestamp: 0.0
+          scheduler_stats: null
+          outputs:
+          - request_id: req-unknown
+            new_token_ids: []
+            mm_cache_miss_hashes: [missing-hash-1, missing-hash-2]
+    lru-key-replicated-sender-cache:
+      entries:
+        missing-hash-1: {bytes: 100}
+        missing-hash-2: {bytes: 200}
+        kept-hash: {bytes: 50}
+      order: [missing-hash-1, missing-hash-2, kept-hash]
+      used: 350
+  steps:
+  - flow: llm-engine-step
+    as: step
+  expect:
+  - "steps.step.result.ok && steps.step.result.value.request_outputs == []"
+  - "trace.filter(e, e.type == 'call.start' && e.interface == 'lru-key-replicated-sender-cache.invalidate').map(e, e.input.mm_hash) == ['missing-hash-1', 'missing-hash-2']"
+  - "state['lru-key-replicated-sender-cache'].order == ['kept-hash'] && state['lru-key-replicated-sender-cache'].used == 50"
+
+- id: oracle-engine-core-context-length-too-short-mm
+  name: An image prompt whose expanded length exceeds max_model_len is refused with VLLMValidationError
+  description: >-
+    tests/engine/test_short_mm_context.py::test_context_length_too_short. LLaVA-1.5 with
+    max_model_len=579: the image expands to 576 placeholder tokens, so text plus image tokens exceed
+    579 and InputProcessor._validate_prompt_len (vllm/v1/engine/input_processor.py:557-591) raises
+    VLLMValidationError "... longer than the maximum model length ...". The model's world is Llama
+    (text-only), so this checks only that the offline path counts multimodal tokens in the prompt length.
+  fixtures: [full-tp1-llama-8b]
+  config:
+    max-model-len: 579
+  steps:
+  - flow: serving-api-offline-generate
+    input:
+      prompts:
+      - prompt: "USER: <image>\nWhat's the content of the image?\nASSISTANT:"
+        multi_modal_data: {image: stop_sign}
+      sampling_params: {max_tokens: 1, temperature: 0.0}
+    as: gen
+  expect:
+  - "!steps.gen.result.ok && steps.gen.result.error.code == 'vllm-validation-error'"
+  - "steps.gen.result.error.message.contains('longer than the maximum model length')"
+  - "!trace.exists(e, e.type == 'call.start' && e.interface == 'sync-mp-client.add-request')"

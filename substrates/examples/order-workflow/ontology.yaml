@@ -1,0 +1,265 @@
+# A small order service on the Temporal substrate, to show an import works. Placing an order
+# starts an `order` workflow whose id is the order id (reuse policy reject_duplicate, so a
+# retried submission can't start a second one). The workflow charges the card through an
+# external payments API (an activity retried on outages but not on a declined card), waits out
+# a 2 s shipping delay on a durable timer, then ships (a heartbeating activity). A `cancel`
+# signal during the delay ends it early. The order status reads DescribeWorkflowExecution.
+# Imported ids: the server is temporal/temporal-server (state at state['temporal/temporal-server']);
+# the task topics are temporal/temporal-workflow-task and temporal/temporal-activity-task
+# (imported topics take the prefix, §17 item 8). The local
+# temporal-retry-initial-interval-ms overrides the substrate's 1 s default.
+#   go run ./internal/devtools/check -f substrates/examples/order-workflow/ontology.yaml
+schema_version: 1
+id: order-workflow
+name: Order workflow (Temporal substrate import example)
+level: system
+imports:
+  - {ontology: ../../temporal, as: temporal}
+
+configs:
+  - id: temporal-retry-initial-interval-ms
+    type: integer
+    value: 500
+    default: 1000
+    summary: "This service retries activities after 500 ms first (overrides the substrate's 1 s)."
+
+components:
+  - {id: shopper, kind: client, summary: The customer's browser.}
+  - {id: order-api, kind: service, summary: "Accepts orders and starts their workflows; answers status from Temporal."}
+  - {id: order-worker, kind: service, summary: "The Temporal worker on task queue orders: the order workflow and its activities."}
+  - {id: payments, kind: external, summary: "The card processor's API."}
+  - {id: warehouse, kind: external, summary: "The fulfilment API."}
+
+interfaces:
+  - component: order-api
+    name: place-order
+    kind: http
+    attributes: {method: POST, path: /v1/orders}
+    request: {type: object, required: [order_id, amount], properties: {order_id: {type: string, examples: [o-1]}, amount: {type: integer, examples: [4200]}}}
+    response: {type: object, properties: {order_id: {type: string}, run_id: {type: string}}}
+    errors: [{code: duplicate_order, status: 409}]
+    behavior:
+      - call: temporal/temporal-server.start-workflow
+        input:
+          workflow_id: "= input.order_id"
+          workflow_type: order
+          task_queue: orders
+          input: {order_id: "= input.order_id", amount: "= input.amount"}
+          id_reuse_policy: reject_duplicate
+          id_conflict_policy: fail
+        as: st
+        on_error:
+          - fail: {code: duplicate_order, status: 409, message: "= 'order already placed: ' + input.order_id"}
+      - return: {order_id: "= input.order_id", run_id: "= vars.st.value.run_id"}
+
+  - component: order-api
+    name: cancel-order
+    kind: http
+    attributes: {method: POST, path: "/v1/orders/:order_id/cancel"}
+    request: {type: object, required: [order_id], properties: {order_id: {type: string, examples: [o-1]}}}
+    response: {type: object, properties: {}}
+    errors: [{code: not_found, status: 404}]
+    behavior:
+      - call: temporal/temporal-server.signal-workflow
+        input: {workflow_id: "= input.order_id", run_id: "", signal_name: cancel, input: {}}
+        on_error: [{fail: {code: not_found, status: 404, message: order not found or already finished}}]
+      - return: {}
+
+  - component: order-api
+    name: order-status
+    kind: http
+    attributes: {method: GET, path: "/v1/orders/:order_id"}
+    request: {type: object, required: [order_id], properties: {order_id: {type: string, examples: [o-1]}}}
+    response: {type: object, properties: {status: {type: string}, waiting_on: {type: array, items: {type: string}}, attempts: {type: array, items: {type: integer}}}}
+    behavior:
+      - call: temporal/temporal-server.describe-workflow
+        input: {workflow_id: "= input.order_id", run_id: ""}
+        as: d
+      - return:
+          status: "= vars.d.value.execution_info.status"
+          waiting_on: "= vars.d.value.pending_activities.map(a, a.activity_type)"
+          attempts: "= vars.d.value.pending_activities.map(a, a.attempt)"
+
+  - component: order-api
+    name: order-result
+    kind: http
+    attributes: {method: GET, path: "/v1/orders/:order_id/result"}
+    request: {type: object, required: [order_id], properties: {order_id: {type: string, examples: [o-1]}}}
+    response: {type: object, properties: {status: {type: string}, outcome: {}}}
+    behavior:
+      - call: temporal/temporal-server.get-workflow-history
+        input: {workflow_id: "= input.order_id", run_id: ""}
+        as: h
+      - set: {vars.last: "= vars.h.value.events[size(vars.h.value.events) - 1]"}
+      - return:
+          status: "= vars.h.value.status"
+          outcome: "= 'result' in vars.last.attrs ? vars.last.attrs.result : ('failure' in vars.last.attrs ? vars.last.attrs.failure : null)"
+
+  # ---- the worker ----
+  - component: order-worker
+    name: order-workflow
+    kind: event
+    summary: "Workflow order: charge, wait the shipping delay (or a cancel signal), ship, complete."
+    subscribe: [temporal/temporal-workflow-task]
+    request: temporal.WorkflowTask
+    behavior:
+      - if: "input.workflow_type != 'order'"
+        then: [{return: {}}]
+      - set:
+          vars.ev: "= input.new_events"
+          vars.done: "= input.new_events.filter(e, e.type == 'activity_task_completed').map(e, e.attrs.activity_id)"
+      - set:
+          vars.cmds: >-
+            = vars.ev.exists(e, e.type in ['activity_task_failed', 'activity_task_timed_out']) ?
+                [dyn({'type': 'fail_workflow', 'failure': {'type': 'OrderFailed', 'message': vars.ev.filter(e, e.type in ['activity_task_failed', 'activity_task_timed_out'])[0].attrs.failure.type, 'non_retryable': true}})] :
+              vars.ev.exists(e, e.type == 'workflow_execution_signaled' && e.attrs.signal_name == 'cancel') && !('ship' in vars.done) ?
+                [dyn({'type': 'cancel_timer', 'timer_id': 'ship-delay'}), dyn({'type': 'complete_workflow', 'result': {'status': 'cancelled'}})] :
+              vars.ev.exists(e, e.type == 'workflow_execution_started') ?
+                [dyn({'type': 'schedule_activity', 'activity_id': 'charge', 'activity_type': 'charge', 'input': input.input,
+                      'start_to_close_timeout_ms': 5000, 'retry_policy': {'maximum_attempts': 5, 'non_retryable_error_types': ['card_declined']}})] :
+              'charge' in vars.done ?
+                [dyn({'type': 'start_timer', 'timer_id': 'ship-delay', 'duration_ms': 2000})] :
+              vars.ev.exists(e, e.type == 'timer_fired') ?
+                [dyn({'type': 'schedule_activity', 'activity_id': 'ship', 'activity_type': 'ship', 'input': input.input,
+                      'start_to_close_timeout_ms': 30000, 'heartbeat_timeout_ms': 5000})] :
+              'ship' in vars.done ?
+                [dyn({'type': 'complete_workflow', 'result': {'status': 'shipped', 'tracking': vars.ev.filter(e, e.type == 'activity_task_completed')[0].attrs.result}})] :
+              []
+      - call: temporal/temporal-server.respond-workflow-task-completed
+        input: {task_token: "= input.task_token", commands: "= vars.cmds"}
+
+  - component: order-worker
+    name: charge-activity
+    kind: event
+    summary: "Activity charge: call payments; report an outage as a retryable failure and a decline by its code."
+    subscribe: [temporal/temporal-activity-task]
+    request: temporal.ActivityTask
+    behavior:
+      - if: "input.activity_type != 'charge'"
+        then: [{return: {}}]
+      - call: payments.charge
+        input: {idempotency_key: "= input.workflow_id", amount: "= input.input.amount"}
+        timeout_ms: 2000
+        as: pay
+        on_error: continue
+      - if: "!vars.pay.ok"
+        then:
+          - call: temporal/temporal-server.respond-activity-failed
+            input: {task_token: "= input.task_token", failure: {type: "= vars.pay.error.code", message: "= vars.pay.error.message", non_retryable: false}}
+          - return: {}
+      - call: temporal/temporal-server.respond-activity-completed
+        input: {task_token: "= input.task_token", result: "= vars.pay.value.charge_id"}
+
+  - component: order-worker
+    name: ship-activity
+    kind: event
+    summary: "Activity ship: book the shipment, heartbeat once, report the tracking number."
+    subscribe: [temporal/temporal-activity-task]
+    request: temporal.ActivityTask
+    behavior:
+      - if: "input.activity_type != 'ship'"
+        then: [{return: {}}]
+      - call: temporal/temporal-server.record-activity-heartbeat
+        input: {task_token: "= input.task_token", details: booking}
+      - call: warehouse.ship
+        input: {order_id: "= input.workflow_id"}
+        as: s
+      - call: temporal/temporal-server.respond-activity-completed
+        input: {task_token: "= input.task_token", result: "= vars.s.value.tracking"}
+
+  - component: payments
+    name: charge
+    kind: http
+    latency_ms: 200
+    request: {type: object, required: [idempotency_key, amount], properties: {idempotency_key: {type: string}, amount: {type: integer}}}
+    response: {type: object, properties: {charge_id: {type: string}}}
+    errors: [{code: card_declined, status: 402}]
+    behavior:
+      - return: {charge_id: "= id('ch', input.idempotency_key)"}
+
+  - component: warehouse
+    name: ship
+    kind: http
+    latency_ms: 300
+    request: {type: object, required: [order_id], properties: {order_id: {type: string}}}
+    response: {type: object, properties: {tracking: {type: string}}}
+    behavior:
+      - return: {tracking: "= 'TRK-' + input.order_id"}
+
+flows:
+  - {id: place-order, tags: [writes], entry: {caller: shopper, interface: order-api.place-order}}
+  - {id: cancel-order, tags: [writes], entry: {caller: shopper, interface: order-api.cancel-order}}
+  - {id: order-status, tags: [reads], entry: {caller: shopper, interface: order-api.order-status}}
+  - {id: order-result, tags: [reads], entry: {caller: shopper, interface: order-api.order-result}}
+
+fixtures:
+  - id: start
+    clock: {epoch: "2026-11-01T00:00:00Z"}
+
+scenarios:
+  - id: order-ships
+    name: An order is charged, waits out the shipping delay, ships and completes
+    fixtures: [start]
+    max_virtual_ms: 60000
+    steps:
+      - {flow: place-order, as: place, at_ms: 0, input: {order_id: o-1, amount: 4200}}
+      - {flow: order-status, as: waiting, at_ms: 1000, input: {order_id: o-1}}
+      - {flow: order-result, as: done, at_ms: 5000, input: {order_id: o-1}}
+    expect:
+      - "steps.place.result.ok && steps.waiting.result.value == {'status': 'running', 'waiting_on': [], 'attempts': []}"
+      - "steps.done.result.value.status == 'completed' && steps.done.result.value.outcome == {'status': 'shipped', 'tracking': 'TRK-o-1'}"
+      - "io.exists(i, i.interface == 'payments.charge' && i.input.amount == 4200) && calls['warehouse.ship'] == 1"
+
+  - id: duplicate-order-refused
+    name: Placing the same order twice is refused 409 by the reuse policy, even after the first finished
+    fixtures: [start]
+    max_virtual_ms: 60000
+    steps:
+      - {flow: place-order, as: first, at_ms: 0, input: {order_id: o-2, amount: 100}}
+      - {flow: place-order, as: again, at_ms: 100, input: {order_id: o-2, amount: 100}}
+      - {flow: place-order, as: later, at_ms: 8000, input: {order_id: o-2, amount: 100}}
+    expect:
+      - "steps.first.result.ok && !steps.again.result.ok && steps.again.result.error.status == 409"
+      - "!steps.later.result.ok && steps.later.result.error.code == 'duplicate_order'"
+      - "calls['payments.charge'] == 1"
+
+  - id: payments-outage-retried
+    name: Two payment outages are retried by Temporal (after 500 ms, then 1 s) and the third charge succeeds
+    fixtures: [start]
+    max_virtual_ms: 60000
+    faults: [{target: payments.charge, type: unavailable, calls: [1, 2]}]
+    steps:
+      - {flow: place-order, as: place, at_ms: 0, input: {order_id: o-3, amount: 900}}
+      - {flow: order-status, as: retrying, at_ms: 300, input: {order_id: o-3}}
+      - {flow: order-result, as: done, at_ms: 8000, input: {order_id: o-3}}
+    expect:
+      - "steps.retrying.result.value.waiting_on == ['charge'] && steps.retrying.result.value.attempts == [1]"
+      - "steps.done.result.value.status == 'completed' && calls['payments.charge'] == 3 && faults == 2"
+      - "state['temporal/temporal-server'].runs[steps.place.result.value.run_id].history[2].attrs.attempt == 3"
+      - "[state['temporal/temporal-server'].runs[steps.place.result.value.run_id].history].all(h, h[2].time - h[0].time >= 1500 && h[2].time - h[0].time < 2500)"
+
+  - id: card-declined-not-retried
+    name: A declined card is a non-retryable failure; the order fails after one charge and never ships
+    fixtures: [start]
+    max_virtual_ms: 60000
+    faults: [{target: payments.charge, type: error, code: card_declined, status: 402}]
+    steps:
+      - {flow: place-order, as: place, at_ms: 0, input: {order_id: o-4, amount: 900}}
+      - {flow: order-result, as: done, at_ms: 5000, input: {order_id: o-4}}
+    expect:
+      - "steps.done.result.value.status == 'failed' && steps.done.result.value.outcome.message == 'card_declined'"
+      - "calls['payments.charge'] == 1 && calls['warehouse.ship'] == 0"
+
+  - id: cancel-during-shipping-delay
+    name: A cancel signal during the shipping delay cancels the timer and completes the order as cancelled
+    fixtures: [start]
+    max_virtual_ms: 60000
+    steps:
+      - {flow: place-order, as: place, at_ms: 0, input: {order_id: o-5, amount: 900}}
+      - {flow: cancel-order, as: cancel, at_ms: 1000, input: {order_id: o-5}}
+      - {flow: order-result, as: done, at_ms: 5000, input: {order_id: o-5}}
+      - {flow: cancel-order, as: too_late, at_ms: 6000, input: {order_id: o-5}}
+    expect:
+      - "steps.cancel.result.ok && steps.done.result.value.outcome == {'status': 'cancelled'}"
+      - "calls['warehouse.ship'] == 0 && size(state['temporal/temporal-server'].timers) == 0"
+      - "!steps.too_late.result.ok && steps.too_late.result.error.status == 404"

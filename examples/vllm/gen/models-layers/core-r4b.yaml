@@ -1,0 +1,263 @@
+# models-layers fix round 4: fused_moe dispatch, selection and shape checks that kernels-ops' tests exercise
+# (FusedMoEQuantConfig, FusedMoEParallelConfig, maybe_make_prepare_finalize, FusedMoEKernel, FusedMoEExperts).
+components:
+  - id: fused-moe-quant-config
+    name: FusedMoEQuantConfig
+    kind: module
+    parent: fused-moe
+    layer: moe
+    summary: "Quantization descriptors of one MoE op (a1, a2, w1, w2): dtype, group shape (per-tensor, per-token or a block) and scales; the accessors derive quant_dtype, per_act_token_quant, block_shape and the scales."
+    sources: ["vllm/model_executor/layers/fused_moe/config.py:212-260"]
+  - id: fused-moe-parallel-config
+    name: FusedMoEParallelConfig
+    kind: module
+    parent: fused-moe
+    layer: moe
+    summary: "MoE parallel layout (TP, PCP, DP, EP, SP sizes and ranks, all2all backend, EPLB) and the predicates that pick the all-to-all kernels."
+    sources: ["vllm/model_executor/layers/fused_moe/config.py:1000-1025"]
+  - id: all2all-utils
+    name: vllm/model_executor/layers/fused_moe/all2all_utils.py
+    kind: module
+    parent: fused-moe
+    layer: moe
+    summary: "Chooses the prepare/finalize (dispatch/combine) implementation for an MoE layer from its parallel config and all2all backend."
+    sources: ["vllm/model_executor/layers/fused_moe/all2all_utils.py:182-190"]
+  - id: fused-moe-kernel
+    name: FusedMoEKernel (modular_kernel.py)
+    kind: module
+    parent: fused-moe
+    layer: moe
+    summary: "Pairs a prepare/finalize with a fused-experts implementation; both must be modular or both monolithic, and their activation formats must agree. Its experts expose the quant-config accessors and run the activation."
+    sources: ["vllm/model_executor/layers/fused_moe/modular_kernel.py:1612-1620"]
+
+interfaces:
+  - component: fused-moe-quant-config
+    name: make
+    kind: function
+    summary: "FusedMoEQuantConfig.make: validate string dtypes, map the flags to group shapes (_quant_flags_to_group_shape: a block shape excludes per-token and per-channel), build the four descriptors, and check the accessors round-trip; returns the derived accessors."
+    sources: ["vllm/model_executor/layers/fused_moe/config.py:486-583", "vllm/model_executor/layers/fused_moe/config.py:74-100", "vllm/model_executor/layers/fused_moe/config.py:262-360"]
+    request:
+      type: object
+      properties:
+        quant_dtype: {type: [string, "null"], default: null, examples: [fp8_e4m3]}
+        weight_dtype: {type: [string, "null"], default: null}
+        per_act_token_quant: {type: boolean, default: false}
+        per_out_ch_quant: {type: boolean, default: false}
+        block_shape: {type: [array, "null"], items: {type: integer}, default: null}
+        has_w1_scale: {type: boolean, default: false}
+        has_w2_scale: {type: boolean, default: false}
+        has_a1_scale: {type: boolean, default: false}
+        has_a2_scale: {type: boolean, default: false}
+    response:
+      type: object
+      properties:
+        quant_dtype: {type: [string, "null"]}
+        weight_quant_dtype: {type: [string, "null"]}
+        is_quantized: {type: boolean}
+        per_act_token_quant: {type: boolean}
+        per_out_ch_quant: {type: boolean}
+        is_per_tensor: {type: boolean}
+        block_shape: {type: [array, "null"]}
+        is_block_quantized: {type: boolean}
+        a_shape: {type: [string, "null"]}
+        w_shape: {type: [string, "null"]}
+        w1_scale: {type: boolean}
+        w2_scale: {type: boolean}
+        a1_scale: {type: boolean}
+        a2_scale: {type: boolean}
+    errors:
+      - {code: assertion-error, status: 0, retryable: false}
+    behavior:
+      - title: torch dtypes pass; string dtypes must be one of the MX/NV formats
+        source: "vllm/model_executor/layers/fused_moe/config.py:545-559"
+        if: "(input.quant_dtype != null && input.quant_dtype.startsWith('mx') && !(input.quant_dtype in ['mxfp4', 'mxfp6_e3m2', 'mxfp6_e2m3', 'mxfp8'])) || (input.quant_dtype != null && !input.quant_dtype.startsWith('mx') && !input.quant_dtype.startsWith('fp8') && !input.quant_dtype.startsWith('int') && input.quant_dtype != 'nvfp4')"
+        then:
+          - fail: {code: assertion-error, status: 0, message: "= 'invalid quant_dtype ' + input.quant_dtype"}
+      - set:
+          vars.wdt: "= input.weight_dtype != null ? input.weight_dtype : input.quant_dtype"
+      - title: A block shape is incompatible with per-token and per-channel quantization
+        source: "vllm/model_executor/layers/fused_moe/config.py:83-85"
+        if: "input.block_shape != null && (input.per_act_token_quant || input.per_out_ch_quant)"
+        then:
+          - fail: {code: assertion-error, status: 0, message: "illegal quantization"}
+      - title: _quant_flags_to_group_shape
+        source: "vllm/model_executor/layers/fused_moe/config.py:83-100"
+        set:
+          vars.a: "= input.block_shape != null ? 'block' : (input.per_act_token_quant ? 'per_token' : (input.quant_dtype == null ? dyn(null) : dyn('per_tensor')))"
+          vars.w: "= input.block_shape != null ? 'block' : (input.per_out_ch_quant ? dyn('per_token') : dyn(null))"
+      - title: Accessors over the a1/w1 descriptors (quant_dtype, per_act_token_quant, block_shape, scales)
+        source: "vllm/model_executor/layers/fused_moe/config.py:270-360"
+        return:
+          quant_dtype: "= input.quant_dtype"
+          weight_quant_dtype: "= vars.wdt"
+          is_quantized: "= input.quant_dtype != null"
+          per_act_token_quant: "= vars.a == 'per_token'"
+          per_out_ch_quant: "= vars.w == 'per_token'"
+          is_per_tensor: "= vars.a == 'per_tensor'"
+          block_shape: "= input.block_shape"
+          is_block_quantized: "= input.block_shape != null"
+          a_shape: "= vars.a"
+          w_shape: "= vars.w"
+          w1_scale: "= input.has_w1_scale"
+          w2_scale: "= input.has_w2_scale"
+          a1_scale: "= input.has_a1_scale"
+          a2_scale: "= input.has_a2_scale"
+
+  - component: fused-moe-parallel-config
+    name: make-no-parallel
+    kind: function
+    summary: "FusedMoEParallelConfig.make_no_parallel: every size 1, rank 0, no EP, allgather_reducescatter backend, no EPLB (tests and CI)."
+    sources: ["vllm/model_executor/layers/fused_moe/config.py:1238-1254"]
+    response: {type: object}
+    behavior:
+      - source: "vllm/model_executor/layers/fused_moe/config.py:1241-1254"
+        return: {tp_size: 1, tp_rank: 0, pcp_size: 1, pcp_rank: 0, dp_size: 1, dp_rank: 0, ep_size: 1, ep_rank: 0, sp_size: 1, use_ep: false, all2all_backend: allgather_reducescatter, enable_eplb: false, is_sequence_parallel: false}
+
+  - component: all2all-utils
+    name: maybe-make-prepare-finalize
+    kind: function
+    summary: "maybe_make_prepare_finalize: passthrough when the experts dispatch themselves; without all-to-all kernels (no EP, or EP with DP 1 and no PCP/SP) none, or under the new interface naive DP (AllGather+ReduceScatter) or no-DP; with all-to-all kernels the class for the all2all backend."
+    sources: ["vllm/model_executor/layers/fused_moe/all2all_utils.py:182-440", "vllm/model_executor/layers/fused_moe/config.py:1025-1104"]
+    request:
+      type: object
+      required: [moe_parallel_config]
+      properties:
+        moe_parallel_config: {type: object, description: "FusedMoEParallelConfig fields (use_ep, dp_size, pcp_size, is_sequence_parallel, all2all_backend)"}
+        allow_new_interface: {type: boolean, default: false}
+        has_quant_config: {type: boolean, default: true}
+    response: {type: object, properties: {prepare_finalize: {type: [string, "null"]}}}
+    errors:
+      - {code: assertion-error, status: 0, retryable: false}
+    behavior:
+      - set:
+          vars.p: "= input.moe_parallel_config"
+      - set:
+          vars.b: "= has(vars.p.all2all_backend) ? vars.p.all2all_backend : 'allgather_reducescatter'"
+          vars.dp: "= has(vars.p.dp_size) ? vars.p.dp_size : 1"
+          vars.a2a: "= has(vars.p.use_ep) && vars.p.use_ep && ((has(vars.p.dp_size) ? vars.p.dp_size : 1) > 1 || (has(vars.p.pcp_size) ? vars.p.pcp_size : 1) > 1 || (has(vars.p.is_sequence_parallel) && vars.p.is_sequence_parallel))"
+      - title: The experts dispatch and combine themselves in every EP topology
+        source: "vllm/model_executor/layers/fused_moe/all2all_utils.py:191-193"
+        if: "vars.b == 'passthrough'"
+        then:
+          - return: {prepare_finalize: PassThroughPrepareAndFinalize}
+      - title: No all-to-all kernels (use_all2all_kernels false)
+        source: "vllm/model_executor/layers/fused_moe/all2all_utils.py:195-222"
+        if: "!vars.a2a"
+        then:
+          - if: "!input.allow_new_interface"
+            then:
+              - return: {prepare_finalize: null}
+          - title: DP without --enable-expert-parallel falls back to AllGather+ReduceScatter
+            source: "vllm/model_executor/layers/fused_moe/all2all_utils.py:209-220"
+            if: "vars.dp > 1"
+            then:
+              - return: {prepare_finalize: MoEPrepareAndFinalizeNaiveDPEP}
+          - source: "vllm/model_executor/layers/fused_moe/all2all_utils.py:221-222"
+            return: {prepare_finalize: MoEPrepareAndFinalizeNoDPEP}
+      - title: DeepEP low-latency needs a quant config
+        source: "vllm/model_executor/layers/fused_moe/all2all_utils.py:242-243"
+        if: "vars.b == 'deepep_low_latency' && !input.has_quant_config"
+        then:
+          - fail: {code: assertion-error, status: 0, message: "quant_config is required for DeepEP low-latency"}
+      - title: One prepare/finalize per all2all backend; allgather_reducescatter only under the new interface
+        source: "vllm/model_executor/layers/fused_moe/all2all_utils.py:229-440"
+        set:
+          vars.pf: "= {'deepep_high_throughput': 'DeepEPHTPrepareAndFinalize', 'deepep_low_latency': 'DeepEPLLPrepareAndFinalize', 'deepep_v2': 'DeepEPV2PrepareAndFinalize', 'moonep': 'MoonEPPrepareAndFinalize', 'mori_high_throughput': 'MoriPrepareAndFinalize', 'mori_low_latency': 'MoriPrepareAndFinalize', 'flashinfer_all2allv': 'FlashInferNVLinkTwoSidedPrepareAndFinalize', 'flashinfer_nvlink_two_sided': 'FlashInferNVLinkTwoSidedPrepareAndFinalize', 'flashinfer_nvlink_one_sided': 'FlashInferNVLinkOneSidedPrepareAndFinalize', 'nixl_ep': 'NixlEPPrepareAndFinalize'}"
+      - if: "vars.b == 'allgather_reducescatter'"
+        then:
+          - return: {prepare_finalize: "= input.allow_new_interface ? dyn('MoEPrepareAndFinalizeNaiveDPEP') : dyn(null)"}
+      - return: {prepare_finalize: "= vars.b in vars.pf ? dyn(vars.pf[vars.b]) : dyn(null)"}
+
+  - component: fused-moe-kernel
+    name: init
+    kind: function
+    summary: "FusedMoEKernel.__init__: modular prepare/finalize + modular experts -> modular impl, monolithic + monolithic -> monolithic impl, else ValueError; then the activation formats must match. moe_config and supports_lora come from the experts."
+    sources: ["vllm/model_executor/layers/fused_moe/modular_kernel.py:1612-1682"]
+    request:
+      type: object
+      required: [prepare_finalize, fused_experts]
+      properties:
+        prepare_finalize: {type: object, description: "{name, monolithic, activation_format (standard|batched), supports_async}"}
+        fused_experts: {type: object, description: "{name, monolithic, activation_format, moe_config, supports_lora}"}
+    response: {type: object, properties: {impl: {type: string}, is_monolithic: {type: boolean}, can_overlap_shared_experts: {type: boolean}, moe_config: {}}}
+    errors:
+      - {code: value-error, status: 0, retryable: false}
+      - {code: assertion-error, status: 0, retryable: false}
+    behavior:
+      - title: Both modular or both monolithic
+        source: "vllm/model_executor/layers/fused_moe/modular_kernel.py:1622-1645"
+        if: "input.prepare_finalize.monolithic != input.fused_experts.monolithic"
+        then:
+          - fail: {code: value-error, status: 0, message: "= 'prepare_finalize and fused_experts must both be either monolithic or non-monolithic but got ' + input.prepare_finalize.name + ' and ' + input.fused_experts.name"}
+      - title: _post_init_setup - the activation formats must agree
+        source: "vllm/model_executor/layers/fused_moe/modular_kernel.py:1674-1682"
+        if: "input.prepare_finalize.activation_format != input.fused_experts.activation_format"
+        then:
+          - fail: {code: assertion-error, status: 0, message: "prepare_finalize.activation_format != fused_experts.activation_format()"}
+      - source: "vllm/model_executor/layers/fused_moe/modular_kernel.py:1649-1670"
+        return:
+          impl: "= input.fused_experts.monolithic ? 'FusedMoEKernelMonolithicImpl' : 'FusedMoEKernelModularImpl'"
+          is_monolithic: "= input.fused_experts.monolithic"
+          can_overlap_shared_experts: "= !input.fused_experts.monolithic && has(input.prepare_finalize.supports_async) && input.prepare_finalize.supports_async"
+          moe_config: "= has(input.fused_experts.moe_config) ? input.fused_experts.moe_config : null"
+
+  - component: fused-moe-kernel
+    name: experts-activation
+    kind: function
+    summary: "FusedMoEExpertsModular.activation: apply the MoE activation with the experts' activation config (clamp limit) through apply_moe_activation; the output width is N/2 for gated activations."
+    sources: ["vllm/model_executor/layers/fused_moe/modular_kernel.py:879-897", "vllm/model_executor/layers/fused_moe/modular_kernel.py:860-877"]
+    request:
+      type: object
+      required: [activation, num_tokens, n]
+      properties:
+        activation: {type: string, examples: [silu]}
+        num_tokens: {type: integer, examples: [16]}
+        n: {type: integer, examples: [28672]}
+        clamp_limit: {type: [number, "null"], default: null}
+        has_expert_map: {type: boolean, default: false}
+    response: {type: object, properties: {activation_out_dim: {type: integer}}}
+    errors:
+      - {code: value-error, status: 0, retryable: false}
+    behavior:
+      - call: moe-activation.from-str
+        input: {s: "= input.activation"}
+        as: act
+      - title: adjust_N_for_activation - gated activations halve N
+        source: "vllm/model_executor/layers/fused_moe/modular_kernel.py:870-877"
+        set: {vars.d: "= vars.act.value.is_gated ? input.n / 2 : input.n"}
+      - source: "vllm/model_executor/layers/fused_moe/modular_kernel.py:889-897"
+        call: fused-moe-activation.apply-moe-activation
+        input: {activation: "= vars.act.value.value", num_tokens: "= input.num_tokens", d: "= vars.d", clamp_limit: "= input.clamp_limit", has_expert_map: "= input.has_expert_map", layer_repeat: 1}
+      - return: {activation_out_dim: "= vars.d"}
+
+  - component: fused-moe-kernel
+    name: experts-quant-accessors
+    kind: function
+    summary: "FusedMoEExperts quantization accessors (quant_dtype, weight_quant_dtype, block_shape, per_act_token_quant, per_out_ch_quant, a1/a2/w1/w2 scales): each reads the experts' FusedMoEQuantConfig."
+    sources: ["vllm/model_executor/layers/fused_moe/modular_kernel.py:678-722"]
+    request:
+      type: object
+      properties:
+        quant_dtype: {type: [string, "null"], default: null}
+        per_act_token_quant: {type: boolean, default: false}
+        per_out_ch_quant: {type: boolean, default: false}
+        block_shape: {type: [array, "null"], items: {type: integer}, default: null}
+        has_w1_scale: {type: boolean, default: false}
+        has_w2_scale: {type: boolean, default: false}
+    response: {type: object}
+    errors:
+      - {code: assertion-error, status: 0, retryable: false}
+    behavior:
+      - title: self.quant_config (built by the MoE method's get_fused_moe_quant_config)
+        source: "vllm/model_executor/layers/fused_moe/modular_kernel.py:678-722"
+        call: fused-moe-quant-config.make
+        input: {quant_dtype: "= input.quant_dtype", per_act_token_quant: "= input.per_act_token_quant", per_out_ch_quant: "= input.per_out_ch_quant", block_shape: "= input.block_shape", has_w1_scale: "= input.has_w1_scale", has_w2_scale: "= input.has_w2_scale"}
+        as: q
+      - return:
+          quant_dtype: "= vars.q.value.quant_dtype"
+          weight_quant_dtype: "= vars.q.value.weight_quant_dtype"
+          block_shape: "= vars.q.value.block_shape"
+          per_act_token_quant: "= vars.q.value.per_act_token_quant"
+          per_out_ch_quant: "= vars.q.value.per_out_ch_quant"
+          w1_scale: "= vars.q.value.w1_scale"
+          w2_scale: "= vars.q.value.w2_scale"

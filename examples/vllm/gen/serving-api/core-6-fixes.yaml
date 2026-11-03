@@ -1,0 +1,199 @@
+# Fix round: tool parsing, /score, LLM.encode through the engine, feature flows.
+components:
+  - id: llama3-json-tool-parser
+    name: Llama3JsonToolParser
+    kind: module
+    parent: api-server
+    layer: parsers
+    summary: "--tool-call-parser llama3_json: JSON tool calls ({\"name\", \"arguments\"|\"parameters\"}) after an optional <|python_tag|>; adjust_request forces a JSON schema for required/named tool choice."
+    sources: ["vllm/tool_parsers/llama_tool_parser.py:34-160", "vllm/tool_parsers/abstract_tool_parser.py:122-165"]
+
+interfaces:
+  - component: llama3-json-tool-parser
+    name: adjust-request
+    kind: function
+    summary: "ToolParser.adjust_request: with tools and no structural tag, tool_choice required (or a named function) forces structured_outputs.json from the tools' schema and clears response_format."
+    sources: ["vllm/tool_parsers/abstract_tool_parser.py:122-165"]
+    request: {type: object, properties: {body: {type: object}}, required: [body]}
+    behavior:
+      - if: "!has(input.body.tools) || input.body.tools == null || size(input.body.tools) == 0"
+        then: [{title: No tools, source: "vllm/tool_parsers/abstract_tool_parser.py:126-128", return: "= input.body"}]
+      - if: "has(input.body.structured_outputs) && input.body.structured_outputs != null && has(input.body.structured_outputs.structural_tag) && input.body.structured_outputs.structural_tag != null"
+        then: [{title: An existing structural tag wins, source: "vllm/tool_parsers/abstract_tool_parser.py:133-138", return: "= input.body"}]
+      - title: "get_json_schema_from_tools: required -> an array of {name, parameters} over every tool; a named function -> that tool's parameters; auto -> none"
+        source: "vllm/tool_parsers/utils.py:449-500"
+        set:
+          vars.schema: "= input.body.tool_choice == 'required' ? dyn({'type': 'array', 'minItems': 1, 'items': {'anyOf': input.body.tools.map(t, {'type': 'object', 'properties': {'name': {'enum': [t.function.name]}, 'parameters': has(t.function.parameters) ? t.function.parameters : {}}, 'required': ['name', 'parameters']})}}) : (type(input.body.tool_choice) == map ? dyn(input.body.tools.filter(t, t.function.name == input.body.tool_choice.function.name).map(t, has(t.function.parameters) ? t.function.parameters : {})) : null)"
+      - if: "type(input.body.tool_choice) == map && size(vars.schema) == 0"
+        then: [{source: "vllm/tool_parsers/utils.py:483-484", fail: {code: value-error, message: "= 'Tool \\'' + input.body.tool_choice.function.name + '\\' has not been passed in `tools`.'"}}]
+      - if: "vars.schema == null"
+        then: [{return: "= input.body"}]
+      - title: "structured_outputs = StructuredOutputsParams(json=schema); response_format = None"
+        source: "vllm/tool_parsers/abstract_tool_parser.py:152-161"
+        return: "= merge(input.body, {'structured_outputs': {'json': type(vars.schema) == list ? vars.schema[0] : vars.schema}, 'response_format': null})"
+  - component: llama3-json-tool-parser
+    name: extract-tool-calls
+    kind: function
+    summary: "Llama3JsonToolParser.extract_tool_calls: decode the JSON objects in the output; each needs name and arguments (or parameters); any failure returns the text as content."
+    sources: ["vllm/tool_parsers/llama_tool_parser.py:76-160"]
+    request: {type: object, properties: {model_output: {type: string, examples: ["{\"name\": \"get_weather\", \"parameters\": {\"city\": \"Paris\"}}"]}}, required: [model_output]}
+    behavior:
+      - if: "!(input.model_output.contains('<|python_tag|>') || input.model_output.contains('{'))"
+        then: [{title: Quick check -- no bot token and no brace, source: "vllm/tool_parsers/llama_tool_parser.py:83-87", return: {tools_called: false, tool_calls: [], content: "= input.model_output"}}]
+      - set:
+          vars.objs: "= input.model_output.replace('<|python_tag|>', '').split(';').map(s, s.trim()).filter(s, s != '')"
+      - title: "Every JSON object must decode and carry name and arguments/parameters; otherwise the whole output is content"
+        source: "vllm/tool_parsers/llama_tool_parser.py:94-146"
+        if: "!vars.objs.all(s, s.matches('(?s)^\\\\{.*\\\\}$'))"
+        then: [{return: {tools_called: false, tool_calls: [], content: "= input.model_output"}}]
+      - set:
+          vars.parsed: "= vars.objs.map(s, eval(s, {}))"
+      - if: "!vars.parsed.all(o, type(o) == map && 'name' in o && ('arguments' in o || 'parameters' in o))"
+        then: [{title: Missing required key, source: "vllm/tool_parsers/llama_tool_parser.py:127-137", return: {tools_called: false, tool_calls: [], content: "= input.model_output"}}]
+      - source: "vllm/tool_parsers/llama_tool_parser.py:110-126"
+        return:
+          tools_called: true
+          tool_calls: "= vars.parsed.map(o, {'type': 'function', 'function': {'name': o['name'], 'arguments': 'arguments' in o ? o['arguments'] : o['parameters']}})"
+          content: null
+  # ------------------------------------------------------------------ /score
+  - component: serving-scores
+    name: serve-score
+    kind: function
+    summary: "ServingScores: the IO processor follows the model's pooling task. An embedding model is a bi-encoder: encode queries and documents with the embed task, then one cosine score per (query, document) pair; a classifier scores each pair with the score task."
+    sources: ["vllm/entrypoints/pooling/scoring/serving.py:46-110", "vllm/entrypoints/pooling/scoring/io_processor.py:216-357"]
+    request: {type: object, properties: {body: {type: object, properties: {model: {type: string, examples: [llama-8b]}, queries: {type: [string, array], examples: ["What is the capital of France?"]}, documents: {type: [string, array], examples: [The capital of France is Paris.]}}}, prefix: {type: string, default: score}, x_request_id: {type: [string, "null"]}}, required: [body]}
+    errors: [{code: value-error, status: 0}]
+    behavior:
+      - call: base-serving.check-model
+        input: {model: "= has(input.body.model) ? input.body.model : ''"}
+        as: model
+      - call: app-state.supported-tasks
+        as: tasks
+      - set:
+          vars.q: "= has(input.body.queries) ? (type(input.body.queries) == string ? [input.body.queries] : input.body.queries) : (has(input.body.query) ? [input.body.query] : (has(input.body.text_1) ? [input.body.text_1] : []))"
+          vars.d: "= has(input.body.documents) ? (type(input.body.documents) == string ? [input.body.documents] : input.body.documents) : (has(input.body.text_2) ? (type(input.body.text_2) == string ? [input.body.text_2] : input.body.text_2) : [])"
+          vars.rid: "= (has(input.prefix) ? input.prefix : 'score') + '-' + (has(input.x_request_id) && input.x_request_id != null ? input.x_request_id : id('random-uuid', seq('random-uuid')))"
+      - title: "valid_inputs: one query against N documents, or N against N"
+        source: "vllm/entrypoints/pooling/scoring/io_processor.py:223-260"
+        if: "size(vars.q) == 0 || size(vars.d) == 0 || (size(vars.q) != 1 && size(vars.q) != size(vars.d))"
+        then: [{fail: {code: value-error, message: "queries and documents must be 1:N or N:N"}}]
+      - if: "!('embed' in vars.tasks.value)"
+        then:
+          - title: "Cross-encoder: one request per pair with the classify task (CrossEncoderIOProcessor.pooling_task)"
+            source: "vllm/entrypoints/pooling/scoring/io_processor.py:560-640"
+            parallel: "= lists.range(size(vars.d))"
+            as: j
+            steps:
+              - call: base-renderer.tokenize-prompt
+                input: {prompt: "= (size(vars.q) == 1 ? vars.q[0] : vars.q[vars.j]) + ' ' + vars.d[vars.j]"}
+                as: tok
+              - call: async-llm.encode
+                input: {request_id: "= vars.rid + '-' + string(vars.j)", prompt_token_ids: "= vars.tok.value.prompt_token_ids", pooling_params: {task: classify}}
+                as: e
+                on_error: continue
+              - return: "= {'error': vars.e.ok ? null : vars.e.error, 'score': !vars.e.ok || vars.e.value == null || !has(vars.e.value.outputs) ? 0.0 : double(vars.e.value.outputs.data[0])}"
+            join: {need: all}
+            as_result: outs
+          - foreach: "= vars.outs.results"
+            as: o
+            steps:
+              - if: "vars.o.value.error != null"
+                then: [{fail: "= vars.o.value.error"}]
+          - call: serving-scores.build-response
+            input: {prefix: "= has(input.prefix) ? input.prefix : 'score'", request_id: "= vars.rid", model_name: "= vars.model.value.model_name", scores: "= vars.outs.results.sortBy(r, r.index).map(r, r.value.score)", documents: "= vars.d", top_n: "= has(input.body.top_n) && input.body.top_n != null ? input.body.top_n : 0", num_prompt_tokens: "= size(vars.q) + size(vars.d)"}
+            as: resp
+          - return: "= vars.resp.value"
+      - title: "Bi-encoder: embed queries + documents (one encode each), merged"
+        source: "vllm/entrypoints/pooling/scoring/io_processor.py:262-300"
+        parallel: "= vars.q + vars.d"
+        as: text
+        steps:
+          - call: base-renderer.tokenize-prompt
+            input: {prompt: "= vars.text"}
+            as: tok
+          - call: async-llm.encode
+            input: {request_id: "= vars.rid + '-' + string(vars.index)", prompt_token_ids: "= vars.tok.value.prompt_token_ids", pooling_params: {task: embed}}
+            as: e
+            on_error: continue
+          - return: "= {'error': vars.e.ok ? null : vars.e.error, 'emb': !vars.e.ok || vars.e.value == null || !has(vars.e.value.outputs) || !has(vars.e.value.outputs.data) ? [1.0] : vars.e.value.outputs.data}"
+        join: {need: all}
+        as_result: outs
+      - foreach: "= vars.outs.results"
+        as: o
+        steps:
+          - if: "vars.o.value.error != null"
+            then: [{fail: "= vars.o.value.error"}]
+      - title: "post_process: cosine similarity per pair (query i against document i, or the one query against every document)"
+        source: "vllm/entrypoints/pooling/scoring/io_processor.py:320-357"
+        set:
+          vars.emb: "= vars.outs.results.map(r, r.value.emb)"
+      - set:
+          vars.scores: "= lists.range(size(vars.d)).map(j, [vars.emb[size(vars.q) == 1 ? 0 : j], vars.emb[size(vars.q) + j]]).map(p, size(p[0]) == size(p[1]) ? sum(lists.range(size(p[0])).map(k, double(p[0][k]) * double(p[1][k]))) / (math.sqrt(sum(p[0].map(x, double(x) * double(x)))) * math.sqrt(sum(p[1].map(x, double(x) * double(x)))) + 1e-12) : 0.0)"
+      - call: serving-scores.build-response
+        input: {prefix: "= has(input.prefix) ? input.prefix : 'score'", request_id: "= vars.rid", model_name: "= vars.model.value.model_name", scores: "= vars.scores", documents: "= vars.d", top_n: "= has(input.body.top_n) && input.body.top_n != null ? input.body.top_n : 0", num_prompt_tokens: "= size(vars.q) + size(vars.d)"}
+        as: resp
+      - return: "= vars.resp.value"
+  - component: serving-scores
+    name: build-response
+    kind: function
+    summary: "_request_output_to_score_response / _request_output_to_rerank_response: /score answers a ScoreResponse (one ScoreResponseData per pair, in order); /rerank answers a RerankResponse with results sorted by relevance and cut to top_n."
+    sources: ["vllm/entrypoints/pooling/scoring/serving.py:108-187", "vllm/entrypoints/pooling/scoring/protocol.py:160-184"]
+    request: {type: object, properties: {prefix: {type: string, examples: [score]}, request_id: {type: string}, model_name: {type: string}, scores: {type: array, items: {type: number}}, documents: {type: array}, top_n: {type: integer, default: 0}, num_prompt_tokens: {type: integer}}, required: [scores]}
+    behavior:
+      - if: "input.prefix == 'rerank'"
+        then:
+          - title: "RerankResult per document (text documents), sorted by relevance_score descending; top_n below the document count truncates"
+            source: "vllm/entrypoints/pooling/scoring/serving.py:155-177"
+            set:
+              vars.results: "= lists.range(size(input.scores)).map(i, {'index': i, 'document': {'text': type(input.documents[i]) == string ? input.documents[i] : ''}, 'relevance_score': input.scores[i]}).sortBy(r, -r.relevance_score)"
+          - set:
+              vars.results: "= input.top_n > 0 && input.top_n < size(input.documents) ? vars.results.slice(0, input.top_n) : vars.results"
+          - source: "vllm/entrypoints/pooling/scoring/serving.py:179-187"
+            return: {id: "= input.request_id", model: "= input.model_name", results: "= vars.results", usage: {prompt_tokens: "= input.num_prompt_tokens", total_tokens: "= input.num_prompt_tokens"}}
+      - title: "ScoreResponse: one ScoreResponseData (index, object score, score) per pair; usage total = prompt tokens"
+        source: "vllm/entrypoints/pooling/scoring/serving.py:117-139"
+        return: {id: "= input.request_id", object: list, created: "= now / 1000", model: "= input.model_name", data: "= lists.range(size(input.scores)).map(j, {'index': j, 'object': 'score', 'score': input.scores[j]})", usage: {prompt_tokens: "= input.num_prompt_tokens", total_tokens: "= input.num_prompt_tokens"}}
+  # ------------------------------------------------------------------ LLM.encode through the engine
+  - component: llm
+    name: run-tiling-engine
+    kind: function
+    summary: "_run_tiling_engine: add requests in windows of max_num_seqs * 2 through LLMEngine.add_request, step until the window finishes, keep the outputs in request order; abort what was added on an exception."
+    sources: ["vllm/entrypoints/pooling/offline.py:396-479"]
+    request: {type: object, properties: {prompts: {type: array, items: {type: string}}, pooling_task: {type: string}}, required: [prompts, pooling_task]}
+    errors: [{code: value-error, status: 0}]
+    behavior:
+      - if: "size(input.prompts) == 0"
+        then: [{source: "vllm/entrypoints/pooling/offline.py:403-404", fail: {code: value-error, message: You must pass at least one prompt}}]
+      - set:
+          vars.window: "= config['max-num-seqs'] * 2"
+          vars.outputs: []
+          vars.ids: []
+      - title: "At most max_num_seqs * 2 requests in the core (ASSUMPTION: the code refills the core as requests finish; modeled as consecutive windows)"
+        source: "vllm/entrypoints/pooling/offline.py:406-468"
+        foreach: "= lists.range((size(input.prompts) + vars.window - 1) / vars.window)"
+        as: w
+        steps:
+          - set: {vars.batch: "= input.prompts.slice(vars.w * vars.window, math.least([size(input.prompts), (vars.w + 1) * vars.window]))"}
+          - foreach: "= vars.batch"
+            as: p
+            steps:
+              - call: base-renderer.tokenize-prompt
+                input: {prompt: "= vars.p"}
+                as: tok
+              - title: "LLMEngine.add_request with PoolingParams(task); abort the window on an exception"
+                source: "vllm/entrypoints/common/offline.py:568-586"
+                call: llm-engine.add-request
+                input: {request_id: "= string(state.request_counter)", prompt_token_ids: "= vars.tok.value.prompt_token_ids", sampling_params: {}, pooling_params: {task: "= input.pooling_task"}}
+                on_error:
+                  - when: "size(vars.ids) > 0"
+                    call: llm-engine.abort-request
+                    input: {request_ids: "= vars.ids", internal: true}
+                  - fail: "= error"
+              - set:
+                  vars.ids: "= vars.ids + [string(state.request_counter)]"
+                  state.request_counter: "= state.request_counter + 1"
+          - call: llm.run-engine
+            input: {num_requests: "= size(vars.batch)"}
+            as: out
+          - set: {vars.outputs: "= vars.outputs + vars.out.value"}
+      - return: "= vars.outputs"

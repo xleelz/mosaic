@@ -1,0 +1,37 @@
+schema_version: 1
+id: vllm
+scenarios:
+  - id: bench-k5
+    name: "K5 KV exhaustion (fcfs): the running request that needs a block preempts the last running request, which is freed and later recomputed from the prefix cache"
+    description: "--num-gpu-blocks-override 9: eight usable blocks (block 0 is the null block). Two 63-token prompts take four blocks each."
+    fixtures: [full-tp1-llama-8b]
+    config: {num-gpu-blocks-override: 9}
+    state:
+      block-pool: {num_gpu_blocks: 9}
+    steps:
+      - {flow: scheduler-add-request, as: a1, input: {request_id: chatcmpl-r1, prompt_segments: [{key: p1, num_tokens: 63}], sampling_params: {max_tokens: 50}}}
+      - {flow: scheduler-add-request, as: a2, at_ms: 1, input: {request_id: chatcmpl-r2, prompt_segments: [{key: p2, num_tokens: 63}], sampling_params: {max_tokens: 50}}}
+      - {flow: scheduler-schedule, as: s1, input: {}}
+      - {flow: scheduler-update-from-output, as: u1, input: {scheduler_output: "= steps.s1.result.value", model_runner_output: {req_ids: [chatcmpl-r1, chatcmpl-r2], sampled_token_ids: [[11], [21]]}}}
+      - {flow: scheduler-schedule, as: s2, input: {}}
+      - {flow: scheduler-update-from-output, as: u2, input: {scheduler_output: "= steps.s2.result.value", model_runner_output: {req_ids: [chatcmpl-r1, chatcmpl-r2], sampled_token_ids: [[12], [22]]}}}
+      - {flow: scheduler-schedule, as: s3, input: {}}
+      - {flow: scheduler-update-from-output, as: u3, input: {scheduler_output: "= steps.s3.result.value", model_runner_output: {req_ids: [chatcmpl-r1], sampled_token_ids: [[128009]]}}}
+      - {flow: scheduler-schedule, as: s4, input: {}}
+    expect:
+      - "steps.s1.result.value.num_scheduled_tokens == {'chatcmpl-r1': 63, 'chatcmpl-r2': 63}"
+      - "steps.s2.result.value.num_scheduled_tokens == {'chatcmpl-r1': 1, 'chatcmpl-r2': 1}"
+      # s3: r1 needs a 5th block, none is free: the last running request (r2) is preempted
+      - "steps.s3.result.value.num_scheduled_tokens == {'chatcmpl-r1': 1}"
+      - "steps.s3.result.value.preempted_req_ids == ['chatcmpl-r2']"
+      - "size(steps.s3.result.value.scheduled_cached_reqs.new_block_ids[0]) == 1"
+      # s4: r1 finished; r2 resumes as a new (resumed) request, recomputing past its surviving cached blocks (no swap)
+      - "steps.s4.result.value.scheduled_new_reqs.map(r, r.req_id) == ['chatcmpl-r2']"
+      - "steps.s4.result.value.scheduled_new_reqs[0].num_computed_tokens == 48"
+      - "steps.s4.result.value.num_scheduled_tokens == {'chatcmpl-r2': 17}"
+      - "state.scheduler.requests['chatcmpl-r2'].num_preemptions == 1 && state.scheduler.requests['chatcmpl-r2'].output_token_ids == [21, 22]"
+      # path
+      - "trace.filter(e, e.type == 'call.start' && e.interface == 'scheduler.preempt-request').map(e, e.input.request_id) == ['chatcmpl-r2']"
+      - "trace.filter(e, e.type == 'call.start' && e.interface == 'kv-cache-manager.free').map(e, e.input.request_id) == ['chatcmpl-r2', 'chatcmpl-r1']"
+      - "trace.exists(e, e.type == 'note' && e.title == 'Preemption this step; no waiting request is admitted')"
+      - "calls['custom-ops.swap-blocks-batch'] == 0 && calls['swap-blocks-triton.swap-blocks-batch'] == 0"

@@ -1,0 +1,601 @@
+scenarios:
+- id: wr-sample-greedy-no-processing
+  name: A greedy request needs no logits processing; only the Gumbel kernel (argmax at temperature 0) runs
+  fixtures:
+  - full-tp1-llama-8b
+  steps:
+  - flow: wr-execute-model
+    as: e
+    input:
+      scheduled_new_reqs:
+      - req_id: chatcmpl-abc123
+        prompt_token_ids:
+        - 128000
+        - 9906
+        - 1917
+        block_ids:
+        - 1
+        num_computed_tokens: 0
+        sampling_params:
+          temperature: 0.0
+      num_scheduled_tokens:
+        chatcmpl-abc123: 3
+      total_num_scheduled_tokens: 3
+  - flow: wr-sample-tokens
+    as: s
+  expect:
+  - size(steps.s.result.value.sampled_token_ids[0]) == 1
+  - '!state[''sampler@rank0''].slots[''1023''].needs_processing'
+  - calls['bad-words-state.apply'] == 0 && calls['logprob.compute-topk-scores'] == 0
+- id: wr-sample-random-topk-topp-minp
+  name: Temperature 0.7 with top_k, top_p and min_p runs temperature, min_p and both top-k/top-p kernels
+  fixtures:
+  - full-tp1-llama-8b
+  steps:
+  - flow: wr-execute-model
+    as: e
+    input:
+      scheduled_new_reqs:
+      - req_id: chatcmpl-abc123
+        prompt_token_ids:
+        - 128000
+        - 9906
+        - 1917
+        block_ids:
+        - 1
+        num_computed_tokens: 0
+        sampling_params:
+          temperature: 0.7
+          top_k: 50
+          top_p: 0.9
+          min_p: 0.05
+          seed: 7
+      num_scheduled_tokens:
+        chatcmpl-abc123: 3
+      total_num_scheduled_tokens: 3
+  - flow: wr-sample-tokens
+    as: s
+  expect:
+  - state['sampler@rank0'].slots['1023'].needs_processing && state['sampler@rank0'].slots['1023'].seeded
+  - trace.exists(e, e.type == 'call.end' && e.interface == 'topk-topp-triton.apply-top-k-top-p' && e.output.path == 'monolithic+split')
+  - size(steps.s.result.value.sampled_token_ids[0]) == 1
+- id: wr-sample-top-p-only-large-batch
+  name: Top-p alone on a small batch takes the split-row pipeline only
+  fixtures:
+  - full-tp1-llama-8b
+  steps:
+  - flow: wr-execute-model
+    as: e
+    input:
+      scheduled_new_reqs:
+      - req_id: chatcmpl-abc123
+        prompt_token_ids:
+        - 128000
+        - 9906
+        block_ids:
+        - 1
+        num_computed_tokens: 0
+        sampling_params:
+          temperature: 1.0
+          top_p: 0.9
+      num_scheduled_tokens:
+        chatcmpl-abc123: 2
+      total_num_scheduled_tokens: 2
+  - flow: wr-sample-tokens
+    as: s
+  - interface: topk-topp-triton.apply-top-k-top-p
+    caller: sampler
+    as: big
+    input:
+      batch_size: 128
+      topk_enabled: true
+      topp_enabled: false
+  expect:
+  - trace.exists(e, e.type == 'call.end' && e.interface == 'topk-topp-triton.apply-top-k-top-p' && e.output.path == 'split')
+  - steps.big.result.value.path == 'monolithic' && calls['gumbel.temperature-kernel'] == 0
+- id: wr-sample-penalties-bias-bad-words-logprobs
+  name: Penalties, logit bias, bad words and logprobs run in pipeline order; the bad word's last token is masked where its prefix completes
+  fixtures:
+  - full-tp1-llama-8b
+  steps:
+  - flow: wr-execute-model
+    as: e
+    input:
+      scheduled_new_reqs:
+      - req_id: chatcmpl-abc123
+        prompt_token_ids:
+        - 5
+        prefill_token_ids:
+        - 5
+        - 10
+        - 11
+        prompt_len: 1
+        block_ids:
+        - 1
+        num_computed_tokens: 0
+        sampling_params:
+          temperature: 1.0
+          repetition_penalty: 1.2
+          logit_bias:
+            '50': 2.0
+          bad_words_token_ids:
+          - - 10
+            - 11
+            - 60
+          - - 11
+            - 11
+            - 50
+          logprobs: 5
+          prompt_logprobs: 1
+      num_scheduled_tokens:
+        chatcmpl-abc123: 3
+      total_num_scheduled_tokens: 3
+  - flow: wr-sample-tokens
+    as: s
+  expect:
+  - calls['penalties-state.bincount-kernel'] == 1 && calls['logit-bias-state.bias-kernel'] == 1 && calls['penalties-state.penalties-kernel'] == 1
+  - 'trace.exists(e, e.type == ''call.end'' && e.interface == ''bad-words-state.apply'' && e.output.masked == [{''slot'': 1023, ''local_pos'': 0, ''token'': 60}])'
+- id: wr-sample-too-many-bad-words
+  name: More bad words than VLLM_MAX_NUM_BAD_WORDS fail when the request is added
+  flow: wr-execute-model
+  fixtures:
+  - full-tp1-llama-8b
+  config:
+    vllm-max-num-bad-words: 1
+  input:
+    scheduled_new_reqs:
+    - req_id: chatcmpl-abc123
+      prompt_token_ids:
+      - 5
+      block_ids:
+      - 1
+      num_computed_tokens: 0
+      sampling_params:
+        bad_words_token_ids:
+        - - 1
+          - 2
+        - - 3
+          - 4
+    num_scheduled_tokens:
+      chatcmpl-abc123: 1
+    total_num_scheduled_tokens: 1
+  expect:
+  - '!result.ok && result.error.code == ''value-error'' && result.error.message == ''Too many bad words: 2. The max number is 1.'''
+  - '!(''1023'' in state[''bad-words-state@rank0''].num_bad_words) && calls[''llama-for-causal-lm.forward''] == 0'
+- id: wr-sample-too-many-bad-word-tokens
+  name: Bad words longer than VLLM_MAX_BAD_WORDS_TOTAL_TOKENS in total are refused
+  fixtures:
+  - full-tp1-llama-8b
+  config:
+    vllm-max-bad-words-total-tokens: 3
+  steps:
+  - interface: bad-words-state.add-request
+    caller: sampler
+    as: a
+    input:
+      slot: 3
+      bad_words_token_ids:
+      - - 1
+        - 2
+      - - 3
+        - 4
+  expect:
+  - '!steps.a.result.ok && steps.a.result.error.message.startsWith(''Too many total bad word tokens: 4'')'
+  - '!(''3'' in state[''bad-words-state@rank0''].bad_words)'
+- id: wr-sample-structured-output
+  name: The grammar bitmask masks only structured-output requests; an empty id list returns at once
+  fixtures:
+  - full-tp1-llama-8b
+  steps:
+  - flow: wr-execute-model
+    as: e
+    input:
+      scheduled_new_reqs:
+      - req_id: chatcmpl-abc123
+        prompt_token_ids:
+        - 128000
+        - 9906
+        block_ids:
+        - 1
+        num_computed_tokens: 0
+        sampling_params:
+          temperature: 0.0
+      num_scheduled_tokens:
+        chatcmpl-abc123: 2
+      total_num_scheduled_tokens: 2
+  - flow: wr-sample-tokens
+    as: s
+    input:
+      grammar_output:
+        structured_output_request_ids:
+        - chatcmpl-abc123
+        grammar_bitmask:
+        - - 255
+  - interface: structured-outputs-worker.apply-grammar-bitmask
+    caller: gpu-model-runner
+    as: none
+    input:
+      structured_output_request_ids: []
+      batch_req_ids:
+      - chatcmpl-abc123
+  expect:
+  - trace.exists(e, e.type == 'call.end' && e.interface == 'structured-outputs-worker.apply-grammar-bitmask' && e.output.masked_req_ids == ['chatcmpl-abc123'])
+  - steps.none.result.value.masked_req_ids == [] && calls['structured-outputs-worker.apply-grammar-bitmask-kernel'] == 1
+- id: wr-sample-watermark-trace-replay-nans-thinking
+  name: Watermarking, trace replay, NaN counting, the sampling mask, batch sharding and a thinking budget all run their kernels
+  fixtures:
+  - full-tp1-llama-8b
+  config:
+    watermark-enabled: true
+    enable-trace-replay: true
+    vllm-compute-nans-in-logits: true
+    return-sampling-mask: true
+    enable-batch-sharded-sampling: true
+  steps:
+  - flow: wr-execute-model
+    as: e
+    input:
+      scheduled_new_reqs:
+      - req_id: chatcmpl-abc123
+        prompt_token_ids:
+        - 128000
+        - 9906
+        block_ids:
+        - 1
+        num_computed_tokens: 0
+        sampling_params:
+          temperature: 1.0
+          thinking_token_budget: 64
+      num_scheduled_tokens:
+        chatcmpl-abc123: 2
+      total_num_scheduled_tokens: 2
+  - flow: wr-sample-tokens
+    as: s
+  expect:
+  - calls['trace-replay-state.trace-replay-kernel'] == 1 && calls['gpu-logits-metrics.num-nans-kernel'] == 1 && calls['sampling-mask-tensors.compact-sampling-mask-kernel'] == 1
+- id: wr-sample-logprobs-extra-token-ids
+  name: Per-request logprob token ids fill an extra kernel
+  fixtures:
+  - full-tp1-llama-8b
+  steps:
+  - interface: logprob.compute-topk-scores
+    caller: sampler
+    as: lp
+    input:
+      num_rows: 2
+      num_logprobs: 5
+      extra_token_ids: 3
+  expect:
+  - trace.exists(e, e.type == 'call.start' && e.interface == 'logprob.topk-log-softmax-kernel')
+- id: oracle-build-worker-runner-3
+  name: 'test_v2_bad_words_slot_reuse_clears_state: a slot recycled from a bad-words request stops masking'
+  description: 'Arrange: a request at slot 127 with bad word [10, 11, 60] (committed output [10, 11], drafts [12, 13]). Act: add_request(slot, SamplingParams()) on the same slot, then apply. Assert: num_bad_words[slot]
+    == 0 and no -inf in the logits (the kernel is not even launched).'
+  fixtures:
+  - full-tp1-llama-8b
+  steps:
+  - interface: bad-words-state.add-request
+    caller: sampler
+    as: first
+    input:
+      slot: 127
+      bad_words_token_ids:
+      - - 10
+        - 11
+        - 60
+  - interface: bad-words-state.add-request
+    caller: sampler
+    as: reuse
+    input:
+      slot: 127
+      bad_words_token_ids: []
+  - interface: bad-words-state.apply
+    caller: sampler
+    as: apply
+    input:
+      rows:
+      - slot: 127
+        context_token_ids:
+        - 10
+        - 11
+        drafts:
+        - 12
+        - 13
+  expect:
+  - steps.first.result.value.uses_bad_words && !steps.reuse.result.value.uses_bad_words
+  - state['bad-words-state@rank0'].num_bad_words['127'] == 0
+  - steps.apply.result.value.masked == [] && !steps.apply.result.value.kernel_launched
+- id: wr-bad-words-prefix-in-drafts
+  name: Bad-word prefixes are matched across committed and draft tokens at the completing position (sibling tests of the oracle file)
+  fixtures:
+  - full-tp1-llama-8b
+  steps:
+  - interface: bad-words-state.add-request
+    caller: sampler
+    as: a
+    input:
+      slot: 127
+      bad_words_token_ids:
+      - - 12
+        - 13
+        - 40
+      - - 11
+        - 12
+        - 30
+      - - 11
+        - 11
+        - 50
+  - interface: bad-words-state.apply
+    caller: sampler
+    as: apply
+    input:
+      rows:
+      - slot: 127
+        context_token_ids:
+        - 10
+        - 11
+        drafts:
+        - 12
+        - 13
+  expect:
+  - steps.apply.result.value.kernel_launched
+  - 'steps.apply.result.value.masked == [{''slot'': 127, ''local_pos'': 1, ''token'': 30}, {''slot'': 127, ''local_pos'': 2, ''token'': 40}]'
+  - calls['bad-words-state.bad-words-kernel'] == 1 && state['bad-words-state@rank0'].num_bad_words['127'] == 3
+- id: oracle-build-worker-runner-2
+  name: 'test_loads_v2_processors[ENTRYPOINT]: plugins load before the configured FQCN'
+  description: 'Arrange: one installed entry point resolving to DummyV2Processor; custom = [module:AltV2Processor]. Act: build_custom_logits_processors(None, req_states(max_num_reqs=4), False, custom).
+    Assert: types == [DummyV2Processor, AltV2Processor] and the request state''s max_num_reqs == 4. The CLASS and FQCN parametrizations are wr-logitsprocs-load-class and wr-logitsprocs-load-fqcn.'
+  flow: wr-load-logits-processors
+  fixtures:
+  - full-tp1-llama-8b
+  state:
+    logits-processor-loader:
+      installed_plugins:
+      - name: dummyv2processor
+        value: fake:DummyV2Processor
+      classes:
+        fake:DummyV2Processor:
+          cls: DummyV2Processor
+          is_type: true
+          v2: true
+        tests.v1.worker.test_logits_processor_loader:AltV2Processor:
+          cls: AltV2Processor
+          is_type: true
+          v2: true
+  input:
+    max_num_reqs: 4
+    custom:
+    - kind: fqcn
+      name: tests.v1.worker.test_logits_processor_loader:AltV2Processor
+  expect:
+  - result.ok && result.value.processors == ['DummyV2Processor', 'AltV2Processor']
+  - result.value.req_state.max_num_reqs == 4
+- id: wr-logitsprocs-load-class
+  name: 'test_loads_v2_processors[CLASS]: an already-loaded V2 class is accepted; load_model builds the configured one again'
+  fixtures:
+  - full-tp1-llama-8b
+  state:
+    logits-processor-loader:
+      classes:
+        DummyV2Processor:
+          cls: DummyV2Processor
+          is_type: true
+          v2: true
+  config:
+    logits-processors:
+    - kind: class
+      name: DummyV2Processor
+  steps:
+  - flow: wr-load-logits-processors
+    as: lp
+    input:
+      max_num_reqs: 4
+      custom:
+      - kind: class
+        name: DummyV2Processor
+  - flow: wr-load-model
+    as: load
+  expect:
+  - steps.lp.result.value.processors == ['DummyV2Processor'] && steps.lp.result.value.req_state.max_num_reqs == 4
+  - trace.filter(e, e.type == 'call.end' && e.interface == 'logits-processor-loader.build-custom-logits-processors').size() == 2
+- id: wr-logitsprocs-load-fqcn
+  name: 'test_loads_v2_processors[FQCN]: a <module>:<type> string resolves to the class'
+  flow: wr-load-logits-processors
+  fixtures:
+  - full-tp1-llama-8b
+  state:
+    logits-processor-loader:
+      classes:
+        tests.v1.worker.test_logits_processor_loader:DummyV2Processor:
+          cls: DummyV2Processor
+          is_type: true
+          v2: true
+  input:
+    max_num_reqs: 4
+    custom:
+    - kind: fqcn
+      name: tests.v1.worker.test_logits_processor_loader:DummyV2Processor
+  expect:
+  - result.value.processors == ['DummyV2Processor']
+- id: wr-logitsprocs-rejections
+  name: V1 classes, V1 plugins, malformed or unimportable FQCNs, non-types and pooling models are refused
+  fixtures:
+  - full-tp1-llama-8b
+  state:
+    logits-processor-loader:
+      classes:
+        DummyV1Processor:
+          cls: DummyV1Processor
+          is_type: true
+          v2: false
+        m:DummyV1Processor:
+          cls: DummyV1Processor
+          is_type: true
+          v2: false
+        m:not_a_processor:
+          cls: not_a_processor
+          is_type: false
+          v2: false
+  steps:
+  - flow: wr-load-logits-processors
+    as: v1cls
+    input:
+      custom:
+      - kind: class
+        name: DummyV1Processor
+  - flow: wr-load-logits-processors
+    as: v1fqcn
+    input:
+      custom:
+      - kind: fqcn
+        name: m:DummyV1Processor
+  - flow: wr-load-logits-processors
+    as: nontype
+    input:
+      custom:
+      - kind: fqcn
+        name: m:not_a_processor
+  - flow: wr-load-logits-processors
+    as: badfmt
+    input:
+      custom:
+      - kind: fqcn
+        name: no_colon_here
+  - flow: wr-load-logits-processors
+    as: missing
+    input:
+      custom:
+      - kind: fqcn
+        name: nowhere:Proc
+  - flow: wr-load-logits-processors
+    as: pooling
+    input:
+      is_pooling_model: true
+      custom:
+      - kind: class
+        name: DummyV1Processor
+  - flow: wr-load-logits-processors
+    as: poolok
+    input:
+      is_pooling_model: true
+      custom: []
+  expect:
+  - steps.v1cls.result.error.message.contains('is not a subclass') && steps.v1fqcn.result.error.code == 'value-error'
+  - steps.nontype.result.error.message == 'Loaded logit processor must be a type.'
+  - steps.badfmt.result.error.message.startsWith('Invalid logits processor FQCN') && steps.missing.result.error.code == 'runtime-error'
+  - steps.pooling.result.error.code == 'value-error' && steps.poolok.result.value.processors == []
+- id: wr-logitsprocs-v1-plugin-rejected
+  name: An installed V1-interface plugin is refused by the V2 loader; a broken entry point is a RuntimeError
+  fixtures:
+  - full-tp1-llama-8b
+  state:
+    logits-processor-loader:
+      installed_plugins:
+      - name: oldproc
+        value: pkg:OldProc
+      - name: broken
+        value: pkg:Missing
+      classes:
+        pkg:OldProc:
+          cls: OldProc
+          is_type: true
+          v2: false
+  steps:
+  - flow: wr-load-logits-processors
+    as: v1
+  expect:
+  - steps.v1.result.error.message.contains('V1-interface plugins are not supported')
+- id: wr-logitsprocs-broken-plugin
+  name: A plugin entry point that fails to load is a RuntimeError
+  flow: wr-load-logits-processors
+  fixtures:
+  - full-tp1-llama-8b
+  state:
+    logits-processor-loader:
+      installed_plugins:
+      - name: broken
+        value: pkg:Missing
+  expect:
+  - '!result.ok && result.error.code == ''runtime-error'' && result.error.message == ''Failed to load LogitsProcessor plugin broken'''
+- id: wr-logitsprocs-v1-loader
+  name: The V1 loader adds built-ins and plugins, rejects custom processors with spec decode or pooling
+  fixtures:
+  - full-tp1-llama-8b
+  state:
+    logits-processor-v1-loader:
+      installed_plugins:
+      - name: myproc
+        loadable: true
+  steps:
+  - interface: logits-processor-v1-loader.build-logitsprocs
+    caller: gpu-model-runner-v1
+    as: ok
+    input:
+      is_pooling_model: false
+      custom:
+      - m:Custom
+  - interface: logits-processor-v1-loader.build-logitsprocs
+    caller: gpu-model-runner-v1
+    as: pool
+    input:
+      is_pooling_model: true
+      custom:
+      - m:Custom
+  - interface: logits-processor-v1-loader.build-logitsprocs
+    caller: gpu-model-runner-v1
+    as: poolok
+    input:
+      is_pooling_model: true
+      custom: []
+  expect:
+  - steps.ok.result.value.processors == ['MinTokensLogitsProcessor', 'LogitBiasLogitsProcessor', 'MinPLogitsProcessor', 'myproc', 'm:Custom']
+  - steps.pool.result.error.code == 'value-error' && steps.poolok.result.value.processors == []
+  - trace.filter(e, e.type == 'call.start' && e.interface == 'logits-processor-v1-loader.build-logitsprocs').size() == 3
+- id: wr-logitsprocs-v1-loader-spec-and-broken
+  name: Under speculative decoding V1 keeps only MinTokens and rejects custom processors; a broken plugin is a RuntimeError
+  fixtures:
+  - full-tp1-llama-8b
+  config:
+    speculative-method: eagle3
+  state:
+    logits-processor-v1-loader:
+      installed_plugins:
+      - name: broken
+        loadable: false
+  steps:
+  - interface: logits-processor-v1-loader.build-logitsprocs
+    caller: gpu-model-runner-v1
+    as: spec
+    input:
+      is_pooling_model: false
+      custom: []
+  - interface: logits-processor-v1-loader.build-logitsprocs
+    caller: gpu-model-runner-v1
+    as: specbad
+    input:
+      is_pooling_model: false
+      custom:
+      - m:Custom
+  expect:
+  - steps.spec.result.value.processors == ['MinTokensLogitsProcessor']
+  - steps.specbad.result.error.message == 'Custom logits processors are not supported when speculative decoding is enabled.'
+  - trace.exists(e, e.type == 'call.start' && e.interface == 'logits-processor-v1-loader.build-logitsprocs')
+- id: wr-logitsprocs-v1-loader-broken
+  name: A V1 plugin that fails to import is a RuntimeError
+  fixtures:
+  - full-tp1-llama-8b
+  state:
+    logits-processor-v1-loader:
+      installed_plugins:
+      - name: broken
+        loadable: false
+  steps:
+  - interface: logits-processor-v1-loader.build-logitsprocs
+    caller: gpu-model-runner-v1
+    as: b
+    input:
+      is_pooling_model: false
+      custom: []
+  expect:
+  - steps.b.result.error.code == 'runtime-error'
+  - trace.exists(e, e.type == 'call.end' && e.interface == 'logits-processor-v1-loader.build-logitsprocs')

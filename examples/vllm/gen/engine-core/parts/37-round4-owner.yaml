@@ -1,0 +1,289 @@
+# Fix round 4: the owner coverage report (reconcile/round4/by-owner/coverage-engine-core.md).
+# Metrics accumulators, ConstantList and watermark resolution in code engine-core owns.
+components:
+  - id: caching-metrics
+    name: CachingMetrics
+    kind: module
+    parent: engine-core
+    layer: metrics
+    tags: [metrics]
+    summary: "Hit rate over the most recent N requests (prefix cache, connector cache, multimodal cache): a window of (requests, queries, hits) updates, reset by reset_prefix_cache."
+    sources: ["vllm/v1/metrics/stats.py:40-110"]
+    state:
+      schema: {type: object, properties: {window: {type: array}, requests: {type: integer}, queries: {type: integer}, hits: {type: integer}}}
+      initial: {window: [], requests: 0, queries: 0, hits: 0}
+  - id: request-spec-decode-metrics
+    name: RequestSpecDecodeMetrics
+    kind: module
+    parent: engine-core
+    layer: metrics
+    tags: [metrics]
+    summary: "Per-sequence speculative-decoding accumulator: a histogram of accepted draft tokens per verify step and the proposed-draft total; to_dict gives the response's metrics.speculative_decoding."
+    sources: ["vllm/v1/metrics/stats.py:349-422"]
+    state:
+      schema: {type: object, properties: {requests: {type: object}}}
+      initial: {requests: {}}
+  - id: lora-stats
+    name: LoRAStats
+    kind: module
+    parent: engine-core
+    layer: metrics
+    tags: [metrics]
+    summary: "Waiting and running request ids of one LoRA adapter, for the vllm:lora_requests_info gauge."
+    sources: ["vllm/v1/metrics/stats.py:645-665"]
+    state:
+      schema: {type: object, properties: {waiting: {type: array}, running: {type: array}}}
+      initial: {waiting: [], running: []}
+
+interfaces:
+  - component: caching-metrics
+    name: observe
+    kind: function
+    summary: "CachingMetrics.observe: a reset in the stats clears the window first; an update with no requests is not appended (it would push useful history out); otherwise append and drop the oldest updates while more than max_recent_requests requests remain, keeping the latest. MultiModalCacheStats.record builds such an update per request; hits are attributed to a CacheHitSource tier."
+    sources: ["vllm/v1/metrics/stats.py:59-98", "vllm/v1/metrics/stats.py:100-110", "vllm/v1/metrics/stats.py:181-185", "vllm/v1/metrics/cache_hit_source.py:10-29"]
+    request:
+      type: object
+      properties:
+        stats: {type: object, properties: {reset: {type: boolean, default: false}, requests: {type: integer}, queries: {type: integer}, hits: {type: integer}}}
+        max_recent_requests: {type: integer, default: 1000}
+    response: {type: object, properties: {empty: {type: boolean}, hit_rate: {type: number}}}
+    behavior:
+      - if: "has(input.stats.reset) && input.stats.reset"
+        then:
+          - title: "reset_prefix_cache ran before this update: reset the window"
+            source: "vllm/v1/metrics/stats.py:73-76"
+            set: {state.window: [], state.requests: 0, state.queries: 0, state.hits: 0}
+      - if: "input.stats.requests == 0"
+        then:
+          - title: "Empty stats are not appended (they would push history out of the window)"
+            source: "vllm/v1/metrics/stats.py:78-81"
+            return: {empty: "= state.requests == 0", hit_rate: "= state.queries == 0 ? 0.0 : double(state.hits) / double(state.queries)"}
+      - set:
+          vars.max: "= has(input.max_recent_requests) ? input.max_recent_requests : 1000"
+          vars.window: "= state.window + [[input.stats.requests, input.stats.queries, input.stats.hits]]"
+      - title: "Drop the oldest updates while over max_recent_requests, always keeping the latest"
+        source: "vllm/v1/metrics/stats.py:89-98"
+        foreach: "= lists.range(size(vars.window))"
+        as: i
+        steps:
+          - if: "size(vars.window) <= 1 || sum(vars.window.map(w, w[0])) <= vars.max"
+            then: [{break: true}]
+          - set: {vars.window: "= vars.window.slice(1, size(vars.window))"}
+      - set:
+          state.window: "= vars.window"
+          state.requests: "= sum(vars.window.map(w, w[0]))"
+          state.queries: "= sum(vars.window.map(w, w[1]))"
+          state.hits: "= sum(vars.window.map(w, w[2]))"
+      - return: {empty: "= state.requests == 0", hit_rate: "= state.queries == 0 ? 0.0 : double(state.hits) / double(state.queries)"}
+
+  - component: request-spec-decode-metrics
+    name: observe
+    kind: function
+    summary: "RequestSpecDecodeMetrics.new / observe / to_dict: one histogram bucket per accepted-draft count (0..num_spec_tokens); mean acceptance length counts the bonus token; the acceptance rate is draft-only."
+    sources: ["vllm/v1/metrics/stats.py:381-395", "vllm/v1/metrics/stats.py:397-422"]
+    request: {type: object, required: [request_id, num_spec_tokens, num_draft_tokens, num_accepted], properties: {request_id: {type: string}, num_spec_tokens: {type: integer}, num_draft_tokens: {type: integer}, num_accepted: {type: integer}, detailed: {type: boolean, default: false}}}
+    response: {type: object}
+    behavior:
+      - title: "RequestSpecDecodeMetrics.new: a zero histogram of num_spec_tokens + 1 buckets"
+        source: "vllm/v1/metrics/stats.py:381-386"
+        set:
+          vars.m: "= input.request_id in state.requests ? state.requests[input.request_id] : {'histogram': lists.range(input.num_spec_tokens + 1).map(i, 0), 'num_draft_tokens': 0, 'per_step_accepted': [], 'per_step_drafted': []}"
+      - if: "input.num_accepted < 0 || input.num_accepted >= size(vars.m.histogram)"
+        then:
+          - title: "histogram[num_accepted] out of range"
+            source: "vllm/v1/metrics/stats.py:390-391"
+            fail: {code: index-error, message: "list index out of range"}
+      - title: "observe: count the step in its bucket and add the proposed drafts"
+        source: "vllm/v1/metrics/stats.py:388-395"
+        set:
+          vars.m: "= {'histogram': lists.range(size(vars.m.histogram)).map(i, vars.m.histogram[i] + (i == input.num_accepted ? 1 : 0)), 'num_draft_tokens': vars.m.num_draft_tokens + input.num_draft_tokens, 'per_step_accepted': has(input.detailed) && input.detailed ? vars.m.per_step_accepted + [input.num_accepted] : vars.m.per_step_accepted, 'per_step_drafted': has(input.detailed) && input.detailed ? vars.m.per_step_drafted + [input.num_draft_tokens] : vars.m.per_step_drafted}"
+      - set: {state.requests: "= merge(state.requests, {input.request_id: vars.m})"}
+      - set:
+          vars.steps: "= sum(vars.m.histogram)"
+          vars.acc: "= sum(lists.range(size(vars.m.histogram)).map(j, j * vars.m.histogram[j]))"
+      - title: "to_dict: mean_acceptance_length = 1 + accepted / steps; draft_acceptance_rate = accepted / drafted"
+        source: "vllm/v1/metrics/stats.py:397-422"
+        return:
+          acceptance_histogram: "= vars.m.histogram"
+          num_spec_steps: "= vars.steps"
+          num_accepted_draft_tokens: "= vars.acc"
+          num_draft_tokens: "= vars.m.num_draft_tokens"
+          mean_acceptance_length: "= vars.steps == 0 ? 1.0 : 1.0 + double(vars.acc) / double(vars.steps)"
+          draft_acceptance_rate: "= vars.m.num_draft_tokens == 0 ? 0.0 : double(vars.acc) / double(vars.m.num_draft_tokens)"
+
+  - component: lora-stats
+    name: update
+    kind: function
+    summary: "LoRAStats.update: a request is waiting or running (never both); empty when neither set holds a request."
+    sources: ["vllm/v1/metrics/stats.py:652-665"]
+    request: {type: object, required: [request_id], properties: {request_id: {type: string}, waiting: {type: boolean, default: false}, running: {type: boolean, default: false}}}
+    response: {type: object, properties: {empty: {type: boolean}}}
+    errors: [{code: assertion-error, status: 0, retryable: false}]
+    behavior:
+      - if: "input.waiting && input.running"
+        then:
+          - title: "assert not (waiting and running)"
+            source: "vllm/v1/metrics/stats.py:653"
+            fail: {code: assertion-error, message: "not (waiting and running)"}
+      - set:
+          state.waiting: "= input.waiting ? (input.request_id in state.waiting ? state.waiting : state.waiting + [input.request_id]) : state.waiting.filter(r, r != input.request_id)"
+          state.running: "= input.running ? (input.request_id in state.running ? state.running : state.running + [input.request_id]) : state.running.filter(r, r != input.request_id)"
+      - title: "empty: no waiting and no running request"
+        source: "vllm/v1/metrics/stats.py:663-665"
+        return: {empty: "= size(state.waiting) == 0 && size(state.running) == 0"}
+
+  - component: output-processor
+    name: append-to-constant-list
+    kind: function
+    summary: "ConstantList (the read-only view vLLM hands out of a request's token lists): append and extend raise TypeError."
+    sources: ["vllm/v1/utils.py:48-56"]
+    request: {type: object, properties: {op: {type: string, enum: [append, extend], default: append}}}
+    errors: [{code: type-error, status: 0, retryable: false}]
+    behavior:
+      - if: "has(input.op) && input.op == 'extend'"
+        then:
+          - title: "ConstantList.extend"
+            source: "vllm/v1/utils.py:55-56"
+            fail: {code: type-error, message: "Cannot extend a constant list"}
+      - title: "ConstantList.append"
+        source: "vllm/v1/utils.py:52-53"
+        fail: {code: type-error, message: "Cannot append to a constant list"}
+
+  - component: input-processor
+    name: resolve-watermarking
+    kind: function
+    summary: "InputProcessor.resolve_watermarking -> VllmConfig._check_supports_watermarking: without an engine watermark_config the request runs unwatermarked (warning if it asked); a request that opts out (watermarking False) is not watermarked; otherwise it is. Requests that ask but can't get it count as watermark-skipped in RequestStateStats."
+    sources: ["vllm/v1/engine/input_processor.py:115-122", "vllm/config/vllm.py:1275-1290", "vllm/v1/metrics/stats.py:258-284"]
+    request: {type: object, properties: {watermarking: {type: ["boolean", "null"], default: null}}}
+    response: {type: object, properties: {watermarking: {type: boolean}, skipped: {type: boolean}}}
+    behavior:
+      - if: "!config['watermark-enabled']"
+        then:
+          - title: "No watermark_config: False (warn once if the request asked for it)"
+            source: "vllm/config/vllm.py:1281-1290"
+            return: {watermarking: false, skipped: "= has(input.watermarking) && input.watermarking == true"}
+      - if: "has(input.watermarking) && input.watermarking == false"
+        then:
+          - title: "The request opts out"
+            source: "vllm/v1/engine/input_processor.py:115-122"
+            return: {watermarking: false, skipped: false}
+      - return: {watermarking: true, skipped: false}
+
+  - component: ray-cluster
+    name: initialize-ray-cluster
+    kind: function
+    summary: "ray_utils.initialize_ray_cluster (the Ray executor's setup): reuse a given placement group after checking each bundle holds at most one device and there are world_size of them; otherwise require a device on the driver node, ask for world_size one-device bundles with the first pinned to the driver ('node:<ip>': 0.001), PACK them, and verify the driver is in the group."
+    sources: ["vllm/v1/executor/ray_utils.py:510-656", "vllm/v1/executor/ray_utils.py:281-317"]
+    request:
+      type: object
+      required: [world_size, driver_ip]
+      properties:
+        world_size: {type: integer, examples: [2]}
+        driver_ip: {type: string, examples: [127.0.0.1]}
+        require_gpu_on_driver: {type: boolean, default: true}
+        existing_bundles: {type: ["array", "null"], default: null, description: "bundle specs of an existing placement group, e.g. [{GPU: 1}]"}
+    response: {type: object, properties: {bundles: {type: array}, created: {type: boolean}}}
+    errors: [{code: value-error, status: 0, retryable: false}, {code: runtime-error, status: 0, retryable: false}]
+    behavior:
+      - if: "has(input.existing_bundles) && input.existing_bundles != null"
+        then:
+          - if: "input.existing_bundles.exists(b, has(b.GPU) && b.GPU > 1)"
+            then:
+              - title: "A bundle with more than one device"
+                source: "vllm/v1/executor/ray_utils.py:592-596"
+                fail: {code: value-error, message: "Placement group bundle cannot have more than 1 GPU."}
+          - if: "input.world_size > size(input.existing_bundles.filter(b, has(b.GPU) && b.GPU > 0))"
+            then:
+              - title: "Fewer device bundles than the world size"
+                source: "vllm/v1/executor/ray_utils.py:599-605"
+                fail: {code: value-error, message: "= 'The number of required GPUs exceeds the total number of available GPUs in the placement group. Required number of devices: ' + string(input.world_size) + '. Total number of devices: ' + string(size(input.existing_bundles.filter(b, has(b.GPU) && b.GPU > 0))) + '.'"}
+          - return: {bundles: "= input.existing_bundles", created: false}
+      - call: ray-cluster.available-resources-per-node
+        as: res
+      - set:
+          vars.driver: "= vars.res.value.filter(n, n.ip == input.driver_ip)"
+          vars.req: "= !has(input.require_gpu_on_driver) || input.require_gpu_on_driver"
+      - if: "vars.req && (size(vars.driver) == 0 || vars.driver[0].GPU < 1)"
+        then:
+          - title: "The driver node has no device: the engine can't start"
+            source: "vllm/v1/executor/ray_utils.py:629-637"
+            fail: {code: value-error, message: "= 'Current node has no GPU available. vLLM engine cannot start without GPU. Make sure you have at least 1 GPU available in a node current_ip=' + input.driver_ip + '.'"}
+      - title: "world_size one-device bundles; the first is pinned to the driver ('node:<ip>': 0.001); PACK fills the driver node first, then the other nodes in order"
+        source: "vllm/v1/executor/ray_utils.py:614-648"
+        set:
+          vars.order: "= (vars.req ? vars.driver : []) + vars.res.value.filter(n, !vars.req || n.ip != input.driver_ip)"
+      - set:
+          vars.slots: "= vars.order.map(n, lists.range(int(n.GPU)).map(i, n.ip)).flatten()"
+      - if: "size(vars.slots) < input.world_size"
+        then:
+          - title: "_wait_until_pg_ready: the group can never be placed"
+            source: "vllm/v1/executor/ray_utils.py:649"
+            fail: {code: value-error, message: "= 'Cannot provide a placement group of placement_group_specs=' + string(input.world_size) + ' GPU bundles within the timeout.'"}
+      - call: ray-cluster.placement-group
+        input: {name: "= 'vllm-ray-' + input.driver_ip", strategy: PACK, node_ip: "= input.driver_ip", num_devices: "= input.world_size"}
+      - set: {vars.bundles: "= vars.slots.slice(0, input.world_size).map(ip, {'GPU': 1, 'node_ip': ip})"}
+      - if: "vars.req && !vars.bundles.exists(b, b.node_ip == input.driver_ip)"
+        then:
+          - title: "_verify_bundles: the driver node must be in the group"
+            source: "vllm/v1/executor/ray_utils.py:309-317"
+            fail: {code: runtime-error, message: "driver node is not included in a placement group"}
+      - return: {bundles: "= vars.bundles", created: true}
+
+scenarios:
+  - id: engine-core-caching-metrics-window
+    name: The cache hit rate covers the most recent requests and resets with the prefix cache
+    fixtures: [full-tp1-llama-8b]
+    steps:
+      - {interface: caching-metrics.observe, caller: engine-core, as: a, input: {stats: {requests: 2, queries: 100, hits: 50}, max_recent_requests: 3}}
+      - {interface: caching-metrics.observe, caller: engine-core, as: z, input: {stats: {requests: 0, queries: 0, hits: 0}, max_recent_requests: 3}}
+      - {interface: caching-metrics.observe, caller: engine-core, as: b, input: {stats: {requests: 2, queries: 100, hits: 100}, max_recent_requests: 3}}
+      - {interface: caching-metrics.observe, caller: engine-core, as: r, input: {stats: {reset: true, requests: 1, queries: 10, hits: 0}, max_recent_requests: 3}}
+    expect:
+      - "steps.a.result.value.hit_rate == 0.5 && !steps.z.result.value.empty"
+      - "steps.b.result.value.hit_rate == 1.0"
+      - "steps.r.result.value.hit_rate == 0.0 && state['caching-metrics'].requests == 1"
+
+  - id: engine-core-spec-decode-request-metrics
+    name: Per-request spec-decode metrics histogram accepted drafts and report acceptance
+    fixtures: [full-tp1-llama-8b]
+    steps:
+      - {interface: request-spec-decode-metrics.observe, caller: engine-core, as: s1, input: {request_id: r, num_spec_tokens: 3, num_draft_tokens: 3, num_accepted: 3}}
+      - {interface: request-spec-decode-metrics.observe, caller: engine-core, as: s2, input: {request_id: r, num_spec_tokens: 3, num_draft_tokens: 3, num_accepted: 1}}
+      - {interface: request-spec-decode-metrics.observe, caller: engine-core, as: bad, input: {request_id: r, num_spec_tokens: 3, num_draft_tokens: 3, num_accepted: 4}}
+    expect:
+      - "steps.s2.result.value.acceptance_histogram == [0, 1, 0, 1] && steps.s2.result.value.mean_acceptance_length == 3.0"
+      - "steps.s2.result.value.num_draft_tokens == 6 && steps.s2.result.value.draft_acceptance_rate > 0.66 && steps.s2.result.value.draft_acceptance_rate < 0.67"
+      - "!steps.bad.result.ok && state['request-spec-decode-metrics'].requests['r'].num_draft_tokens == 6"
+
+  - id: engine-core-lora-stats-and-constant-list
+    name: LoRA stats track waiting and running ids; ConstantList refuses appends; watermark resolution
+    fixtures: [full-tp1-llama-8b]
+    steps:
+      - {interface: lora-stats.update, caller: engine-core, as: w, input: {request_id: a, waiting: true}}
+      - {interface: lora-stats.update, caller: engine-core, as: r, input: {request_id: a, running: true}}
+      - {interface: lora-stats.update, caller: engine-core, as: d, input: {request_id: a}}
+      - {interface: lora-stats.update, caller: engine-core, as: both, input: {request_id: b, waiting: true, running: true}}
+      - {interface: output-processor.append-to-constant-list, caller: engine-core, as: app}
+      - {interface: input-processor.resolve-watermarking, caller: api-server, as: wm, input: {watermarking: true}}
+    expect:
+      - "!steps.w.result.value.empty && !steps.r.result.value.empty && steps.d.result.value.empty && !steps.both.result.ok"
+      - "state['lora-stats'].waiting == [] && state['lora-stats'].running == []"
+      - "!steps.app.result.ok && steps.app.result.error.message == 'Cannot append to a constant list'"
+      - "!steps.wm.result.value.watermarking && steps.wm.result.value.skipped"
+
+  - id: engine-core-ray-initialize-cluster-pins-driver
+    name: initialize_ray_cluster pins the first bundle to the driver, so the workers land on its node
+    description: "tests/distributed/test_multi_node_assignment.py:31: ParallelConfig(1, 2) on a two-node cluster: both GPU bundles are placed on the driver's node (PACK, first bundle pinned). A driver without a GPU can't start; an existing group with a 2-GPU bundle is refused."
+    fixtures: [full-tp1-llama-8b]
+    state:
+      ray-cluster: {nodes: [{ip: 10.0.0.9, GPU: 8}, {ip: 10.0.0.1, GPU: 2}]}
+    steps:
+      - {interface: ray-cluster.initialize-ray-cluster, caller: engine-core, as: pg, input: {world_size: 2, driver_ip: 10.0.0.1}}
+      - {interface: ray-cluster.initialize-ray-cluster, caller: engine-core, as: three, input: {world_size: 3, driver_ip: 10.0.0.1}}
+      - {interface: ray-cluster.initialize-ray-cluster, caller: engine-core, as: nogpu, input: {world_size: 2, driver_ip: 10.0.0.5}}
+      - {interface: ray-cluster.initialize-ray-cluster, caller: engine-core, as: big, input: {world_size: 2, driver_ip: 10.0.0.1, existing_bundles: [{GPU: 2}]}}
+    expect:
+      - "steps.pg.result.value.bundles.all(b, b.node_ip == '10.0.0.1') && size(steps.pg.result.value.bundles) == 2"
+      - "steps.three.result.value.bundles.map(b, b.node_ip) == ['10.0.0.1', '10.0.0.1', '10.0.0.9']"
+      - "!steps.nogpu.result.ok && steps.nogpu.result.error.code == 'value-error' && !steps.big.result.ok"
+      - "trace.exists(e, e.type == 'call.start' && e.interface == 'ray-cluster.placement-group' && e.input.strategy == 'PACK')"

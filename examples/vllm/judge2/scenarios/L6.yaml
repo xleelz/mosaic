@@ -1,0 +1,35 @@
+schema_version: 1
+id: vllm
+scenarios:
+  - id: bench-l6
+    name: "L6 runtime LoRA load, then a chat request on the adapter"
+    fixtures: [full-tp1-llama-8b]
+    config: {enable-lora: true, vllm-allow-runtime-lora-updating: true}
+    max_events: 500000
+    max_iterations: 100000
+    state:
+      local-disk:
+        files:
+          /adapters/sql/adapter_config.json: {content: '{"r": 16, "lora_alpha": 32, "target_modules": ["q_proj", "k_proj", "v_proj", "o_proj"], "base_model_name_or_path": "meta-llama/Llama-3.1-8B-Instruct"}', json: {base_model_name_or_path: meta-llama/Llama-3.1-8B-Instruct, lora_alpha: 32, r: 16, target_modules: [q_proj, k_proj, v_proj, o_proj]}, size: 160}
+          /adapters/sql/adapter_model.safetensors: {size: 54525952}
+    steps:
+      - {flow: serving-api-lora-load, input: {path: /v1/load_lora_adapter, body: {lora_name: sql, lora_path: /adapters/sql, load_inplace: false}}, as: load}
+      - {flow: serving-api-models-list, as: models}
+      - flow: serving-api-chat-completion
+        input: {path: /v1/chat/completions, body: {model: sql, messages: [{role: user, content: "Write a SQL query that lists every customer who placed an order in the last thirty days"}], max_tokens: 4, stream: false}}
+        as: chat
+    expect:
+      # (a) checked, a new lora_int_id from the counter, add_lora through the engine core to the worker's LRU manager
+      - "state['openai-serving-models'].lora_id_counter == 1 && state['openai-serving-models'].lora_requests['sql'].lora_int_id == 1"
+      - "trace.exists(e, e.type == 'call.start' && e.interface == 'engine-core.add-lora') && trace.exists(e, e.type == 'call.start' && e.interface == 'lru-cache-worker-lora-manager.add-adapter' && e.instance == 'rank0')"
+      - "1 in state['lru-cache-lora-model-manager@rank0'].registered"
+      # (b) 200 and the success text
+      - "steps.load.result.ok && steps.load.result.value.message == \"Success: LoRA adapter 'sql' added successfully.\""
+      # (c) /v1/models lists sql, parented to llama-8b
+      - "steps.models.result.value.data.exists(m, m.id == 'sql' && m.parent == 'llama-8b' && m.root == '/adapters/sql' && m.object == 'model')"
+      - "steps.models.result.value.data.exists(m, m.id == 'llama-8b')"
+      # (d) the chat runs with the adapter's LoRARequest; its blocks are hashed with the LoRA name and path
+      - "steps.chat.result.ok"
+      - "trace.exists(e, e.type == 'call.start' && e.interface == 'async-llm.generate' && has(e.input.lora_request) && e.input.lora_request.lora_name == 'sql')"
+      - "trace.exists(e, e.type == 'call.start' && e.interface == 'lru-cache-worker-lora-manager.set-active-adapters' && e.input.requests.exists(r, r.lora_int_id == 1))"
+      - "trace.exists(e, e.type == 'call.start' && e.interface == 'kv-cache-utils.request-block-hasher' && has(e.input.lora_name) && e.input.lora_name == 'sql')"

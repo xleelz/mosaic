@@ -1,0 +1,344 @@
+# distributed area, part 6: SimpleCPUOffloadConnector (scheduler role) with its
+# SimpleCPUOffloadScheduler manager (vllm/v1/simple_kv_offload/manager.py), eager store mode.
+schema_version: 1
+id: vllm
+
+configs:
+  - id: simple-cpu-offload-cpu-bytes
+    type: integer
+    value: 8589934592
+    default: 8589934592
+    summary: "kv_connector_extra_config.cpu_bytes_to_use: server-wide CPU KV capacity (8 GiB default), split per rank."
+    sources: ["vllm/distributed/kv_transfer/kv_connector/v1/simple_cpu_offload_connector.py:54", "vllm/distributed/kv_transfer/kv_connector/v1/simple_cpu_offload_connector.py:86-91"]
+    attributes: {key: kv_connector_extra_config.cpu_bytes_to_use}
+
+components:
+  - id: simple-cpu-offload-connector
+    name: SimpleCPUOffloadConnector (scheduler role) / SimpleCPUOffloadScheduler
+    kind: module
+    layer: kv-transfer
+    parent: engine-core
+    summary: "Offloads computed KV blocks to a CPU block pool keyed by block hash and reloads them as external tokens when the GPU prefix cache misses. Eager mode (the default): a request's computed blocks are stored when it finishes (or on a later step); stores land in the CPU cache when the worker reports them done."
+    sources: ["vllm/distributed/kv_transfer/kv_connector/v1/simple_cpu_offload_connector.py:66-192", "vllm/v1/simple_kv_offload/manager.py:141-260"]
+    state:
+      schema:
+        type: object
+        properties:
+          lazy_mode: {type: boolean}
+          block_size: {type: integer}
+          cpu_cache: {type: object}
+          num_cpu_blocks: {type: integer}
+          req_hashes: {type: object}
+          pending_hits: {type: object}
+          reqs_to_load: {type: object}
+          reqs_to_store: {type: array}
+          pending_finished_stores: {type: array}
+          store_events: {type: object}
+          load_events: {type: object}
+          next_event: {type: integer}
+      initial: {lazy_mode: false, block_size: 16, cpu_cache: {}, num_cpu_blocks: 64000, req_hashes: {}, pending_hits: {}, reqs_to_load: {}, reqs_to_store: [], pending_finished_stores: [], store_events: {}, load_events: {}, next_event: 0}
+
+interfaces:
+  - component: simple-cpu-offload-connector
+    name: get-num-new-matched-tokens
+    kind: function
+    summary: "SimpleCPUOffloadScheduler.get_num_new_matched_tokens: past a block-aligned local hit, find the longest run of the request's remaining block hashes in the CPU cache (leaving the last token to recompute), pin it, and report it as an asynchronous external hit."
+    sources: ["vllm/v1/simple_kv_offload/manager.py:338-393", "vllm/distributed/kv_transfer/kv_connector/v1/simple_cpu_offload_connector.py:257-266"]
+    request: DistKvRequest
+    response: DistKvMatch
+    behavior:
+      - set:
+          vars.hashes: "= has(input.block_hashes) && input.block_hashes != null ? input.block_hashes : []"
+          vars.computed: "= has(input.num_computed_tokens) ? input.num_computed_tokens : 0"
+          vars.ntok: "= has(input.num_prompt_tokens) ? input.num_prompt_tokens : 0"
+      - title: Drop a stale pin from an earlier call for this request; remember its hashes for the store
+        source: "vllm/v1/simple_kv_offload/manager.py:346-347"
+        set:
+          state.pending_hits: "= omit(state.pending_hits, input.request_id)"
+          state.req_hashes: "= size(vars.hashes) > 0 ? merge(state.req_hashes, {input.request_id: vars.hashes}) : state.req_hashes"
+      - if: "vars.computed % state.block_size != 0"
+        then:
+          - title: External loads start only at a scheduler-block boundary
+            source: "vllm/v1/simple_kv_offload/manager.py:352-364"
+            return: {num_external_tokens: 0, load_async: false}
+      - set:
+          vars.remaining: "= vars.hashes.slice(math.least(vars.computed / state.block_size, size(vars.hashes)), size(vars.hashes))"
+          vars.max_hit: "= vars.ntok - 1 - vars.computed"
+      - if: "size(vars.remaining) == 0 || vars.max_hit <= 0"
+        then:
+          - title: No hashes left to look up, or nothing beyond the token that must be recomputed
+            source: "vllm/v1/simple_kv_offload/manager.py:366-375"
+            return: {num_external_tokens: 0, load_async: false}
+      - title: Longest consecutive run of CPU-cached hashes, capped below the last token
+        source: "vllm/v1/simple_kv_offload/manager.py:376-378"
+        set:
+          vars.run: "= vars.remaining.exists(h, !(h in state.cpu_cache)) ? lists.range(size(vars.remaining)).filter(i, !(vars.remaining[i] in state.cpu_cache))[0] : size(vars.remaining)"
+      - set:
+          vars.hit: "= math.least(vars.run, vars.max_hit / state.block_size) * state.block_size"
+      - if: "vars.hit > 0"
+        then:
+          - title: Pin the CPU blocks until update_state_after_alloc consumes them
+            source: "vllm/v1/simple_kv_offload/manager.py:380-392"
+            set:
+              state.pending_hits: "= merge(state.pending_hits, {input.request_id: {'hashes': vars.remaining.slice(0, vars.hit / state.block_size), 'num_computed_tokens': vars.computed}})"
+          - return: {num_external_tokens: "= vars.hit", load_async: true}
+      - source: "vllm/v1/simple_kv_offload/manager.py:393"
+        return: {num_external_tokens: 0, load_async: false}
+
+  - component: simple-cpu-offload-connector
+    name: update-state-after-alloc
+    kind: function
+    summary: "SimpleCPUOffloadScheduler.update_state_after_alloc: register the request for eager stores; with external tokens, turn the pinned CPU hit into a load of CPU blocks into the newly allocated GPU blocks after the local hit."
+    sources: ["vllm/v1/simple_kv_offload/manager.py:395-506"]
+    request: DistKvRequest
+    response: {type: object, properties: {kv_transfer_params: {type: [object, "null"]}, recorded: {type: boolean}}}
+    behavior:
+      - set:
+          vars.ext: "= has(input.num_external_tokens) ? input.num_external_tokens : 0"
+          vars.groups: "= has(input.block_ids) && input.block_ids != null ? input.block_ids : [[]]"
+      - if: "!state.lazy_mode && !(input.request_id in state.reqs_to_store)"
+        then:
+          - title: Eager mode tracks every request's computed blocks for storing
+            source: "vllm/v1/simple_kv_offload/manager.py:404-410"
+            set: {state.reqs_to_store: "= state.reqs_to_store + [input.request_id]"}
+      - set:
+          vars.pending: "= input.request_id in state.pending_hits ? state.pending_hits[input.request_id] : null"
+          state.pending_hits: "= omit(state.pending_hits, input.request_id)"
+      - if: "vars.ext == 0 || vars.pending == null"
+        then:
+          - title: No external tokens, or no pinned hit (a stale pin is released with a warning)
+            source: "vllm/v1/simple_kv_offload/manager.py:412-433"
+            return: {kv_transfer_params: null, recorded: false}
+      - title: Load the hit's CPU blocks into the GPU blocks that follow the local hit
+        source: "vllm/v1/simple_kv_offload/manager.py:434-506"
+        set:
+          vars.start: "= vars.pending.num_computed_tokens / state.block_size"
+          vars.n: "= vars.ext / state.block_size"
+      - set:
+          state.reqs_to_load: "= merge(state.reqs_to_load, {input.request_id: {'gpu_block_ids': vars.groups[0].slice(math.least(vars.start, size(vars.groups[0])), math.least(vars.start + vars.n, size(vars.groups[0]))), 'cpu_hashes': vars.pending.hashes.slice(0, math.least(vars.n, size(vars.pending.hashes))), 'load_event': -1}})"
+      - return: {kv_transfer_params: null, recorded: true}
+
+  - component: simple-cpu-offload-connector
+    name: request-finished
+    kind: function
+    summary: "SimpleCPUOffloadScheduler.request_finished: release any pin; in eager mode flush the finished request's computed full blocks into a pending store (they are freed on the GPU right away, protected by ref counts). Always returns (False, None)."
+    sources: ["vllm/v1/simple_kv_offload/manager.py:1181-1213", "vllm/v1/simple_kv_offload/manager.py:1223-1255"]
+    request: DistKvRequest
+    response: DistKvFinished
+    behavior:
+      - set:
+          state.pending_hits: "= omit(state.pending_hits, input.request_id)"
+          vars.groups: "= has(input.block_ids) && input.block_ids != null ? input.block_ids : [[]]"
+          vars.hashes: "= input.request_id in state.req_hashes ? state.req_hashes[input.request_id] : []"
+          vars.computed: "= has(input.num_computed_tokens) ? input.num_computed_tokens : 0"
+      - if: "!state.lazy_mode && input.request_id in state.reqs_to_store"
+        then:
+          - title: Finish-time flush of the request's computed full blocks not yet in the CPU cache
+            source: "vllm/v1/simple_kv_offload/manager.py:1206-1212"
+            set:
+              vars.nfull: "= math.least([vars.computed / state.block_size, size(vars.hashes), size(vars.groups[0])])"
+          - set:
+              vars.new: "= lists.range(vars.nfull).filter(i, !(vars.hashes[i] in state.cpu_cache)).map(i, {'hash': vars.hashes[i], 'gpu_block': vars.groups[0][i]})"
+          - set:
+              state.pending_finished_stores: "= size(vars.new) > 0 ? state.pending_finished_stores + [{'request_id': input.request_id, 'blocks': vars.new}] : state.pending_finished_stores"
+              state.reqs_to_store: "= state.reqs_to_store.filter(r, r != input.request_id)"
+      - title: An in-flight load defers its cleanup; otherwise drop the load state
+        source: "vllm/v1/simple_kv_offload/manager.py:1196-1203"
+        set:
+          state.reqs_to_load: "= input.request_id in state.reqs_to_load && state.reqs_to_load[input.request_id].load_event >= 0 ? state.reqs_to_load : omit(state.reqs_to_load, input.request_id)"
+          state.req_hashes: "= omit(state.req_hashes, input.request_id)"
+      - return: {delay_free_blocks: false, kv_transfer_params: null}
+
+  - component: simple-cpu-offload-connector
+    name: build-connector-meta
+    kind: function
+    summary: "SimpleCPUOffloadScheduler.build_connector_meta: one store event for the pending (finish-time) stores and one load event for the new loads; the worker copies GPU→CPU and CPU→GPU and reports both back."
+    sources: ["vllm/v1/simple_kv_offload/manager.py:508-570"]
+    request: {type: object, properties: {scheduled_new_reqs: {type: array}}}
+    response: {type: object, properties: {store_event: {type: integer}, store_gpu_blocks: {type: array}, store_hashes: {type: array}, load_event: {type: integer}, load_gpu_blocks: {type: array}, load_hashes: {type: array}, load_event_to_reqs: {type: object}}}
+    behavior:
+      - set:
+          vars.store: "= state.pending_finished_stores.map(t, t.blocks).flatten()"
+          vars.loads: "= state.reqs_to_load.filter(r, state.reqs_to_load[r].load_event < 0)"
+      - set:
+          vars.room: "= state.num_cpu_blocks - size(state.cpu_cache)"
+      - title: Store event for the pending finished stores (as many as fit the CPU pool)
+        source: "vllm/v1/simple_kv_offload/manager.py:513-536"
+        set:
+          vars.store: "= vars.store.slice(0, math.least(size(vars.store), math.greatest(vars.room, 0)))"
+      - set:
+          vars.sev: "= size(vars.store) > 0 ? state.next_event : -1"
+          vars.lev: "= size(vars.loads) > 0 ? state.next_event + 1 : -1"
+          state.pending_finished_stores: []
+      - set:
+          state.store_events: "= vars.sev >= 0 ? merge(state.store_events, {string(vars.sev): vars.store}) : state.store_events"
+          state.load_events: "= vars.lev >= 0 ? merge(state.load_events, {string(vars.lev): vars.loads}) : state.load_events"
+          state.reqs_to_load: "= state.reqs_to_load.transformMapEntry(r, v, {r: vars.lev >= 0 && r in vars.loads ? merge(v, {'load_event': vars.lev}) : v})"
+          state.next_event: "= state.next_event + 2"
+      - title: Load event for the requests whose loads have not been sent yet
+        source: "vllm/v1/simple_kv_offload/manager.py:538-570"
+        return:
+          store_event: "= vars.sev"
+          store_gpu_blocks: "= vars.store.map(b, b.gpu_block)"
+          store_hashes: "= vars.store.map(b, b.hash)"
+          load_event: "= vars.lev"
+          load_gpu_blocks: "= vars.loads.map(r, state.reqs_to_load[r].gpu_block_ids).flatten()"
+          load_hashes: "= vars.loads.map(r, state.reqs_to_load[r].cpu_hashes).flatten()"
+          load_event_to_reqs: "= vars.lev >= 0 ? {string(vars.lev): vars.loads} : {}"
+
+  - component: simple-cpu-offload-connector
+    name: update-connector-output
+    kind: function
+    summary: "SimpleCPUOffloadScheduler.update_connector_output: a completed store event caches its block hashes in the CPU pool; a completed load event releases its requests' load state (they leave WAITING_FOR_REMOTE_KVS through finished_recving)."
+    sources: ["vllm/v1/simple_kv_offload/manager.py:1005-1163"]
+    request: {type: object, properties: {finished_store_events: {type: array, items: {type: integer}}, finished_recving: {type: array, items: {type: string}}}}
+    response: {type: object, properties: {cached: {type: integer}, loaded: {type: array}}}
+    behavior:
+      - set:
+          vars.sevs: "= has(input.finished_store_events) ? input.finished_store_events.map(e, string(e)).filter(e, e in state.store_events) : []"
+          vars.done: "= has(input.finished_recving) ? input.finished_recving.filter(r, r in state.reqs_to_load) : []"
+      - set:
+          vars.blocks: "= vars.sevs.map(e, state.store_events[e]).flatten()"
+      - title: Stored blocks become CPU prefix-cache hits
+        source: "vllm/v1/simple_kv_offload/manager.py:1065-1163"
+        set:
+          state.cpu_cache: "= merge(state.cpu_cache, vars.blocks.transformMapEntry(i, b, {b.hash: {'stored_at': now}}))"
+          state.store_events: "= omit(state.store_events, vars.sevs)"
+      - title: Finished loads are cleaned up
+        source: "vllm/v1/simple_kv_offload/manager.py:1320-1361"
+        set:
+          state.reqs_to_load: "= omit(state.reqs_to_load, vars.done)"
+      - return: {cached: "= size(vars.blocks)", loaded: "= vars.done"}
+
+  - component: simple-cpu-offload-connector
+    name: reset
+    kind: function
+    summary: "SimpleCPUOffloadScheduler.reset (reset_cache, only when reset_prefix_cache(reset_connector=True)): drop pins, pending stores and unsent loads, and clear the CPU prefix cache."
+    sources: ["vllm/v1/simple_kv_offload/manager.py:1387-1446", "vllm/distributed/kv_transfer/kv_connector/v1/simple_cpu_offload_connector.py:365-368"]
+    request: {type: object, properties: {}}
+    response: {type: object, properties: {reset: {type: boolean}}}
+    behavior:
+      - set:
+          state.pending_hits: {}
+          state.pending_finished_stores: []
+          state.reqs_to_store: []
+          state.reqs_to_load: "= state.reqs_to_load.transformMapEntry(r, v, v.load_event >= 0, {r: v})"
+          state.cpu_cache: {}
+      - return: {reset: true}
+
+  # seams added to the dispatcher for the scheduler
+  - component: kv-connector-base-v1
+    name: update-connector-output
+    kind: function
+    summary: "Scheduler hook in update_from_output: hand the workers' aggregated KVConnectorOutput to the connector (finished transfers, store events)."
+    sources: ["vllm/distributed/kv_transfer/kv_connector/v1/base.py:606-614"]
+    attributes: {seam: true, callers: [scheduler-kv]}
+    request: {type: object, properties: {finished_store_events: {type: array, items: {type: integer}}, finished_sending: {type: array, items: {type: string}}, finished_recving: {type: array, items: {type: string}}}}
+    response: {type: object, properties: {cached: {type: integer}, loaded: {type: array}}}
+    behavior:
+      - if: "config['kv-connector'] != 'SimpleCPUOffloadConnector'"
+        then:
+          - title: The base implementation does nothing
+            source: "vllm/distributed/kv_transfer/kv_connector/v1/base.py:606-614"
+            return: {cached: 0, loaded: []}
+      - call: simple-cpu-offload-connector.update-connector-output
+        input: "= input"
+        as: u
+      - return: "= vars.u.value"
+
+  - component: kv-connector-base-v1
+    name: reset-cache
+    kind: function
+    summary: "Scheduler hook reset_connector_cache (reset_prefix_cache with reset_connector=True): reset the connector's own cache; None when the connector has none."
+    sources: ["vllm/distributed/kv_transfer/kv_connector/v1/base.py:778-790"]
+    attributes: {seam: true, callers: [scheduler-kv]}
+    request: {type: object, properties: {}}
+    response: {type: object, properties: {reset: {type: [boolean, "null"]}}}
+    behavior:
+      - if: "config['kv-connector'] != 'SimpleCPUOffloadConnector'"
+        then:
+          - return: {reset: null}
+      - call: simple-cpu-offload-connector.reset
+        as: r
+      - return: {reset: "= vars.r.value.reset"}
+
+flows:
+  - id: distributed-kv-update-output
+    name: Scheduler hands the workers' KV connector output to the connector
+    tags: ["feature:disaggregated-prefill", writes]
+    entry: {caller: engine-core, interface: kv-connector-base-v1.update-connector-output, input: {}}
+    sources: ["vllm/distributed/kv_transfer/kv_connector/v1/base.py:606-614"]
+  - id: distributed-kv-reset-cache
+    name: Reset the connector's cache
+    tags: [writes]
+    entry: {caller: engine-core, interface: kv-connector-base-v1.reset-cache}
+    sources: ["vllm/distributed/kv_transfer/kv_connector/v1/base.py:778-790"]
+
+scenarios:
+  - id: distributed-cpu-offload-store-reset-reload
+    name: A finished prompt is stored to CPU; after the GPU prefix cache is reset the same prompt is reloaded from CPU as an async external hit
+    description: >-
+      The connector-side half of tests/v1/simple_kv_offload/test_integration.py:150. The cold request
+      registers for eager stores, its 2010 computed tokens (125 full blocks) are flushed at finish,
+      the next step's metadata carries the store event, and the worker's completion caches the
+      hashes. The GPU prefix-cache reset (reset_connector=False) leaves the CPU cache alone, so the
+      repeated prompt gets 2000 external tokens (the last token is recomputed), loaded asynchronously
+      into its new GPU blocks.
+    flow: distributed-kv-match
+    fixtures: [tp1-llama-8b, distributed-seed]
+    config: {kv-connector: SimpleCPUOffloadConnector, kv-role: kv_both}
+    steps:
+      - {flow: distributed-kv-match, as: cold, input: {request_id: offload-cold, num_prompt_tokens: 2010, num_computed_tokens: 0, block_hashes: "= lists.range(125).map(i, 'h' + string(i))"}}
+      - {flow: distributed-kv-alloc, as: alloc1, input: {request_id: offload-cold, num_external_tokens: 0, block_ids: ["= lists.range(126).map(i, i + 1)"]}}
+      - {flow: distributed-kv-finished, as: fin1, input: {request_id: offload-cold, status: FINISHED_LENGTH_CAPPED, num_computed_tokens: 2010, block_ids: ["= lists.range(126).map(i, i + 1)"]}}
+      - {flow: distributed-kv-meta, as: meta1, input: {scheduled_new_reqs: []}}
+      - {flow: distributed-kv-update-output, as: out1, input: {finished_store_events: ["= steps.meta1.result.value.store_event"]}}
+      - {flow: distributed-kv-match, as: hit, input: {request_id: offload-hit, num_prompt_tokens: 2010, num_computed_tokens: 0, block_hashes: "= lists.range(125).map(i, 'h' + string(i))"}}
+      - {flow: distributed-kv-alloc, as: alloc2, input: {request_id: offload-hit, num_external_tokens: 2000, block_ids: ["= lists.range(126).map(i, i + 200)"]}}
+      - {flow: distributed-kv-meta, as: meta2, input: {scheduled_new_reqs: []}}
+      - {flow: distributed-kv-update-output, as: out2, input: {finished_recving: [offload-hit]}}
+    expect:
+      - "steps.cold.result.value.num_external_tokens == 0 && !steps.fin1.result.value.delay_free_blocks"
+      - "steps.meta1.result.value.store_event >= 0 && size(steps.meta1.result.value.store_gpu_blocks) == 125 && steps.out1.result.value.cached == 125"
+      - "steps.hit.result.value.num_external_tokens == 2000 && steps.hit.result.value.load_async"
+      - "steps.meta2.result.value.load_event >= 0 && size(steps.meta2.result.value.load_gpu_blocks) == 125 && steps.meta2.result.value.load_gpu_blocks[0] == 200"
+      - "steps.out2.result.value.loaded == ['offload-hit'] && size(state['simple-cpu-offload-connector'].reqs_to_load) == 0"
+  - id: distributed-cpu-offload-no-hashes-or-unaligned
+    flow: distributed-kv-match
+    fixtures: [tp1-llama-8b]
+    config: {kv-connector: SimpleCPUOffloadConnector}
+    state:
+      simple-cpu-offload-connector: {cpu_cache: {h0: {stored_at: 0}, h1: {stored_at: 0}}}
+    steps:
+      - {flow: distributed-kv-match, as: nohash, input: {request_id: r1, num_prompt_tokens: 64, num_computed_tokens: 0}}
+      - {flow: distributed-kv-match, as: unaligned, input: {request_id: r2, num_prompt_tokens: 64, num_computed_tokens: 5, block_hashes: [h0, h1]}}
+      - {flow: distributed-kv-match, as: short, input: {request_id: r3, num_prompt_tokens: 16, num_computed_tokens: 0, block_hashes: [h0]}}
+      - {flow: distributed-kv-match, as: partial, input: {request_id: r4, num_prompt_tokens: 64, num_computed_tokens: 0, block_hashes: [h0, h1, h9, h2]}}
+      - {flow: distributed-kv-match, as: miss, input: {request_id: r5, num_prompt_tokens: 64, num_computed_tokens: 0, block_hashes: [h7]}}
+    expect:
+      - "[steps.nohash, steps.unaligned, steps.short, steps.miss].all(st, st.result.value.num_external_tokens == 0)"
+      - "steps.partial.result.value.num_external_tokens == 32 && 'r4' in state['simple-cpu-offload-connector'].pending_hits"
+  - id: distributed-cpu-offload-alloc-without-pin-and-reset
+    name: An allocation with external tokens but no pin skips the load; reset_connector clears the CPU cache
+    flow: distributed-kv-alloc
+    fixtures: [tp1-llama-8b]
+    config: {kv-connector: SimpleCPUOffloadConnector}
+    state:
+      simple-cpu-offload-connector: {cpu_cache: {h0: {stored_at: 0}}, pending_finished_stores: [{request_id: r0, blocks: [{hash: h5, gpu_block: 5}]}], num_cpu_blocks: 1}
+    steps:
+      - {flow: distributed-kv-alloc, as: nopin, input: {request_id: r6, num_external_tokens: 16, block_ids: [[1]]}}
+      - {flow: distributed-kv-meta, as: full}
+      - {flow: distributed-kv-reset-cache, as: reset}
+      - {flow: distributed-kv-update-output, as: none, input: {finished_store_events: [99]}}
+    expect:
+      - "!steps.nopin.result.value.recorded && size(state['simple-cpu-offload-connector'].reqs_to_load) == 0"
+      - "steps.full.result.value.store_event == -1 && steps.reset.result.value.reset"
+      - "steps.none.result.value.cached == 0"
+  - id: distributed-cpu-offload-hooks-other-connector
+    flow: distributed-kv-update-output
+    fixtures: [tp1-llama-8b]
+    steps:
+      - {flow: distributed-kv-update-output, as: u}
+      - {flow: distributed-kv-reset-cache, as: r}
+    expect:
+      - "steps.u.result.value.cached == 0 && steps.r.result.value.reset == null"

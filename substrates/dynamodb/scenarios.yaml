@@ -1,0 +1,344 @@
+# The DynamoDB substrate's own tests. Run with:
+#   go run ./internal/devtools/check -f substrates/dynamodb/dynamodb.yaml \
+#     -f substrates/dynamodb/tables/orders.yaml -f substrates/dynamodb/scenarios.yaml
+# Imports don't bring these along (MergeImports skips flows and scenarios).
+schema_version: 1
+id: dynamodb-scenarios
+
+components:
+  - {id: app, name: Application, kind: client, summary: "Any caller of the substrate; the scenarios' entry point."}
+
+fixtures:
+  - id: demo-tables
+    summary: >-
+      An orders table (pk CUSTOMER#<id>, sk ORDER#<id>) with two GSIs, by-status (status,
+      created_at) and by-sku (sku, no sort key), and a sessions table with TTL on expires_at.
+      The clock starts at 2026-11-01T00:00:00Z (epoch second 1793491200).
+    clock: {epoch: "2026-11-01T00:00:00Z"}
+    config:
+      dynamodb-tables:
+        orders:
+          gsis:
+            by-status: {pk: status, sk: created_at}
+            by-sku: {pk: sku}
+        sessions: {ttl_attribute: expires_at}
+  - id: seeded-orders
+    extends: [demo-tables]
+    state:
+      dynamodb:
+        items:
+          "orders|CUSTOMER#c1|ORDER#001": {pk: "CUSTOMER#c1", sk: "ORDER#001", status: open, created_at: "2026-10-30", sku: A, total: 10, version: 1, addr: {city: Lyon, zip: "69001"}}
+          "orders|CUSTOMER#c1|ORDER#002": {pk: "CUSTOMER#c1", sk: "ORDER#002", status: shipped, created_at: "2026-10-31", sku: B, total: 25, version: 3}
+          "orders|CUSTOMER#c1|ORDER#003": {pk: "CUSTOMER#c1", sk: "ORDER#003", status: open, created_at: "2026-10-29", sku: A, total: 5, version: 1}
+          "orders|CUSTOMER#c2|ORDER#001": {pk: "CUSTOMER#c2", sk: "ORDER#001", status: open, created_at: "2026-10-28", total: 7, version: 1}
+          "orders|CUSTOMER#c1|PROFILE": {pk: "CUSTOMER#c1", sk: PROFILE, name: Ada, order_count: 3}
+
+flows:
+  - {id: ddb-get, tags: [reads], entry: {caller: app, interface: dynamodb.get, input: {table: orders}}}
+  - {id: ddb-put, tags: [writes], entry: {caller: app, interface: dynamodb.put, input: {table: orders}}}
+  - {id: ddb-update, tags: [writes], entry: {caller: app, interface: dynamodb.update, input: {table: orders}}}
+  - {id: ddb-delete, tags: [writes], entry: {caller: app, interface: dynamodb.delete, input: {table: orders}}}
+  - {id: ddb-put-if, tags: [writes], entry: {caller: app, interface: dynamodb.put-if, input: {table: orders}}}
+  - {id: ddb-update-if, tags: [writes], entry: {caller: app, interface: dynamodb.update-if, input: {table: orders}}}
+  - {id: ddb-delete-if, tags: [writes], entry: {caller: app, interface: dynamodb.delete-if, input: {table: orders}}}
+  - {id: ddb-incr-if, tags: [writes], entry: {caller: app, interface: dynamodb.incr-if, input: {table: orders}}}
+  - {id: ddb-transact, tags: [writes], entry: {caller: app, interface: dynamodb.transact-write}}
+  - {id: ddb-query, tags: [reads], entry: {caller: app, interface: dynamodb.query, input: {table: orders}}}
+  - {id: ddb-ttl-sweep, tags: [writes], entry: {caller: app, interface: dynamodb.ttl-sweep, input: {}}}
+  - {id: orders-put-if, tags: [writes], entry: {caller: app, interface: dynamodb.orders-put-if}}
+  - {id: orders-incr-if, tags: [writes], entry: {caller: app, interface: dynamodb.orders-incr-if}}
+  - {id: orders-get, tags: [reads], entry: {caller: app, interface: dynamodb.orders-get}}
+
+scenarios:
+  # ---- get / put / update / delete ----
+  - id: put-then-get
+    name: PutItem replaces the item and GetItem reads it back
+    fixtures: [seeded-orders]
+    steps:
+      - {flow: ddb-put, as: put, input: {pk: "CUSTOMER#c1", sk: "ORDER#001", item: {status: cancelled, total: 10}}}
+      - {flow: ddb-get, as: get, input: {pk: "CUSTOMER#c1", sk: "ORDER#001"}}
+    expect:
+      - "steps.put.result.ok && steps.put.result.value.old_item.status == 'open'"
+      - "steps.get.result.value.item == {'pk': 'CUSTOMER#c1', 'sk': 'ORDER#001', 'status': 'cancelled', 'total': 10}"
+      - "!has(state.dynamodb.items['orders|CUSTOMER#c1|ORDER#001'].addr)"
+
+  - id: get-missing-item
+    name: GetItem on a missing key returns no item, not an error
+    fixtures: [seeded-orders]
+    flow: ddb-get
+    input: {pk: "CUSTOMER#c9", sk: "ORDER#001"}
+    expect: ["result.ok && result.value.item == null", "size(state.dynamodb.items) == 5"]
+
+  - id: unknown-table
+    name: A table missing from config is ResourceNotFoundException
+    fixtures: [demo-tables]
+    flow: ddb-put
+    input: {table: nope, pk: a, item: {x: 1}}
+    expect:
+      - "!result.ok && result.error.code == 'resource_not_found' && result.error.status == 400"
+      - "size(state.dynamodb.items) == 0"
+
+  - id: update-merges-upserts-and-removes
+    name: UpdateItem merges attributes, removes the listed ones, and creates a missing item
+    fixtures: [seeded-orders]
+    steps:
+      - {flow: ddb-update, as: u1, input: {pk: "CUSTOMER#c1", sk: "ORDER#001", item: {status: paid, addr: {city: Paris}}, remove: [sku]}}
+      - {flow: ddb-update, as: u2, input: {pk: "CUSTOMER#c3", sk: "ORDER#001", item: {status: open}}}
+      - {flow: ddb-get, as: g, input: {pk: "CUSTOMER#c3", sk: "ORDER#001"}}
+    expect:
+      - "steps.u1.result.value.item.status == 'paid' && steps.u1.result.value.item.total == 10"
+      - "state.dynamodb.items['orders|CUSTOMER#c1|ORDER#001'].addr == {'city': 'Paris', 'zip': '69001'}"
+      - "!has(state.dynamodb.items['orders|CUSTOMER#c1|ORDER#001'].sku)"
+      - "steps.g.result.value.item == {'pk': 'CUSTOMER#c3', 'sk': 'ORDER#001', 'status': 'open'}"
+
+  - id: delete-returns-old
+    name: DeleteItem returns the old item; deleting a missing item succeeds
+    fixtures: [seeded-orders]
+    steps:
+      - {flow: ddb-delete, as: d1, input: {pk: "CUSTOMER#c1", sk: "ORDER#002"}}
+      - {flow: ddb-delete, as: d2, input: {pk: "CUSTOMER#c1", sk: "ORDER#002"}}
+      - {flow: ddb-get, as: g, input: {pk: "CUSTOMER#c1", sk: "ORDER#002"}}
+    expect:
+      - "steps.d1.result.value.old_item.status == 'shipped'"
+      - "steps.d2.result.ok && steps.d2.result.value.old_item == null"
+      - "steps.g.result.value.item == null && !('orders|CUSTOMER#c1|ORDER#002' in state.dynamodb.items)"
+
+  # ---- conditional writes ----
+  - id: put-if-absent-then-conflict
+    name: put-if row == null creates once; the second put fails 412 and changes nothing
+    fixtures: [demo-tables]
+    steps:
+      - {flow: ddb-put-if, as: first, input: {pk: "CUSTOMER#c1", sk: "ORDER#100", item: {status: open}, cond: "row == null"}}
+      - {flow: ddb-put-if, as: second, input: {pk: "CUSTOMER#c1", sk: "ORDER#100", item: {status: hijacked}, cond: "row == null"}}
+      - {flow: ddb-get, as: read, input: {pk: "CUSTOMER#c1", sk: "ORDER#100"}}
+    expect:
+      - "steps.first.result.ok && steps.first.result.value.old_item == null"
+      - "!steps.second.result.ok && steps.second.result.error.code == 'condition_failed' && steps.second.result.error.status == 412"
+      - "steps.second.result.error.retryable == false && steps.second.result.error.data.row.status == 'open' && steps.second.result.error.data.table == 'orders'"
+      - "steps.read.result.value.item.status == 'open' && state.dynamodb.items['orders|CUSTOMER#c1|ORDER#100'].status == 'open'"
+
+  - id: put-if-default-condition
+    name: put-if without cond writes unconditionally
+    fixtures: [seeded-orders]
+    flow: ddb-put-if
+    input: {pk: "CUSTOMER#c1", sk: "ORDER#001", item: {status: replaced}, cond: {$absent: true}}
+    expect: ["result.ok", "state.dynamodb.items['orders|CUSTOMER#c1|ORDER#001'].status == 'replaced'"]
+
+  - id: update-if-missing-row
+    name: update-if without cond fails on a missing row (the shared default row != null)
+    fixtures: [demo-tables]
+    flow: ddb-update-if
+    input: {pk: "CUSTOMER#c1", sk: "ORDER#404", item: {status: paid}, cond: {$absent: true}}
+    expect:
+      - "!result.ok && result.error.code == 'condition_failed' && result.error.data.row == null"
+      - "size(state.dynamodb.items) == 0"
+
+  - id: update-if-optimistic-version
+    name: update-if on a version passes once, then the stale writer fails
+    fixtures: [seeded-orders]
+    steps:
+      - {flow: ddb-update-if, as: w1, input: {pk: "CUSTOMER#c1", sk: "ORDER#001", item: {status: paid, version: 2}, cond: "row != null && row.version == 1"}}
+      - {flow: ddb-update-if, as: w2, input: {pk: "CUSTOMER#c1", sk: "ORDER#001", item: {status: cancelled, version: 2}, cond: "row != null && row.version == 1"}}
+      - {flow: ddb-get, as: read, input: {pk: "CUSTOMER#c1", sk: "ORDER#001"}}
+    expect:
+      - "steps.w1.result.ok && steps.w1.result.value.old_item.version == 1"
+      - "!steps.w2.result.ok && steps.w2.result.error.code == 'condition_failed' && steps.w2.result.error.data.row.version == 2"
+      - "steps.read.result.value.item.status == 'paid' && state.dynamodb.items['orders|CUSTOMER#c1|ORDER#001'].version == 2"
+
+  - id: update-if-creates-when-cond-allows
+    name: update-if whose cond passes on a missing row creates the item, as UpdateItem does
+    fixtures: [demo-tables]
+    flow: ddb-update-if
+    input: {pk: "CUSTOMER#c5", sk: "ORDER#001", item: {status: open}, cond: "row == null"}
+    expect: ["result.ok", "state.dynamodb.items['orders|CUSTOMER#c5|ORDER#001'] == {'pk': 'CUSTOMER#c5', 'sk': 'ORDER#001', 'status': 'open'}"]
+
+  - id: delete-if-guarded
+    name: delete-if refuses a shipped order and deletes an open one
+    fixtures: [seeded-orders]
+    steps:
+      - {flow: ddb-delete-if, as: shipped, input: {pk: "CUSTOMER#c1", sk: "ORDER#002", cond: "row != null && row.status == 'open'"}}
+      - {flow: ddb-delete-if, as: open, input: {pk: "CUSTOMER#c1", sk: "ORDER#001", cond: "row != null && row.status == 'open'"}}
+      - {flow: ddb-query, as: read, input: {pk: "CUSTOMER#c1", sk_begins_with: "ORDER#"}}
+    expect:
+      - "!steps.shipped.result.ok && steps.shipped.result.error.code == 'condition_failed'"
+      - "'orders|CUSTOMER#c1|ORDER#002' in state.dynamodb.items"
+      - "steps.open.result.ok && !('orders|CUSTOMER#c1|ORDER#001' in state.dynamodb.items)"
+      - "steps.read.result.value.items.map(i, i.sk) == ['ORDER#002', 'ORDER#003']"
+
+  - id: incr-if-capped-counter
+    name: incr-if adds atomically under a cap; the write past the cap fails
+    fixtures: [demo-tables]
+    steps:
+      - {flow: ddb-incr-if, as: a, input: {pk: "LIMIT#org1", sk: "", delta: {count: 1}, cond: "(row != null && has(row.count) ? row.count : 0) + 1 <= 2"}}
+      - {flow: ddb-incr-if, as: b, input: {pk: "LIMIT#org1", sk: "", delta: {count: 1}, cond: "(row != null && has(row.count) ? row.count : 0) + 1 <= 2"}}
+      - {flow: ddb-incr-if, as: c, input: {pk: "LIMIT#org1", sk: "", delta: {count: 1}, cond: "(row != null && has(row.count) ? row.count : 0) + 1 <= 2"}}
+      - {flow: ddb-get, as: read, input: {pk: "LIMIT#org1", sk: ""}}
+    expect:
+      - "steps.a.result.value.item == {'pk': 'LIMIT#org1', 'sk': '', 'count': 1}"
+      - "steps.b.result.value.item.count == 2"
+      - "!steps.c.result.ok && steps.c.result.error.code == 'condition_failed'"
+      - "state.dynamodb.items['orders|LIMIT#org1|'].count == 2 && steps.read.result.value.item.count == 2"
+
+  # ---- transactions ----
+  - id: transact-commits-all
+    name: TransactWriteItems applies a put, an update, an incr, a delete and a check together
+    fixtures: [seeded-orders]
+    steps:
+      - flow: ddb-transact
+        as: tx
+        input:
+          items:
+            - {op: put, table: orders, pk: "CUSTOMER#c1", sk: "ORDER#004", item: {status: open, total: 12}, cond: "row == null"}
+            - {op: incr, table: orders, pk: "CUSTOMER#c1", sk: PROFILE, delta: {order_count: 1}}
+            - {op: delete, table: orders, pk: "CUSTOMER#c2", sk: "ORDER#001", cond: "row.status == 'open'"}
+            - {op: check, table: orders, pk: "CUSTOMER#c1", sk: "ORDER#002", cond: "row != null && row.status == 'shipped'"}
+      - {flow: ddb-get, as: g, input: {pk: "CUSTOMER#c1", sk: "ORDER#004"}}
+    expect:
+      - "steps.tx.result.ok && size(steps.tx.result.value.items) == 4 && steps.tx.result.value.items[2] == null"
+      - "steps.g.result.value.item.total == 12"
+      - "state.dynamodb.items['orders|CUSTOMER#c1|PROFILE'].order_count == 4"
+      - "!('orders|CUSTOMER#c2|ORDER#001' in state.dynamodb.items) && !('~' in state.dynamodb.items)"
+      - "state.dynamodb.items['orders|CUSTOMER#c1|ORDER#002'].version == 3"
+
+  - id: transact-update-applies
+    name: A transactional update merges into the existing item
+    fixtures: [seeded-orders]
+    flow: ddb-transact
+    input:
+      items:
+        - {op: update, table: orders, pk: "CUSTOMER#c1", sk: "ORDER#001", item: {status: paid}, cond: "row.version == 1"}
+    expect: ["result.ok", "state.dynamodb.items['orders|CUSTOMER#c1|ORDER#001'].status == 'paid' && state.dynamodb.items['orders|CUSTOMER#c1|ORDER#001'].total == 10"]
+
+  - id: transact-cancels-all
+    name: One failed condition cancels every write, with CancellationReasons
+    fixtures: [seeded-orders]
+    flow: ddb-transact
+    input:
+      items:
+        - {op: put, table: orders, pk: "CUSTOMER#c1", sk: "ORDER#005", item: {status: open}}
+        - {op: update, table: orders, pk: "CUSTOMER#c1", sk: "ORDER#002", item: {status: cancelled}, cond: "row.status == 'open'"}
+        - {op: incr, table: orders, pk: "CUSTOMER#c1", sk: PROFILE, delta: {order_count: 1}}
+    expect:
+      - "!result.ok && result.error.code == 'transaction_canceled' && result.error.status == 400"
+      - "result.error.data.index == 1 && result.error.data.reasons == ['None', 'ConditionalCheckFailed', 'None']"
+      - "!('orders|CUSTOMER#c1|ORDER#005' in state.dynamodb.items)"
+      - "state.dynamodb.items['orders|CUSTOMER#c1|ORDER#002'].status == 'shipped' && state.dynamodb.items['orders|CUSTOMER#c1|PROFILE'].order_count == 3"
+
+  - id: transact-update-missing-row
+    name: A transactional update of a missing item cancels by default (row != null)
+    fixtures: [seeded-orders]
+    flow: ddb-transact
+    input:
+      items:
+        - {op: put, table: orders, pk: "CUSTOMER#c1", sk: "ORDER#006", item: {status: open}}
+        - {op: update, table: orders, pk: "CUSTOMER#c9", sk: "ORDER#001", item: {status: paid}}
+    expect:
+      - "!result.ok && result.error.code == 'transaction_canceled' && result.error.data.index == 1"
+      - "size(state.dynamodb.items) == 5"
+
+  - id: transact-same-item-twice
+    name: Two operations on one item are a ValidationException
+    fixtures: [seeded-orders]
+    flow: ddb-transact
+    input:
+      items:
+        - {op: put, table: orders, pk: "CUSTOMER#c1", sk: "ORDER#001", item: {status: a}}
+        - {op: delete, table: orders, pk: "CUSTOMER#c1", sk: "ORDER#001"}
+    expect:
+      - "!result.ok && result.error.code == 'validation_error'"
+      - "state.dynamodb.items['orders|CUSTOMER#c1|ORDER#001'].status == 'open'"
+
+  - id: transact-too-many-items
+    name: More items than the model's slots is refused
+    fixtures: [demo-tables]
+    flow: ddb-transact
+    input:
+      items:
+        - {op: put, table: orders, pk: a, sk: "1", item: {}}
+        - {op: put, table: orders, pk: a, sk: "2", item: {}}
+        - {op: put, table: orders, pk: a, sk: "3", item: {}}
+        - {op: put, table: orders, pk: a, sk: "4", item: {}}
+        - {op: put, table: orders, pk: a, sk: "5", item: {}}
+    expect: ["!result.ok && result.error.code == 'validation_error'", "size(state.dynamodb.items) == 0"]
+
+  # ---- query and GSIs ----
+  - id: query-base-table
+    name: Query by partition key with a sort-key prefix, descending, limited
+    fixtures: [seeded-orders]
+    flow: ddb-query
+    input: {pk: "CUSTOMER#c1", sk_begins_with: "ORDER#", forward: false, limit: 2}
+    expect:
+      - "result.ok && result.value.count == 2"
+      - "result.value.items.map(i, i.sk) == ['ORDER#003', 'ORDER#002']"
+      - "state.dynamodb.items.size() == 5"
+
+  - id: query-sk-between
+    name: Query with a sort-key range
+    fixtures: [seeded-orders]
+    flow: ddb-query
+    input: {pk: "CUSTOMER#c1", sk_between: ["ORDER#002", "ORDER#009"]}
+    expect: ["result.value.items.map(i, i.sk) == ['ORDER#002', 'ORDER#003']"]
+
+  - id: query-gsi
+    name: Query a GSI, ordered by its sort key, across partitions
+    fixtures: [seeded-orders]
+    flow: ddb-query
+    input: {index: by-status, pk: open}
+    expect:
+      - "result.value.items.map(i, i.pk + '/' + i.sk) == ['CUSTOMER#c2/ORDER#001', 'CUSTOMER#c1/ORDER#003', 'CUSTOMER#c1/ORDER#001']"
+
+  - id: query-gsi-sparse
+    name: Items without the index key attribute are not in the GSI
+    fixtures: [seeded-orders]
+    steps:
+      - {flow: ddb-put, as: w, input: {pk: "CUSTOMER#c4", sk: "ORDER#001", item: {sku: A, status: open}}}
+      - {flow: ddb-query, as: q, input: {index: by-sku, pk: A}}
+    expect:
+      - "steps.q.result.value.count == 3"
+      - "!steps.q.result.value.items.exists(i, i.pk == 'CUSTOMER#c2')"
+      - "state.dynamodb.items['orders|CUSTOMER#c4|ORDER#001'].sku == 'A'"
+
+  - id: query-unknown-index
+    name: Querying an index the table lacks is a ValidationException
+    fixtures: [seeded-orders]
+    flow: ddb-query
+    input: {index: by-nothing, pk: x}
+    expect: ["!result.ok && result.error.code == 'validation_error'"]
+
+  # ---- TTL ----
+  - id: ttl-expired-readable-until-sweep
+    name: An expired item is still readable until the TTL process deletes it
+    fixtures: [demo-tables]
+    state:
+      dynamodb:
+        items:
+          "sessions|s1|": {pk: s1, sk: "", expires_at: 1793491100}
+          "sessions|s2|": {pk: s2, sk: "", expires_at: 1793491260}
+          "sessions|s3|": {pk: s3, sk: ""}
+          "orders|x|1": {pk: x, sk: "1", expires_at: 1}
+    steps:
+      - {flow: ddb-get, as: before, input: {table: sessions, pk: s1, sk: ""}}
+      - {flow: ddb-ttl-sweep, as: sweep1, at_ms: 1000}
+      - {flow: ddb-ttl-sweep, as: sweep2, at_ms: 120000}
+      - {flow: ddb-get, as: after, input: {table: sessions, pk: s1, sk: ""}}
+    expect:
+      - "steps.before.result.value.item.pk == 's1'"
+      - "steps.sweep1.result.value.deleted == ['sessions|s1|']"
+      - "steps.sweep2.result.value.deleted == ['sessions|s2|']"
+      - "steps.after.result.value.item == null"
+      - "'sessions|s3|' in state.dynamodb.items && 'orders|x|1' in state.dynamodb.items"
+
+  # ---- the per-table template ----
+  - id: table-template-wrappers
+    name: The generated orders-* interfaces fill in the table and keep the conditional semantics
+    fixtures: [demo-tables]
+    steps:
+      - {flow: orders-put-if, as: p, input: {pk: "CUSTOMER#c1", sk: "ORDER#007", item: {status: open, n: 0}, cond: "row == null"}}
+      - {flow: orders-put-if, as: p2, input: {pk: "CUSTOMER#c1", sk: "ORDER#007", item: {status: open}, cond: "row == null"}}
+      - {flow: orders-incr-if, as: i, input: {pk: "CUSTOMER#c1", sk: "ORDER#007", delta: {n: 5}, cond: "row != null"}}
+      - {flow: orders-get, as: g, input: {pk: "CUSTOMER#c1", sk: "ORDER#007"}}
+    expect:
+      - "steps.p.result.ok && !steps.p2.result.ok && steps.p2.result.error.code == 'condition_failed' && steps.p2.result.error.status == 412"
+      - "steps.g.result.value.item.n == 5"
+      - "calls['dynamodb.put-if'] == 2 && calls['dynamodb.incr-if'] == 1"
+      - "state.dynamodb.items['orders|CUSTOMER#c1|ORDER#007'].status == 'open'"

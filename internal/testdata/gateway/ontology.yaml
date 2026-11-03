@@ -1,0 +1,862 @@
+# A generic LLM inference gateway, written as a shared test fixture for the
+# Go tests of cmd/mosaic, internal/api, internal/model and internal/sim.
+#
+# One flow carries a streaming chat request through admission gates, a shared
+# capacity ledger, upstream dispatch with retry before the response commits,
+# and asynchronous billing. Each scenario reaches its outcome through a
+# different mechanism: input data (unknown key, oversized prompt), component
+# state (balance, key budget, free slots), choice points (rate limit, policy,
+# stream break) and injected faults (store down, ledger down, upstream error
+# and timeout).
+#
+# The tests assert on its shape: 20 components, 20 interfaces, 1 link, 1 flow,
+# 3 choice points, 14 scenarios, no configs and no fixtures. Keep those counts
+# in step with the tests when editing.
+schema_version: 1
+id: gateway
+name: Inference gateway
+description: >-
+  A synthetic inference gateway: key authentication, rate limiting, balance
+  admission, model policy, cost preflight, shared slot accounting, dispatch to
+  a pool of upstreams with retry before commitment, token streaming, usage
+  rating and asynchronous billing.
+source:
+  repo: example/gateway
+
+components:
+  - id: client
+    name: API client
+    kind: client
+    layer: clients
+    summary: An application calling the gateway with an API key.
+
+  - id: gateway
+    name: Gateway
+    kind: service
+    layer: edge
+    summary: Admits, routes and streams inference requests.
+
+  - id: auth
+    name: Auth
+    kind: module
+    parent: gateway
+    layer: edge
+    summary: Maps an API key to its organization; the first gate.
+    state:
+      schema: {type: object, properties: {keys: {type: object}}}
+      initial:
+        keys:
+          key-test: {org_id: org-test, key_id: key-test, principal: "user:test"}
+
+  - id: throttle
+    name: Throttle
+    kind: module
+    parent: gateway
+    layer: edge
+    summary: Per-organization request rate limit, checked before the balance.
+
+  - id: admission
+    name: Balance admission
+    kind: module
+    parent: gateway
+    layer: edge
+    summary: Admits organizations in good standing whose balance is above a floor.
+    state:
+      initial: {floor_cents: 50}
+
+  - id: parser
+    name: Request parser
+    kind: module
+    parent: gateway
+    layer: edge
+    summary: Checks the body names a model and extracts the prompt size.
+
+  - id: catalog
+    name: Model catalog
+    kind: module
+    parent: gateway
+    layer: edge
+    summary: Maps a public model name to its serving pool and limits.
+    state:
+      initial:
+        models:
+          test-model:
+            id: test-model
+            backend_ref: pool/test-model-1
+            context_window: 128000
+            pool: pool
+            api_family: chat
+
+  - id: policy
+    name: Policy
+    kind: module
+    parent: gateway
+    layer: edge
+    summary: Decides whether the principal may invoke the model.
+
+  - id: planner
+    name: Route planner
+    kind: module
+    parent: gateway
+    layer: edge
+    summary: Orders the pool's upstreams into a dial plan.
+    state:
+      initial:
+        pools:
+          pool: {targets: [upstream-a, upstream-b]}
+
+  - id: preflight
+    name: Cost preflight
+    kind: module
+    parent: gateway
+    layer: edge
+    summary: Context-window guard, then the per-key spend budget.
+    state:
+      initial: {estimate_cents: 2, key_budget_cents: 500}
+
+  - id: slots
+    name: Slot admission
+    kind: module
+    parent: gateway
+    layer: edge
+    summary: Takes a concurrency slot from the shared ledger, or a local slot when the ledger is down.
+    state:
+      initial: {held: 0, local_free: 2}
+
+  - id: dispatch
+    name: Upstream dispatch
+    kind: module
+    parent: gateway
+    layer: edge
+    summary: Dials upstreams in plan order and moves to the next one only while nothing has been committed.
+
+  - id: relay
+    name: Stream relay
+    kind: module
+    parent: gateway
+    layer: edge
+    summary: Commits the chosen upstream's response and streams its tokens.
+
+  - id: rating
+    name: Usage rating
+    kind: module
+    parent: gateway
+    layer: edge
+    summary: Prices a completed response once.
+
+  - id: account-store
+    name: Account store
+    kind: datastore
+    layer: data
+    summary: Organization standing and balance.
+    state:
+      initial:
+        orgs:
+          org-test: {balance_cents: 100, standing: active}
+
+  - id: ledger
+    name: Slot ledger
+    kind: datastore
+    layer: data
+    summary: Shared counter of free upstream slots across gateway replicas.
+    attributes: {technology: key-value store}
+    state:
+      initial: {free: 3}
+
+  - id: pool
+    name: Upstream pool
+    kind: pool
+    layer: serving
+    summary: Interchangeable replicas serving test-model.
+
+  - id: upstream-a
+    name: Upstream A
+    kind: engine
+    parent: pool
+    layer: serving
+    summary: A model server replica.
+
+  - id: upstream-b
+    name: Upstream B
+    kind: engine
+    parent: pool
+    layer: serving
+    summary: A model server replica.
+
+  - id: billing
+    name: Billing
+    kind: service
+    layer: billing
+    summary: Records usage asynchronously, off the response path.
+    state:
+      initial: {records: 0}
+
+schemas:
+  - id: ChatRequest
+    schema:
+      type: object
+      required: [api_key, model, messages, stream]
+      properties:
+        api_key: {type: string, examples: [key-test]}
+        model: {type: string, examples: [test-model]}
+        stream: {type: boolean, default: true}
+        prompt_tokens: {type: integer, minimum: 1, maximum: 2000000, examples: [640, 1200, 2400]}
+        max_tokens: {type: integer, minimum: 16, maximum: 1024}
+        messages:
+          type: array
+          minItems: 1
+          maxItems: 3
+          items:
+            type: object
+            required: [role, content]
+            properties:
+              role: {type: string, enum: [system, user]}
+              content: {type: string}
+
+  - id: ChatResponse
+    schema:
+      type: object
+      properties:
+        id: {type: string, format: uuid}
+        model: {type: string}
+        status: {type: string, enum: [complete, interrupted]}
+        partial: {type: boolean}
+        tokens_out: {type: integer, minimum: 0, maximum: 1024}
+        cost_cents: {type: integer}
+
+  - id: Principal
+    schema:
+      type: object
+      required: [org_id, key_id]
+      properties:
+        org_id: {type: string}
+        key_id: {type: string}
+        principal: {type: string}
+
+  - id: Org
+    schema:
+      type: object
+      required: [balance_cents, standing]
+      properties:
+        balance_cents: {type: integer}
+        standing: {type: string, enum: [active, suspended]}
+
+  - id: Model
+    schema:
+      type: object
+      properties:
+        id: {type: string}
+        backend_ref: {type: string}
+        context_window: {type: integer}
+        pool: {type: string}
+        api_family: {type: string}
+
+  - id: UpstreamRequest
+    schema:
+      type: object
+      properties:
+        model: {type: string}
+        stream: {type: boolean}
+        messages: {type: array, items: {type: object}}
+
+  - id: UpstreamResponse
+    schema:
+      type: object
+      required: [id, tokens_out]
+      properties:
+        id: {type: string, format: uuid}
+        server: {type: string, examples: [model-server-1]}
+        tokens_out: {type: integer, minimum: 32, maximum: 512}
+        finish_reason: {type: string, enum: [stop, length]}
+
+  - id: Usage
+    schema:
+      type: object
+      properties:
+        org_id: {type: string}
+        tokens_out: {type: integer}
+        cost_cents: {type: integer}
+
+interfaces:
+  - component: gateway
+    name: chat
+    kind: http
+    summary: Streaming chat completions.
+    attributes: {method: POST, path: /v1/chat}
+    request: ChatRequest
+    response: ChatResponse
+    errors:
+      - {code: unauthenticated, status: 401}
+      - {code: rate_limited, status: 429}
+      - {code: insufficient_balance, status: 402}
+      - {code: internal, status: 500}
+      - {code: forbidden, status: 403}
+      - {code: context_too_long, status: 400}
+      - {code: key_budget_exceeded, status: 402}
+      - {code: upstream_error, status: 502}
+    behavior:
+      - title: Receive chat request
+        detail: A simulated streaming chat request arrives with an API key and a model name.
+        set:
+          ctx.phase: received
+          ctx.httpStatus: pending
+          ctx.upstreamDials: 0
+          ctx.committed: false
+          ctx.usageAccepted: false
+      - call: auth.authenticate
+        input: {api_key: "= input.api_key"}
+        as: principal
+      - call: throttle.check
+        input: {org_id: "= vars.principal.value.org_id"}
+      - call: admission.check-balance
+        input: {org_id: "= vars.principal.value.org_id"}
+      - call: parser.parse
+        input: "= input"
+        as: parsed
+      - call: catalog.resolve
+        input: {model: "= vars.parsed.value.model"}
+        as: model
+      - call: policy.authorize
+        input:
+          principal: "= vars.principal.value.principal"
+          model: "= vars.model.value.id"
+          action: invoke
+      - call: planner.plan
+        input: {pool: "= vars.model.value.pool", api_family: "= vars.model.value.api_family"}
+        as: plan
+      - call: preflight.check
+        input:
+          prompt_tokens: "= vars.parsed.value.prompt_tokens"
+          context_window: "= vars.model.value.context_window"
+          key_id: "= vars.principal.value.key_id"
+        as: preflight
+      - call: slots.acquire
+        input: {pool: "= vars.plan.value.pool"}
+      - call: dispatch.send
+        input:
+          targets: "= vars.plan.value.targets"
+          backend_ref: "= vars.model.value.backend_ref"
+          body: "= input"
+        as: upstream
+        on_error:
+          - call: slots.release
+          - set: {ctx.httpStatus: 502, ctx.errorCode: upstream_error, ctx.phase: failed}
+          - fail: {code: upstream_error, status: 502, message: "= 'no upstream answered: ' + error.code"}
+      - call: relay.stream
+        input: {response: "= vars.upstream.value"}
+        on_error:
+          - title: Stream breaks after commitment
+            detail: The response is already committed to the client, so it is neither retried nor billed; the client gets a partial result.
+            set: {ctx.phase: interrupted, ctx.usageAccepted: false, ctx.retryAllowed: false}
+          - call: slots.release
+          - return: {id: "= vars.upstream.value.id", model: "= input.model", status: interrupted, partial: true, tokens_out: 0}
+      - call: rating.rate
+        input:
+          org_id: "= vars.principal.value.org_id"
+          tokens_out: "= vars.upstream.value.tokens_out"
+          estimate_cents: "= vars.preflight.value.estimate_cents"
+        as: usage
+      - emit: billing.record
+        input:
+          org_id: "= vars.principal.value.org_id"
+          tokens_out: "= vars.upstream.value.tokens_out"
+          cost_cents: "= vars.usage.value.cost_cents"
+      - call: slots.release
+      - set: {ctx.phase: complete}
+      - return:
+          id: "= vars.upstream.value.id"
+          model: "= input.model"
+          status: complete
+          partial: false
+          tokens_out: "= vars.upstream.value.tokens_out"
+          cost_cents: "= vars.usage.value.cost_cents"
+
+  - component: auth
+    name: authenticate
+    kind: function
+    request: {type: object, required: [api_key], properties: {api_key: {type: string}}}
+    response: Principal
+    errors: [{code: unauthenticated, status: 401}]
+    behavior:
+      - title: Look up the API key
+        detail: Nothing else runs until the key resolves to an organization.
+      - if: "input.api_key in state.keys"
+        then:
+          - set: {ctx.credential: valid}
+          - return: "= state.keys[input.api_key]"
+      - set: {ctx.credential: invalid, ctx.httpStatus: 401, ctx.errorCode: unauthenticated, ctx.phase: refused, ctx.upstreamDials: 0}
+      - title: Refuse unknown key
+        detail: The key is not known; the request ends here.
+        fail: {code: unauthenticated, status: 401, message: unknown API key}
+
+  - component: throttle
+    name: check
+    kind: function
+    request: {type: object, properties: {org_id: {type: string}}}
+    errors: [{code: rate_limited, status: 429}]
+    behavior:
+      - title: Check the rate limit
+        detail: The organization's request rate is checked before its balance.
+      - choice: rate_limit
+        default: allowed
+        options:
+          allowed:
+            - set: {ctx.rateLimit: allowed}
+            - return: {limited: false}
+          exceeded:
+            - set: {ctx.rateLimit: exceeded, ctx.httpStatus: 429, ctx.errorCode: rate_limited, ctx.phase: refused, ctx.upstreamDials: 0}
+            - title: Refuse over the limit
+              detail: The organization is over its rate; the client should retry after a second.
+              fail: {code: rate_limited, status: 429, message: rate limit exceeded, data: {retry_after_s: 1}}
+
+  - component: admission
+    name: check-balance
+    kind: function
+    request: {type: object, properties: {org_id: {type: string}}}
+    response: Org
+    errors:
+      - {code: insufficient_balance, status: 402}
+      - {code: internal, status: 500}
+    behavior:
+      - title: Load the organization
+        detail: Standing and balance come from the account store.
+      - call: account-store.read
+        input: {org_id: "= input.org_id"}
+        as: org
+        on_error:
+          - set: {ctx.httpStatus: 500, ctx.errorCode: internal, ctx.phase: refused, ctx.upstreamDials: 0}
+          - title: Refuse when the store fails
+            detail: Admission fails closed; an unreadable balance is not treated as sufficient.
+            fail: {code: internal, status: 500, message: account store unavailable}
+      - set:
+          ctx.balanceCents: "= vars.org.value.balance_cents"
+          ctx.floorCents: "= state.floor_cents"
+          ctx.standing: "= vars.org.value.standing"
+      - if: "vars.org.value.balance_cents < state.floor_cents"
+        then:
+          - set: {ctx.httpStatus: 402, ctx.errorCode: insufficient_balance, ctx.phase: refused, ctx.upstreamDials: 0}
+          - title: Refuse below the floor
+            detail: The balance is under the floor, so the request is not parsed or dispatched.
+            fail:
+              code: insufficient_balance
+              status: 402
+              message: "= 'balance ' + string(vars.org.value.balance_cents) + ' is below the floor of ' + string(state.floor_cents)"
+      - return: "= vars.org.value"
+
+  - component: account-store
+    name: read
+    kind: sql
+    request: {type: object, properties: {org_id: {type: string}}}
+    response: Org
+    latency_ms: {min: 1, max: 3}
+    behavior:
+      - if: "!(input.org_id in state.orgs)"
+        then:
+          - fail: {code: not_found, status: 404, message: unknown organization}
+      - return: "= state.orgs[input.org_id]"
+
+  - component: parser
+    name: parse
+    kind: function
+    request: ChatRequest
+    behavior:
+      - title: Parse the body
+        detail: A model name is required; the prompt size defaults to zero.
+      - if: "!has(input.model) || input.model == ''"
+        then:
+          - set: {ctx.httpStatus: 400, ctx.errorCode: invalid_request, ctx.phase: refused}
+          - fail: {code: invalid_request, status: 400, message: model is required}
+      - set: {ctx.body: valid}
+      - return:
+          model: "= input.model"
+          stream: "= has(input.stream) ? input.stream : false"
+          prompt_tokens: "= has(input.prompt_tokens) ? input.prompt_tokens : 0"
+
+  - component: catalog
+    name: resolve
+    kind: function
+    request: {type: object, properties: {model: {type: string}}}
+    response: Model
+    behavior:
+      - title: Resolve the model
+        detail: The public name maps to a catalog entry with its pool and context window.
+      - if: "!(input.model in state.models)"
+        then:
+          - set: {ctx.httpStatus: 404, ctx.errorCode: model_not_found, ctx.phase: refused}
+          - fail: {code: model_not_found, status: 404}
+      - set: {ctx.model: "= input.model"}
+      - return: "= state.models[input.model]"
+
+  - component: policy
+    name: authorize
+    kind: function
+    request:
+      type: object
+      properties:
+        principal: {type: string}
+        model: {type: string}
+        action: {type: string}
+    errors: [{code: forbidden, status: 403}]
+    behavior:
+      - title: Evaluate the model policy
+        detail: The principal must be allowed to invoke this model.
+      - choice: decision
+        default: allow
+        options:
+          allow:
+            - set: {ctx.policy: allowed}
+            - return: {allowed: true}
+          deny:
+            - set: {ctx.policy: denied, ctx.httpStatus: 403, ctx.errorCode: forbidden, ctx.phase: refused, ctx.upstreamDials: 0}
+            - title: Refuse by policy
+              detail: The policy denies the model before any routing happens.
+              fail: {code: forbidden, status: 403, message: model invocation denied}
+
+  - component: planner
+    name: plan
+    kind: function
+    request: {type: object, properties: {pool: {type: string}, api_family: {type: string}}}
+    behavior:
+      - title: Plan the route
+        detail: The pool's upstreams, in the order they will be tried.
+        set: {ctx.routePlan: "= state.pools[input.pool].targets.join(', ')"}
+      - return: {pool: "= input.pool", targets: "= state.pools[input.pool].targets"}
+
+  - component: preflight
+    name: check
+    kind: function
+    request:
+      type: object
+      properties:
+        prompt_tokens: {type: integer}
+        context_window: {type: integer}
+        key_id: {type: string}
+    errors:
+      - {code: context_too_long, status: 400}
+      - {code: key_budget_exceeded, status: 402}
+    behavior:
+      - title: Check context and key budget
+        detail: The prompt must fit the model's context window, then the key's remaining budget must cover the estimate.
+        set: {ctx.estimateCents: "= state.estimate_cents"}
+      - if: "input.prompt_tokens > input.context_window"
+        then:
+          - set: {ctx.context: too long, ctx.httpStatus: 400, ctx.errorCode: context_too_long, ctx.phase: refused, ctx.upstreamDials: 0}
+          - title: Refuse an oversized prompt
+            detail: The prompt is longer than the model's context window.
+            fail: {code: context_too_long, status: 400}
+      - set: {ctx.context: fits}
+      - if: "state.key_budget_cents < state.estimate_cents"
+        then:
+          - set: {ctx.keyBudget: exhausted, ctx.httpStatus: 402, ctx.errorCode: key_budget_exceeded, ctx.phase: refused, ctx.upstreamDials: 0}
+          - title: Refuse an exhausted key
+            detail: The key's own budget is spent, whatever the organization's balance.
+            fail: {code: key_budget_exceeded, status: 402}
+      - set: {ctx.keyBudget: available}
+      - return: {estimate_cents: "= state.estimate_cents"}
+
+  - component: slots
+    name: acquire
+    kind: function
+    request: {type: object, properties: {pool: {type: string}}}
+    errors: [{code: rate_limited, status: 429}]
+    behavior:
+      - call: ledger.take
+        input: {pool: "= input.pool"}
+        as: taken
+        on_error: continue
+      - if: "vars.taken.ok"
+        then:
+          - title: Take a shared slot
+            detail: The shared ledger counts slots across every gateway replica.
+            set: {ctx.slotMode: shared, vars.granted: "= vars.taken.value.granted"}
+        else:
+          - title: Take a local slot
+            detail: The ledger is unreachable, so each replica falls back to its own small cap.
+            set: {ctx.slotMode: local, vars.granted: "= state.local_free > 0"}
+      - if: "!vars.granted"
+        then:
+          - set: {ctx.slots: none free, ctx.httpStatus: 429, ctx.errorCode: rate_limited, ctx.phase: refused, ctx.upstreamDials: 0}
+          - title: Refuse at capacity
+            detail: Every upstream is busy; nothing is dialed.
+            fail: {code: rate_limited, status: 429, message: no free upstream slot, data: {retry_after_s: 1}}
+      - set:
+          ctx.slots: held
+          state.held: "= state.held + 1"
+          state.local_free: "= ctx.slotMode == 'local' ? state.local_free - 1 : state.local_free"
+      - return: {mode: "= ctx.slotMode", granted: true}
+
+  - component: slots
+    name: release
+    kind: function
+    behavior:
+      - title: Release the slot
+        detail: The request gives its slot back.
+      - call: ledger.put
+        when: "ctx.slotMode == 'shared'"
+        on_error: continue
+      - set:
+          state.held: "= state.held > 0 ? state.held - 1 : 0"
+          state.local_free: "= ctx.slotMode == 'local' ? state.local_free + 1 : state.local_free"
+          ctx.slots: released
+      - return: {released: true}
+
+  - component: ledger
+    name: take
+    kind: rpc
+    request: {type: object, properties: {pool: {type: string}}}
+    latency_ms: {min: 1, max: 2}
+    behavior:
+      - if: "state.free <= 0"
+        then:
+          - return: {granted: false, free: 0}
+      - set: {state.free: "= state.free - 1"}
+      - return: {granted: true, free: "= state.free"}
+
+  - component: ledger
+    name: put
+    kind: rpc
+    latency_ms: 1
+    behavior:
+      - set: {state.free: "= state.free + 1"}
+      - return: {free: "= state.free"}
+
+  - component: dispatch
+    name: send
+    kind: function
+    request:
+      type: object
+      properties:
+        targets: {type: array, items: {type: string}}
+        backend_ref: {type: string}
+        body: {$ref: ChatRequest}
+    response: UpstreamResponse
+    errors: [{code: upstream_error, status: 502, retryable: true}]
+    behavior:
+      - title: Dial the first upstream
+        detail: The body is forwarded with the public model name replaced by the backend reference.
+        set: {ctx.phase: dialing}
+      - call: "= input.targets[attempt - 1] + '.chat'"
+        targets: [upstream-a.chat, upstream-b.chat]
+        input:
+          model: "= input.backend_ref"
+          messages: "= input.body.messages"
+          stream: true
+        timeout_ms: 30000
+        retry:
+          max_attempts: "= size(input.targets)"
+          codes: [upstream_error, unavailable, timeout]
+          when: "!ctx.committed"
+          title: Upstream fails before commitment
+          detail: Nothing has reached the client yet, so the next upstream in the plan is tried.
+        as: response
+      - set: {ctx.upstreamDials: "= vars.response.attempts"}
+      - when: "vars.response.attempts > 1"
+        set: {ctx.firstAttempt: failed before commitment}
+      - return: "= vars.response.value"
+
+  - component: upstream-a
+    name: chat
+    kind: http
+    summary: Chat endpoint of a model server. A stub; responses come from its schema.
+    attributes: {method: POST, path: /v1/chat}
+    request: UpstreamRequest
+    response: UpstreamResponse
+    errors: [{code: upstream_error, status: 502, retryable: true}]
+    latency_ms: {min: 40, max: 120}
+
+  - component: upstream-b
+    name: chat
+    kind: http
+    summary: Chat endpoint of a model server. A stub; responses come from its schema.
+    attributes: {method: POST, path: /v1/chat}
+    request: UpstreamRequest
+    response: UpstreamResponse
+    errors: [{code: upstream_error, status: 502, retryable: true}]
+    latency_ms: {min: 40, max: 120}
+
+  - component: relay
+    name: stream
+    kind: stream
+    request: {type: object, properties: {response: {$ref: UpstreamResponse}}}
+    errors: [{code: stream_interrupted, status: 200}]
+    behavior:
+      - title: Commit and stream
+        detail: From here the response belongs to the client; a later failure is never retried elsewhere.
+        set: {ctx.committed: true, ctx.httpStatus: 200, ctx.phase: streaming}
+      - choice: stream
+        default: completes
+        options:
+          completes:
+            - wait: "= input.response.tokens_out / 10"
+            - return: {delivered: true, tokens_out: "= input.response.tokens_out"}
+          breaks:
+            - wait: 15
+            - fail: {code: stream_interrupted, status: 200, message: the stream broke after commitment}
+
+  - component: rating
+    name: rate
+    kind: function
+    request: Usage
+    behavior:
+      - title: Price the response
+        detail: Completed usage is priced once, at the preflight estimate.
+        set: {ctx.usageAccepted: true}
+      - return: {cost_cents: "= input.estimate_cents"}
+
+  - component: billing
+    name: record
+    kind: queue
+    summary: Usage records, consumed asynchronously.
+    request: Usage
+    behavior:
+      - title: Queue the usage record
+        detail: Billing happens after the response, not on its path.
+        set: {ctx.billing: queued, state.records: "= state.records + 1"}
+
+links:
+  - id: billing-debits-balance
+    from: billing
+    to: account-store
+    kind: writes
+    label: debits
+    summary: Billed usage is debited from the organization's balance off the request path.
+
+flows:
+  - id: chat-stream
+    name: Streaming chat request
+    description: One streaming chat request through admission, policy, shared capacity and the commitment boundary.
+    entry:
+      caller: client
+      interface: gateway.chat
+      input: {stream: true}
+    tags: [inference]
+
+scenarios:
+  - id: happy-path
+    flow: chat-stream
+    name: Successful stream
+    expect:
+      - "result.ok && result.value.status == 'complete'"
+      - "ctx.committed && ctx.httpStatus == 200"
+      - "ctx.phase == 'complete' && ctx.billing == 'queued' && ctx.slots == 'released'"
+      - "calls['upstream-a.chat'] == 1 && calls['upstream-b.chat'] == 0 && retries == 0"
+      - "state['billing'].records == 1 && state['slots'].held == 0"
+      - "state['ledger'].free == 3"
+
+  - id: invalid-api-key
+    flow: chat-stream
+    name: Unknown API key
+    input: {api_key: key-unknown}
+    expect:
+      - "!result.ok && result.error.status == 401 && result.error.code == 'unauthenticated'"
+      - "calls['throttle.check'] == 0 && ctx.upstreamDials == 0"
+
+  - id: rate-limited
+    flow: chat-stream
+    name: Rate limited
+    choices: {throttle.check.rate_limit: exceeded}
+    expect:
+      - "result.error.status == 429 && result.error.code == 'rate_limited'"
+      - "calls['admission.check-balance'] == 0"
+
+  - id: below-balance-floor
+    flow: chat-stream
+    name: Balance below the floor
+    state:
+      account-store:
+        orgs:
+          org-test: {balance_cents: 20, standing: active}
+    expect:
+      - "result.error.status == 402 && result.error.code == 'insufficient_balance'"
+      - "ctx.balanceCents == 20 && calls['parser.parse'] == 0"
+
+  - id: account-store-unavailable
+    flow: chat-stream
+    name: Account store unavailable
+    faults:
+      - {target: account-store, type: unavailable}
+    expect:
+      - "result.error.status == 500 && result.error.code == 'internal'"
+      - "calls['parser.parse'] == 0 && faults == 1"
+
+  - id: policy-denies
+    flow: chat-stream
+    name: Policy denies the model
+    choices: {policy.authorize.decision: deny}
+    expect:
+      - "result.error.status == 403"
+      - "calls['planner.plan'] == 0"
+
+  - id: context-too-large
+    flow: chat-stream
+    name: Prompt exceeds the context window
+    input: {prompt_tokens: 200000}
+    expect:
+      - "result.error.status == 400 && result.error.code == 'context_too_long'"
+      - "calls['slots.acquire'] == 0"
+
+  - id: key-budget-exhausted
+    flow: chat-stream
+    name: Key budget exhausted
+    state:
+      preflight: {key_budget_cents: 0}
+    expect:
+      - "result.error.status == 402 && result.error.code == 'key_budget_exceeded'"
+
+  - id: pool-full
+    flow: chat-stream
+    name: No free upstream slot
+    state:
+      ledger: {free: 0}
+    expect:
+      - "result.error.status == 429 && ctx.slots == 'none free'"
+      - "calls['upstream-a.chat'] == 0 && calls['upstream-b.chat'] == 0"
+
+  - id: retry-before-commit
+    flow: chat-stream
+    name: First upstream fails before commitment
+    faults:
+      - {target: upstream-a.chat, type: error, code: upstream_error, status: 502, retryable: true, calls: [1]}
+    expect:
+      - "result.ok && retries == 1"
+      - "calls['upstream-a.chat'] == 1 && calls['upstream-b.chat'] == 1"
+      - "ctx.upstreamDials == 2 && ctx.firstAttempt == 'failed before commitment'"
+
+  - id: stream-breaks-after-commit
+    flow: chat-stream
+    name: Stream breaks after commitment
+    choices: {relay.stream.stream: breaks}
+    expect:
+      - "result.ok && result.value.partial == true"
+      - "ctx.committed && !ctx.usageAccepted && ctx.retryAllowed == false"
+      - "retries == 0 && calls['upstream-b.chat'] == 0 && calls['rating.rate'] == 0"
+      - "state['slots'].held == 0"
+
+  - id: ledger-unavailable-local-fallback
+    flow: chat-stream
+    name: "Ledger unavailable: local slots"
+    faults:
+      - {target: ledger, type: unavailable}
+    expect:
+      - "result.ok && ctx.slotMode == 'local'"
+      - "state['slots'].local_free == 2 && state['slots'].held == 0"
+
+  - id: upstream-timeout-retry
+    flow: chat-stream
+    name: First upstream times out, second answers
+    faults:
+      - {target: upstream-a.chat, type: timeout}
+    expect:
+      - "result.ok && retries == 1 && calls['upstream-b.chat'] == 1"
+      - "duration_ms >= 30000"
+
+  - id: all-upstreams-fail
+    flow: chat-stream
+    name: Every upstream fails
+    faults:
+      - {target: upstream-a, type: error, code: upstream_error, status: 502, retryable: true}
+      - {target: upstream-b, type: error, code: upstream_error, status: 502, retryable: true}
+    expect:
+      - "result.error.status == 502 && result.error.code == 'upstream_error'"
+      - "retries == 1 && calls['rating.rate'] == 0"
+      - "state['slots'].held == 0 && state['ledger'].free == 3"

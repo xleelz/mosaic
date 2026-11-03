@@ -1,0 +1,77 @@
+# Round-4 in-build oracle for kernels-ops (build-oracle/round4/kernels-ops.json). See kernels-ops.md.
+schema_version: 1
+id: vllm
+
+scenarios:
+  - id: oracle-r4-kernels-ops-fa4-hd256-version
+    name: On Blackwell (SM100) a head_size=256 FlashAttention layer gets FA4, with or without a sliding window
+    description: >-
+      tests/kernels/attention/test_attention_selector.py::test_fa4_hd256_impl_selection (line 766), the
+      DECODER rows (expected 4). FlashAttentionImpl.__init__ asks get_flash_attn_version(head_size=256,
+      supports_fa4_hd256=True) (vllm/v1/attention/backends/flash_attn.py:1099-1105): SM100 defaults to FA4,
+      and 256 is an FA4 hd256 shape, so TMEM limits do not demote it (fa_utils.py:99-107, 205). The
+      ENCODER_ONLY + sliding-window row (expected 2) is decided after that call, in FlashAttentionImpl.__init__
+      (flash_attn.py:1109-1116), which the model does not have (attention's area).
+    fixtures: [full-tp1-llama-8b]
+    steps:
+      - interface: fa-utils.get-flash-attn-version
+        caller: gpu-worker
+        as: decoder
+        input: {platform: cuda, device_capability_major: 10, supported_versions: [2, 3, 4], head_size: 256, has_sinks: false}
+      - interface: fa-utils.get-flash-attn-version
+        caller: gpu-worker
+        as: hd512
+        input: {platform: cuda, device_capability_major: 10, supported_versions: [2, 3, 4], head_size: 512, has_sinks: false}
+    expect:
+      - "steps.decoder.result.ok && steps.decoder.result.value.fa_version == 4"
+      - "steps.hd512.result.ok && steps.hd512.result.value.fa_version == 2"
+
+  - id: oracle-r4-kernels-ops-workspace-topk-paths
+    name: persistent_topk and cooperative_topk on the test's batches (top_k=2048) take the expected host paths
+    description: >-
+      tests/kernels/test_top_k_per_row.py::test_workspace_topk_correctness (line 1235) for both workspace
+      backends. Each case builds float32 logits [len(seq_lens), max(seq_lens)], int32 lengths and an
+      [rows, 2048] output. persistent_topk with <= 32 rows runs persistent_topk_kernel with a vector width
+      from the row stride (csrc/topk.cu:88-93). cooperative_topk needs a row stride divisible by 4, so the
+      test skips the unaligned cases (test lines 87-91; csrc/cooperative_topk.cu:69-72); with 2 rows on
+      SM90 it launches 8-CTA clusters. The index comparison against torch.topk is numeric and untranslatable.
+    fixtures: [full-tp1-llama-8b]
+    steps:
+      - {interface: torch-bindings.persistent-topk, caller: gpu-worker, as: p_low, input: {num_rows: 4, k: 2048, max_seq_len: 2063, row_stride: 2063}}
+      - {interface: torch-bindings.persistent-topk, caller: gpu-worker, as: p_4k, input: {num_rows: 4, k: 2048, max_seq_len: 4102, row_stride: 4102}}
+      - {interface: torch-bindings.persistent-topk, caller: gpu-worker, as: p_mixed, input: {num_rows: 2, k: 2048, max_seq_len: 10000, row_stride: 10000}}
+      - {interface: torch-bindings.cooperative-topk, caller: gpu-worker, as: c_mixed, input: {num_rows: 2, k: 2048, max_seq_len: 10000, row_stride: 10000}}
+      - {interface: torch-bindings.cooperative-topk, caller: gpu-worker, as: c_low, input: {num_rows: 4, k: 2048, max_seq_len: 2063, row_stride: 2063}}
+    expect:
+      - "steps.p_low.result.ok && steps.p_low.result.value.path == 'persistent' && steps.p_low.result.value.vec_size == 1"
+      - "steps.p_4k.result.ok && steps.p_4k.result.value.vec_size == 2"
+      - "steps.p_mixed.result.ok && steps.p_mixed.result.value.vec_size == 4"
+      - "steps.c_mixed.result.ok && steps.c_mixed.result.value.cluster_size == 8"
+      - "!steps.c_low.result.ok && steps.c_low.result.error.message.contains('stride must be multiple of 4')"
+
+  - id: oracle-r4-kernels-ops-gelu-and-mul-sparse-triton
+    name: The Triton gelu_and_mul_sparse impl supports the generated inputs and launches one row-wide program per token
+    description: >-
+      tests/kernels/ir/test_activation.py::test_gelu_and_mul_sparse_triton (line 32), for intermediate sizes
+      2048 and 32768 and fp16/fp32. generate_inputs makes x [T, 2I] with approximate='tanh'
+      (vllm/ir/ops/activation.py:25-33); the Triton impl's supports_args accepts CUDA fp16/bf16/fp32
+      contiguous inputs whose half last dim is <= 32768 (vllm/kernels/triton/activation.py:55-71); the op
+      launches with BLOCK_SIZE = next_power_of_2(I) and num_warps = min(max(BLOCK_SIZE // 256, 1), 8)
+      (activation.py:76-97). assert_close against the native impl and the zero-mask mismatch rate are numeric
+      and untranslatable.
+    fixtures: [full-tp1-llama-8b]
+    steps:
+      - {interface: ir-op.generate-inputs, caller: gpu-worker, as: gen, input: {op: gelu_and_mul_sparse, num_tokens: 64, hidden_size: 32768, dtype_bytes: 4}}
+      - interface: ir-op.impl-supports-args
+        caller: gpu-worker
+        as: sup
+        input: {provider: triton, args: {op: gelu_and_mul_sparse, num_tokens: 64, hidden_size: 65536, dtype_bytes: 4, approximate: tanh, contiguous: true, ndim: 2, device_type: cuda}}
+      - {interface: kernels-triton-activation.gelu-and-mul-sparse-triton, caller: gpu-worker, as: big, input: {op: gelu_and_mul_sparse, num_tokens: 64, hidden_size: 65536, dtype_bytes: 4, approximate: tanh}}
+      - {interface: kernels-triton-activation.gelu-and-mul-sparse-triton, caller: gpu-worker, as: small, input: {op: gelu_and_mul_sparse, num_tokens: 1, hidden_size: 4096, dtype_bytes: 2, approximate: tanh}}
+      - {interface: kernels-triton-activation.gelu-and-mul-sparse-triton, caller: gpu-worker, as: odd, input: {op: gelu_and_mul_sparse, num_tokens: 8, hidden_size: 27648, dtype_bytes: 2, approximate: tanh}}
+    expect:
+      - "steps.gen.result.ok && steps.gen.result.value.hidden_size == 65536 && steps.gen.result.value.approximate == 'tanh'"
+      - "steps.sup.result.value.supported && steps.sup.result.value.supports_args"
+      - "steps.big.result.ok && steps.big.result.value.d == 32768 && steps.big.result.value.block_size == 32768 && steps.big.result.value.num_warps == 8"
+      - "steps.small.result.value.block_size == 2048 && steps.small.result.value.num_warps == 8"
+      - "steps.odd.result.value.d == 13824 && steps.odd.result.value.block_size == 16384"

@@ -1,0 +1,1244 @@
+# Fix round 4 (coverage): the functions worker-runner's tests call that the model did not cite.
+configs:
+  - {id: pcp-shard-decode-requests, type: boolean, value: false, default: false, summary: "parallel_config.pcp_shard_decode_requests: with PCP, give each decode request to one PCP rank (round-robin over decodes) instead of replicating it", sources: ["vllm/v1/worker/gpu/pcp_manager.py:852"], attributes: {boundary: true, owner: config-platform, key: parallel_config.pcp_shard_decode_requests}}
+  - {id: hisparse-enabled, type: boolean, value: false, default: false, summary: "attention_config.hisparse_config is not None (HiSparse host-backed KV)", sources: ["vllm/v1/worker/gpu/attn_utils.py:409-418"], attributes: {boundary: true, owner: config-platform, key: attention_config.hisparse_config}}
+
+components:
+  - id: request-state
+    name: RequestState (V2)
+    kind: module
+    parent: gpu-model-runner
+    layer: runner
+    summary: "vllm/v1/worker/gpu/states.py RequestState: the runner's per-slot request buffers (prompt_len, prefill_len, all_token_ids, num_computed_tokens, drafts). add_request stages host writes; apply_staged_writes flushes them to the device once per step."
+    sources: ["vllm/v1/worker/gpu/states.py:20-133"]
+  - id: custom-logits-processor
+    name: LogitsProcessor (V2 custom)
+    kind: module
+    parent: sampler
+    layer: sampling
+    summary: "vllm/v1/worker/gpu/sample/logits_processor/interface.py: the base class of user logits processors for the V2 runner. Per-slot state is (re)initialized in add_request, host writes are flushed in apply_staged_writes, and apply runs once per step on the whole batch with the step's LogitsContext."
+    sources: ["vllm/v1/worker/gpu/sample/logits_processor/interface.py:92-158"]
+  - id: input-batch-v1
+    name: InputBatch (V1)
+    kind: module
+    parent: gpu-model-runner-v1
+    layer: runner
+    summary: "vllm/v1/worker/gpu_input_batch.py: the V1 runner's persistent batch. Requests (CachedRequestState) take the next free row or append; removals leave holes that condense() fills by moving the last rows down; per-step SamplingMetadata is built from the per-row sampling sets."
+    sources: ["vllm/v1/worker/gpu_input_batch.py:90-320"]
+    state:
+      schema:
+        type: object
+        properties:
+          req_ids: {type: array, description: "row -> request id (null holes after a removal)"}
+          req_id_to_index: {type: object}
+          removed: {type: array, items: {type: integer}, description: "freed rows, kept sorted descending"}
+          num_tokens: {type: object}
+          greedy_reqs: {type: array}
+          random_reqs: {type: array}
+          top_p_reqs: {type: array}
+          top_k_reqs: {type: array}
+          penalty_reqs: {type: array}
+          num_logprobs: {type: object}
+      initial: {req_ids: [], req_id_to_index: {}, removed: [], num_tokens: {}, greedy_reqs: [], random_reqs: [], top_p_reqs: [], top_k_reqs: [], penalty_reqs: [], num_logprobs: {}}
+  - id: sampler-v1
+    name: Sampler (V1)
+    kind: module
+    parent: gpu-model-runner-v1
+    layer: sampling
+    summary: "vllm/v1/sample/sampler.py: the V1 runner's sampler: raw logprobs, logits processors, then greedy argmax and/or temperature + argmax-invariant processors + top-k/top-p random sampling, merged per row by temperature."
+    sources: ["vllm/v1/sample/sampler.py:24-330"]
+  - id: spec-decoding-stats
+    name: spec_decode/metrics.py
+    kind: module
+    parent: spec-decode
+    layer: spec-decode
+    summary: "vllm/v1/spec_decode/metrics.py: SpecDecodingStats, the per-step acceptance counts the scheduler aggregates into SchedulerStats; SpecDecodingLogging and SpecDecodingProm turn them into the periodic log line and the vllm:spec_decode_* counters."
+    sources: ["vllm/v1/spec_decode/metrics.py:17-281"]
+  - id: spec-decoding-prom
+    name: SpecDecodingProm
+    kind: module
+    parent: spec-decoding-stats
+    layer: spec-decode
+    tags: [metrics]
+    summary: "The Prometheus counters vllm:spec_decode_num_drafts, _num_draft_tokens, _num_accepted_tokens (exported with _total) and _num_accepted_tokens_per_pos, per engine."
+    sources: ["vllm/v1/spec_decode/metrics.py:177-281"]
+    state:
+      schema: {type: object, properties: {num_drafts: {type: integer}, num_draft_tokens: {type: integer}, num_accepted_tokens: {type: integer}, num_accepted_tokens_per_pos: {type: array}}}
+      initial: {num_drafts: 0, num_draft_tokens: 0, num_accepted_tokens: 0, num_accepted_tokens_per_pos: []}
+  - id: flash-maxsim
+    name: flash_maxsim/_common.py
+    kind: module
+    parent: late-interaction-runner
+    layer: pooling
+    summary: "Shared autotune helpers of the flash-maxsim late-interaction kernels: the (BLOCK_Q, BLOCK_D) config grid and its shared-memory pruning."
+    sources: ["vllm/v1/pool/flash_maxsim/_common.py:1-85"]
+    state:
+      schema: {type: object, properties: {max_shared_mem: {type: integer}}}
+      initial: {max_shared_mem: 232448}
+  - id: workspace-manager
+    name: WorkspaceManager
+    kind: module
+    parent: gpu-model-runner
+    layer: runner
+    summary: "vllm/v1/worker/workspace.py: the process-wide scratch manager kernels draw temporary buffers from, one slot per (ubatch, lane); locked after warmup so execution never allocates."
+    sources: ["vllm/v1/worker/workspace.py:49-130"]
+    state:
+      schema: {type: object, properties: {initialized: {type: boolean}, locked: {type: boolean}, num_lanes: {type: integer}, sizes: {type: array}, resources: {type: array}}}
+      initial: {initialized: true, locked: true, num_lanes: 1, sizes: [0], resources: [[]]}
+  - id: runner-kv-connector
+    name: KVConnector / ActiveKVConnector (V2 runner)
+    kind: module
+    parent: gpu-model-runner
+    layer: runner
+    summary: "vllm/v1/worker/gpu/kv_connector.py: the runner's wrapper around the worker-side KV transfer connector (distributed's kv-connector-base-v1-worker). Without a kv_transfer_config it is the no-op connector; otherwise it binds the scheduler's connector metadata before the forward and collects transfer results after it."
+    sources: ["vllm/v1/worker/gpu/kv_connector.py:30-170"]
+  - id: forward-context
+    name: forward_context.py
+    kind: module
+    parent: gpu-model-runner
+    layer: runner
+    tags: [incidental]
+    description: "Tagged incidental: the forward context is a module global that lives only for one forward (set_forward_context is a context manager that restores the previous context on exit), so no later step reads it back."
+    summary: "vllm/forward_context.py: the per-forward context every layer reads (attention metadata, CUDA graph runtime mode, batch descriptor, DP token counts, slot mappings), set by the runner around each model forward. No area owns the file by path; the profile assigns it to worker-runner."
+    sources: ["vllm/forward_context.py:30-58", "vllm/forward_context.py:141-206"]
+    state:
+      schema: {type: object, properties: {current: {type: ["object", "null"]}, previous: {type: array}}}
+      initial: {current: null, previous: []}
+  - id: pooling-metadata
+    name: pool/metadata.py
+    kind: module
+    parent: pooling-runner
+    layer: pooling
+    summary: "vllm/v1/pool/metadata.py: PoolingMetadata (prompt lengths, token ids, per-request PoolingParams and PoolingStates) the poolers read."
+    sources: ["vllm/v1/pool/metadata.py:48-176"]
+  - id: spec-decode-metadata-v1
+    name: SpecDecodeMetadata (V1)
+    kind: module
+    parent: gpu-model-runner-v1
+    layer: spec-decode
+    summary: "vllm/v1/spec_decode/metadata.py: the V1 runner's per-step draft layout (draft ids, cumulative draft and sampled counts, target/bonus logits indices)."
+    sources: ["vllm/v1/spec_decode/metadata.py:9-66"]
+  - id: encoder-cache
+    name: EncoderCache (V2)
+    kind: module
+    parent: gpu-model-runner
+    layer: runner
+    tags: [cache]
+    summary: "vllm/v1/worker/gpu/mm/encoder_cache.py: per-request multimodal features and the encoder outputs by mm hash."
+    sources: ["vllm/v1/worker/gpu/mm/encoder_cache.py:8-42"]
+    state:
+      schema: {type: object, properties: {mm_features: {type: object}, encoder_outputs: {type: object}}}
+      initial: {mm_features: {}, encoder_outputs: {}}
+  - id: runner-ec-connector
+    name: ECConnector / ActiveECConnector (V2 runner)
+    kind: module
+    parent: gpu-model-runner
+    layer: runner
+    summary: "vllm/v1/worker/gpu/ec_connector.py: the runner's wrapper around the encoder-cache transfer connector (EPD disaggregation)."
+    sources: ["vllm/v1/worker/gpu/ec_connector.py:20-89"]
+  - id: cudagraph-dispatcher-v1
+    name: CudagraphDispatcher (V1)
+    kind: module
+    parent: gpu-model-runner-v1
+    layer: runner
+    summary: "vllm/v1/cudagraph_dispatcher.py: the V1 runner's CUDA graph key registry and dispatcher."
+    sources: ["vllm/v1/cudagraph_dispatcher.py:15-70"]
+  - id: dual-key-gumbel-watermarker
+    name: DualKeyGumbelWatermarker
+    kind: module
+    parent: gpu-watermark-sampler
+    layer: sampling
+    summary: "vllm/v1/watermarking/gumbel.py: routes each token between a draft-key and a target-key Gumbel watermarker with probability alpha."
+    sources: ["vllm/v1/watermarking/gumbel.py:100-182"]
+
+interfaces:
+  # ---------------- RequestState ----------------
+  - component: request-state
+    name: apply-staged-writes
+    kind: function
+    summary: "RequestState.apply_staged_writes: copies prompt_len and prefill_len to their UVA buffers and applies the staged total_len, all_token_ids and num_computed_tokens writes (one kernel launch each)."
+    sources: ["vllm/v1/worker/gpu/states.py:119-124"]
+    latency_ms: 0
+    request: {type: object, properties: {num_rows: {type: integer}}}
+    response: {type: object, properties: {flushed: {type: array, items: {type: string}}}}
+    behavior:
+      - title: Staged total_len, all_token_ids and num_computed_tokens writes reach the device
+        source: "vllm/v1/worker/gpu/states.py:121-124"
+        call: staged-write-tensor.apply-write-kernel
+        input: {num_rows: "= input.num_rows"}
+      - return: {flushed: [prompt_len, prefill_len, total_len, all_token_ids, num_computed_tokens]}
+
+  # ---------------- V2 custom logits processors ----------------
+  - component: custom-logits-processor
+    name: add-request
+    kind: function
+    summary: "LogitsProcessor.add_request: initializes the processor's per-slot state for a request entering the batch (the slot may hold a previous occupant's) and says whether it modifies logits for the request; the base class returns True."
+    sources: ["vllm/v1/worker/gpu/sample/logits_processor/interface.py:126-134"]
+    latency_ms: 0
+    request: {type: object, required: [processor, slot], properties: {processor: {type: string}, slot: {type: integer}, sampling_params: {type: object, default: {}}}}
+    response: {type: object, properties: {modifies_logits: {type: boolean}}}
+    behavior:
+      - if: "has(input.sampling_params) && has(input.sampling_params.extra_args) && input.processor in input.sampling_params.extra_args && input.sampling_params.extra_args[input.processor] == false"
+        then:
+          - title: A processor may decline the request for its slot
+            source: "vllm/v1/worker/gpu/sample/logits_processor/interface.py:126-133"
+            return: {modifies_logits: false}
+      - title: The base implementation modifies every request's logits
+        source: "vllm/v1/worker/gpu/sample/logits_processor/interface.py:134"
+        return: {modifies_logits: true}
+  - component: custom-logits-processor
+    name: apply-staged-writes
+    kind: function
+    summary: "LogitsProcessor.apply_staged_writes: flushes host-side writes staged by add_request, once per step before the forward and after the request states are flushed; a no-op in the base class."
+    sources: ["vllm/v1/worker/gpu/sample/logits_processor/interface.py:136-142"]
+    latency_ms: 0
+    request: {type: object, required: [processor], properties: {processor: {type: string}}}
+    response: {type: object, properties: {processor: {type: string}}}
+    behavior:
+      - return: {processor: "= input.processor"}
+  - component: custom-logits-processor
+    name: apply
+    kind: function
+    summary: "LogitsProcessor.apply: called once per step for the whole batch (rows of declined requests included, to be filtered via ctx.expanded_idx_mapping), after bias, penalties, bad words and the grammar and before temperature, min_p and top-k/top-p; abstract in the base class."
+    sources: ["vllm/v1/worker/gpu/sample/logits_processor/interface.py:144-158"]
+    latency_ms: 0
+    errors: [{code: not-implemented-error, status: 0, retryable: false}]
+    request: {type: object, required: [processor], properties: {processor: {type: string}, ctx: {type: object, default: {}, properties: {idx_mapping: {type: array, default: []}, expanded_idx_mapping: {type: array, default: []}}}}}
+    response: {type: object, properties: {num_rows: {type: integer}}}
+    behavior:
+      - if: "input.processor == 'LogitsProcessor'"
+        then:
+          - title: The abstract base has no apply
+            source: "vllm/v1/worker/gpu/sample/logits_processor/interface.py:158"
+            fail: {code: not-implemented-error, status: 0, message: "LogitsProcessor.apply is abstract"}
+      - return: {num_rows: "= has(input.ctx) && has(input.ctx.expanded_idx_mapping) ? size(input.ctx.expanded_idx_mapping) : 0"}
+  - component: logits-processor-loader
+    name: build-custom-logits-processors-params-validator
+    kind: function
+    summary: "build_custom_logits_processors_params_validator: loads the configured custom processor classes once (at frontend startup) and returns a validator that runs each class's validate_params at request admission, re-raising a ValueError as VLLMValidationError (a client error, so the request fails with 400 instead of reaching the sampler)."
+    sources: ["vllm/v1/worker/gpu/sample/logits_processor/loader.py:185-211", "vllm/exceptions.py:28-56"]
+    latency_ms: 0
+    errors: [{code: vllm-validation-error, status: 0, retryable: false}]
+    request:
+      type: object
+      properties:
+        custom: {type: array, default: [], items: {type: object, properties: {name: {type: string}, rejects: {type: array, default: [], items: {type: string}, description: "sampling-param keys this class's validate_params rejects with ValueError"}}}}
+        sampling_params: {type: object, default: {}}
+    response: {type: object, properties: {validated_by: {type: array, items: {type: string}}}}
+    behavior:
+      - if: "!has(input.custom) || size(input.custom) == 0"
+        then:
+          - title: No custom classes, the validator accepts everything
+            source: "vllm/v1/worker/gpu/sample/logits_processor/loader.py:201-202"
+            return: {validated_by: []}
+      - foreach: "= input.custom"
+        as: cls
+        steps:
+          - if: "has(vars.cls.rejects) && vars.cls.rejects.exists(k, has(input.sampling_params) && k in input.sampling_params)"
+            then:
+              - title: "A ValueError from validate_params becomes VLLMValidationError (message kept; parameter and value unset)"
+                source: "vllm/v1/worker/gpu/sample/logits_processor/loader.py:204-209"
+                fail: {code: vllm-validation-error, status: 0, message: "= vars.cls.name + ': invalid ' + vars.cls.rejects.filter(k, k in input.sampling_params)[0]"}
+      - return: {validated_by: "= input.custom.map(c, c.name)"}
+
+  # ---------------- V1 InputBatch ----------------
+  - component: input-batch-v1
+    name: add-request
+    kind: function
+    summary: "InputBatch.add_request (V1): a CachedRequestState takes the lowest freed row (else appends at num_reqs, below max_num_reqs); its prompt and output tokens are copied, num_tokens = prompt + output, and it joins the greedy or random set (temperature 0 is greedy), the top-p / top-k / penalty sets and the logprobs map."
+    sources: ["vllm/v1/worker/gpu_input_batch.py:320-494", "vllm/v1/worker/gpu_input_batch.py:34-87"]
+    latency_ms: 0
+    errors: [{code: assertion-error, status: 0, retryable: false}]
+    request:
+      type: object
+      required: [req_id]
+      properties:
+        req_id: {type: string}
+        prompt_token_ids: {type: ["array", "null"], default: null, items: {type: integer}}
+        output_token_ids: {type: array, default: [], items: {type: integer}}
+        num_computed_tokens: {type: integer, default: 0}
+        block_ids: {type: array, default: []}
+        sampling_params: {type: object, default: {}, properties: {temperature: {type: number, default: 1.0}, top_p: {type: number, default: 1.0}, top_k: {type: integer, default: 0}, frequency_penalty: {type: number, default: 0.0}, presence_penalty: {type: number, default: 0.0}, repetition_penalty: {type: number, default: 1.0}, logprobs: {type: ["integer", "null"], default: null}}}
+    response: {type: object, properties: {req_index: {type: integer}, num_tokens: {type: integer}}}
+    behavior:
+      - title: "Fill the lowest freed row, else append at the end"
+        source: "vllm/v1/worker/gpu_input_batch.py:324-329"
+        set:
+          vars.idx: "= size(state.removed) > 0 ? state.removed[size(state.removed) - 1] : size(state.req_id_to_index)"
+      - if: "vars.idx >= int(config['max-num-seqs'])"
+        then:
+          - source: "vllm/v1/worker/gpu_input_batch.py:330"
+            fail: {code: assertion-error, status: 0, message: "= 'new_req_index ' + string(vars.idx) + ' >= max_num_reqs'"}
+      - set:
+          vars.sp: "= has(input.sampling_params) ? input.sampling_params : {}"
+          vars.out: "= has(input.output_token_ids) ? input.output_token_ids : []"
+      - title: "CachedRequestState.num_tokens = prompt tokens + output tokens"
+        source: "vllm/v1/worker/gpu_input_batch.py:65-75"
+        set:
+          vars.ntok: "= (has(input.prompt_token_ids) && input.prompt_token_ids != null ? size(input.prompt_token_ids) : 0) + size(vars.out)"
+      - set:
+          state.removed: "= size(state.removed) > 0 ? state.removed.slice(0, size(state.removed) - 1) : []"
+          state.req_ids: "= vars.idx == size(state.req_ids) ? state.req_ids + [input.req_id] : lists.range(size(state.req_ids)).map(i, i == vars.idx ? input.req_id : state.req_ids[i])"
+          state.req_id_to_index: "= merge(state.req_id_to_index, {input.req_id: vars.idx})"
+          state.num_tokens: "= merge(state.num_tokens, {input.req_id: vars.ntok})"
+      - title: "Greedy (temperature 0) or random; top-p below 1, top-k inside (0, vocab), non-neutral penalties and requested logprobs join their sets"
+        source: "vllm/v1/worker/gpu_input_batch.py:404-440"
+        set:
+          state.greedy_reqs: "= has(vars.sp.temperature) && double(vars.sp.temperature) < 0.00001 ? state.greedy_reqs + [input.req_id] : state.greedy_reqs"
+          state.random_reqs: "= has(vars.sp.temperature) && double(vars.sp.temperature) < 0.00001 ? state.random_reqs : state.random_reqs + [input.req_id]"
+          state.top_p_reqs: "= has(vars.sp.top_p) && double(vars.sp.top_p) < 1.0 ? state.top_p_reqs + [input.req_id] : state.top_p_reqs"
+          state.top_k_reqs: "= has(vars.sp.top_k) && vars.sp.top_k > 0 && vars.sp.top_k < 128256 ? state.top_k_reqs + [input.req_id] : state.top_k_reqs"
+          state.penalty_reqs: "= (has(vars.sp.frequency_penalty) && double(vars.sp.frequency_penalty) != 0.0) || (has(vars.sp.presence_penalty) && double(vars.sp.presence_penalty) != 0.0) || (has(vars.sp.repetition_penalty) && double(vars.sp.repetition_penalty) != 1.0) ? state.penalty_reqs + [input.req_id] : state.penalty_reqs"
+          state.num_logprobs: "= has(vars.sp.logprobs) && vars.sp.logprobs != null ? merge(state.num_logprobs, {input.req_id: vars.sp.logprobs}) : state.num_logprobs"
+      - return: {req_index: "= vars.idx", num_tokens: "= vars.ntok"}
+  - component: input-batch-v1
+    name: remove-request
+    kind: function
+    summary: "InputBatch.remove_request (V1): frees the request's row (a hole until condense), clears its block-table row and drops it from every sampling set; an unknown request returns None."
+    sources: ["vllm/v1/worker/gpu_input_batch.py:523-578"]
+    latency_ms: 0
+    request: {type: object, required: [req_id], properties: {req_id: {type: string}}}
+    response: {type: object, properties: {req_index: {type: ["integer", "null"]}}}
+    behavior:
+      - if: "!(input.req_id in state.req_id_to_index)"
+        then:
+          - title: Not in the batch
+            source: "vllm/v1/worker/gpu_input_batch.py:533-535"
+            return: {req_index: null}
+      - set: {vars.idx: "= state.req_id_to_index[input.req_id]"}
+      - title: "The row becomes a hole; removed rows stay sorted descending, so the lowest is reused first"
+        source: "vllm/v1/worker/gpu_input_batch.py:537-541"
+        set:
+          state.removed: "= (state.removed + [vars.idx]).sortBy(x, -x)"
+          state.req_ids: "= lists.range(size(state.req_ids)).map(i, i == vars.idx ? null : state.req_ids[i])"
+          state.req_id_to_index: "= omit(state.req_id_to_index, input.req_id)"
+          state.num_tokens: "= omit(state.num_tokens, input.req_id)"
+      - source: "vllm/v1/worker/gpu_input_batch.py:558-574"
+        set:
+          state.greedy_reqs: "= state.greedy_reqs.filter(r, r != input.req_id)"
+          state.random_reqs: "= state.random_reqs.filter(r, r != input.req_id)"
+          state.top_p_reqs: "= state.top_p_reqs.filter(r, r != input.req_id)"
+          state.top_k_reqs: "= state.top_k_reqs.filter(r, r != input.req_id)"
+          state.penalty_reqs: "= state.penalty_reqs.filter(r, r != input.req_id)"
+          state.num_logprobs: "= omit(state.num_logprobs, input.req_id)"
+      - return: {req_index: "= vars.idx"}
+  - component: input-batch-v1
+    name: condense
+    kind: function
+    summary: "InputBatch.condense (V1): slides the last live rows down into the lowest holes until no hole lies below a live row; trailing holes are dropped. Nothing moves when every removed row was refilled."
+    sources: ["vllm/v1/worker/gpu_input_batch.py:698-831"]
+    latency_ms: 0
+    response: {type: object, properties: {req_ids: {type: array}, moved: {type: array}}}
+    behavior:
+      - if: "size(state.removed) == 0"
+        then:
+          - title: Every removed row was refilled
+            source: "vllm/v1/worker/gpu_input_batch.py:710-713"
+            return: {req_ids: "= state.req_ids", moved: []}
+      - title: "Live requests keep their relative order: the k-th live row goes to the k-th slot of [the lowest holes, then the live rows that stay]"
+        source: "vllm/v1/worker/gpu_input_batch.py:724-760"
+        set:
+          vars.n: "= size(state.req_id_to_index)"
+      - set:
+          vars.stay: "= lists.range(vars.n).filter(i, i < size(state.req_ids) && state.req_ids[i] != null)"
+          vars.movers: "= lists.range(size(state.req_ids)).filter(i, i >= vars.n && state.req_ids[i] != null)"
+      - set:
+          vars.holes: "= lists.range(vars.n).filter(i, !(i in vars.stay))"
+      - set:
+          vars.moved: "= lists.range(size(vars.movers)).map(k, {'req_id': state.req_ids[vars.movers[size(vars.movers) - 1 - k]], 'from': vars.movers[size(vars.movers) - 1 - k], 'to': vars.holes[k]})"
+      - set:
+          state.req_ids: "= lists.range(vars.n).map(i, i in vars.stay ? state.req_ids[i] : vars.moved.filter(m, m.to == i)[0].req_id)"
+          state.req_id_to_index: "= lists.range(vars.n).transformMapEntry(i, j, {(i in vars.stay ? state.req_ids[i] : vars.moved.filter(m, m.to == i)[0].req_id): i})"
+          state.removed: []
+      - return: {req_ids: "= state.req_ids", moved: "= vars.moved"}
+  - component: input-batch-v1
+    name: make-sampling-metadata
+    kind: function
+    summary: "InputBatch._make_sampling_metadata (V1): SamplingMetadata for the live rows: all_greedy / all_random from the greedy and random sets, temperature only when some row is random, top-p / top-k only when some row uses them, no_penalties, max_num_logprobs (None when no row asks), and req_ids / num_reqs."
+    sources: ["vllm/v1/worker/gpu_input_batch.py:851-955", "vllm/v1/worker/gpu_input_batch.py:314-318", "vllm/v1/worker/gpu_input_batch.py:1103-1144", "vllm/v1/sample/metadata.py:14-55"]
+    latency_ms: 0
+    response:
+      type: object
+      properties:
+        req_ids: {type: array}
+        num_reqs: {type: integer}
+        all_greedy: {type: boolean}
+        all_random: {type: boolean}
+        has_temperature: {type: boolean}
+        has_top_p: {type: boolean}
+        has_top_k: {type: boolean}
+        no_penalties: {type: boolean}
+        max_num_logprobs: {type: ["integer", "null"]}
+    behavior:
+      - title: "req_ids (with holes only transiently) and num_reqs = len(req_id_to_index)"
+        source: "vllm/v1/worker/gpu_input_batch.py:1103-1113"
+        set:
+          vars.all_greedy: "= size(state.random_reqs) == 0"
+          vars.all_random: "= size(state.greedy_reqs) == 0"
+      - return:
+          req_ids: "= state.req_ids"
+          num_reqs: "= size(state.req_id_to_index)"
+          all_greedy: "= vars.all_greedy"
+          all_random: "= vars.all_random"
+          has_temperature: "= !vars.all_greedy"
+          has_top_p: "= size(state.top_p_reqs) > 0"
+          has_top_k: "= size(state.top_k_reqs) > 0"
+          no_penalties: "= size(state.penalty_reqs) == 0"
+          max_num_logprobs: "= size(state.num_logprobs) > 0 ? state.num_logprobs.map(k, state.num_logprobs[k]).sortBy(x, -x)[0] : null"
+
+  # ---------------- V1 Sampler ----------------
+  - component: sampler-v1
+    name: forward
+    kind: function
+    summary: "Sampler.forward (V1): raw logprobs first when any row wants them, then the non-argmax-invariant logits processors (LogitsProcessors splits the loaded processors by is_argmax_invariant), then Sampler.sample: all-greedy batches take the argmax; otherwise temperature, the argmax-invariant processors and top-k/top-p random sampling run, and a mixed batch picks greedy or random per row by temperature."
+    sources: ["vllm/v1/sample/sampler.py:70-160", "vllm/v1/sample/sampler.py:247-305", "vllm/v1/sample/logits_processor/state.py:150-167", "vllm/v1/sample/logits_processor/interface.py:60-109"]
+    latency_ms: 0
+    errors: [{code: assertion-error, status: 0, retryable: false}]
+    request:
+      type: object
+      required: [sampling_metadata]
+      properties:
+        sampling_metadata: {type: object, properties: {all_greedy: {type: boolean}, all_random: {type: boolean}, max_num_logprobs: {type: ["integer", "null"], default: null}, temperatures: {type: array, default: [], items: {type: number}}}}
+        logitsprocs: {type: array, default: [], items: {type: object, properties: {name: {type: string}, argmax_invariant: {type: boolean}}}}
+        greedy_tokens: {type: array, default: [], items: {type: integer}, description: "the argmax token of each row (stand-in for the logits)"}
+        random_tokens: {type: array, default: [], items: {type: integer}, description: "the token top-k/top-p sampling draws for each row (stand-in)"}
+    response: {type: object, properties: {sampled_token_ids: {type: array}, path: {type: string}, processors_applied: {type: array}, has_logprobs: {type: boolean}}}
+    behavior:
+      - set:
+          vars.m: "= input.sampling_metadata"
+          vars.procs: "= has(input.logitsprocs) ? input.logitsprocs : []"
+      - title: "LogitsProcessors: argmax-invariant processors only matter for random sampling; the others always run"
+        source: "vllm/v1/sample/logits_processor/state.py:153-162"
+        set:
+          vars.non_inv: "= vars.procs.filter(p, !p.argmax_invariant).map(p, p.name)"
+          vars.inv: "= vars.procs.filter(p, p.argmax_invariant).map(p, p.name)"
+      - if: "vars.m.all_greedy && vars.m.all_random"
+        then:
+          - source: "vllm/v1/sample/sampler.py:258"
+            fail: {code: assertion-error, status: 0, message: "a batch cannot be all greedy and all random"}
+      - title: Raw logprobs come from the logits before any processing
+        source: "vllm/v1/sample/sampler.py:84-95"
+        set: {vars.lp: "= has(vars.m.max_num_logprobs) && vars.m.max_num_logprobs != null"}
+      - if: "vars.m.all_greedy"
+        then:
+          - title: "All greedy: argmax, nothing else runs"
+            source: "vllm/v1/sample/sampler.py:259-272"
+            return: {sampled_token_ids: "= input.greedy_tokens", path: greedy, processors_applied: "= vars.non_inv", has_logprobs: "= vars.lp"}
+      - if: "vars.m.all_random"
+        then:
+          - title: "All random: temperature, argmax-invariant processors, top-k/top-p sampling"
+            source: "vllm/v1/sample/sampler.py:274-296"
+            return: {sampled_token_ids: "= input.random_tokens", path: random, processors_applied: "= vars.non_inv + vars.inv", has_logprobs: "= vars.lp"}
+      - title: "Mixed: each row takes the greedy token when its temperature is below epsilon, else the random one"
+        source: "vllm/v1/sample/sampler.py:298-305"
+        return:
+          sampled_token_ids: "= lists.range(size(input.greedy_tokens)).map(i, vars.m.temperatures[i] < 0.00001 ? input.greedy_tokens[i] : input.random_tokens[i])"
+          path: mixed
+          processors_applied: "= vars.non_inv + vars.inv"
+          has_logprobs: "= vars.lp"
+
+  # ---------------- spec-decode stats ----------------
+  - component: spec-decoding-stats
+    name: observe-draft
+    kind: function
+    summary: "SpecDecodingStats.new and observe_draft: per step, one draft per request that had drafts: num_drafts += 1, num_draft_tokens and num_accepted_tokens accumulate, and the per-position counters count each accepted and each drafted position. More accepted tokens than spec tokens is an assertion error."
+    sources: ["vllm/v1/spec_decode/metrics.py:17-50"]
+    latency_ms: 0
+    errors: [{code: assertion-error, status: 0, retryable: false}]
+    request:
+      type: object
+      required: [num_spec_tokens, num_draft_tokens, num_accepted_tokens]
+      properties:
+        stats: {type: ["object", "null"], default: null}
+        num_spec_tokens: {type: integer}
+        num_draft_tokens: {type: integer}
+        num_accepted_tokens: {type: integer}
+    response: {type: object, properties: {num_spec_tokens: {type: integer}, num_drafts: {type: integer}, num_draft_tokens: {type: integer}, num_accepted_tokens: {type: integer}, num_accepted_tokens_per_pos: {type: array}, num_draft_tokens_per_pos: {type: array}}}
+    behavior:
+      - title: "A step's first draft starts fresh stats with zeroed per-position counters"
+        source: "vllm/v1/spec_decode/metrics.py:33-39"
+        set:
+          vars.st: "= has(input.stats) && input.stats != null ? input.stats : {'num_spec_tokens': input.num_spec_tokens, 'num_drafts': 0, 'num_draft_tokens': 0, 'num_accepted_tokens': 0, 'num_accepted_tokens_per_pos': lists.range(input.num_spec_tokens).map(i, 0), 'num_draft_tokens_per_pos': lists.range(input.num_spec_tokens).map(i, 0)}"
+      - if: "input.num_accepted_tokens > vars.st.num_spec_tokens"
+        then:
+          - source: "vllm/v1/spec_decode/metrics.py:45"
+            fail: {code: assertion-error, status: 0, message: "= 'num_accepted_tokens ' + string(input.num_accepted_tokens) + ' > num_spec_tokens ' + string(vars.st.num_spec_tokens)"}
+      - source: "vllm/v1/spec_decode/metrics.py:41-50"
+        return:
+          num_spec_tokens: "= vars.st.num_spec_tokens"
+          num_drafts: "= vars.st.num_drafts + 1"
+          num_draft_tokens: "= vars.st.num_draft_tokens + input.num_draft_tokens"
+          num_accepted_tokens: "= vars.st.num_accepted_tokens + input.num_accepted_tokens"
+          num_accepted_tokens_per_pos: "= lists.range(vars.st.num_spec_tokens).map(i, vars.st.num_accepted_tokens_per_pos[i] + (i < input.num_accepted_tokens ? 1 : 0))"
+          num_draft_tokens_per_pos: "= lists.range(vars.st.num_spec_tokens).map(i, vars.st.num_draft_tokens_per_pos[i] + (i < input.num_draft_tokens ? 1 : 0))"
+  - component: spec-decoding-stats
+    name: log
+    kind: function
+    summary: "SpecDecodingLogging.log: over the interval's observed stats, the mean acceptance length 1 + accepted / drafts (the bonus token included), the draft acceptance rate accepted / drafted x 100 (NaN with no draft tokens), and the per-position acceptance rates; nothing is logged without observations."
+    sources: ["vllm/v1/spec_decode/metrics.py:52-137"]
+    latency_ms: 0
+    request: {type: object, properties: {observed: {type: array, default: [], items: {type: object}}}}
+    response: {type: ["object", "null"], properties: {num_drafts: {type: integer}, num_draft_tokens: {type: integer}, num_accepted_tokens: {type: integer}, mean_acceptance_length: {type: number}, draft_acceptance_rate: {type: ["number", "null"]}, acceptance_rates: {type: array}}}
+    behavior:
+      - if: "!has(input.observed) || size(input.observed) == 0"
+        then:
+          - title: Nothing observed in this interval
+            source: "vllm/v1/spec_decode/metrics.py:83-84"
+            return: null
+      - set:
+          vars.d: "= sum(input.observed.map(o, o.num_drafts))"
+          vars.dt: "= sum(input.observed.map(o, o.num_draft_tokens))"
+          vars.a: "= sum(input.observed.map(o, o.num_accepted_tokens))"
+          vars.k: "= size(input.observed[0].num_accepted_tokens_per_pos)"
+      - title: "Mean acceptance length counts the bonus token; per-position rates are accepted-at-position / drafts"
+        source: "vllm/v1/spec_decode/metrics.py:107-117"
+        return:
+          num_drafts: "= vars.d"
+          num_draft_tokens: "= vars.dt"
+          num_accepted_tokens: "= vars.a"
+          mean_acceptance_length: "= 1.0 + double(vars.a) / double(vars.d)"
+          draft_acceptance_rate: "= vars.dt > 0 ? dyn(double(vars.a) / double(vars.dt) * 100.0) : dyn(null)"
+          acceptance_rates: "= lists.range(vars.k).map(p, double(sum(input.observed.map(o, o.num_accepted_tokens_per_pos[p]))) / double(vars.d))"
+  - component: spec-decoding-prom
+    name: observe
+    kind: function
+    summary: "SpecDecodingProm.observe: increments vllm:spec_decode_num_drafts, _num_draft_tokens and _num_accepted_tokens by the step's stats, and each position's _num_accepted_tokens_per_pos counter; a no-op when speculative decoding is off."
+    sources: ["vllm/v1/spec_decode/metrics.py:266-281"]
+    latency_ms: 0
+    request: {type: object, required: [stats], properties: {stats: {type: object}}}
+    response: {type: object, properties: {num_drafts: {type: integer}, num_draft_tokens: {type: integer}, num_accepted_tokens: {type: integer}, num_accepted_tokens_per_pos: {type: array}}}
+    behavior:
+      - if: "config['speculative-method'] == ''"
+        then:
+          - title: Spec decoding disabled, no counters exist
+            source: "vllm/v1/spec_decode/metrics.py:267-268"
+            return: {num_drafts: "= state.num_drafts", num_draft_tokens: "= state.num_draft_tokens", num_accepted_tokens: "= state.num_accepted_tokens", num_accepted_tokens_per_pos: "= state.num_accepted_tokens_per_pos"}
+      - title: Increment the counters
+        source: "vllm/v1/spec_decode/metrics.py:269-281"
+        set:
+          state.num_drafts: "= state.num_drafts + input.stats.num_drafts"
+          state.num_draft_tokens: "= state.num_draft_tokens + input.stats.num_draft_tokens"
+          state.num_accepted_tokens: "= state.num_accepted_tokens + input.stats.num_accepted_tokens"
+          state.num_accepted_tokens_per_pos: "= lists.range(size(input.stats.num_accepted_tokens_per_pos)).map(p, (p < size(state.num_accepted_tokens_per_pos) ? state.num_accepted_tokens_per_pos[p] : 0) + input.stats.num_accepted_tokens_per_pos[p])"
+      - return: {num_drafts: "= state.num_drafts", num_draft_tokens: "= state.num_draft_tokens", num_accepted_tokens: "= state.num_accepted_tokens", num_accepted_tokens_per_pos: "= state.num_accepted_tokens_per_pos"}
+
+  # ---------------- flash-maxsim autotune pruning ----------------
+  - component: flash-maxsim
+    name: prune-configs
+    kind: function
+    summary: "_prune_configs: keeps the (BLOCK_Q, BLOCK_D) configs with BLOCK_Q <= 2 Lq whose shared-memory estimate (BLOCK_Q + BLOCK_D) x d_pad x 2 + BLOCK_Q x BLOCK_D x 4 bytes fits the device's opt-in budget (d_pad = next power of two of max(d, 16) unless given). When nothing fits it returns the single smallest-footprint config, never a rejected slice."
+    sources: ["vllm/v1/pool/flash_maxsim/_common.py:52-85", "vllm/v1/pool/flash_maxsim/_common.py:13-28", "vllm/v1/pool/flash_maxsim/_common.py:31-49"]
+    latency_ms: 0
+    request: {type: object, properties: {Lq: {type: integer, default: 32}, d: {type: integer, default: 128}, d_pad: {type: integer, default: 0, description: "0 (default): the next power of two of max(d, 16)"}}}
+    response: {type: object, properties: {configs: {type: array, items: {type: object, properties: {BLOCK_Q: {type: integer}, BLOCK_D: {type: integer}}}}, smem_limit: {type: integer}}}
+    behavior:
+      - title: The autotune grid
+        source: "vllm/v1/pool/flash_maxsim/_common.py:13-28"
+        set:
+          vars.grid: "= [[16, 16], [16, 32], [32, 16], [32, 32], [32, 64], [32, 128], [64, 64], [64, 128], [128, 64], [128, 128]]"
+          vars.lq: "= has(input.Lq) ? input.Lq : 32"
+          vars.d: "= has(input.d) ? (input.d > 16 ? input.d : 16) : 128"
+      - title: "d_pad: the next power of two of max(d, 16) when not given"
+        source: "vllm/v1/pool/flash_maxsim/_common.py:63-65"
+        set:
+          vars.dpad: "= has(input.d_pad) && input.d_pad > 0 ? input.d_pad : [16, 32, 64, 128, 256, 512, 1024, 2048, 4096].filter(p, p >= vars.d)[0]"
+          vars.limit: "= state.max_shared_mem"
+      - set:
+          vars.est: "= vars.grid.map(c, (c[0] * vars.dpad + c[1] * vars.dpad) * 2 + c[0] * c[1] * 4)"
+      - set:
+          vars.kept: "= lists.range(size(vars.grid)).filter(i, vars.grid[i][0] <= vars.lq * 2 && vars.est[i] <= vars.limit)"
+      - if: "size(vars.kept) > 0"
+        then:
+          - return: {configs: "= vars.kept.map(i, {'BLOCK_Q': vars.grid[i][0], 'BLOCK_D': vars.grid[i][1]})", smem_limit: "= vars.limit"}
+      - title: "Nothing fits: the single smallest-footprint config"
+        source: "vllm/v1/pool/flash_maxsim/_common.py:82-85"
+        set:
+          vars.best: "= lists.range(size(vars.grid)).sortBy(i, vars.est[i])[0]"
+      - return: {configs: "= [{'BLOCK_Q': vars.grid[vars.best][0], 'BLOCK_D': vars.grid[vars.best][1]}]", smem_limit: "= vars.limit"}
+
+  # ---------------- CUDA graph capture inputs ----------------
+  - component: cuda-graph-manager
+    name: prepare-inputs-to-capture
+    kind: function
+    summary: "prepare_inputs_to_capture: the dummy batch a graph is captured with. num_tokens are spread over num_reqs (the remainder on the last requests); a FULL graph promises max_query_len = num_tokens unless the descriptor bounds it (mixed graphs may replay one prefill spanning the batch), PIECEWISE leaves it unset; attention metadata is built for capture only for FULL graphs. The descriptor is a BatchExecutionDescriptor (cg_mode, num_tokens, num_reqs, uniform_token_count, max_query_len)."
+    sources: ["vllm/v1/worker/gpu/cudagraph_utils.py:786-858", "vllm/v1/worker/gpu/input_batch.py:127-172", "vllm/v1/worker/gpu/cudagraph_utils.py:65-80"]
+    latency_ms: 0
+    errors: [{code: assertion-error, status: 0, retryable: false}]
+    request:
+      type: object
+      required: [num_reqs, num_tokens, full_cudagraph]
+      properties:
+        num_reqs: {type: integer}
+        num_tokens: {type: integer}
+        full_cudagraph: {type: boolean}
+        max_query_len: {type: ["integer", "null"], default: null}
+    response: {type: object, properties: {num_scheduled_tokens: {type: array, items: {type: integer}}, max_query_len: {type: ["integer", "null"]}, for_capture: {type: boolean}}}
+    behavior:
+      - set: {vars.mql: "= has(input.max_query_len) ? input.max_query_len : null"}
+      - if: "input.full_cudagraph && vars.mql == null"
+        then:
+          - title: A mixed FULL graph must cover a single prefill as long as the whole batch
+            source: "vllm/v1/worker/gpu/cudagraph_utils.py:798-801"
+            set: {vars.mql: "= input.num_tokens"}
+      - if: "input.num_reqs <= 0 || input.num_reqs > input.num_tokens"
+        then:
+          - source: "vllm/v1/worker/gpu/input_batch.py:135"
+            fail: {code: assertion-error, status: 0, message: "assert 0 < num_reqs <= num_tokens"}
+      - title: "Spread the tokens evenly; the remainder goes to the last requests"
+        source: "vllm/v1/worker/gpu/input_batch.py:148-154"
+        set:
+          vars.base: "= input.num_tokens / input.num_reqs"
+          vars.extra: "= input.num_tokens % input.num_reqs"
+      - if: "vars.mql != null && vars.base + (vars.extra > 0 ? 1 : 0) > vars.mql"
+        then:
+          - source: "vllm/v1/worker/gpu/input_batch.py:150"
+            fail: {code: assertion-error, status: 0, message: "a dummy request exceeds max_query_len"}
+      - title: "Attention metadata for the dummy batch: capturable (for_capture) only for FULL graphs"
+        source: "vllm/v1/worker/gpu/cudagraph_utils.py:849-857"
+        return:
+          num_scheduled_tokens: "= lists.range(input.num_reqs).map(i, vars.base + (i >= input.num_reqs - vars.extra ? 1 : 0))"
+          max_query_len: "= vars.mql"
+          for_capture: "= input.full_cudagraph"
+
+  # ---------------- attention-group CUDA graph support ----------------
+  - component: attn-utils
+    name: get-attn-cg-support
+    kind: function
+    summary: "get_attn_cg_support: the weakest CUDA graph support (ALWAYS 3 > UNIFORM_BATCH 2 > UNIFORM_SINGLE_TOKEN_DECODE 1 > NEVER 0) among the attention groups' metadata builders, and the backend that set it; with checked_layer_names only groups sharing a layer with that set count (adaptive verification checks the target's layers), so a group shared by target and drafter still counts."
+    sources: ["vllm/v1/worker/gpu/attn_utils.py:313-338", "vllm/v1/worker/utils.py:261-320"]
+    latency_ms: 0
+    request:
+      type: object
+      required: [attn_groups]
+      properties:
+        attn_groups: {type: array, items: {type: array, items: {type: object, properties: {backend: {type: string}, layer_names: {type: array, items: {type: string}}, cg_support: {type: string, enum: [ALWAYS, UNIFORM_BATCH, UNIFORM_SINGLE_TOKEN_DECODE, NEVER], description: "what this group's metadata builder reports"}}}}}
+        checked_layer_names: {type: ["array", "null"], default: null, items: {type: string}}
+    response: {type: object, properties: {min_cg_support: {type: string}, min_cg_attn_backend: {type: ["string", "null"]}}}
+    behavior:
+      - title: "Only groups that share a layer with checked_layer_names (all groups when it is None)"
+        source: "vllm/v1/worker/gpu/attn_utils.py:321-326"
+        set:
+          vars.rank: "= {'NEVER': 0, 'UNIFORM_SINGLE_TOKEN_DECODE': 1, 'UNIFORM_BATCH': 2, 'ALWAYS': 3}"
+          vars.groups: "= input.attn_groups.flatten().filter(g, !has(input.checked_layer_names) || input.checked_layer_names == null || g.layer_names.exists(n, n in input.checked_layer_names))"
+      - title: "Keep the first group with strictly weaker support than seen so far"
+        source: "vllm/v1/worker/gpu/attn_utils.py:327-334"
+        set:
+          vars.weaker: "= lists.range(size(vars.groups)).filter(i, vars.rank[vars.groups[i].cg_support] < 3 && lists.range(i).all(j, vars.rank[vars.groups[j].cg_support] > vars.rank[vars.groups[i].cg_support]))"
+      - return:
+          min_cg_support: "= size(vars.weaker) > 0 ? vars.groups[vars.weaker[size(vars.weaker) - 1]].cg_support : 'ALWAYS'"
+          min_cg_attn_backend: "= size(vars.weaker) > 0 ? vars.groups[vars.weaker[size(vars.weaker) - 1]].backend : null"
+  - component: attn-utils
+    name: get-query-lens-mismatch-unsupported-backend
+    kind: function
+    summary: "get_query_lens_mismatch_unsupported_backend: the first checked attention group whose backend needs exact CPU query lengths (supports_device_cpu_query_lens_mismatch() is False), else None; models that hard-wire a backend never pass the selector's filter, so adaptive verification checks here."
+    sources: ["vllm/v1/worker/gpu/attn_utils.py:341-359"]
+    latency_ms: 0
+    request:
+      type: object
+      required: [attn_groups]
+      properties:
+        attn_groups: {type: array, items: {type: array, items: {type: object, properties: {backend: {type: string}, layer_names: {type: array, items: {type: string}}, supports_query_lens_mismatch: {type: boolean}}}}}
+        checked_layer_names: {type: ["array", "null"], default: null, items: {type: string}}
+    response: {type: object, properties: {backend: {type: ["string", "null"]}}}
+    behavior:
+      - set:
+          vars.bad: "= input.attn_groups.flatten().filter(g, (!has(input.checked_layer_names) || input.checked_layer_names == null || g.layer_names.exists(n, n in input.checked_layer_names)) && !g.supports_query_lens_mismatch)"
+      - if: "size(vars.bad) > 0"
+        then:
+          - title: The first backend that needs exact CPU query lengths
+            source: "vllm/v1/worker/gpu/attn_utils.py:357-358"
+            return: {backend: "= vars.bad[0].backend"}
+      - return: {backend: null}
+
+  # ---------------- PCP rank segments ----------------
+  - component: pcp-manager
+    name: get-rank-segments
+    kind: function
+    summary: "PCPManager._get_rank_segments: one PCP rank's pieces of the global batch. A prefill long enough to fill 2 x pcp chunks is split in 2 x pcp chunks and the rank takes chunks rank and 2 x pcp - 1 - rank (load-balanced); decodes and short prefills are replicated: every rank takes the whole query, unless pcp_shard_decode_requests gives each to one rank, round-robin over a decode-only ordinal (so a rank can own nothing); with DCP every rank keeps the decode. Segments are ordered decodes first, then by request."
+    sources: ["vllm/v1/worker/gpu/pcp_manager.py:197-306"]
+    latency_ms: 0
+    request:
+      type: object
+      required: [rank, num_scheduled_tokens, is_prefilling]
+      properties:
+        rank: {type: integer}
+        num_scheduled_tokens: {type: array, items: {type: integer}}
+        is_prefilling: {type: array, items: {type: boolean}}
+        query_start_loc: {type: array, default: [], items: {type: integer}}
+        req_ids: {type: array, default: [], items: {type: string}}
+    response: {type: object, properties: {segments: {type: array, items: {type: object, properties: {global_batch_req_idx: {type: integer}, start: {type: integer}, length: {type: integer}}}}, req_ids: {type: array}}}
+    behavior:
+      - set:
+          vars.p: "= int(config['prefill-context-parallel-size'])"
+          vars.dcp: "= int(config['decode-context-parallel-size'])"
+          vars.n: "= size(input.num_scheduled_tokens)"
+          vars.qsl: "= has(input.query_start_loc) && size(input.query_start_loc) > 0 ? input.query_start_loc : lists.range(size(input.num_scheduled_tokens) + 1).map(j, sum(input.num_scheduled_tokens.slice(0, j)))"
+      - title: "Replicated: decodes, and under DCP prefills too short for every chunk"
+        source: "vllm/v1/worker/gpu/pcp_manager.py:222-233"
+        set:
+          vars.repl: "= lists.range(vars.n).map(i, !input.is_prefilling[i] || (vars.dcp > 1 && (2 * vars.p - 1) * ((input.num_scheduled_tokens[i] + 2 * vars.p - 1) / (2 * vars.p)) >= input.num_scheduled_tokens[i]))"
+      - title: "Per request: the rank's two mirrored chunks of a split prefill, the whole query of a replicated one, or (sharded decodes) the whole query on its round-robin owner only"
+        source: "vllm/v1/worker/gpu/pcp_manager.py:235-282"
+        set:
+          vars.chunks: "= lists.range(vars.n).map(i, input.num_scheduled_tokens[i] == 0 ? [] : (!vars.repl[i] ? [input.rank, 2 * vars.p - 1 - input.rank].map(c, {'i': i, 'off': c * ((input.num_scheduled_tokens[i] + 2 * vars.p - 1) / (2 * vars.p)), 'size': (input.num_scheduled_tokens[i] + 2 * vars.p - 1) / (2 * vars.p)}) : ((config['pcp-shard-decode-requests'] && size(lists.range(i).filter(j, vars.repl[j] && input.num_scheduled_tokens[j] > 0)) % vars.p != input.rank) ? [] : [{'i': i, 'off': 0, 'size': input.num_scheduled_tokens[i]}]))).flatten()"
+      - set:
+          vars.segs: "= vars.chunks.map(c, {'global_batch_req_idx': c.i, 'start': vars.qsl[c.i] + c.off, 'length': (c.size < input.num_scheduled_tokens[c.i] - c.off ? c.size : input.num_scheduled_tokens[c.i] - c.off)}).filter(s, s.length > 0)"
+      - title: Decodes first, then prefills, by request and position
+        source: "vllm/v1/worker/gpu/pcp_manager.py:197-220"
+        set:
+          vars.sorted: "= vars.segs.sortBy(s, (input.is_prefilling[s.global_batch_req_idx] ? 1000000000 : 0) + s.global_batch_req_idx * 100000 + s.start)"
+      - return:
+          segments: "= vars.sorted"
+          req_ids: "= has(input.req_ids) && size(input.req_ids) > 0 ? vars.sorted.map(s, input.req_ids[s.global_batch_req_idx]) : []"
+
+  # ---------------- speculator forward return shape ----------------
+  - component: target-dependent-ar-speculator
+    name: run-model
+    kind: function
+    summary: "TargetDependentARSpeculator._run_model: one drafter forward under the forward context (PIECEWISE through the prefill graph manager, else eager), embedding multimodal inputs first when supported. Some MTP drafters return (logits_hidden, feedback_hidden) for final-norm correctness; a plain tensor is used for both."
+    sources: ["vllm/v1/worker/gpu/spec_decode/target_dependent_ar/speculator.py:367-430"]
+    latency_ms: 0
+    request:
+      type: object
+      required: [num_tokens]
+      properties:
+        num_tokens: {type: integer}
+        cudagraph_runtime_mode: {type: string, enum: [NONE, PIECEWISE, FULL], default: NONE}
+    response: {type: object, properties: {logits_hidden: {type: object}, feedback_hidden: {type: object}}}
+    behavior:
+      - if: "has(input.cudagraph_runtime_mode) && input.cudagraph_runtime_mode == 'PIECEWISE'"
+        then:
+          - title: Draft prefill through the PIECEWISE graph manager
+            source: "vllm/v1/worker/gpu/spec_decode/target_dependent_ar/speculator.py:413-418"
+            call: cuda-graph-manager.run-pw-graph
+            input: {num_tokens: "= input.num_tokens"}
+      - title: The drafter's forward returns hidden states, or a (logits_hidden, feedback_hidden) pair
+        source: "vllm/v1/worker/gpu/spec_decode/target_dependent_ar/speculator.py:419-422"
+        set:
+          vars.ret: "= has(state.draft_model) && has(state.draft_model.returns_tuple) && state.draft_model.returns_tuple ? dyn([{'tensor': 'draft-output', 'part': 0, 'num_tokens': input.num_tokens}, {'tensor': 'draft-output', 'part': 1, 'num_tokens': input.num_tokens}]) : dyn({'tensor': 'draft-output', 'part': 0, 'num_tokens': input.num_tokens})"
+      - if: "type(vars.ret) == list"
+        then:
+          - title: "A tuple is unpacked: logits come from the first, the next draft step is fed the second"
+            source: "vllm/v1/worker/gpu/spec_decode/target_dependent_ar/speculator.py:423-426"
+            return: {logits_hidden: "= vars.ret[0]", feedback_hidden: "= vars.ret[1]"}
+      - title: A single tensor serves both
+        source: "vllm/v1/worker/gpu/spec_decode/target_dependent_ar/speculator.py:427-430"
+        return: {logits_hidden: "= vars.ret", feedback_hidden: "= vars.ret"}
+
+  # ---------------- workspace manager ----------------
+  - component: workspace-manager
+    name: init
+    kind: function
+    summary: "init_workspace_manager: creates the process's WorkspaceManager (GPUModelRunner.__init__ calls it) with num_ubatches (default 1) x num_lanes scratch slots, each empty and unlocked; re-initializing replaces the manager with a warning; num_lanes below 1 is a ValueError."
+    sources: ["vllm/v1/worker/workspace.py:307-333", "vllm/v1/worker/workspace.py:56-76"]
+    latency_ms: 0
+    errors: [{code: value-error, status: 0, retryable: false}]
+    request: {type: object, properties: {num_ubatches: {type: ["integer", "null"], default: null}, num_lanes: {type: integer, default: 1}}}
+    response: {type: object, properties: {num_slots: {type: integer}, replaced: {type: boolean}}}
+    behavior:
+      - if: "input.num_lanes < 1"
+        then:
+          - source: "vllm/v1/worker/workspace.py:67-68"
+            fail: {code: value-error, status: 0, message: "= 'num_lanes must be at least one, got ' + string(input.num_lanes) + '.'"}
+      - set:
+          vars.ub: "= input.num_ubatches != null ? input.num_ubatches : 1"
+          vars.replaced: "= state.initialized"
+      - title: "One empty, unlocked scratch slot (and persistent-resource cache) per (ubatch, lane)"
+        source: "vllm/v1/worker/workspace.py:69-76"
+        set:
+          state.initialized: true
+          state.locked: false
+          state.num_lanes: "= input.num_lanes"
+          state.sizes: "= lists.range(vars.ub * input.num_lanes).map(i, 0)"
+          state.resources: "= lists.range(vars.ub * input.num_lanes).map(i, [])"
+      - return: {num_slots: "= vars.ub * input.num_lanes", replaced: "= vars.replaced"}
+  - component: workspace-manager
+    name: current
+    kind: function
+    summary: "current_workspace_manager / is_workspace_manager_initialized: the process's manager; asking for it before init_workspace_manager is an AssertionError."
+    sources: ["vllm/v1/worker/workspace.py:283-304"]
+    latency_ms: 0
+    errors: [{code: assertion-error, status: 0, retryable: false}]
+    response: {type: object, properties: {locked: {type: boolean}, sizes: {type: array}}}
+    behavior:
+      - if: "!state.initialized"
+        then:
+          - source: "vllm/v1/worker/workspace.py:300-303"
+            fail: {code: assertion-error, status: 0, message: "WorkspaceManager not initialized. Call init_workspace_manager() with a device before using workspace functions."}
+      - return: {locked: "= state.locked", sizes: "= state.sizes"}
+  - component: workspace-manager
+    name: reset
+    kind: function
+    summary: "reset_workspace_manager: back to uninitialized (for tests that re-initialize)."
+    sources: ["vllm/v1/worker/workspace.py:369-376"]
+    latency_ms: 0
+    response: {type: object, properties: {initialized: {type: boolean}}}
+    behavior:
+      - set: {state.initialized: false, state.locked: false, state.sizes: [], state.resources: []}
+      - return: {initialized: false}
+  - component: workspace-manager
+    name: lock
+    kind: function
+    summary: "lock_workspace / unlock_workspace: after warmup (end of capture_model) the scratch may not grow and no new persistent resource may appear; elastic EP unlocks to grow. Needs an initialized manager."
+    sources: ["vllm/v1/worker/workspace.py:84-117", "vllm/v1/worker/workspace.py:336-366"]
+    latency_ms: 0
+    errors: [{code: assertion-error, status: 0, retryable: false}]
+    request: {type: object, properties: {locked: {type: boolean, default: true}}}
+    response: {type: object, properties: {locked: {type: boolean}}}
+    behavior:
+      - call: workspace-manager.current
+        input: {}
+      - set: {state.locked: "= input.locked"}
+      - return: {locked: "= input.locked"}
+  - component: workspace-manager
+    name: get-simultaneous
+    kind: function
+    summary: "WorkspaceManager.get_simultaneous: several views carved from one scratch buffer of the current (ubatch, lane) slot, each 256-byte aligned. A slot that is too small grows (only that slot), unless the manager is locked, which is an AssertionError; a lane beyond the configured ones is a RuntimeError."
+    sources: ["vllm/v1/worker/workspace.py:123-130", "vllm/v1/worker/workspace.py:182-275"]
+    latency_ms: 0
+    errors:
+      - {code: assertion-error, status: 0, retryable: false}
+      - {code: runtime-error, status: 0, retryable: false}
+    request: {type: object, required: [nbytes], properties: {nbytes: {type: array, items: {type: integer}, description: "each view's size in bytes"}, ubatch: {type: integer, default: 0}, lane: {type: integer, default: 0}}}
+    response: {type: object, properties: {offsets: {type: array}, workspace_bytes: {type: integer}, grew: {type: boolean}}}
+    behavior:
+      - call: workspace-manager.current
+        input: {}
+      - if: "input.lane >= state.num_lanes"
+        then:
+          - source: "vllm/v1/worker/workspace.py:125-129"
+            fail: {code: runtime-error, status: 0, message: "= 'Workspace lane ' + string(input.lane) + ' is not configured; manager has ' + string(state.num_lanes) + ' lane(s).'"}
+      - title: Each view is rounded up to 256 bytes; offsets accumulate
+        source: "vllm/v1/worker/workspace.py:194-199"
+        set:
+          vars.aligned: "= input.nbytes.map(b, (b + 255) / 256 * 256)"
+          vars.id: "= input.ubatch * state.num_lanes + input.lane"
+      - set:
+          vars.total: "= sum(vars.aligned)"
+          vars.offsets: "= lists.range(size(vars.aligned)).map(i, sum(vars.aligned.slice(0, i)))"
+      - if: "state.sizes[vars.id] < vars.total"
+        then:
+          - if: "state.locked"
+            then:
+              - title: No growth after locking
+                source: "vllm/v1/worker/workspace.py:241-247"
+                fail: {code: assertion-error, status: 0, message: "= 'Workspace is locked but allocation requires ' + string(vars.total) + ' bytes, current size is ' + string(state.sizes[vars.id]) + ' bytes. Workspace growth is not allowed after locking.'"}
+          - title: Only the requesting slot is resized
+            source: "vllm/v1/worker/workspace.py:249-275"
+            set:
+              state.sizes: "= lists.range(size(state.sizes)).map(i, i == vars.id ? vars.total : state.sizes[i])"
+          - return: {offsets: "= vars.offsets", workspace_bytes: "= vars.total", grew: true}
+      - return: {offsets: "= vars.offsets", workspace_bytes: "= state.sizes[vars.id]", grew: false}
+
+  # ---------------- KV cache allocation helpers ----------------
+  - component: worker-utils
+    name: select-common-block-size
+    kind: function
+    summary: "select_common_block_size: the KV manager's block size when every attention backend supports it (an exact size matches exactly, MultipleOf(n) accepts any multiple of n), else the largest explicit backend size dividing it that all backends support; none is a ValueError naming each backend's sizes."
+    sources: ["vllm/v1/worker/utils.py:489-561"]
+    latency_ms: 0
+    errors: [{code: value-error, status: 0, retryable: false}]
+    request:
+      type: object
+      required: [kv_manager_block_size, backends]
+      properties:
+        kv_manager_block_size: {type: integer}
+        backends: {type: array, items: {type: object, properties: {name: {type: string}, sizes: {type: array, items: {type: integer}, default: []}, multiple_of: {type: array, items: {type: integer}, default: []}}}}
+    response: {type: object, properties: {block_size: {type: integer}}}
+    behavior:
+      - title: "Supported by a backend: an exact size equal to it, or a MultipleOf base dividing it"
+        source: "vllm/v1/worker/utils.py:499-512"
+        set:
+          vars.ok: "= lists.range(input.kv_manager_block_size + 1).map(b, b > 0 && input.backends.all(be, (has(be.sizes) && b in be.sizes) || (has(be.multiple_of) && be.multiple_of.exists(m, b % m == 0))))"
+      - if: "vars.ok[input.kv_manager_block_size]"
+        then:
+          - source: "vllm/v1/worker/utils.py:538-539"
+            return: {block_size: "= input.kv_manager_block_size"}
+      - set:
+          vars.cands: "= input.backends.map(be, (has(be.sizes) ? be.sizes : []).filter(s, s > 0 && input.kv_manager_block_size % s == 0)).flatten().filter(s, vars.ok[s]).sortBy(s, -s)"
+      - if: "size(vars.cands) > 0"
+        then:
+          - title: The largest explicit size dividing the manager's block size
+            source: "vllm/v1/worker/utils.py:541-553"
+            return: {block_size: "= vars.cands[0]"}
+      - source: "vllm/v1/worker/utils.py:554-561"
+        fail: {code: value-error, status: 0, message: "= 'No common block size for ' + string(input.kv_manager_block_size) + ' (' + input.backends.map(be, be.name + ': ' + (has(be.sizes) ? be.sizes : []).map(s, string(s)).join(', ')).join('; ') + ').'"}
+  - component: worker-utils
+    name: allocate-kv-cache
+    kind: function
+    summary: "allocate_kv_cache: one zeroed int8 backing allocation for every KVCacheTensor (they must share one size: cache groups overlay each other), viewed as [B, H, N, C] per layer; a spec without layer views (e.g. HiSparse) gets the raw buffer; no tensors, no allocation."
+    sources: ["vllm/v1/worker/utils.py:564-627"]
+    latency_ms: 0
+    errors:
+      - {code: assertion-error, status: 0, retryable: false}
+      - {code: out-of-memory-error, status: 0, retryable: false}
+    request:
+      type: object
+      required: [kv_cache_tensors]
+      properties:
+        kv_cache_tensors: {type: array, items: {type: object, properties: {size: {type: integer}, layers: {type: array, items: {type: string}}}}}
+        pool: {type: ["string", "null"], default: null}
+    response: {type: object, properties: {kv_caches: {type: array, items: {type: string}}, bytes: {type: integer}}}
+    behavior:
+      - if: "size(input.kv_cache_tensors) == 0"
+        then:
+          - source: "vllm/v1/worker/utils.py:576-577"
+            return: {kv_caches: [], bytes: 0}
+      - if: "input.kv_cache_tensors.exists(t, t.size != input.kv_cache_tensors[0].size)"
+        then:
+          - source: "vllm/v1/worker/utils.py:579-580"
+            fail: {code: assertion-error, status: 0, message: "KV cache tensors must share one backing allocation."}
+      - title: One zeroed backing buffer of the shared size
+        source: "vllm/v1/worker/utils.py:594-596"
+        call: gpu-memory.allocate
+        input: {kind: kv_cache, bytes: "= input.kv_cache_tensors[0].size", pool: "= input.pool"}
+        as: buf
+      - title: Each tensor's layers are views into it
+        source: "vllm/v1/worker/utils.py:598-626"
+        return: {kv_caches: "= input.kv_cache_tensors.map(t, t.layers).flatten()", bytes: "= vars.buf.value.bytes"}
+  - component: block-table
+    name: get-block-table-width
+    kind: function
+    summary: "get_block_table_width: the block-table row width rounded up so a row spans a multiple of token_alignment tokens (128 by default; None disables it): blocks are padded to a multiple of token_alignment / gcd(token_alignment, block_size); a non-positive alignment is a ValueError."
+    sources: ["vllm/v1/worker/block_table.py:29-41"]
+    latency_ms: 0
+    errors: [{code: value-error, status: 0, retryable: false}]
+    request: {type: object, required: [max_num_blocks, block_size], properties: {max_num_blocks: {type: integer}, block_size: {type: integer}, token_alignment: {type: ["integer", "null"], default: 128}}}
+    response: {type: object, properties: {width: {type: integer}}}
+    behavior:
+      - if: "input.token_alignment == null"
+        then: [{return: {width: "= input.max_num_blocks"}}]
+      - if: "input.token_alignment <= 0"
+        then:
+          - source: "vllm/v1/worker/block_table.py:37-38"
+            fail: {code: value-error, status: 0, message: "token_alignment must be positive"}
+      - set:
+          vars.g: "= lists.range(input.token_alignment).map(d, d + 1).filter(d, input.token_alignment % d == 0 && input.block_size % d == 0).sortBy(d, -d)[0]"
+      - set:
+          vars.align: "= input.token_alignment / vars.g"
+      - title: Pad the row to a multiple of the block alignment
+        source: "vllm/v1/worker/block_table.py:39-40"
+        return: {width: "= (input.max_num_blocks + vars.align - 1) / vars.align * vars.align"}
+
+  # ---------------- the runner's KV connector wrapper ----------------
+  - component: runner-kv-connector
+    name: pre-forward
+    kind: function
+    summary: "KVConnector.pre_forward: a no-op without a connector; ActiveKVConnector binds the scheduler output's connector metadata (asserting it is there) before the forward."
+    sources: ["vllm/v1/worker/gpu/kv_connector.py:33-40", "vllm/v1/worker/gpu/kv_connector.py:70-92"]
+    latency_ms: 0
+    errors: [{code: assertion-error, status: 0, retryable: false}]
+    request: {type: object, properties: {kv_connector_metadata: {type: ["object", "null"], default: null}}}
+    response: {type: object, properties: {bound: {type: boolean}}}
+    behavior:
+      - if: "config['kv-connector'] == ''"
+        then:
+          - title: The no-op connector
+            source: "vllm/v1/worker/gpu/kv_connector.py:33-40"
+            return: {bound: false}
+      - if: "input.kv_connector_metadata == null"
+        then:
+          - source: "vllm/v1/worker/gpu/kv_connector.py:80"
+            fail: {code: assertion-error, status: 0, message: "assert kv_connector_metadata is not None"}
+      - title: Bind this step's connector metadata
+        source: "vllm/v1/worker/gpu/kv_connector.py:81-82"
+        call: kv-connector-base-v1-worker.bind-connector-metadata
+        input: {metadata: "= input.kv_connector_metadata"}
+      - return: {bound: true}
+  - component: runner-kv-connector
+    name: post-forward
+    kind: function
+    summary: "KVConnector.post_forward: None without a connector; ActiveKVConnector waits for the layer saves, collects finished sends and receives, load-error blocks and stats into the step's KVConnectorOutput, then clears the bound metadata."
+    sources: ["vllm/v1/worker/gpu/kv_connector.py:44-45", "vllm/v1/worker/gpu/kv_connector.py:131-151"]
+    latency_ms: 0
+    request: {type: object, properties: {finished_req_ids: {type: array, items: {type: string}, default: []}}}
+    response: {type: ["object", "null"], properties: {finished_sending: {type: ["array", "null"]}, finished_recving: {type: ["array", "null"]}, invalid_block_ids: {type: array}}}
+    behavior:
+      - if: "config['kv-connector'] == ''"
+        then:
+          - source: "vllm/v1/worker/gpu/kv_connector.py:44-45"
+            return: null
+      - source: "vllm/v1/worker/gpu/kv_connector.py:139"
+        call: kv-connector-base-v1-worker.wait-for-save
+        input: {}
+      - source: "vllm/v1/worker/gpu/kv_connector.py:140-143"
+        call: kv-connector-base-v1-worker.get-transfer-results
+        input: {finished_req_ids: "= input.finished_req_ids"}
+        as: tr
+      - source: "vllm/v1/worker/gpu/kv_connector.py:144"
+        call: kv-connector-base-v1-worker.get-block-ids-with-load-errors
+        input: {}
+        as: errs
+      - source: "vllm/v1/worker/gpu/kv_connector.py:145"
+        call: kv-connector-base-v1-worker.get-kv-connector-stats
+        input: {}
+      - source: "vllm/v1/worker/gpu/kv_connector.py:150"
+        call: kv-connector-base-v1-worker.clear-connector-metadata
+        input: {}
+      - return:
+          finished_sending: "= has(vars.tr.value.finished_sending) && size(vars.tr.value.finished_sending) > 0 ? dyn(vars.tr.value.finished_sending) : dyn(null)"
+          finished_recving: "= has(vars.tr.value.finished_recving) && size(vars.tr.value.finished_recving) > 0 ? dyn(vars.tr.value.finished_recving) : dyn(null)"
+          invalid_block_ids: "= vars.errs.value"
+  - component: runner-kv-connector
+    name: no-forward
+    kind: function
+    summary: "KVConnector.no_forward: a step with no tokens to run still drives the connector (pre_forward, finish, post_forward) and returns a ModelRunnerOutput carrying only the KV connector output; without a connector, the empty output."
+    sources: ["vllm/v1/worker/gpu/kv_connector.py:47-48", "vllm/v1/worker/gpu/kv_connector.py:153-161"]
+    latency_ms: 0
+    request: {type: object, properties: {kv_connector_metadata: {type: ["object", "null"], default: null}, finished_req_ids: {type: array, items: {type: string}, default: []}}}
+    response: {type: object, properties: {req_ids: {type: array}, sampled_token_ids: {type: array}, kv_connector_output: {type: ["object", "null"]}}}
+    behavior:
+      - if: "config['kv-connector'] == ''"
+        then:
+          - source: "vllm/v1/worker/gpu/kv_connector.py:47-48"
+            return: {req_ids: [], sampled_token_ids: [], kv_connector_output: null}
+      - call: runner-kv-connector.pre-forward
+        input: {kv_connector_metadata: "= input.kv_connector_metadata"}
+      - call: runner-kv-connector.post-forward
+        input: {finished_req_ids: "= input.finished_req_ids"}
+        as: out
+      - source: "vllm/v1/worker/gpu/kv_connector.py:161"
+        return: {req_ids: [], sampled_token_ids: [], kv_connector_output: "= vars.out.value"}
+
+  # ---------------- forward context ----------------
+  - component: forward-context
+    name: set-forward-context
+    kind: function
+    summary: "set_forward_context (entering the context manager): with data parallelism above 1 (or sequence-parallel MoE) on a MoE model it builds DPMetadata, asserting this rank's entry in num_tokens_across_dp equals num_tokens (a single-rank count when DP is 1); with a CUDA graph mode other than NONE and num_tokens it fills in a BatchDescriptor(num_tokens) when none is given; then the new ForwardContext replaces the current one (the previous is restored on exit)."
+    sources: ["vllm/forward_context.py:277-362", "vllm/forward_context.py:88-108", "vllm/forward_context.py:230-276", "vllm/forward_context.py:30-58"]
+    latency_ms: 0
+    errors: [{code: assertion-error, status: 0, retryable: false}]
+    request:
+      type: object
+      properties:
+        num_tokens: {type: ["integer", "null"], default: null}
+        num_tokens_across_dp: {type: ["array", "null"], default: null, items: {type: integer}}
+        cudagraph_runtime_mode: {type: string, default: NONE, enum: [NONE, PIECEWISE, FULL]}
+        batch_descriptor: {type: ["object", "null"], default: null}
+        has_attn_metadata: {type: boolean, default: true}
+        is_moe_model: {type: boolean, default: false}
+        dp_rank: {type: integer, default: 0}
+    response: {type: object, properties: {cudagraph_runtime_mode: {type: string}, batch_descriptor: {type: ["object", "null"]}, dp_metadata: {type: ["object", "null"]}}}
+    behavior:
+      - set:
+          vars.inp: "= merge({'num_tokens': null, 'num_tokens_across_dp': null, 'cudagraph_runtime_mode': 'NONE', 'batch_descriptor': null, 'has_attn_metadata': true, 'is_moe_model': false, 'dp_rank': 0}, input)"
+      - set: {vars.dp: null, vars.across: "= vars.inp.num_tokens_across_dp"}
+      - if: "int(config['data-parallel-size']) > 1 && vars.inp.is_moe_model && (vars.inp.has_attn_metadata || vars.inp.num_tokens != null)"
+        then:
+          - if: "vars.across == null"
+            then:
+              - title: "Without a precomputed count, DP ranks agree on token counts (coordinate_batch_across_dp)"
+                source: "vllm/forward_context.py:309-320"
+                set: {vars.across: "= lists.range(int(config['data-parallel-size'])).map(r, r == vars.inp.dp_rank ? vars.inp.num_tokens : 0)"}
+          - if: "vars.across[vars.inp.dp_rank] != (vars.inp.num_tokens != null ? vars.inp.num_tokens : 0)"
+            then:
+              - title: This rank's entry must equal its batch size
+                source: "vllm/forward_context.py:101-106"
+                fail: {code: assertion-error, status: 0, message: "= string(vars.across[vars.inp.dp_rank]) + ' ' + string(vars.inp.num_tokens)"}
+          - source: "vllm/forward_context.py:324-326"
+            set: {vars.dp: "= {'num_tokens_across_dp_cpu': vars.across}"}
+      - title: "A CUDA graph run with num_tokens gets a BatchDescriptor(num_tokens) when none is given"
+        source: "vllm/forward_context.py:328-332"
+        set:
+          vars.bd: "= vars.inp.batch_descriptor != null ? vars.inp.batch_descriptor : (vars.inp.cudagraph_runtime_mode != 'NONE' && vars.inp.num_tokens != null ? dyn({'num_tokens': vars.inp.num_tokens, 'num_reqs': null, 'uniform': false, 'has_lora': false, 'num_active_loras': 0}) : dyn(null))"
+      - title: The new context replaces the current one until the block exits
+        source: "vllm/forward_context.py:263-276"
+        set:
+          state.previous: "= state.previous + [state.current]"
+          state.current: "= {'cudagraph_runtime_mode': vars.inp.cudagraph_runtime_mode, 'batch_descriptor': vars.bd, 'dp_metadata': vars.dp, 'num_tokens': vars.inp.num_tokens}"
+      - return: {cudagraph_runtime_mode: "= vars.inp.cudagraph_runtime_mode", batch_descriptor: "= vars.bd", dp_metadata: "= vars.dp"}
+  - component: forward-context
+    name: exit-forward-context
+    kind: function
+    summary: "Leaving set_forward_context: the previous forward context (usually none) is restored."
+    sources: ["vllm/forward_context.py:360-363", "vllm/forward_context.py:263-276"]
+    latency_ms: 0
+    response: {type: object, properties: {restored: {type: ["object", "null"]}}}
+    behavior:
+      - set:
+          vars.prev: "= size(state.previous) > 0 ? state.previous[size(state.previous) - 1] : null"
+      - set:
+          state.current: "= vars.prev"
+          state.previous: "= size(state.previous) > 0 ? state.previous.slice(0, size(state.previous) - 1) : []"
+      - return: {restored: "= vars.prev"}
+  - component: forward-context
+    name: get-forward-context
+    kind: function
+    summary: "get_forward_context / is_forward_context_available / in_piecewise_cudagraph: the current context; asking outside a forward is an AssertionError."
+    sources: ["vllm/forward_context.py:205-228"]
+    latency_ms: 0
+    errors: [{code: assertion-error, status: 0, retryable: false}]
+    response: {type: object, properties: {cudagraph_runtime_mode: {type: string}, batch_descriptor: {type: ["object", "null"]}, in_piecewise_cudagraph: {type: boolean}}}
+    behavior:
+      - if: "state.current == null"
+        then:
+          - source: "vllm/forward_context.py:210-213"
+            fail: {code: assertion-error, status: 0, message: "Forward context is not set. Please use `set_forward_context` to set the forward context."}
+      - return:
+          cudagraph_runtime_mode: "= state.current.cudagraph_runtime_mode"
+          batch_descriptor: "= state.current.batch_descriptor"
+          in_piecewise_cudagraph: "= state.current.cudagraph_runtime_mode == 'PIECEWISE'"
+
+  # ---------------- pooling, V1 spec metadata, encoder cache, EC connector ----------------
+  - component: pooling-metadata
+    name: build
+    kind: function
+    summary: "PoolingMetadata.__post_init__: every request's PoolingParams must name a task (ValueError otherwise); the tasks are kept in batch order. Each request also carries its PoolingStates (the hidden-state cache chunked ALL pooling accumulates, cleaned when the request finishes)."
+    sources: ["vllm/v1/pool/metadata.py:57-84", "vllm/v1/pool/metadata.py:48-54"]
+    latency_ms: 0
+    errors: [{code: value-error, status: 0, retryable: false}]
+    request: {type: object, required: [pooling_params], properties: {pooling_params: {type: array, items: {type: object, properties: {task: {type: ["string", "null"]}}}}, prompt_lens: {type: array, default: [], items: {type: integer}}}}
+    response: {type: object, properties: {tasks: {type: array, items: {type: string}}, num_states: {type: integer}}}
+    behavior:
+      - set: {vars.tasks: "= input.pooling_params.filter(p, has(p.task) && p.task != null).map(p, p.task)"}
+      - if: "size(vars.tasks) != size(input.pooling_params)"
+        then:
+          - source: "vllm/v1/pool/metadata.py:76-81"
+            fail: {code: value-error, status: 0, message: "= 'Every pooling param must have a task set, but got ' + string(size(vars.tasks)) + ' tasks for ' + string(size(input.pooling_params)) + ' pooling params'"}
+      - return: {tasks: "= vars.tasks", num_states: "= size(input.pooling_params)"}
+  - component: spec-decode-metadata-v1
+    name: make-dummy
+    kind: function
+    summary: "SpecDecodeMetadata.make_dummy (V1): from per-request draft ids, the flattened drafts, num_draft_tokens, cumulative draft and sampled (drafts + 1) counts, zeroed logits indices, and max_spec_len."
+    sources: ["vllm/v1/spec_decode/metadata.py:26-66"]
+    latency_ms: 0
+    request: {type: object, required: [draft_token_ids], properties: {draft_token_ids: {type: array, items: {type: array, items: {type: integer}}}}}
+    response: {type: object, properties: {draft_token_ids: {type: array}, num_draft_tokens: {type: array}, cu_num_draft_tokens: {type: array}, cu_num_sampled_tokens: {type: array}, num_logits: {type: integer}, max_spec_len: {type: integer}}}
+    behavior:
+      - set:
+          vars.n: "= input.draft_token_ids.map(d, size(d))"
+      - return:
+          draft_token_ids: "= input.draft_token_ids.flatten()"
+          num_draft_tokens: "= vars.n"
+          cu_num_draft_tokens: "= lists.range(size(vars.n)).map(i, sum(vars.n.slice(0, i + 1)))"
+          cu_num_sampled_tokens: "= lists.range(size(vars.n)).map(i, sum(vars.n.slice(0, i + 1)) + i + 1)"
+          num_logits: "= sum(vars.n) + size(vars.n)"
+          max_spec_len: "= vars.n.sortBy(x, -x)[0]"
+  - component: encoder-cache
+    name: add-request
+    kind: function
+    summary: "EncoderCache.add_request / remove_request: track a request's multimodal features (remove ignores unknown requests)."
+    sources: ["vllm/v1/worker/gpu/mm/encoder_cache.py:18-25"]
+    latency_ms: 0
+    request: {type: object, required: [req_id], properties: {req_id: {type: string}, mm_features: {type: ["array", "null"], default: [], description: "null removes the request"}}}
+    response: {type: object, properties: {num_requests: {type: integer}}}
+    behavior:
+      - if: "input.mm_features == null"
+        then:
+          - source: "vllm/v1/worker/gpu/mm/encoder_cache.py:24-25"
+            set: {state.mm_features: "= omit(state.mm_features, input.req_id)"}
+          - return: {num_requests: "= size(state.mm_features)"}
+      - set: {state.mm_features: "= merge(state.mm_features, {input.req_id: input.mm_features})"}
+      - return: {num_requests: "= size(state.mm_features)"}
+  - component: encoder-cache
+    name: free-encoder-cache
+    kind: function
+    summary: "EncoderCache.free_encoder_cache drops one mm hash's encoder output; reset_encoder_cache (after a weight update) drops them all so stale embeddings are never reused; reset_mm_cache is a no-op in V2."
+    sources: ["vllm/v1/worker/gpu/mm/encoder_cache.py:27-42"]
+    latency_ms: 0
+    request: {type: object, properties: {mm_hash: {type: ["string", "null"], default: null, description: "null resets the whole cache"}}}
+    response: {type: object, properties: {num_outputs: {type: integer}}}
+    behavior:
+      - if: "input.mm_hash == null"
+        then:
+          - source: "vllm/v1/worker/gpu/mm/encoder_cache.py:34-40"
+            set: {state.encoder_outputs: {}}
+          - return: {num_outputs: 0}
+      - source: "vllm/v1/worker/gpu/mm/encoder_cache.py:41-42"
+        set: {state.encoder_outputs: "= omit(state.encoder_outputs, input.mm_hash)"}
+      - return: {num_outputs: "= size(state.encoder_outputs)"}
+  - component: runner-ec-connector
+    name: maybe-get-output
+    kind: function
+    summary: "ECConnector.maybe_get_output: none without a connector or without this step's EC metadata. Otherwise it binds the metadata, a producer starts saving and a consumer starts loading encoder caches, after the encoder runs a producer saves every newly computed mm hash, and finally finished sends and receives are collected and the metadata cleared."
+    sources: ["vllm/v1/worker/gpu/ec_connector.py:23-89"]
+    latency_ms: 0
+    request:
+      type: object
+      properties:
+        ec_connector_metadata: {type: ["object", "null"], default: null}
+        is_producer: {type: boolean, default: false}
+        is_consumer: {type: boolean, default: false}
+        cached_before: {type: array, default: [], items: {type: string}}
+        cached_after: {type: array, default: [], items: {type: string}}
+    response: {type: ["object", "null"], properties: {started: {type: array}, saved: {type: array}}}
+    behavior:
+      - if: "input.ec_connector_metadata == null"
+        then:
+          - source: "vllm/v1/worker/gpu/ec_connector.py:53-55"
+            return: null
+      - title: Bind the metadata; producers start saving, consumers start loading
+        source: "vllm/v1/worker/gpu/ec_connector.py:57-66"
+        set:
+          vars.started: "= (input.is_producer ? ['save'] : []) + (input.is_consumer ? ['load'] : [])"
+      - title: After the encoder, a producer offloads each newly computed encoder output
+        source: "vllm/v1/worker/gpu/ec_connector.py:68-74"
+        set:
+          vars.saved: "= input.is_producer ? input.cached_after.filter(h, !(h in input.cached_before)) : []"
+      - source: "vllm/v1/worker/gpu/ec_connector.py:75-81"
+        return: {started: "= vars.started", saved: "= vars.saved"}
+  - component: cudagraph-dispatcher-v1
+    name: initialize-cudagraph-keys
+    kind: function
+    summary: "CudagraphDispatcher.initialize_cudagraph_keys (V1): nothing with mode NONE; otherwise one mixed-mode key per capture size (PIECEWISE keys drop num_reqs and uniform), plus, when decode runs FULL as a separate routine, FULL uniform-decode keys for capture sizes between the decode query length and max_num_seqs x that length."
+    sources: ["vllm/v1/cudagraph_dispatcher.py:164-231"]
+    latency_ms: 0
+    errors: [{code: assertion-error, status: 0, retryable: false}]
+    request: {type: object, required: [cudagraph_mode], properties: {cudagraph_mode: {type: string, enum: [NONE, PIECEWISE, FULL, FULL_DECODE_ONLY, FULL_AND_PIECEWISE]}, uniform_decode_query_len: {type: integer, default: 1}, capture_sizes: {type: ["array", "null"], items: {type: integer}}}}
+    response: {type: object, properties: {mixed_keys: {type: array}, decode_keys: {type: array}}}
+    behavior:
+      - if: "input.cudagraph_mode == 'NONE'"
+        then:
+          - source: "vllm/v1/cudagraph_dispatcher.py:171-174"
+            return: {mixed_keys: [], decode_keys: []}
+      - set:
+          vars.mixed: "= input.cudagraph_mode in ['PIECEWISE', 'FULL_AND_PIECEWISE'] ? 'PIECEWISE' : (input.cudagraph_mode == 'FULL' ? 'FULL' : 'NONE')"
+      - if: "input.capture_sizes == null && (vars.mixed != 'NONE' || input.cudagraph_mode in ['FULL_DECODE_ONLY', 'FULL_AND_PIECEWISE'])"
+        then:
+          - source: "vllm/v1/cudagraph_dispatcher.py:187-189"
+            fail: {code: assertion-error, status: 0, message: "Cudagraph capture sizes must be set when mixed mode is enabled."}
+      - title: "Mixed-mode keys: every capture size (PIECEWISE ones match any request count)"
+        source: "vllm/v1/cudagraph_dispatcher.py:186-201"
+        set:
+          vars.mk: "= vars.mixed == 'NONE' ? [] : input.capture_sizes.map(b, {'mode': vars.mixed, 'num_tokens': b, 'num_reqs': vars.mixed == 'PIECEWISE' ? dyn(null) : dyn(b)})"
+      - title: "FULL uniform-decode keys when decode runs FULL as a separate routine"
+        source: "vllm/v1/cudagraph_dispatcher.py:203-229"
+        set:
+          vars.dk: "= input.cudagraph_mode in ['FULL_DECODE_ONLY', 'FULL_AND_PIECEWISE'] ? input.capture_sizes.filter(b, b <= input.uniform_decode_query_len * int(config['max-num-seqs']) && b >= input.uniform_decode_query_len).map(b, {'mode': 'FULL', 'num_tokens': b, 'uniform': true}) : []"
+      - return: {mixed_keys: "= vars.mk", decode_keys: "= vars.dk"}
+  - component: dual-key-gumbel-watermarker
+    name: sample
+    kind: function
+    summary: "DualKeyGumbelWatermarker.sample: alpha 0 samples with the draft key only, alpha 1 with the target key only; in between both keys sample and each row is routed to the draft key with probability 1 - alpha, which needs a random sampler (ValueError otherwise). context_width is the draft watermarker's."
+    sources: ["vllm/v1/watermarking/gumbel.py:137-182"]
+    latency_ms: 0
+    errors: [{code: value-error, status: 0, retryable: false}]
+    request: {type: object, required: [alpha], properties: {alpha: {type: number}, has_random_sampler: {type: boolean, default: true}, draft_context_width: {type: integer, default: 4}}}
+    response: {type: object, properties: {keys: {type: array, items: {type: string}}, context_width: {type: integer}}}
+    behavior:
+      - if: "input.alpha == 0.0"
+        then: [{source: "vllm/v1/watermarking/gumbel.py:147-150", return: {keys: [draft], context_width: "= input.draft_context_width"}}]
+      - if: "input.alpha == 1.0"
+        then: [{source: "vllm/v1/watermarking/gumbel.py:151-154", return: {keys: [target], context_width: "= input.draft_context_width"}}]
+      - if: "!input.has_random_sampler"
+        then:
+          - source: "vllm/v1/watermarking/gumbel.py:155-156"
+            fail: {code: value-error, status: 0, message: "dual-key Gumbel routing requires a random sampler"}
+      - title: Both keys sample; each row keeps the draft key's token with probability 1 - alpha
+        source: "vllm/v1/watermarking/gumbel.py:158-174"
+        return: {keys: [draft, target], context_width: "= input.draft_context_width"}
+  - component: gpu-model-runner-v1
+    name: get-model
+    kind: function
+    summary: "GPUModelRunner.get_model (V1): the loaded model, unwrapped from its CUDA graph (or ubatch) wrapper; before load_model it raises ValueError."
+    sources: ["vllm/v1/worker/gpu_model_runner.py:3112-3120"]
+    latency_ms: 0
+    errors: [{code: value-error, status: 0, retryable: false}]
+    request: {type: object, properties: {model_loaded: {type: boolean, default: true}}}
+    response: {type: object, properties: {model: {type: string}}}
+    behavior:
+      - if: "!input.model_loaded"
+        then:
+          - source: "vllm/v1/worker/gpu_model_runner.py:3113-3114"
+            fail: {code: value-error, status: 0, message: "Cannot get model before model has been initialized"}
+      - return: {model: unwrapped}

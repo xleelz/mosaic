@@ -1,0 +1,702 @@
+# Nomad substrate (DESIGN §14.6, §15.6). Import it instead of modeling Nomad again:
+#   imports: [{ontology: <path to this file>, as: nomad}]
+# There is no code snapshot: every behavior cites HashiCorp's documentation by URL.
+# Scope: jobs (service and batch), evaluations, placement onto eligible nodes, allocation
+# lifecycle with health, node loss, and job stop/deregister. Not modeled: deployments and
+# canaries, restart and reschedule policies after a task failure, spread/affinity scoring,
+# preemption, node drain and reconnection of disconnected allocations.
+schema_version: 1
+id: nomad
+name: HashiCorp Nomad (substrate)
+level: service
+description: >-
+  A Nomad cluster: servers that accept jobs, create evaluations and schedule allocations onto
+  eligible client nodes, and clients that start allocations after a boot delay, report health,
+  and kill them one kill timeout after a stop. Node loss marks allocations lost (or unknown
+  with disconnect.lost_after) and places replacements.
+source: {url: "https://developer.hashicorp.com/nomad/docs"}
+
+configs:
+  - id: nomad-boot-delay-ms
+    type: integer
+    value: 5000
+    default: 5000
+    summary: >-
+      Time from placement until the task is running on the client: artifact and image download
+      plus driver start. Seconds for a container, tens of seconds for a VM (qemu driver). A task
+      group may override it with boot_delay_ms. Not a Nomad setting; a property of the workload.
+    sources: ["https://developer.hashicorp.com/nomad/docs/concepts/architecture", "https://developer.hashicorp.com/nomad/docs/drivers/qemu"]
+  - id: nomad-scheduler-delay-ms
+    type: integer
+    value: 50
+    default: 50
+    summary: Time an evaluation waits in the eval broker before a scheduler worker processes it.
+    sources: ["https://developer.hashicorp.com/nomad/docs/concepts/scheduling/scheduling"]
+  - id: nomad-kill-timeout-ms
+    type: integer
+    value: 5000
+    default: 5000
+    summary: "Task kill_timeout: the wait between the kill signal and the force kill. Nomad's default is 5s; a group may override it with kill_timeout_ms."
+    sources: ["https://developer.hashicorp.com/nomad/docs/job-specification/task#kill_timeout"]
+  - id: nomad-min-healthy-time-ms
+    type: integer
+    value: 10000
+    default: 10000
+    summary: "update.min_healthy_time: how long an allocation must be running with passing checks to be marked healthy (default 10s)."
+    sources: ["https://developer.hashicorp.com/nomad/docs/job-specification/update#min_healthy_time"]
+  - id: nomad-healthy-deadline-ms
+    type: integer
+    value: 300000
+    default: 300000
+    summary: "update.healthy_deadline: by when an allocation must be healthy, or it is marked unhealthy (default 5m)."
+    sources: ["https://developer.hashicorp.com/nomad/docs/job-specification/update#healthy_deadline"]
+  - id: nomad-heartbeat-ttl-ms
+    type: integer
+    value: 10000
+    default: 10000
+    summary: "Server min_heartbeat_ttl: the TTL a client heartbeat renews (default 10s)."
+    sources: ["https://developer.hashicorp.com/nomad/docs/configuration/server#min_heartbeat_ttl"]
+  - id: nomad-heartbeat-grace-ms
+    type: integer
+    value: 10000
+    default: 10000
+    summary: "Server heartbeat_grace: extra time past the TTL before a node is marked down (default 10s)."
+    sources: ["https://developer.hashicorp.com/nomad/docs/configuration/server#heartbeat_grace"]
+
+components:
+  - id: nomad
+    name: Nomad cluster
+    kind: service
+    layer: platform
+    summary: "A Nomad region: servers and client nodes."
+    attributes: {technology: nomad}
+    sources: ["https://developer.hashicorp.com/nomad/docs/concepts/architecture"]
+  - id: nomad-server
+    name: Nomad servers
+    kind: service
+    parent: nomad
+    layer: platform
+    summary: >-
+      The HTTP API, the replicated state store (nodes, jobs, evaluations, allocations) and the
+      scheduler workers that turn evaluations into allocation placements.
+    sources: ["https://developer.hashicorp.com/nomad/docs/concepts/architecture", "https://developer.hashicorp.com/nomad/docs/concepts/scheduling/scheduling"]
+    state:
+      schema:
+        type: object
+        properties:
+          nodes: {type: object, description: "id -> {id, datacenter, node_class, cpu, memory_mb, status: ready|down|disconnected, eligibility: eligible|ineligible}"}
+          jobs: {type: object, description: "id -> the registered job, with status pending|running|dead, stop and version"}
+          evals: {type: object, description: "id -> {id, job_id, triggered_by, status: pending|complete|blocked, ...}"}
+          allocs: {type: object, description: "id -> {id, name, job_id, task_group, node_id, desired_status, client_status, deployment_health, status, ...}"}
+      initial: {nodes: {}, jobs: {}, evals: {}, allocs: {}}
+  - id: nomad-client
+    name: Nomad clients
+    kind: service
+    parent: nomad
+    layer: platform
+    summary: >-
+      The client agents on the nodes: alloc runners that start tasks, run health checks, send
+      kill signals, and report allocation status to the servers (Node.UpdateAlloc).
+    sources: ["https://developer.hashicorp.com/nomad/docs/concepts/architecture"]
+
+schemas:
+  - id: TaskGroup
+    summary: "A task group, flattened to what placement and the lifecycle need. The sim fields (check, exit, run_ms, boot_delay_ms) say how the workload behaves."
+    schema:
+      type: object
+      required: [name, count]
+      properties:
+        name: {type: string, examples: [web]}
+        count: {type: integer, minimum: 0, maximum: 20, default: 1}
+        cpu: {type: integer, default: 100, description: "MHz (resources.cpu)"}
+        memory_mb: {type: integer, default: 300, description: "resources.memory"}
+        kill_timeout_ms: {type: integer, default: 0, description: "0: config nomad-kill-timeout-ms"}
+        min_healthy_time_ms: {type: integer, default: 0, description: "0: config nomad-min-healthy-time-ms"}
+        healthy_deadline_ms: {type: integer, default: 0, description: "0: config nomad-healthy-deadline-ms"}
+        disconnect_lost_after_ms: {type: integer, default: 0, description: "disconnect.lost_after; 0: allocations on a lost node are lost at once"}
+        boot_delay_ms: {type: integer, default: 0, description: "0: config nomad-boot-delay-ms"}
+        check: {type: string, enum: [passing, failing, none], default: passing, description: "How the service's health checks behave"}
+        exit: {type: string, enum: [never, success, failure], default: never, description: "Whether the task exits by itself run_ms after starting (batch default: success)"}
+        run_ms: {type: integer, default: 10000}
+  - id: Job
+    summary: A job specification (the parts this substrate models), in snake_case.
+    schema:
+      type: object
+      required: [id, groups]
+      properties:
+        id: {type: string, examples: [web]}
+        type: {type: string, enum: [service, batch], default: service}
+        datacenters: {type: array, items: {type: string}, default: [dc1]}
+        node_class: {type: string, default: "", description: "A constraint on ${node.class}; \"\" places anywhere"}
+        groups: {type: array, items: {$ref: TaskGroup}}
+  - id: Allocation
+    schema:
+      type: object
+      properties:
+        id: {type: string}
+        name: {type: string, description: "<job>.<group>[<index>]"}
+        job_id: {type: string}
+        task_group: {type: string}
+        node_id: {type: string}
+        desired_status: {type: string, enum: [run, stop]}
+        client_status: {type: string, enum: [pending, running, complete, failed, lost, unknown]}
+        deployment_health: {type: [boolean, "null"]}
+        status: {type: string, enum: [pending, running, healthy, unhealthy, complete, failed, lost, unknown], description: "client_status, with running refined by deployment health"}
+
+interfaces:
+  # ---- Jobs API -----------------------------------------------------------------------------
+  - component: nomad-server
+    name: job-register
+    kind: http
+    attributes: {method: PUT, path: /v1/jobs}
+    summary: >-
+      Register (or update) a job. The job is stored as pending, an evaluation (triggered_by
+      job-register) is created and queued to the eval broker, and the response returns at once
+      with the EvalID: placement happens asynchronously.
+    sources: ["https://developer.hashicorp.com/nomad/api-docs/jobs#create-job", "https://developer.hashicorp.com/nomad/docs/concepts/scheduling/scheduling"]
+    latency_ms: 2
+    request: {type: object, required: [job], properties: {job: {$ref: Job}}}
+    response: {type: object, properties: {eval_id: {type: string}, job_modify_index: {type: integer}}}
+    errors: [{code: invalid_job, status: 400}]
+    behavior:
+      - if: "input.job.id == '' || size(input.job.groups) == 0 || !input.job.groups.all(g, g.name != '' && g.count >= 0) || input.job.groups.map(g, g.name).distinct().size() != size(input.job.groups)"
+        title: Job validation
+        source: "https://developer.hashicorp.com/nomad/api-docs/jobs#create-job"
+        then: [{fail: {code: invalid_job, status: 400, message: "job validation failed: an id and uniquely named task groups are required"}}]
+      - set:
+          vars.prev: "= input.job.id in state.jobs ? state.jobs[input.job.id] : null"
+          vars.type: "= has(input.job.type) ? input.job.type : 'service'"
+      - transact:
+          - table: jobs
+            op: put
+            key: "= input.job.id"
+            value: >-
+              = merge(input.job, {'type': vars.type,
+                  'datacenters': has(input.job.datacenters) ? input.job.datacenters : ['dc1'],
+                  'node_class': has(input.job.node_class) ? input.job.node_class : '',
+                  'stop': false,
+                  'status': vars.prev != null && !vars.prev.stop ? vars.prev.status : 'pending',
+                  'version': vars.prev != null ? vars.prev.version + 1 : 0,
+                  'submit_time': now})
+        as: job
+      - call: nomad-server.eval-create
+        input: {job_id: "= input.job.id", triggered_by: job-register}
+        as: ev
+      - return: {eval_id: "= vars.ev.value.id", job_modify_index: "= vars.job.value[0].version"}
+
+  - component: nomad-server
+    name: job-stop
+    kind: http
+    attributes: {method: DELETE, path: "/v1/job/:job_id"}
+    summary: >-
+      Stop (deregister) a job. Without purge the job stays, marked stop, and becomes dead once its
+      allocations are terminal; with purge it is removed from the state store at once. Either way
+      an evaluation (triggered_by job-deregister) sets the allocations' desired status to stop,
+      and each running allocation finishes one kill timeout later.
+    sources: ["https://developer.hashicorp.com/nomad/api-docs/jobs#stop-a-job", "https://developer.hashicorp.com/nomad/docs/commands/job/stop"]
+    latency_ms: 2
+    request: {type: object, required: [job_id], properties: {job_id: {type: string, examples: [web]}, purge: {type: boolean, default: false}}}
+    response: {type: object, properties: {eval_id: {type: string}}}
+    errors: [{code: job_not_found, status: 404}]
+    behavior:
+      - if: "!(input.job_id in state.jobs)"
+        then: [{fail: {code: job_not_found, status: 404, message: "= 'job not found: ' + input.job_id"}}]
+      - transact:
+          - {table: jobs, op: update, key: "= input.job_id", value: {stop: true}}
+        when: "!(has(input.purge) && input.purge)"
+      - transact:
+          - {table: jobs, op: delete, key: "= input.job_id"}
+        when: "has(input.purge) && input.purge"
+        title: Purge removes the job at once
+      - call: nomad-server.eval-create
+        input: {job_id: "= input.job_id", triggered_by: job-deregister}
+        as: ev
+      - return: {eval_id: "= vars.ev.value.id"}
+
+  - component: nomad-server
+    name: job-get
+    kind: http
+    attributes: {method: GET, path: "/v1/job/:job_id"}
+    summary: Read a job, with its status (pending, running or dead).
+    sources: ["https://developer.hashicorp.com/nomad/api-docs/jobs#read-job"]
+    latency_ms: 1
+    request: {type: object, required: [job_id], properties: {job_id: {type: string, examples: [web]}}}
+    response: Job
+    errors: [{code: job_not_found, status: 404}]
+    behavior:
+      - if: "!(input.job_id in state.jobs)"
+        then: [{fail: {code: job_not_found, status: 404, message: "= 'job not found: ' + input.job_id"}}]
+      - return: "= state.jobs[input.job_id]"
+
+  - component: nomad-server
+    name: allocations-by-job
+    kind: http
+    attributes: {method: GET, path: "/v1/job/:job_id/allocations"}
+    summary: >-
+      List a job's allocations, in creation order, terminal ones included (until garbage
+      collection, which is not modeled). A purged job's allocations are still listed.
+    sources: ["https://developer.hashicorp.com/nomad/api-docs/jobs#list-job-allocations"]
+    latency_ms: 1
+    request: {type: object, required: [job_id], properties: {job_id: {type: string, examples: [web]}}}
+    response: {type: array, items: {$ref: Allocation}}
+    behavior:
+      - return: "= state.allocs.filter(k, state.allocs[k].job_id == input.job_id).map(k, state.allocs[k]).sortBy(a, a.create_index)"
+
+  - component: nomad-server
+    name: allocations-by-node
+    kind: http
+    attributes: {method: GET, path: "/v1/node/:node_id/allocations"}
+    summary: List the allocations placed on a node, in creation order.
+    sources: ["https://developer.hashicorp.com/nomad/api-docs/nodes#list-node-allocations"]
+    latency_ms: 1
+    request: {type: object, required: [node_id], properties: {node_id: {type: string, examples: [node-1]}}}
+    response: {type: array, items: {$ref: Allocation}}
+    errors: [{code: node_not_found, status: 404}]
+    behavior:
+      - if: "!(input.node_id in state.nodes)"
+        then: [{fail: {code: node_not_found, status: 404, message: "= 'node not found: ' + input.node_id"}}]
+      - return: "= state.allocs.filter(k, state.allocs[k].node_id == input.node_id).map(k, state.allocs[k]).sortBy(a, a.create_index)"
+
+  # ---- Nodes ---------------------------------------------------------------------------------
+  - component: nomad-server
+    name: node-register
+    kind: rpc
+    summary: >-
+      Node.Register: a client node joins (or rejoins) as ready. Blocked evaluations are unblocked
+      and re-run, so allocations that found no capacity are placed on the new node.
+    sources: ["https://developer.hashicorp.com/nomad/docs/concepts/scheduling/scheduling", "https://developer.hashicorp.com/nomad/api-docs/nodes"]
+    latency_ms: 2
+    request:
+      type: object
+      required: [node]
+      properties:
+        node:
+          type: object
+          required: [id]
+          properties:
+            id: {type: string, examples: [node-9]}
+            datacenter: {type: string, default: dc1}
+            node_class: {type: string, default: ""}
+            cpu: {type: integer, default: 4000}
+            memory_mb: {type: integer, default: 8192}
+            eligibility: {type: string, enum: [eligible, ineligible], default: eligible}
+    response: {type: object, properties: {unblocked: {type: array, items: {type: string}}}}
+    behavior:
+      - transact:
+          - table: nodes
+            op: put
+            key: "= input.node.id"
+            value: "= merge({'datacenter': 'dc1', 'node_class': '', 'cpu': 4000, 'memory_mb': 8192, 'eligibility': 'eligible'}, merge(input.node, {'status': 'ready'}))"
+      - set: {vars.blocked: "= state.evals.filter(k, state.evals[k].status == 'blocked')"}
+      - foreach: "= vars.blocked"
+        as: e
+        max: 1000
+        steps:
+          - transact:
+              - {table: evals, op: update, key: "= vars.e", value: {status: pending}}
+            title: Unblock the evaluation
+          - emit: nomad-server.process-eval
+            input: {eval_id: "= vars.e"}
+            after_ms: "= config['nomad-scheduler-delay-ms']"
+      - return: {unblocked: "= vars.blocked"}
+
+  - component: nomad-server
+    name: node-heartbeat-expired
+    kind: event
+    summary: >-
+      A node's heartbeat TTL plus heartbeat_grace passed without a heartbeat. The node is marked
+      down (disconnected when its allocations allow disconnects); its pending and running
+      allocations become lost, or unknown when their group sets disconnect.lost_after (then
+      lost when that expires). An evaluation per affected job places replacements.
+    sources: ["https://developer.hashicorp.com/nomad/docs/configuration/server#heartbeat_grace", "https://developer.hashicorp.com/nomad/docs/job-specification/disconnect#lost_after", "https://developer.hashicorp.com/nomad/api-docs/allocations"]
+    latency_ms: 0
+    request: {type: object, required: [node_id], properties: {node_id: {type: string, examples: [node-1]}}}
+    response: {type: object, properties: {lost: {type: array}, unknown: {type: array}}}
+    errors: [{code: node_not_found, status: 404}]
+    behavior:
+      - if: "!(input.node_id in state.nodes)"
+        then: [{fail: {code: node_not_found, status: 404, message: "= 'node not found: ' + input.node_id"}}]
+      - if: "state.nodes[input.node_id].status != 'ready'"
+        then: [{return: {lost: [], unknown: []}}]
+      - set:
+          vars.affected: "= state.allocs.filter(k, state.allocs[k].node_id == input.node_id && state.allocs[k].client_status in ['pending', 'running'])"
+      - set:
+          vars.unknown: "= vars.affected.filter(k, state.allocs[k].lost_after_ms > 0 && state.allocs[k].desired_status == 'run')"
+          vars.lost: "= vars.affected.filter(k, !(state.allocs[k].lost_after_ms > 0 && state.allocs[k].desired_status == 'run'))"
+          vars.jobs: "= vars.affected.map(k, state.allocs[k].job_id).distinct()"
+      - transact:
+          - {table: nodes, op: update, key: "= input.node_id", value: {status: "= size(vars.unknown) > 0 ? 'disconnected' : 'down'"}}
+        title: Node marked down
+      - foreach: "= vars.lost"
+        as: k
+        max: 1000
+        steps:
+          - transact:
+              - {table: allocs, op: update, key: "= vars.k", value: {client_status: lost, status: lost, desired_status: stop, modify_time: "= now"}}
+      - foreach: "= vars.unknown"
+        as: k
+        max: 1000
+        steps:
+          - transact:
+              - {table: allocs, op: update, key: "= vars.k", value: {client_status: unknown, status: unknown, modify_time: "= now"}}
+          - emit: nomad-server.alloc-disconnect-expired
+            input: {alloc_id: "= vars.k"}
+            after_ms: "= state.allocs[vars.k].lost_after_ms"
+      - foreach: "= vars.jobs"
+        as: j
+        max: 1000
+        steps:
+          - call: nomad-server.eval-create
+            input: {job_id: "= vars.j", triggered_by: node-update}
+            when: "vars.j in state.jobs && !state.jobs[vars.j].stop"
+          - call: nomad-server.job-refresh
+            input: {job_id: "= vars.j"}
+      - return: {lost: "= vars.lost", unknown: "= vars.unknown"}
+
+  - component: nomad-server
+    name: alloc-disconnect-expired
+    kind: event
+    summary: disconnect.lost_after expired for an unknown allocation whose node never came back; it becomes lost.
+    sources: ["https://developer.hashicorp.com/nomad/docs/job-specification/disconnect#lost_after"]
+    latency_ms: 0
+    request: {type: object, required: [alloc_id], properties: {alloc_id: {type: string}}}
+    behavior:
+      - if: "!(input.alloc_id in state.allocs) || state.allocs[input.alloc_id].client_status != 'unknown'"
+        then: [{return: {changed: false}}]
+      - transact:
+          - {table: allocs, op: update, key: "= input.alloc_id", value: {client_status: lost, status: lost, desired_status: stop, modify_time: "= now"}}
+      - call: nomad-server.job-refresh
+        input: {job_id: "= state.allocs[input.alloc_id].job_id"}
+      - return: {changed: true}
+
+  # ---- Allocation updates from clients (Node.UpdateAlloc) ---------------------------------
+  - component: nomad-server
+    name: node-update-alloc
+    kind: rpc
+    summary: >-
+      Node.UpdateAlloc: a client reports an allocation's client status or deployment health. The
+      update applies only while the allocation is still in one of the `expect` statuses (and, with
+      `desired`, still has that desired status); otherwise it is stale and ignored (applied: false).
+    sources: ["https://developer.hashicorp.com/nomad/docs/concepts/architecture", "https://developer.hashicorp.com/nomad/api-docs/allocations"]
+    latency_ms: 1
+    request:
+      type: object
+      required: [alloc_id, expect]
+      properties:
+        alloc_id: {type: string}
+        expect: {type: array, items: {type: string}, examples: [[pending]]}
+        desired: {type: string, default: ""}
+        client_status: {type: string, default: ""}
+        healthy: {type: [boolean, "null"], default: null}
+    response: {type: object, properties: {applied: {type: boolean}, alloc: {type: object}}}
+    behavior:
+      - if: "!(input.alloc_id in state.allocs)"
+        then: [{return: {applied: false}}]
+      - set:
+          vars.row: "= state.allocs[input.alloc_id]"
+          vars.cs: "= has(input.client_status) && input.client_status != '' ? input.client_status : state.allocs[input.alloc_id].client_status"
+          vars.health: "= has(input.healthy) && input.healthy != null ? input.healthy : state.allocs[input.alloc_id].deployment_health"
+      - transact:
+          - table: allocs
+            op: update
+            key: "= input.alloc_id"
+            if: "row != null && row.client_status in input.expect && (!has(input.desired) || input.desired == '' || row.desired_status == input.desired)"
+            value:
+              client_status: "= vars.cs"
+              deployment_health: "= vars.health"
+              status: "= vars.cs == 'running' ? (vars.health == true ? 'healthy' : vars.health == false ? 'unhealthy' : 'running') : vars.cs"
+              modify_time: "= now"
+        title: Apply unless stale
+        as: u
+        on_error: [{return: {applied: false}}]
+      - call: nomad-server.job-refresh
+        input: {job_id: "= vars.row.job_id"}
+      - return: {applied: true, alloc: "= vars.u.value[0]"}
+
+  # ---- Evaluations and the scheduler ----------------------------------------------------------
+  - component: nomad-server
+    name: eval-create
+    kind: function
+    summary: Create a pending evaluation for a job and enqueue it to the eval broker.
+    sources: ["https://developer.hashicorp.com/nomad/docs/concepts/scheduling/scheduling"]
+    latency_ms: 0
+    request: {type: object, required: [job_id, triggered_by], properties: {job_id: {type: string}, triggered_by: {type: string, enum: [job-register, job-deregister, node-update, queued-allocs]}}}
+    response: {type: object, properties: {id: {type: string}}}
+    behavior:
+      - set: {vars.n: "= seq('eval')"}
+      - set: {vars.id: "= id('eval', input.job_id, string(vars.n))"}
+      - transact:
+          - {table: evals, op: put, key: "= vars.id", value: {id: "= vars.id", job_id: "= input.job_id", triggered_by: "= input.triggered_by", status: pending, create_index: "= vars.n", create_time: "= now"}}
+      - emit: nomad-server.process-eval
+        input: {eval_id: "= vars.id"}
+        after_ms: "= config['nomad-scheduler-delay-ms']"
+      - return: {id: "= vars.id"}
+
+  - component: nomad-server
+    name: process-eval
+    kind: event
+    summary: >-
+      A scheduler worker processes an evaluation. It reconciles the job's desired allocations
+      with the existing ones: for a stopped or purged job it sets every live allocation's
+      desired status to stop (pending ones finish at once; running ones get a kill signal);
+      otherwise it places each missing allocation on a feasible node (ready, eligible, in one of
+      the job's datacenters, matching node_class, with free cpu and memory) ranked by bin
+      packing, and stops allocations past the group's count. Unplaceable allocations leave a
+      blocked evaluation that a new node unblocks.
+    sources: ["https://developer.hashicorp.com/nomad/docs/concepts/scheduling/scheduling", "https://developer.hashicorp.com/nomad/docs/concepts/scheduling/placement", "https://developer.hashicorp.com/nomad/docs/job-specification/task#kill_timeout"]
+    latency_ms: 0
+    request: {type: object, required: [eval_id], properties: {eval_id: {type: string}}}
+    response: {type: object, properties: {placed: {type: array}, stopped: {type: array}, unplaced: {type: integer}}}
+    behavior:
+      - if: "!(input.eval_id in state.evals) || state.evals[input.eval_id].status != 'pending'"
+        then: [{return: {placed: [], stopped: [], unplaced: 0}}]
+      - set:
+          vars.ev: "= state.evals[input.eval_id]"
+          vars.placed: []
+          vars.stopped: []
+          vars.unplaced: 0
+      - set:
+          vars.job: "= vars.ev.job_id in state.jobs ? state.jobs[vars.ev.job_id] : null"
+      - set:
+          vars.stopping: "= vars.job == null || vars.job.stop"
+      # Stopping: every live allocation of the job is told to stop.
+      - set:
+          vars.to_stop: "= vars.stopping ? state.allocs.filter(k, state.allocs[k].job_id == vars.ev.job_id && state.allocs[k].desired_status == 'run' && state.allocs[k].client_status in ['pending', 'running', 'unknown']) : []"
+      # Running: allocations past each group's count are stopped too (highest index first).
+      - foreach: "= vars.stopping ? [] : vars.job.groups"
+        as: g
+        steps:
+          - set:
+              vars.live: "= state.allocs.filter(k, state.allocs[k].job_id == vars.job.id && state.allocs[k].task_group == vars.g.name && state.allocs[k].desired_status == 'run' && state.allocs[k].client_status in ['pending', 'running']).sortBy(k, -state.allocs[k].index)"
+          - set:
+              vars.to_stop: "= size(vars.live) > vars.g.count ? vars.to_stop + vars.live.slice(0, size(vars.live) - vars.g.count) : vars.to_stop"
+      - foreach: "= vars.to_stop"
+        as: k
+        max: 1000
+        steps:
+          - transact:
+              - {table: allocs, op: update, key: "= vars.k", value: {desired_status: stop, client_status: complete, status: complete, modify_time: "= now"}}
+            when: "state.allocs[vars.k].client_status == 'pending'"
+            title: A pending allocation has no task to kill; it completes at once
+          - transact:
+              - {table: allocs, op: update, key: "= vars.k", value: {desired_status: stop, modify_time: "= now"}}
+            when: "state.allocs[vars.k].client_status != 'pending'"
+          - emit: nomad-client.alloc-kill
+            input: {alloc_id: "= vars.k", kill_timeout_ms: "= state.allocs[vars.k].kill_timeout_ms"}
+            when: "state.allocs[vars.k].client_status == 'running'"
+          - set: {vars.stopped: "= vars.stopped + [vars.k]"}
+      # Placement of missing allocations, group by group, one at a time.
+      - foreach: "= vars.stopping ? [] : vars.job.groups"
+        as: g
+        steps:
+          - set:
+              vars.live: "= state.allocs.filter(k, state.allocs[k].job_id == vars.job.id && state.allocs[k].task_group == vars.g.name && state.allocs[k].desired_status == 'run' && state.allocs[k].client_status in ['pending', 'running'])"
+          - set:
+              vars.missing: "= vars.g.count - size(vars.live)"
+          - foreach: "= vars.missing > 0 ? lists.range(vars.missing) : []"
+            as: i
+            max: 20
+            steps:
+              - set:
+                  vars.used: >-
+                    = state.nodes.transformMap(n, node, {
+                        'cpu': sum(state.allocs.filter(k, state.allocs[k].node_id == n && state.allocs[k].desired_status == 'run' && state.allocs[k].client_status in ['pending', 'running']).map(k, state.allocs[k].cpu)),
+                        'memory_mb': sum(state.allocs.filter(k, state.allocs[k].node_id == n && state.allocs[k].desired_status == 'run' && state.allocs[k].client_status in ['pending', 'running']).map(k, state.allocs[k].memory_mb))})
+                  vars.indexes: "= state.allocs.filter(k, state.allocs[k].job_id == vars.job.id && state.allocs[k].task_group == vars.g.name && state.allocs[k].desired_status == 'run' && state.allocs[k].client_status in ['pending', 'running']).map(k, state.allocs[k].index)"
+              - set:
+                  vars.feasible: >-
+                    = state.nodes.filter(n,
+                        state.nodes[n].status == 'ready' && state.nodes[n].eligibility == 'eligible' &&
+                        state.nodes[n].datacenter in vars.job.datacenters &&
+                        (vars.job.node_class == '' || state.nodes[n].node_class == vars.job.node_class) &&
+                        state.nodes[n].cpu - vars.used[n].cpu >= (has(vars.g.cpu) ? vars.g.cpu : 100) &&
+                        state.nodes[n].memory_mb - vars.used[n].memory_mb >= (has(vars.g.memory_mb) ? vars.g.memory_mb : 300))
+              - if: "size(vars.feasible) == 0"
+                title: No feasible node; the allocation stays unplaced
+                then:
+                  - set: {vars.unplaced: "= vars.unplaced + 1"}
+                  - continue: true
+              - set:
+                  vars.node: "= vars.feasible.sortBy(n, state.nodes[n].memory_mb - vars.used[n].memory_mb)[0]"
+                  vars.index: "= lists.range(vars.g.count).filter(x, !(x in vars.indexes))[0]"
+                  vars.n: "= seq('alloc')"
+              - set:
+                  vars.alloc_id: "= id('alloc', vars.job.id, vars.g.name, string(vars.n))"
+                  vars.boot: "= has(vars.g.boot_delay_ms) && vars.g.boot_delay_ms > 0 ? vars.g.boot_delay_ms : config['nomad-boot-delay-ms']"
+              - transact:
+                  - table: allocs
+                    op: put
+                    key: "= vars.alloc_id"
+                    value:
+                      id: "= vars.alloc_id"
+                      name: "= vars.job.id + '.' + vars.g.name + '[' + string(vars.index) + ']'"
+                      index: "= vars.index"
+                      job_id: "= vars.job.id"
+                      job_type: "= vars.job.type"
+                      task_group: "= vars.g.name"
+                      node_id: "= vars.node"
+                      eval_id: "= input.eval_id"
+                      create_index: "= vars.n"
+                      desired_status: run
+                      client_status: pending
+                      deployment_health: null
+                      status: pending
+                      cpu: "= has(vars.g.cpu) ? vars.g.cpu : 100"
+                      memory_mb: "= has(vars.g.memory_mb) ? vars.g.memory_mb : 300"
+                      kill_timeout_ms: "= has(vars.g.kill_timeout_ms) && vars.g.kill_timeout_ms > 0 ? vars.g.kill_timeout_ms : config['nomad-kill-timeout-ms']"
+                      lost_after_ms: "= has(vars.g.disconnect_lost_after_ms) ? vars.g.disconnect_lost_after_ms : 0"
+                      create_time: "= now"
+                      modify_time: "= now"
+                title: Place the allocation (bin packing)
+              - emit: nomad-client.alloc-start
+                input:
+                  alloc_id: "= vars.alloc_id"
+                  job_type: "= vars.job.type"
+                  check: "= has(vars.g.check) ? vars.g.check : 'passing'"
+                  exit: "= has(vars.g.exit) && vars.g.exit != 'never' ? vars.g.exit : (vars.job.type == 'batch' ? 'success' : 'never')"
+                  run_ms: "= has(vars.g.run_ms) ? vars.g.run_ms : 10000"
+                  min_healthy_time_ms: "= has(vars.g.min_healthy_time_ms) && vars.g.min_healthy_time_ms > 0 ? vars.g.min_healthy_time_ms : config['nomad-min-healthy-time-ms']"
+                  healthy_deadline_ms: "= has(vars.g.healthy_deadline_ms) && vars.g.healthy_deadline_ms > 0 ? vars.g.healthy_deadline_ms : config['nomad-healthy-deadline-ms']"
+                after_ms: "= vars.boot"
+              - set: {vars.placed: "= vars.placed + [vars.alloc_id]"}
+      - if: "vars.unplaced > 0"
+        title: A blocked evaluation waits for capacity
+        then:
+          - set: {vars.bn: "= seq('eval')"}
+          - set: {vars.blocked_id: "= id('eval', vars.ev.job_id, string(vars.bn))"}
+          - transact:
+              - {table: evals, op: put, key: "= vars.blocked_id", value: {id: "= vars.blocked_id", job_id: "= vars.ev.job_id", triggered_by: queued-allocs, status: blocked, previous_eval: "= input.eval_id", create_index: "= vars.bn", create_time: "= now"}}
+      - transact:
+          - {table: evals, op: update, key: "= input.eval_id", value: {status: complete, queued_allocations: "= vars.unplaced", modify_time: "= now"}}
+      - call: nomad-server.job-refresh
+        input: {job_id: "= vars.ev.job_id"}
+      - return: {placed: "= vars.placed", stopped: "= vars.stopped", unplaced: "= vars.unplaced"}
+
+  - component: nomad-server
+    name: job-refresh
+    kind: function
+    summary: >-
+      Recompute a job's status from its allocations: running while any allocation is running (or
+      unknown), pending while it only has pending allocations or none placed yet, and dead once
+      every allocation is terminal and the job is stopped or has run.
+    sources: ["https://developer.hashicorp.com/nomad/api-docs/jobs#read-job", "https://developer.hashicorp.com/nomad/docs/commands/job/status"]
+    latency_ms: 0
+    request: {type: object, required: [job_id], properties: {job_id: {type: string}}}
+    behavior:
+      - if: "!(input.job_id in state.jobs)"
+        then: [{return: {status: ""}}]
+      - set:
+          vars.allocs: "= state.allocs.filter(k, state.allocs[k].job_id == input.job_id).map(k, state.allocs[k])"
+      - set:
+          vars.status: >-
+            = vars.allocs.exists(a, a.client_status in ['running', 'unknown']) ? 'running' :
+              vars.allocs.exists(a, a.client_status == 'pending') ? 'pending' :
+              (state.jobs[input.job_id].stop || size(vars.allocs) > 0) ? 'dead' : 'pending'
+      - transact:
+          - {table: jobs, op: update, key: "= input.job_id", value: {status: "= vars.status"}}
+        when: "state.jobs[input.job_id].status != vars.status"
+      - return: {status: "= vars.status"}
+
+  # ---- Clients: alloc runners ---------------------------------------------------------------
+  - component: nomad-client
+    name: alloc-start
+    kind: event
+    summary: >-
+      The alloc runner has the task running, one boot delay after placement: it reports running
+      (if the allocation is still pending and wanted). Service tasks then report health:
+      healthy after min_healthy_time with passing checks, unhealthy at healthy_deadline with
+      failing ones. A task that exits by itself does so run_ms after starting.
+    sources: ["https://developer.hashicorp.com/nomad/docs/job-specification/update#min_healthy_time", "https://developer.hashicorp.com/nomad/docs/job-specification/check", "https://developer.hashicorp.com/nomad/docs/drivers/qemu"]
+    latency_ms: 0
+    request:
+      type: object
+      required: [alloc_id]
+      properties:
+        alloc_id: {type: string}
+        job_type: {type: string, enum: [service, batch], default: service}
+        check: {type: string, enum: [passing, failing, none], default: passing}
+        exit: {type: string, enum: [never, success, failure], default: never}
+        run_ms: {type: integer, default: 10000}
+        min_healthy_time_ms: {type: integer, default: 10000}
+        healthy_deadline_ms: {type: integer, default: 300000}
+    behavior:
+      - call: nomad-server.node-update-alloc
+        input: {alloc_id: "= input.alloc_id", expect: [pending], desired: run, client_status: running}
+        as: u
+      - if: "!vars.u.value.applied"
+        title: Stopped or lost before it booted
+        then: [{return: {started: false}}]
+      - emit: nomad-client.alloc-health
+        input: {alloc_id: "= input.alloc_id", healthy: true}
+        after_ms: "= input.min_healthy_time_ms"
+        when: "input.job_type == 'service' && input.check != 'failing'"
+      - emit: nomad-client.alloc-health
+        input: {alloc_id: "= input.alloc_id", healthy: false}
+        after_ms: "= input.healthy_deadline_ms"
+        when: "input.job_type == 'service' && input.check == 'failing'"
+      - emit: nomad-client.alloc-task-exit
+        input: {alloc_id: "= input.alloc_id", exit: "= input.exit"}
+        after_ms: "= input.run_ms"
+        when: "input.exit != 'never'"
+      - return: {started: true}
+
+  - component: nomad-client
+    name: alloc-health
+    kind: event
+    summary: The allocation's deployment health is decided (healthy or unhealthy), if it is still running and wanted.
+    sources: ["https://developer.hashicorp.com/nomad/docs/job-specification/update#health_check"]
+    latency_ms: 0
+    request: {type: object, required: [alloc_id, healthy], properties: {alloc_id: {type: string}, healthy: {type: boolean}}}
+    behavior:
+      - call: nomad-server.node-update-alloc
+        input: {alloc_id: "= input.alloc_id", expect: [running], desired: run, healthy: "= input.healthy"}
+
+  - component: nomad-client
+    name: alloc-task-exit
+    kind: event
+    summary: The task exited by itself; exit code 0 completes the allocation, anything else fails it (restarts not modeled).
+    sources: ["https://developer.hashicorp.com/nomad/api-docs/allocations", "https://developer.hashicorp.com/nomad/docs/job-specification/restart"]
+    latency_ms: 0
+    request: {type: object, required: [alloc_id, exit], properties: {alloc_id: {type: string}, exit: {type: string, enum: [success, failure]}}}
+    behavior:
+      - call: nomad-server.node-update-alloc
+        input: {alloc_id: "= input.alloc_id", expect: [running], client_status: "= input.exit == 'success' ? 'complete' : 'failed'"}
+
+  - component: nomad-client
+    name: alloc-kill
+    kind: event
+    summary: >-
+      The server stopped the allocation: the client sends the kill signal and the task gets
+      kill_timeout to exit before it is force-killed. The allocation keeps running until then.
+    sources: ["https://developer.hashicorp.com/nomad/docs/job-specification/task#kill_timeout", "https://developer.hashicorp.com/nomad/docs/commands/job/stop"]
+    latency_ms: 0
+    request: {type: object, required: [alloc_id], properties: {alloc_id: {type: string}, kill_timeout_ms: {type: integer, default: 5000}}}
+    behavior:
+      - emit: nomad-client.alloc-killed
+        input: {alloc_id: "= input.alloc_id"}
+        after_ms: "= input.kill_timeout_ms"
+
+  - component: nomad-client
+    name: alloc-killed
+    kind: event
+    summary: The kill timeout elapsed; the task is gone and the allocation is complete.
+    sources: ["https://developer.hashicorp.com/nomad/docs/job-specification/task#kill_timeout"]
+    latency_ms: 0
+    request: {type: object, required: [alloc_id], properties: {alloc_id: {type: string}}}
+    behavior:
+      - call: nomad-server.node-update-alloc
+        input: {alloc_id: "= input.alloc_id", expect: [running], desired: stop, client_status: complete}
+
+  - component: nomad-client
+    name: node-crash
+    kind: event
+    summary: >-
+      A client node stops heartbeating (crash or partition). The servers notice when the
+      heartbeat TTL plus heartbeat_grace have passed.
+    sources: ["https://developer.hashicorp.com/nomad/docs/configuration/server#heartbeat_grace", "https://developer.hashicorp.com/nomad/docs/configuration/server#min_heartbeat_ttl"]
+    latency_ms: 0
+    request: {type: object, required: [node_id], properties: {node_id: {type: string, examples: [node-1]}}}
+    behavior:
+      - emit: nomad-server.node-heartbeat-expired
+        input: {node_id: "= input.node_id"}
+        after_ms: "= config['nomad-heartbeat-ttl-ms'] + config['nomad-heartbeat-grace-ms']"

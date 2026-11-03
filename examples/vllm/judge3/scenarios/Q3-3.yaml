@@ -1,0 +1,116 @@
+schema_version: 1
+id: vllm
+scenarios:
+- id: bench-q3-3
+  name: Q3-3 a preempting step admits nothing new; C resumes before W
+  fixtures:
+  - full-tp1-llama-8b
+  config:
+    num-gpu-blocks-override: 12
+    max-num-batched-tokens: 2048
+  state:
+    block-pool:
+      num_gpu_blocks: 12
+  steps:
+  - flow: scheduler-add-request
+    as: add_a
+    input:
+      request_id: a
+      prompt_segments:
+      - key: doc-a
+        num_tokens: 32
+      sampling_params:
+        max_tokens: 200
+  - flow: scheduler-add-request
+    as: add_b
+    input:
+      request_id: b
+      prompt_segments:
+      - key: doc-b
+        num_tokens: 20
+      sampling_params:
+        max_tokens: 200
+  - flow: scheduler-add-request
+    as: add_c
+    input:
+      request_id: c
+      prompt_segments:
+      - key: doc-c
+        num_tokens: 100
+      sampling_params:
+        max_tokens: 200
+  - flow: scheduler-schedule
+    as: s1
+    input: {}
+  - interface: kv-cache-manager.get-block-ids
+    caller: engine-core
+    as: ta1
+    input:
+      request_id: a
+  - interface: kv-cache-manager.get-block-ids
+    caller: engine-core
+    as: tc1
+    input:
+      request_id: c
+  - flow: scheduler-make-stats
+    as: st1
+    input: {}
+  - flow: scheduler-add-request
+    as: add_w
+    input:
+      request_id: w
+      prompt_segments:
+      - key: doc-w
+        num_tokens: 16
+      sampling_params:
+        max_tokens: 200
+  - flow: scheduler-schedule
+    as: s2
+    input: {}
+  - interface: kv-cache-manager.get-block-ids
+    caller: engine-core
+    as: ta2
+    input:
+      request_id: a
+  - interface: scheduler.get-request-counts
+    caller: engine-core
+    as: c2
+  - interface: block-pool.get-num-free-blocks
+    caller: engine-core
+    as: f2
+  - flow: scheduler-schedule
+    as: s3
+    input: {}
+  - flow: scheduler-finish-requests
+    as: fin_b
+    input:
+      request_ids:
+      - b
+  - flow: scheduler-schedule
+    as: s4
+    input: {}
+  - flow: scheduler-make-stats
+    as: st4
+    input: {}
+  expect:
+  - 'steps.s1.result.value.num_scheduled_tokens == {''a'': 32, ''b'': 20, ''c'': 100} && size(steps.tc1.result.value.block_ids) == 7'
+  - '// (a) A cannot get its 3rd block, so C (running[-1]) is preempted; A and B are scheduled
+
+    steps.s2.result.value.num_scheduled_tokens == {''a'': 1, ''b'': 1} && steps.s2.result.value.preempted_req_ids == [''c''] && state.scheduler.requests[''c''].num_preemptions == 1'
+  - trace.exists(e, e.type == 'call.start' && e.interface == 'scheduler.preempt-request' && e.input.request_id == 'c')
+  - '// (b) W fits in C''s freed blocks but the waiting pass is skipped
+
+    steps.s2.result.value.scheduled_new_reqs == [] && steps.c2.result.value == {''num_running'': 2, ''num_waiting'': 2} && trace.exists(n, n.type == ''note'' && n.title == ''Preemption this step; no waiting
+    request is admitted'')'
+  - '// (c) C''s unhashed partial (7th) block went to the front of the free queue and A reused it
+
+    steps.ta2.result.value.block_ids[2] == steps.tc1.result.value.block_ids[6]'
+  - steps.f2.result.value.num_free_blocks == 6
+  - '// C at the waiting head is admitted before W once B frees blocks, hitting 96 and computing 4
+
+    state.scheduler.waiting == [] && steps.s3.result.value.scheduled_new_reqs == [] && steps.s4.result.value.num_scheduled_tokens[''c''] == 4 && steps.s4.result.value.num_scheduled_tokens[''w''] == 16'
+  - state.scheduler.running == ['a', 'c', 'w'] && steps.s4.result.value.scheduled_new_reqs.map(r, r.req_id) == ['w', 'c']
+  - '// (d) the re-admission lookup is recorded as preempted
+
+    steps.st4.result.value.prefix_cache_stats.preempted_requests == 1 && steps.st4.result.value.prefix_cache_stats.preempted_hits == 96 && steps.st4.result.value.prefix_cache_stats.preempted_queries ==
+    100 && steps.st4.result.value.prefix_cache_stats.requests == 1 && steps.st4.result.value.prefix_cache_stats.hits == 0'

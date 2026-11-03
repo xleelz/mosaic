@@ -1,0 +1,70 @@
+schema_version: 1
+id: vscode
+scenarios:
+  - id: bench-r2-backoff-then-reconnect
+    name: "R2: socket drops, two network errors, waits 0/5/5 s between attempts, reconnects with the same token"
+    fixtures: [full-window, remote-server-srv1]
+    faults:
+      - {target: remote-socket-factory-service.connect, type: error, code: econnrefused, calls: [2, 3]}
+    steps:
+      - flow: rs-remote-connect
+        input: {commit: 2c33b50b16c472efe58357d1d2a8a5414bc23fbf, reconnection_token: tok-r2, remote_authority: ssh-remote+dev-box}
+        as: c
+      - flow: rs-remote-reconnect
+        input: {commit: 2c33b50b16c472efe58357d1d2a8a5414bc23fbf, millis_since_last_incoming_data: 45000, remote_authority: ssh-remote+dev-box}
+        as: r
+    expect:
+      - "steps.r.result.ok && steps.r.result.value.started"
+      - "state['management-persistent-connection@w1'].connection_state == 'connection-gain' && state['management-persistent-connection@w1'].attempts == 3"
+      - "!state['management-persistent-connection@w1'].permanent_failure"
+      # backoff TIMES = [0, 5, 5, ...] seconds: attempt 1 immediate, then two ReconnectionWait events of 5 s
+      - "trace.filter(e, e.type == 'call.start' && e.interface == 'remote-agent-connection-status-listener.on-did-state-change' && e.input.type == 'reconnection-wait').map(e, e.input.duration_seconds) == [5, 5]"
+      - "trace.filter(e, e.type == 'call.start' && e.interface == 'remote-socket-factory-service.connect').size() == 4"
+      # the server accepted the reconnection on the existing ManagementConnection
+      - "trace.exists(e, e.type == 'note' && e.title == 'Accept the reconnection on the existing ManagementConnection')"
+      # 45 s without data > 40 s DISCONNECT_PROMPT_TIME: the progress dialog showed, then hid on ConnectionGain
+      - "state['remote-agent-connection-status-listener@w1'].last_report == 'Disconnected. Attempting to reconnect...' && state['remote-agent-connection-status-listener@w1'].visible_progress == 'none'"
+      - "!state['remote-agent-connection-status-listener@w1'].reload_window_shown"
+  - id: bench-r2-grace-expired-reload
+    name: "R2: the server stays unreachable past the grace time: permanent failure, user asked to reload"
+    fixtures: [full-window, remote-server-srv1]
+    state:
+      management-persistent-connection@w1: {grace_time_ms: 20000}
+    choices:
+      remote-agent-connection-status-listener.on-did-state-change.reload: reload-window
+    faults:
+      - {target: remote-socket-factory-service.connect, type: error, code: econnrefused, calls: [2, 3, 4, 5, 6, 7, 8, 9, 10]}
+    steps:
+      - flow: rs-remote-connect
+        input: {commit: 2c33b50b16c472efe58357d1d2a8a5414bc23fbf, reconnection_token: tok-r2, remote_authority: ssh-remote+dev-box}
+        as: c
+      - flow: rs-remote-reconnect
+        input: {commit: 2c33b50b16c472efe58357d1d2a8a5414bc23fbf, millis_since_last_incoming_data: 45000, remote_authority: ssh-remote+dev-box}
+        as: r
+    expect:
+      - "trace.exists(e, e.type == 'note' && e.title == 'Error after the grace time expired is permanent')"
+      - "state['management-persistent-connection@w1'].permanent_failure && state['management-persistent-connection@w1'].connection_state == 'reconnection-permanent-failure'"
+      # waits 0,5,5,10 s = 20 s grace consumed at the 4th attempt's failure
+      - "state['management-persistent-connection@w1'].attempts == 4"
+      - "state['remote-agent-connection-status-listener@w1'].reload_window_shown && state['remote-agent-connection-status-listener@w1'].last_report == 'Cannot reconnect. Please reload the window.'"
+      - "trace.exists(e, e.type == 'call.start' && e.interface == 'command-service.execute-command' && e.input.command_id == 'workbench.action.reloadWindow')"
+  - id: bench-r2-default-grace-keeps-trying
+    name: "R2: with the deployed 3 h grace, a server down for ~10 min is still being retried (no permanent failure, no reload prompt)"
+    fixtures: [full-window, remote-server-srv1]
+    faults:
+      - {target: remote-socket-factory-service.connect, type: error, code: econnrefused, calls: [2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 17, 18, 19, 20, 21, 22, 23, 24, 25, 26, 27, 28, 29, 30]}
+    steps:
+      - flow: rs-remote-connect
+        input: {commit: 2c33b50b16c472efe58357d1d2a8a5414bc23fbf, reconnection_token: tok-r2, remote_authority: ssh-remote+dev-box}
+        as: c
+      - flow: rs-remote-reconnect
+        input: {commit: 2c33b50b16c472efe58357d1d2a8a5414bc23fbf, millis_since_last_incoming_data: 45000, remote_authority: ssh-remote+dev-box}
+        as: r
+    expect:
+      # code: the do/while loop never stops on network errors before 3 h (remoteAgentConnection.ts:671-744)
+      - "!state['management-persistent-connection@w1'].permanent_failure"
+      - "!state['remote-agent-connection-status-listener@w1'].reload_window_shown"
+      # sim-gap: the model's foreach stops after 20 attempts (~390 s of waits) and silently ends the loop
+      # (is_reconnecting false, no ConnectionGain, no permanent failure); the code would keep looping until 3 h.
+      - "trace.filter(e, e.type == 'call.start' && e.interface == 'remote-socket-factory-service.connect').size() == 21"
+      - "state['management-persistent-connection@w1'].connection_state != 'connection-gain'"

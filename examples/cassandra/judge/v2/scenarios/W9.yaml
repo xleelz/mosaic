@@ -1,0 +1,65 @@
+schema_version: 1
+id: cassandra
+scenarios:
+  - id: bench-w9
+    name: "W9: write users and orders, flush users: one sstable in the live set, the users-only old segment is deleted, the mixed segment and the allocating segment are kept"
+    fixtures: [one-node]
+    state:
+      commit-log@n1:
+        segments_on_disk:
+          CommitLog-8-0.log:
+            id: 0
+            name: CommitLog-8-0.log
+            entries:
+              - mutation: {keyspace: shop, table: users, partition_key: "user:1", token: 11, timestamp: 1793318300000000, columns: {name: old}}
+          CommitLog-8-00.log:
+            id: 0
+            name: CommitLog-8-00.log
+            entries:
+              - mutation: {keyspace: shop, table: users, partition_key: "user:2", token: 12, timestamp: 1793318300000001, columns: {name: old2}}
+              - mutation: {keyspace: shop, table: orders, partition_key: "order:1", token: 13, timestamp: 1793318300000002, columns: {total: 1}}
+    steps:
+      - flow: coordinator-write
+        as: w
+        input:
+          consistency: ONE
+          mutations:
+            - {keyspace: shop, table: users, partition_key: "user:42", token: 4242, counter: false, timestamp: 1793318400000000, columns: {name: Ada}}
+      - flow: memtable-force-flush
+        as: flush
+        input: {keyspace: shop, table: users, reason: USER_FORCED}
+    expect:
+      - "steps.w.result.ok && steps.flush.result.ok && steps.flush.result.value.flushed && steps.flush.result.value.sstables == 1"
+      - "calls['skip-list-memtable.switch-out'] == 1 && calls['flushing-flush-runnable.call'] == 1 && trace.exists(e, e.type == 'call.start' && e.interface == 'data-disk.sstable-write' && e.input.table == 'users')"
+      - "state['column-family-store@n1'].live_sstables['shop.users'] == 1"
+      - "calls['commit-log.discard-completed-segments'] == 1"
+      # users-only old segment became unused and was deleted; the mixed one is kept with users marked clean
+      - "!('CommitLog-8-0.log' in state['commit-log@n1'].segments_on_disk)"
+      - "'CommitLog-8-00.log' in state['commit-log@n1'].segments_on_disk && state['commit-log@n1'].segments_on_disk['CommitLog-8-00.log'].entries.exists(e, e.mutation.table == 'orders' && !(has(e.already_persisted) && e.already_persisted))"
+      # the allocating segment holding the new write is kept (isStillAllocating)
+      - "'CommitLog-8-1.log' in state['commit-log@n1'].segments_on_disk"
+      # discard happens after the sstable is live (PostFlush after the flush runnable)
+      - "trace.filter(e, e.type == 'call.start' && e.interface == 'column-family-store.live-sstables-incr')[0].seq < trace.filter(e, e.type == 'call.start' && e.interface == 'commit-log.discard-completed-segments')[0].seq"
+  - id: bench-w9-readback
+    name: "W9 read-back (round 2 expected to fail; passes in round 3): after the flush the row lives in the new sstable and the switched-in memtable is empty"
+    fixtures: [one-node]
+    steps:
+      - flow: coordinator-write
+        as: w
+        input:
+          consistency: ONE
+          mutations:
+            - {keyspace: shop, table: users, partition_key: "user:42", token: 4242, counter: false, timestamp: 1793318400000000, columns: {name: Ada}}
+      - flow: memtable-force-flush
+        as: flush
+        input: {keyspace: shop, table: users, reason: USER_FORCED}
+      - flow: coordinator-local-read
+        as: r
+        input: {read_command: {keyspace: shop, kind: single_partition, limit: 100, partition_key: "user:42", table: users, token: 4242}}
+    expect:
+      - "steps.flush.result.ok && steps.r.result.ok"
+      # Code: Flushing writes the memtable's partitions into the sstable and the old memtable is discarded
+      # (ColumnFamilyStore.java:1298-1316, 1391-1404). Model: switch-out zeroes the stats but keeps the cells.
+      - "!('shop.users:user:42:name' in state['skip-list-memtable@n1'].cells)"
+      # Code: the read finds the row in the flushed sstable. Model: the flushed sstable carries no partitions, so it is skipped.
+      - "!has(ctx.sstable_skip) || ctx.sstable_skip != 'BLOOM_FILTER'"

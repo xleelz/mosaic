@@ -1,0 +1,1115 @@
+  # ================================================================ request queues
+  - component: fcfs-request-queue
+    name: peek-request
+    kind: function
+    latency_ms: 0
+    summary: "Head of the FCFS waiting deque; an empty queue raises IndexError."
+    sources: ["vllm/v1/core/sched/request_queue.py:86-90"]
+    errors: [{code: index-error, status: 0, retryable: false}]
+    request: {type: object, required: [queue], properties: {queue: {type: array, items: {type: object, properties: {request_id: {type: string}, priority: {type: integer}, arrival_time: {type: number}}}}}}
+    response: {type: object, properties: {request_id: {type: string}}}
+    behavior:
+      - if: "size(input.queue) == 0"
+        then:
+          - title: Peek from an empty queue
+            source: "vllm/v1/core/sched/request_queue.py:88-89"
+            fail: {code: index-error, status: 0, message: "peek from an empty queue"}
+      - return: {request_id: "= input.queue[0].request_id"}
+
+  - component: priority-request-queue
+    name: peek-request
+    kind: function
+    latency_ms: 0
+    summary: "Heap top: the lowest priority value, ties broken by earlier arrival_time."
+    sources: ["vllm/v1/core/sched/request_queue.py:153-157", "vllm/v1/request.py:357-367"]
+    errors: [{code: index-error, status: 0, retryable: false}]
+    request: {type: object, required: [queue], properties: {queue: {type: array, items: {type: object, properties: {request_id: {type: string}, priority: {type: integer}, arrival_time: {type: number}}}}}}
+    response: {type: object, properties: {request_id: {type: string}}}
+    behavior:
+      - if: "size(input.queue) == 0"
+        then:
+          - title: Peek from an empty heap
+            source: "vllm/v1/core/sched/request_queue.py:155-156"
+            fail: {code: index-error, status: 0, message: "peek from empty heap"}
+      - title: Order by (priority, arrival_time, request_id)
+        detail: "Request.__lt__: a lower priority value first, then the earlier arrival, then the smaller request id."
+        source: "vllm/v1/request.py:357-367"
+        return:
+          request_id: "= input.queue.filter(r, !input.queue.exists(o, o.priority < r.priority || (o.priority == r.priority && o.arrival_time < r.arrival_time) || (o.priority == r.priority && o.arrival_time == r.arrival_time && o.request_id < r.request_id)))[0].request_id"
+
+  # ==================================================================== check_stop
+  - component: sched-utils
+    name: check-stop
+    kind: function
+    latency_ms: 0
+    summary: "After appending a sampled token: EOS or a stop token id stops; max_tokens or max_model_len caps the length."
+    sources: ["vllm/v1/core/sched/utils.py:98-140"]
+    request:
+      type: object
+      required: [last_token_id, num_tokens, num_output_tokens, max_tokens]
+      properties:
+        last_token_id: {type: integer}
+        num_tokens: {type: integer}
+        num_output_tokens: {type: integer}
+        max_tokens: {type: integer}
+        min_tokens: {type: integer}
+        eos_token_id: {type: [integer, "null"]}
+        stop_token_ids: {type: array, items: {type: integer}}
+    response: {type: object, properties: {stopped: {type: boolean}, status: {type: string}, stop_reason: {}}}
+    behavior:
+      - if: "has(input.eos_token_id) && input.eos_token_id != null && input.last_token_id == input.eos_token_id"
+        then:
+          - title: EOS sampled
+            source: "vllm/v1/core/sched/utils.py:105-107"
+            return: {stopped: true, status: FINISHED_STOPPED, stop_reason: null}
+      - if: "has(input.stop_token_ids) && input.last_token_id in input.stop_token_ids"
+        then:
+          - title: Stop token id sampled
+            source: "vllm/v1/core/sched/utils.py:109-112"
+            return: {stopped: true, status: FINISHED_STOPPED, stop_reason: "= input.last_token_id"}
+      - if: "input.num_tokens >= int(config['max-model-len']) || input.num_output_tokens >= input.max_tokens"
+        then:
+          - title: Length cap (max_tokens or max_model_len)
+            source: "vllm/v1/core/sched/utils.py:114-119"
+            return: {stopped: true, status: FINISHED_LENGTH_CAPPED, stop_reason: null}
+      - return: {stopped: false, status: RUNNING, stop_reason: null}
+
+  # ===================================================================== scheduler
+  - component: scheduler
+    name: add-request
+    kind: function
+    latency_ms: 0
+    summary: "Admit a new request into the waiting queue (status WAITING) and the request table."
+    sources: ["vllm/v1/core/sched/scheduler.py:2616-2647"]
+    errors: [{code: assertion-error, status: 0, retryable: false}]
+    request: SchedKvRequest
+    response: {type: object, properties: {request_id: {type: string}, status: {type: string}, num_prompt_tokens: {type: integer}, num_block_hashes: {type: integer}}}
+    behavior:
+      - if: "input.request_id in state.requests"
+        then:
+          - title: Duplicate request id
+            detail: "A non-streaming request with an id already in the table trips the 'duplicate request id' assertion."
+            source: "vllm/v1/core/sched/scheduler.py:2617-2622"
+            fail: {code: assertion-error, status: 0, message: "duplicate request id"}
+      - set:
+          vars.sp: "= has(input.sampling_params) ? input.sampling_params : {}"
+          vars.segs: "= has(input.prompt_segments) && size(input.prompt_segments) > 0 ? input.prompt_segments : (has(input.prompt_token_ids) ? input.prompt_token_ids.map(t, {'key': string(t), 'num_tokens': 1}) : [])"
+      - set:
+          vars.num_prompt: "= sum(vars.segs.map(s, s.num_tokens))"
+          vars.lora: "= has(input.lora_request) && input.lora_request != null ? input.lora_request : dyn(null)"
+          vars.salt: "= has(input.cache_salt) && input.cache_salt != null ? input.cache_salt : dyn(null)"
+          vars.status: WAITING
+          vars.grammar_id: "= has(input.grammar_id) ? input.grammar_id : dyn(null)"
+      - if: "has(vars.sp.structured_outputs) && vars.sp.structured_outputs != null && size(vars.sp.structured_outputs) > 0"
+        then:
+          - title: A structured-output request waits for its grammar
+            detail: "Request.__init__ builds a StructuredOutputRequest when sampling_params.structured_outputs has a constraint and starts the request in WAITING_FOR_STRUCTURED_OUTPUT_GRAMMAR; its grammar is the one the StructuredOutputManager compiles for this request id."
+            source: "vllm/v1/request.py:110-117"
+            set:
+              vars.status: WAITING_FOR_STRUCTURED_OUTPUT_GRAMMAR
+              vars.grammar_id: "= vars.grammar_id != null ? vars.grammar_id : input.request_id"
+      - set: {vars.hashes: []}
+      - if: "config['enable-prefix-caching'] || config['kv-connector'] != ''"
+        then:
+          - title: Hash the prompt's full blocks
+            detail: "The engine core builds a block_hasher only when prefix caching or a KV connector is on; the Request hashes every full block when it is created."
+            source: "vllm/v1/engine/core.py:231-240"
+            call: kv-cache-utils.request-block-hasher
+            input: {prompt_segments: "= vars.segs", output_token_ids: [], num_existing_hashes: 0, lora_request: "= vars.lora", cache_salt: "= vars.salt"}
+            as: h
+          - set: {vars.hashes: "= vars.h.value.new_block_hashes"}
+      - title: Enqueue in the waiting queue
+        detail: "FCFS appends to the deque; priority pushes onto the heap (ordering is applied at peek)."
+        source: "vllm/v1/core/sched/scheduler.py:2633-2635"
+        set:
+          state.waiting: "= state.waiting + [input.request_id]"
+          state.requests: >-
+            = merge(state.requests, {input.request_id: {
+              'request_id': input.request_id, 'status': vars.status,
+              'lora_request': vars.lora, 'cache_salt': vars.salt,
+              'priority': has(input.priority) ? input.priority : 0,
+              'arrival_time': has(input.arrival_time) && input.arrival_time != null ? input.arrival_time : double(now),
+              'prompt_segments': vars.segs,
+              'prompt_token_ids': has(input.prompt_segments) && size(input.prompt_segments) > 0 ? null : (has(input.prompt_token_ids) ? input.prompt_token_ids : null),
+              'num_prompt_tokens': vars.num_prompt, 'output_token_ids': [],
+              'num_computed_tokens': 0, 'num_output_placeholders': 0,
+              'max_tokens': has(vars.sp.max_tokens) ? vars.sp.max_tokens : 16,
+              'min_tokens': has(vars.sp.min_tokens) ? vars.sp.min_tokens : 0,
+              'eos_token_id': has(vars.sp.ignore_eos) && vars.sp.ignore_eos ? null : (has(vars.sp.eos_token_id) ? vars.sp.eos_token_id : 128009),
+              'stop_token_ids': has(vars.sp.stop_token_ids) ? vars.sp.stop_token_ids : [],
+              'sampling_params': vars.sp,
+              'block_hashes': vars.hashes, 'spec_token_ids': [],
+              'kv_transfer_params': has(input.kv_transfer_params) ? input.kv_transfer_params : dyn(null),
+              'num_preemptions': 0, 'num_cached_tokens': -1, 'is_prefill_chunk': true,
+              'grammar_id': vars.grammar_id,
+              'client_index': has(input.client_index) ? input.client_index : 0}})
+      - if: "config['kv-connector'] != ''"
+        then:
+          - title: Tell the KV connector about the new request; adopt any fields its hook changed
+            source: "vllm/v1/core/sched/scheduler.py:2639-2645"
+            call: kv-connector-base-v1.on-new-request
+            input: "= {'request_id': input.request_id, 'num_prompt_tokens': vars.num_prompt, 'max_tokens': state.requests[input.request_id].max_tokens, 'kv_transfer_params': state.requests[input.request_id].kv_transfer_params, 'prompt_token_ids': has(input.prompt_token_ids) && input.prompt_token_ids != null && size(vars.segs) == size(input.prompt_token_ids) ? input.prompt_token_ids : []}"
+            as: conn
+          - if: "vars.conn.value.truncated"
+            then:
+              - title: The connector truncated the request (MoRIIO producer with Mamba layers)
+                source: "vllm/v1/core/sched/scheduler.py:2639-2641"
+                set:
+                  state.requests: "= merge(state.requests, {input.request_id: {'num_prompt_tokens': vars.conn.value.num_prompt_tokens, 'prompt_token_ids': vars.conn.value.prompt_token_ids, 'prompt_segments': vars.conn.value.prompt_token_ids.map(t, {'key': string(t), 'num_tokens': 1}), 'max_tokens': vars.conn.value.max_tokens != null ? vars.conn.value.max_tokens : state.requests[input.request_id].max_tokens, 'kv_transfer_params': vars.conn.value.kv_transfer_params}})"
+      - return: {request_id: "= input.request_id", status: "= vars.status", num_prompt_tokens: "= vars.num_prompt", num_block_hashes: "= size(vars.hashes)"}
+
+  - component: scheduler
+    name: preempt-request
+    kind: function
+    latency_ms: 0
+    summary: "Preempt a RUNNING request: free its KV blocks, reset num_computed_tokens to 0 (recompute) and put it back at the front of the waiting queue."
+    sources: ["vllm/v1/core/sched/scheduler.py:1571-1614"]
+    errors: [{code: assertion-error, status: 0, retryable: false}]
+    request: {type: object, required: [request_id], properties: {request_id: {type: string}}}
+    response: {type: object, properties: {request_id: {type: string}, num_preemptions: {type: integer}}}
+    behavior:
+      - if: "!(input.request_id in state.requests) || state.requests[input.request_id].status != 'RUNNING'"
+        then:
+          - title: Only running requests can be preempted
+            source: "vllm/v1/core/sched/scheduler.py:1584-1586"
+            fail: {code: assertion-error, status: 0, message: "Only running requests can be preempted"}
+      - title: Free the request's KV blocks
+        detail: "Its cached full blocks stay in the prefix cache (ref_cnt 0, evictable), so resuming can hit them."
+        source: "vllm/v1/core/sched/scheduler.py:1589"
+        call: kv-cache-manager.free
+        input: {request_id: "= input.request_id"}
+      - title: Reset to PREEMPTED and prepend to waiting
+        detail: "The caller removes it from running (pop() for FCFS, del by index for priority); prepend_request puts it at the deque head (heap push for priority)."
+        source: "vllm/v1/core/sched/scheduler.py:1592-1614"
+        set:
+          state.requests: "= merge(state.requests, {input.request_id: {'status': 'PREEMPTED', 'num_computed_tokens': 0, 'num_output_placeholders': 0, 'num_preemptions': state.requests[input.request_id].num_preemptions + 1}})"
+          state.running: "= state.running.filter(r, r != input.request_id)"
+          state.waiting: "= [input.request_id] + state.waiting"
+          state.preempted_req_ids: "= state.preempted_req_ids + [input.request_id]"
+      - return: {request_id: "= input.request_id", num_preemptions: "= state.requests[input.request_id].num_preemptions"}
+
+  - component: scheduler
+    name: free-request
+    kind: function
+    latency_ms: 0
+    summary: "Release a finished request: free its blocks, report it in the next SchedulerOutput.finished_req_ids, drop it from the table."
+    sources: ["vllm/v1/core/sched/scheduler.py:2714-2750"]
+    request: {type: object, required: [request_id], properties: {request_id: {type: string}}}
+    response: {type: object, properties: {request_id: {type: string}, delay_free_blocks: {type: boolean}, kv_transfer_params: {}}}
+    behavior:
+      - set: {vars.delay: false, vars.params: null}
+      - if: "config['kv-connector'] != ''"
+        then:
+          - call: kv-cache-manager.get-block-ids
+            input: {request_id: "= input.request_id"}
+            as: tbl
+          - title: Tell the KV connector the request finished
+            detail: "A producer may still be sending the KV, so freeing the blocks can be delayed until finished_sending."
+            source: "vllm/v1/core/sched/scheduler.py:3005-3058"
+            call: kv-connector-base-v1.request-finished
+            input:
+              request_id: "= input.request_id"
+              num_prompt_tokens: "= state.requests[input.request_id].num_prompt_tokens"
+              num_computed_tokens: "= state.requests[input.request_id].num_computed_tokens"
+              status: "= state.requests[input.request_id].status"
+              kv_transfer_params: "= state.requests[input.request_id].kv_transfer_params"
+              block_hashes: "= state.requests[input.request_id].block_hashes"
+              block_ids: ["= vars.tbl.value.block_ids"]
+            as: cf
+          - set: {vars.delay: "= vars.cf.value.delay_free_blocks", vars.params: "= vars.cf.value.kv_transfer_params"}
+      - set: {state.finished_req_ids: "= state.finished_req_ids + [input.request_id]"}
+      - if: "vars.delay"
+        then:
+          - title: Keep the blocks (and the request) until the connector reports finished_sending
+            source: "vllm/v1/core/sched/scheduler.py:2744-2748"
+            return: {request_id: "= input.request_id", delay_free_blocks: true, kv_transfer_params: "= vars.params"}
+      - call: kv-cache-manager.free
+        input: {request_id: "= input.request_id"}
+      - title: Remember the id for the workers and drop the request
+        source: "vllm/v1/core/sched/scheduler.py:2736-2750"
+        set:
+          state.requests: "= omit(state.requests, input.request_id)"
+      - return: {request_id: "= input.request_id", delay_free_blocks: false, kv_transfer_params: "= vars.params"}
+
+  - component: scheduler
+    name: finish-requests
+    kind: function
+    latency_ms: 0
+    summary: "Finish requests from outside the scheduler (abort on client disconnect): unknown or already finished ids are ignored."
+    sources: ["vllm/v1/core/sched/scheduler.py:2649-2712"]
+    request:
+      type: object
+      required: [request_ids]
+      properties:
+        request_ids: {type: [array, "null"], default: null, items: {type: string, examples: [chatcmpl-abc123]}, description: "null finishes every request (finish_requests(None))."}
+        finished_status: {type: string, default: FINISHED_ABORTED, enum: [FINISHED_ABORTED, FINISHED_STOPPED, FINISHED_LENGTH_CAPPED, FINISHED_ERROR]}
+    response: {type: object, properties: {finished: {type: array, items: {type: string}}}}
+    behavior:
+      - set:
+          vars.status: "= has(input.finished_status) ? input.finished_status : 'FINISHED_ABORTED'"
+          vars.done: []
+      - set:
+          vars.ids: "= input.request_ids == null ? state.requests.transformList(k, v, k) : input.request_ids"
+      - title: "None means every request"
+        source: "vllm/v1/core/sched/scheduler.py:2665-2670"
+        foreach: "= vars.ids"
+        as: rid
+        steps:
+          - if: "!(vars.rid in state.requests) || state.requests[vars.rid].status.startsWith('FINISHED')"
+            then:
+              - title: Unknown or already finished id; skipped
+                source: "vllm/v1/core/sched/scheduler.py:2678-2681"
+                continue: true
+          - if: "state.requests[vars.rid].status == 'RUNNING'"
+            then:
+              - set: {state.running: "= state.running.filter(r, r != vars.rid)"}
+            else:
+              - set: {state.waiting: "= state.waiting.filter(r, r != vars.rid)"}
+          - set: {state.requests: "= merge(state.requests, {vars.rid: {'status': vars.status}})"}
+          - call: scheduler.free-request
+            input: {request_id: "= vars.rid"}
+          - set: {vars.done: "= vars.done + [vars.rid]"}
+      - return: {finished: "= vars.done"}
+
+  - component: scheduler
+    name: get-request-counts
+    kind: function
+    latency_ms: 0
+    summary: "(num_running_reqs, num_waiting_reqs)."
+    sources: ["vllm/v1/core/sched/scheduler.py:2608-2610"]
+    request: {type: object}
+    response: {type: object, properties: {num_running: {type: integer}, num_waiting: {type: integer}}}
+    behavior:
+      - return: {num_running: "= size(state.running)", num_waiting: "= size(state.waiting)"}
+
+  - component: scheduler
+    name: make-stats
+    kind: function
+    latency_ms: 0
+    summary: "SchedulerStats for the step: running and waiting counts, KV cache usage and the prefix-cache stats since the last call."
+    sources: ["vllm/v1/core/sched/scheduler.py:2915-2959"]
+    request: {type: object, properties: {spec_decoding_stats: {type: [object, "null"], default: null}}}
+    response:
+      type: [object, "null"]
+      properties:
+        num_running_reqs: {type: integer}
+        num_waiting_reqs: {type: integer}
+        kv_cache_usage: {type: number}
+        prefix_cache_stats: {type: object}
+        spec_decoding_stats: {type: [object, "null"]}
+    behavior:
+      - if: "config['disable-log-stats']"
+        then:
+          - title: Stats are off; no SchedulerStats
+            source: "vllm/v1/core/sched/scheduler.py:2923-2924"
+            return: null
+      - call: kv-cache-manager.make-prefix-cache-stats
+        as: pcs
+      - call: kv-cache-manager.usage
+        as: usage
+      - title: Build SchedulerStats
+        source: "vllm/v1/core/sched/scheduler.py:2943-2959"
+        return:
+          num_running_reqs: "= size(state.running)"
+          num_waiting_reqs: "= size(state.waiting)"
+          kv_cache_usage: "= vars.usage.value.usage"
+          prefix_cache_stats: "= vars.pcs.value"
+          spec_decoding_stats: "= has(input.spec_decoding_stats) ? input.spec_decoding_stats : dyn(null)"
+
+  - component: scheduler
+    name: reset-prefix-cache
+    kind: function
+    latency_ms: 0
+    summary: "Reset the prefix cache; with reset_running_requests every running request is preempted first so the reset can succeed."
+    sources: ["vllm/v1/core/sched/scheduler.py:2840-2883"]
+    errors: [{code: runtime-error, status: 0, retryable: false}]
+    request: {type: object, properties: {reset_running_requests: {type: boolean, default: false}}}
+    response: {type: object, properties: {reset: {type: boolean}}}
+    behavior:
+      - if: "has(input.reset_running_requests) && input.reset_running_requests"
+        then:
+          - title: Preempt every running request, last first
+            source: "vllm/v1/core/sched/scheduler.py:2850-2866"
+            foreach: "= state.running.reverse()"
+            as: rid
+            steps:
+              - call: scheduler.preempt-request
+                input: {request_id: "= vars.rid"}
+      - call: kv-cache-manager.reset-prefix-cache
+        as: r
+      - if: "has(input.reset_running_requests) && input.reset_running_requests && !vars.r.value.reset"
+        then:
+          - title: Reset failed even after preempting everything
+            source: "vllm/v1/core/sched/scheduler.py:2868-2874"
+            fail: {code: runtime-error, status: 0, message: "Failed to reset KV cache even when all the running requests are preempted and moved to the waiting queue."}
+      - return: {reset: "= vars.r.value.reset"}
+
+  # ------------------------------------------------------------------ schedule()
+  - component: scheduler
+    name: schedule
+    kind: function
+    latency_ms: 0
+    summary: "One scheduling step: decode and continuing prefills of RUNNING requests first, then WAITING admissions, within the token budget, max_num_seqs and free KV blocks."
+    description: >-
+      There is no prefill or decode phase: each request has num_computed_tokens and
+      num_tokens, and the step assigns tokens so computed catches up (chunked prefill,
+      prefix caching and decode are the same rule). A running request that can't get
+      blocks preempts the last running request (FCFS) or the lowest-priority one, possibly
+      itself. Any preemption in a step skips all waiting admissions in that step.
+    sources: ["vllm/v1/core/sched/scheduler.py:591-1556", "vllm/v1/core/sched/output.py:231-326", "vllm/v1/request.py:294-300", "vllm/v1/core/sched/output.py:193-203", "vllm/v1/core/sched/output.py:85-91", "vllm/v1/core/sched/output.py:175-177", "vllm/v1/core/sched/output.py:214-228"]
+    request: {type: object, properties: {throttle_prefills: {type: boolean, default: false}}}
+    response: SchedulerOutput
+    behavior:
+      - title: Start the step with the token budget
+        detail: "The budget is max_num_scheduled_tokens (defaults to max_num_batched_tokens); it is 0 when paused."
+        source: "vllm/v1/core/sched/scheduler.py:604-611"
+        set:
+          state.current_step: "= state.current_step + 1"
+          vars.policy: "= config['scheduling-policy']"
+          vars.token_budget: "= state.pause_state == 'PAUSED_ALL' ? 0 : int(config['max-num-batched-tokens'])"
+          vars.sched: {}
+          vars.new_blocks: {}
+          vars.sched_running: []
+          vars.sched_new: []
+          vars.sched_resumed: []
+          vars.preempted: []
+          vars.req_index: 0
+          vars.async_sched: "= config['async-scheduling'] == true"
+          vars.spec: {}
+          vars.skipped: []
+          vars.k: "= int(config['num-speculative-tokens'])"
+          vars.lookahead: "= config['speculative-method'] != '' && config['speculative-method'] != 'ngram' ? int(config['num-speculative-tokens']) : 0"
+      - title: Long-prefill cap only when another request could starve
+        source: "vllm/v1/core/sched/scheduler.py:640-645"
+        set:
+          vars.long_thr: "= size(state.running) + size(state.waiting) > 1 ? int(config['long-prefill-token-threshold']) : 0"
+      - title: First, schedule the RUNNING requests
+        source: "vllm/v1/core/sched/scheduler.py:657-659"
+        foreach: "= lists.range(size(state.running))"
+        as: it
+        max: 1000
+        steps:
+          - if: "vars.req_index >= size(state.running) || vars.token_budget <= 0"
+            then: [{break: true}]
+          - set: {vars.rid: "= state.running[vars.req_index]"}
+          - set: {vars.req: "= state.requests[vars.rid]"}
+          - if: "vars.req.num_output_placeholders > 0 && vars.req.num_computed_tokens + 2 - vars.req.num_output_placeholders >= vars.req.num_prompt_tokens + vars.req.max_tokens"
+            then:
+              - title: Async - the in-flight step already reaches max_tokens
+                source: "vllm/v1/core/sched/scheduler.py:667-681"
+                set: {vars.req_index: "= vars.req_index + 1"}
+              - continue: true
+          - title: Tokens this request still needs
+            detail: "num_tokens_with_spec + num_output_placeholders - num_computed_tokens, cut by the long-prefill cap, the budget and max_model_len."
+            source: "vllm/v1/core/sched/scheduler.py:703-721"
+            set:
+              vars.num_new: "= vars.req.num_prompt_tokens + size(vars.req.output_token_ids) + size(vars.req.spec_token_ids) + vars.req.num_output_placeholders - vars.req.num_computed_tokens"
+          - set:
+              vars.num_new: "= vars.long_thr > 0 && vars.long_thr < vars.num_new ? vars.long_thr : vars.num_new"
+          - set:
+              vars.num_new: "= math.least([vars.num_new, vars.token_budget, int(config['max-model-len']) - vars.req.num_computed_tokens - 1])"
+          - if: "vars.num_new <= 0"
+            then:
+              - title: Nothing to schedule for this request; try the next
+                source: "vllm/v1/core/sched/scheduler.py:755-779"
+                set: {vars.req_index: "= vars.req_index + 1"}
+              - continue: true
+          - set: {vars.alloc_ok: false}
+          - title: Allocate slots, preempting until it fits
+            source: "vllm/v1/core/sched/scheduler.py:776-845"
+            foreach: "= lists.range(size(state.running))"
+            as: try_i
+            steps:
+              - call: kv-cache-manager.allocate-slots
+                input:
+                  request_id: "= vars.rid"
+                  status: RUNNING
+                  num_computed_tokens: "= vars.req.num_computed_tokens"
+                  num_tokens: "= vars.req.num_prompt_tokens + size(vars.req.output_token_ids)"
+                  num_new_tokens: "= vars.num_new"
+                  num_lookahead_tokens: "= vars.lookahead"
+                  block_hashes: "= vars.req.block_hashes"
+                as: alloc
+              - if: "vars.alloc.value.allocated"
+                then: [{set: {vars.alloc_ok: true}}, {break: true}]
+              - title: Choose the preemption victim
+                detail: "Priority: max (priority, arrival_time) among running. FCFS: the last running request."
+                source: "vllm/v1/core/sched/scheduler.py:795-802"
+                set:
+                  vars.victim: "= vars.policy == 'priority' ? state.running.filter(id, !state.running.exists(o, state.requests[o].priority > state.requests[id].priority || (state.requests[o].priority == state.requests[id].priority && state.requests[o].arrival_time > state.requests[id].arrival_time)))[0] : state.running[size(state.running) - 1]"
+              - if: "vars.policy == 'priority'"
+                then:
+                  - set: {vars.victim_index: "= lists.range(size(state.running)).filter(i, state.running[i] == vars.victim)[0]"}
+                  - if: "vars.victim_index < vars.req_index"
+                    then: [{set: {vars.req_index: "= vars.req_index - 1"}}]
+                  - if: "vars.victim in vars.sched_running"
+                    then:
+                      - title: Give back the victim's tokens scheduled earlier this step
+                        source: "vllm/v1/core/sched/scheduler.py:813-820"
+                        set:
+                          vars.token_budget: "= vars.token_budget + vars.sched[vars.victim]"
+                          vars.sched: "= omit(vars.sched, vars.victim)"
+                          vars.new_blocks: "= omit(vars.new_blocks, vars.victim)"
+                          vars.spec: "= omit(vars.spec, vars.victim)"
+                          vars.sched_running: "= vars.sched_running.filter(x, x != vars.victim)"
+              - call: scheduler.preempt-request
+                input: {request_id: "= vars.victim"}
+              - set: {vars.preempted: "= vars.preempted + [vars.victim]"}
+              - if: "vars.victim == vars.rid"
+                then:
+                  - title: Preempted itself; it cannot be scheduled
+                    source: "vllm/v1/core/sched/scheduler.py:842-844"
+                    break: true
+          - if: "!vars.alloc_ok"
+            then:
+              - title: Cannot schedule this request; stop the running pass
+                source: "vllm/v1/core/sched/scheduler.py:846-848"
+                break: true
+          - title: Schedule the running request
+            source: "vllm/v1/core/sched/scheduler.py:850-858"
+            set:
+              vars.sched: "= merge(vars.sched, {vars.rid: vars.num_new})"
+              vars.new_blocks: "= merge(vars.new_blocks, {vars.rid: vars.alloc.value.new_block_ids})"
+              vars.sched_running: "= vars.sched_running + [vars.rid]"
+              vars.token_budget: "= vars.token_budget - vars.num_new"
+              vars.req_index: "= vars.req_index + 1"
+          - set:
+              vars.n_spec: "= vars.num_new + vars.req.num_computed_tokens - (vars.req.num_prompt_tokens + size(vars.req.output_token_ids)) - vars.req.num_output_placeholders"
+          - if: "size(vars.req.spec_token_ids) > 0"
+            then:
+              - title: Schedule the request's draft tokens for verification
+                detail: "The tokens past num_tokens are draft (spec) tokens; the request's spec_token_ids are consumed here (new ones arrive before the next step)."
+                source: "vllm/v1/core/sched/scheduler.py:861-876"
+                set:
+                  vars.spec: "= vars.n_spec > 0 ? merge(vars.spec, {vars.rid: vars.req.spec_token_ids.slice(0, math.least(vars.n_spec, size(vars.req.spec_token_ids)))}) : vars.spec"
+                  state.requests: "= merge(state.requests, {vars.rid: {'spec_token_ids': []}})"
+      - title: Record the LoRAs of the scheduled running requests
+        source: "vllm/v1/core/sched/scheduler.py:889-897"
+        set:
+          vars.lids: "= config['enable-lora'] ? vars.sched_running.filter(id, has(state.requests[id].lora_request) && state.requests[id].lora_request != null && state.requests[id].lora_request.lora_int_id > 0).map(id, state.requests[id].lora_request.lora_int_id) : []"
+      - set:
+          vars.loras: "= lists.range(size(vars.lids)).filter(i, !(vars.lids[i] in vars.lids.slice(0, i))).map(i, vars.lids[i])"
+      - if: "size(vars.preempted) > 0 || state.pause_state != 'UNPAUSED'"
+        then:
+          - title: Preemption this step; no waiting request is admitted
+            detail: "Also when paused: PAUSED_ALL schedules nothing, and PAUSED_NEW admits only KV-holding waiting requests (none without a KV connector)."
+            source: "vllm/v1/core/sched/scheduler.py:899-919"
+        else:
+          - title: Next, schedule the WAITING requests
+            source: "vllm/v1/core/sched/scheduler.py:911-926"
+            foreach: "= lists.range(size(state.waiting))"
+            as: wit
+            max: 1000
+            steps:
+              - if: "vars.token_budget <= 0 || size(state.waiting) == 0"
+                then: [{break: true}]
+              - if: "size(state.running) + state.num_waiting_for_streaming_input >= int(config['max-num-seqs'])"
+                then:
+                  - title: max_num_seqs requests already running
+                    source: "vllm/v1/core/sched/scheduler.py:920-924"
+                    break: true
+              - if: "size(state.waiting.filter(id, !(id in vars.skipped))) == 0"
+                then: [{break: true}]
+              - call: "= vars.policy == 'priority' ? 'priority-request-queue.peek-request' : 'fcfs-request-queue.peek-request'"
+                targets: [priority-request-queue.peek-request, fcfs-request-queue.peek-request]
+                input:
+                  queue: "= state.waiting.filter(id, !(id in vars.skipped)).map(id, {'request_id': id, 'priority': state.requests[id].priority, 'arrival_time': state.requests[id].arrival_time})"
+                as: peek
+              - set: {vars.wid: "= vars.peek.value.request_id"}
+              - if: "state.requests[vars.wid].status == 'WAITING_FOR_STRUCTURED_OUTPUT_GRAMMAR'"
+                then:
+                  - title: Blocked on its grammar - check whether compilation finished
+                    source: "vllm/v1/core/sched/scheduler.py:3191-3194"
+                    call: structured-output-manager.grammar-status
+                    input: {request_id: "= state.requests[vars.wid].grammar_id"}
+                    as: gst
+                  - if: "vars.gst.value.status == 'pending'"
+                    then:
+                      - title: Grammar still compiling; skip this request this step
+                        source: "vllm/v1/core/sched/scheduler.py:3193-3194"
+                        set: {vars.skipped: "= vars.skipped + [vars.wid]"}
+                      - continue: true
+                  - if: "vars.gst.value.status == 'failed'"
+                    then:
+                      - title: Grammar compilation failed; the request is finished with an error after the step
+                        source: "vllm/v1/core/sched/scheduler.py:3195-3197"
+                        set:
+                          state.grammar_compile_error_reqs: "= state.grammar_compile_error_reqs + [vars.wid]"
+                          vars.skipped: "= vars.skipped + [vars.wid]"
+                      - continue: true
+                  - title: Grammar ready; promote to WAITING
+                    source: "vllm/v1/core/sched/scheduler.py:3198-3199"
+                    set: {state.requests: "= merge(state.requests, {vars.wid: {'status': 'WAITING'}})"}
+              - if: "config['enable-lora'] && has(state.requests[vars.wid].lora_request) && state.requests[vars.wid].lora_request != null && size(vars.loras) == int(config['max-loras']) && !(state.requests[vars.wid].lora_request.lora_int_id in vars.loras)"
+                then:
+                  - title: Admitting it would exceed max_loras; skip this request this step
+                    source: "vllm/v1/core/sched/scheduler.py:940-951"
+                    set: {vars.skipped: "= vars.skipped + [vars.wid]"}
+                  - continue: true
+              - set:
+                  vars.wreq: "= state.requests[vars.wid]"
+                  vars.hit_blocks: []
+                  vars.num_hit: 0
+                  vars.num_ext: 0
+                  vars.load_async: false
+                  vars.mamba_hit: null
+              - if: "vars.wreq.status == 'WAITING_FOR_REMOTE_KVS'"
+                then:
+                  - if: "!(vars.wid in state.finished_recving_kv_req_ids)"
+                    then:
+                      - title: Remote KV still loading; skip this request this step
+                        source: "vllm/v1/core/sched/scheduler.py:3178-3185"
+                        set: {vars.skipped: "= vars.skipped + [vars.wid]"}
+                      - continue: true
+                  - title: Remote KV arrived - cache the loaded blocks and promote to WAITING
+                    detail: "A fully loaded prompt recomputes its last token so the next one can be sampled."
+                    source: "vllm/v1/core/sched/scheduler.py:3123-3175"
+                    call: kv-cache-manager.cache-blocks
+                    input: {request_id: "= vars.wid", num_tokens: "= vars.wreq.num_computed_tokens", block_hashes: "= vars.wreq.block_hashes"}
+                  - set:
+                      state.finished_recving_kv_req_ids: "= state.finished_recving_kv_req_ids.filter(r, r != vars.wid)"
+                      state.requests: "= merge(state.requests, {vars.wid: {'status': vars.wreq.num_preemptions > 0 ? 'PREEMPTED' : 'WAITING', 'num_computed_tokens': vars.wreq.num_computed_tokens == vars.wreq.num_prompt_tokens + size(vars.wreq.output_token_ids) ? vars.wreq.num_computed_tokens - 1 : vars.wreq.num_computed_tokens}})"
+                  - set: {vars.wreq: "= state.requests[vars.wid]"}
+              - set:
+                  vars.num_tokens: "= vars.wreq.num_prompt_tokens + size(vars.wreq.output_token_ids)"
+                  vars.prior: "= vars.wreq.num_computed_tokens"
+              - if: "vars.wreq.num_computed_tokens == 0"
+                then:
+                  - title: Look up already-cached tokens
+                    source: "vllm/v1/core/sched/scheduler.py:960-968"
+                    call: kv-cache-manager.get-computed-blocks
+                    input: {request_id: "= vars.wid", block_hashes: "= vars.wreq.block_hashes", num_tokens: "= vars.num_tokens"}
+                    as: hit
+                  - set: {vars.hit_blocks: "= vars.hit.value.blocks", vars.num_hit: "= vars.hit.value.num_computed_tokens", vars.mamba_hit: "= vars.hit.value.mamba_block"}
+                  - if: "config['kv-connector'] != ''"
+                    then:
+                      - title: Ask the KV connector for external hits beyond the local block-aligned hit
+                        source: "vllm/v1/core/sched/scheduler.py:970-990"
+                        call: kv-connector-base-v1.get-num-new-matched-tokens
+                        input:
+                          request_id: "= vars.wid"
+                          num_prompt_tokens: "= vars.wreq.num_prompt_tokens"
+                          num_computed_tokens: "= vars.num_hit"
+                          status: WAITING
+                          kv_transfer_params: "= vars.wreq.kv_transfer_params"
+                          block_hashes: "= vars.wreq.block_hashes"
+                        as: ext
+                      - set: {vars.num_ext: "= vars.ext.value.num_external_tokens", vars.load_async: "= vars.ext.value.load_async && vars.ext.value.num_external_tokens > 0"}
+              - title: Tokens to compute for this request
+                detail: "num_tokens (prompt plus any output a resumed request already has) minus local and external computed tokens; an async load schedules nothing now."
+                source: "vllm/v1/core/sched/scheduler.py:1125-1129"
+                set:
+                  vars.num_new: "= vars.load_async ? 0 : vars.num_tokens - vars.prior - vars.num_hit - vars.num_ext"
+              - set:
+                  vars.num_new: "= vars.long_thr > 0 && vars.long_thr < vars.num_new ? vars.long_thr : vars.num_new"
+              - if: "!vars.load_async && !config['enable-chunked-prefill'] && vars.num_new > vars.token_budget"
+                then:
+                  - title: Chunked prefill off and the prompt exceeds the remaining budget
+                    source: "vllm/v1/core/sched/scheduler.py:1158-1167"
+                    break: true
+              - title: Chunk to the remaining budget
+                source: "vllm/v1/core/sched/scheduler.py:1169"
+                set:
+                  vars.num_new: "= math.least(vars.num_new, vars.token_budget)"
+              - call: kv-cache-manager.allocate-slots
+                input:
+                  request_id: "= vars.wid"
+                  status: "= vars.wreq.status"
+                  num_computed_tokens: "= vars.prior"
+                  num_tokens: "= vars.num_tokens"
+                  num_new_tokens: "= vars.num_new"
+                  num_new_computed_tokens: "= vars.num_hit"
+                  new_computed_blocks: "= vars.hit_blocks"
+                  mamba_hit_block: "= vars.mamba_hit"
+                  num_external_computed_tokens: "= vars.num_ext"
+                  num_lookahead_tokens: "= vars.load_async ? 0 : vars.lookahead"
+                  delay_cache_blocks: "= vars.load_async"
+                  block_hashes: "= vars.wreq.block_hashes"
+                  full_sequence_must_fit: "= config['scheduler-reserve-full-isl']"
+                  has_scheduled_reqs: "= size(state.running) > 0"
+                as: walloc
+              - if: "!vars.walloc.value.allocated"
+                then:
+                  - title: Not enough KV blocks; stop admitting this step
+                    source: "vllm/v1/core/sched/scheduler.py:1275-1282"
+                    break: true
+              - if: "config['kv-connector'] != ''"
+                then:
+                  - title: Tell the connector which blocks hold the external tokens
+                    source: "vllm/v1/core/sched/scheduler.py:1287-1293"
+                    call: kv-connector-base-v1.update-state-after-alloc
+                    input:
+                      request_id: "= vars.wid"
+                      num_prompt_tokens: "= vars.wreq.num_prompt_tokens"
+                      num_external_tokens: "= vars.num_ext"
+                      kv_transfer_params: "= vars.wreq.kv_transfer_params"
+                      block_hashes: "= vars.wreq.block_hashes"
+                      block_ids: ["= vars.walloc.value.block_ids"]
+                    as: upd
+                  - if: "vars.upd.value.kv_transfer_params != null"
+                    then:
+                      - set: {state.requests: "= merge(state.requests, {vars.wid: {'kv_transfer_params': vars.upd.value.kv_transfer_params}})"}
+              - if: "vars.wreq.num_computed_tokens == 0"
+                then:
+                  - title: Record prefix-cache stats at admission
+                    source: "vllm/v1/core/sched/scheduler.py:1314-1318"
+                    call: kv-cache-manager.record-prefix-cache-stats
+                    input: {num_tokens: "= vars.num_tokens", num_hits: "= vars.num_hit", preempted: "= vars.wreq.num_preemptions > 0"}
+              - if: "vars.load_async"
+                then:
+                  - title: Async KV load - wait in WAITING_FOR_REMOTE_KVS holding the blocks
+                    detail: "num_computed_tokens already counts the tokens being loaded; the request stays in the waiting queue and is skipped until the load finishes."
+                    source: "vllm/v1/core/sched/scheduler.py:1320-1341"
+                    set:
+                      state.requests: "= merge(state.requests, {vars.wid: {'status': 'WAITING_FOR_REMOTE_KVS', 'num_computed_tokens': vars.num_hit + vars.num_ext, 'num_cached_tokens': vars.num_hit + vars.num_ext}})"
+                      vars.skipped: "= vars.skipped + [vars.wid]"
+                  - continue: true
+              - title: Move the request to RUNNING
+                detail: "A WAITING request is a new request; a PREEMPTED one is resumed."
+                source: "vllm/v1/core/sched/scheduler.py:1343-1371"
+                set:
+                  state.waiting: "= state.waiting.filter(r, r != vars.wid)"
+                  state.running: "= state.running + [vars.wid]"
+                  vars.sched_new: "= vars.wreq.status == 'WAITING' ? vars.sched_new + [vars.wid] : vars.sched_new"
+                  vars.sched_resumed: "= vars.wreq.status == 'PREEMPTED' ? vars.sched_resumed + [vars.wid] : vars.sched_resumed"
+                  vars.sched: "= merge(vars.sched, {vars.wid: vars.num_new})"
+                  vars.new_blocks: "= merge(vars.new_blocks, {vars.wid: vars.walloc.value.block_ids})"
+                  vars.token_budget: "= vars.token_budget - vars.num_new"
+                  state.requests: "= merge(state.requests, {vars.wid: {'status': 'RUNNING', 'num_computed_tokens': vars.prior + vars.num_hit + vars.num_ext, 'num_cached_tokens': vars.wreq.num_preemptions == 0 && vars.prior == 0 ? vars.num_hit + vars.num_ext : vars.wreq.num_cached_tokens}})"
+              - if: "config['enable-lora'] && has(vars.wreq.lora_request) && vars.wreq.lora_request != null"
+                then:
+                  - title: Count the admitted request's adapter against max_loras
+                    source: "vllm/v1/core/sched/scheduler.py:1360-1361"
+                    set: {vars.loras: "= vars.wreq.lora_request.lora_int_id in vars.loras ? vars.loras : vars.loras + [vars.wreq.lora_request.lora_int_id]"}
+      - title: Build the SchedulerOutput
+        detail: "With the V2 model runner a resumed request is sent as a new request with its full block table; running requests carry only their new block ids."
+        source: "vllm/v1/core/sched/scheduler.py:1404-1446"
+        set:
+          vars.as_new: "= config['use-v2-model-runner'] ? vars.sched_new + vars.sched_resumed : vars.sched_new"
+          vars.as_resumed: "= config['use-v2-model-runner'] ? [] : vars.sched_resumed"
+          vars.total: "= sum(vars.sched.transformList(k, v, v))"
+      - title: NewRequestData carries the prompt and, for the V2 runner, every token to prefill
+        detail: "from_request(req, block_ids, req._all_token_ids): prefill_token_ids is the prompt plus any output a resumed request already has (Request.num_tokens of them). A prompt given as segments has no token ids, so num_prompt_tokens and num_prefill_tokens carry the lengths."
+        source: "vllm/v1/core/sched/output.py:40-81"
+        set:
+          vars.output:
+            scheduled_new_reqs: "= vars.as_new.map(id, merge(config['use-v2-model-runner'] && state.requests[id].prompt_token_ids != null ? {'prefill_token_ids': state.requests[id].prompt_token_ids + state.requests[id].output_token_ids} : {}, {'req_id': id, 'prompt_token_ids': state.requests[id].prompt_token_ids, 'num_prompt_tokens': state.requests[id].num_prompt_tokens, 'prompt_len': state.requests[id].num_prompt_tokens, 'num_prefill_tokens': state.requests[id].num_prompt_tokens + size(state.requests[id].output_token_ids), 'prompt_segments': state.requests[id].prompt_token_ids == null ? state.requests[id].prompt_segments : dyn(null), 'block_ids': vars.new_blocks[id], 'num_computed_tokens': state.requests[id].num_computed_tokens, 'sampling_params': state.requests[id].sampling_params, 'lora_request': has(state.requests[id].lora_request) ? state.requests[id].lora_request : dyn(null)}))"
+            scheduled_cached_reqs:
+              req_ids: "= vars.sched_running + vars.as_resumed"
+              resumed_req_ids: "= vars.as_resumed"
+              new_block_ids: "= (vars.sched_running + vars.as_resumed).map(id, vars.new_blocks[id])"
+              num_computed_tokens: "= (vars.sched_running + vars.as_resumed).map(id, state.requests[id].num_computed_tokens)"
+              num_output_tokens: "= (vars.sched_running + vars.as_resumed).map(id, size(state.requests[id].output_token_ids) + state.requests[id].num_output_placeholders)"
+            num_scheduled_tokens: "= vars.sched"
+            total_num_scheduled_tokens: "= vars.total"
+            finished_req_ids: "= state.finished_req_ids"
+            preempted_req_ids: "= state.preempted_req_ids"
+            scheduled_spec_decode_tokens: "= vars.spec"
+            num_spec_tokens_to_schedule: "= vars.k"
+      - if: "config['kv-connector'] != ''"
+        then:
+          - title: Build this step's KV connector metadata and attach it to the SchedulerOutput
+            source: "vllm/v1/core/sched/scheduler.py:1523-1530"
+            call: kv-connector-base-v1.build-connector-meta
+            input:
+              scheduled_new_reqs: "= vars.output.scheduled_new_reqs.map(r, {'req_id': r.req_id, 'block_ids': r.block_ids})"
+            as: kvmeta
+          - set: {vars.output: "= merge(vars.output, {'kv_connector_metadata': vars.kvmeta.value})"}
+      - title: "Async: a scheduled structured-output request past its prefill whose earlier tokens are still in flight (placeholders) has a grammar that lags; the engine must defer this step's sampling"
+        source: "vllm/v1/core/sched/async_scheduler.py:31-38"
+        set:
+          vars.output: "= merge(vars.output, {'pending_structured_output_tokens': vars.async_sched && vars.sched.exists(sid, has(state.requests[sid].grammar_id) && state.requests[sid].grammar_id != null && state.requests[sid].num_output_placeholders > 0 && state.requests[sid].num_computed_tokens + vars.sched[sid] >= state.requests[sid].num_prompt_tokens + size(state.requests[sid].output_token_ids) + state.requests[sid].num_output_placeholders)})"
+      - title: Advance num_computed_tokens after scheduling
+        detail: "So a chunked prefill can be scheduled again next step; async scheduling also adds one output placeholder per decoding request."
+        source: "vllm/v1/core/sched/scheduler.py:1616-1648"
+        foreach: "= vars.sched"
+        as: n
+        index: sid
+        max: 1000
+        steps:
+          - set:
+              vars.r: "= state.requests[vars.sid]"
+          - set:
+              vars.computed: "= vars.r.num_computed_tokens + vars.n"
+          - set:
+              vars.is_chunk: "= vars.computed < vars.r.num_prompt_tokens + size(vars.r.output_token_ids) + vars.r.num_output_placeholders"
+          - set:
+              vars.n_spec_sched: "= vars.sid in vars.spec ? size(vars.spec[vars.sid]) : 0"
+          - title: Async - placeholders for the sampled and draft tokens, and -1 draft slots for the next step
+            source: "vllm/v1/core/sched/async_scheduler.py:25-57"
+            set:
+              state.requests: "= merge(state.requests, {vars.sid: {'num_computed_tokens': vars.computed, 'is_prefill_chunk': vars.is_chunk, 'num_output_placeholders': vars.async_sched && !vars.is_chunk ? vars.r.num_output_placeholders + 1 + vars.n_spec_sched : vars.r.num_output_placeholders, 'spec_token_ids': vars.async_sched && !vars.is_chunk && vars.k > 0 ? lists.range(vars.k).map(i, -1) : vars.r.spec_token_ids}})"
+      - title: Clear finished and preempted ids (they went out in this output)
+        source: "vllm/v1/core/sched/scheduler.py:1644-1648"
+        set:
+          state.finished_req_ids: []
+          state.preempted_req_ids: []
+      - return: "= vars.output"
+
+  # ----------------------------------------------------------- update_from_output
+  - component: scheduler
+    name: update-from-output
+    kind: function
+    latency_ms: 0
+    summary: "Apply a step's ModelRunnerOutput: append sampled tokens, check stops, free finished requests, and build EngineCoreOutputs."
+    description: "Owned by scheduler-kv by override: the scheduler owns request state transitions after each step."
+    sources: ["vllm/v1/core/sched/scheduler.py:2026-2424", "vllm/v1/outputs.py:266-350", "vllm/v1/request.py:272-283", "vllm/v1/request.py:370-397"]
+    request:
+      type: object
+      required: [scheduler_output, model_runner_output]
+      properties:
+        scheduler_output: SchedulerOutput
+        model_runner_output:
+          allOf:
+            - $ref: ModelRunnerOutput
+            - type: object
+              properties:
+                kv_connector_output:
+                  type: [object, "null"]
+                  description: "KVConnectorOutput aggregated from the workers (vllm/v1/outputs.py)."
+                  properties:
+                    finished_sending: {type: array, items: {type: string}}
+                    finished_recving: {type: array, items: {type: string}}
+                    finished_store_events: {type: array, items: {type: integer}}
+    response: SchedKvEngineCoreOutputs
+    behavior:
+      - set:
+          vars.outputs: []
+          vars.mro: "= input.model_runner_output"
+          vars.async_sched: "= config['async-scheduling'] == true"
+          vars.spec_stats: null
+      - title: Walk the requests scheduled in that step
+        source: "vllm/v1/core/sched/scheduler.py:2075-2077"
+        foreach: "= input.scheduler_output.num_scheduled_tokens"
+        as: n_sched
+        index: rid
+        max: 1000
+        steps:
+          - if: "!(vars.rid in state.requests) || state.requests[vars.rid].status.startsWith('FINISHED')"
+            then:
+              - title: Finished or aborted while the model ran; skip
+                source: "vllm/v1/core/sched/scheduler.py:2091-2098"
+                continue: true
+          - set:
+              vars.gen0: "= has(vars.mro.req_ids) && vars.rid in vars.mro.req_ids ? vars.mro.sampled_token_ids[lists.range(size(vars.mro.req_ids)).filter(i, vars.mro.req_ids[i] == vars.rid)[0]] : []"
+              vars.drafts: "= has(input.scheduler_output.scheduled_spec_decode_tokens) && vars.rid in input.scheduler_output.scheduled_spec_decode_tokens ? input.scheduler_output.scheduled_spec_decode_tokens[vars.rid] : []"
+          - if: "size(vars.drafts) > 0 && size(vars.gen0) > 0"
+            then:
+              - title: Roll back the rejected draft tokens
+                detail: "accepted = sampled - 1 (the bonus/resampled token); num_computed_tokens and the output placeholders drop by the rejected count."
+                source: "vllm/v1/core/sched/scheduler.py:2110-2128"
+                set:
+                  vars.rejected: "= size(vars.drafts) - math.greatest(size(vars.gen0) - 1, 0)"
+              - set:
+                  state.requests: "= merge(state.requests, {vars.rid: {'num_computed_tokens': state.requests[vars.rid].num_computed_tokens > 0 ? state.requests[vars.rid].num_computed_tokens - vars.rejected : 0, 'num_output_placeholders': state.requests[vars.rid].num_output_placeholders > 0 ? state.requests[vars.rid].num_output_placeholders - vars.rejected : 0}})"
+              - title: Observe the draft in this step's SpecDecodingStats (only when stats are logged)
+                detail: "make_spec_decoding_stats starts SpecDecodingStats.new(num_spec_tokens) on the first draft of the step and observe_draft adds one draft, its draft tokens, its accepted tokens and the per-position counts."
+                source: "vllm/v1/core/sched/scheduler.py:2129-2135"
+                call: scheduler.make-spec-decoding-stats
+                input:
+                  spec_decoding_stats: "= vars.spec_stats"
+                  num_draft_tokens: "= size(vars.drafts)"
+                  num_accepted_tokens: "= size(vars.drafts) - vars.rejected"
+                as: sds
+              - set: {vars.spec_stats: "= vars.sds.value"}
+          - set:
+              vars.req: "= state.requests[vars.rid]"
+              vars.gen: "= has(vars.mro.req_ids) && vars.rid in vars.mro.req_ids ? vars.mro.sampled_token_ids[lists.range(size(vars.mro.req_ids)).filter(i, vars.mro.req_ids[i] == vars.rid)[0]] : []"
+              vars.stopped: false
+              vars.status: "= state.requests[vars.rid].status"
+              vars.stop_reason: null
+              vars.kept: []
+          - if: "size(vars.gen) > 0"
+            then:
+              - title: Append tokens and check for stop
+                detail: "Tokens after a stop are trimmed."
+                source: "vllm/v1/core/sched/scheduler.py:2493-2510"
+                foreach: "= vars.gen"
+                as: tok
+                steps:
+                  - set:
+                      vars.kept: "= vars.kept + [vars.tok]"
+                  - call: sched-utils.check-stop
+                    input:
+                      last_token_id: "= vars.tok"
+                      num_tokens: "= vars.req.num_prompt_tokens + size(vars.req.output_token_ids) + size(vars.kept)"
+                      num_output_tokens: "= size(vars.req.output_token_ids) + size(vars.kept)"
+                      max_tokens: "= vars.req.max_tokens"
+                      min_tokens: "= vars.req.min_tokens"
+                      eos_token_id: "= vars.req.eos_token_id"
+                      stop_token_ids: "= vars.req.stop_token_ids"
+                    as: chk
+                  - if: "vars.chk.value.stopped"
+                    then:
+                      - set: {vars.stopped: true, vars.status: "= vars.chk.value.status", vars.stop_reason: "= vars.chk.value.stop_reason"}
+                      - break: true
+              - set:
+                  state.requests: "= merge(state.requests, {vars.rid: {'output_token_ids': vars.req.output_token_ids + vars.kept, 'status': vars.status, 'num_output_placeholders': vars.async_sched ? math.greatest(vars.req.num_output_placeholders - size(vars.kept), 0) : vars.req.num_output_placeholders}})"
+              - if: "vars.req.grammar_id != null"
+                then:
+                  - title: Advance the request's grammar
+                    source: "vllm/v1/core/sched/scheduler.py:2186-2197"
+                    call: structured-output-manager.accept-tokens
+                    input: {request_id: "= vars.rid", grammar_id: "= vars.req.grammar_id", new_token_ids: "= vars.kept"}
+                    as: acc
+                  - if: "!vars.acc.value.accepted"
+                    then:
+                      - title: Grammar rejected the tokens; terminate the request
+                        source: "vllm/v1/core/sched/scheduler.py:2186-2197"
+                        set: {vars.stopped: true, vars.status: FINISHED_ERROR}
+              - set:
+                  vars.req2: "= state.requests[vars.rid]"
+              - if: "(config['enable-prefix-caching'] || config['kv-connector'] != '') && (vars.req2.num_prompt_tokens + size(vars.req2.output_token_ids)) / int(config['block-size']) > size(vars.req2.block_hashes)"
+                then:
+                  - title: Hash newly full blocks
+                    detail: "Request.append_output_token_ids runs the block hasher as tokens are appended."
+                    source: "vllm/v1/core/kv_cache_utils.py:954-960"
+                    call: kv-cache-utils.request-block-hasher
+                    input: {prompt_segments: "= vars.req2.prompt_segments", output_token_ids: "= vars.req2.output_token_ids", num_existing_hashes: "= size(vars.req2.block_hashes)", lora_request: "= has(vars.req2.lora_request) ? vars.req2.lora_request : dyn(null)", cache_salt: "= has(vars.req2.cache_salt) ? vars.req2.cache_salt : dyn(null)"}
+                    as: nh
+                  - set:
+                      state.requests: "= merge(state.requests, {vars.rid: {'block_hashes': vars.req2.block_hashes + vars.nh.value.new_block_hashes}})"
+              - if: "vars.async_sched && vars.req.status == 'RUNNING'"
+                then:
+                  - title: Async - cache the blocks the new tokens completed (a no-op with caching off)
+                    source: "vllm/v1/core/sched/async_scheduler.py:73-77"
+                    call: kv-cache-manager.cache-blocks
+                    input:
+                      request_id: "= vars.rid"
+                      num_tokens: "= state.requests[vars.rid].num_computed_tokens - state.requests[vars.rid].num_output_placeholders"
+                      block_hashes: "= state.requests[vars.rid].block_hashes"
+          - set:
+              vars.finish_reason: "= !vars.stopped ? dyn(null) : dyn(vars.status == 'FINISHED_STOPPED' ? 'stop' : (vars.status == 'FINISHED_LENGTH_CAPPED' ? 'length' : (vars.status == 'FINISHED_ABORTED' ? 'abort' : 'error')))"
+          - if: "vars.stopped"
+            then:
+              - title: Stopped - remove from running and free the request
+                source: "vllm/v1/core/sched/scheduler.py:2223-2244"
+                set:
+                  state.running: "= state.running.filter(r, r != vars.rid)"
+                  state.waiting: "= state.waiting.filter(r, r != vars.rid)"
+                  state.requests: "= merge(state.requests, {vars.rid: {'status': vars.status}})"
+              - call: scheduler.free-request
+                input: {request_id: "= vars.rid"}
+                as: freed
+          - set:
+              vars.ktp: "= vars.stopped && has(vars.freed) && has(vars.freed.value) && vars.freed.value != null ? vars.freed.value.kv_transfer_params : dyn(null)"
+          - if: "size(vars.kept) > 0 || vars.stopped"
+            then:
+              - title: Emit an EngineCoreOutput
+                detail: "Partial prefill chunks sample nothing and emit nothing."
+                source: "vllm/v1/core/sched/scheduler.py:2261-2290"
+                set:
+                  vars.outputs: "= vars.outputs + [{'request_id': vars.rid, 'new_token_ids': vars.kept, 'finish_reason': vars.finish_reason, 'stop_reason': vars.stop_reason, 'num_cached_tokens': vars.req.num_cached_tokens, 'client_index': vars.req.client_index, 'kv_transfer_params': vars.ktp}]"
+      - if: "size(state.grammar_compile_error_reqs) > 0"
+        then:
+          - title: Requests whose grammar failed to compile finish with an error
+            source: "vllm/v1/core/sched/scheduler.py:2302-2326"
+            set:
+              vars.err_ids: "= state.grammar_compile_error_reqs.filter(r, r in state.requests)"
+              state.grammar_compile_error_reqs: []
+          - set:
+              vars.outputs: "= vars.outputs + vars.err_ids.map(r, {'request_id': r, 'new_token_ids': [], 'finish_reason': 'error', 'stop_reason': null, 'num_cached_tokens': state.requests[r].num_cached_tokens, 'client_index': state.requests[r].client_index, 'kv_transfer_params': null})"
+          - call: scheduler.finish-requests
+            input: {request_ids: "= vars.err_ids", finished_status: FINISHED_ERROR}
+      - if: "has(vars.mro.kv_connector_output) && vars.mro.kv_connector_output != null"
+        then:
+          - if: "config['kv-connector'] != ''"
+            then:
+              - title: Hand the workers' KVConnectorOutput to the connector first
+                source: "vllm/v1/core/sched/scheduler.py:3218-3219"
+                call: kv-connector-base-v1.update-connector-output
+                input:
+                  finished_store_events: "= has(vars.mro.kv_connector_output.finished_store_events) ? vars.mro.kv_connector_output.finished_store_events : []"
+                  finished_sending: "= has(vars.mro.kv_connector_output.finished_sending) ? vars.mro.kv_connector_output.finished_sending : []"
+                  finished_recving: "= has(vars.mro.kv_connector_output.finished_recving) ? vars.mro.kv_connector_output.finished_recving : []"
+          - title: KV connector - loads that finished make their requests schedulable next step
+            source: "vllm/v1/core/sched/scheduler.py:3209-3226"
+            set:
+              state.finished_recving_kv_req_ids: "= state.finished_recving_kv_req_ids + (has(vars.mro.kv_connector_output.finished_recving) ? vars.mro.kv_connector_output.finished_recving.filter(r, r in state.requests && state.requests[r].status == 'WAITING_FOR_REMOTE_KVS') : [])"
+          - title: Sends that finished release the blocks a finished request kept
+            source: "vllm/v1/core/sched/scheduler.py:3227-3230"
+            foreach: "= has(vars.mro.kv_connector_output.finished_sending) ? vars.mro.kv_connector_output.finished_sending.filter(r, r in state.requests) : []"
+            as: sent
+            steps:
+              - call: kv-cache-manager.free
+                input: {request_id: "= vars.sent"}
+              - set: {state.requests: "= omit(state.requests, vars.sent)"}
+      - title: Attach this step's SchedulerStats (spec-decoding stats included)
+        source: "vllm/v1/core/sched/scheduler.py:2408-2422"
+        call: scheduler.make-stats
+        input: {spec_decoding_stats: "= vars.spec_stats"}
+        as: stats
+      - return: {outputs: "= vars.outputs", finished_req_ids: "= state.finished_req_ids", scheduler_stats: "= vars.stats.value"}
+
+  - component: scheduler
+    name: has-requests
+    kind: function
+    latency_ms: 0
+    summary: "Whether the engine still has work: unfinished requests (respecting the pause state) or finished ids not yet reported to the workers."
+    sources: ["vllm/v1/core/sched/scheduler.py:2803-2838", "vllm/v1/core/sched/interface.py:179-182"]
+    request: {type: object}
+    response: {type: boolean, examples: [true]}
+    behavior:
+      - title: get_num_unfinished_requests
+        detail: "PAUSED_ALL counts nothing; PAUSED_NEW counts only KV-holding waiting requests (none here); sessions waiting for streaming input don't count."
+        source: "vllm/v1/core/sched/scheduler.py:2803-2811"
+        set:
+          vars.unfinished: "= state.pause_state == 'PAUSED_ALL' ? 0 : size(state.running) + (state.pause_state == 'PAUSED_NEW' ? 0 : size(state.waiting)) - state.num_waiting_for_streaming_input"
+      - if: "vars.unfinished > 0"
+        then: [{return: true}]
+      - title: Finished ids still to be sent, or finished requests a connector is still sending
+        source: "vllm/v1/core/sched/scheduler.py:2813-2821"
+        return: "= size(state.finished_req_ids) > 0 || (config['kv-connector'] != '' && size(state.requests) > size(state.running) + size(state.waiting))"
+
+  - component: scheduler
+    name: pause-state
+    kind: function
+    latency_ms: 0
+    summary: "The scheduler's pause state."
+    sources: ["vllm/v1/core/sched/scheduler.py:2751-2753"]
+    request: {type: object}
+    response: {type: string, enum: [UNPAUSED, PAUSED_NEW, PAUSED_ALL], examples: [UNPAUSED]}
+    behavior:
+      - return: "= state.pause_state"
+
+  - component: scheduler
+    name: set-pause-state
+    kind: function
+    latency_ms: 0
+    summary: "Set the pause state: PAUSED_NEW stops new admissions, PAUSED_ALL stops scheduling entirely, UNPAUSED resumes."
+    sources: ["vllm/v1/core/sched/scheduler.py:2755-2757"]
+    request: {type: object, required: [pause_state], properties: {pause_state: {type: string, enum: [UNPAUSED, PAUSED_NEW, PAUSED_ALL], examples: [PAUSED_NEW]}}}
+    response: {type: object}
+    behavior:
+      - title: Log and store the new state
+        source: "vllm/v1/core/sched/scheduler.py:2755-2757"
+        set: {state.pause_state: "= input.pause_state"}
+      - return: {pause_state: "= input.pause_state"}
+
+  - component: scheduler
+    name: reset-encoder-cache
+    kind: function
+    latency_ms: 0
+    summary: "Reset the multimodal encoder cache so stale embeddings are not reused after a weight update."
+    sources: ["vllm/v1/core/sched/scheduler.py:2907-2913"]
+    request: {type: object}
+    response: {type: object}
+    behavior:
+      - title: encoder_cache_manager.reset()
+        source: "vllm/v1/core/sched/scheduler.py:2913"
+        call: encoder-cache-manager.reset
+        as: r
+      - return: {reset: true, num_free_slots: "= vars.r.value.num_free_slots"}
+
+  - component: scheduler
+    name: shutdown
+    kind: function
+    latency_ms: 0
+    summary: "Shut down the KV event publisher and connectors (none in the default deployment)."
+    sources: ["vllm/v1/core/sched/scheduler.py:2980-2993"]
+    request: {type: object}
+    response: {type: object}
+    behavior:
+      - return: {shutdown: true}
+
+  - component: scheduler
+    name: update-draft-token-ids
+    kind: function
+    latency_ms: 0
+    summary: "Sync speculative decoding: store the drafter's new draft tokens on each decoding request (ignored for finished requests and prefill chunks)."
+    sources: ["vllm/v1/core/sched/scheduler.py:2550-2569"]
+    request:
+      type: object
+      required: [req_ids, draft_token_ids]
+      properties:
+        req_ids: {type: array, items: {type: string}}
+        draft_token_ids: {type: array, items: {type: array, items: {type: integer}}}
+    response: {type: object, properties: {updated: {type: array, items: {type: string}}}}
+    behavior:
+      - set: {vars.updated: []}
+      - foreach: "= lists.range(size(input.req_ids))"
+        as: i
+        steps:
+          - set: {vars.rid: "= input.req_ids[vars.i]"}
+          - if: "!(vars.rid in state.requests) || state.requests[vars.rid].status.startsWith('FINISHED')"
+            then:
+              - title: Finished meanwhile; skip
+                source: "vllm/v1/core/sched/scheduler.py:2555-2558"
+                continue: true
+          - if: "state.requests[vars.rid].is_prefill_chunk"
+            then:
+              - title: Prefill chunk - drafts are ignored
+                source: "vllm/v1/core/sched/scheduler.py:2560-2564"
+                set: {state.requests: "= merge(state.requests, {vars.rid: {'spec_token_ids': []}})"}
+              - continue: true
+          - set:
+              state.requests: "= merge(state.requests, {vars.rid: {'spec_token_ids': input.draft_token_ids[vars.i]}})"
+              vars.updated: "= vars.updated + [vars.rid]"
+      - return: {updated: "= vars.updated"}
+
+  - component: scheduler
+    name: make-spec-decoding-stats
+    kind: function
+    latency_ms: 0
+    summary: "Fold one request's verified draft into the step's SpecDecodingStats: none when stats are off or nothing was drafted; grammar-invalidated drafts are not counted."
+    sources: ["vllm/v1/core/sched/scheduler.py:2961-2978", "vllm/v1/spec_decode/metrics.py:18-49"]
+    errors: [{code: assertion-error, status: 0, retryable: false}]
+    request:
+      type: object
+      required: [num_draft_tokens, num_accepted_tokens]
+      properties:
+        spec_decoding_stats: {type: [object, "null"], default: null}
+        num_draft_tokens: {type: integer, examples: [3]}
+        num_accepted_tokens: {type: integer, examples: [1]}
+        num_invalid_spec_tokens: {type: integer, default: 0}
+    response: {type: [object, "null"], properties: {num_spec_tokens: {type: integer}, num_drafts: {type: integer}, num_draft_tokens: {type: integer}, num_accepted_tokens: {type: integer}, num_accepted_tokens_per_pos: {type: array, items: {type: integer}}, num_draft_tokens_per_pos: {type: array, items: {type: integer}}}}
+    behavior:
+      - if: "config['disable-log-stats'] || input.num_draft_tokens == 0"
+        then:
+          - title: Stats off or no draft - nothing to record
+            source: "vllm/v1/core/sched/scheduler.py:2969-2970"
+            return: null
+      - set:
+          vars.k: "= int(config['num-speculative-tokens'])"
+          vars.s: "= has(input.spec_decoding_stats) ? input.spec_decoding_stats : null"
+          vars.nd: "= input.num_draft_tokens - (has(input.num_invalid_spec_tokens) ? input.num_invalid_spec_tokens : 0)"
+      - title: "spec_decoding_stats.observe_draft(num_draft_tokens, num_accepted_tokens): SpecDecodingStats is worker-runner's (spec_decode/metrics.py); it asserts accepted <= num_spec_tokens"
+        source: "vllm/v1/core/sched/scheduler.py:2975-2977"
+        call: spec-decoding-stats.observe-draft
+        input:
+          stats: "= vars.s"
+          num_spec_tokens: "= vars.k"
+          num_draft_tokens: "= vars.nd"
+          num_accepted_tokens: "= input.num_accepted_tokens"
+        as: od
+        on_error:
+          - fail: "= error"
+      - return: "= vars.od.value"
+
+  - component: scheduler
+    name: get-grammar-bitmask
+    kind: function
+    latency_ms: 0
+    summary: "The GrammarOutput for a step: the scheduled structured-output requests past their prefill (in scheduling order), their grammars and how many drafts each may accept; null when none."
+    description: "The bitmask rows themselves are the grammars' next-token masks; xgrammar-grammar.fill-bitmask reports them for the candidate tokens a sampler asks about."
+    sources: ["vllm/v1/core/sched/scheduler.py:1995-2024"]
+    request: {type: object, required: [scheduler_output], properties: {scheduler_output: SchedulerOutput}}
+    response: {type: [object, "null"], properties: {structured_output_request_ids: {type: array, items: {type: string}}, grammar_ids: {type: array, items: {type: string}}, num_acceptable_drafts: {type: array, items: {type: integer}}}}
+    behavior:
+      - title: Scheduled requests that use structured output and are not mid-prefill
+        source: "vllm/v1/core/sched/scheduler.py:2003-2008"
+        set:
+          vars.ids: "= input.scheduler_output.num_scheduled_tokens.transformList(k, v, k).filter(id, id in state.requests && has(state.requests[id].grammar_id) && state.requests[id].grammar_id != null && !state.requests[id].is_prefill_chunk)"
+      - if: "size(vars.ids) == 0"
+        then:
+          - title: No structured-output request to mask this step
+            source: "vllm/v1/core/sched/scheduler.py:2000-2001"
+            return: null
+      - set:
+          vars.spec: "= has(input.scheduler_output.scheduled_spec_decode_tokens) && input.scheduler_output.scheduled_spec_decode_tokens != null ? input.scheduler_output.scheduled_spec_decode_tokens : {}"
+      - title: GrammarOutput(request ids, bitmask, acceptable drafts per request)
+        source: "vllm/v1/core/sched/scheduler.py:2012-2024"
+        return:
+          structured_output_request_ids: "= vars.ids"
+          grammar_ids: "= vars.ids.map(id, state.requests[id].grammar_id)"
+          num_acceptable_drafts: "= vars.ids.map(id, id in vars.spec ? size(vars.spec[id].filter(t, t != -1)) : 0)"

@@ -1,0 +1,103 @@
+schema_version: 1
+id: vscode
+# T2 verified (enablePersistentSessions true, persistentSessionReviveProcess onExit):
+# - onBeforeShutdown(RELOAD): _shouldReviveProcesses is false for RELOAD with 'onExit', so
+#   persistTerminalState is NOT called; confirmOnExit is skipped because processes persist
+#   (terminalService.ts:640-670, 677-691).
+# - onWillShutdown(RELOAD): every shouldPersist instance -> detachProcessAndDispose(Shutdown)
+#   (terminalService.ts:702-719; terminalInstance.ts:1391-1396) -> PtyService.detachFromProcess ->
+#   PersistentTerminalProcess.detach: kept (disconnect runner, graceTime 60 s) only if the
+#   terminal had interaction (input / API title / user icon) or was replayed; else shutdown(true)
+#   (ptyService.ts:844-851, 896-901, 810-816).
+# - After the reload: initializePrimaryBackend -> getTerminalLayoutInfo (orphan question) ->
+#   attachToProcess cancels both runners (ptyService.ts:836-842) -> start() on an already-started
+#   process fires ready and triggerReplay -> onProcessReplay restores the buffer
+#   (ptyService.ts:868-895, 957-972). The shell is never killed.
+scenarios:
+  - id: bench-t2-reload-single-run
+    name: "T2 in one run: create, type, reload (before/will shutdown), reconnect"
+    fixtures: [full-window]
+    state:
+      terminal-service@w1: {layout_listeners_attached: true}
+    steps:
+      - {flow: terminal-create, as: c}
+      - interface: local-pty.input
+        caller: terminal-process-manager
+        input: {id: 1, data: "ls\r"}
+        as: i
+      - {flow: terminal-before-shutdown, input: {reason: reload}, as: b}
+      - {flow: terminal-will-shutdown, input: {reason: reload}, as: w}
+      # round 2: the reloaded window comes back a few seconds after the detach (26 s), well inside
+      # the 60 s grace runner (ptyService.ts:810-816); without at_ms the step waits for that timer.
+      - {flow: terminal-reconnect, input: {startup_kind: reloaded-window}, at_ms: 30000, as: r}
+    expect:
+      - "steps.w.result.value.detached == 1"
+      - "calls['local-terminal-backend.persist-terminal-state'] == 0"
+      # verified outcome: the window reattaches to the same process within the grace time
+      - "steps.r.result.ok && steps.r.result.value.reconnected == 1"
+      - "calls['terminal-process.shutdown'] == 0"
+
+  - id: bench-t2-reload-detach
+    name: "T2 part 1: reload detaches the interacted-with persistent pty; its buffer is not persisted to storage; the grace runner is armed"
+    fixtures: [full-window]
+    state:
+      terminal-service@w1: {layout_listeners_attached: true}
+    steps:
+      - {flow: terminal-create, as: c}
+      - interface: local-pty.input
+        caller: terminal-process-manager
+        input: {id: 1, data: "ls\r"}
+        as: i
+      - {flow: terminal-before-shutdown, input: {reason: reload}, as: b}
+      - {flow: terminal-will-shutdown, input: {reason: reload}, as: w}
+    expect:
+      - "steps.b.result.ok && steps.w.result.value.detached == 1 && steps.w.result.value.disposed == 0"
+      - "calls['local-terminal-backend.persist-terminal-state'] == 0"
+      - "trace.exists(e, e.type == 'call.end' && e.interface == 'pty-service.detach-from-process' && e.output.kept == true)"
+      - "trace.exists(e, e.type == 'emit' && e.interface == 'pty-service.disconnect-runner-expired')"
+      # the layout the reloaded window reads back was saved by the debounced _saveState
+      - "state['pty-service'].layouts['w1-app'].tabs.size() == 1"
+      # the shell is only killed when the 60 s grace runner fires (it does, because nothing reconnects in this run)
+      - >-
+        trace.filter(e, e.type == 'call.start' && e.interface == 'terminal-process.shutdown').all(e,
+          e.t >= trace.filter(x, x.type == 'call.start' && x.interface == 'pty-service.detach-from-process')[0].t + 60000)
+
+  - id: bench-t2-reattach
+    name: "T2 part 2: the reloaded window reattaches to the still-running pty (seeded as part 1 leaves it, before the grace time ends)"
+    flow: terminal-reconnect
+    input: {startup_kind: reloaded-window}
+    fixtures: [full-window]
+    state:
+      pty-host-service: {started: true, responsive: true}
+      pty-service:
+        last_pty_id: 1
+        layouts:
+          w1-app: {background: [], tabs: [[1]]}
+        ptys:
+          '1': {id: 1, cwd: "file:///work/app", executable: /bin/bash, workspace_id: w1-app, should_persist: true,
+                started: true, interaction: Session, was_revived: false, pid: 4242, grace_scheduled_at: 0, type: ''}
+    expect:
+      - "result.ok && result.value.reconnected == 1"
+      - "calls['pty-service.attach-to-process'] == 1 && calls['pty-service.create-process'] == 0"
+      - "calls['terminal-process.start'] == 0 && calls['terminal-process.shutdown'] == 0"
+      - "calls['pty-host-main.start-pty-host'] == 0"
+      - "state['pty-service'].ptys['1'].pid == 4242 && state['pty-service'].ptys['1'].grace_scheduled_at == null"
+      - "state['terminal-service@w1'].instances['1'].persistent_process_id == 1"
+      - "trace.exists(e, e.type == 'note' && e.title.contains('replay'))"
+
+  - id: bench-t2-gap-replay-data
+    name: "T2 gap: the buffer replay reaches the renderer (onProcessReplay -> LocalPty.handleReplay)"
+    flow: terminal-reconnect
+    input: {startup_kind: reloaded-window}
+    fixtures: [full-window]
+    state:
+      pty-host-service: {started: true, responsive: true}
+      pty-service:
+        last_pty_id: 1
+        layouts:
+          w1-app: {background: [], tabs: [[1]]}
+        ptys:
+          '1': {id: 1, cwd: "file:///work/app", executable: /bin/bash, workspace_id: w1-app, should_persist: true,
+                started: true, interaction: Session, was_revived: false, pid: 4242, grace_scheduled_at: 0, type: ''}
+    expect:
+      - "trace.exists(e, e.type == 'call.start' && e.interface.matches('(?i)replay'))"

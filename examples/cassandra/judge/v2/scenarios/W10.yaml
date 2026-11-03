@@ -1,0 +1,36 @@
+schema_version: 1
+id: cassandra
+scenarios:
+  - id: bench-w10
+    flow: daemon-startup
+    name: "W10: startup replays the unflushed commit log entries into the memtables, flushes and deletes the files, before initServer and before the native transport starts"
+    fixtures: [one-node]
+    state:
+      commit-log@n1:
+        segments_on_disk:
+          CommitLog-8-1.log:
+            id: 1
+            name: CommitLog-8-1.log
+            entries:
+              - already_persisted: true
+                mutation: {keyspace: shop, table: users, partition_key: "user:42", token: 4242, timestamp: 1793318300000000, columns: {name: alice}}
+              - mutation: {keyspace: shop, table: users, partition_key: "user:43", token: 4343, timestamp: 1793318300000001, columns: {name: bob}}
+              - mutation: {keyspace: shop, table: orders, partition_key: "order:9", token: 4444, timestamp: 1793318300000002, columns: {total: 9}}
+    expect:
+      - "result.ok"
+      - "calls['commit-log.recover-segments-on-disk'] == 1 && calls['commit-log-replayer.block-for-writes'] == 1"
+      # only the two unflushed entries are re-applied, without the commit log
+      - "trace.filter(e, e.type == 'call.start' && e.interface == 'keyspace.apply').size() == 2"
+      - "trace.filter(e, e.type == 'call.start' && e.interface == 'keyspace.apply').all(e, e.input.mutation.partition_key != 'user:42')"
+      - "calls['commit-log.add'] == 0"
+      # round 3 (adapted path, same claim): the replayed row went through the memtable and the replay's
+      # blockForWrites flush (CommitLogReplayer.java:244-270) moved it into an sstable (memtable discarded,
+      # ColumnFamilyStore.java:1391-1404), so it is read from the Tracker View, not the memtable
+      - "trace.exists(e, e.type == 'call.start' && e.interface == 'keyspace.apply' && e.input.mutation.partition_key == 'user:43')"
+      - "state['tracker@n1'].views['shop.users'].sstables.exists(s, has(s.partitions) && 'user:43' in s.partitions && s.partitions['user:43'].cells.exists(c, c.column == 'name' && c.value == 'bob'))"
+      - "!('shop.users:user:43:name' in state['skip-list-memtable@n1'].cells)"
+      # flushed and the replayed file deleted
+      - "calls['keyspace.flush'] >= 1 && !('CommitLog-8-1.log' in state['commit-log@n1'].segments_on_disk)"
+      # ordering: replay finishes before initServer and before the native transport starts
+      - "trace.filter(e, e.type == 'call.end' && e.interface == 'commit-log.recover-segments-on-disk')[0].seq < trace.filter(e, e.type == 'call.start' && e.interface == 'storage-service.init-server')[0].seq"
+      - "trace.filter(e, e.type == 'call.end' && e.interface == 'commit-log.recover-segments-on-disk')[0].seq < trace.filter(e, e.type == 'call.start' && e.interface == 'native-transport-service.start')[0].seq"

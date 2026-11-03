@@ -1,0 +1,2280 @@
+# distributed area, part 1: parallel state, tensor-parallel collectives, the custom all-reduce.
+# Merged into fragments/distributed.yaml by gen/distributed/build.py.
+schema_version: 1
+id: vllm
+
+configs:
+  - id: tensor-parallel-size
+    type: integer
+    value: 1
+    default: 1
+    summary: "tensor_parallel_size: GPUs per tensor-parallel group; the TP group is rank0..rank{n-1} (deployed = default in tp1 fixtures; tp4-llama-70b deploys 4)"
+    sources: ["vllm/config/parallel.py:141", "vllm/engine/arg_utils.py:530"]
+    attributes: {key: tensor_parallel_size}
+  - id: vllm-allreduce-use-flashinfer
+    type: boolean
+    value: true
+    default: true
+    summary: "VLLM_ALLREDUCE_USE_FLASHINFER (env, default 1): the TP CudaCommunicator builds a FlashInferAllReduce and tries it first"
+    sources: ["vllm/envs.py:1970-1972", "vllm/distributed/device_communicators/cuda_communicator.py:69-71"]
+    attributes: {key: VLLM_ALLREDUCE_USE_FLASHINFER}
+  - id: vllm-allreduce-use-symm-mem
+    type: boolean
+    value: true
+    default: true
+    summary: "VLLM_ALLREDUCE_USE_SYMM_MEM (env, default 1): the TP CudaCommunicator builds a torch SymmMemCommunicator"
+    sources: ["vllm/envs.py:1966-1968", "vllm/distributed/device_communicators/cuda_communicator.py:67"]
+    attributes: {key: VLLM_ALLREDUCE_USE_SYMM_MEM}
+  - id: vllm-use-nccl-symm-mem
+    type: boolean
+    value: false
+    default: false
+    summary: "VLLM_USE_NCCL_SYMM_MEM (env, default 0): enables the NCCL symmetric-memory all-reduce op"
+    sources: ["vllm/envs.py:2099-2101", "vllm/distributed/device_communicators/pynccl_allocator.py:49-51"]
+    attributes: {key: VLLM_USE_NCCL_SYMM_MEM}
+  - id: vllm-custom-allreduce-algo
+    type: string
+    value: ""
+    default: ""
+    summary: "VLLM_CUSTOM_ALLREDUCE_ALGO (read by getenv in C++): 1stage|oneshot|2stage|twoshot forces the kernel; empty picks by size"
+    sources: ["csrc/custom_all_reduce.cuh:271-286"]
+    attributes: {key: VLLM_CUSTOM_ALLREDUCE_ALGO}
+  - id: vllm-skip-p2p-check
+    type: boolean
+    value: true
+    default: true
+    summary: "VLLM_SKIP_P2P_CHECK: the env lambda defaults to '1' (true) although the typed stub says False; true trusts the driver's P2P report instead of the subprocess probe"
+    sources: ["vllm/envs.py:1216", "vllm/envs.py:129"]
+    attributes: {key: VLLM_SKIP_P2P_CHECK}
+  - id: distributed-timeout-seconds
+    type: integer
+    value: null
+    default: null
+    summary: "distributed_timeout_seconds: process-group timeout; None means torch's default_pg_timeout (600 s for NCCL), which bounds how long ranks wait in a collective (reference; the worker passes it to init_distributed_environment)"
+    sources: ["vllm/config/parallel.py:360-364", "vllm/distributed/parallel_state.py:1879-1895"]
+    attributes: {key: distributed_timeout_seconds, boundary: true, owner: worker-runner}
+  # Latency coefficients. The code gives no numbers; these are labeled assumptions for an
+  # H100-class NVLink node (see notes/distributed.md, "Config").
+  - {id: dist-nvlink-bus-gbps, type: number, value: 300, default: 300, summary: "ASSUMPTION: effective intra-node NVLink bus bandwidth in GB/s used by collective latency expressions", sources: ["vllm/distributed/device_communicators/all_reduce_utils.py:31-37"], attributes: {assumption: true}}
+  - {id: dist-custom-ar-base-us, type: number, value: 6, default: 6, summary: "ASSUMPTION: fixed launch+barrier cost of a custom all-reduce kernel, microseconds", sources: ["csrc/custom_all_reduce.cuh:288-308"], attributes: {assumption: true}}
+  - {id: dist-flashinfer-ar-base-us, type: number, value: 5, default: 5, summary: "ASSUMPTION: fixed cost of a FlashInfer one-shot all-reduce, microseconds", sources: ["vllm/distributed/device_communicators/flashinfer_all_reduce.py:522"], attributes: {assumption: true}}
+  - {id: dist-symm-mem-base-us, type: number, value: 8, default: 8, summary: "ASSUMPTION: fixed cost of a torch symmetric-memory all-reduce, microseconds", sources: ["vllm/distributed/device_communicators/symm_mem.py:127"], attributes: {assumption: true}}
+  - {id: dist-nccl-base-us, type: number, value: 15, default: 15, summary: "ASSUMPTION: fixed cost of an NCCL ring collective, microseconds", sources: ["vllm/distributed/device_communicators/pynccl.py:268"], attributes: {assumption: true}}
+
+schemas:
+  - id: DistCollectiveRequest
+    summary: "A tensor handed to a collective, described by its shape: num_tokens x hidden_size of dtype. num_collectives lets a caller stand for several identical collectives (for example 2 per decoder layer) so millisecond rounding does not inflate the step."
+    schema:
+      type: object
+      required: [num_tokens]
+      properties:
+        num_tokens: {type: integer, minimum: 1, examples: [128]}
+        hidden_size: {type: integer, default: 4096}
+        dtype: {type: string, enum: [bfloat16, float16, float32, int32], default: bfloat16}
+        dim: {type: integer, default: -1}
+        num_collectives: {type: integer, minimum: 1, default: 1}
+        layer: {type: integer, default: 0}
+  - id: DistCollectiveResult
+    schema:
+      type: object
+      properties:
+        backend: {type: string, examples: [custom-allreduce]}
+        algorithm: {type: string}
+        bytes: {type: integer}
+        world_size: {type: integer}
+        num_tokens: {type: integer}
+        hidden_size: {type: integer}
+  - id: DistTpGroup
+    schema:
+      type: object
+      properties:
+        world_size: {type: integer, examples: [1]}
+        ranks: {type: array, items: {type: string}, examples: [[rank0]]}
+        rank_in_group: {type: integer, examples: [0]}
+        unique_name: {type: string, examples: ["tp:0"]}
+  - id: DistKernelLaunch
+    summary: "What a collective kernel needs for its latency: the bytes this rank contributes, the group size, and how many identical launches the call stands for."
+    schema:
+      type: object
+      required: [bytes, world_size]
+      properties:
+        bytes: {type: integer, examples: [1048576]}
+        world_size: {type: integer, examples: [4]}
+        num_collectives: {type: integer, default: 1}
+        algorithm: {type: string}
+
+components:
+  - id: parallel-state
+    name: parallel_state (module)
+    kind: module
+    layer: distributed
+    parent: gpu-worker
+    summary: "Module-level process-group registry of one worker process: the world group, the TP/PP/DP/EP/DCP/PCP GroupCoordinators and the torch custom ops vllm::all_reduce/all_gather/reduce_scatter that look groups up by name."
+    sources: ["vllm/distributed/parallel_state.py:1487-1490", "vllm/distributed/parallel_state.py:1585-1590"]
+    state:
+      schema:
+        type: object
+        properties:
+          world_initialized: {type: boolean}
+          mp_initialized: {type: boolean}
+          world_size: {type: integer}
+          backend: {type: string}
+          custom_all_reduce_enabled: {type: boolean}
+          groups: {type: object}
+          destroyed_groups: {type: array, items: {type: string}}
+      # The default world is a worker after startup: Worker.init_device already ran
+      # init_worker_distributed_environment, so the groups exist and follow the deployed
+      # config (tensor-parallel-size). Scenarios of a fresh process override the flags.
+      initial: {world_initialized: true, mp_initialized: true, world_size: 0, backend: nccl, custom_all_reduce_enabled: true, groups: {pp: {world_size: 1, unique_name: "pp:0"}, dp: {world_size: 1, unique_name: "dp:0"}}, destroyed_groups: []}
+  - id: tensor-model-parallel
+    name: communication_op (tensor_model_parallel_* helpers)
+    kind: module
+    layer: distributed
+    parent: gpu-worker
+    summary: "The helpers model code calls (tensor_model_parallel_all_reduce/all_gather/reduce_scatter): each fetches the TP GroupCoordinator and delegates to it."
+    sources: ["vllm/distributed/communication_op.py:12-28"]
+  - id: group-coordinator
+    name: GroupCoordinator
+    kind: module
+    layer: distributed
+    parent: parallel-state
+    summary: "Wrapper over one process group: bypasses collectives at world size 1, otherwise routes through the torch custom op (CUDA uses custom-op calls) to the device communicator."
+    sources: ["vllm/distributed/parallel_state.py:426-454", "vllm/distributed/parallel_state.py:570-572"]
+  - id: cuda-communicator
+    name: CudaCommunicator
+    kind: module
+    layer: distributed
+    parent: group-coordinator
+    summary: "The CUDA device communicator of a group: picks the all-reduce backend per call (FlashInfer, NCCL symmetric memory, custom all-reduce, torch symmetric memory, PyNccl) and drives the collective on every rank of the group."
+    sources: ["vllm/distributed/device_communicators/cuda_communicator.py:35-60"]
+    state:
+      schema:
+        type: object
+        properties:
+          device_capability: {type: string}
+          flashinfer_available: {type: boolean}
+          platform: {type: string}
+          fi_ar_max_mb: {type: object}
+          symm_mem_max_mb: {type: object}
+          nccl_symm_custom_ar_range_kb: {type: object}
+      # ASSUMPTION: an H100 (sm 9.0) CUDA node with flashinfer-python installed (requirements/cuda.txt).
+      initial:
+        device_capability: "9.0"
+        flashinfer_available: true
+        platform: cuda
+        fi_ar_max_mb: {"2": 64, "4": 2, "8": 0.5}
+        symm_mem_max_mb: {"2": 64, "4": 32, "6": 64, "8": 64}
+        nccl_symm_custom_ar_range_kb: {"4": [16, 512], "8": [16, 128]}
+  - id: flashinfer-all-reduce
+    name: FlashInferAllReduce
+    kind: module
+    layer: distributed
+    parent: cuda-communicator
+    summary: "FlashInfer one-shot all-reduce (mnnvl backend on a single NVSwitch node); used for 2-D tensors up to a per-world-size workspace limit."
+    sources: ["vllm/distributed/device_communicators/flashinfer_all_reduce.py:394-449"]
+  - id: symm-mem-communicator
+    name: SymmMemCommunicator
+    kind: module
+    layer: distributed
+    parent: cuda-communicator
+    summary: "torch symmetric-memory all-reduce, used for bf16 tensors up to SYMM_MEM_ALL_REDUCE_MAX_SIZES[capability][world_size]."
+    sources: ["vllm/distributed/device_communicators/symm_mem.py:25-115"]
+  - id: pynccl
+    name: pynccl (module)
+    kind: module
+    layer: distributed
+    parent: cuda-communicator
+    summary: "PyNccl module: registers the vllm::all_reduce_symmetric_with_copy op when NCCL symmetric memory is enabled."
+    sources: ["vllm/distributed/device_communicators/pynccl.py:62-88"]
+  - id: pynccl-communicator
+    name: PyNcclCommunicator
+    kind: module
+    layer: distributed
+    parent: pynccl
+    summary: "ctypes NCCL communicator of a group: ncclAllReduce / ncclAllGather / ncclReduceScatter on the current stream; returns None when disabled."
+    sources: ["vllm/distributed/device_communicators/pynccl.py:91-141"]
+    state:
+      schema: {type: object, properties: {disabled: {type: boolean}}}
+      initial: {disabled: false}
+  - id: torch-distributed
+    name: torch.distributed (device group)
+    kind: external
+    layer: distributed
+    parent: cuda-communicator
+    summary: "PyTorch's own process-group collective, the fallback when PyNccl is missing or disabled."
+    sources: ["vllm/distributed/device_communicators/cuda_communicator.py:430-434"]
+  - id: custom-allreduce
+    name: CustomAllreduce (Python)
+    kind: module
+    layer: distributed
+    parent: cuda-communicator
+    summary: "vLLM's custom one-/two-shot all-reduce over CUDA IPC buffers for TP groups of 2/4/6/8 GPUs on one fully connected node; also custom all-gather and reduce-scatter."
+    sources: ["vllm/distributed/device_communicators/custom_all_reduce.py:120-137", "vllm/distributed/device_communicators/custom_all_reduce.py:293-330"]
+    state:
+      schema:
+        type: object
+        properties:
+          disabled: {type: boolean}
+          disabled_reason: {type: string}
+          fully_connected: {type: boolean}
+          same_node: {type: boolean}
+          mnnvl_multicast: {type: boolean}
+          mnnvl_only: {type: boolean}
+          batch_invariant: {type: boolean}
+          max_size: {type: integer}
+          max_all_gather_size: {type: integer}
+          max_reduce_scatter_size: {type: integer}
+          max_mnnvl_reduce_scatter_size: {type: integer}
+          max_mnnvl_multimem_reduce_scatter_size: {type: integer}
+          mnnvl_multimem_rs_supported: {type: boolean}
+          capturing: {type: boolean}
+      # After a successful init on an NVLink (fully connected) H100 node: max_size is
+      # min(CUSTOM_ALL_REDUCE_MAX_SIZES['9.0'][ws], 8 MiB) = 8 MiB for 2 and 4 GPUs.
+      initial: {disabled: false, disabled_reason: "", fully_connected: true, same_node: true, mnnvl_multicast: false, mnnvl_only: false, batch_invariant: false, max_size: 8388608, max_all_gather_size: 2097152, max_reduce_scatter_size: 16777216, max_mnnvl_reduce_scatter_size: 16777216, max_mnnvl_multimem_reduce_scatter_size: 67108864, mnnvl_multimem_rs_supported: false, capturing: false}
+  - id: custom-allreduce-cuda
+    name: CustomAllreduce (C++)
+    kind: module
+    layer: kernels
+    parent: custom-allreduce
+    summary: "The C++ vllm::CustomAllreduce object behind the _C_custom_ar ops: checks sizes and registration, then launches the one-stage or two-stage cross-device reduce kernel."
+    sources: ["csrc/custom_all_reduce.cuh:80-130", "csrc/custom_all_reduce.cu:70-116"]
+  - id: custom-all-gather-reduce-scatter-ops
+    name: custom_all_gather_reduce_scatter ops
+    kind: module
+    layer: kernels
+    parent: gpu-worker
+    summary: "The _C_custom_ar custom all-gather and reduce-scatter torch ops (legacy IPC, MNNVL Lamport and MNNVL multimem variants) and their kernels."
+    sources: ["csrc/custom_all_gather_reduce_scatter_ops.cpp:6-34"]
+  - id: all-reduce-utils
+    name: all_reduce_utils (module)
+    kind: module
+    layer: distributed
+    parent: custom-allreduce
+    capacity: {concurrency: 1}   # called from CustomAllreduce.__init__ on the worker's main thread; the module-level cache has no other writer (all_reduce_utils.py:341-350)
+    summary: "GPU P2P access check with a JSON cache under VLLM_CACHE_ROOT; the local master generates the cache by running this file as a subprocess (its __main__)."
+    sources: ["vllm/distributed/device_communicators/all_reduce_utils.py:330-341"]
+    state:
+      schema: {type: object, properties: {cache_file_exists: {type: boolean}, p2p_ok: {type: object}, cache_loaded: {type: boolean}}}
+      initial: {cache_file_exists: false, p2p_ok: {}, cache_loaded: false}
+
+interfaces:
+  # ---------------------------------------------------------------- parallel state
+  - component: parallel-state
+    name: init-distributed-environment
+    kind: function
+    summary: "Create the world process group (torch.distributed.init_process_group) and the world GroupCoordinator, falling back to gloo when the backend is unavailable."
+    sources: ["vllm/distributed/parallel_state.py:1814-2016"]
+    request:
+      type: object
+      required: [world_size, rank]
+      properties:
+        world_size: {type: integer, examples: [1]}
+        rank: {type: integer, examples: [0]}
+        local_rank: {type: integer, default: -1}
+        backend: {type: string, default: nccl}
+        distributed_init_method: {type: string, default: "env://"}
+        backend_available: {type: boolean, default: true}
+    response: {type: object, properties: {world_size: {type: integer}, backend: {type: string}, already_initialized: {type: boolean}}}
+    errors:
+      - {code: assertion-error, status: 0, retryable: false, summary: "world group already initialized with a different world size"}
+    behavior:
+      - if: "state.world_initialized"
+        then:
+          - title: World group already exists
+            detail: "torch.distributed is initialized; the world GroupCoordinator must match the requested world size."
+            source: "vllm/distributed/parallel_state.py:1989-1992"
+            if: "state.world_size > 0 && state.world_size != input.world_size"
+            then:
+              - fail: {code: assertion-error, status: 0, message: "world group already initialized with a different world size"}
+          - return: {world_size: "= input.world_size", backend: "= state.backend", already_initialized: true}
+      - title: Fall back to gloo when the backend is missing
+        source: "vllm/distributed/parallel_state.py:1913-1922"
+        if: "!input.backend_available"
+        then:
+          - set: {vars.backend: gloo}
+        else:
+          - set: {vars.backend: "= input.backend"}
+      - title: init_process_group and the world GroupCoordinator
+        detail: "The world group spans every rank (ranks = range(world_size)); the node count is derived from the CPU group."
+        source: "vllm/distributed/parallel_state.py:1981-1988"
+        set:
+          state.world_initialized: true
+          state.world_size: "= input.world_size"
+          state.backend: "= vars.backend"
+          state.groups: "= merge(state.groups, {'world': {'world_size': input.world_size, 'unique_name': 'world:0'}})"
+      - return: {world_size: "= input.world_size", backend: "= vars.backend", already_initialized: false}
+
+  - component: parallel-state
+    name: set-custom-all-reduce
+    kind: function
+    summary: "Set the module flag _ENABLE_CUSTOM_ALL_REDUCE that the TP CudaCommunicator reads when it is built."
+    sources: ["vllm/distributed/parallel_state.py:1708-1713"]
+    request: {type: object, required: [enable], properties: {enable: {type: boolean, examples: [true]}}}
+    response: {type: object, properties: {enabled: {type: boolean}}}
+    behavior:
+      - set: {state.custom_all_reduce_enabled: "= input.enable"}
+      - if: "!input.enable"
+        then:
+          - title: The custom all-reduce will not be built
+            detail: "CudaCommunicator only creates CustomAllreduce when _ENABLE_CUSTOM_ALL_REDUCE is true for the tp group."
+            source: "vllm/distributed/device_communicators/cuda_communicator.py:63-66"
+            call: custom-allreduce.disable
+            input: {reason: "disable_custom_all_reduce"}
+      - return: {enabled: "= input.enable"}
+
+  - component: parallel-state
+    name: ensure-model-parallel-initialized
+    kind: function
+    summary: "Initialize the model-parallel groups if absent, else assert that TP/PP/PCP/DCP sizes match the request."
+    sources: ["vllm/distributed/parallel_state.py:2366-2415"]
+    request:
+      type: object
+      required: [tensor_model_parallel_size, pipeline_model_parallel_size]
+      properties:
+        tensor_model_parallel_size: {type: integer, examples: [1]}
+        pipeline_model_parallel_size: {type: integer, default: 1}
+        data_parallel_size: {type: integer, default: 1}
+        is_moe: {type: boolean, default: false}
+        enable_eplb: {type: boolean, default: false}
+    response: {type: object, properties: {tp_world_size: {type: integer}, pp_world_size: {type: integer}, created: {type: boolean}}}
+    errors:
+      - {code: assertion-error, status: 0, retryable: false}
+    behavior:
+      - if: "!state.mp_initialized"
+        then:
+          - call: parallel-state.initialize-model-parallel
+            input: "= input"
+            as: init
+          - return: {tp_world_size: "= input.tensor_model_parallel_size", pp_world_size: "= input.pipeline_model_parallel_size", created: true}
+      - title: get_pp_group().world_size
+        source: "vllm/distributed/parallel_state.py:2397"
+        call: parallel-state.get-pp-group
+        as: ppg
+      - set:
+          vars.tp: "= 'tp' in state.groups ? state.groups.tp.world_size : config['tensor-parallel-size']"
+          vars.pp: "= vars.ppg.value.world_size"
+      - title: Sizes must match the existing groups
+        source: "vllm/distributed/parallel_state.py:2392-2396"
+        if: "vars.tp != input.tensor_model_parallel_size"
+        then:
+          - fail: {code: assertion-error, status: 0, message: "= 'tensor parallel group already initialized, but of unexpected size. got: ' + string(vars.tp) + ' vs. wanted: ' + string(input.tensor_model_parallel_size)"}
+      - if: "vars.pp != input.pipeline_model_parallel_size"
+        then:
+          - source: "vllm/distributed/parallel_state.py:2397-2402"
+            fail: {code: assertion-error, status: 0, message: "pipeline parallel group already initialized, but of unexpected size"}
+      - return: {tp_world_size: "= vars.tp", pp_world_size: "= vars.pp", created: false}
+
+  - component: parallel-state
+    name: initialize-model-parallel
+    kind: function
+    summary: "Lay out ranks as ExternalDP x DP x PP x PCP x TP and build the TP (with a message-queue broadcaster), DCP, PCP, PP, DP groups, plus EP (MoE only) and EPLB (when enabled)."
+    sources: ["vllm/distributed/parallel_state.py:2056-2364"]
+    request:
+      type: object
+      required: [tensor_model_parallel_size, pipeline_model_parallel_size]
+      properties:
+        tensor_model_parallel_size: {type: integer, examples: [1]}
+        pipeline_model_parallel_size: {type: integer, default: 1}
+        data_parallel_size: {type: integer, default: 1}
+        is_moe: {type: boolean, default: false}
+        enable_eplb: {type: boolean, default: false}
+    response: {type: object, properties: {groups: {type: array, items: {type: string}}}}
+    errors:
+      - {code: assertion-error, status: 0, retryable: false}
+      - {code: runtime-error, status: 0, retryable: false}
+    behavior:
+      - title: torch.distributed must be initialized first
+        source: "vllm/distributed/parallel_state.py:2091"
+        if: "!state.world_initialized"
+        then:
+          - fail: {code: assertion-error, status: 0, message: "torch.distributed is not initialized"}
+      - set:
+          vars.block: "= input.tensor_model_parallel_size * input.pipeline_model_parallel_size * input.data_parallel_size"
+      - title: "all_ranks = arange(world_size).reshape(-1, DP, PP, PCP, TP)"
+        detail: "torch reshape raises when world_size is not a multiple of DP x PP x TP."
+        source: "vllm/distributed/parallel_state.py:2135-2141"
+        if: "state.world_size % vars.block != 0"
+        then:
+          - fail: {code: runtime-error, status: 0, message: "= 'shape \\'[-1, ' + string(input.data_parallel_size) + ', ' + string(input.pipeline_model_parallel_size) + ', 1, ' + string(input.tensor_model_parallel_size) + ']\\' is invalid for input of size ' + string(state.world_size)"}
+      - title: TP groups are consecutive ranks; the TP group gets the shared-memory broadcaster
+        source: "vllm/distributed/parallel_state.py:2143-2157"
+        set:
+          vars.groups: "= {'tp': {'world_size': input.tensor_model_parallel_size, 'unique_name': 'tp:0', 'mq_broadcaster': true}, 'dcp': {'world_size': 1, 'unique_name': 'dcp:0'}, 'pcp': {'world_size': 1, 'unique_name': 'pcp:0'}, 'pp': {'world_size': input.pipeline_model_parallel_size, 'unique_name': 'pp:0'}, 'dp': {'world_size': input.data_parallel_size, 'unique_name': 'dp:0'}}"
+      - title: EP group only for MoE models
+        detail: "Dense models get no EP group (_EP stays None); EP spans DP x PCP x TP."
+        source: "vllm/distributed/parallel_state.py:2289-2322"
+        if: "input.is_moe"
+        then:
+          - set:
+              vars.groups: "= merge(vars.groups, {'ep': {'world_size': input.data_parallel_size * input.tensor_model_parallel_size, 'unique_name': 'ep:0'}})"
+          - title: EPLB gets its own group with the EP ranks
+            source: "vllm/distributed/parallel_state.py:2324-2346"
+            when: "input.enable_eplb"
+            set:
+              vars.groups: "= merge(vars.groups, {'eplb': {'world_size': input.data_parallel_size * input.tensor_model_parallel_size, 'unique_name': 'eplb:0'}})"
+      - set:
+          state.groups: "= merge(state.groups, vars.groups)"
+          state.mp_initialized: true
+      - return: {groups: "= vars.groups.map(k, k)"}
+
+  - component: parallel-state
+    name: get-tp-group
+    kind: function
+    summary: "Return the tensor-parallel GroupCoordinator (its size, ranks and this process's rank in it); asserts it was initialized."
+    sources: ["vllm/distributed/parallel_state.py:1588-1590", "vllm/distributed/parallel_state.py:2437-2444"]
+    request: {type: object, properties: {}}
+    response: DistTpGroup
+    errors:
+      - {code: assertion-error, status: 0, retryable: false}
+    behavior:
+      - if: "!state.mp_initialized"
+        then:
+          - title: "assert _TP is not None"
+            source: "vllm/distributed/parallel_state.py:1589"
+            fail: {code: assertion-error, status: 0, message: "tensor model parallel group is not initialized"}
+      - set:
+          vars.ws: "= 'tp' in state.groups ? state.groups.tp.world_size : config['tensor-parallel-size']"
+      - return:
+          world_size: "= vars.ws"
+          ranks: "= lists.range(vars.ws).map(i, 'rank' + string(i))"
+          rank_in_group: "= int(self.replace('rank', '')) % vars.ws"
+          unique_name: "tp:0"
+
+  - component: parallel-state
+    name: get-pp-group
+    kind: io
+    summary: "get_pp_group: the pipeline-parallel GroupCoordinator; asserts it was initialized (the module global _PP)."
+    sources: ["vllm/distributed/parallel_state.py:1638-1640"]
+    request: {type: object, properties: {}}
+    response: {type: object, properties: {world_size: {type: integer}, unique_name: {type: string}}}
+    errors:
+      - {code: assertion-error, status: 0, retryable: false, summary: "pipeline model parallel group is not initialized"}
+    store: {table: groups, op: get, key: pp, not_found: assertion-error}
+
+  - component: parallel-state
+    name: get-tensor-model-parallel-world-size
+    kind: function
+    summary: "get_tp_group().world_size, the read path for the TP layout."
+    sources: ["vllm/distributed/parallel_state.py:2437-2439"]
+    request: {type: object, properties: {}}
+    response: {type: object, properties: {world_size: {type: integer}}}
+    behavior:
+      - call: parallel-state.get-tp-group
+        as: tp
+      - return: {world_size: "= vars.tp.value.world_size"}
+
+  - component: parallel-state
+    name: destroy-model-parallel
+    kind: function
+    summary: "Destroy every model-parallel GroupCoordinator and reset the module globals to None."
+    sources: ["vllm/distributed/parallel_state.py:2458-2503"]
+    request: {type: object, properties: {}}
+    response: {type: object, properties: {destroyed: {type: array, items: {type: string}}}}
+    behavior:
+      - if: "!state.mp_initialized"
+        then:
+          - title: Nothing to destroy
+            detail: "Each group is destroyed only when its global is set."
+            source: "vllm/distributed/parallel_state.py:2466-2468"
+            return: {destroyed: []}
+      - set:
+          vars.names: "= ['tp', 'dcp', 'pcp', 'pp', 'dp', 'ep', 'eplb'].filter(n, n in state.groups || n == 'tp')"
+      - set:
+          state.destroyed_groups: "= state.destroyed_groups + vars.names.map(n, n + ':0')"
+          state.mp_initialized: false
+          state.groups: "= 'world' in state.groups ? {'world': state.groups.world} : {}"
+      - return: {destroyed: "= vars.names"}
+
+  # The torch custom ops registered with direct_register_custom_op (torch-op entries).
+  - component: parallel-state
+    name: all-reduce
+    kind: kernel
+    summary: "torch.ops.vllm.all_reduce: look the group up by name in _groups and run its out-of-place all-reduce (registered as a custom op so torch.compile can trace it)."
+    sources: ["vllm/distributed/parallel_state.py:398-402", "vllm/distributed/parallel_state.py:198-203", "vllm/distributed/parallel_state.py:747-750"]
+    request:
+      type: object
+      required: [group_name, num_tokens]
+      properties:
+        group_name: {type: string, examples: ["tp:0"]}
+        num_tokens: {type: integer, examples: [128]}
+        hidden_size: {type: integer, default: 4096}
+        dtype: {type: string, default: bfloat16}
+        num_collectives: {type: integer, default: 1}
+        world_size: {type: integer, examples: [4]}
+        ranks: {type: array, items: {type: string}}
+    response: DistCollectiveResult
+    errors:
+      - {code: assertion-error, status: 0, retryable: false}
+      - {code: value-error, status: 0, retryable: false}
+    behavior:
+      - call: parallel-state.lookup-group
+        input: {group_name: "= input.group_name"}
+      - call: cuda-communicator.all-reduce
+        input: "= input"
+        as: out
+      - return: "= vars.out.value"
+
+  - component: parallel-state
+    name: all-gather
+    kind: kernel
+    summary: "torch.ops.vllm.all_gather: look the group up by name and run its out-of-place all-gather along dim."
+    sources: ["vllm/distributed/parallel_state.py:410-414", "vllm/distributed/parallel_state.py:228-235", "vllm/distributed/parallel_state.py:768-771"]
+    request:
+      type: object
+      required: [group_name, num_tokens]
+      properties:
+        group_name: {type: string, examples: ["tp:0"]}
+        num_tokens: {type: integer, examples: [128]}
+        hidden_size: {type: integer, default: 4096}
+        dtype: {type: string, default: bfloat16}
+        dim: {type: integer, default: -1}
+        num_collectives: {type: integer, default: 1}
+        world_size: {type: integer}
+        ranks: {type: array, items: {type: string}}
+    response: DistCollectiveResult
+    errors:
+      - {code: assertion-error, status: 0, retryable: false}
+      - {code: value-error, status: 0, retryable: false}
+    behavior:
+      - call: parallel-state.lookup-group
+        input: {group_name: "= input.group_name"}
+      - call: cuda-communicator.all-gather
+        input: "= input"
+        as: out
+      - return: "= vars.out.value"
+
+  - component: parallel-state
+    name: reduce-scatter
+    kind: kernel
+    summary: "torch.ops.vllm.reduce_scatter: look the group up by name and run its out-of-place reduce-scatter along dim."
+    sources: ["vllm/distributed/parallel_state.py:404-408", "vllm/distributed/parallel_state.py:210-217", "vllm/distributed/parallel_state.py:819-822"]
+    request:
+      type: object
+      required: [group_name, num_tokens]
+      properties:
+        group_name: {type: string, examples: ["tp:0"]}
+        num_tokens: {type: integer, examples: [128]}
+        hidden_size: {type: integer, default: 4096}
+        dtype: {type: string, default: bfloat16}
+        dim: {type: integer, default: -1}
+        num_collectives: {type: integer, default: 1}
+        world_size: {type: integer}
+        ranks: {type: array, items: {type: string}}
+    response: DistCollectiveResult
+    errors:
+      - {code: assertion-error, status: 0, retryable: false}
+      - {code: value-error, status: 0, retryable: false}
+    behavior:
+      - call: parallel-state.lookup-group
+        input: {group_name: "= input.group_name"}
+      - call: cuda-communicator.reduce-scatter
+        input: "= input"
+        as: out
+      - return: "= vars.out.value"
+
+  - component: parallel-state
+    name: patched-fused-scaled-matmul-reduce-scatter
+    kind: kernel
+    summary: "torch.ops.vllm.patched_fused_scaled_matmul_reduce_scatter: a workaround op that forwards to torch.ops.symm_mem.fused_scaled_matmul_reduce_scatter (used by the async-TP compile pass) until the PyTorch fix ships."
+    sources: ["vllm/distributed/parallel_state.py:416-423", "vllm/distributed/parallel_state.py:366-395"]
+    request:
+      type: object
+      required: [group_name, num_tokens]
+      properties:
+        group_name: {type: string, examples: ["tp:0"]}
+        num_tokens: {type: integer, examples: [2048]}
+        hidden_size: {type: integer, default: 4096}
+        world_size: {type: integer, examples: [4]}
+    response: DistCollectiveResult
+    behavior:
+      - call: parallel-state.lookup-group
+        input: {group_name: "= input.group_name"}
+      - title: Forward to torch symm_mem fused_scaled_matmul_reduce_scatter
+        source: "vllm/distributed/parallel_state.py:381-395"
+        call: symm-mem-communicator.fused-scaled-matmul-reduce-scatter
+        input: {bytes: "= input.num_tokens * input.hidden_size * 2", world_size: "= input.world_size"}
+        as: k
+      - return: {backend: torch-symm-mem, bytes: "= input.num_tokens * input.hidden_size * 2", world_size: "= input.world_size"}
+
+  - component: parallel-state
+    name: lookup-group
+    kind: function
+    summary: "The _groups lookup shared by the custom ops: assert the name is registered, and refuse a group whose weakref is dead (destroyed)."
+    sources: ["vllm/distributed/parallel_state.py:199-202"]
+    request: {type: object, required: [group_name], properties: {group_name: {type: string, examples: ["tp:0"]}}}
+    response: {type: object, properties: {group_name: {type: string}}}
+    errors:
+      - {code: assertion-error, status: 0, retryable: false}
+      - {code: value-error, status: 0, retryable: false}
+    behavior:
+      - if: "input.group_name in state.destroyed_groups && !state.mp_initialized"
+        then:
+          - title: The weak reference is dead
+            source: "vllm/distributed/parallel_state.py:201-202"
+            fail: {code: value-error, status: 0, message: "= 'Group ' + input.group_name + ' is destroyed.'"}
+      - if: "!state.mp_initialized"
+        then:
+          - title: "assert group_name in _groups"
+            source: "vllm/distributed/parallel_state.py:199"
+            fail: {code: assertion-error, status: 0, message: "= 'Group ' + input.group_name + ' is not found.'"}
+      - return: {group_name: "= input.group_name"}
+
+  # ---------------------------------------------------------------- communication_op (the seam)
+  - component: tensor-model-parallel
+    name: all-reduce
+    kind: function
+    summary: "tensor_model_parallel_all_reduce: all-reduce the input across the TP group. Every rank of the group joins the collective; one slow rank delays all, one failed rank fails the step."
+    description: >-
+      The seam models-layers calls after row-parallel linear layers. Multi-rank semantics: the
+      call on one rank fans out as a parallel with join all over the TP ranks
+      (cuda-communicator.all-reduce), each branch running the chosen backend kernel on its rank.
+    sources: ["vllm/distributed/communication_op.py:12-14", "vllm/distributed/parallel_state.py:724-745"]
+    attributes: {seam: true, callers: [models-layers]}
+    request: DistCollectiveRequest
+    response: DistCollectiveResult
+    errors:
+      - {code: assertion-error, status: 0, retryable: false, summary: "the TP group is not initialized"}
+      - {code: dist-backend-error, status: 0, retryable: false, summary: "a rank failed inside the collective"}
+    behavior:
+      - call: parallel-state.get-tp-group
+        as: tp
+      - call: group-coordinator.all-reduce
+        input: "= merge(input, {'world_size': vars.tp.value.world_size, 'ranks': vars.tp.value.ranks, 'group_name': vars.tp.value.unique_name})"
+        as: out
+      - return: "= vars.out.value"
+
+  - component: tensor-model-parallel
+    name: all-gather
+    kind: function
+    summary: "tensor_model_parallel_all_gather: gather the input from every TP rank along dim."
+    sources: ["vllm/distributed/communication_op.py:17-21"]
+    request: DistCollectiveRequest
+    response: DistCollectiveResult
+    errors:
+      - {code: assertion-error, status: 0, retryable: false}
+    behavior:
+      - call: parallel-state.get-tp-group
+        as: tp
+      - call: group-coordinator.all-gather
+        input: "= merge(input, {'world_size': vars.tp.value.world_size, 'ranks': vars.tp.value.ranks, 'group_name': vars.tp.value.unique_name})"
+        as: out
+      - return: "= vars.out.value"
+
+  - component: tensor-model-parallel
+    name: reduce-scatter
+    kind: function
+    summary: "tensor_model_parallel_reduce_scatter: reduce across TP ranks and keep this rank's 1/world_size slice along dim."
+    sources: ["vllm/distributed/communication_op.py:24-28"]
+    request: DistCollectiveRequest
+    response: DistCollectiveResult
+    errors:
+      - {code: assertion-error, status: 0, retryable: false}
+    behavior:
+      - call: parallel-state.get-tp-group
+        as: tp
+      - call: group-coordinator.reduce-scatter
+        input: "= merge(input, {'world_size': vars.tp.value.world_size, 'ranks': vars.tp.value.ranks, 'group_name': vars.tp.value.unique_name})"
+        as: out
+      - return: "= vars.out.value"
+
+  # ---------------------------------------------------------------- GroupCoordinator
+  - component: group-coordinator
+    name: all-reduce
+    kind: function
+    summary: "GroupCoordinator.all_reduce: bypass at world size 1, else call torch.ops.vllm.all_reduce with the group's unique name."
+    sources: ["vllm/distributed/parallel_state.py:724-745"]
+    request: {type: object, required: [num_tokens, world_size], properties: {num_tokens: {type: integer}, world_size: {type: integer}, group_name: {type: string}}}
+    response: DistCollectiveResult
+    behavior:
+      - if: "input.world_size == 1"
+        then:
+          - title: Bypass on a single GPU
+            source: "vllm/distributed/parallel_state.py:739-740"
+            return: {backend: bypass, bytes: 0, world_size: 1, num_tokens: "= input.num_tokens"}
+      - title: "CUDA uses the custom-op call (use_custom_op_call)"
+        source: "vllm/distributed/parallel_state.py:742-743"
+        call: parallel-state.all-reduce
+        input: "= input"
+        as: out
+      - return: "= vars.out.value"
+
+  - component: group-coordinator
+    name: all-gather
+    kind: function
+    summary: "GroupCoordinator.all_gather: bypass at world size 1, check dim, then call torch.ops.vllm.all_gather."
+    sources: ["vllm/distributed/parallel_state.py:752-766"]
+    request: {type: object, required: [num_tokens, world_size], properties: {num_tokens: {type: integer}, world_size: {type: integer}, dim: {type: integer}}}
+    response: DistCollectiveResult
+    errors:
+      - {code: assertion-error, status: 0, retryable: false}
+    behavior:
+      - if: "input.world_size == 1"
+        then:
+          - source: "vllm/distributed/parallel_state.py:755-756"
+            return: {backend: bypass, bytes: 0, world_size: 1, num_tokens: "= input.num_tokens"}
+      - set: {vars.dim: "= has(input.dim) ? input.dim : -1"}
+      - title: "assert -input_.dim() <= dim < input_.dim() (2-D activations)"
+        source: "vllm/distributed/parallel_state.py:757-759"
+        if: "vars.dim < -2 || vars.dim >= 2"
+        then:
+          - fail: {code: assertion-error, status: 0, message: "= 'Invalid dim (' + string(vars.dim) + ') for input tensor'"}
+      - call: parallel-state.all-gather
+        input: "= input"
+        as: out
+      - return: "= vars.out.value"
+
+  - component: group-coordinator
+    name: reduce-scatter
+    kind: function
+    summary: "GroupCoordinator.reduce_scatter: bypass at world size 1, check dim, then call torch.ops.vllm.reduce_scatter."
+    sources: ["vllm/distributed/parallel_state.py:783-797"]
+    request: {type: object, required: [num_tokens, world_size], properties: {num_tokens: {type: integer}, world_size: {type: integer}, dim: {type: integer}}}
+    response: DistCollectiveResult
+    errors:
+      - {code: assertion-error, status: 0, retryable: false}
+    behavior:
+      - if: "input.world_size == 1"
+        then:
+          - source: "vllm/distributed/parallel_state.py:786-787"
+            return: {backend: bypass, bytes: 0, world_size: 1, num_tokens: "= input.num_tokens"}
+      - set: {vars.dim: "= has(input.dim) ? input.dim : -1"}
+      - if: "vars.dim < -2 || vars.dim >= 2"
+        then:
+          - source: "vllm/distributed/parallel_state.py:788-790"
+            fail: {code: assertion-error, status: 0, message: "= 'Invalid dim (' + string(vars.dim) + ') for input tensor'"}
+      - call: parallel-state.reduce-scatter
+        input: "= input"
+        as: out
+      - return: "= vars.out.value"
+
+  # ---------------------------------------------------------------- CudaCommunicator
+  - component: cuda-communicator
+    name: all-reduce
+    kind: function
+    summary: "CudaCommunicator.all_reduce: pick the backend for this tensor, then every rank of the group runs it; the collective completes when all ranks have."
+    sources: ["vllm/distributed/device_communicators/cuda_communicator.py:362-446"]
+    request: {type: object, required: [num_tokens, world_size, ranks], properties: {num_tokens: {type: integer}, hidden_size: {type: integer}, dtype: {type: string}, world_size: {type: integer}, ranks: {type: array, items: {type: string}}, num_collectives: {type: integer}}}
+    response: DistCollectiveResult
+    errors:
+      - {code: dist-backend-error, status: 0, retryable: false, summary: "a rank failed inside the collective (NCCL/IPC error)"}
+    behavior:
+      - set:
+          vars.hidden: "= has(input.hidden_size) ? input.hidden_size : 4096"
+          vars.dtype: "= has(input.dtype) ? input.dtype : 'bfloat16'"
+          vars.n: "= has(input.num_collectives) ? input.num_collectives : 1"
+          vars.ws: "= input.world_size"
+          vars.wskey: "= string(input.world_size)"
+      - set:
+          vars.esize: "= vars.dtype == 'float32' || vars.dtype == 'int32' ? 4 : 2"
+      - set:
+          vars.bytes: "= input.num_tokens * vars.hidden * vars.esize"
+      - title: FlashInfer all-reduce first, when built and the tensor fits its workspace
+        detail: "should_use_fi_ar: CUDA, contiguous, 2-D, fp16/bf16/fp32, nbytes <= the max size for this capability and world size (sm90: 64 MB at 2, 2 MB at 4, 0.5 MB at 8 GPUs)."
+        source: "vllm/distributed/device_communicators/cuda_communicator.py:363-368"
+        set:
+          vars.use_fi: "= config['vllm-allreduce-use-flashinfer'] && state.flashinfer_available && state.platform == 'cuda' && vars.dtype != 'int32' && vars.wskey in state.fi_ar_max_mb && double(vars.bytes) <= double(state.fi_ar_max_mb[vars.wskey]) * 1048576.0"
+      - title: NCCL symmetric memory for small and large tensors (opt-in)
+        detail: "should_nccl_symm_mem_allreduce: VLLM_USE_NCCL_SYMM_MEM, world size >= 4, size <= 16 KB or >= the custom-AR preferred upper bound."
+        source: "vllm/distributed/device_communicators/cuda_communicator.py:372-379"
+        if: "!vars.use_fi && config['vllm-use-nccl-symm-mem'] && vars.ws >= 4 && (!(vars.wskey in state.nccl_symm_custom_ar_range_kb) || vars.bytes <= state.nccl_symm_custom_ar_range_kb[vars.wskey][0] * 1024 || vars.bytes >= state.nccl_symm_custom_ar_range_kb[vars.wskey][1] * 1024)"
+        then:
+          - set: {vars.target: pynccl.all-reduce-symmetric-with-copy, vars.backend: nccl-symm-mem}
+        else:
+          - if: "vars.use_fi"
+            then:
+              - source: "vllm/distributed/device_communicators/cuda_communicator.py:392-396"
+                set: {vars.target: flashinfer-all-reduce.all-reduce, vars.backend: flashinfer}
+            else:
+              - call: custom-allreduce.should-custom-ar
+                input: {bytes: "= vars.bytes", dtype: "= vars.dtype", world_size: "= vars.ws"}
+                as: ca
+              - if: "vars.ca.value.use"
+                then:
+                  - title: vLLM custom all-reduce
+                    source: "vllm/distributed/device_communicators/cuda_communicator.py:407-415"
+                    set: {vars.target: custom-allreduce.custom-all-reduce, vars.backend: custom-allreduce}
+                else:
+                  - title: torch symmetric memory, else PyNccl
+                    source: "vllm/distributed/device_communicators/cuda_communicator.py:426-436"
+                    set:
+                      vars.target: "= config['vllm-allreduce-use-symm-mem'] && vars.dtype == 'bfloat16' && state.platform == 'cuda' && vars.wskey in state.symm_mem_max_mb && double(vars.bytes) <= double(state.symm_mem_max_mb[vars.wskey]) * 1048576.0 ? 'symm-mem-communicator.all-reduce' : 'pynccl-communicator.all-reduce'"
+                  - set:
+                      vars.backend: "= vars.target == 'symm-mem-communicator.all-reduce' ? 'torch-symm-mem' : 'pynccl'"
+      - title: Meet the other ranks of the group (every rank calls the collective once)
+        detail: "A collective completes only when all ranks have entered it: the latest arrival sets the start, and a rank that never arrives makes the others time out (torch's process-group timeout, 600 s for NCCL by default)."
+        source: "vllm/distributed/parallel_state.py:1953-1960"
+        rendezvous: "= 'tp-allreduce:' + string(has(input.layer) ? input.layer : 0)"
+        count: "= config['tensor-parallel-size']"
+        value: "= self"
+        timeout_ms: "= !('distributed-timeout-seconds' in config) || config['distributed-timeout-seconds'] == null ? 600000 : config['distributed-timeout-seconds'] * 1000"
+        as: meet
+        on_error:
+          - fail: {code: dist-backend-error, status: 0, message: "= 'collective timed out: ' + string(error.data.arrived) + ' of ' + string(error.data.count) + ' ranks arrived'"}
+      - title: Run the chosen backend on this rank
+        source: "vllm/distributed/device_communicators/cuda_communicator.py:438-446"
+        call: "= vars.target"
+        targets: [flashinfer-all-reduce.all-reduce, pynccl.all-reduce-symmetric-with-copy, custom-allreduce.custom-all-reduce, symm-mem-communicator.all-reduce, pynccl-communicator.all-reduce]
+        input: {bytes: "= vars.bytes", world_size: "= vars.ws", num_collectives: "= vars.n", dtype: "= vars.dtype"}
+        as: k
+      - if: "vars.target == 'pynccl-communicator.all-reduce' && vars.k.value.out_none"
+        then:
+          - title: PyNccl disabled; fall back to torch.distributed.all_reduce
+            source: "vllm/distributed/device_communicators/cuda_communicator.py:437-445"
+            call: torch-distributed.all-reduce
+            input: {bytes: "= vars.bytes", world_size: "= vars.ws", num_collectives: "= vars.n"}
+      - return:
+          backend: "= vars.backend"
+          algorithm: "= vars.backend == 'custom-allreduce' ? vars.k.value.algorithm : vars.backend"
+          bytes: "= vars.bytes"
+          world_size: "= vars.ws"
+          num_tokens: "= input.num_tokens"
+          hidden_size: "= vars.hidden"
+
+  - component: cuda-communicator
+    name: all-gather
+    kind: function
+    summary: "CudaCommunicator.all_gather: NVLS symmetric memory for dim-0 gathers when enabled, else PyNccl all_gather into a world_size-times larger buffer; the base-class torch collective when PyNccl is disabled or on ROCm."
+    sources: ["vllm/distributed/device_communicators/cuda_communicator.py:460-494"]
+    request: {type: object, required: [num_tokens, world_size, ranks], properties: {num_tokens: {type: integer}, hidden_size: {type: integer}, dim: {type: integer}, world_size: {type: integer}, ranks: {type: array, items: {type: string}}, num_collectives: {type: integer}}}
+    response: DistCollectiveResult
+    errors:
+      - {code: dist-backend-error, status: 0, retryable: false}
+    behavior:
+      - set:
+          vars.bytes: "= input.num_tokens * (has(input.hidden_size) ? input.hidden_size : 4096) * 2"
+          vars.n: "= has(input.num_collectives) ? input.num_collectives : 1"
+          vars.dim: "= has(input.dim) ? input.dim : -1"
+      - set: {vars.dim0: "= vars.dim == 0 || vars.dim == -2"}
+      - title: "dim 0 with NCCL symmetric memory uses the symm-mem all-gather"
+        source: "vllm/distributed/device_communicators/cuda_communicator.py:465-468"
+        if: "vars.dim0 && config['vllm-use-nccl-symm-mem']"
+        then:
+          - set: {vars.target: pynccl-communicator.all-gather, vars.backend: nccl-symm-mem}
+        else:
+          - call: pynccl-communicator.status
+            as: pn
+          - title: PyNccl disabled or ROCm use the base-class torch all_gather_into_tensor
+            source: "vllm/distributed/device_communicators/cuda_communicator.py:470-478"
+            set:
+              vars.target: "= vars.pn.value.disabled || state.platform == 'rocm' ? 'torch-distributed.all-gather' : 'pynccl-communicator.all-gather'"
+          - set:
+              vars.backend: "= vars.target == 'pynccl-communicator.all-gather' ? 'pynccl' : 'torch-distributed'"
+      - title: Meet the other ranks of the group (every rank calls the collective once)
+        detail: "A collective completes only when all ranks have entered it: the latest arrival sets the start, and a rank that never arrives makes the others time out (torch's process-group timeout, 600 s for NCCL by default)."
+        source: "vllm/distributed/parallel_state.py:1953-1960"
+        rendezvous: "= 'tp-allgather:' + string(has(input.layer) ? input.layer : 0)"
+        count: "= config['tensor-parallel-size']"
+        value: "= self"
+        timeout_ms: "= !('distributed-timeout-seconds' in config) || config['distributed-timeout-seconds'] == null ? 600000 : config['distributed-timeout-seconds'] * 1000"
+        as: meet
+        on_error:
+          - fail: {code: dist-backend-error, status: 0, message: "= 'collective timed out: ' + string(error.data.arrived) + ' of ' + string(error.data.count) + ' ranks arrived'"}
+      - source: "vllm/distributed/device_communicators/cuda_communicator.py:480-494"
+        call: "= vars.target"
+        targets: [pynccl-communicator.all-gather, torch-distributed.all-gather]
+        input: {bytes: "= vars.bytes", world_size: "= input.world_size", num_collectives: "= vars.n"}
+      - return: {backend: "= vars.backend", bytes: "= vars.bytes * input.world_size", world_size: "= input.world_size", num_tokens: "= vars.dim0 ? input.num_tokens * input.world_size : input.num_tokens"}
+
+  - component: cuda-communicator
+    name: reduce-scatter
+    kind: function
+    summary: "CudaCommunicator.reduce_scatter: the scattered dim must divide by world_size; NVLS symmetric memory when enabled, else PyNccl reduce_scatter into a 1/world_size buffer."
+    sources: ["vllm/distributed/device_communicators/cuda_communicator.py:496-531"]
+    request: {type: object, required: [num_tokens, world_size, ranks], properties: {num_tokens: {type: integer}, hidden_size: {type: integer}, dim: {type: integer}, world_size: {type: integer}, ranks: {type: array, items: {type: string}}, num_collectives: {type: integer}}}
+    response: DistCollectiveResult
+    errors:
+      - {code: assertion-error, status: 0, retryable: false}
+      - {code: dist-backend-error, status: 0, retryable: false}
+    behavior:
+      - set:
+          vars.hidden: "= has(input.hidden_size) ? input.hidden_size : 4096"
+          vars.n: "= has(input.num_collectives) ? input.num_collectives : 1"
+          vars.dim: "= has(input.dim) ? input.dim : -1"
+      - set:
+          vars.scattered: "= vars.dim == 0 || vars.dim == -2 ? input.num_tokens : vars.hidden"
+      - title: "assert input_tensor.shape[0] % world_size == 0 (after moving dim to the front)"
+        source: "vllm/distributed/device_communicators/cuda_communicator.py:508-510"
+        if: "vars.scattered % input.world_size != 0"
+        then:
+          - fail: {code: assertion-error, status: 0, message: "= 'reduce_scatter dim of size ' + string(vars.scattered) + ' is not divisible by world size ' + string(input.world_size)"}
+      - set:
+          vars.target: "= config['vllm-use-nccl-symm-mem'] ? 'symm-mem-communicator.reduce-scatter' : 'pynccl-communicator.reduce-scatter'"
+          vars.bytes: "= input.num_tokens * vars.hidden * 2"
+      - title: Meet the other ranks of the group (every rank calls the collective once)
+        detail: "A collective completes only when all ranks have entered it: the latest arrival sets the start, and a rank that never arrives makes the others time out (torch's process-group timeout, 600 s for NCCL by default)."
+        source: "vllm/distributed/parallel_state.py:1953-1960"
+        rendezvous: "= 'tp-reducescatter:' + string(has(input.layer) ? input.layer : 0)"
+        count: "= config['tensor-parallel-size']"
+        value: "= self"
+        timeout_ms: "= !('distributed-timeout-seconds' in config) || config['distributed-timeout-seconds'] == null ? 600000 : config['distributed-timeout-seconds'] * 1000"
+        as: meet
+        on_error:
+          - fail: {code: dist-backend-error, status: 0, message: "= 'collective timed out: ' + string(error.data.arrived) + ' of ' + string(error.data.count) + ' ranks arrived'"}
+      - source: "vllm/distributed/device_communicators/cuda_communicator.py:513-528"
+        call: "= vars.target"
+        targets: [symm-mem-communicator.reduce-scatter, pynccl-communicator.reduce-scatter]
+        input: {bytes: "= vars.bytes", world_size: "= input.world_size", num_collectives: "= vars.n"}
+      - return: {backend: "= vars.target == 'pynccl-communicator.reduce-scatter' ? 'pynccl' : 'nccl-symm-mem'", bytes: "= vars.bytes / input.world_size", world_size: "= input.world_size", num_tokens: "= vars.dim == 0 || vars.dim == -2 ? input.num_tokens / input.world_size : input.num_tokens"}
+
+  - component: cuda-communicator
+    name: custom-all-gather
+    kind: function
+    summary: "CudaCommunicator.custom_all_gather: the sequence-parallel gather; None when no CustomAllreduce was built, else the custom all-gather (which may also decline with None)."
+    sources: ["vllm/distributed/device_communicators/cuda_communicator.py:448-452"]
+    request: {type: object, required: [num_tokens], properties: {num_tokens: {type: integer, examples: [512]}, hidden_size: {type: integer, default: 4096}, dtype: {type: string, default: bfloat16}}}
+    response: {type: object, properties: {used: {type: boolean}, backend: {type: string}, out_tokens: {type: integer}}}
+    behavior:
+      - call: parallel-state.get-tp-group
+        as: tp
+      - if: "vars.tp.value.world_size == 1"
+        then:
+          - title: No CustomAllreduce on a single GPU (ca_comm is None)
+            source: "vllm/distributed/device_communicators/cuda_communicator.py:449-451"
+            return: {used: false, backend: none}
+      - call: custom-allreduce.custom-all-gather
+        input: "= merge(input, {'world_size': vars.tp.value.world_size, 'ranks': vars.tp.value.ranks})"
+        as: ag
+      - return: "= vars.ag.value"
+
+  - component: cuda-communicator
+    name: custom-reduce-scatter
+    kind: function
+    summary: "CudaCommunicator.custom_reduce_scatter: None without a CustomAllreduce, else its backend-selected reduce-scatter."
+    sources: ["vllm/distributed/device_communicators/cuda_communicator.py:454-458"]
+    request: {type: object, required: [num_tokens], properties: {num_tokens: {type: integer, examples: [512]}, hidden_size: {type: integer, default: 4096}, dtype: {type: string, default: bfloat16}}}
+    response: {type: object, properties: {used: {type: boolean}, backend: {type: string}, out_tokens: {type: integer}}}
+    behavior:
+      - call: parallel-state.get-tp-group
+        as: tp
+      - if: "vars.tp.value.world_size == 1"
+        then:
+          - source: "vllm/distributed/device_communicators/cuda_communicator.py:455-457"
+            return: {used: false, backend: none}
+      - call: custom-allreduce.custom-reduce-scatter
+        input: "= merge(input, {'world_size': vars.tp.value.world_size, 'ranks': vars.tp.value.ranks})"
+        as: rs
+      - return: "= vars.rs.value"
+
+  # ---------------------------------------------------------------- backends (per rank)
+  - component: flashinfer-all-reduce
+    name: all-reduce
+    kind: kernel
+    summary: "FlashInfer one-shot all-reduce on this rank (mnnvl backend on a single NVSwitch node)."
+    sources: ["vllm/distributed/device_communicators/flashinfer_all_reduce.py:522-542"]
+    request: DistKernelLaunch
+    response: {type: object, properties: {algorithm: {type: string}}}
+    latency_ms: "= (double(has(input.num_collectives) ? input.num_collectives : 1) * (double(config['dist-flashinfer-ar-base-us']) + double(input.bytes) * double(input.world_size - 1) / double(input.world_size) / (double(config['dist-nvlink-bus-gbps']) * 1000.0)) / 1000.0)"
+
+  - component: symm-mem-communicator
+    name: all-reduce
+    kind: kernel
+    summary: "torch symmetric-memory all-reduce on this rank: copy into the symmetric buffer, then multimem or two-shot all-reduce."
+    sources: ["vllm/distributed/device_communicators/symm_mem.py:127-156"]
+    request: DistKernelLaunch
+    response: {type: object, properties: {algorithm: {type: string}}}
+    latency_ms: "= (double(has(input.num_collectives) ? input.num_collectives : 1) * (double(config['dist-symm-mem-base-us']) + 2.0 * double(input.bytes) * double(input.world_size - 1) / double(input.world_size) / (double(config['dist-nvlink-bus-gbps']) * 1000.0)) / 1000.0)"
+
+  - component: symm-mem-communicator
+    name: reduce-scatter
+    kind: kernel
+    summary: "NVLS symmetric-memory reduce-scatter on this rank (CudaCommunicator._reduce_scatter_symm_mem)."
+    sources: ["vllm/distributed/device_communicators/cuda_communicator.py:711-745"]
+    request: DistKernelLaunch
+    response: {type: object, properties: {algorithm: {type: string}}}
+    latency_ms: "= (double(has(input.num_collectives) ? input.num_collectives : 1) * (double(config['dist-symm-mem-base-us']) + double(input.bytes) * double(input.world_size - 1) / double(input.world_size) / (double(config['dist-nvlink-bus-gbps']) * 1000.0)) / 1000.0)"
+
+  - component: symm-mem-communicator
+    name: fused-scaled-matmul-reduce-scatter
+    kind: kernel
+    summary: "torch.ops.symm_mem.fused_scaled_matmul_reduce_scatter (PyTorch-owned kernel, latency only)."
+    sources: ["vllm/distributed/parallel_state.py:381-395"]
+    request: DistKernelLaunch
+    response: {type: object, properties: {algorithm: {type: string}}}
+    latency_ms: "= ((double(config['dist-symm-mem-base-us']) + double(input.bytes) / (double(config['dist-nvlink-bus-gbps']) * 1000.0)) / 1000.0)"
+
+  - component: pynccl
+    name: all-reduce-symmetric-with-copy
+    kind: kernel
+    summary: "torch.ops.vllm.all_reduce_symmetric_with_copy: allocate symmetric input/output in the NCCL symmetric pool, copy the input in, and ncclAllReduce."
+    sources: ["vllm/distributed/device_communicators/pynccl.py:84-88", "vllm/distributed/device_communicators/pynccl.py:73-79"]
+    request: DistKernelLaunch
+    response: {type: object, properties: {algorithm: {type: string}, out_none: {type: boolean}}}
+    behavior:
+      - title: Copy into the symmetric buffer, then PyNccl all_reduce
+        source: "vllm/distributed/device_communicators/pynccl.py:74-78"
+        call: pynccl-communicator.all-reduce
+        input: "= input"
+        as: ar
+      - return: {algorithm: nccl-symm-mem, out_none: "= vars.ar.value.out_none"}
+
+  - component: pynccl-communicator
+    name: status
+    kind: function
+    summary: "Whether this PyNcclCommunicator is disabled (NCCL library missing or world size 1)."
+    sources: ["vllm/distributed/device_communicators/pynccl.py:125-141"]
+    request: {type: object, properties: {}}
+    response: {type: object, properties: {disabled: {type: boolean}}}
+    behavior:
+      - return: {disabled: "= state.disabled"}
+
+  - component: pynccl-communicator
+    name: all-reduce
+    kind: kernel
+    summary: "PyNcclCommunicator.all_reduce: ncclAllReduce on the current stream; returns None when disabled."
+    sources: ["vllm/distributed/device_communicators/pynccl.py:268-299"]
+    request: DistKernelLaunch
+    response: {type: object, properties: {algorithm: {type: string}, out_none: {type: boolean}}}
+    latency_ms: "= state.disabled ? 0.0 : (double(has(input.num_collectives) ? input.num_collectives : 1) * (double(config['dist-nccl-base-us']) + 2.0 * double(input.bytes) * double(input.world_size - 1) / double(input.world_size) / (double(config['dist-nvlink-bus-gbps']) * 1000.0)) / 1000.0)"
+    behavior:
+      - if: "state.disabled"
+        then:
+          - source: "vllm/distributed/device_communicators/pynccl.py:275-276"
+            return: {algorithm: none, out_none: true}
+      - source: "vllm/distributed/device_communicators/pynccl.py:290-299"
+        return: {algorithm: nccl-ring, out_none: false}
+
+  - component: pynccl-communicator
+    name: all-gather
+    kind: kernel
+    summary: "PyNcclCommunicator.all_gather: ncclAllGather into the output buffer."
+    sources: ["vllm/distributed/device_communicators/pynccl.py:301-322"]
+    request: DistKernelLaunch
+    response: {type: object, properties: {algorithm: {type: string}}}
+    latency_ms: "= (double(has(input.num_collectives) ? input.num_collectives : 1) * (double(config['dist-nccl-base-us']) + double(input.bytes) * double(input.world_size - 1) / (double(config['dist-nvlink-bus-gbps']) * 1000.0)) / 1000.0)"
+
+  - component: pynccl-communicator
+    name: reduce-scatter
+    kind: kernel
+    summary: "PyNcclCommunicator.reduce_scatter: ncclReduceScatter; silently does nothing when disabled."
+    sources: ["vllm/distributed/device_communicators/pynccl.py:359-385"]
+    request: DistKernelLaunch
+    response: {type: object, properties: {algorithm: {type: string}}}
+    latency_ms: "= (double(has(input.num_collectives) ? input.num_collectives : 1) * (double(config['dist-nccl-base-us']) + double(input.bytes) * double(input.world_size - 1) / double(input.world_size) / (double(config['dist-nvlink-bus-gbps']) * 1000.0)) / 1000.0)"
+
+  - component: torch-distributed
+    name: all-reduce
+    kind: kernel
+    summary: "torch.distributed.all_reduce on the device group (fallback)."
+    sources: ["vllm/distributed/device_communicators/cuda_communicator.py:430-434"]
+    request: DistKernelLaunch
+    response: {type: object, properties: {algorithm: {type: string}}}
+    latency_ms: "= (double(has(input.num_collectives) ? input.num_collectives : 1) * (2.0 * double(config['dist-nccl-base-us']) + 2.0 * double(input.bytes) / (double(config['dist-nvlink-bus-gbps']) * 1000.0)) / 1000.0)"
+
+  - component: torch-distributed
+    name: all-gather
+    kind: kernel
+    summary: "torch.distributed.all_gather_into_tensor on the device group (DeviceCommunicatorBase.all_gather)."
+    sources: ["vllm/distributed/device_communicators/base_device_communicator.py:265-288"]
+    request: DistKernelLaunch
+    response: {type: object, properties: {algorithm: {type: string}}}
+    latency_ms: "= (double(has(input.num_collectives) ? input.num_collectives : 1) * (2.0 * double(config['dist-nccl-base-us']) + double(input.bytes) * double(input.world_size) / (double(config['dist-nvlink-bus-gbps']) * 1000.0)) / 1000.0)"
+
+  # ---------------------------------------------------------------- CustomAllreduce (Python)
+  - component: custom-allreduce
+    name: init
+    kind: function
+    summary: "CustomAllreduce.__init__: decide whether the custom all-reduce can run on this group, and if so allocate the IPC buffers. Each refusal leaves disabled=True with a warning; nothing fails."
+    sources: ["vllm/distributed/device_communicators/custom_all_reduce.py:137-330"]
+    request:
+      type: object
+      required: [world_size]
+      properties:
+        world_size: {type: integer, examples: [4]}
+        custom_ar_library: {type: boolean, default: true}
+        same_node: {type: boolean, default: true}
+        fully_connected: {type: boolean, default: true}
+        mnnvl_capable: {type: boolean, default: false}
+        platform: {type: string, enum: [cuda, rocm], default: cuda}
+    response: {type: object, properties: {disabled: {type: boolean}, reason: {type: string}, max_size: {type: integer}}}
+    behavior:
+      - set: {state.disabled: true, state.disabled_reason: ""}
+      - if: "!input.custom_ar_library"
+        then:
+          - title: Missing custom all-reduce library (non-GPU build)
+            source: "vllm/distributed/device_communicators/custom_all_reduce.py:189-195"
+            set: {state.disabled_reason: missing-library}
+          - return: {disabled: true, reason: missing-library}
+      - if: "input.world_size == 1"
+        then:
+          - source: "vllm/distributed/device_communicators/custom_all_reduce.py:209-212"
+            set: {state.disabled_reason: single-gpu}
+          - return: {disabled: true, reason: single-gpu}
+      - if: "!(input.world_size in [2, 4, 6, 8, 16])"
+        then:
+          - title: Unsupported world size
+            source: "vllm/distributed/device_communicators/custom_all_reduce.py:214-222"
+            set: {state.disabled_reason: unsupported-world-size}
+          - return: {disabled: true, reason: unsupported-world-size}
+      - if: "!input.same_node && !input.mnnvl_capable"
+        then:
+          - title: Multi-node group without MNNVL on every rank
+            source: "vllm/distributed/device_communicators/custom_all_reduce.py:234-239"
+            set: {state.disabled_reason: no-mnnvl}
+          - return: {disabled: true, reason: no-mnnvl}
+      - if: "input.same_node && input.world_size > 2 && !input.fully_connected"
+        then:
+          - title: More than two PCIe-only GPUs
+            source: "vllm/distributed/device_communicators/custom_all_reduce.py:270-276"
+            set: {state.disabled_reason: pcie-only}
+          - return: {disabled: true, reason: pcie-only}
+      - if: "input.same_node && input.platform != 'rocm'"
+        then:
+          - title: Test P2P capability (cached)
+            source: "vllm/distributed/device_communicators/custom_all_reduce.py:281-290"
+            call: all-reduce-utils.can-p2p
+            input: {world_size: "= input.world_size", rank: "= int(self.replace('rank', ''))"}
+            as: p2p
+          - if: "!vars.p2p.value.ok"
+            then:
+              - source: "vllm/distributed/device_communicators/custom_all_reduce.py:285-294"
+                set: {state.disabled_reason: p2p-failed}
+              - return: {disabled: true, reason: p2p-failed}
+      - title: Enabled; allocate the IPC meta and buffer for every rank
+        source: "vllm/distributed/device_communicators/custom_all_reduce.py:293-330"
+        set:
+          state.disabled: false
+          state.fully_connected: "= input.fully_connected"
+          state.same_node: "= input.same_node"
+          state.mnnvl_only: "= !input.same_node"
+          state.max_size: "= input.world_size <= 4 ? 8388608 : (input.world_size == 6 ? 524288 : 262144)"
+      - return: {disabled: false, reason: "", max_size: "= state.max_size"}
+
+  - component: custom-allreduce
+    name: disable
+    kind: function
+    summary: "No CustomAllreduce is created (custom all-reduce turned off, or not the tp group)."
+    sources: ["vllm/distributed/device_communicators/cuda_communicator.py:56-66"]
+    request: {type: object, properties: {reason: {type: string}}}
+    response: {type: object, properties: {disabled: {type: boolean}}}
+    behavior:
+      - set: {state.disabled: true, state.disabled_reason: "= input.reason"}
+      - return: {disabled: true}
+
+  - component: custom-allreduce
+    name: should-custom-ar
+    kind: function
+    summary: "CustomAllreduce.should_custom_ar: enabled, at most 8 GPUs, fp32/fp16/bf16, a multiple of 16 bytes, and (2 GPUs or fully connected) with size < max_size (always when batch invariant)."
+    sources: ["vllm/distributed/device_communicators/custom_all_reduce.py:499-514"]
+    request: {type: object, required: [bytes, world_size], properties: {bytes: {type: integer}, dtype: {type: string}, world_size: {type: integer}}}
+    response: {type: object, properties: {use: {type: boolean}, reason: {type: string}}}
+    behavior:
+      - if: "state.disabled || input.world_size > 8"
+        then:
+          - source: "vllm/distributed/device_communicators/custom_all_reduce.py:500-501"
+            return: {use: false, reason: disabled}
+      - if: "!(input.dtype in ['float32', 'float16', 'bfloat16'])"
+        then:
+          - source: "vllm/distributed/device_communicators/custom_all_reduce.py:502-503"
+            return: {use: false, reason: dtype}
+      - if: "input.bytes % 16 != 0"
+        then:
+          - source: "vllm/distributed/device_communicators/custom_all_reduce.py:505-507"
+            return: {use: false, reason: alignment}
+      - if: "input.world_size == 2 || state.fully_connected"
+        then:
+          - source: "vllm/distributed/device_communicators/custom_all_reduce.py:512-513"
+            return: {use: "= state.batch_invariant || input.bytes < state.max_size", reason: "= state.batch_invariant || input.bytes < state.max_size ? '' : 'too-large'"}
+      - source: "vllm/distributed/device_communicators/custom_all_reduce.py:514"
+        return: {use: false, reason: not-fully-connected}
+
+  - component: custom-allreduce
+    name: custom-all-reduce
+    kind: function
+    summary: "CustomAllreduce.custom_all_reduce on this rank: during CUDA-graph capture all-reduce the registered buffer in place; in eager mode copy into the pre-registered IPC buffer (all_reduce(registered=False)), chunking inputs larger than max_size."
+    sources: ["vllm/distributed/device_communicators/custom_all_reduce.py:549-565", "vllm/distributed/device_communicators/custom_all_reduce.py:516-547"]
+    request: DistKernelLaunch
+    response: {type: object, properties: {algorithm: {type: string}, chunks: {type: integer}}}
+    behavior:
+      - set:
+          vars.chunks: "= input.bytes <= state.max_size ? 1 : (input.bytes + state.max_size - 1) / state.max_size"
+          vars.registered: "= state.capturing"
+      - title: "Chunk inputs above max_size (only reachable in batch-invariant mode)"
+        source: "vllm/distributed/device_communicators/custom_all_reduce.py:526-537"
+        call: custom-allreduce-cuda.all-reduce
+        input: {bytes: "= input.bytes / vars.chunks", world_size: "= input.world_size", num_collectives: "= (has(input.num_collectives) ? input.num_collectives : 1) * vars.chunks", registered: "= vars.registered", dtype: "= has(input.dtype) ? input.dtype : 'bfloat16'"}
+        as: ar
+      - return: {algorithm: "= vars.ar.value.algorithm", chunks: "= vars.chunks"}
+
+  - component: custom-allreduce
+    name: custom-all-gather
+    kind: function
+    summary: "CustomAllreduce.custom_all_gather: gate on should_custom_all_gather, then every rank launches the MNNVL Lamport kernel (multicast) or the legacy IPC all-gather."
+    sources: ["vllm/distributed/device_communicators/custom_all_reduce.py:567-619"]
+    request: {type: object, required: [num_tokens, world_size, ranks], properties: {num_tokens: {type: integer}, hidden_size: {type: integer}, dtype: {type: string}, world_size: {type: integer}, ranks: {type: array, items: {type: string}}}}
+    response: {type: object, properties: {used: {type: boolean}, backend: {type: string}, out_tokens: {type: integer}}}
+    errors:
+      - {code: dist-backend-error, status: 0, retryable: false}
+    behavior:
+      - set:
+          vars.dtype: "= has(input.dtype) ? input.dtype : 'bfloat16'"
+          vars.hidden: "= has(input.hidden_size) ? input.hidden_size : 4096"
+      - set:
+          vars.bytes: "= input.num_tokens * vars.hidden * (vars.dtype == 'float32' ? 4 : 2)"
+          vars.max: "= state.mnnvl_multicast ? (input.world_size == 2 ? 8388608 : (input.world_size == 4 ? 4194304 : 2097152)) : state.max_all_gather_size"
+      - title: should_custom_all_gather
+        detail: "disabled or not CUDA, 16 GPUs on one node, a dtype other than fp32/fp16/bf16, size not in (0, max], not 16-byte aligned, or neither fully connected nor multicast: decline with None."
+        source: "vllm/distributed/device_communicators/custom_all_reduce.py:567-589"
+        if: "state.disabled || (input.world_size == 16 && !state.mnnvl_only) || !(vars.dtype in ['float32', 'float16', 'bfloat16']) || vars.bytes <= 0 || vars.bytes > vars.max || vars.bytes % 16 != 0 || !(state.fully_connected || state.mnnvl_multicast)"
+        then:
+          - return: {used: false, backend: none}
+      - set:
+          vars.op: "= state.mnnvl_multicast ? 'custom-all-gather-reduce-scatter-ops.mnnvl-lamport-all-gather' : 'custom-all-gather-reduce-scatter-ops.custom-all-gather'"
+      - title: Meet the other ranks of the group (every rank calls the collective once)
+        detail: "A collective completes only when all ranks have entered it: the latest arrival sets the start, and a rank that never arrives makes the others time out (torch's process-group timeout, 600 s for NCCL by default)."
+        source: "vllm/distributed/parallel_state.py:1953-1960"
+        rendezvous: "= 'tp-custom-allgather:' + string(has(input.layer) ? input.layer : 0)"
+        count: "= config['tensor-parallel-size']"
+        value: "= self"
+        timeout_ms: "= !('distributed-timeout-seconds' in config) || config['distributed-timeout-seconds'] == null ? 600000 : config['distributed-timeout-seconds'] * 1000"
+        as: meet
+        on_error:
+          - fail: {code: dist-backend-error, status: 0, message: "= 'collective timed out: ' + string(error.data.arrived) + ' of ' + string(error.data.count) + ' ranks arrived'"}
+      - title: Launch the all-gather kernel on this rank
+        source: "vllm/distributed/device_communicators/custom_all_reduce.py:594-618"
+        call: "= vars.op"
+        targets: [custom-all-gather-reduce-scatter-ops.mnnvl-lamport-all-gather, custom-all-gather-reduce-scatter-ops.custom-all-gather]
+        input: {bytes: "= vars.bytes", world_size: "= input.world_size"}
+      - return: {used: true, backend: "= state.mnnvl_multicast ? 'mnnvl-lamport' : 'legacy'", out_tokens: "= input.num_tokens * input.world_size"}
+
+  - component: custom-allreduce
+    name: custom-reduce-scatter
+    kind: function
+    summary: "CustomAllreduce.custom_reduce_scatter: _select_reduce_scatter_backend picks mnnvl_lamport, mnnvl_multimem or legacy (or None), then every rank launches that kernel."
+    sources: ["vllm/distributed/device_communicators/custom_all_reduce.py:621-715"]
+    request: {type: object, required: [num_tokens, world_size, ranks], properties: {num_tokens: {type: integer}, hidden_size: {type: integer}, dtype: {type: string}, world_size: {type: integer}, ranks: {type: array, items: {type: string}}}}
+    response: {type: object, properties: {used: {type: boolean}, backend: {type: string}, out_tokens: {type: integer}}}
+    errors:
+      - {code: dist-backend-error, status: 0, retryable: false}
+    behavior:
+      - set:
+          vars.dtype: "= has(input.dtype) ? input.dtype : 'bfloat16'"
+          vars.hidden: "= has(input.hidden_size) ? input.hidden_size : 4096"
+      - set:
+          vars.bytes: "= input.num_tokens * vars.hidden * (vars.dtype == 'float32' ? 4 : 2)"
+      - title: No backend for this tensor
+        detail: "Disabled, batch-invariant, 16 GPUs on one node, wrong dtype, rows not divisible by world size, or an output shard not 16-byte aligned."
+        source: "vllm/distributed/device_communicators/custom_all_reduce.py:624-638"
+        if: "state.disabled || state.batch_invariant || (input.world_size == 16 && !state.mnnvl_only) || !(vars.dtype in ['float32', 'float16', 'bfloat16']) || input.num_tokens % input.world_size != 0 || (vars.bytes / input.world_size) % 16 != 0"
+        then:
+          - return: {used: false, backend: none}
+      - if: "state.mnnvl_multicast"
+        then:
+          - source: "vllm/distributed/device_communicators/custom_all_reduce.py:640-656"
+            set:
+              vars.backend: "= vars.bytes <= state.max_mnnvl_reduce_scatter_size ? 'mnnvl_lamport' : (state.mnnvl_multimem_rs_supported && vars.bytes <= state.max_mnnvl_multimem_reduce_scatter_size ? 'mnnvl_multimem' : 'none')"
+        else:
+          - source: "vllm/distributed/device_communicators/custom_all_reduce.py:658-659"
+            set:
+              vars.backend: "= state.fully_connected && vars.bytes <= state.max_reduce_scatter_size ? 'legacy' : 'none'"
+      - if: "vars.backend == 'none'"
+        then:
+          - return: {used: false, backend: none}
+      - set:
+          vars.op: "= vars.backend == 'mnnvl_lamport' ? 'custom-all-gather-reduce-scatter-ops.mnnvl-lamport-reduce-scatter' : (vars.backend == 'mnnvl_multimem' ? 'custom-all-gather-reduce-scatter-ops.mnnvl-multimem-reduce-scatter' : 'custom-all-gather-reduce-scatter-ops.custom-reduce-scatter')"
+      - title: Meet the other ranks of the group (every rank calls the collective once)
+        detail: "A collective completes only when all ranks have entered it: the latest arrival sets the start, and a rank that never arrives makes the others time out (torch's process-group timeout, 600 s for NCCL by default)."
+        source: "vllm/distributed/parallel_state.py:1953-1960"
+        rendezvous: "= 'tp-custom-reducescatter:' + string(has(input.layer) ? input.layer : 0)"
+        count: "= config['tensor-parallel-size']"
+        value: "= self"
+        timeout_ms: "= !('distributed-timeout-seconds' in config) || config['distributed-timeout-seconds'] == null ? 600000 : config['distributed-timeout-seconds'] * 1000"
+        as: meet
+        on_error:
+          - fail: {code: dist-backend-error, status: 0, message: "= 'collective timed out: ' + string(error.data.arrived) + ' of ' + string(error.data.count) + ' ranks arrived'"}
+      - source: "vllm/distributed/device_communicators/custom_all_reduce.py:678-715"
+        call: "= vars.op"
+        targets: [custom-all-gather-reduce-scatter-ops.mnnvl-lamport-reduce-scatter, custom-all-gather-reduce-scatter-ops.mnnvl-multimem-reduce-scatter, custom-all-gather-reduce-scatter-ops.custom-reduce-scatter]
+        input: {bytes: "= vars.bytes", world_size: "= input.world_size"}
+      - return: {used: true, backend: "= vars.backend", out_tokens: "= input.num_tokens / input.world_size"}
+
+  # ---------------------------------------------------------------- C++ CustomAllreduce
+  - component: custom-allreduce-cuda
+    name: all-reduce
+    kind: function
+    summary: "The _C_custom_ar all_reduce op body (csrc/custom_all_reduce.cu) and CustomAllreduce::allreduce: pick the one-stage or two-stage kernel by world size, connectivity and size, or as forced by VLLM_CUSTOM_ALLREDUCE_ALGO."
+    sources: ["csrc/custom_all_reduce.cu:70-116", "csrc/custom_all_reduce.cuh:236-327"]
+    request:
+      type: object
+      required: [bytes, world_size]
+      properties:
+        bytes: {type: integer, examples: [1048576]}
+        world_size: {type: integer, examples: [4]}
+        num_collectives: {type: integer, default: 1}
+        registered: {type: boolean, default: false}
+        dtype: {type: string, default: bfloat16}
+    response: {type: object, properties: {algorithm: {type: string}}}
+    errors:
+      - {code: runtime-error, status: 0, retryable: false}
+    behavior:
+      - set:
+          vars.dtype: "= has(input.dtype) ? input.dtype : 'bfloat16'"
+          vars.n: "= has(input.num_collectives) ? input.num_collectives : 1"
+      - if: "!(vars.dtype in ['float32', 'float16', 'bfloat16'])"
+        then:
+          - source: "csrc/custom_all_reduce.cu:111-113"
+            fail: {code: runtime-error, status: 0, message: "custom allreduce only supports float32, float16 and bfloat16"}
+      - set: {vars.algo: "= config['vllm-custom-allreduce-algo']"}
+      - if: "vars.algo != '' && !(vars.algo in ['1stage', 'oneshot', '2stage', 'twoshot'])"
+        then:
+          - title: Invalid VLLM_CUSTOM_ALLREDUCE_ALGO
+            source: "csrc/custom_all_reduce.cuh:281-285"
+            fail: {code: runtime-error, status: 0, message: "= 'Invalid VLLM_CUSTOM_ALLREDUCE_ALGO: ' + vars.algo + '. Valid values: 1stage, oneshot, 2stage, twoshot'"}
+      - if: "!(input.world_size in [2, 4, 6, 8])"
+        then:
+          - source: "csrc/custom_all_reduce.cuh:317-322"
+            fail: {code: runtime-error, status: 0, message: "= 'custom allreduce only supports num gpus in (2,4,6,8). Actual num gpus = ' + string(input.world_size)"}
+      - title: Kernel choice (REDUCE_CASE)
+        detail: "Forced by the env var; else 2 GPUs always one-stage; fully connected 4 GPUs < 512 KB or 6/8 GPUs < 256 KB one-stage; otherwise two-stage (reduce-scatter then all-gather)."
+        source: "csrc/custom_all_reduce.cuh:291-310"
+        set:
+          vars.kernel: "= vars.algo in ['1stage', 'oneshot'] ? '1stage' : (vars.algo in ['2stage', 'twoshot'] ? '2stage' : (input.world_size == 2 ? '1stage' : ((input.world_size <= 4 && input.bytes < 524288) || (input.world_size <= 8 && input.bytes < 262144) ? '1stage' : '2stage')))"
+      - if: "vars.kernel == '1stage'"
+        then:
+          - call: custom-allreduce-cuda.cross-device-reduce-1stage
+            input: {bytes: "= input.bytes", world_size: "= input.world_size", num_collectives: "= vars.n"}
+        else:
+          - call: custom-allreduce-cuda.cross-device-reduce-2stage
+            input: {bytes: "= input.bytes", world_size: "= input.world_size", num_collectives: "= vars.n"}
+      - return: {algorithm: "= 'custom-' + vars.kernel"}
+
+  - component: custom-allreduce-cuda
+    name: cross-device-reduce-1stage
+    kind: kernel
+    summary: "cross_device_reduce_1stage<T, ngpus>: barrier, every rank reads all peers' buffers and sums (bitwise-identical order), barrier."
+    sources: ["csrc/custom_all_reduce.cuh:7-23"]
+    request: DistKernelLaunch
+    response: {type: object, properties: {algorithm: {type: string}}}
+    latency_ms: "= (double(has(input.num_collectives) ? input.num_collectives : 1) * (double(config['dist-custom-ar-base-us']) + double(input.bytes) * double(input.world_size - 1) / (double(config['dist-nvlink-bus-gbps']) * 1000.0)) / 1000.0)"
+
+  - component: custom-allreduce-cuda
+    name: cross-device-reduce-2stage
+    kind: kernel
+    summary: "cross_device_reduce_2stage<T, ngpus>: reduce-scatter into the peer tmp buffers, barrier, then all-gather."
+    sources: ["csrc/custom_all_reduce.cuh:30-75"]
+    request: DistKernelLaunch
+    response: {type: object, properties: {algorithm: {type: string}}}
+    latency_ms: "= (double(has(input.num_collectives) ? input.num_collectives : 1) * (2.0 * double(config['dist-custom-ar-base-us']) + 2.0 * double(input.bytes) * double(input.world_size - 1) / double(input.world_size) / (double(config['dist-nvlink-bus-gbps']) * 1000.0)) / 1000.0)"
+
+  # The _C_custom_ar all-gather / reduce-scatter torch ops (registered in custom_all_gather_reduce_scatter_ops.cpp).
+  - component: custom-all-gather-reduce-scatter-ops
+    name: custom-all-gather
+    kind: kernel
+    summary: "_C_custom_ar::custom_all_gather: copy the input into the registered IPC buffer and launch cross_device_all_gather<ngpus> (2/4/6/8 GPUs)."
+    sources: ["csrc/custom_all_gather_reduce_scatter_ops.cpp:7-9", "csrc/custom_all_gather_reduce_scatter.cu:250-269", "csrc/custom_all_gather_reduce_scatter.cu:13-42", "csrc/custom_all_gather_reduce_scatter.cuh:17-36"]
+    request: DistKernelLaunch
+    response: {type: object, properties: {algorithm: {type: string}}}
+    errors:
+      - {code: runtime-error, status: 0, retryable: false}
+    latency_ms: "= ((double(config['dist-custom-ar-base-us']) + double(input.bytes) * double(input.world_size) / (double(config['dist-nvlink-bus-gbps']) * 1000.0)) / 1000.0)"
+    behavior:
+      - if: "!(input.world_size in [2, 4, 6, 8])"
+        then:
+          - source: "csrc/custom_all_gather_reduce_scatter.cu:33-40"
+            fail: {code: runtime-error, status: 0, message: "custom allgather only supports num gpus in (2,4,6,8)"}
+      - title: Launch cross_device_all_gather
+        source: "csrc/custom_all_gather_reduce_scatter.cu:25-29"
+        return: {algorithm: cross_device_all_gather}
+
+  - component: custom-all-gather-reduce-scatter-ops
+    name: mnnvl-lamport-all-gather
+    kind: kernel
+    summary: "_C_custom_ar::mnnvl_lamport_all_gather: the input times world size must fit one Lamport stage; launch mnnvl_lamport_all_gather<T, ngpus> (2/4/6/8/16 GPUs) over the multicast buffer."
+    sources: ["csrc/custom_all_gather_reduce_scatter_ops.cpp:10-12", "csrc/custom_all_gather_reduce_scatter.cu:271-318", "csrc/custom_all_gather_reduce_scatter.cu:44-102", "csrc/custom_all_gather_reduce_scatter.cuh:342-410"]
+    request: DistKernelLaunch
+    response: {type: object, properties: {algorithm: {type: string}}}
+    errors:
+      - {code: runtime-error, status: 0, retryable: false}
+    latency_ms: "= ((double(config['dist-custom-ar-base-us']) + double(input.bytes) * double(input.world_size) / (double(config['dist-nvlink-bus-gbps']) * 1000.0)) / 1000.0)"
+    behavior:
+      - if: "!(input.world_size in [2, 4, 6, 8, 16])"
+        then:
+          - source: "csrc/custom_all_gather_reduce_scatter.cu:96-99"
+            fail: {code: runtime-error, status: 0, message: "MNNVL Lamport allgather only supports num gpus in (2,4,6,8,16)"}
+      - title: Launch mnnvl_lamport_all_gather with programmatic stream serialization
+        source: "csrc/custom_all_gather_reduce_scatter.cu:61-77"
+        return: {algorithm: mnnvl_lamport_all_gather}
+
+  - component: custom-all-gather-reduce-scatter-ops
+    name: custom-reduce-scatter
+    kind: kernel
+    summary: "_C_custom_ar::custom_reduce_scatter: copy into the registered IPC buffer and launch cross_device_reduce_scatter<T, ngpus> (2/4/6/8 GPUs)."
+    sources: ["csrc/custom_all_gather_reduce_scatter_ops.cpp:14-16", "csrc/custom_all_gather_reduce_scatter.cu:320-363", "csrc/custom_all_gather_reduce_scatter.cu:104-132", "csrc/custom_all_gather_reduce_scatter.cuh:37-58"]
+    request: DistKernelLaunch
+    response: {type: object, properties: {algorithm: {type: string}}}
+    errors:
+      - {code: runtime-error, status: 0, retryable: false}
+    latency_ms: "= ((double(config['dist-custom-ar-base-us']) + double(input.bytes) * double(input.world_size - 1) / double(input.world_size) / (double(config['dist-nvlink-bus-gbps']) * 1000.0)) / 1000.0)"
+    behavior:
+      - if: "!(input.world_size in [2, 4, 6, 8])"
+        then:
+          - source: "csrc/custom_all_gather_reduce_scatter.cu:123-130"
+            fail: {code: runtime-error, status: 0, message: "custom reduce-scatter only supports num gpus in (2,4,6,8)"}
+      - title: Launch cross_device_reduce_scatter
+        source: "csrc/custom_all_gather_reduce_scatter.cu:116-120"
+        return: {algorithm: cross_device_reduce_scatter}
+
+  - component: custom-all-gather-reduce-scatter-ops
+    name: mnnvl-lamport-reduce-scatter
+    kind: kernel
+    summary: "_C_custom_ar::mnnvl_lamport_reduce_scatter: launch mnnvl_lamport_reduce_scatter_kernel<T, ngpus> (2/4/6/8/16 GPUs)."
+    sources: ["csrc/custom_all_gather_reduce_scatter_ops.cpp:17-19", "csrc/custom_all_gather_reduce_scatter.cu:365-411", "csrc/custom_all_gather_reduce_scatter.cu:134-192", "csrc/custom_all_gather_reduce_scatter.cuh:411-470"]
+    request: DistKernelLaunch
+    response: {type: object, properties: {algorithm: {type: string}}}
+    errors:
+      - {code: runtime-error, status: 0, retryable: false}
+    latency_ms: "= ((double(config['dist-custom-ar-base-us']) + double(input.bytes) * double(input.world_size - 1) / double(input.world_size) / (double(config['dist-nvlink-bus-gbps']) * 1000.0)) / 1000.0)"
+    behavior:
+      - if: "!(input.world_size in [2, 4, 6, 8, 16])"
+        then:
+          - source: "csrc/custom_all_gather_reduce_scatter.cu:179-188"
+            fail: {code: runtime-error, status: 0, message: "MNNVL Lamport reduce-scatter only supports num gpus in (2,4,6,8,16)"}
+      - title: Launch mnnvl_lamport_reduce_scatter_kernel
+        source: "csrc/custom_all_gather_reduce_scatter.cu:163-172"
+        return: {algorithm: mnnvl_lamport_reduce_scatter_kernel}
+
+  - component: custom-all-gather-reduce-scatter-ops
+    name: mnnvl-multimem-reduce-scatter
+    kind: kernel
+    summary: "_C_custom_ar::mnnvl_multimem_reduce_scatter: barrier kernel, multimem reduce-scatter kernel, barrier kernel (2/4/8 GPUs, NVLS multicast, never on ROCm)."
+    sources: ["csrc/custom_all_gather_reduce_scatter_ops.cpp:20-22", "csrc/custom_all_gather_reduce_scatter.cu:413-440", "csrc/custom_all_gather_reduce_scatter.cu:194-241", "csrc/custom_all_gather_reduce_scatter.cuh:113-130", "csrc/custom_all_gather_reduce_scatter.cuh:131-175"]
+    request: DistKernelLaunch
+    response: {type: object, properties: {algorithm: {type: string}}}
+    errors:
+      - {code: runtime-error, status: 0, retryable: false}
+    latency_ms: "= ((2.0 * double(config['dist-custom-ar-base-us']) + double(input.bytes) * double(input.world_size - 1) / double(input.world_size) / (double(config['dist-nvlink-bus-gbps']) * 1000.0)) / 1000.0)"
+    behavior:
+      - if: "!(input.world_size in [2, 4, 8])"
+        then:
+          - source: "csrc/custom_all_gather_reduce_scatter.cu:231-237"
+            fail: {code: runtime-error, status: 0, message: "MNNVL multimem reduce-scatter only supports num gpus in (2,4,8)"}
+      - title: Barrier, mnnvl_multimem_reduce_scatter_kernel, barrier
+        source: "csrc/custom_all_gather_reduce_scatter.cu:220-229"
+        return: {algorithm: mnnvl_multimem_reduce_scatter_kernel}
+
+  # ---------------------------------------------------------------- P2P check
+  - component: all-reduce-utils
+    name: can-p2p
+    kind: function
+    summary: "custom_all_reduce._can_p2p: for every peer, trust torch's can_device_access_peer when VLLM_SKIP_P2P_CHECK, else the cached gpu_p2p_access_check."
+    sources: ["vllm/distributed/device_communicators/custom_all_reduce.py:86-100"]
+    request: {type: object, required: [world_size, rank], properties: {world_size: {type: integer}, rank: {type: integer}}}
+    response: {type: object, properties: {ok: {type: boolean}, source: {type: string}}}
+    behavior:
+      - if: "config['vllm-skip-p2p-check']"
+        then:
+          - title: Trust the driver's P2P report
+            source: "vllm/distributed/device_communicators/custom_all_reduce.py:90-97"
+            return: {ok: "= !('driver' in state.p2p_ok) || state.p2p_ok.driver", source: driver}
+      - call: all-reduce-utils.gpu-p2p-access-check
+        input: {src: "= input.rank", tgt: "= (input.rank + 1) % input.world_size"}
+        as: chk
+      - return: {ok: "= vars.chk.value.ok", source: cache}
+
+  - component: all-reduce-utils
+    name: gpu-p2p-access-check
+    kind: function
+    summary: "gpu_p2p_access_check: answer from the in-process cache; otherwise the local master (local_rank 0) generates the JSON cache file by running this module as a subprocess, a barrier waits for it, then every rank reads it."
+    sources: ["vllm/distributed/device_communicators/all_reduce_utils.py:344-433"]
+    request: {type: object, required: [src, tgt], properties: {src: {type: integer}, tgt: {type: integer}}}
+    response: {type: object, properties: {ok: {type: boolean}, generated: {type: boolean}}}
+    errors:
+      - {code: runtime-error, status: 0, retryable: false}
+    behavior:
+      - if: "state.cache_loaded"
+        then:
+          - source: "vllm/distributed/device_communicators/all_reduce_utils.py:348-350"
+            return: {ok: "= !('pair' in state.p2p_ok) || state.p2p_ok.pair", generated: false}
+      - if: "!state.cache_file_exists"
+        then:
+          - title: Local master generates the cache with a subprocess
+            source: "vllm/distributed/device_communicators/all_reduce_utils.py:369-421"
+            call: all-reduce-utils.main
+            input: {pairs: 2}
+            as: probe
+          - set: {state.cache_file_exists: true, state.p2p_ok: "= merge(state.p2p_ok, {'pair': vars.probe.value.ok})"}
+      - title: Read the cache file after the world barrier
+        source: "vllm/distributed/device_communicators/all_reduce_utils.py:422-428"
+        set: {state.cache_loaded: true}
+      - return: {ok: "= !('pair' in state.p2p_ok) || state.p2p_ok.pair", generated: "= has(vars.probe)"}
+
+  - component: all-reduce-utils
+    name: main
+    kind: cli
+    summary: "all_reduce_utils.py __main__: the probe subprocess. Reads (batch_src, batch_tgt, output_file) from stdin, runs can_actually_p2p (real IPC writes between GPU pairs), pickles the results to the file. A non-zero exit becomes a RuntimeError in the parent."
+    sources: ["vllm/distributed/device_communicators/all_reduce_utils.py:436-440", "vllm/distributed/device_communicators/all_reduce_utils.py:244-327"]
+    request: {type: object, properties: {pairs: {type: integer, default: 2}}}
+    response: {type: object, properties: {ok: {type: boolean}}}
+    errors:
+      - {code: runtime-error, status: 0, retryable: false}
+    latency_ms: 2000
+    behavior:
+      - choice: probe
+        default: ok
+        options:
+          ok:
+            - return: {ok: true}
+          broken:
+            - title: Driver claims P2P but the IPC write does not arrive
+              source: "vllm/distributed/device_communicators/all_reduce_utils.py:244-257"
+              return: {ok: false}
+          crashed:
+            - title: The subprocess failed; the parent wraps it
+              source: "vllm/distributed/device_communicators/all_reduce_utils.py:408-416"
+              fail: {code: runtime-error, status: 0, message: "Error happened when batch testing peer-to-peer access"}
+
+flows:
+  - id: distributed-tp-all-reduce
+    tags: ["feature:tensor-parallel"]
+    name: Tensor-parallel all-reduce
+    description: "The seam tensor-model-parallel.all-reduce as models-layers calls it after a row-parallel layer."
+    entry: {caller: gpu-worker, interface: tensor-model-parallel.all-reduce, input: {num_tokens: 128, hidden_size: 4096, dtype: bfloat16}}
+    sources: ["vllm/distributed/communication_op.py:12-14"]
+  - id: distributed-tp-all-gather
+    name: Tensor-parallel all-gather
+    entry: {caller: gpu-worker, interface: tensor-model-parallel.all-gather, input: {num_tokens: 128, hidden_size: 4096, dim: -1}}
+    sources: ["vllm/distributed/communication_op.py:17-21"]
+  - id: distributed-tp-reduce-scatter
+    name: Tensor-parallel reduce-scatter
+    entry: {caller: gpu-worker, interface: tensor-model-parallel.reduce-scatter, input: {num_tokens: 128, hidden_size: 4096, dim: 0}}
+    sources: ["vllm/distributed/communication_op.py:24-28"]
+  - id: distributed-sp-custom-collectives
+    name: Sequence-parallel custom all-gather
+    description: "The sequence-parallel ops of models/common call CudaCommunicator.custom_all_gather / custom_reduce_scatter; the reduce-scatter path is a scenario step on the same world."
+    entry: {caller: gpu-worker, interface: cuda-communicator.custom-all-gather, input: {num_tokens: 128, hidden_size: 4096}}
+    sources: ["vllm/distributed/device_communicators/cuda_communicator.py:448-458"]
+  - id: distributed-sp-custom-reduce-scatter
+    name: Sequence-parallel custom reduce-scatter
+    entry: {caller: gpu-worker, interface: cuda-communicator.custom-reduce-scatter, input: {num_tokens: 128, hidden_size: 4096}}
+    sources: ["vllm/distributed/device_communicators/cuda_communicator.py:454-458"]
+  - id: distributed-init-world
+    name: Initialize the distributed environment
+    tags: [writes]
+    entry: {caller: gpu-worker, interface: parallel-state.init-distributed-environment, input: {world_size: 1, rank: 0}}
+    sources: ["vllm/distributed/parallel_state.py:1814-2016"]
+  - id: distributed-init-model-parallel
+    name: Ensure model-parallel groups
+    tags: [writes]
+    entry: {caller: gpu-worker, interface: parallel-state.ensure-model-parallel-initialized, input: {tensor_model_parallel_size: 1, pipeline_model_parallel_size: 1}}
+    sources: ["vllm/distributed/parallel_state.py:2366-2415"]
+  - id: distributed-pp-group
+    name: Read the PP group
+    entry: {caller: gpu-worker, interface: parallel-state.get-pp-group}
+    sources: ["vllm/distributed/parallel_state.py:1638-1640"]
+  - id: distributed-tp-world-size
+    name: Read the TP world size
+    entry: {caller: gpu-worker, interface: parallel-state.get-tensor-model-parallel-world-size}
+    sources: ["vllm/distributed/parallel_state.py:2437-2439"]
+  - id: distributed-destroy-model-parallel
+    name: Destroy model-parallel groups
+    tags: [writes]
+    entry: {caller: gpu-worker, interface: parallel-state.destroy-model-parallel}
+    sources: ["vllm/distributed/parallel_state.py:2458-2503"]
+  - id: distributed-custom-ar-init
+    name: Build the custom all-reduce
+    tags: [writes]
+    entry: {caller: gpu-worker, interface: custom-allreduce.init, input: {world_size: 4}}
+    sources: ["vllm/distributed/device_communicators/custom_all_reduce.py:137-330"]
+  - id: distributed-set-custom-all-reduce
+    name: Toggle the custom all-reduce
+    tags: [writes]
+    entry: {caller: gpu-worker, interface: parallel-state.set-custom-all-reduce, input: {enable: false}}
+    sources: ["vllm/distributed/parallel_state.py:1711-1713"]
+  - id: distributed-fused-matmul-reduce-scatter
+    name: Async-TP fused matmul reduce-scatter op
+    entry: {caller: gpu-worker, interface: parallel-state.patched-fused-scaled-matmul-reduce-scatter, input: {group_name: "tp:0", num_tokens: 2048, hidden_size: 8192, world_size: 4}}
+    sources: ["vllm/distributed/parallel_state.py:416-423"]
+
+scenarios:
+  # ---- all-reduce
+  - id: distributed-all-reduce-tp1-bypass
+    flow: distributed-tp-all-reduce
+    fixtures: [tp1-llama-8b]
+    expect:
+      - "result.ok && result.value.backend == 'bypass'"
+      - "calls['parallel-state.all-reduce'] == 0"
+  - id: distributed-all-reduce-tp4-decode-flashinfer
+    name: A 1 MB decode all-reduce on 4 H100s uses FlashInfer on every rank
+    flow: distributed-tp-all-reduce
+    fixtures: [tp4-llama-70b]
+    steps:
+      - {flow: distributed-tp-all-reduce, as: r0, on: rank0, at_ms: 0, await: false, input: {num_tokens: 64, hidden_size: 8192}}
+      - {flow: distributed-tp-all-reduce, as: r1, on: rank1, at_ms: 0, await: false, input: {num_tokens: 64, hidden_size: 8192}}
+      - {flow: distributed-tp-all-reduce, as: r2, on: rank2, at_ms: 0, await: false, input: {num_tokens: 64, hidden_size: 8192}}
+      - {flow: distributed-tp-all-reduce, as: r3, on: rank3, at_ms: 0, await: false, input: {num_tokens: 64, hidden_size: 8192}}
+    expect:
+      - "result.ok && result.value.backend == 'flashinfer' && result.value.world_size == 4 && result.value.bytes == 1048576"
+      - "['rank0','rank1','rank2','rank3'].all(r, calls_by_instance['flashinfer-all-reduce.all-reduce@' + r] == 1)"
+  - id: distributed-all-reduce-tp4-custom-1stage
+    name: With FlashInfer off, a 256 KB all-reduce runs the one-stage custom kernel
+    flow: distributed-tp-all-reduce
+    fixtures: [tp4-llama-70b]
+    config: {vllm-allreduce-use-flashinfer: false}
+    steps:
+      - {flow: distributed-tp-all-reduce, as: r0, on: rank0, at_ms: 0, await: false, input: {num_tokens: 16, hidden_size: 8192}}
+      - {flow: distributed-tp-all-reduce, as: r1, on: rank1, at_ms: 0, await: false, input: {num_tokens: 16, hidden_size: 8192}}
+      - {flow: distributed-tp-all-reduce, as: r2, on: rank2, at_ms: 0, await: false, input: {num_tokens: 16, hidden_size: 8192}}
+      - {flow: distributed-tp-all-reduce, as: r3, on: rank3, at_ms: 0, await: false, input: {num_tokens: 16, hidden_size: 8192}}
+    expect:
+      - "result.ok && result.value.backend == 'custom-allreduce' && result.value.algorithm == 'custom-1stage'"
+  - id: distributed-all-reduce-tp4-custom-2stage
+    name: A 4 MB all-reduce above FlashInfer's 2 MB limit runs the two-stage custom kernel
+    flow: distributed-tp-all-reduce
+    fixtures: [tp4-llama-70b]
+    steps:
+      - {flow: distributed-tp-all-reduce, as: r0, on: rank0, at_ms: 0, await: false, input: {num_tokens: 256, hidden_size: 8192}}
+      - {flow: distributed-tp-all-reduce, as: r1, on: rank1, at_ms: 0, await: false, input: {num_tokens: 256, hidden_size: 8192}}
+      - {flow: distributed-tp-all-reduce, as: r2, on: rank2, at_ms: 0, await: false, input: {num_tokens: 256, hidden_size: 8192}}
+      - {flow: distributed-tp-all-reduce, as: r3, on: rank3, at_ms: 0, await: false, input: {num_tokens: 256, hidden_size: 8192}}
+    expect:
+      - "result.ok && result.value.backend == 'custom-allreduce' && result.value.algorithm == 'custom-2stage'"
+  - id: distributed-all-reduce-tp4-prefill-symm-mem
+    name: A 32 MB prefill all-reduce exceeds the custom 8 MB limit and uses torch symmetric memory
+    flow: distributed-tp-all-reduce
+    fixtures: [tp4-llama-70b]
+    steps:
+      - {flow: distributed-tp-all-reduce, as: r0, on: rank0, at_ms: 0, await: false, input: {num_tokens: 2048, hidden_size: 8192}}
+      - {flow: distributed-tp-all-reduce, as: r1, on: rank1, at_ms: 0, await: false, input: {num_tokens: 2048, hidden_size: 8192}}
+      - {flow: distributed-tp-all-reduce, as: r2, on: rank2, at_ms: 0, await: false, input: {num_tokens: 2048, hidden_size: 8192}}
+      - {flow: distributed-tp-all-reduce, as: r3, on: rank3, at_ms: 0, await: false, input: {num_tokens: 2048, hidden_size: 8192}}
+    expect:
+      - "result.ok && result.value.backend == 'torch-symm-mem' && result.value.bytes == 33554432"
+      - "calls['custom-allreduce-cuda.all-reduce'] == 0"
+      - "duration_us >= 100"
+  - id: distributed-all-reduce-tp4-huge-pynccl
+    name: Above the 32 MB symmetric-memory limit the all-reduce falls to PyNccl
+    flow: distributed-tp-all-reduce
+    fixtures: [tp4-llama-70b]
+    steps:
+      - {flow: distributed-tp-all-reduce, as: r0, on: rank0, at_ms: 0, await: false, input: {num_tokens: 4096, hidden_size: 8192}}
+      - {flow: distributed-tp-all-reduce, as: r1, on: rank1, at_ms: 0, await: false, input: {num_tokens: 4096, hidden_size: 8192}}
+      - {flow: distributed-tp-all-reduce, as: r2, on: rank2, at_ms: 0, await: false, input: {num_tokens: 4096, hidden_size: 8192}}
+      - {flow: distributed-tp-all-reduce, as: r3, on: rank3, at_ms: 0, await: false, input: {num_tokens: 4096, hidden_size: 8192}}
+    expect:
+      - "result.ok && result.value.backend == 'pynccl'"
+      - "calls['torch-distributed.all-reduce'] == 0"
+  - id: distributed-all-reduce-pynccl-disabled-fallback
+    name: A disabled PyNccl makes every rank fall back to torch.distributed.all_reduce
+    flow: distributed-tp-all-reduce
+    fixtures: [tp4-llama-70b]
+    config: {vllm-allreduce-use-symm-mem: false}
+    state:
+      pynccl-communicator: {disabled: true}
+    steps:
+      - {flow: distributed-tp-all-reduce, as: r0, on: rank0, at_ms: 0, await: false, input: {num_tokens: 4096, hidden_size: 8192}}
+      - {flow: distributed-tp-all-reduce, as: r1, on: rank1, at_ms: 0, await: false, input: {num_tokens: 4096, hidden_size: 8192}}
+      - {flow: distributed-tp-all-reduce, as: r2, on: rank2, at_ms: 0, await: false, input: {num_tokens: 4096, hidden_size: 8192}}
+      - {flow: distributed-tp-all-reduce, as: r3, on: rank3, at_ms: 0, await: false, input: {num_tokens: 4096, hidden_size: 8192}}
+    expect:
+      - "result.ok && result.value.backend == 'pynccl'"
+      - "calls['torch-distributed.all-reduce'] == 4"
+  - id: distributed-all-reduce-int32-skips-custom
+    name: An int32 tensor never uses FlashInfer or the custom all-reduce
+    flow: distributed-tp-all-reduce
+    fixtures: [tp4-llama-70b]
+    steps:
+      - {flow: distributed-tp-all-reduce, as: r0, on: rank0, at_ms: 0, await: false, input: {num_tokens: 16, hidden_size: 8192, dtype: int32}}
+      - {flow: distributed-tp-all-reduce, as: r1, on: rank1, at_ms: 0, await: false, input: {num_tokens: 16, hidden_size: 8192, dtype: int32}}
+      - {flow: distributed-tp-all-reduce, as: r2, on: rank2, at_ms: 0, await: false, input: {num_tokens: 16, hidden_size: 8192, dtype: int32}}
+      - {flow: distributed-tp-all-reduce, as: r3, on: rank3, at_ms: 0, await: false, input: {num_tokens: 16, hidden_size: 8192, dtype: int32}}
+    expect:
+      - "result.ok && result.value.backend == 'pynccl'"
+      - "calls['custom-allreduce-cuda.all-reduce'] == 0"
+  - id: distributed-all-reduce-custom-disabled
+    name: A CustomAllreduce disabled at init sends mid-size tensors to symmetric memory
+    flow: distributed-tp-all-reduce
+    fixtures: [tp4-llama-70b]
+    state:
+      custom-allreduce: {disabled: true, disabled_reason: p2p-failed}
+    steps:
+      - {flow: distributed-tp-all-reduce, as: r0, on: rank0, at_ms: 0, await: false, input: {num_tokens: 256, hidden_size: 8192}}
+      - {flow: distributed-tp-all-reduce, as: r1, on: rank1, at_ms: 0, await: false, input: {num_tokens: 256, hidden_size: 8192}}
+      - {flow: distributed-tp-all-reduce, as: r2, on: rank2, at_ms: 0, await: false, input: {num_tokens: 256, hidden_size: 8192}}
+      - {flow: distributed-tp-all-reduce, as: r3, on: rank3, at_ms: 0, await: false, input: {num_tokens: 256, hidden_size: 8192}}
+    expect:
+      - "result.ok && result.value.backend == 'torch-symm-mem'"
+      - "calls['custom-allreduce-cuda.all-reduce'] == 0"
+  - id: distributed-all-reduce-pcie-not-fully-connected
+    name: Four PCIe GPUs that are not fully connected decline the custom all-reduce
+    flow: distributed-tp-all-reduce
+    fixtures: [tp4-llama-70b]
+    config: {vllm-allreduce-use-flashinfer: false, vllm-allreduce-use-symm-mem: false}
+    state:
+      custom-allreduce: {fully_connected: false}
+    steps:
+      - {flow: distributed-tp-all-reduce, as: r0, on: rank0, at_ms: 0, await: false, input: {num_tokens: 16, hidden_size: 8192}}
+      - {flow: distributed-tp-all-reduce, as: r1, on: rank1, at_ms: 0, await: false, input: {num_tokens: 16, hidden_size: 8192}}
+      - {flow: distributed-tp-all-reduce, as: r2, on: rank2, at_ms: 0, await: false, input: {num_tokens: 16, hidden_size: 8192}}
+      - {flow: distributed-tp-all-reduce, as: r3, on: rank3, at_ms: 0, await: false, input: {num_tokens: 16, hidden_size: 8192}}
+    expect:
+      - "result.ok && result.value.backend == 'pynccl'"
+  - id: distributed-all-reduce-forced-2stage
+    name: VLLM_CUSTOM_ALLREDUCE_ALGO=2stage forces the two-stage kernel for a small tensor
+    flow: distributed-tp-all-reduce
+    fixtures: [tp4-llama-70b]
+    config: {vllm-allreduce-use-flashinfer: false, vllm-custom-allreduce-algo: 2stage}
+    steps:
+      - {flow: distributed-tp-all-reduce, as: r0, on: rank0, at_ms: 0, await: false, input: {num_tokens: 16, hidden_size: 8192}}
+      - {flow: distributed-tp-all-reduce, as: r1, on: rank1, at_ms: 0, await: false, input: {num_tokens: 16, hidden_size: 8192}}
+      - {flow: distributed-tp-all-reduce, as: r2, on: rank2, at_ms: 0, await: false, input: {num_tokens: 16, hidden_size: 8192}}
+      - {flow: distributed-tp-all-reduce, as: r3, on: rank3, at_ms: 0, await: false, input: {num_tokens: 16, hidden_size: 8192}}
+    expect:
+      - "result.ok && result.value.algorithm == 'custom-2stage'"
+  - id: distributed-all-reduce-invalid-algo
+    name: An invalid VLLM_CUSTOM_ALLREDUCE_ALGO makes the custom kernel throw
+    flow: distributed-tp-all-reduce
+    fixtures: [tp4-llama-70b]
+    config: {vllm-allreduce-use-flashinfer: false, vllm-custom-allreduce-algo: threeshot}
+    steps:
+      - {flow: distributed-tp-all-reduce, as: r0, on: rank0, at_ms: 0, await: false, input: {num_tokens: 16, hidden_size: 8192}}
+      - {flow: distributed-tp-all-reduce, as: r1, on: rank1, at_ms: 0, await: false, input: {num_tokens: 16, hidden_size: 8192}}
+      - {flow: distributed-tp-all-reduce, as: r2, on: rank2, at_ms: 0, await: false, input: {num_tokens: 16, hidden_size: 8192}}
+      - {flow: distributed-tp-all-reduce, as: r3, on: rank3, at_ms: 0, await: false, input: {num_tokens: 16, hidden_size: 8192}}
+    expect:
+      - "[steps.r0, steps.r1, steps.r2, steps.r3].all(st, !st.result.ok && st.result.error.code == 'runtime-error')"
+  - id: distributed-all-reduce-one-slow-rank
+    name: One rank arriving 40 ms late delays the collective on every rank
+    flow: distributed-tp-all-reduce
+    fixtures: [tp4-llama-70b]
+    faults:
+      - {target: group-coordinator.all-reduce, type: latency, latency_ms: 40, instance: rank2}
+    steps:
+      - {flow: distributed-tp-all-reduce, as: r0, on: rank0, at_ms: 0, await: false, input: {num_tokens: 64, hidden_size: 8192}}
+      - {flow: distributed-tp-all-reduce, as: r1, on: rank1, at_ms: 0, await: false, input: {num_tokens: 64, hidden_size: 8192}}
+      - {flow: distributed-tp-all-reduce, as: r2, on: rank2, at_ms: 0, await: false, input: {num_tokens: 64, hidden_size: 8192}}
+      - {flow: distributed-tp-all-reduce, as: r3, on: rank3, at_ms: 0, await: false, input: {num_tokens: 64, hidden_size: 8192}}
+    expect:
+      - "[steps.r0, steps.r1, steps.r2, steps.r3].all(st, st.result.ok && st.duration_ms >= 40)"
+      - "trace.filter(e, e.type == 'rendezvous').size() == 4"
+  - id: distributed-all-reduce-rank-failure
+    name: A rank that fails before the collective leaves the others waiting until the process-group timeout
+    flow: distributed-tp-all-reduce
+    fixtures: [tp4-llama-70b]
+    config: {distributed-timeout-seconds: 5}
+    faults:
+      - {target: group-coordinator.all-reduce, type: error, code: cuda-error, instance: rank3}
+    steps:
+      - {flow: distributed-tp-all-reduce, as: r0, on: rank0, at_ms: 0, await: false, input: {num_tokens: 64, hidden_size: 8192}}
+      - {flow: distributed-tp-all-reduce, as: r1, on: rank1, at_ms: 0, await: false, input: {num_tokens: 64, hidden_size: 8192}}
+      - {flow: distributed-tp-all-reduce, as: r2, on: rank2, at_ms: 0, await: false, input: {num_tokens: 64, hidden_size: 8192}}
+      - {flow: distributed-tp-all-reduce, as: r3, on: rank3, at_ms: 0, await: false, input: {num_tokens: 64, hidden_size: 8192}}
+    expect:
+      - "[steps.r0, steps.r1, steps.r2].all(st, !st.result.ok && st.result.error.code == 'dist-backend-error' && st.duration_ms >= 5000)"
+      - "!steps.r3.result.ok && steps.r3.result.error.code == 'cuda-error'"
+  - id: distributed-all-reduce-not-initialized
+    name: Calling the all-reduce before the TP group exists trips the assertion
+    flow: distributed-tp-all-reduce
+    fixtures: [tp1-llama-8b]
+    state:
+      parallel-state: {mp_initialized: false}
+    expect:
+      - "!result.ok && result.error.code == 'assertion-error' && result.error.message == 'tensor model parallel group is not initialized'"
+  - id: distributed-all-reduce-nccl-symm-small
+    name: With NCCL symmetric memory on, a 16 KB tensor at TP4 skips FlashInfer only when FlashInfer declines
+    flow: distributed-tp-all-reduce
+    fixtures: [tp4-llama-70b]
+    config: {vllm-use-nccl-symm-mem: true, vllm-allreduce-use-flashinfer: false}
+    steps:
+      - {flow: distributed-tp-all-reduce, as: r0, on: rank0, at_ms: 0, await: false, input: {num_tokens: 1, hidden_size: 8192}}
+      - {flow: distributed-tp-all-reduce, as: r1, on: rank1, at_ms: 0, await: false, input: {num_tokens: 1, hidden_size: 8192}}
+      - {flow: distributed-tp-all-reduce, as: r2, on: rank2, at_ms: 0, await: false, input: {num_tokens: 1, hidden_size: 8192}}
+      - {flow: distributed-tp-all-reduce, as: r3, on: rank3, at_ms: 0, await: false, input: {num_tokens: 1, hidden_size: 8192}}
+    expect:
+      - "result.ok && result.value.backend == 'nccl-symm-mem'"
+  - id: distributed-all-reduce-destroyed-group
+    name: The custom op refuses a destroyed group
+    flow: distributed-tp-all-reduce
+    fixtures: [tp4-llama-70b]
+    steps:
+      - {flow: distributed-destroy-model-parallel, as: d}
+      - {interface: parallel-state.all-reduce, caller: gpu-worker, as: ar, input: {group_name: "tp:0", num_tokens: 4, world_size: 4, ranks: [rank0, rank1, rank2, rank3]}}
+    expect:
+      - "steps.d.result.ok && 'tp' in steps.d.result.value.destroyed"
+      - "!steps.ar.result.ok && steps.ar.result.error.code == 'value-error' && 'tp:0' in state['parallel-state@rank0'].destroyed_groups"
+  - id: distributed-all-reduce-unknown-group
+    name: The custom op asserts on a group that was never registered
+    flow: distributed-tp-all-reduce
+    fixtures: [tp4-llama-70b]
+    state:
+      parallel-state: {mp_initialized: false}
+    steps:
+      - {interface: parallel-state.all-reduce, caller: gpu-worker, as: ar, input: {group_name: "tp:7", num_tokens: 4, world_size: 4, ranks: [rank0, rank1, rank2, rank3]}}
+    expect:
+      - "!steps.ar.result.ok && steps.ar.result.error.code == 'assertion-error'"
+  # ---- all-gather / reduce-scatter
+  - id: distributed-all-gather-tp4-pynccl
+    flow: distributed-tp-all-gather
+    fixtures: [tp4-llama-70b]
+    steps:
+      - {flow: distributed-tp-all-gather, as: r0, on: rank0, at_ms: 0, await: false}
+      - {flow: distributed-tp-all-gather, as: r1, on: rank1, at_ms: 0, await: false}
+      - {flow: distributed-tp-all-gather, as: r2, on: rank2, at_ms: 0, await: false}
+      - {flow: distributed-tp-all-gather, as: r3, on: rank3, at_ms: 0, await: false}
+    expect:
+      - "result.ok && result.value.backend == 'pynccl' && result.value.world_size == 4"
+  - id: distributed-all-gather-tp1-bypass
+    flow: distributed-tp-all-gather
+    fixtures: [tp1-llama-8b]
+    expect:
+      - "result.ok && result.value.backend == 'bypass'"
+  - id: distributed-all-gather-bad-dim
+    flow: distributed-tp-all-gather
+    fixtures: [tp4-llama-70b]
+    steps:
+      - {flow: distributed-tp-all-gather, as: r0, on: rank0, at_ms: 0, await: false, input: {dim: 2}}
+      - {flow: distributed-tp-all-gather, as: r1, on: rank1, at_ms: 0, await: false, input: {dim: 2}}
+      - {flow: distributed-tp-all-gather, as: r2, on: rank2, at_ms: 0, await: false, input: {dim: 2}}
+      - {flow: distributed-tp-all-gather, as: r3, on: rank3, at_ms: 0, await: false, input: {dim: 2}}
+    expect:
+      - "!result.ok && result.error.code == 'assertion-error'"
+  - id: distributed-all-gather-dim0-nccl-symm
+    flow: distributed-tp-all-gather
+    fixtures: [tp4-llama-70b]
+    config: {vllm-use-nccl-symm-mem: true}
+    steps:
+      - {flow: distributed-tp-all-gather, as: r0, on: rank0, at_ms: 0, await: false, input: {dim: 0}}
+      - {flow: distributed-tp-all-gather, as: r1, on: rank1, at_ms: 0, await: false, input: {dim: 0}}
+      - {flow: distributed-tp-all-gather, as: r2, on: rank2, at_ms: 0, await: false, input: {dim: 0}}
+      - {flow: distributed-tp-all-gather, as: r3, on: rank3, at_ms: 0, await: false, input: {dim: 0}}
+    expect:
+      - "result.ok && result.value.backend == 'nccl-symm-mem' && result.value.num_tokens == 512"
+  - id: distributed-all-gather-pynccl-disabled
+    flow: distributed-tp-all-gather
+    fixtures: [tp4-llama-70b]
+    state:
+      pynccl-communicator: {disabled: true}
+    steps:
+      - {flow: distributed-tp-all-gather, as: r0, on: rank0, at_ms: 0, await: false}
+      - {flow: distributed-tp-all-gather, as: r1, on: rank1, at_ms: 0, await: false}
+      - {flow: distributed-tp-all-gather, as: r2, on: rank2, at_ms: 0, await: false}
+      - {flow: distributed-tp-all-gather, as: r3, on: rank3, at_ms: 0, await: false}
+    expect:
+      - "result.ok && result.value.backend == 'torch-distributed' && calls['torch-distributed.all-gather'] == 4"
+  - id: distributed-reduce-scatter-tp4
+    flow: distributed-tp-reduce-scatter
+    fixtures: [tp4-llama-70b]
+    steps:
+      - {flow: distributed-tp-reduce-scatter, as: r0, on: rank0, at_ms: 0, await: false}
+      - {flow: distributed-tp-reduce-scatter, as: r1, on: rank1, at_ms: 0, await: false}
+      - {flow: distributed-tp-reduce-scatter, as: r2, on: rank2, at_ms: 0, await: false}
+      - {flow: distributed-tp-reduce-scatter, as: r3, on: rank3, at_ms: 0, await: false}
+    expect:
+      - "result.ok && result.value.backend == 'pynccl' && result.value.num_tokens == 32"
+  - id: distributed-reduce-scatter-indivisible
+    flow: distributed-tp-reduce-scatter
+    fixtures: [tp4-llama-70b]
+    steps:
+      - {flow: distributed-tp-reduce-scatter, as: r0, on: rank0, at_ms: 0, await: false, input: {num_tokens: 130}}
+      - {flow: distributed-tp-reduce-scatter, as: r1, on: rank1, at_ms: 0, await: false, input: {num_tokens: 130}}
+      - {flow: distributed-tp-reduce-scatter, as: r2, on: rank2, at_ms: 0, await: false, input: {num_tokens: 130}}
+      - {flow: distributed-tp-reduce-scatter, as: r3, on: rank3, at_ms: 0, await: false, input: {num_tokens: 130}}
+    expect:
+      - "!result.ok && result.error.code == 'assertion-error'"
+  - id: distributed-reduce-scatter-bad-dim
+    flow: distributed-tp-reduce-scatter
+    fixtures: [tp4-llama-70b]
+    steps:
+      - {flow: distributed-tp-reduce-scatter, as: r0, on: rank0, at_ms: 0, await: false, input: {dim: -3}}
+      - {flow: distributed-tp-reduce-scatter, as: r1, on: rank1, at_ms: 0, await: false, input: {dim: -3}}
+      - {flow: distributed-tp-reduce-scatter, as: r2, on: rank2, at_ms: 0, await: false, input: {dim: -3}}
+      - {flow: distributed-tp-reduce-scatter, as: r3, on: rank3, at_ms: 0, await: false, input: {dim: -3}}
+    expect:
+      - "!result.ok && result.error.code == 'assertion-error'"
+  - id: distributed-reduce-scatter-tp1-bypass
+    flow: distributed-tp-reduce-scatter
+    fixtures: [tp1-llama-8b]
+    expect:
+      - "result.ok && result.value.backend == 'bypass'"
+  - id: distributed-reduce-scatter-nccl-symm
+    flow: distributed-tp-reduce-scatter
+    fixtures: [tp4-llama-70b]
+    config: {vllm-use-nccl-symm-mem: true}
+    steps:
+      - {flow: distributed-tp-reduce-scatter, as: r0, on: rank0, at_ms: 0, await: false}
+      - {flow: distributed-tp-reduce-scatter, as: r1, on: rank1, at_ms: 0, await: false}
+      - {flow: distributed-tp-reduce-scatter, as: r2, on: rank2, at_ms: 0, await: false}
+      - {flow: distributed-tp-reduce-scatter, as: r3, on: rank3, at_ms: 0, await: false}
+    expect:
+      - "result.ok && result.value.backend == 'nccl-symm-mem'"
+  # ---- sequence-parallel custom collectives
+  - id: distributed-sp-custom-all-gather-legacy
+    flow: distributed-sp-custom-collectives
+    fixtures: [tp4-llama-70b]
+    steps:
+      - {flow: distributed-sp-custom-collectives, as: r0, on: rank0, at_ms: 0, await: false, input: {num_tokens: 64, hidden_size: 8192}}
+      - {flow: distributed-sp-custom-collectives, as: r1, on: rank1, at_ms: 0, await: false, input: {num_tokens: 64, hidden_size: 8192}}
+      - {flow: distributed-sp-custom-collectives, as: r2, on: rank2, at_ms: 0, await: false, input: {num_tokens: 64, hidden_size: 8192}}
+      - {flow: distributed-sp-custom-collectives, as: r3, on: rank3, at_ms: 0, await: false, input: {num_tokens: 64, hidden_size: 8192}}
+    expect:
+      - "result.ok && result.value.used && result.value.backend == 'legacy' && result.value.out_tokens == 256"
+      - "calls['custom-all-gather-reduce-scatter-ops.custom-all-gather'] == 4"
+  - id: distributed-sp-custom-all-gather-too-large
+    name: Above the 2 MB legacy limit the custom all-gather declines (caller falls back)
+    flow: distributed-sp-custom-collectives
+    fixtures: [tp4-llama-70b]
+    steps:
+      - {flow: distributed-sp-custom-collectives, as: r0, on: rank0, at_ms: 0, await: false, input: {num_tokens: 256, hidden_size: 8192}}
+      - {flow: distributed-sp-custom-collectives, as: r1, on: rank1, at_ms: 0, await: false, input: {num_tokens: 256, hidden_size: 8192}}
+      - {flow: distributed-sp-custom-collectives, as: r2, on: rank2, at_ms: 0, await: false, input: {num_tokens: 256, hidden_size: 8192}}
+      - {flow: distributed-sp-custom-collectives, as: r3, on: rank3, at_ms: 0, await: false, input: {num_tokens: 256, hidden_size: 8192}}
+    expect:
+      - "result.ok && !result.value.used && calls['custom-all-gather-reduce-scatter-ops.custom-all-gather'] == 0"
+  - id: distributed-sp-custom-all-gather-mnnvl
+    name: With a multicast (MNNVL) buffer the Lamport all-gather kernel runs
+    flow: distributed-sp-custom-collectives
+    fixtures: [tp4-llama-70b]
+    state:
+      custom-allreduce: {mnnvl_multicast: true}
+    steps:
+      - {flow: distributed-sp-custom-collectives, as: r0, on: rank0, at_ms: 0, await: false, input: {num_tokens: 128, hidden_size: 8192}}
+      - {flow: distributed-sp-custom-collectives, as: r1, on: rank1, at_ms: 0, await: false, input: {num_tokens: 128, hidden_size: 8192}}
+      - {flow: distributed-sp-custom-collectives, as: r2, on: rank2, at_ms: 0, await: false, input: {num_tokens: 128, hidden_size: 8192}}
+      - {flow: distributed-sp-custom-collectives, as: r3, on: rank3, at_ms: 0, await: false, input: {num_tokens: 128, hidden_size: 8192}}
+    expect:
+      - "result.ok && result.value.backend == 'mnnvl-lamport' && calls['custom-all-gather-reduce-scatter-ops.mnnvl-lamport-all-gather'] == 4"
+  - id: distributed-sp-custom-all-gather-tp1
+    flow: distributed-sp-custom-collectives
+    fixtures: [tp1-llama-8b]
+    expect:
+      - "result.ok && !result.value.used"
+  - id: distributed-sp-custom-all-gather-ws16
+    name: A 16-GPU single-node group never uses the custom all-gather
+    flow: distributed-sp-custom-collectives
+    fixtures: [tp4-llama-70b]
+    config: {tensor-parallel-size: 16}
+    steps:
+      - {flow: distributed-sp-custom-collectives, as: r0, on: rank0, at_ms: 0, await: false}
+      - {flow: distributed-sp-custom-collectives, as: r1, on: rank1, at_ms: 0, await: false}
+      - {flow: distributed-sp-custom-collectives, as: r2, on: rank2, at_ms: 0, await: false}
+      - {flow: distributed-sp-custom-collectives, as: r3, on: rank3, at_ms: 0, await: false}
+    expect:
+      - "result.ok && !result.value.used"
+  - id: distributed-sp-custom-reduce-scatter-legacy
+    flow: distributed-sp-custom-reduce-scatter
+    fixtures: [tp4-llama-70b]
+    steps:
+      - {flow: distributed-sp-custom-reduce-scatter, as: r0, on: rank0, at_ms: 0, await: false, input: {num_tokens: 512, hidden_size: 8192}}
+      - {flow: distributed-sp-custom-reduce-scatter, as: r1, on: rank1, at_ms: 0, await: false, input: {num_tokens: 512, hidden_size: 8192}}
+      - {flow: distributed-sp-custom-reduce-scatter, as: r2, on: rank2, at_ms: 0, await: false, input: {num_tokens: 512, hidden_size: 8192}}
+      - {flow: distributed-sp-custom-reduce-scatter, as: r3, on: rank3, at_ms: 0, await: false, input: {num_tokens: 512, hidden_size: 8192}}
+    expect:
+      - "result.ok && result.value.backend == 'legacy' && result.value.out_tokens == 128"
+      - "calls['custom-all-gather-reduce-scatter-ops.custom-reduce-scatter'] == 4"
+  - id: distributed-sp-custom-reduce-scatter-indivisible
+    flow: distributed-sp-custom-reduce-scatter
+    fixtures: [tp4-llama-70b]
+    steps:
+      - {flow: distributed-sp-custom-reduce-scatter, as: r0, on: rank0, at_ms: 0, await: false, input: {num_tokens: 10}}
+      - {flow: distributed-sp-custom-reduce-scatter, as: r1, on: rank1, at_ms: 0, await: false, input: {num_tokens: 10}}
+      - {flow: distributed-sp-custom-reduce-scatter, as: r2, on: rank2, at_ms: 0, await: false, input: {num_tokens: 10}}
+      - {flow: distributed-sp-custom-reduce-scatter, as: r3, on: rank3, at_ms: 0, await: false, input: {num_tokens: 10}}
+    expect:
+      - "result.ok && !result.value.used"
+  - id: distributed-sp-custom-reduce-scatter-mnnvl-lamport
+    flow: distributed-sp-custom-reduce-scatter
+    fixtures: [tp4-llama-70b]
+    state:
+      custom-allreduce: {mnnvl_multicast: true}
+    steps:
+      - {flow: distributed-sp-custom-reduce-scatter, as: r0, on: rank0, at_ms: 0, await: false, input: {num_tokens: 512, hidden_size: 8192}}
+      - {flow: distributed-sp-custom-reduce-scatter, as: r1, on: rank1, at_ms: 0, await: false, input: {num_tokens: 512, hidden_size: 8192}}
+      - {flow: distributed-sp-custom-reduce-scatter, as: r2, on: rank2, at_ms: 0, await: false, input: {num_tokens: 512, hidden_size: 8192}}
+      - {flow: distributed-sp-custom-reduce-scatter, as: r3, on: rank3, at_ms: 0, await: false, input: {num_tokens: 512, hidden_size: 8192}}
+    expect:
+      - "result.ok && result.value.backend == 'mnnvl_lamport' && calls['custom-all-gather-reduce-scatter-ops.mnnvl-lamport-reduce-scatter'] == 4"
+  - id: distributed-sp-custom-reduce-scatter-mnnvl-multimem
+    name: Above the 16 MB Lamport limit a multimem-capable node uses the multimem kernel
+    flow: distributed-sp-custom-reduce-scatter
+    fixtures: [tp4-llama-70b]
+    state:
+      custom-allreduce: {mnnvl_multicast: true, mnnvl_multimem_rs_supported: true}
+    steps:
+      - {flow: distributed-sp-custom-reduce-scatter, as: r0, on: rank0, at_ms: 0, await: false, input: {num_tokens: 2048, hidden_size: 8192}}
+      - {flow: distributed-sp-custom-reduce-scatter, as: r1, on: rank1, at_ms: 0, await: false, input: {num_tokens: 2048, hidden_size: 8192}}
+      - {flow: distributed-sp-custom-reduce-scatter, as: r2, on: rank2, at_ms: 0, await: false, input: {num_tokens: 2048, hidden_size: 8192}}
+      - {flow: distributed-sp-custom-reduce-scatter, as: r3, on: rank3, at_ms: 0, await: false, input: {num_tokens: 2048, hidden_size: 8192}}
+    expect:
+      - "result.ok && result.value.backend == 'mnnvl_multimem' && calls['custom-all-gather-reduce-scatter-ops.mnnvl-multimem-reduce-scatter'] == 4"
+  - id: distributed-sp-custom-reduce-scatter-too-large
+    flow: distributed-sp-custom-reduce-scatter
+    fixtures: [tp4-llama-70b]
+    steps:
+      - {flow: distributed-sp-custom-reduce-scatter, as: r0, on: rank0, at_ms: 0, await: false, input: {num_tokens: 2048, hidden_size: 8192}}
+      - {flow: distributed-sp-custom-reduce-scatter, as: r1, on: rank1, at_ms: 0, await: false, input: {num_tokens: 2048, hidden_size: 8192}}
+      - {flow: distributed-sp-custom-reduce-scatter, as: r2, on: rank2, at_ms: 0, await: false, input: {num_tokens: 2048, hidden_size: 8192}}
+      - {flow: distributed-sp-custom-reduce-scatter, as: r3, on: rank3, at_ms: 0, await: false, input: {num_tokens: 2048, hidden_size: 8192}}
+    expect:
+      - "result.ok && !result.value.used"
+  - id: distributed-sp-custom-ops-bad-world-size
+    name: The C++ launchers refuse a world size their switch has no case for
+    flow: distributed-sp-custom-collectives
+    fixtures: [tp4-llama-70b]
+    steps:
+      - {interface: custom-all-gather-reduce-scatter-ops.custom-all-gather, caller: gpu-worker, as: ag, input: {bytes: 1024, world_size: 16}}
+      - {interface: custom-all-gather-reduce-scatter-ops.custom-reduce-scatter, caller: gpu-worker, as: rs, input: {bytes: 1024, world_size: 16}}
+      - {interface: custom-all-gather-reduce-scatter-ops.mnnvl-lamport-all-gather, caller: gpu-worker, as: lag, input: {bytes: 1024, world_size: 3}}
+      - {interface: custom-all-gather-reduce-scatter-ops.mnnvl-lamport-reduce-scatter, caller: gpu-worker, as: lrs, input: {bytes: 1024, world_size: 3}}
+      - {interface: custom-all-gather-reduce-scatter-ops.mnnvl-multimem-reduce-scatter, caller: gpu-worker, as: mrs, input: {bytes: 1024, world_size: 6}}
+      - {interface: custom-allreduce-cuda.all-reduce, caller: gpu-worker, as: ar, input: {bytes: 1024, world_size: 16}}
+      - {interface: custom-allreduce-cuda.all-reduce, caller: gpu-worker, as: dt, input: {bytes: 1024, world_size: 4, dtype: int32}}
+    expect:
+      - "[steps.ag, steps.rs, steps.lag, steps.lrs, steps.mrs, steps.ar, steps.dt].all(s, !s.result.ok && s.result.error.code == 'runtime-error')"
+  # ---- init, read back, destroy
+  - id: distributed-init-fresh-process
+    name: A fresh worker builds the world group and the TP group, and reads the TP size back
+    flow: distributed-init-world
+    fixtures: [tp4-llama-70b]
+    state:
+      parallel-state: {world_initialized: false, mp_initialized: false}
+    steps:
+      - {flow: distributed-init-world, as: w, input: {world_size: 4, rank: 0}}
+      - {flow: distributed-init-model-parallel, as: mp, input: {tensor_model_parallel_size: 4, pipeline_model_parallel_size: 1}}
+      - {flow: distributed-tp-world-size, as: r}
+    expect:
+      - "steps.w.result.ok && !steps.w.result.value.already_initialized"
+      - "steps.mp.result.ok && steps.mp.result.value.created"
+      - "steps.r.result.ok && steps.r.result.value.world_size == 4"
+      - "state['parallel-state@rank0'].groups.tp.mq_broadcaster && !('ep' in state['parallel-state@rank0'].groups)"
+  - id: distributed-init-gloo-fallback
+    flow: distributed-init-world
+    fixtures: [tp1-llama-8b]
+    state:
+      parallel-state: {world_initialized: false, mp_initialized: false}
+    input: {backend_available: false}
+    expect:
+      - "result.ok && result.value.backend == 'gloo' && state['parallel-state@rank0'].backend == 'gloo'"
+  - id: distributed-init-world-size-mismatch
+    flow: distributed-init-world
+    fixtures: [tp1-llama-8b]
+    state:
+      parallel-state: {world_size: 2}
+    input: {world_size: 4, rank: 0}
+    expect:
+      - "!result.ok && result.error.code == 'assertion-error'"
+  - id: distributed-init-already
+    flow: distributed-init-world
+    fixtures: [tp1-llama-8b]
+    expect:
+      - "result.ok && result.value.already_initialized && state['parallel-state@rank0'].world_size == 0"
+  - id: distributed-mp-init-moe-eplb
+    name: A MoE model with EPLB gets EP and EPLB groups
+    flow: distributed-init-model-parallel
+    fixtures: [tp4-llama-70b]
+    state:
+      parallel-state: {world_initialized: true, mp_initialized: false, world_size: 4}
+    steps:
+      - {flow: distributed-init-model-parallel, as: mp, input: {tensor_model_parallel_size: 4, pipeline_model_parallel_size: 1, is_moe: true, enable_eplb: true}}
+      - {flow: distributed-tp-world-size, as: r}
+    expect:
+      - "steps.mp.result.ok && steps.r.result.value.world_size == 4"
+      - "state['parallel-state@rank0'].groups.ep.world_size == 4 && state['parallel-state@rank0'].groups.eplb.world_size == 4"
+  - id: distributed-mp-init-before-world
+    flow: distributed-init-model-parallel
+    fixtures: [tp1-llama-8b]
+    state:
+      parallel-state: {world_initialized: false, mp_initialized: false}
+    expect:
+      - "!result.ok && result.error.code == 'assertion-error' && !state['parallel-state@rank0'].mp_initialized"
+  - id: distributed-mp-init-indivisible
+    flow: distributed-init-model-parallel
+    fixtures: [tp4-llama-70b]
+    state:
+      parallel-state: {world_initialized: true, mp_initialized: false, world_size: 6}
+    input: {tensor_model_parallel_size: 4, pipeline_model_parallel_size: 1}
+    expect:
+      - "!result.ok && result.error.code == 'runtime-error' && !state['parallel-state@rank0'].mp_initialized"
+  - id: distributed-mp-init-size-mismatch
+    flow: distributed-init-model-parallel
+    fixtures: [tp4-llama-70b]
+    input: {tensor_model_parallel_size: 2, pipeline_model_parallel_size: 1}
+    expect:
+      - "!result.ok && result.error.code == 'assertion-error' && result.error.message.contains('got: 4 vs. wanted: 2')"
+  - id: distributed-mp-init-pp-mismatch
+    flow: distributed-init-model-parallel
+    fixtures: [tp4-llama-70b]
+    input: {tensor_model_parallel_size: 4, pipeline_model_parallel_size: 2}
+    expect:
+      - "!result.ok && result.error.code == 'assertion-error' && result.error.message.contains('pipeline')"
+  - id: distributed-mp-init-matches
+    flow: distributed-init-model-parallel
+    fixtures: [tp4-llama-70b]
+    input: {tensor_model_parallel_size: 4, pipeline_model_parallel_size: 1}
+    expect:
+      - "result.ok && !result.value.created && result.value.tp_world_size == 4"
+      - "state['parallel-state@rank0'].mp_initialized && !('tp' in state['parallel-state@rank0'].groups)"
+  - id: distributed-destroy-then-all-reduce
+    name: After destroy_model_parallel the TP group is gone
+    flow: distributed-destroy-model-parallel
+    fixtures: [tp4-llama-70b]
+    steps:
+      - {flow: distributed-destroy-model-parallel, as: d}
+      - {flow: distributed-tp-world-size, as: r}
+      - {flow: distributed-destroy-model-parallel, as: d2}
+    expect:
+      - "steps.d.result.ok && !state['parallel-state@rank0'].mp_initialized"
+      - "!steps.r.result.ok && steps.r.result.error.code == 'assertion-error'"
+      - "steps.d2.result.ok && size(steps.d2.result.value.destroyed) == 0"
+  # ---- custom all-reduce construction
+  - id: distributed-custom-ar-init-ok-then-used
+    name: A successful init on every rank enables the custom all-reduce for the next mid-size all-reduce
+    flow: distributed-custom-ar-init
+    fixtures: [tp4-llama-70b]
+    config: {vllm-allreduce-use-flashinfer: false}
+    state:
+      custom-allreduce: {disabled: true}
+    steps:
+      - {flow: distributed-custom-ar-init, as: i0, on: rank0, input: {world_size: 4}}
+      - {flow: distributed-custom-ar-init, as: i1, on: rank1, input: {world_size: 4}}
+      - {flow: distributed-custom-ar-init, as: i2, on: rank2, input: {world_size: 4}}
+      - {flow: distributed-custom-ar-init, as: i3, on: rank3, input: {world_size: 4}}
+      - {flow: distributed-tp-all-reduce, as: r0, on: rank0, at_ms: 10, await: false, input: {num_tokens: 16, hidden_size: 8192}}
+      - {flow: distributed-tp-all-reduce, as: r1, on: rank1, at_ms: 10, await: false, input: {num_tokens: 16, hidden_size: 8192}}
+      - {flow: distributed-tp-all-reduce, as: r2, on: rank2, at_ms: 10, await: false, input: {num_tokens: 16, hidden_size: 8192}}
+      - {flow: distributed-tp-all-reduce, as: r3, on: rank3, at_ms: 10, await: false, input: {num_tokens: 16, hidden_size: 8192}}
+    expect:
+      - "steps.i0.result.ok && !steps.i0.result.value.disabled && steps.i0.result.value.max_size == 8388608"
+      - "[steps.r0, steps.r3].all(st, st.result.value.backend == 'custom-allreduce') && !state['custom-allreduce@rank3'].disabled"
+  - id: distributed-custom-ar-init-unsupported-size
+    flow: distributed-custom-ar-init
+    fixtures: [tp4-llama-70b]
+    input: {world_size: 3}
+    expect:
+      - "result.ok && result.value.reason == 'unsupported-world-size' && state['custom-allreduce@rank0'].disabled"
+  - id: distributed-custom-ar-init-pcie
+    flow: distributed-custom-ar-init
+    fixtures: [tp4-llama-70b]
+    input: {world_size: 4, fully_connected: false}
+    expect:
+      - "result.ok && result.value.reason == 'pcie-only' && state['custom-allreduce@rank0'].disabled"
+  - id: distributed-custom-ar-init-no-library
+    flow: distributed-custom-ar-init
+    fixtures: [tp4-llama-70b]
+    input: {custom_ar_library: false}
+    expect:
+      - "result.ok && result.value.reason == 'missing-library' && state['custom-allreduce@rank0'].disabled_reason == 'missing-library'"
+  - id: distributed-custom-ar-init-single-gpu
+    flow: distributed-custom-ar-init
+    fixtures: [tp1-llama-8b]
+    input: {world_size: 1}
+    expect:
+      - "result.ok && result.value.reason == 'single-gpu' && state['custom-allreduce@rank0'].disabled"
+  - id: distributed-custom-ar-init-multinode-no-mnnvl
+    flow: distributed-custom-ar-init
+    fixtures: [tp4-llama-70b]
+    input: {world_size: 4, same_node: false}
+    expect:
+      - "result.ok && result.value.reason == 'no-mnnvl' && state['custom-allreduce@rank0'].disabled"
+  - id: distributed-custom-ar-init-p2p-probe-fails
+    name: With the P2P check on and a broken driver, the probe subprocess reports no P2P
+    flow: distributed-custom-ar-init
+    fixtures: [tp4-llama-70b]
+    config: {vllm-skip-p2p-check: false}
+    choices: {all-reduce-utils.main.probe: broken}
+    expect:
+      - "result.ok && result.value.reason == 'p2p-failed' && state['all-reduce-utils@rank0'].cache_file_exists"
+  - id: distributed-custom-ar-init-p2p-cache-hit
+    name: The P2P cache is read from memory on the second check
+    flow: distributed-custom-ar-init
+    fixtures: [tp4-llama-70b]
+    config: {vllm-skip-p2p-check: false}
+    steps:
+      - {flow: distributed-custom-ar-init, as: a, input: {world_size: 4}}
+      - {flow: distributed-custom-ar-init, as: b, input: {world_size: 4}}
+    expect:
+      - "!steps.a.result.value.disabled && !steps.b.result.value.disabled"
+      - "calls['all-reduce-utils.main'] == 1 && state['all-reduce-utils@rank0'].cache_loaded"
+  - id: distributed-custom-ar-init-cache-file-present
+    name: Another engine already wrote the P2P cache file, so no probe runs
+    flow: distributed-custom-ar-init
+    fixtures: [tp4-llama-70b]
+    config: {vllm-skip-p2p-check: false}
+    state:
+      all-reduce-utils: {cache_file_exists: true}
+    expect:
+      - "result.ok && !result.value.disabled && calls['all-reduce-utils.main'] == 0 && state['all-reduce-utils@rank0'].cache_loaded && !state['custom-allreduce@rank0'].disabled"
+  - id: distributed-custom-ar-init-probe-crash
+    flow: distributed-custom-ar-init
+    fixtures: [tp4-llama-70b]
+    config: {vllm-skip-p2p-check: false}
+    choices: {all-reduce-utils.main.probe: crashed}
+    expect:
+      - "!result.ok && result.error.code == 'runtime-error' && state['custom-allreduce@rank0'].disabled && !state['all-reduce-utils@rank0'].cache_file_exists"
+  - id: distributed-custom-ar-init-driver-says-no
+    flow: distributed-custom-ar-init
+    fixtures: [tp4-llama-70b]
+    state:
+      all-reduce-utils: {p2p_ok: {driver: false}}
+    expect:
+      - "result.ok && result.value.reason == 'p2p-failed' && state['custom-allreduce@rank0'].disabled_reason == 'p2p-failed'"
+  - id: distributed-set-custom-all-reduce-off
+    name: disable_custom_all_reduce turns the custom kernel off for the next all-reduce
+    flow: distributed-set-custom-all-reduce
+    fixtures: [tp4-llama-70b]
+    config: {vllm-allreduce-use-flashinfer: false, vllm-allreduce-use-symm-mem: false}
+    steps:
+      - {flow: distributed-set-custom-all-reduce, as: d0, on: rank0, input: {enable: false}}
+      - {flow: distributed-set-custom-all-reduce, as: d1, on: rank1, input: {enable: false}}
+      - {flow: distributed-set-custom-all-reduce, as: d2, on: rank2, input: {enable: false}}
+      - {flow: distributed-set-custom-all-reduce, as: d3, on: rank3, input: {enable: false}}
+      - {flow: distributed-tp-all-reduce, as: r0, on: rank0, at_ms: 10, await: false, input: {num_tokens: 16, hidden_size: 8192}}
+      - {flow: distributed-tp-all-reduce, as: r1, on: rank1, at_ms: 10, await: false, input: {num_tokens: 16, hidden_size: 8192}}
+      - {flow: distributed-tp-all-reduce, as: r2, on: rank2, at_ms: 10, await: false, input: {num_tokens: 16, hidden_size: 8192}}
+      - {flow: distributed-tp-all-reduce, as: r3, on: rank3, at_ms: 10, await: false, input: {num_tokens: 16, hidden_size: 8192}}
+    expect:
+      - "steps.d0.result.ok && !state['parallel-state@rank0'].custom_all_reduce_enabled"
+      - "steps.r0.result.value.backend == 'pynccl'"
+  - id: distributed-set-custom-all-reduce-on
+    flow: distributed-set-custom-all-reduce
+    fixtures: [tp4-llama-70b]
+    steps:
+      - {flow: distributed-set-custom-all-reduce, as: e0, on: rank0, input: {enable: true}}
+      - {flow: distributed-set-custom-all-reduce, as: e1, on: rank1, input: {enable: true}}
+      - {flow: distributed-set-custom-all-reduce, as: e2, on: rank2, input: {enable: true}}
+      - {flow: distributed-set-custom-all-reduce, as: e3, on: rank3, input: {enable: true}}
+      - {flow: distributed-tp-all-reduce, as: r0, on: rank0, at_ms: 10, await: false, input: {num_tokens: 256, hidden_size: 8192}}
+      - {flow: distributed-tp-all-reduce, as: r1, on: rank1, at_ms: 10, await: false, input: {num_tokens: 256, hidden_size: 8192}}
+      - {flow: distributed-tp-all-reduce, as: r2, on: rank2, at_ms: 10, await: false, input: {num_tokens: 256, hidden_size: 8192}}
+      - {flow: distributed-tp-all-reduce, as: r3, on: rank3, at_ms: 10, await: false, input: {num_tokens: 256, hidden_size: 8192}}
+    expect:
+      - "steps.e0.result.ok && state['parallel-state@rank0'].custom_all_reduce_enabled"
+      - "steps.r1.result.value.backend == 'custom-allreduce'"
+  - id: distributed-sp-custom-reduce-scatter-tp1
+    flow: distributed-sp-custom-reduce-scatter
+    fixtures: [tp1-llama-8b]
+    expect:
+      - "result.ok && !result.value.used"
+  - id: distributed-all-reduce-unaligned-skips-custom
+    name: A tensor whose byte size is not a multiple of 16 never uses the custom all-reduce
+    flow: distributed-tp-all-reduce
+    fixtures: [tp4-llama-70b]
+    config: {vllm-allreduce-use-flashinfer: false, vllm-allreduce-use-symm-mem: false}
+    steps:
+      - {flow: distributed-tp-all-reduce, as: r0, on: rank0, at_ms: 0, await: false, input: {num_tokens: 1, hidden_size: 4097}}
+      - {flow: distributed-tp-all-reduce, as: r1, on: rank1, at_ms: 0, await: false, input: {num_tokens: 1, hidden_size: 4097}}
+      - {flow: distributed-tp-all-reduce, as: r2, on: rank2, at_ms: 0, await: false, input: {num_tokens: 1, hidden_size: 4097}}
+      - {flow: distributed-tp-all-reduce, as: r3, on: rank3, at_ms: 0, await: false, input: {num_tokens: 1, hidden_size: 4097}}
+    expect:
+      - "result.ok && result.value.backend == 'pynccl' && calls['custom-allreduce-cuda.all-reduce'] == 0"
+  - id: distributed-fused-matmul-reduce-scatter-op
+    flow: distributed-fused-matmul-reduce-scatter
+    fixtures: [tp4-llama-70b]
+    expect:
+      - "result.ok && result.value.backend == 'torch-symm-mem'"
+  - id: distributed-all-reduce-concurrent-ranks
+    name: Four ranks entering the TP all-reduce in any order all leave together with the same result
+    description: >-
+      Every TP rank calls tensor_model_parallel_all_reduce once; the collective completes only when
+      all four have arrived (the rendezvous), so whatever order the ranks arrive in, each gets the same
+      backend and result, and none finishes before the last arrival. Run under --explore.
+    tags: [concurrency]
+    flow: distributed-tp-all-reduce
+    fixtures: [tp4-llama-70b]
+    steps:
+      - {flow: distributed-tp-all-reduce, as: r0, on: rank0, at_ms: 0, await: false, input: {num_tokens: 64, hidden_size: 8192}}
+      - {flow: distributed-tp-all-reduce, as: r1, on: rank1, at_ms: 0, await: false, input: {num_tokens: 64, hidden_size: 8192}}
+      - {flow: distributed-tp-all-reduce, as: r2, on: rank2, at_ms: 0, await: false, input: {num_tokens: 64, hidden_size: 8192}}
+      - {flow: distributed-tp-all-reduce, as: r3, on: rank3, at_ms: 0, await: false, input: {num_tokens: 64, hidden_size: 8192}}
+    invariants:
+      - "[steps.r0, steps.r1, steps.r2, steps.r3].all(s, s.result.ok && s.result.value.backend == 'flashinfer' && s.result.value.bytes == 1048576)"
+      - "[steps.r1, steps.r2, steps.r3].all(s, s.duration_us == steps.r0.duration_us)"
+    expect:
+      - "steps.r0.result.value == steps.r3.result.value"

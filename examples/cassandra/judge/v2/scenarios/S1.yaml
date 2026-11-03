@@ -1,0 +1,53 @@
+schema_version: 1
+id: cassandra
+scenarios:
+  - id: bench-s1-native-ddl
+    flow: native-query
+    fixtures: [three-node-rf3]
+    name: "S1: CREATE TABLE over the native protocol reaches AlterSchemaStatement, applies locally, announces the version and pushes to both live peers"
+    input:
+      query: "CREATE TABLE shop.customers (id uuid PRIMARY KEY, name text)"
+      statement: {type: CREATE_TABLE, keyspace: shop, table: customers, columns: [id uuid, name text], partition_key: [id], fully_qualified: true, bind_markers: 0}
+    expect:
+      - "result.ok && result.value.type == 'RESULT' && result.value.result.kind == 'SCHEMA_CHANGE' && result.value.result.change == 'CREATED' && result.value.result.target == 'TABLE'"
+      - "calls_by_instance['alter-schema-statement.execute@n1'] == 1"
+      - "calls_by_instance['schema-keyspace.apply-changes@n1'] >= 1 && calls_by_instance['keyspace.init-cf@n1'] == 1"
+      - "calls_by_instance['migration-coordinator.announce@n1'] == 1 && calls_by_instance['gossiper.add-local-application-state@n1'] >= 1"
+      - "calls_by_instance['schema-push-verb-handler.do-verb@n2'] == 1 && calls_by_instance['schema-push-verb-handler.do-verb@n3'] == 1"
+      - "'table:shop.customers' in state['schema-keyspace@n1'].rows && 'table:shop.customers' in state['schema-keyspace@n2'].rows && 'table:shop.customers' in state['schema-keyspace@n3'].rows"
+      - "state['schema@n1'].version == state['schema@n2'].version && state['schema@n2'].version == state['schema@n3'].version"
+  - id: bench-s1-no-wait-for-agreement
+    flow: create-table
+    fixtures: [three-node-rf3]
+    name: "S1: the push is async and fire-and-forget; with both pushes failing the client still gets SCHEMA_CHANGE"
+    faults:
+      - {target: schema-push-verb-handler.do-verb, type: unavailable}
+    expect:
+      - "result.ok && result.value.kind == 'SCHEMA_CHANGE'"
+      - "'table:shop.customers' in state['schema-keyspace@n1'].rows && !('table:shop.customers' in state['schema-keyspace@n2'].rows)"
+  - id: bench-s1-peer-down
+    flow: create-table
+    fixtures: [three-node-rf3]
+    name: "S1: a peer that n1's gossiper sees as down is not pushed to (getLiveMembers)"
+    state:
+      gossiper@n1:
+        live_endpoints: [n2]
+        unreachable_endpoints: [n3]
+        endpoint_state_map: {n3: {alive: false}}
+    expect:
+      - "result.ok"
+      - "calls_by_instance['schema-push-verb-handler.do-verb@n2'] == 1"
+      - "!trace.exists(e, e.type == 'call.start' && e.interface == 'schema-push-verb-handler.do-verb' && e.instance == 'n3')"
+      - "ctx.schema_pushed_to == ['n2'] && !('table:shop.customers' in state['schema-keyspace@n3'].rows)"
+  - id: bench-s1-pull-converges
+    fixtures: [three-node-rf3]
+    name: "S1: n3 misses the push, hears the SCHEMA gossip state, pulls after MIGRATION_DELAY and converges"
+    faults:
+      - {target: schema-push-verb-handler.do-verb, type: unavailable, instance: n3}
+    steps:
+      - {flow: create-table, on: n1, as: ddl}
+      - {interface: default-schema-update-handler.on-change, caller: membership, on: n3, at_ms: 1000, as: gossip, input: {endpoint: n1, state: SCHEMA, value: "= ctx.announced_version"}}
+    expect:
+      - "steps.ddl.result.ok"
+      - "trace.exists(e, e.type == 'call.start' && e.interface == 'schema-pull-verb-handler.do-verb' && e.instance == 'n1')"
+      - "state['schema@n3'].version == state['schema@n1'].version && 'table:shop.customers' in state['schema-keyspace@n3'].rows"

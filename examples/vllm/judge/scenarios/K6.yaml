@@ -1,0 +1,31 @@
+schema_version: 1
+id: vllm
+scenarios:
+  - id: bench-k6
+    name: "K6 block allocation: n tokens hold ceil(n/16) blocks; on finish full blocks stay cached (evictable, LRU tail) and the partial block is freed uncached"
+    fixtures: [full-tp1-llama-8b]
+    steps:
+      - {flow: scheduler-add-request, as: a1, input: {request_id: chatcmpl-r1, prompt_segments: [{key: doc-k6, num_tokens: 40}], sampling_params: {max_tokens: 16}}}
+      - {flow: scheduler-add-request, as: a2, input: {request_id: chatcmpl-r2, prompt_segments: [{key: doc-big, num_tokens: 1000}], sampling_params: {max_tokens: 16}}}
+      - {flow: scheduler-schedule, as: s1, input: {}}
+      - {interface: kv-cache-manager.get-block-ids, caller: engine-core, as: t1, input: {request_id: chatcmpl-r1}}
+      - {interface: kv-cache-manager.get-block-ids, caller: engine-core, as: t2, input: {request_id: chatcmpl-r2}}
+      - {flow: scheduler-update-from-output, as: u1, input: {scheduler_output: "= steps.s1.result.value", model_runner_output: {req_ids: [chatcmpl-r1, chatcmpl-r2], sampled_token_ids: [[128009], [128009]]}}}
+      - {flow: scheduler-make-stats, as: st, input: {}}
+      - {flow: scheduler-add-request, as: a3, input: {request_id: chatcmpl-r3, prompt_segments: [{key: doc-k6, num_tokens: 40}, {key: other, num_tokens: 8}], sampling_params: {max_tokens: 16}}}
+      - {flow: scheduler-schedule, as: s2, input: {}}
+    expect:
+      - "steps.t1.result.value.block_ids == [1, 2, 3]"
+      - "size(steps.t2.result.value.block_ids) == 63"
+      - "steps.u1.result.value.outputs.all(o, o.finish_reason == 'stop')"
+      - "steps.st.result.value.kv_cache_usage == 0.0 && steps.st.result.value.num_running_reqs == 0"
+      # r1's full blocks 1 and 2 keep their hashes; its partial block 3 does not. Uncached frees are reused first.
+      - "'doc-k6@16' in state['block-pool'].cached && 'doc-k6@32' in state['block-pool'].cached"
+      # r3 reuses r1's two full blocks (32 tokens) and computes the rest
+      - "steps.s2.result.value.scheduled_new_reqs[0].num_computed_tokens == 32"
+      - "steps.s2.result.value.scheduled_new_reqs[0].block_ids.slice(0, 2) == [1, 2]"
+      - "steps.s2.result.value.num_scheduled_tokens == {'chatcmpl-r3': 16}"
+      - "trace.filter(e, e.type == 'call.start' && e.interface == 'kv-cache-manager.free').map(e, e.input.request_id) == ['chatcmpl-r1', 'chatcmpl-r2']"
+      - "!('doc-k6@40' in state['block-pool'].cached) && state['block-pool'].free_front == [3]"
+      - "size(state['block-pool'].free_tail) == 62 && state['block-pool'].free_tail[0] == 65"
+      - "steps.s2.result.value.scheduled_new_reqs[0].block_ids == [1, 2, 66]"

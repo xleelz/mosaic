@@ -1,0 +1,41 @@
+schema_version: 1
+id: cassandra
+# H1 (round 2). Verified expectation: no gossip/FD subscriber triggers hint dispatch.
+# HintsService.startDispatch schedules HintsDispatchTrigger every 10 s (HintsService.java:226-229);
+# it keeps stores that are not scheduled, isLive (host id -> endpoint and FailureDetector.isAlive,
+# HintsStore.java:146-150) and writing or with files (HintsDispatchTrigger.java:52-71). Delivered
+# files are deleted (HintsDispatchExecutor.java:296-299). StorageService.onAlive only notifies
+# clients (StorageService.java:3872-3876).
+scenarios:
+  - id: bench-h1-end-to-end
+    name: "H1: QUORUM write with n2 down hints it; n2 returns through gossip (ACK2 -> echo -> markAlive) without dispatching; the 10 s polls close the writer and deliver; the file is deleted"
+    fixtures: [three-node-rf3]
+    state:
+      gossiper@n1: {endpoint_state_map: {n2: {alive: false}}, live_endpoints: [n3], unreachable_endpoints: [n2]}
+    steps:
+      - flow: coordinator-write
+        input:
+          consistency: QUORUM
+          mutations:
+            - {keyspace: shop, table: orders, partition_key: "order:1", token: -4069959284402364209, counter: false, timestamp: 1793318400000000, columns: {total: 42}}
+        as: write
+      - {flow: hb-hints-flush, at_ms: 10000, as: flush}
+      - {flow: hb-hints-dispatch, at_ms: 20000, as: poll1}
+      - flow: membership-gossip-ack2
+        at_ms: 25000
+        input:
+          from: n2
+          states:
+            - {endpoint: n2, generation: 1793314800, heartbeat: 400, max_version: 410, status: NORMAL, tokens: [0]}
+        as: up
+      - {flow: hb-hints-dispatch, at_ms: 30000, as: poll2}
+      - {flow: hb-hints-dispatch, at_ms: 40000, as: poll3}
+    expect:
+      - steps.write.result.ok && steps.write.result.value.acks == 2
+      - trace.exists(e, e.type == 'call.start' && e.interface == 'storage-proxy.submit-hint' && 'n2' in e.input.targets)
+      - steps.poll1.result.value.scheduled == 0
+      - state['gossiper@n1'].endpoint_state_map.n2.alive == true
+      - "!trace.exists(e, e.type == 'call.start' && (e.interface == 'hints-dispatch-trigger.run' || e.interface == 'hints-dispatch-executor.dispatch') && e.t >= 25000 && e.t < 30000)"
+      - steps.poll2.result.value.scheduled + steps.poll3.result.value.scheduled == 1
+      - calls_by_instance['hint-verb-handler.do-verb@n2'] == 1
+      - size(state['hints-store@n1'].hints) == 0

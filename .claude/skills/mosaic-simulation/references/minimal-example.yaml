@@ -1,0 +1,297 @@
+# Minimal complete ontology: a shop checkout. It validates with no issues and
+# all six scenarios pass with no warnings. It shows a stub, a retry with
+# backoff and a timeout, a choice point, a state-driven refusal, fallback
+# cleanup in on_error, an async emit, and fault scenarios with expectations.
+# Apply it with: mosaic apply shop-checkout -f minimal-example.yaml -m "Initial model"
+schema_version: 1
+id: shop-checkout
+name: Shop checkout
+description: Place an order, reserve stock, charge a card with retries, then record the order asynchronously.
+source: {repo: example/shop, sha: 4f2c9e1}
+
+components:
+  - id: shop-client
+    name: Shop web client
+    kind: client
+    layer: clients
+    summary: The browser checkout page.
+    sources: [web/src/checkout/Checkout.tsx:42]
+
+  - id: checkout
+    name: Checkout service
+    kind: service
+    layer: api
+    summary: Places orders. Owns fraud screening, stock reservation and payment.
+    sources: [services/checkout/main.go:18]
+
+  - id: inventory
+    name: Inventory store
+    kind: datastore
+    layer: data
+    summary: Stock for the single SKU this example sells.
+    sources: [services/checkout/inventory.go:20]
+    state:
+      schema:
+        type: object
+        properties:
+          available: {type: integer, minimum: 0}
+          reserved: {type: integer, minimum: 0}
+      initial: {available: 3, reserved: 0}
+
+  - id: payments
+    name: Card payments provider
+    kind: external
+    layer: external
+    summary: Third-party card processor. Modelled as a stub.
+    sources: [services/checkout/payments/client.go:15]
+
+  - id: ledger
+    name: Order ledger
+    kind: queue
+    layer: data
+    summary: Consumes placed orders asynchronously.
+    sources: [services/checkout/ledger.go:9]
+    state:
+      initial: {entries: 0}
+
+schemas:
+  - id: OrderRequest
+    schema:
+      type: object
+      required: [sku, quantity, amount_cents, card_token]
+      properties:
+        sku: {type: string, examples: [sku-1001]}
+        quantity: {type: integer, minimum: 1, maximum: 3}
+        amount_cents: {type: integer, minimum: 100, maximum: 50000, examples: [2599]}
+        card_token: {type: string, examples: [tok_visa_4242]}
+
+  - id: OrderResponse
+    schema:
+      type: object
+      required: [status, charge_id]
+      properties:
+        status: {type: string, enum: [placed]}
+        charge_id: {type: string}
+        attempts: {type: integer, minimum: 1}
+
+  - id: ChargeRequest
+    schema:
+      type: object
+      required: [amount_cents, card_token]
+      properties:
+        amount_cents: {type: integer, minimum: 1}
+        card_token: {type: string}
+
+  - id: ChargeResponse
+    schema:
+      type: object
+      required: [charge_id, status]
+      properties:
+        charge_id: {type: string, examples: [ch_3PqX9aLk]}
+        status: {type: string, const: succeeded}
+
+  - id: StockRequest
+    schema:
+      type: object
+      required: [quantity]
+      properties:
+        quantity: {type: integer, minimum: 1}
+
+interfaces:
+  - component: checkout
+    name: place-order
+    kind: http
+    summary: POST /orders
+    attributes: {method: POST, path: /orders}
+    sources: [services/checkout/orders.go:30]
+    request: OrderRequest
+    response: OrderResponse
+    errors:
+      - {code: fraud_blocked, status: 403}
+      - {code: out_of_stock, status: 409}
+      - {code: payment_failed, status: 502}
+    latency_ms: 2
+    behavior:
+      - title: Receive the order
+        source: services/checkout/orders.go:31
+        set: {ctx.order_status: received}
+      - title: Screen for fraud
+        detail: A rules engine scores the order. Scenarios pick the outcome.
+        source: services/checkout/fraud.go:12
+        choice: fraud_screen
+        default: clear
+        options:
+          clear:
+            - set: {ctx.fraud: clear}
+          block:
+            - set: {ctx.fraud: blocked, ctx.order_status: refused}
+            - fail: {code: fraud_blocked, status: 403, message: order blocked by fraud screening}
+      - call: inventory.reserve
+        input: {quantity: "= input.quantity"}
+        as: reservation
+      - title: Charge the card
+        source: services/checkout/payments/client.go:40
+        call: payments.charge
+        input: {amount_cents: "= input.amount_cents", card_token: "= input.card_token"}
+        timeout_ms: 2000
+        retry:
+          max_attempts: 3
+          backoff_ms: 100
+          multiplier: 2
+          codes: [gateway_error, unavailable, timeout]
+          title: Retry the charge
+          detail: Transient processor errors are retried with exponential backoff.
+          source: services/checkout/payments/client.go:48
+        as: charge
+        on_error:
+          - title: Release the reservation
+            detail: Payment failed, so the reserved stock goes back.
+            source: services/checkout/orders.go:61
+            call: inventory.release
+            input: {quantity: "= input.quantity"}
+          - set: {ctx.order_status: payment_failed}
+          - fail:
+              code: payment_failed
+              status: 502
+              message: "= 'charge failed after ' + string(vars.charge.attempts) + ' attempts: ' + error.code"
+      - emit: ledger.record
+        input: {charge_id: "= vars.charge.value.charge_id", amount_cents: "= input.amount_cents"}
+      - set: {ctx.order_status: placed}
+      - return:
+          status: placed
+          charge_id: "= vars.charge.value.charge_id"
+          attempts: "= vars.charge.attempts"
+
+  - component: inventory
+    name: reserve
+    kind: sql
+    sources: [services/checkout/inventory.go:44]
+    request: StockRequest
+    response:
+      type: object
+      properties:
+        reserved: {type: integer}
+        remaining: {type: integer}
+    latency_ms: {min: 1, max: 3}
+    behavior:
+      - if: "state.available < input.quantity"
+        then:
+          - set: {ctx.order_status: refused}
+          - title: Refuse, not enough stock
+            source: services/checkout/inventory.go:51
+            fail: {code: out_of_stock, status: 409, message: "= 'only ' + string(state.available) + ' left'"}
+      - set:
+          state.available: "= state.available - input.quantity"
+          state.reserved: "= state.reserved + input.quantity"
+      - return: {reserved: "= input.quantity", remaining: "= state.available"}
+
+  - component: inventory
+    name: release
+    kind: sql
+    sources: [services/checkout/inventory.go:70]
+    request: StockRequest
+    latency_ms: 1
+    behavior:
+      - set:
+          state.available: "= state.available + input.quantity"
+          state.reserved: "= state.reserved - input.quantity"
+
+  - component: payments
+    name: charge
+    kind: http
+    summary: The processor's charge endpoint. A stub, so it returns fake ChargeResponse data.
+    attributes: {method: POST, path: /v1/charges}
+    sources: [services/checkout/payments/client.go:40]
+    request: ChargeRequest
+    response: ChargeResponse
+    errors:
+      - {code: gateway_error, status: 502, retryable: true}
+      - {code: card_declined, status: 402}
+    latency_ms: {min: 80, max: 250}
+
+  - component: ledger
+    name: record
+    kind: queue
+    sources: [services/checkout/ledger.go:22]
+    request:
+      type: object
+      properties:
+        charge_id: {type: string}
+        amount_cents: {type: integer}
+    behavior:
+      - title: Record the order
+        source: services/checkout/ledger.go:23
+        set: {state.entries: "= state.entries + 1", ctx.ledger: recorded}
+
+flows:
+  - id: place-order
+    name: Customer places an order
+    description: One checkout from the web client through fraud screening, stock and payment.
+    entry:
+      caller: shop-client
+      interface: checkout.place-order
+      input: {quantity: 1}
+    steps:
+      - {component: checkout, title: "Screen, reserve and charge", source: "services/checkout/orders.go:30"}
+      - {component: ledger, title: Record the order asynchronously, source: "services/checkout/ledger.go:22"}
+    sources: [services/checkout/orders.go:30]
+    tags: [checkout]
+
+scenarios:
+  - id: happy-path
+    flow: place-order
+    name: Order placed
+    expect:
+      - "result.ok && result.value.status == 'placed' && result.value.attempts == 1"
+      - "calls['payments.charge'] == 1 && retries == 0 && faults == 0"
+      - "state['inventory'].available == 2 && state['inventory'].reserved == 1"
+      - "state['ledger'].entries == 1 && ctx.ledger == 'recorded'"
+      - "ctx.order_status == 'placed' && size(warnings) == 0"
+
+  - id: fraud-blocked
+    flow: place-order
+    name: Fraud screen blocks the order
+    choices: {checkout.place-order.fraud_screen: block}
+    expect:
+      - "!result.ok && result.error.code == 'fraud_blocked' && result.error.status == 403"
+      - "calls['inventory.reserve'] == 0 && calls['payments.charge'] == 0"
+
+  - id: out-of-stock
+    flow: place-order
+    name: Nothing left to reserve
+    state:
+      inventory: {available: 0}
+    expect:
+      - "status == 'error' && result.error.code == 'out_of_stock'"
+      - "calls['payments.charge'] == 0 && ctx.order_status == 'refused'"
+
+  - id: charge-retry
+    flow: place-order
+    name: First charge attempt hits a gateway error
+    faults:
+      - {target: payments.charge, type: error, code: gateway_error, status: 502, calls: [1]}
+    expect:
+      - "result.ok && result.value.attempts == 2"
+      - "retries == 1 && faults == 1 && calls['payments.charge'] == 2"
+      - "state['ledger'].entries == 1"
+
+  - id: charge-timeout
+    flow: place-order
+    name: Processor hangs once, then answers
+    faults:
+      - {target: payments.charge, type: timeout, calls: [1]}
+    expect:
+      - "result.ok && retries == 1"
+      - "duration_ms >= 2000"
+
+  - id: payments-outage
+    flow: place-order
+    name: Payments provider is down
+    faults:
+      - {target: payments, type: unavailable}
+    expect:
+      - "result.error.code == 'payment_failed' && result.error.status == 502"
+      - "result.error.message == 'charge failed after 3 attempts: unavailable'"
+      - "calls['payments.charge'] == 3 && retries == 2 && calls['inventory.release'] == 1"
+      - "state['inventory'].available == 3 && state['inventory'].reserved == 0"
+      - "state['ledger'].entries == 0"

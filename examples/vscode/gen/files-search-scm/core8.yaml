@@ -1,0 +1,130 @@
+interfaces:
+  - component: text-file-editor-tracker
+    name: on-did-save-error
+    kind: event
+    subscribe: [text-file-models.on-did-save-error]
+    summary: "A save error also queues the file on the dirty-file worker so it stays visible in an editor."
+    sources: ["src/vs/workbench/contrib/files/browser/editors/textFileEditorTracker.ts:45"]
+    request: {type: object, properties: {resource: {type: string}, error_code: {type: string}}}
+    behavior:
+      - emit: text-file-editor-tracker.ensure-dirty-text-files-are-opened
+        after_ms: 800
+        input: {resource: "= input.resource"}
+
+  - component: text-file-models
+    name: on-will-run-working-copy-file-operation
+    kind: event
+    subscribe: [working-copy-file-service.on-will-run-working-copy-file-operation]
+    summary: "TextFileEditorModelManager.onWillRunWorkingCopyFileOperation: before a move/copy remember every model at or under the source, with its dirty contents, to restore at the target."
+    sources: ["src/vs/workbench/services/textfile/common/textFileEditorModelManager.ts:201-255"]
+    request: FilesWorkingCopyFileOperation
+    behavior:
+      - if: "!(input.operation in ['move', 'copy'])"
+        then: [{return: {remembered: 0}}]
+      - set: {vars.restore: []}
+      - foreach: "= input.files"
+        as: f
+        steps:
+          - if: "!has(vars.f.source) || vars.f.source == vars.f.target"
+            then: [{continue: true}]
+          - title: Remember source models (and their dirty snapshot) with their target resource
+            source: "src/vs/workbench/services/textfile/common/textFileEditorModelManager.ts:213-249"
+            set:
+              vars.restore: "= vars.restore + state.models.filter(r, r == vars.f.source || r.startsWith(vars.f.source + '/')).map(r, {'source': r, 'target': vars.f.target + r.substring(size(vars.f.source)), 'snapshot': state.models[r].dirty ? state.models[r].value : '', 'dirty': state.models[r].dirty})"
+      - set: {state.models_to_restore: "= vars.restore"}
+      - return: {remembered: "= size(vars.restore)"}
+
+  - component: text-file-models
+    name: on-did-fail-working-copy-file-operation
+    kind: event
+    subscribe: [working-copy-file-service.on-did-fail-working-copy-file-operation]
+    summary: "TextFileEditorModelManager.onDidFailWorkingCopyFileOperation: a failed move/copy puts the dirty flag back on models that were dirty (they were only soft reverted)."
+    sources: ["src/vs/workbench/services/textfile/common/textFileEditorModelManager.ts:257-275"]
+    request: FilesWorkingCopyFileOperation
+    behavior:
+      - if: "!(input.operation in ['move', 'copy']) || !has(state.models_to_restore)"
+        then: [{return: {restored: 0}}]
+      - foreach: "= state.models_to_restore"
+        as: m
+        steps:
+          - if: "vars.m.dirty && vars.m.source in state.models"
+            then:
+              - title: Restore the dirty flag of the source model
+                source: "src/vs/workbench/services/textfile/common/textFileEditorModelManager.ts:265-271"
+                set:
+                  state.models: "= merge(state.models, {vars.m.source: {'dirty': true}})"
+              - publish: text-file-models.on-did-change-dirty
+                input: {resource: "= vars.m.source", dirty: true}
+                delivery: sync
+      - set: {state.models_to_restore: []}
+      - return: {restored: true}
+
+  - component: text-file-models
+    name: on-did-run-working-copy-file-operation
+    kind: event
+    subscribe: [working-copy-file-service.on-did-run-working-copy-file-operation]
+    summary: "TextFileEditorModelManager.onDidRunWorkingCopyFileOperation: after create, revert existing target models; after move/copy, resolve each remembered model at its target, passing the dirty contents or forcing a reload."
+    sources: ["src/vs/workbench/services/textfile/common/textFileEditorModelManager.ts:277-340"]
+    request: FilesWorkingCopyFileOperation
+    behavior:
+      - if: "input.operation == 'create'"
+        then:
+          - foreach: "= input.files"
+            as: f
+            steps:
+              - if: "vars.f.target in state.models"
+                then:
+                  - title: Revert an existing model of a created file
+                    source: "src/vs/workbench/services/textfile/common/textFileEditorModelManager.ts:281-290"
+                    call: text-file-models.revert
+                    input: {resource: "= vars.f.target"}
+          - return: {restored: 0}
+      - if: "!(input.operation in ['move', 'copy']) || !has(state.models_to_restore)"
+        then: [{return: {restored: 0}}]
+      - set: {vars.restore: "= state.models_to_restore", state.models_to_restore: []}
+      - foreach: "= vars.restore"
+        as: m
+        steps:
+          - if: "vars.m.dirty"
+            then:
+              - title: Restore at the target with the previous dirty contents
+                source: "src/vs/workbench/services/textfile/common/textFileEditorModelManager.ts:307-316"
+                call: text-file-models.resolve
+                input: {resource: "= vars.m.target", contents: "= vars.m.snapshot"}
+            else:
+              - title: Restore at the target with a forced reload from disk
+                source: "src/vs/workbench/services/textfile/common/textFileEditorModelManager.ts:312-316"
+                call: text-file-models.resolve
+                input: {resource: "= vars.m.target", reload: true}
+                on_error: continue
+      - return: {restored: "= size(vars.restore)"}
+
+flows:
+  - {id: files-save, name: Save the active editor, tags: [writes], entry: {caller: user, interface: file-commands.cmd-workbench-action-files-save, input: {command_id: workbench.action.files.save, resource: "file:///work/app/src/main.ts"}}, sources: ["src/vs/workbench/contrib/files/browser/fileCommands.ts:497-505"]}
+  - {id: files-save-model, name: Save a text file model (auto save and other callers), tags: [writes], entry: {caller: workbench, interface: text-file-models.save, input: {resource: "file:///work/app/src/main.ts", options: {reason: auto, force: false, skip_save_participants: false}}}, sources: ["src/vs/workbench/services/textfile/common/textFileEditorModel.ts:831-857"]}
+  - {id: files-model-get, name: Read a text file model, entry: {caller: workbench, interface: text-file-models.get, input: {resource: "file:///work/app/src/main.ts"}}, sources: ["src/vs/workbench/services/textfile/common/textFileEditorModelManager.ts:342-344"]}
+  - {id: files-content-change, name: Type into a text file (dirty tracking and backup), tags: [writes], entry: {caller: editor, interface: text-file-models.on-model-content-changed, input: {resource: "file:///work/app/src/main.ts"}}, sources: ["src/vs/workbench/services/textfile/common/textFileEditorModel.ts:693-738"]}
+  - {id: files-revert, name: Revert the active editor, tags: [writes], entry: {caller: user, interface: file-commands.cmd-workbench-action-files-revert, input: {command_id: workbench.action.files.revert, resource: "file:///work/app/src/main.ts"}}, sources: ["src/vs/workbench/contrib/files/browser/fileCommands.ts:571-597"]}
+  - {id: files-resolve, name: Open (resolve) a text file model, tags: [writes], entry: {caller: workbench, interface: text-file-models.resolve, input: {resource: "file:///work/app/src/util.ts"}}, sources: ["src/vs/workbench/services/textfile/common/textFileEditorModelManager.ts:365-377"]}
+  - {id: files-external-change, name: File changes on disk, tags: [writes], entry: {caller: workbench, interface: text-file-models.on-did-files-change}, sources: ["src/vs/workbench/services/textfile/common/textFileEditorModelManager.ts:134-147"]}
+  - {id: files-save-error-action, name: Run an action of the save error notification, tags: [writes], entry: {caller: user, interface: text-file-save-error-handler.run-notification-action, input: {resource: "file:///work/app/src/main.ts"}}, sources: ["src/vs/workbench/contrib/files/browser/editors/textFileSaveErrorHandler.ts:238-395"]}
+  - {id: files-shutdown, name: Shutdown with modified working copies (hot exit), tags: [writes], entry: {caller: workbench, interface: native-working-copy-backup-tracker.on-final-before-shutdown}, sources: ["src/vs/workbench/services/workingCopy/common/workingCopyBackupTracker.ts:59"]}
+  - {id: files-backups-read, name: List backups, entry: {caller: workbench, interface: native-working-copy-backup-service.get-backups}, sources: ["src/vs/workbench/services/workingCopy/common/workingCopyBackupService.ts:362-371"]}
+  - {id: files-history-read, name: Local history entries of a file, entry: {caller: workbench, interface: native-working-copy-history-service.get-entries, input: {resource: "file:///work/app/src/main.ts"}}, sources: ["src/vs/workbench/services/workingCopy/common/workingCopyHistoryService.ts:752-770"]}
+  - {id: files-explorer-delete, name: Delete from the explorer, entry: {caller: user, interface: file-actions.cmd-movefiletotrash, input: {command_id: moveFileToTrash, resource: "file:///work/app/README.md"}}, sources: ["src/vs/workbench/contrib/files/browser/fileActions.contribution.ts:64-75"]}
+  - {id: files-working-copy-move, name: Move a file with working copies, tags: [writes], entry: {caller: workbench, interface: working-copy-file-service.move, input: {files: [{source: "file:///work/app/src/main.ts", target: "file:///work/app/src/app.ts"}]}}, sources: ["src/vs/workbench/services/workingCopy/common/workingCopyFileService.ts:390-392"]}
+  - {id: files-working-copy-create, name: Create a file through the text file service, tags: [writes], entry: {caller: workbench, interface: text-file-service.create, input: {resource: "file:///work/app/src/main.ts"}}, sources: ["src/vs/workbench/services/textfile/browser/textFileService.ts:253-264"]}
+  - {id: files-working-copy-delete, name: Delete a file with working copies, tags: [writes], entry: {caller: workbench, interface: working-copy-file-service.delete, input: {resources: ["file:///work/app/src/main.ts"]}}, sources: ["src/vs/workbench/services/workingCopy/common/workingCopyFileService.ts:449-497"]}
+  - {id: files-run-command, name: Run a files/search/scm command, entry: {caller: user, interface: files-area-registrations.run-command}, sources: ["src/vs/platform/commands/common/commands.ts"]}
+  - {id: files-contributions-startup, name: Start this area's workbench contributions, tags: [writes], entry: {caller: workbench, interface: files-area-registrations.instantiate-contributions}, sources: ["src/vs/workbench/common/contributions.ts"]}
+  - {id: files-text-search-worker-start, name: Local file search worker main (web), tags: [writes], entry: {caller: workbench, interface: local-file-search-worker.bootstrap}, sources: ["src/vs/workbench/services/search/worker/localFileSearchMain.ts:9"]}
+  - {id: search-find-in-files, name: Find in files, tags: [writes], entry: {caller: user, interface: search-actions.cmd-workbench-action-findinfiles, input: {command_id: workbench.action.findInFiles, query: add}}, sources: ["src/vs/workbench/contrib/search/browser/searchActionsFind.ts:203-258"]}
+  - {id: search-replace-all, name: Replace all search results, tags: [writes], entry: {caller: user, interface: search-view.replace-all}, sources: ["src/vs/workbench/contrib/search/browser/searchView.ts:812-856"]}
+  - {id: search-view-read, name: Read the search view result summary, entry: {caller: user, interface: search-view-model-workbench-service.get-search-results}, sources: ["src/vs/workbench/contrib/search/browser/searchTreeModel/searchModel.ts:412-430"]}
+  - {id: search-history-read, name: Load search history, entry: {caller: workbench, interface: search-history-service.load}, sources: ["src/vs/workbench/contrib/search/common/searchHistoryService.ts:45-58"]}
+  - {id: search-register-provider, name: Register a search provider, tags: [writes], entry: {caller: exthost-bridge, interface: search-service.register-search-result-provider, input: {scheme: file, type: text}}, sources: ["src/vs/workbench/services/search/common/searchService.ts:54-80"]}
+  - {id: scm-register-provider, name: Register a source control provider, tags: [writes], entry: {caller: exthost-bridge, interface: scm-service.register-scm-provider, input: {id: scm1, label: Git, root_uri: "file:///work/app/lib"}}, sources: ["src/vs/workbench/contrib/scm/common/scmService.ts:389-424"]}
+  - {id: scm-get-repository, name: Read a repository, entry: {caller: workbench, interface: scm-service.get-repository, input: {id: scm0}}, sources: ["src/vs/workbench/contrib/scm/common/scmService.ts:426-433"]}
+  - {id: scm-input-type, name: Type a commit message, tags: [writes], entry: {caller: user, interface: scm-service.input-set-value, input: {repository_id: scm0, value: "Fix add"}}, sources: ["src/vs/workbench/contrib/scm/common/scmService.ts:139-152"]}
+  - {id: scm-accept-input, name: Accept the SCM input (commit), entry: {caller: user, interface: scm-actions.cmd-scm-acceptinput, input: {command_id: scm.acceptInput, repository_id: scm0}}, sources: ["src/vs/workbench/contrib/scm/browser/scm.contribution.ts:420-445"]}
+  - {id: merge-accept, name: Complete a merge, entry: {caller: user, interface: merge-editor-actions.accept-merge, input: {result_uri: "file:///work/app/src/main.ts"}}, sources: ["src/vs/workbench/contrib/mergeEditor/browser/commands/commands.ts:621-662"]}

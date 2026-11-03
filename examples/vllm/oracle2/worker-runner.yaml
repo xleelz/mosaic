@@ -1,0 +1,81 @@
+schema_version: 1
+id: vllm
+scenarios:
+- id: oracle-worker-runner-local-batch-partition
+  name: Batch-sharded sampling partitions requests by idx_mapping % tp_size
+  description: >-
+    tests/v1/worker/test_gpu_batch_shard.py::test_local_batch_partition (line 142).
+    BatchSharder.shard_sampler_inputs (vllm/v1/worker/gpu/sample/batch_shard.py:162) owns
+    request i on rank idx_mapping[i] % tp_size, keeps batch order within an owner, and its
+    metadata counts each rank's logits rows (summing to the batch's). Six requests in slots
+    0..5 with 1 or 2 logits rows each, sharded over TP=4, seen from rank 1: rank 1 owns slots
+    1 and 5 (batch positions 1 and 5), 2 + 2 = 4 logits rows; per-rank rows are [3, 4, 1, 1].
+  fixtures: [full-tp4-llama-70b]
+  config:
+    enable-batch-sharded-sampling: true
+  steps:
+  - interface: batch-sharder.shard-sampler-inputs
+    caller: gpu-model-runner
+    on: rank1
+    input:
+      num_reqs: 6
+      tp_rank: 1
+      tp_size: 4
+      req_ids: [req-0, req-1, req-2, req-3, req-4, req-5]
+      idx_mapping: [0, 1, 2, 3, 4, 5]
+      cu_num_logits: [0, 1, 3, 4, 6, 7, 9]
+    as: shard
+  expect:
+  - steps.shard.result.ok
+  - steps.shard.result.value != null && has(steps.shard.result.value.metadata)
+  - steps.shard.result.value.metadata.num_local_reqs == 2
+  - steps.shard.result.value.metadata.num_logits_per_rank == [3, 4, 1, 1]
+  - steps.shard.result.value.metadata.num_local_logits == 4
+  - steps.shard.result.value.metadata.max_num_logits_per_req == 2
+  - steps.shard.result.value.local_batch.req_ids == ['req-1', 'req-5']
+  - steps.shard.result.value.local_batch.idx_mapping == [1, 5]
+  - steps.shard.result.value.local_batch.cu_num_logits == [0, 2, 4]
+
+- id: oracle-worker-runner-pp-send-wait-before-forward
+  name: The previous step's PP send is waited before the forward; the new send is left pending
+  description: >-
+    tests/v1/worker/test_gpu_worker.py::test_execute_model_waits_previous_pp_send_before_forward
+    (line 389). Worker.execute_model (vllm/v1/worker/gpu_worker.py:1302-1356) on the first of two
+    PP ranks waits the previous step's tensor handles, runs the forward, then isends the
+    intermediate tensors and keeps only the tensor handle pending; it returns None.
+    The monkeypatched pp group becomes seeded rank state (first, not last PP rank) and a seeded
+    pending send; the forward is the real model runner.
+  fixtures: [full-tp1-llama-8b]
+  config:
+    pipeline-parallel-size: 2
+  state:
+    gpu-worker-impl:
+      pp_send_pending: true
+      is_first_pp_rank: true
+      is_last_pp_rank: false
+      pp_rank: 0
+    gpu-model-runner:
+      fresh_slots_used: 1
+      slots: {r0: {prefill_len: 4, prompt_len: 4, slot: 1023}}
+      is_first_pp_rank: true
+      is_last_pp_rank: false
+      pp_rank: 0
+  steps:
+  - interface: gpu-worker-impl.execute-model
+    caller: multiproc-executor
+    on: rank0
+    input:
+      total_num_scheduled_tokens: 4
+      num_scheduled_tokens: {r0: 4}
+      scheduled_new_reqs: []
+      scheduled_cached_reqs: {req_ids: [r0], num_computed_tokens: [0], new_block_ids: [null], resumed_req_ids: [], new_token_ids: [], num_output_tokens: [0]}
+      finished_req_ids: []
+      preempted_req_ids: []
+      scheduled_spec_decode_tokens: {}
+      new_block_ids_to_zero: []
+    as: exec
+  expect:
+  - steps.exec.result.ok && steps.exec.result.value == null
+  - "trace.exists(w, w.type == 'note' && w.title.startsWith('Wait for the previous step') && trace.exists(f, f.type == 'call.start' && f.interface == 'gpu-model-runner.execute-model' && f.seq > w.seq))"
+  - "trace.exists(f, f.type == 'call.end' && f.interface == 'gpu-model-runner.execute-model' && trace.exists(s, s.type == 'note' && s.title.startsWith('A non-last PP rank sends') && s.seq > f.seq))"
+  - "state['gpu-worker-impl@rank0'].pp_send_pending == true"

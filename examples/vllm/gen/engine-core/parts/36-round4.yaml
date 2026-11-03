@@ -1,0 +1,726 @@
+# Fix round 4 (coverage): functions vLLM's tests call that the model did not cover, and the
+# test-hit inventory skips. See notes/engine-core.md, "Fix round 4".
+configs:
+  - {id: model, type: string, value: meta-llama/Llama-3.1-8B-Instruct, default: Qwen/Qwen3-0.6B, summary: "--model (boundary copy): the tokenizer defaults to the model path", sources: ["vllm/config/model.py:154"], attributes: {boundary: true, owner: config-platform, key: model}}
+  - {id: skip-tokenizer-init, type: boolean, value: false, default: false, summary: "skip_tokenizer_init: no tokenizer is built, so get_tokenizer raises", sources: ["vllm/config/model.py:315"], attributes: {boundary: true, owner: config-platform, key: skip_tokenizer_init}}
+  - {id: otlp-traces-endpoint, type: string, value: "", default: "", summary: "--otlp-traces-endpoint: None ('' here) means tracing is off", sources: ["vllm/config/observability.py:38"], attributes: {boundary: true, owner: config-platform, key: observability_config.otlp_traces_endpoint, none_is: ""}}
+  - {id: enable-kv-cache-events, type: boolean, value: false, default: false, summary: "kv_events_config.enable_kv_cache_events (boundary copy)", sources: ["vllm/config/kv_events.py:14"], attributes: {boundary: true, owner: distributed, key: kv_events_config.enable_kv_cache_events}}
+  - {id: kv-events-publisher, type: string, value: null, default: null, summary: "kv_events_config.publisher (boundary copy)", sources: ["vllm/config/kv_events.py:19"], attributes: {boundary: true, owner: distributed, key: kv_events_config.publisher}}
+  - {id: vllm-elastic-ep-drain-requests, type: boolean, value: false, default: false, summary: "VLLM_ELASTIC_EP_DRAIN_REQUESTS: drain in-flight requests before committing an elastic-EP scale", sources: ["vllm/envs.py:327"], attributes: {key: VLLM_ELASTIC_EP_DRAIN_REQUESTS, env: true}}
+  - {id: dp-sync-interval, type: integer, value: 16, default: 16, summary: "parallel_config.dp_sync_interval: the DP busy loop all-reduces the unfinished flag on step 1 and every Nth step after", sources: ["vllm/config/parallel.py:162", "vllm/v1/engine/core.py:2163"], attributes: {boundary: true, owner: config-platform, key: dp_sync_interval}}
+
+components:
+  - id: attention-metrics
+    name: AttentionMetrics
+    kind: module
+    parent: engine-core
+    layer: metrics
+    summary: "The analytic FLOPs and bytes model of standard attention layers (vllm/v1/metrics/perf.py), built from the config alone: full and sliding-window sublayers, divided by TP heads and PP stages."
+    sources: ["vllm/v1/metrics/perf.py:492-614"]
+  - id: logprobs-processor
+    name: LogprobsProcessor
+    kind: module
+    parent: engine-core
+    layer: frontend
+    summary: "Per-request sample logprobs in the output processor: one {token_id: Logprob} position per sampled token, cut to num_logprobs + 1 entries, and the cumulative logprob of the sampled tokens."
+    sources: ["vllm/v1/engine/logprobs.py:31-71"]
+    state:
+      schema: {type: object, properties: {requests: {type: object}}}
+      initial: {requests: {}}
+  - id: logging-stat-logger
+    name: LoggingStatLogger
+    kind: module
+    parent: engine-core
+    layer: metrics
+    tags: [metrics]
+    summary: "The stdout stat logger: accumulates prompt and generation tokens between log intervals and keeps the last SchedulerStats."
+    sources: ["vllm/v1/metrics/loggers.py:101-160"]
+    state:
+      schema: {type: object, properties: {num_prompt_tokens: {type: integer}, num_generation_tokens: {type: integer}, num_preemptions: {type: integer}, last_scheduler_stats: {type: [object, "null"]}, last_scheduler_stats_dict: {type: object}}}
+      initial: {num_prompt_tokens: 0, num_generation_tokens: 0, num_preemptions: 0, last_scheduler_stats: null, last_scheduler_stats_dict: {}}
+  - id: per-engine-stat-logger-adapter
+    name: PerEngineStatLoggerAdapter
+    kind: module
+    parent: engine-core
+    layer: metrics
+    tags: [metrics]
+    summary: "Wraps a per-engine stat logger factory (a custom StatLoggerBase) into one logger per DP engine index."
+    sources: ["vllm/v1/metrics/loggers.py:448-462"]
+    state:
+      schema: {type: object, properties: {engine_indexes: {type: array}, records: {type: object}}}
+      initial: {engine_indexes: [0], records: {}}
+  - id: ray-executor-v2
+    name: RayExecutorV2
+    kind: module
+    parent: engine-core
+    layer: executor
+    summary: "The Ray executor (V2): one RayWorkerProc actor per rank; a RayWorkerMonitor thread fails the executor when a worker's run task ends."
+    sources: ["vllm/v1/executor/ray_executor_v2.py:480-535"]
+    state:
+      schema: {type: object, properties: {is_failed: {type: boolean}, shutting_down: {type: boolean}, dead_ranks: {type: array}}}
+      initial: {is_failed: false, shutting_down: false, dead_ranks: []}
+  - id: dp-engine-core-proc
+    name: DPEngineCoreProc
+    kind: module
+    parent: engine-core
+    layer: process
+    summary: "EngineCoreProc for data_parallel_size > 1: request waves, dummy batches on idle ranks so MoE collectives line up, and an all-reduce of the unfinished flag across the DP group."
+    sources: ["vllm/v1/engine/core.py:2143-2170"]
+    state:
+      schema: {type: object, properties: {engines_running: {type: boolean}, current_wave: {type: integer}, step_counter: {type: integer}, wave_complete: {type: array}}}
+      initial: {engines_running: false, current_wave: 0, step_counter: 0, wave_complete: []}
+
+flows:
+  - id: dp-engine-core-busy-loop
+    name: DP engine-core busy loop
+    description: "DPEngineCoreProc.run_busy_loop on one DP rank: each pass processes input, steps, runs a dummy batch when the wave is live but nothing ran, and all-reduces the unfinished flag to end or continue the wave."
+    tags: [writes, "feature:data-parallel"]
+    sources: ["vllm/v1/engine/core.py:2327-2409"]
+    entry: {caller: engine-core, interface: dp-engine-core-proc.run-busy-loop, input: {dp_rank: 0}, repeat: {count: 2, interval_ms: 1}}
+  - id: dp-client-stats-update-task
+    name: DP client stats update task
+    description: "DPAsyncMPClient's stats task: each pass handles one coordinator message (FIRST_REQ, SCALE_ELASTIC_EP or a stats publish)."
+    tags: [writes, "feature:data-parallel"]
+    sources: ["vllm/v1/engine/core_client.py:1474-1576"]
+    entry: {caller: api-server, interface: dp-lb-async-mp-client.run-engine-stats-update-task, input: {stats: {counts: [[1, 0], [0, 2]], wave: 1, running: true}}, repeat: {count: 2, interval_ms: 1}}
+  - id: ray-v2-worker-monitor
+    name: Ray V2 worker monitor
+    description: "The RayWorkerMonitor thread: polls the workers' run refs until shutdown; a dead worker fails the executor and notifies the engine core."
+    sources: ["vllm/v1/executor/ray_executor_v2.py:502-535"]
+    entry: {caller: engine-core, interface: ray-executor-v2.monitor-workers, input: {max_polls: 120}}
+
+interfaces:
+  # ------------------------------------------------------------------ executor class facts
+  - component: executor
+    name: supports-async-scheduling
+    kind: function
+    summary: "Executor.supports_async_scheduling: False on the base class (and the Ray executor, which inherits it); the uniproc executor (and ExecutorWithExternalLauncher, which inherits it) and the multiproc executor return True."
+    sources: ["vllm/v1/executor/abstract.py:441-444", "vllm/v1/executor/uniproc_executor.py:156-158", "vllm/v1/executor/multiproc_executor.py:564-566"]
+    request: {type: object, required: [executor_class], properties: {executor_class: {type: string, enum: [Executor, UniProcExecutor, ExecutorWithExternalLauncher, MultiprocExecutor, RayDistributedExecutor], examples: [MultiprocExecutor]}}}
+    response: {type: boolean}
+    behavior:
+      - if: "input.executor_class in ['UniProcExecutor', 'ExecutorWithExternalLauncher']"
+        then:
+          - title: "UniProcExecutor.supports_async_scheduling (inherited by ExecutorWithExternalLauncher)"
+            source: "vllm/v1/executor/uniproc_executor.py:156-158"
+            return: true
+      - if: "input.executor_class == 'MultiprocExecutor'"
+        then:
+          - title: "MultiprocExecutor.supports_async_scheduling"
+            source: "vllm/v1/executor/multiproc_executor.py:564-566"
+            return: true
+      - title: "Executor.supports_async_scheduling: the base class (and RayDistributedExecutor, which doesn't override it) says no"
+        source: "vllm/v1/executor/abstract.py:441-444"
+        return: false
+
+  - component: ray-executor-v2
+    name: monitor-workers
+    kind: function
+    summary: "RayExecutorV2.start_worker_monitor's RayWorkerMonitor thread: poll ray.wait on the workers' run refs every 5 s until the executor shuts down; a finished run ref is a dead worker: mark the executor failed, shut it down and fire the failure callback once."
+    sources: ["vllm/v1/executor/ray_executor_v2.py:486-535"]
+    attributes: {single_writer: "only the RayWorkerMonitor thread sets is_failed (vllm/v1/executor/ray_executor_v2.py:519); shutting_down is set by shutdown under shutdown_lock (vllm/v1/executor/ray_executor_v2.py:556-566) and only read through _should_stop"}
+    request: {type: object, properties: {max_polls: {type: integer, default: 120, description: "simulation bound on the 5 s polls"}}}
+    response: {type: object}
+    behavior:
+      - title: "while not _should_stop(): ray.wait(run_refs, num_returns=1, timeout=5.0)"
+        source: "vllm/v1/executor/ray_executor_v2.py:502-512"
+        foreach: "= lists.range(has(input.max_polls) ? input.max_polls : 120)"
+        as: poll
+        max: 1000
+        steps:
+          - if: "state.shutting_down"
+            then:
+              - title: "_should_stop(): the executor is shutting down"
+                source: "vllm/v1/executor/ray_executor_v2.py:498-500"
+                return: {handled: false, stopped: true}
+          - wait: {signals: ["exit:gpu-worker@rank0", "exit:gpu-worker@rank1", "exit:gpu-worker@rank2", "exit:gpu-worker@rank3", "exit:gpu-worker@rank4", "exit:gpu-worker@rank5", "exit:gpu-worker@rank6", "exit:gpu-worker@rank7"], timeout_ms: 5000, on_timeout: continue, as: done}
+          - if: "vars.done.reason == 'signal' && !state.shutting_down"
+            then:
+              - title: "A worker's run ref finished: it died; fail and shut down the executor"
+                source: "vllm/v1/executor/ray_executor_v2.py:515-525"
+                set: {state.is_failed: true, state.shutting_down: true, state.dead_ranks: "= [vars.done.data.instance]"}
+              - title: "failure_callback() once: EXECUTOR_FAILED goes to the engine core"
+                source: "vllm/v1/executor/ray_executor_v2.py:526-530"
+                call: engine-core-proc.executor-fail-callback
+              - return: {handled: true, dead_ranks: "= state.dead_ranks"}
+      - return: {handled: false, stopped: false}
+
+  # ------------------------------------------------------------------ perf metrics (attention)
+  - component: attention-metrics
+    name: from-vllm-config
+    kind: function
+    summary: "AttentionMetrics.from_vllm_config: the parser chain reads heads, layers, head size, TP and PP; SlidingWindowAttentionParser counts the sliding-window layers from layer_types (Gemma 2 alternates; any other SWA model is all sliding)."
+    sources: ["vllm/v1/metrics/perf.py:285-294", "vllm/v1/metrics/perf.py:333-380", "vllm/v1/metrics/perf.py:386-452"]
+    request:
+      type: object
+      required: [num_hidden_layers, num_attention_heads, hidden_size]
+      properties:
+        hidden_size: {type: integer, examples: [2048]}
+        num_attention_heads: {type: integer, examples: [16]}
+        num_key_value_heads: {type: integer, examples: [16]}
+        num_hidden_layers: {type: integer, examples: [6]}
+        head_dim: {type: ["integer", "null"], default: null, description: "hf head_dim; else hidden_size / num_attention_heads"}
+        sliding_window: {type: ["integer", "null"], default: null}
+        layer_types: {type: ["array", "null"], default: null, items: {type: string}}
+        model_type: {type: string, default: ""}
+        disable_sliding_window: {type: boolean, default: false}
+        tensor_parallel_size: {type: integer, default: 1}
+        pipeline_parallel_size: {type: integer, default: 1}
+    response: {type: object}
+    behavior:
+      - title: "BaseConfigParser and BaseAttentionConfigParser: total heads (not divided by TP), layers, head size, TP and PP"
+        source: "vllm/v1/metrics/perf.py:339-401"
+        set:
+          vars.sw: "= has(input.disable_sliding_window) && input.disable_sliding_window ? dyn(null) : (has(input.sliding_window) ? input.sliding_window : dyn(null))"
+          vars.L: "= input.num_hidden_layers"
+      - title: "SlidingWindowAttentionParser: count the sliding layers"
+        source: "vllm/v1/metrics/perf.py:413-452"
+        set:
+          vars.num_swa: "= vars.sw == null || vars.sw <= 0 ? 0 : (has(input.layer_types) && input.layer_types != null ? input.layer_types.slice(0, int(math.least(size(input.layer_types), vars.L))).filter(t, t.lowerAscii().contains('sliding')).size() : (has(input.model_type) && input.model_type == 'gemma2' ? (vars.L + 1) / 2 : vars.L))"
+      - if: "input.num_hidden_layers <= 0 || input.num_attention_heads <= 0"
+        then:
+          - title: "model_validate: every count must be > 0 (InvalidComponent)"
+            source: "vllm/v1/metrics/perf.py:291-294"
+            fail: {code: invalid-component, message: "Invalid attn config"}
+      - return:
+          num_hidden_layers: "= vars.L"
+          hidden_size: "= input.hidden_size"
+          num_attention_heads: "= input.num_attention_heads"
+          num_key_value_heads: "= has(input.num_key_value_heads) ? input.num_key_value_heads : input.num_attention_heads"
+          head_dim: "= has(input.head_dim) && input.head_dim != null ? input.head_dim : input.hidden_size / input.num_attention_heads"
+          tp_size: "= has(input.tensor_parallel_size) ? input.tensor_parallel_size : 1"
+          pp_size: "= has(input.pipeline_parallel_size) ? input.pipeline_parallel_size : 1"
+          sliding_window: "= vars.sw"
+          num_swa_layers: "= vars.num_swa"
+
+  - component: attention-metrics
+    name: get-num-flops-breakdown
+    kind: function
+    summary: "AttentionMetrics.get_num_flops_breakdown: qkv/out projections over all layers, and attn_qk/attn_av split into full layers (context) and sliding layers (context clamped to the window). Per GPU, heads divide by TP and each layer count divides by PP on its own, so a minority sliding layer is not rounded away."
+    sources: ["vllm/v1/metrics/perf.py:534-614", "vllm/v1/metrics/perf.py:140-157", "vllm/v1/metrics/perf.py:187-197"]
+    request:
+      type: object
+      required: [metrics, requests]
+      properties:
+        metrics: {type: object, description: "from-vllm-config's result"}
+        requests: {type: array, description: "ExecutionContext: [num_tokens, context_len, is_prefill] per request", items: {type: array}, examples: [[[1, 4096, false]]]}
+        per_gpu: {type: boolean, default: true}
+    response: {type: object}
+    behavior:
+      - set:
+          vars.m: "= input.metrics"
+          vars.per_gpu: "= !has(input.per_gpu) || input.per_gpu"
+      - title: "_layer_counts: L, L_full = L - L_swa and L_swa, each divided by pp_size separately per GPU"
+        source: "vllm/v1/metrics/perf.py:534-560"
+        set:
+          vars.L: "= double(vars.m.num_hidden_layers) / (vars.per_gpu ? double(vars.m.pp_size) : 1.0)"
+          vars.L_swa: "= double(vars.m.num_swa_layers) / (vars.per_gpu ? double(vars.m.pp_size) : 1.0)"
+          vars.L_full: "= double(vars.m.num_hidden_layers - vars.m.num_swa_layers) / (vars.per_gpu ? double(vars.m.pp_size) : 1.0)"
+      - title: "Tensor parallel splits the heads (at least one per GPU)"
+        source: "vllm/v1/metrics/perf.py:590-593"
+        set:
+          vars.q: "= vars.per_gpu ? math.greatest(1, vars.m.num_attention_heads / vars.m.tp_size) : vars.m.num_attention_heads"
+          vars.kv: "= vars.per_gpu ? math.greatest(1, vars.m.num_key_value_heads / vars.m.tp_size) : vars.m.num_key_value_heads"
+      - title: "ExecutionContext: total tokens and the token x context products (clamped to the window for sliding layers)"
+        source: "vllm/v1/metrics/perf.py:140-157"
+        set:
+          vars.T: "= sum(input.requests.map(r, r[0]))"
+          vars.TC: "= sum(input.requests.map(r, r[0] * r[1]))"
+          vars.TC_swa: "= vars.m.sliding_window == null ? 0 : sum(input.requests.map(r, r[0] * math.least(r[1], vars.m.sliding_window)))"
+      - set:
+          vars.attn: "= (vars.L_full > 0.0 ? 2.0 * double(vars.q) * double(vars.TC) * double(vars.m.head_dim) * vars.L_full : 0.0) + (vars.L_swa > 0.0 && vars.m.sliding_window != null ? 2.0 * double(vars.q) * double(vars.TC_swa) * double(vars.m.head_dim) * vars.L_swa : 0.0)"
+      - return:
+          qkv_proj: "= int(2.0 * double(vars.T) * double(vars.m.hidden_size) * double(vars.q + 2 * vars.kv) * double(vars.m.head_dim) * vars.L)"
+          out_proj: "= int(2.0 * double(vars.T) * double(vars.m.hidden_size) * double(vars.q) * double(vars.m.head_dim) * vars.L)"
+          attn_qk: "= int(vars.attn)"
+          attn_av: "= int(vars.attn)"
+
+  # ------------------------------------------------------------------ LogprobsProcessor
+  - component: logprobs-processor
+    name: update-sample-logprobs
+    kind: function
+    summary: "LogprobsProcessor._update_sample_logprobs: per sampled position add the sampled token's logprob to the cumulative logprob and append one position whose entries zip (token_ids, logprobs, ranks), where ranks has num_logprobs + 1 entries, so trailing columns a wider batch row padded with sentinels are dropped."
+    sources: ["vllm/v1/engine/logprobs.py:72-125", "vllm/logprobs.py:178-209", "vllm/logprobs.py:173-175", "vllm/v1/outputs.py:34-56"]
+    request:
+      type: object
+      required: [request_id, num_logprobs, logprobs_lists]
+      properties:
+        request_id: {type: string}
+        num_logprobs: {type: integer, description: "-1 = every column"}
+        logprobs_lists:
+          type: object
+          description: "LogprobsLists: one row per sampled token; the sampled token is column 0"
+          properties:
+            token_ids: {type: array, items: {type: array, items: {type: integer}}}
+            logprobs: {type: array, items: {type: array, items: {type: number}}}
+            ranks: {type: array, items: {type: integer}}
+    response: {type: object, properties: {logprobs: {type: array}, cumulative_logprob: {type: number}}}
+    behavior:
+      - title: "from_new_request: cumulative_logprob starts at 0.0 and the position list (create_sample_logprobs) is empty"
+        source: "vllm/v1/engine/logprobs.py:45-70"
+        set:
+          vars.cur: "= input.request_id in state.requests ? state.requests[input.request_id] : {'logprobs': [], 'cumulative_logprob': 0.0}"
+          vars.lists: "= input.logprobs_lists"
+      - foreach: "= lists.range(size(vars.lists.token_ids))"
+        as: i
+        steps:
+          - title: "The sampler puts the sampled logprob first: it alone feeds cumulative_logprob"
+            source: "vllm/v1/engine/logprobs.py:108-110"
+            set:
+              vars.width: "= input.num_logprobs == -1 ? size(vars.lists.logprobs[vars.i]) : int(math.least(input.num_logprobs + 1, size(vars.lists.token_ids[vars.i])))"
+          - title: "append_logprobs_for_next_position: ranks = (sampled rank, 1..num_logprobs); zip stops at the shortest, so sentinel columns past num_logprobs + 1 never reach the user"
+            source: "vllm/logprobs.py:186-209"
+            set:
+              vars.cur: "= {'cumulative_logprob': vars.cur.cumulative_logprob + double(vars.lists.logprobs[vars.i][0]), 'logprobs': vars.cur.logprobs + [lists.range(vars.width).map(j, {'token_id': vars.lists.token_ids[vars.i][j], 'logprob': double(vars.lists.logprobs[vars.i][j]), 'rank': j == 0 ? vars.lists.ranks[vars.i] : j})]}"
+      - set: {state.requests: "= merge(state.requests, {input.request_id: vars.cur})"}
+      - return: "= vars.cur"
+
+  # ------------------------------------------------------------------ stat loggers
+  - component: logging-stat-logger
+    name: record
+    kind: function
+    summary: "LoggingStatLogger.record (StatLoggerBase.record's stdout logger): track the iteration's prompt and generation tokens and preemptions, and keep the latest SchedulerStats unless aggregated."
+    sources: ["vllm/v1/metrics/loggers.py:217-253", "vllm/v1/metrics/loggers.py:161-167", "vllm/v1/metrics/loggers.py:65-72", "vllm/v1/metrics/stats.py:223-255"]
+    request:
+      type: object
+      properties:
+        iteration_stats: {type: ["object", "null"], default: null, properties: {num_prompt_tokens: {type: integer}, num_generation_tokens: {type: integer}, num_preempted_reqs: {type: integer}}}
+        scheduler_stats: {type: ["object", "null"], default: null, description: "SchedulerStats (vllm/v1/metrics/stats.py:222-255): num_running_reqs, num_waiting_reqs, kv_cache_usage, ..."}
+        engine_idx: {type: integer, default: 0}
+        aggregated: {type: boolean, default: false}
+    behavior:
+      - if: "has(input.iteration_stats) && input.iteration_stats != null"
+        then:
+          - title: "_track_iteration_stats: computed prompt tokens and generation tokens accumulate until the next log()"
+            source: "vllm/v1/metrics/loggers.py:161-167"
+            set:
+              state.num_prompt_tokens: "= state.num_prompt_tokens + (has(input.iteration_stats.num_prompt_tokens) ? input.iteration_stats.num_prompt_tokens : 0)"
+              state.num_generation_tokens: "= state.num_generation_tokens + (has(input.iteration_stats.num_generation_tokens) ? input.iteration_stats.num_generation_tokens : 0)"
+              state.num_preemptions: "= state.num_preemptions + (has(input.iteration_stats.num_preempted_reqs) ? input.iteration_stats.num_preempted_reqs : 0)"
+      - if: "has(input.scheduler_stats) && input.scheduler_stats != null && !(has(input.aggregated) && input.aggregated)"
+        then:
+          - title: "Keep the latest SchedulerStats for the next log line"
+            source: "vllm/v1/metrics/loggers.py:248-249"
+            set: {state.last_scheduler_stats: "= input.scheduler_stats"}
+      - return: {num_prompt_tokens: "= state.num_prompt_tokens", num_generation_tokens: "= state.num_generation_tokens"}
+
+  - component: logging-stat-logger
+    name: record-aggregated
+    kind: function
+    summary: "AggregatedLoggingStatLogger.record: an engine index it doesn't manage is ignored with a warning; otherwise LoggingStatLogger.record, and the SchedulerStats is kept per engine for aggregation."
+    sources: ["vllm/v1/metrics/loggers.py:379-397"]
+    request: {type: object, properties: {engine_indexes: {type: array, items: {type: integer}, default: [0]}, engine_idx: {type: integer, default: 0}, iteration_stats: {type: ["object", "null"], default: null}, scheduler_stats: {type: ["object", "null"], default: null}}}
+    behavior:
+      - if: "!((has(input.engine_idx) ? input.engine_idx : 0) in (has(input.engine_indexes) ? input.engine_indexes : [0]))"
+        then:
+          - title: "Unexpected engine_idx: warn and drop the record"
+            source: "vllm/v1/metrics/loggers.py:386-388"
+            return: {recorded: false}
+      - call: logging-stat-logger.record
+        input: {iteration_stats: "= has(input.iteration_stats) ? input.iteration_stats : null", scheduler_stats: "= has(input.scheduler_stats) ? input.scheduler_stats : null", engine_idx: "= has(input.engine_idx) ? input.engine_idx : 0", aggregated: true}
+      - if: "has(input.scheduler_stats) && input.scheduler_stats != null"
+        then:
+          - set: {state.last_scheduler_stats_dict: "= merge(state.last_scheduler_stats_dict, {string(has(input.engine_idx) ? input.engine_idx : 0): input.scheduler_stats})"}
+      - return: {recorded: true}
+
+  - component: per-engine-stat-logger-adapter
+    name: record
+    kind: function
+    summary: "PerEngineStatLoggerAdapter.record: route the record to the per-engine logger of engine_idx; an unknown index is ignored with a warning."
+    sources: ["vllm/v1/metrics/loggers.py:448-462"]
+    request: {type: object, properties: {engine_idx: {type: integer, default: 0}, iteration_stats: {type: ["object", "null"], default: null}, scheduler_stats: {type: ["object", "null"], default: null}}}
+    behavior:
+      - set: {vars.idx: "= has(input.engine_idx) ? input.engine_idx : 0"}
+      - if: "!(vars.idx in state.engine_indexes)"
+        then:
+          - title: "Unexpected engine_idx: warn and drop the record"
+            source: "vllm/v1/metrics/loggers.py:455-457"
+            return: {recorded: false}
+      - title: "per_engine_stat_loggers[engine_idx].record(...)"
+        source: "vllm/v1/metrics/loggers.py:458-462"
+        set: {state.records: "= merge(state.records, {string(vars.idx): (string(vars.idx) in state.records ? state.records[string(vars.idx)] : 0) + 1})"}
+      - return: {recorded: true}
+
+  # ------------------------------------------------------------------ AsyncLLM / LLMEngine getters (unskipped)
+  - component: async-llm
+    name: get-tokenizer
+    kind: function
+    summary: "AsyncLLM.get_tokenizer -> renderer.get_tokenizer(): the tokenizer, or ValueError when skip_tokenizer_init left none."
+    sources: ["vllm/v1/engine/async_llm.py:1079-1080", "vllm/v1/engine/async_llm.py:1075-1077", "vllm/renderers/base.py:214-219"]
+    errors: [{code: value-error, status: 0, retryable: false}]
+    behavior:
+      - if: "config['skip-tokenizer-init']"
+        then:
+          - title: "No tokenizer with skip_tokenizer_init=True"
+            source: "vllm/renderers/base.py:216-217"
+            fail: {code: value-error, message: "Tokenizer not available when `skip_tokenizer_init=True`"}
+      - return: {name_or_path: "= config['model']"}
+
+  - component: llm-engine
+    name: get-tokenizer
+    kind: function
+    summary: "LLMEngine.get_tokenizer -> renderer.get_tokenizer(): the tokenizer, or ValueError when skip_tokenizer_init left none."
+    sources: ["vllm/v1/engine/llm_engine.py:452-453", "vllm/renderers/base.py:214-219", "vllm/v1/engine/llm_engine.py:448-450"]
+    errors: [{code: value-error, status: 0, retryable: false}]
+    behavior:
+      - if: "config['skip-tokenizer-init']"
+        then:
+          - title: "No tokenizer with skip_tokenizer_init=True"
+            source: "vllm/renderers/base.py:216-217"
+            fail: {code: value-error, message: "Tokenizer not available when `skip_tokenizer_init=True`"}
+      - return: {name_or_path: "= config['model']"}
+
+  - component: async-llm
+    name: is-tracing-enabled
+    kind: function
+    summary: "AsyncLLM.is_tracing_enabled: an OTLP traces endpoint is configured."
+    sources: ["vllm/v1/engine/async_llm.py:1082-1083"]
+    response: {type: boolean}
+    behavior:
+      - if: "config['otlp-traces-endpoint'] != null && config['otlp-traces-endpoint'] != ''"
+        then:
+          - title: "observability_config.otlp_traces_endpoint is not None"
+            source: "vllm/v1/engine/async_llm.py:1083"
+            return: true
+      - return: false
+
+  - component: async-llm
+    name: get-kv-event-sources
+    kind: function
+    summary: "AsyncLLM.get_kv_event_sources -> MPClient.get_kv_event_sources: a copy of the KV-event publisher configs the engines reported in their READY handshake, keyed by DP rank."
+    sources: ["vllm/v1/engine/async_llm.py:1365-1366", "vllm/v1/engine/core_client.py:888-889"]
+    response: {type: object}
+    behavior:
+      - call: async-mp-client.get-kv-event-sources
+        as: s
+      - return: "= vars.s.value"
+
+  - component: async-mp-client
+    name: get-kv-event-sources
+    kind: function
+    summary: "MPClient.get_kv_event_sources: dict(self._kv_event_sources)."
+    sources: ["vllm/v1/engine/core_client.py:888-889", "vllm/v1/engine/core_client.py:883-886"]
+    response: {type: object}
+    behavior:
+      - if: "!has(state.kv_event_sources) || state.kv_event_sources == null"
+        then: [{return: {}}]
+      - return: "= state.kv_event_sources"
+
+  - component: llm-engine
+    name: has-unfinished-requests-dp
+    kind: function
+    summary: "LLMEngine.has_unfinished_requests_dp: all-reduce the local unfinished flag over the DP group (ParallelConfig.has_unfinished_dp); if only other ranks have work, the next step runs a dummy batch."
+    sources: ["vllm/v1/engine/llm_engine.py:209-215"]
+    request: {type: object, required: [has_unfinished], properties: {has_unfinished: {type: boolean}, dp_rank: {type: string, default: dp0}}}
+    response: {type: boolean}
+    behavior:
+      - title: "ParallelConfig.has_unfinished_dp: an all-reduce (MAX) of the flag over the DP process group; every DP rank calls it once per step"
+        source: "vllm/config/parallel.py:839-847"
+        rendezvous: "dp-has-unfinished"
+        count: "= config['data-parallel-size']"
+        value: "= input.has_unfinished"
+        timeout_ms: 600000
+        as: ar
+      - set: {vars.agg: "= vars.ar.values.exists(v, v == true)"}
+      - if: "!input.has_unfinished && vars.agg"
+        then:
+          - title: "Another rank has work: run a dummy batch so the collectives line up"
+            source: "vllm/v1/engine/llm_engine.py:213-214"
+            set: {state.should_execute_dummy_batch: true}
+      - return: "= vars.agg"
+
+  # ------------------------------------------------------------------ DP engine core
+  - component: dp-engine-core-proc
+    name: run-busy-loop
+    kind: function
+    summary: "One iteration of DPEngineCoreProc.run_busy_loop on one DP rank: process the input queue, step; when nothing ran but a wave is in progress, run a dummy batch; then all-reduce the unfinished flag, and when no rank has work, end the wave (rank 0 tells the coordinator, or each rank its front-end) and start the next."
+    sources: ["vllm/v1/engine/core.py:2327-2409"]
+    attributes: {single_writer: "each DP rank's engines_running, current_wave and step_counter are read and written only by that rank's busy-loop thread (vllm/v1/engine/core.py:2331-2393); other threads only put requests on the mutex-guarded input_queue, which the busy loop drains before each step (vllm/v1/engine/core.py:1574-1600)"}
+    request: {type: object, properties: {dp_rank: {type: integer, default: 0}, has_coordinator: {type: boolean, default: true}}}
+    response: {type: object}
+    behavior:
+      - set:
+          vars.was_running: "= state.engines_running"
+          vars.rank: "= has(input.dp_rank) ? input.dp_rank : 0"
+          vars.coord: "= !has(input.has_coordinator) || input.has_coordinator"
+      - title: "1) Poll the input queue until there is work to do"
+        source: "vllm/v1/engine/core.py:2333-2334"
+        call: engine-core-proc.process-input-queue
+        input: {pump: true}
+      - title: "2) Step the engine"
+        source: "vllm/v1/engine/core.py:2349"
+        call: engine-core-proc.process-engine-step
+        as: st
+      - call: scheduler.has-requests
+        as: local
+      - set: {vars.executed: "= vars.st.value.model_executed", vars.local_unfinished: "= vars.local.value"}
+      - if: "!vars.executed && !vars.local_unfinished && !state.engines_running"
+        then:
+          - title: "All engines are idle: loop again without a sync"
+            source: "vllm/v1/engine/core.py:2353-2356"
+            return: {idle: true, engines_running: false, current_wave: "= state.current_wave"}
+      - if: "!vars.executed"
+        then:
+          - title: "Nothing ran here but the wave is live: a dummy pass keeps the DP ranks' MoE collectives in step"
+            source: "vllm/v1/engine/core.py:2358-2367"
+            call: engine-core.execute-dummy-batch
+      - title: "3) All-reduce to learn whether any engine still has unfinished requests"
+        source: "vllm/v1/engine/core.py:2369-2372"
+        call: dp-engine-core-proc.has-global-unfinished-reqs
+        input: {local_unfinished: "= vars.local_unfinished"}
+        as: g
+      - set: {state.engines_running: "= vars.g.value"}
+      - if: "!state.engines_running"
+        then:
+          - if: "vars.rank == 0 || !vars.coord"
+            then:
+              - title: "Wave finished: notify (client -1 = the coordinator, else the colocated front-end) that the loop pauses"
+                source: "vllm/v1/engine/core.py:2374-2390"
+                set: {state.wave_complete: "= state.wave_complete + [state.current_wave]"}
+          - title: "Increment the wave count and reset the step counter"
+            source: "vllm/v1/engine/core.py:2391-2393"
+            set: {state.current_wave: "= state.current_wave + 1", state.step_counter: 0}
+          - return: {idle: false, engines_running: false, current_wave: "= state.current_wave", dummy: "= !vars.executed"}
+      - if: "!vars.was_running && vars.coord && vars.rank == 0"
+        then:
+          - title: "A wave started here: rank 0 tells the coordinator (start_wave)"
+            source: "vllm/v1/engine/core.py:2394-2407"
+            return: {idle: false, engines_running: true, current_wave: "= state.current_wave", start_wave: "= state.current_wave", dummy: "= !vars.executed"}
+      - return: {idle: false, engines_running: true, current_wave: "= state.current_wave", dummy: "= !vars.executed"}
+
+  - component: dp-engine-core-proc
+    name: has-global-unfinished-reqs
+    kind: function
+    summary: "DPEngineCoreProc._has_global_unfinished_reqs: sync on step 1 and every dp_sync_interval-th step (an all-reduce over the DP group); other steps assume work remains."
+    sources: ["vllm/v1/engine/core.py:2410-2428"]
+    request: {type: object, required: [local_unfinished], properties: {local_unfinished: {type: boolean}}}
+    response: {type: boolean}
+    behavior:
+      - set: {state.step_counter: "= state.step_counter + 1"}
+      - if: "state.step_counter != 1 && state.step_counter % config['dp-sync-interval'] != 0"
+        then:
+          - title: "Not a sync step: keep running"
+            source: "vllm/v1/engine/core.py:2413-2414"
+            return: true
+      - title: "ParallelConfig.sync_dp_state: all-reduce the unfinished flags over the DP group"
+        source: "vllm/v1/engine/core.py:2416-2420"
+        rendezvous: "= 'dp-sync:' + string(state.current_wave) + ':' + string(state.step_counter)"
+        count: "= config['data-parallel-size']"
+        value: "= input.local_unfinished"
+        timeout_ms: 600000
+        as: ar
+      - return: "= vars.ar.values.exists(v, v == true)"
+
+  # ------------------------------------------------------------------ DP client stats task (unskipped)
+  - component: dp-lb-async-mp-client
+    name: run-engine-stats-update-task
+    kind: function
+    summary: "One message of DPAsyncMPClient's stats update task: a FIRST_REQ notice (a request sent while the engines are paused) wakes the wave through the coordinator; a SCALE_ELASTIC_EP notice resizes the managed engines; a stats message updates the wave, the running flag and the per-engine (waiting, running) counts."
+    sources: ["vllm/v1/engine/core_client.py:1474-1576"]
+    request:
+      type: object
+      properties:
+        first_req: {type: ["integer", "null"], default: null, description: "FIRST_REQ target engine index"}
+        scale_elastic_ep: {type: ["integer", "null"], default: null, description: "SCALE_ELASTIC_EP new engine count"}
+        stats: {type: ["object", "null"], default: null, properties: {counts: {type: ["array", "null"]}, wave: {type: integer}, running: {type: boolean}}}
+    response: {type: object}
+    behavior:
+      - if: "has(input.scale_elastic_ep) && input.scale_elastic_ep != null"
+        then:
+          - if: "input.scale_elastic_ep != config['data-parallel-size']"
+            then:
+              - title: "assert dp_size == new_engine_count"
+                source: "vllm/v1/engine/core_client.py:1512-1514"
+                fail: {code: assertion-error, message: "dp_size == new_engine_count"}
+          - title: "Resize lb_engines to the new engine count and forward the notice to the coordinator"
+            source: "vllm/v1/engine/core_client.py:1519-1536"
+            set: {state.lb_engines: "= size(state.lb_engines) < input.scale_elastic_ep ? state.lb_engines + lists.range(input.scale_elastic_ep - size(state.lb_engines)).map(i, [0, 0, 0.0]) : state.lb_engines.slice(0, input.scale_elastic_ep)"}
+          - return: {sent: ["SCALE_ELASTIC_EP", "= input.scale_elastic_ep"]}
+      - if: "has(input.first_req) && input.first_req != null"
+        then:
+          - title: "FIRST_REQ: a request went to a paused engine; engines_running and ask the coordinator to start the wave everywhere"
+            source: "vllm/v1/engine/core_client.py:1538-1547"
+            set: {state.engines_running: true}
+          - return: {sent: ["= input.first_req", "= has(state.current_wave) ? state.current_wave : 0"]}
+      - if: "!has(input.stats) || input.stats == null"
+        then:
+          - title: "No stats event to drain"
+            source: "vllm/v1/engine/core_client.py:1549-1559"
+            return: {updated: false}
+      - title: "Keep only the latest stats: the wave, whether engines run, and this client's slice of the (waiting, running) counts"
+        source: "vllm/v1/engine/core_client.py:1562-1576"
+        set:
+          state.current_wave: "= input.stats.wave"
+          state.engines_running: "= input.stats.running"
+          state.lb_engines: "= has(input.stats.counts) && input.stats.counts != null ? input.stats.counts.slice(0, int(math.least(size(input.stats.counts), config['data-parallel-size']))) : state.lb_engines"
+      - return: {updated: true, lb_engines: "= state.lb_engines"}
+
+  # ------------------------------------------------------------------ elastic EP (unskipped)
+  - component: async-llm
+    name: scale-elastic-ep
+    kind: function
+    summary: "AsyncLLM.scale_elastic_ep: under the elastic-EP lock, skip when the size is unchanged; prepare the client, recreate the stat loggers for a scale-up, optionally drain, commit, then adopt the new data_parallel_size."
+    sources: ["vllm/v1/engine/async_llm.py:1244-1291"]
+    attributes: {single_writer: "scale_elastic_ep holds async with self._elastic_ep_lock around _scale_elastic_ep, the only reader and writer of parallel_config.data_parallel_size here (async_llm.py:1248-1249)"}
+    request: {type: object, required: [new_data_parallel_size], properties: {new_data_parallel_size: {type: integer, examples: [4]}, drain_timeout: {type: integer, default: 300}}}
+    response: {type: object}
+    errors: [{code: runtime-error, status: 0, retryable: false}, {code: value-error, status: 0, retryable: false}, {code: assertion-error, status: 0, retryable: false}]
+    behavior:
+      - set: {vars.old: "= has(state.data_parallel_size) ? state.data_parallel_size : config['data-parallel-size']"}
+      - if: "vars.old == input.new_data_parallel_size"
+        then:
+          - title: "Data parallel size is already the target: skip"
+            source: "vllm/v1/engine/async_llm.py:1256-1262"
+            return: {scaled: false, data_parallel_size: "= vars.old"}
+      - title: "engine_core.prepare_elastic_ep(new size)"
+        source: "vllm/v1/engine/async_llm.py:1264"
+        call: dp-lb-async-mp-client.prepare-elastic-ep
+        input: {new_data_parallel_size: "= input.new_data_parallel_size"}
+      - if: "input.new_data_parallel_size > vars.old && !config['disable-log-stats']"
+        then:
+          - title: "Scale-up: recreate the StatLoggerManager over the new engine indexes"
+            source: "vllm/v1/engine/async_llm.py:1267-1282"
+            call: stat-logger-manager.init
+            input: {custom: [], enable_default_loggers: true}
+      - title: "set_scaling_elastic_ep(True); drain first if VLLM_ELASTIC_EP_DRAIN_REQUESTS"
+        source: "vllm/v1/engine/async_llm.py:1284-1286"
+        set: {state.scaling_elastic_ep: true, vars.drained: "= config['vllm-elastic-ep-drain-requests']"}
+      - title: "engine_core.commit_elastic_ep(), then adopt the new size"
+        source: "vllm/v1/engine/async_llm.py:1288-1291"
+        call: dp-lb-async-mp-client.commit-elastic-ep
+      - set: {state.data_parallel_size: "= input.new_data_parallel_size", state.scaling_elastic_ep: false}
+      - return: {scaled: true, data_parallel_size: "= input.new_data_parallel_size", drained: "= vars.drained"}
+
+  - component: dp-lb-async-mp-client
+    name: prepare-elastic-ep
+    kind: function
+    summary: "DPLBAsyncMPClient.prepare_elastic_ep: idempotent for the same size, refused when another size is prepared; Ray backend only; bounded by elastic_ep_max_dp_size; the physical experts per engine stay fixed, so the redundant experts follow the new size and must not go negative."
+    sources: ["vllm/v1/engine/core_client.py:1796-1835"]
+    request: {type: object, required: [new_data_parallel_size], properties: {new_data_parallel_size: {type: integer}}}
+    errors: [{code: runtime-error, status: 0, retryable: false}, {code: value-error, status: 0, retryable: false}, {code: assertion-error, status: 0, retryable: false}]
+    behavior:
+      - if: "has(state.prepared_elastic_ep) && state.prepared_elastic_ep != null"
+        then:
+          - if: "state.prepared_elastic_ep[0] == input.new_data_parallel_size"
+            then: [{return: {prepared: "= state.prepared_elastic_ep"}}]
+          - title: "Another scale is already prepared"
+            source: "vllm/v1/engine/core_client.py:1798-1801"
+            fail: {code: runtime-error, message: "Elastic EP scaling is already prepared"}
+      - set:
+          vars.cur: "= has(state.core_engines) ? state.core_engines : config['data-parallel-size']"
+          vars.backend: "= has(state.data_parallel_backend) ? state.data_parallel_backend : 'mp'"
+      - if: "vars.backend != 'ray'"
+        then:
+          - title: "Only the Ray DP backend scales elastic EP"
+            source: "vllm/v1/engine/core_client.py:1803-1805"
+            fail: {code: assertion-error, message: "Only ray DP backend supports scaling elastic EP"}
+      - if: "has(state.elastic_ep_max_dp_size) && input.new_data_parallel_size > state.elastic_ep_max_dp_size"
+        then:
+          - title: "Above --elastic-ep-max-dp-size"
+            source: "vllm/v1/engine/core_client.py:1807-1812"
+            fail: {code: value-error, message: "= 'Cannot scale to data_parallel_size ' + string(input.new_data_parallel_size) + '; --elastic-ep-max-dp-size is ' + string(state.elastic_ep_max_dp_size) + '.'"}
+      - set:
+          vars.experts: "= has(state.num_experts) ? state.num_experts : 0"
+          vars.redundant: "= has(state.num_redundant_experts) ? state.num_redundant_experts : 0"
+      - set: {vars.new_redundant: "= (vars.experts + vars.redundant) * input.new_data_parallel_size / vars.cur - vars.experts"}
+      - if: "vars.new_redundant < 0"
+        then:
+          - title: "The logical experts no longer fit at that size"
+            source: "vllm/v1/engine/core_client.py:1821-1830"
+            fail: {code: value-error, message: "= 'Cannot scale to data_parallel_size ' + string(input.new_data_parallel_size) + ': the experts no longer fit.'"}
+      - set: {state.prepared_elastic_ep: "= [input.new_data_parallel_size, vars.new_redundant]"}
+      - return: {prepared: "= state.prepared_elastic_ep"}
+
+  - component: dp-lb-async-mp-client
+    name: commit-elastic-ep
+    kind: function
+    summary: "DPLBAsyncMPClient.commit_elastic_ep: refuse without a prepared scale; scale the engines up or down to the prepared size, adopt its redundant-expert count, clear the preparation."
+    sources: ["vllm/v1/engine/core_client.py:1780-1794"]
+    errors: [{code: runtime-error, status: 0, retryable: false}]
+    behavior:
+      - if: "!has(state.prepared_elastic_ep) || state.prepared_elastic_ep == null"
+        then:
+          - title: "Nothing prepared"
+            source: "vllm/v1/engine/core_client.py:1782-1784"
+            fail: {code: runtime-error, message: "Elastic EP scaling has not been prepared"}
+      - title: "_commit_scale_up_elastic_ep or _commit_scale_down_elastic_ep: the managed engines become the prepared size"
+        source: "vllm/v1/engine/core_client.py:1785-1790"
+        set:
+          state.core_engines: "= state.prepared_elastic_ep[0]"
+          state.lb_engines: "= lists.range(state.prepared_elastic_ep[0]).map(i, size(state.lb_engines) > i ? state.lb_engines[i] : [0, 0, 0.0])"
+          state.num_redundant_experts: "= state.prepared_elastic_ep[1]"
+      - set: {state.prepared_elastic_ep: null}
+      - return: {committed: "= state.core_engines"}
+
+  # ------------------------------------------------------------------ streaming inputs (StreamingInput)
+  - component: async-llm
+    name: add-streaming-input-request
+    kind: function
+    summary: "AsyncLLM._add_streaming_input_request: generate() given an async generator of StreamingInput chunks. The params must allow streaming (generation, n == 1, not FINAL_ONLY, no stop strings); a placeholder final request ([0]) is validated and given the internal id; each chunk is processed as a resumable request under that id and added with the shared collector; once the stream closes, the final request marks the inputs finished."
+    sources: ["vllm/v1/engine/async_llm.py:580-690", "vllm/engine/protocol.py:31-40"]
+    request:
+      type: object
+      required: [request_id, sampling_params, chunks]
+      properties:
+        request_id: {type: string, examples: [session-1]}
+        sampling_params: {type: object, properties: {n: {type: integer, default: 1}, output_kind: {type: string, default: cumulative}, stop: {type: array, items: {type: string}, default: []}, max_tokens: {type: ["integer", "null"], default: null}}}
+        pooling_params: {type: ["object", "null"], default: null}
+        chunks:
+          type: array
+          description: "StreamingInput items: {prompt_token_ids, sampling_params?}"
+          items: {type: object, properties: {prompt_token_ids: {type: array, items: {type: integer}}, sampling_params: {type: ["object", "null"], default: null}}}
+    response: {type: object, properties: {request_id: {type: string}, added: {type: integer}, finished_sent: {type: boolean}}}
+    errors: [{code: vllm-validation-error, status: 0, retryable: false}]
+    behavior:
+      - set: {vars.sp: "= input.sampling_params"}
+      - if: "has(input.pooling_params) && input.pooling_params != null || (has(vars.sp.n) && vars.sp.n > 1) || (has(vars.sp.output_kind) && vars.sp.output_kind.lowerAscii() == 'final_only') || (has(vars.sp.stop) && size(vars.sp.stop) > 0)"
+        then:
+          - title: "_validate_streaming_input_sampling_params"
+            source: "vllm/v1/engine/async_llm.py:677-690"
+            fail: {code: vllm-validation-error, message: "Input streaming not currently supported for pooling models, n > 1, request_kind = FINAL_ONLY or with stop strings."}
+      - title: "The final request (prompt [0]) is validated now and later signals the end of the inputs; it fixes the internal request id"
+        source: "vllm/v1/engine/async_llm.py:614-622"
+        call: input-processor.process-inputs
+        input: {request_id: "= input.request_id", prompt_token_ids: [0], sampling_params: "= vars.sp"}
+        as: final
+      - call: input-processor.assign-request-id
+        input: "= vars.final.value"
+        as: rid
+      - title: "Ensure the output handler is running"
+        source: "vllm/v1/engine/async_llm.py:671-672"
+        call: async-llm.run-output-handler
+      - set: {vars.added: 0}
+      - title: "handle_inputs: each chunk (with its own params, validated, or the request's) becomes a resumable request under the internal id, sharing the collector"
+        source: "vllm/v1/engine/async_llm.py:630-652"
+        foreach: "= input.chunks"
+        as: chunk
+        steps:
+          - set: {vars.csp: "= has(vars.chunk.sampling_params) && vars.chunk.sampling_params != null ? vars.chunk.sampling_params : vars.sp"}
+          - if: "(has(vars.csp.n) && vars.csp.n > 1) || (has(vars.csp.output_kind) && vars.csp.output_kind.lowerAscii() == 'final_only') || (has(vars.csp.stop) && size(vars.csp.stop) > 0)"
+            then:
+              - title: "A chunk's params are validated too; the error goes into the queue as InputStreamError"
+                source: "vllm/v1/engine/async_llm.py:631-634"
+                fail: {code: vllm-validation-error, message: "Input streaming not currently supported for pooling models, n > 1, request_kind = FINAL_ONLY or with stop strings."}
+          - call: input-processor.process-inputs
+            input: {request_id: "= vars.rid.value.request_id", prompt_token_ids: "= vars.chunk.prompt_token_ids", sampling_params: "= vars.csp"}
+            as: creq
+          - set: {vars.req: "= merge(vars.creq.value, {'request_id': vars.rid.value.request_id, 'external_req_id': input.request_id, 'resumable': true})"}
+          - if: "vars.added == 0"
+            then:
+              - call: output-processor.add-request
+                input: {request: "= vars.req", parent_request_id: null, index: 0}
+          - title: "_add_request: ADD over ZMQ; the engine core appends a resumable request's new prompt to the session"
+            source: "vllm/v1/engine/async_llm.py:648"
+            call: async-mp-client.add-request-async
+            input: "= vars.req"
+          - set: {vars.added: "= vars.added + 1"}
+      - if: "vars.added > 0"
+        then:
+          - title: "Inputs finished: the empty final request is sent so the engine finishes the session"
+            source: "vllm/v1/engine/async_llm.py:663-667"
+            call: async-mp-client.add-request-async
+            input: "= merge(vars.final.value, {'request_id': vars.rid.value.request_id, 'external_req_id': input.request_id})"
+          - return: {request_id: "= vars.rid.value.request_id", added: "= vars.added", finished_sent: true}
+      - title: "An empty stream: STREAM_FINISHED goes straight into the queue"
+        source: "vllm/v1/engine/async_llm.py:668-669"
+        return: {request_id: "= vars.rid.value.request_id", added: 0, finished_sent: false}

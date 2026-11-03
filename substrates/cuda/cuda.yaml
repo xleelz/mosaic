@@ -1,0 +1,917 @@
+# CUDA substrate (DESIGN §14.2, §14.6, §16.5). Import it instead of modeling CUDA again:
+#   imports: [{ontology: <path to this file>, as: cuda}]
+# There is no code snapshot: every behavior cites NVIDIA's CUDA documentation by URL.
+# Scope: devices with memory capacity (cudaMalloc, cudaFree, cudaMemGetInfo, out of memory),
+# streams (in order within a stream, concurrent across streams, the legacy default stream's
+# implicit synchronization, non-blocking streams), events (record, query, synchronize, elapsed
+# time, cross-stream waits), memcpy H2D, D2H and D2D with a bandwidth cost model, kernel launches
+# with an occupancy and roofline cost model, and the synchronize calls.
+# Not modeled: unified and managed memory, graphs, the per-thread default stream, stream
+# priorities, multi-process service, sticky errors from faulting kernels, data values (a buffer
+# records which operation last wrote it, not what it holds).
+#
+# Time. Device work runs on the scheduler's microsecond clock (DESIGN §17 item 4). Every queued
+# operation is a row of `ops`. The device starts an operation once nothing it depends on is still
+# pending: earlier work on its stream, the legacy default stream's implicit synchronization, an
+# awaited event, a busy copy engine. A started operation completes through a scheduled timer
+# (`complete`, emitted after its cost, fractional ms), which starts whatever it unblocked. So
+# stream order, cross-stream concurrency and copy-engine contention are scheduler events, and
+# operations that finish at the same instant are choice points for `check --explore`.
+# Asynchronous calls return to the host at once; synchronize calls make the host `wait` until
+# the operations they cover are done.
+schema_version: 1
+id: cuda
+name: NVIDIA CUDA runtime and devices (substrate)
+level: machine
+description: >-
+  The CUDA runtime API over one or more GPUs: device memory with a capacity (allocation fails
+  cudaErrorMemoryAllocation when it is exhausted), streams whose work runs in order while
+  different streams overlap on the scheduler's clock, events for timing and cross-stream
+  dependencies, memcpy whose cost
+  is a fixed overhead plus bytes over the link bandwidth (PCIe or NVLink, from config), kernel
+  launches costed by waves of resident blocks and a roofline (FLOPs against peak compute, bytes
+  against memory bandwidth), and the synchronize calls that make the host wait.
+source: {url: "https://docs.nvidia.com/cuda/cuda-runtime-api/index.html"}
+
+configs:
+  # ---- the device (defaults: an A100 80GB SXM) ----
+  - id: cuda-device-count
+    type: integer
+    value: 1
+    default: 1
+    summary: "GPUs visible to the process (cudaGetDeviceCount). Devices are numbered 0..count-1."
+    sources: ["https://docs.nvidia.com/cuda/cuda-runtime-api/group__CUDART__DEVICE.html"]
+  - id: cuda-device-memory-bytes
+    type: integer
+    value: 85899345920
+    default: 85899345920
+    summary: "Total device memory per GPU (cudaDeviceProp::totalGlobalMem); 80 GiB for an A100 80GB."
+    sources: ["https://docs.nvidia.com/cuda/cuda-runtime-api/structcudaDeviceProp.html", "https://www.nvidia.com/en-us/data-center/a100/"]
+  - id: cuda-context-reserved-bytes
+    type: integer
+    value: 536870912
+    default: 536870912
+    summary: >-
+      Device memory the CUDA context, driver and kernel images take before any cudaMalloc, so
+      cudaMemGetInfo reports free < total at start. A few hundred MiB in practice; a property of
+      the driver and the loaded modules, not a CUDA setting.
+    sources: ["https://docs.nvidia.com/cuda/cuda-runtime-api/group__CUDART__MEMORY.html#group__CUDART__MEMORY_1g376b97f5ab20321ca46f7cfa9511b978"]
+  - id: cuda-alloc-alignment-bytes
+    type: integer
+    value: 256
+    default: 256
+    summary: "cudaMalloc returns memory aligned to at least 256 bytes; each allocation is rounded up to this."
+    sources: ["https://docs.nvidia.com/cuda/cuda-c-programming-guide/index.html#device-memory-accesses"]
+  - id: cuda-sm-count
+    type: integer
+    value: 108
+    default: 108
+    summary: "Streaming multiprocessors (cudaDeviceProp::multiProcessorCount); 108 on an A100."
+    sources: ["https://docs.nvidia.com/cuda/cuda-runtime-api/structcudaDeviceProp.html", "https://docs.nvidia.com/cuda/ampere-tuning-guide/index.html"]
+  - id: cuda-max-threads-per-sm
+    type: integer
+    value: 2048
+    default: 2048
+    summary: "Resident threads per SM (maxThreadsPerMultiProcessor); 2048 on compute capability 8.0."
+    sources: ["https://docs.nvidia.com/cuda/cuda-c-programming-guide/index.html#features-and-technical-specifications"]
+  - id: cuda-max-blocks-per-sm
+    type: integer
+    value: 32
+    default: 32
+    summary: "Resident blocks per SM (maxBlocksPerMultiProcessor); 32 on compute capability 8.0."
+    sources: ["https://docs.nvidia.com/cuda/cuda-c-programming-guide/index.html#features-and-technical-specifications"]
+  - id: cuda-max-threads-per-block
+    type: integer
+    value: 1024
+    default: 1024
+    summary: "Threads per block (maxThreadsPerBlock); a launch above it fails cudaErrorInvalidConfiguration."
+    sources: ["https://docs.nvidia.com/cuda/cuda-c-programming-guide/index.html#features-and-technical-specifications"]
+  - id: cuda-registers-per-sm
+    type: integer
+    value: 65536
+    default: 65536
+    summary: "32-bit registers per SM (regsPerMultiprocessor); a block needing more fails cudaErrorLaunchOutOfResources."
+    sources: ["https://docs.nvidia.com/cuda/cuda-c-programming-guide/index.html#features-and-technical-specifications"]
+  - id: cuda-shared-bytes-per-sm
+    type: integer
+    value: 167936
+    default: 167936
+    summary: "Shared memory per SM usable by blocks (164 KiB on compute capability 8.0)."
+    sources: ["https://docs.nvidia.com/cuda/cuda-c-programming-guide/index.html#features-and-technical-specifications"]
+  - id: cuda-shared-bytes-per-block
+    type: integer
+    value: 49152
+    default: 49152
+    summary: "Dynamic shared memory per block without the cudaFuncAttributeMaxDynamicSharedMemorySize opt-in (48 KiB)."
+    sources: ["https://docs.nvidia.com/cuda/cuda-c-programming-guide/index.html#shared-memory-8-x"]
+  - id: cuda-peak-tflops
+    type: number
+    value: 19.5
+    default: 19.5
+    summary: "Peak arithmetic throughput used by the roofline, in TFLOP/s (19.5 FP32 on an A100; 312 for FP16 tensor cores)."
+    sources: ["https://www.nvidia.com/en-us/data-center/a100/", "https://docs.nvidia.com/deeplearning/performance/dl-performance-gpu-background/index.html#understand-perf"]
+  - id: cuda-mem-bandwidth-gbps
+    type: number
+    value: 2039
+    default: 2039
+    summary: "Device memory (HBM) bandwidth used by the roofline and same-device copies, in GB/s (2039 on an A100 80GB SXM)."
+    sources: ["https://www.nvidia.com/en-us/data-center/a100/", "https://docs.nvidia.com/deeplearning/performance/dl-performance-gpu-background/index.html#understand-perf"]
+  - id: cuda-full-bandwidth-occupancy
+    type: number
+    value: 0.5
+    default: 0.5
+    summary: >-
+      The occupancy (resident threads / max threads per SM) at which a kernel reaches full memory
+      bandwidth; below it the memory-bound part of the roofline scales down linearly, because
+      fewer resident warps hide less latency. A model parameter, not a CUDA setting.
+    sources: ["https://docs.nvidia.com/cuda/cuda-c-best-practices-guide/index.html#occupancy"]
+  - id: cuda-launch-overhead-us
+    type: integer
+    value: 5
+    default: 5
+    summary: "Device-side cost of a kernel launch, in microseconds (a few µs)."
+    sources: ["https://docs.nvidia.com/cuda/cuda-c-best-practices-guide/index.html#execution-configuration"]
+  - id: cuda-memcpy-overhead-us
+    type: integer
+    value: 10
+    default: 10
+    summary: "Fixed cost of one DMA transfer, in microseconds, before the bytes flow."
+    sources: ["https://docs.nvidia.com/cuda/cuda-c-best-practices-guide/index.html#data-transfer-between-host-and-device"]
+  # ---- interconnects ----
+  - id: cuda-host-link
+    type: string
+    value: pcie4
+    default: pcie4
+    summary: "The host-to-device link, a key of cuda-link-bandwidth-gbps: pcie3, pcie4, pcie5, or nvlink-c2c (Grace Hopper)."
+    sources: ["https://docs.nvidia.com/cuda/cuda-c-best-practices-guide/index.html#data-transfer-between-host-and-device"]
+  - id: cuda-peer-link
+    type: string
+    value: nvlink3
+    default: nvlink3
+    summary: "The device-to-device link for copies between GPUs, a key of cuda-link-bandwidth-gbps (pcie4 without NVLink)."
+    sources: ["https://docs.nvidia.com/cuda/cuda-runtime-api/group__CUDART__PEER.html"]
+  - id: cuda-link-bandwidth-gbps
+    type: object
+    value: {pcie3: 12, pcie4: 25, pcie5: 50, nvlink3: 300, nvlink4: 450, nvlink-c2c: 450}
+    default: {pcie3: 12, pcie4: 25, pcie5: 50, nvlink3: 300, nvlink4: 450, nvlink-c2c: 450}
+    summary: >-
+      Achieved one-direction bandwidth per link, in GB/s: PCIe x16 links reach about 80% of
+      their 16/32/64 GB/s theoretical rate; NVLink 3 is 300 GB/s per direction (A100), NVLink 4
+      and NVLink-C2C 450 (H100, GH200).
+    sources: ["https://www.nvidia.com/en-us/data-center/nvlink/", "https://pcisig.com/specifications", "https://docs.nvidia.com/cuda/cuda-c-best-practices-guide/index.html#data-transfer-between-host-and-device"]
+  - id: cuda-pageable-bandwidth-gbps
+    type: number
+    value: 10
+    default: 10
+    summary: >-
+      Host-device bandwidth from pageable (not pinned) host memory, which the driver stages
+      through a pinned buffer; well below the pinned rate.
+    sources: ["https://docs.nvidia.com/cuda/cuda-c-best-practices-guide/index.html#pinned-memory"]
+  - id: cuda-copy-engines
+    type: integer
+    value: 2
+    default: 2
+    summary: >-
+      Copy engines (asyncEngineCount). With 2, an H2D and a D2H copy overlap each other and
+      kernels; with 1, all host copies share one engine. Copies in one direction serialize on
+      their engine.
+    sources: ["https://docs.nvidia.com/cuda/cuda-c-programming-guide/index.html#overlap-of-data-transfer-and-kernel-execution", "https://docs.nvidia.com/cuda/cuda-runtime-api/structcudaDeviceProp.html"]
+
+components:
+  - id: cuda
+    name: CUDA
+    kind: platform
+    layer: machine
+    summary: "The CUDA driver and runtime with the GPUs they drive."
+    attributes: {technology: cuda}
+    sources: ["https://docs.nvidia.com/cuda/cuda-c-programming-guide/index.html#programming-model"]
+  - id: cuda-runtime
+    name: CUDA runtime and devices
+    kind: service
+    parent: cuda
+    layer: machine
+    summary: >-
+      The runtime API the host calls, and the devices' state: allocations, streams with their
+      device timelines, copy engines, events, and a log of the operations the device ran.
+    sources: ["https://docs.nvidia.com/cuda/cuda-runtime-api/index.html", "https://docs.nvidia.com/cuda/cuda-c-programming-guide/index.html#asynchronous-concurrent-execution"]
+    state:
+      schema:
+        type: object
+        properties:
+          allocs: {type: object, description: "ptr -> {ptr, device, bytes, alloc_bytes, written_by?, written_us?}: written_by is the label of the last completed operation that wrote it"}
+          streams: {type: object, description: "stream -> {id, device, non_blocking, destroyed}; the legacy default stream of device d is \"<d>/0\" and needs no row"}
+          events: {type: object, description: "event -> {id, device, recorded, op, at_us, stream}: op is the marker of its last record; at_us is set when that marker completes"}
+          ops: {type: object, description: "op id -> {id, seq, op, kind: kernel|copy|record|wait, device, stream, cls: legacy|blocking|nonblocking, engine, cost_us, after, writes, event, status: queued|running|done, queued_us, start_us, end_us}"}
+          completed: {type: array, description: "Op ids in the order the device completed them"}
+      initial: {allocs: {}, streams: {}, events: {}, ops: {}, completed: []}
+
+schemas:
+  - id: Device
+    schema: {type: integer, minimum: 0, default: 0, description: "The current device (cudaSetDevice)"}
+  - id: Stream
+    schema: {type: string, default: "0", description: "A stream handle from stream-create, or \"0\" for the legacy default stream", examples: ["0"]}
+  - id: Queued
+    summary: An operation queued on a stream; it runs later, and state.ops[op] shows when.
+    schema:
+      type: object
+      properties:
+        op: {type: string, description: "The op id: state.ops[op] has its start_us, end_us and status"}
+        stream: {type: string}
+        queued_us: {type: integer}
+  - id: KernelLaunch
+    summary: A kernel launch (<<<blocks, threads_per_block, shared_bytes, stream>>>) and the work it does, for the cost model.
+    schema:
+      type: object
+      required: [name, blocks, threads_per_block]
+      properties:
+        device: {$ref: Device}
+        stream: {$ref: Stream}
+        name: {type: string, examples: [gemm]}
+        blocks: {type: integer, description: "Total blocks in the grid (gridDim.x*y*z)", examples: [432]}
+        threads_per_block: {type: integer, examples: [256]}
+        shared_bytes: {type: integer, default: 0, description: "Dynamic plus static shared memory per block"}
+        regs_per_thread: {type: integer, default: 32}
+        flops: {type: integer, default: 0, description: "Floating-point operations the kernel performs"}
+        bytes: {type: integer, default: 0, description: "Bytes the kernel moves to and from device memory"}
+        writes: {type: array, items: {type: string}, default: [], description: "Device buffers the kernel writes (sim: recorded as their last writer when it completes)"}
+
+interfaces:
+  # ---- devices ------------------------------------------------------------------------------
+  - component: cuda-runtime
+    name: get-device-count
+    kind: function
+    summary: cudaGetDeviceCount returns the number of visible devices.
+    sources: ["https://docs.nvidia.com/cuda/cuda-runtime-api/group__CUDART__DEVICE.html#group__CUDART__DEVICE_1g18808e54893cfcaafefeab31a73cc55f"]
+    latency_ms: 0
+    request: {type: object}
+    response: {type: object, properties: {count: {type: integer}}}
+    behavior:
+      - return: {count: "= config['cuda-device-count']"}
+
+  - component: cuda-runtime
+    name: get-device-properties
+    kind: function
+    summary: >-
+      cudaGetDeviceProperties: the properties the cost model uses (memory, SMs, resident limits,
+      peak compute and bandwidth, copy engines). An out-of-range device is cudaErrorInvalidDevice.
+    sources: ["https://docs.nvidia.com/cuda/cuda-runtime-api/group__CUDART__DEVICE.html#group__CUDART__DEVICE_1g1bf9d625a931d657e08db2b4391170f0", "https://docs.nvidia.com/cuda/cuda-runtime-api/structcudaDeviceProp.html"]
+    latency_ms: 0
+    request: {type: object, properties: {device: {$ref: Device}}}
+    response: {type: object}
+    errors: [{code: cudaErrorInvalidDevice}]
+    behavior:
+      - if: "input.device < 0 || input.device >= config['cuda-device-count']"
+        then: [{fail: {code: cudaErrorInvalidDevice, message: "invalid device ordinal", data: {cuda_error: 101}}}]
+      - return:
+          device: "= input.device"
+          total_global_mem: "= config['cuda-device-memory-bytes']"
+          multi_processor_count: "= config['cuda-sm-count']"
+          max_threads_per_multiprocessor: "= config['cuda-max-threads-per-sm']"
+          max_blocks_per_multiprocessor: "= config['cuda-max-blocks-per-sm']"
+          max_threads_per_block: "= config['cuda-max-threads-per-block']"
+          regs_per_multiprocessor: "= config['cuda-registers-per-sm']"
+          shared_mem_per_multiprocessor: "= config['cuda-shared-bytes-per-sm']"
+          shared_mem_per_block: "= config['cuda-shared-bytes-per-block']"
+          async_engine_count: "= config['cuda-copy-engines']"
+          peak_tflops: "= config['cuda-peak-tflops']"
+          memory_bandwidth_gbps: "= config['cuda-mem-bandwidth-gbps']"
+          host_link: "= config['cuda-host-link']"
+
+  # ---- memory -------------------------------------------------------------------------------
+  - component: cuda-runtime
+    name: mem-get-info
+    kind: function
+    summary: >-
+      cudaMemGetInfo: free and total device memory. Free is total minus the context's reserve
+      minus every live allocation (each rounded up to the allocation alignment).
+    sources: ["https://docs.nvidia.com/cuda/cuda-runtime-api/group__CUDART__MEMORY.html#group__CUDART__MEMORY_1g376b97f5ab20321ca46f7cfa9511b978"]
+    latency_ms: 0
+    request: {type: object, properties: {device: {$ref: Device}}}
+    response: {type: object, properties: {free: {type: integer}, total: {type: integer}}}
+    errors: [{code: cudaErrorInvalidDevice}]
+    behavior:
+      - if: "input.device < 0 || input.device >= config['cuda-device-count']"
+        then: [{fail: {code: cudaErrorInvalidDevice, message: "invalid device ordinal", data: {cuda_error: 101}}}]
+      - set:
+          vars.used: "= sum(state.allocs.filter(k, state.allocs[k].device == input.device).map(k, state.allocs[k].alloc_bytes))"
+      - return:
+          free: "= config['cuda-device-memory-bytes'] - config['cuda-context-reserved-bytes'] - vars.used"
+          total: "= config['cuda-device-memory-bytes']"
+
+  - component: cuda-runtime
+    name: malloc
+    kind: function
+    summary: >-
+      cudaMalloc: allocate bytes of device memory on the current device, rounded up to the
+      alignment. When the rounded size exceeds free memory it fails cudaErrorMemoryAllocation and
+      allocates nothing. A size of 0 returns the null pointer "0" and succeeds.
+    sources: ["https://docs.nvidia.com/cuda/cuda-runtime-api/group__CUDART__MEMORY.html#group__CUDART__MEMORY_1g37d37965bfb4803b6d4e59ff26856356", "https://docs.nvidia.com/cuda/cuda-runtime-api/group__CUDART__TYPES.html#group__CUDART__TYPES_1g3f51e3575c2178246db0a94a430e0038"]
+    latency_ms: 0
+    request: {type: object, required: [bytes], properties: {device: {$ref: Device}, bytes: {type: integer, minimum: 0, examples: [1073741824]}}}
+    response: {type: object, properties: {ptr: {type: string}, bytes: {type: integer}, alloc_bytes: {type: integer}}}
+    errors: [{code: cudaErrorInvalidDevice}, {code: cudaErrorInvalidValue}, {code: cudaErrorMemoryAllocation}]
+    behavior:
+      - if: "input.device < 0 || input.device >= config['cuda-device-count']"
+        then: [{fail: {code: cudaErrorInvalidDevice, message: "invalid device ordinal", data: {cuda_error: 101}}}]
+      - if: "input.bytes < 0"
+        then: [{fail: {code: cudaErrorInvalidValue, message: "invalid argument", data: {cuda_error: 1}}}]
+      - if: "input.bytes == 0"
+        then: [{return: {ptr: "0", bytes: 0, alloc_bytes: 0}}]
+      - set:
+          vars.align: "= config['cuda-alloc-alignment-bytes']"
+          vars.used: "= sum(state.allocs.filter(k, state.allocs[k].device == input.device).map(k, state.allocs[k].alloc_bytes))"
+      - set:
+          vars.alloc_bytes: "= (input.bytes + vars.align - 1) / vars.align * vars.align"
+          vars.free: "= config['cuda-device-memory-bytes'] - config['cuda-context-reserved-bytes'] - vars.used"
+      - if: "vars.alloc_bytes > vars.free"
+        title: Out of device memory
+        source: "https://docs.nvidia.com/cuda/cuda-runtime-api/group__CUDART__MEMORY.html#group__CUDART__MEMORY_1g37d37965bfb4803b6d4e59ff26856356"
+        then: [{fail: {code: cudaErrorMemoryAllocation, message: "out of memory", data: {cuda_error: 2, requested: "= vars.alloc_bytes", free: "= vars.free"}}}]
+      - set: {vars.ptr: "= 'dptr-' + string(input.device) + '-' + string(seq('ptr'))"}
+      - transact:
+          - {table: allocs, op: put, key: "= vars.ptr", value: {ptr: "= vars.ptr", device: "= input.device", bytes: "= input.bytes", alloc_bytes: "= vars.alloc_bytes"}}
+      - return: {ptr: "= vars.ptr", bytes: "= input.bytes", alloc_bytes: "= vars.alloc_bytes"}
+
+  - component: cuda-runtime
+    name: free
+    kind: function
+    summary: >-
+      cudaFree: release an allocation. It synchronizes the device first (the host waits for all
+      queued work on the pointer's device), then frees. The null pointer is a no-op; an unknown
+      or already freed pointer is cudaErrorInvalidValue.
+    sources: ["https://docs.nvidia.com/cuda/cuda-runtime-api/group__CUDART__MEMORY.html#group__CUDART__MEMORY_1ga042655cbbf3408f01061652a075e094", "https://docs.nvidia.com/cuda/cuda-c-programming-guide/index.html#implicit-synchronization"]
+    latency_ms: 0
+    request: {type: object, required: [ptr], properties: {ptr: {type: string, examples: [dptr-0-1]}}}
+    response: {type: object, properties: {freed: {type: integer}, waited_ms: {type: number}}}
+    errors: [{code: cudaErrorInvalidValue}]
+    behavior:
+      - if: "input.ptr == '0'"
+        then: [{return: {freed: 0, waited_ms: 0}}]
+      - if: "!(input.ptr in state.allocs)"
+        then: [{fail: {code: cudaErrorInvalidValue, message: "invalid argument: not a live device pointer", data: {cuda_error: 1}}}]
+      - set: {vars.dev: "= state.allocs[input.ptr].device"}
+      - call: cuda-runtime.device-synchronize
+        input: {device: "= vars.dev"}
+        as: sync
+        title: cudaFree synchronizes the device
+      - transact:
+          - {table: allocs, op: delete, key: "= input.ptr"}
+        as: del
+      - return: {freed: "= vars.del.value[0].alloc_bytes", waited_ms: "= vars.sync.value.waited_ms"}
+
+  # ---- streams ------------------------------------------------------------------------------
+  - component: cuda-runtime
+    name: stream-create
+    kind: function
+    summary: >-
+      cudaStreamCreateWithFlags: a new stream on the current device. A blocking stream (the
+      default) synchronizes with the legacy default stream; cudaStreamNonBlocking does not.
+    sources: ["https://docs.nvidia.com/cuda/cuda-runtime-api/group__CUDART__STREAM.html#group__CUDART__STREAM_1gb1e32aff9f59119e4d0a9858991c4ad3", "https://docs.nvidia.com/cuda/cuda-runtime-api/stream-sync-behavior.html"]
+    latency_ms: 0
+    request: {type: object, properties: {device: {$ref: Device}, non_blocking: {type: boolean, default: false}}}
+    response: {type: object, properties: {stream: {type: string}}}
+    errors: [{code: cudaErrorInvalidDevice}]
+    behavior:
+      - if: "input.device < 0 || input.device >= config['cuda-device-count']"
+        then: [{fail: {code: cudaErrorInvalidDevice, message: "invalid device ordinal", data: {cuda_error: 101}}}]
+      - set: {vars.id: "= 'stream-' + string(seq('stream'))"}
+      - transact:
+          - {table: streams, op: put, key: "= vars.id", value: {id: "= vars.id", device: "= input.device", non_blocking: "= has(input.non_blocking) && input.non_blocking", destroyed: false}}
+      - return: {stream: "= vars.id"}
+
+  - component: cuda-runtime
+    name: stream-destroy
+    kind: function
+    summary: >-
+      cudaStreamDestroy: returns at once; work already queued on the stream still completes
+      (device-synchronize still waits for it). Later use of the handle is
+      cudaErrorInvalidResourceHandle.
+    sources: ["https://docs.nvidia.com/cuda/cuda-runtime-api/group__CUDART__STREAM.html#group__CUDART__STREAM_1gfda584f1788ca983cb21c5f4d2033a62"]
+    latency_ms: 0
+    request: {type: object, required: [stream], properties: {stream: {$ref: Stream}}}
+    response: {type: object, properties: {destroyed: {type: string}}}
+    errors: [{code: cudaErrorInvalidResourceHandle}]
+    behavior:
+      - if: "input.stream == '0' || !(input.stream in state.streams) || state.streams[input.stream].destroyed"
+        then: [{fail: {code: cudaErrorInvalidResourceHandle, message: "invalid resource handle", data: {cuda_error: 400}}}]
+      - transact:
+          - {table: streams, op: update, key: "= input.stream", value: {destroyed: true}}
+      - return: {destroyed: "= input.stream"}
+
+  - component: cuda-runtime
+    name: stream-query
+    kind: function
+    summary: >-
+      cudaStreamQuery: cudaSuccess when all work queued on the stream has completed,
+      cudaErrorNotReady otherwise. The host doesn't wait.
+    sources: ["https://docs.nvidia.com/cuda/cuda-runtime-api/group__CUDART__STREAM.html#group__CUDART__STREAM_1g2021adeb17905c7ec2a3c1bf125c5435"]
+    latency_ms: 0
+    request: {type: object, properties: {device: {$ref: Device}, stream: {$ref: Stream}}}
+    response: {type: object, properties: {ready: {type: boolean}}}
+    errors: [{code: cudaErrorInvalidResourceHandle}, {code: cudaErrorNotReady}]
+    behavior:
+      - if: "input.stream != '0' && (!(input.stream in state.streams) || state.streams[input.stream].destroyed || state.streams[input.stream].device != input.device)"
+        then: [{fail: {code: cudaErrorInvalidResourceHandle, message: "invalid resource handle", data: {cuda_error: 400}}}]
+      - set: {vars.key: "= input.stream == '0' ? string(input.device) + '/0' : input.stream"}
+      - set: {vars.busy: "= state.ops.filter(k, state.ops[k].stream == vars.key && state.ops[k].status != 'done')"}
+      - if: "size(vars.busy) > 0"
+        then: [{fail: {code: cudaErrorNotReady, message: "device not ready", data: {cuda_error: 600, pending: "= size(vars.busy)"}}}]
+      - return: {ready: true}
+
+  - component: cuda-runtime
+    name: stream-synchronize
+    kind: function
+    summary: >-
+      cudaStreamSynchronize: the host waits until all work queued on the stream has finished.
+      On the legacy default stream ("0") it waits for every blocking stream of the device, as
+      a marker queued there would.
+    sources: ["https://docs.nvidia.com/cuda/cuda-runtime-api/group__CUDART__STREAM.html#group__CUDART__STREAM_1g82b5784f674c17c6df64affe618bf45e", "https://docs.nvidia.com/cuda/cuda-runtime-api/stream-sync-behavior.html"]
+    latency_ms: 0
+    request: {type: object, properties: {device: {$ref: Device}, stream: {$ref: Stream}}}
+    response: {type: object, properties: {waited_ms: {type: number}, done_us: {type: integer}}}
+    errors: [{code: cudaErrorInvalidResourceHandle}]
+    behavior:
+      - if: "input.stream != '0' && (!(input.stream in state.streams) || state.streams[input.stream].destroyed || state.streams[input.stream].device != input.device)"
+        then: [{fail: {code: cudaErrorInvalidResourceHandle, message: "invalid resource handle", data: {cuda_error: 400}}}]
+      - set:
+          vars.covered: >-
+            = state.ops.filter(k, state.ops[k].status != 'done' && state.ops[k].device == input.device &&
+                (input.stream == '0' ? state.ops[k].cls != 'nonblocking' : state.ops[k].stream == input.stream))
+      - call: cuda-runtime.host-wait
+        input: {ops: "= vars.covered"}
+        as: w
+      - return: "= vars.w.value"
+
+  - component: cuda-runtime
+    name: stream-wait-event
+    kind: function
+    summary: >-
+      cudaStreamWaitEvent: work queued on the stream after this call waits for the event's most
+      recent record (at the time of the call) to complete, on any stream of any device. The host
+      doesn't wait. An event never recorded is treated as complete. Queued as a marker.
+    sources: ["https://docs.nvidia.com/cuda/cuda-runtime-api/group__CUDART__STREAM.html#group__CUDART__STREAM_1g7840e3984799941a61839de40413d1d9"]
+    latency_ms: 0
+    request: {type: object, required: [event], properties: {device: {$ref: Device}, stream: {$ref: Stream}, event: {type: string}}}
+    response: Queued
+    errors: [{code: cudaErrorInvalidResourceHandle}]
+    behavior:
+      - if: "!(input.event in state.events) || (input.stream != '0' && (!(input.stream in state.streams) || state.streams[input.stream].destroyed || state.streams[input.stream].device != input.device))"
+        then: [{fail: {code: cudaErrorInvalidResourceHandle, message: "invalid resource handle", data: {cuda_error: 400}}}]
+      - set: {vars.ev: "= state.events[input.event]"}
+      - call: cuda-runtime.enqueue
+        input:
+          device: "= input.device"
+          stream: "= input.stream"
+          kind: wait
+          cost_us: 0
+          op: "= 'wait ' + input.event"
+          after: "= vars.ev.recorded && state.ops[vars.ev.op].status != 'done' ? vars.ev.op : ''"
+        as: q
+        title: Later work on the stream starts after the event
+      - return: "= vars.q.value"
+
+  - component: cuda-runtime
+    name: device-synchronize
+    kind: function
+    summary: >-
+      cudaDeviceSynchronize: the host waits until all work on every stream of the current
+      device (destroyed streams included) has finished.
+    sources: ["https://docs.nvidia.com/cuda/cuda-runtime-api/group__CUDART__DEVICE.html#group__CUDART__DEVICE_1g10e20b05a95f638a4071a655503df25d"]
+    latency_ms: 0
+    request: {type: object, properties: {device: {$ref: Device}}}
+    response: {type: object, properties: {waited_ms: {type: number}, done_us: {type: integer}}}
+    errors: [{code: cudaErrorInvalidDevice}]
+    behavior:
+      - if: "input.device < 0 || input.device >= config['cuda-device-count']"
+        then: [{fail: {code: cudaErrorInvalidDevice, message: "invalid device ordinal", data: {cuda_error: 101}}}]
+      - call: cuda-runtime.host-wait
+        input: {ops: "= state.ops.filter(k, state.ops[k].status != 'done' && state.ops[k].device == input.device)"}
+        as: w
+      - return: "= vars.w.value"
+
+  # ---- events -------------------------------------------------------------------------------
+  - component: cuda-runtime
+    name: event-create
+    kind: function
+    summary: cudaEventCreate makes an event on the current device; it is not recorded yet.
+    sources: ["https://docs.nvidia.com/cuda/cuda-runtime-api/group__CUDART__EVENT.html#group__CUDART__EVENT_1g7c581e3613a2110ba4d4e7fd5c7da418"]
+    latency_ms: 0
+    request: {type: object, properties: {device: {$ref: Device}}}
+    response: {type: object, properties: {event: {type: string}}}
+    errors: [{code: cudaErrorInvalidDevice}]
+    behavior:
+      - if: "input.device < 0 || input.device >= config['cuda-device-count']"
+        then: [{fail: {code: cudaErrorInvalidDevice, message: "invalid device ordinal", data: {cuda_error: 101}}}]
+      - set: {vars.id: "= 'event-' + string(seq('event'))"}
+      - transact:
+          - {table: events, op: put, key: "= vars.id", value: {id: "= vars.id", device: "= input.device", recorded: false, op: "", at_us: 0, stream: ""}}
+      - return: {event: "= vars.id"}
+
+  - component: cuda-runtime
+    name: event-record
+    kind: function
+    summary: >-
+      cudaEventRecord: queue the event on a stream as a marker; it completes when all work queued
+      on the stream before it has finished, and its time is when it completes. Recording again
+      replaces the previous record. The event and the stream must belong to the same device.
+    sources: ["https://docs.nvidia.com/cuda/cuda-runtime-api/group__CUDART__EVENT.html#group__CUDART__EVENT_1gf4fcb74343aa689f4159791967868446"]
+    latency_ms: 0
+    request: {type: object, required: [event], properties: {device: {$ref: Device}, stream: {$ref: Stream}, event: {type: string}}}
+    response: Queued
+    errors: [{code: cudaErrorInvalidResourceHandle}]
+    behavior:
+      - if: "!(input.event in state.events) || state.events[input.event].device != input.device || (input.stream != '0' && (!(input.stream in state.streams) || state.streams[input.stream].destroyed || state.streams[input.stream].device != input.device))"
+        then: [{fail: {code: cudaErrorInvalidResourceHandle, message: "invalid resource handle", data: {cuda_error: 400}}}]
+      - call: cuda-runtime.enqueue
+        input: {device: "= input.device", stream: "= input.stream", kind: record, cost_us: 0, event: "= input.event", op: "= 'event-record ' + input.event"}
+        as: q
+      - return: "= vars.q.value"
+
+  - component: cuda-runtime
+    name: event-query
+    kind: function
+    summary: >-
+      cudaEventQuery: cudaSuccess when the event's last record has completed, or when it was
+      never recorded; cudaErrorNotReady while work before it is still running.
+    sources: ["https://docs.nvidia.com/cuda/cuda-runtime-api/group__CUDART__EVENT.html#group__CUDART__EVENT_1g2bf738909b4a059023537eaa29d8a5b7"]
+    latency_ms: 0
+    request: {type: object, required: [event], properties: {event: {type: string}}}
+    response: {type: object, properties: {ready: {type: boolean}, at_us: {type: integer}}}
+    errors: [{code: cudaErrorInvalidResourceHandle}, {code: cudaErrorNotReady}]
+    behavior:
+      - if: "!(input.event in state.events)"
+        then: [{fail: {code: cudaErrorInvalidResourceHandle, message: "invalid resource handle", data: {cuda_error: 400}}}]
+      - set: {vars.ev: "= state.events[input.event]"}
+      - if: "vars.ev.recorded && state.ops[vars.ev.op].status != 'done'"
+        then: [{fail: {code: cudaErrorNotReady, message: "device not ready", data: {cuda_error: 600}}}]
+      - return: {ready: true, at_us: "= vars.ev.at_us"}
+
+  - component: cuda-runtime
+    name: event-synchronize
+    kind: function
+    summary: >-
+      cudaEventSynchronize: the host waits until the event's last record completes; it returns
+      at once for an event never recorded.
+    sources: ["https://docs.nvidia.com/cuda/cuda-runtime-api/group__CUDART__EVENT.html#group__CUDART__EVENT_1g949aa42b30ae9e622f6ba0787129ff22"]
+    latency_ms: 0
+    request: {type: object, required: [event], properties: {event: {type: string}}}
+    response: {type: object, properties: {waited_ms: {type: number}, done_us: {type: integer}}}
+    errors: [{code: cudaErrorInvalidResourceHandle}]
+    behavior:
+      - if: "!(input.event in state.events)"
+        then: [{fail: {code: cudaErrorInvalidResourceHandle, message: "invalid resource handle", data: {cuda_error: 400}}}]
+      - call: cuda-runtime.host-wait
+        input: {ops: "= state.events[input.event].recorded ? [state.events[input.event].op] : []"}
+        as: w
+      - return: "= vars.w.value"
+
+  - component: cuda-runtime
+    name: event-elapsed-time
+    kind: function
+    summary: >-
+      cudaEventElapsedTime: milliseconds (a float, microsecond resolution here) between two
+      recorded events. An event never recorded is cudaErrorInvalidResourceHandle; one not yet
+      complete is cudaErrorNotReady.
+    sources: ["https://docs.nvidia.com/cuda/cuda-runtime-api/group__CUDART__EVENT.html#group__CUDART__EVENT_1g40159125411db92c835edb46a0989cd6"]
+    latency_ms: 0
+    request: {type: object, required: [start, end], properties: {start: {type: string}, end: {type: string}}}
+    response: {type: object, properties: {ms: {type: number}}}
+    errors: [{code: cudaErrorInvalidResourceHandle}, {code: cudaErrorNotReady}]
+    behavior:
+      - if: "!(input.start in state.events) || !(input.end in state.events) || !state.events[input.start].recorded || !state.events[input.end].recorded"
+        then: [{fail: {code: cudaErrorInvalidResourceHandle, message: "invalid resource handle", data: {cuda_error: 400}}}]
+      - if: "state.ops[state.events[input.start].op].status != 'done' || state.ops[state.events[input.end].op].status != 'done'"
+        then: [{fail: {code: cudaErrorNotReady, message: "device not ready", data: {cuda_error: 600}}}]
+      - return: {ms: "= double(state.events[input.end].at_us - state.events[input.start].at_us) / 1000.0"}
+
+  # ---- memcpy -------------------------------------------------------------------------------
+  - component: cuda-runtime
+    name: memcpy-async
+    kind: function
+    summary: >-
+      cudaMemcpyAsync: queue a copy on a stream and return. Cost: cuda-memcpy-overhead-us plus
+      bytes over the bandwidth: the host link (cuda-host-link) for pinned host memory, the
+      pageable rate otherwise; device memory bandwidth (read plus write) for a copy within one
+      device; the peer link between devices. H2D and D2H copies serialize on their copy engine
+      (one shared engine when cuda-copy-engines is 1) but overlap kernels. From pageable memory
+      the call is synchronous: the host waits for the copy to finish.
+    sources: ["https://docs.nvidia.com/cuda/cuda-runtime-api/group__CUDART__MEMORY.html#group__CUDART__MEMORY_1g85073372f776b4c4d5f89f7124b7bf79", "https://docs.nvidia.com/cuda/cuda-runtime-api/api-sync-behavior.html", "https://docs.nvidia.com/cuda/cuda-c-best-practices-guide/index.html#asynchronous-and-overlapping-transfers-with-computation"]
+    latency_ms: 0
+    request:
+      type: object
+      required: [kind, dst, src, bytes]
+      properties:
+        device: {$ref: Device}
+        stream: {$ref: Stream}
+        kind: {type: string, enum: [h2d, d2h, d2d], description: "cudaMemcpyHostToDevice, DeviceToHost, DeviceToDevice"}
+        dst: {type: string, description: "A device pointer, or any host buffer name"}
+        src: {type: string}
+        bytes: {type: integer, minimum: 0, examples: [1073741824]}
+        pinned: {type: boolean, default: true, description: "The host buffer is page-locked (cudaMallocHost)"}
+    response: {type: object, properties: {op: {type: string}, stream: {type: string}, queued_us: {type: integer}, cost_us: {type: integer}, waited_ms: {type: number}}}
+    errors: [{code: cudaErrorInvalidValue}, {code: cudaErrorInvalidMemcpyDirection}, {code: cudaErrorInvalidResourceHandle}]
+    behavior:
+      - if: "!(input.kind in ['h2d', 'd2h', 'd2d'])"
+        then: [{fail: {code: cudaErrorInvalidMemcpyDirection, message: "invalid copy direction for memcpy", data: {cuda_error: 21}}}]
+      - if: "input.stream != '0' && (!(input.stream in state.streams) || state.streams[input.stream].destroyed || state.streams[input.stream].device != input.device)"
+        then: [{fail: {code: cudaErrorInvalidResourceHandle, message: "invalid resource handle", data: {cuda_error: 400}}}]
+      - set:
+          vars.dev_dst: "= input.kind in ['h2d', 'd2d']"
+          vars.dev_src: "= input.kind in ['d2h', 'd2d']"
+      - if: "input.bytes < 0 || (vars.dev_dst && (!(input.dst in state.allocs) || state.allocs[input.dst].bytes < input.bytes)) || (vars.dev_src && (!(input.src in state.allocs) || state.allocs[input.src].bytes < input.bytes))"
+        title: A device pointer that isn't live, or a copy past its allocation
+        then: [{fail: {code: cudaErrorInvalidValue, message: "invalid argument", data: {cuda_error: 1}}}]
+      - set:
+          vars.pinned: "= !has(input.pinned) || input.pinned"
+          vars.peer: "= input.kind == 'd2d' && state.allocs[input.src].device != state.allocs[input.dst].device"
+      - set:
+          vars.gbps: >-
+            = input.kind == 'd2d'
+                ? (vars.peer ? double(config['cuda-link-bandwidth-gbps'][config['cuda-peer-link']]) : double(config['cuda-mem-bandwidth-gbps']) / 2.0)
+                : (vars.pinned ? double(config['cuda-link-bandwidth-gbps'][config['cuda-host-link']]) : double(config['cuda-pageable-bandwidth-gbps']))
+          vars.engine: "= input.kind == 'd2d' ? '' : string(input.device) + '/' + (config['cuda-copy-engines'] >= 2 ? input.kind : 'copy')"
+      - set:
+          vars.cost: "= config['cuda-memcpy-overhead-us'] + int(math.ceil(double(input.bytes) / (vars.gbps * 1000.0)))"
+        detail: "bytes / (GB/s * 1000) = microseconds"
+      - call: cuda-runtime.enqueue
+        input: {device: "= input.device", stream: "= input.stream", kind: copy, cost_us: "= vars.cost", engine: "= vars.engine", op: "= 'memcpy ' + input.kind", writes: "= vars.dev_dst ? [input.dst] : []"}
+        as: q
+      - set: {vars.waited: "= 0.0"}
+      - if: "!vars.pinned && input.kind != 'd2d'"
+        title: From pageable memory the copy is synchronous
+        then:
+          - call: cuda-runtime.host-wait
+            input: {ops: "= [vars.q.value.op]"}
+            as: w
+          - set: {vars.waited: "= vars.w.value.waited_ms"}
+      - return: "= merge(vars.q.value, {'cost_us': vars.cost, 'waited_ms': vars.waited})"
+
+  - component: cuda-runtime
+    name: memcpy
+    kind: function
+    summary: >-
+      cudaMemcpy: a copy on the legacy default stream that the host waits for. Because it uses
+      the legacy default stream, it starts only after earlier work on every blocking stream.
+    sources: ["https://docs.nvidia.com/cuda/cuda-runtime-api/group__CUDART__MEMORY.html#group__CUDART__MEMORY_1gc263dbe6574220cc776b45438fc351e8", "https://docs.nvidia.com/cuda/cuda-runtime-api/api-sync-behavior.html"]
+    latency_ms: 0
+    request:
+      type: object
+      required: [kind, dst, src, bytes]
+      properties:
+        device: {$ref: Device}
+        kind: {type: string, enum: [h2d, d2h, d2d]}
+        dst: {type: string}
+        src: {type: string}
+        bytes: {type: integer, minimum: 0}
+        pinned: {type: boolean, default: true}
+    response: {type: object, properties: {op: {type: string}, start_us: {type: integer}, end_us: {type: integer}, cost_us: {type: integer}, waited_ms: {type: number}}}
+    errors: [{code: cudaErrorInvalidValue}, {code: cudaErrorInvalidMemcpyDirection}, {code: cudaErrorInvalidResourceHandle}]
+    behavior:
+      - call: cuda-runtime.memcpy-async
+        input: "= merge(input, {'stream': '0'})"
+        as: c
+      - call: cuda-runtime.host-wait
+        input: {ops: "= [vars.c.value.op]"}
+        as: w
+      - return:
+          op: "= vars.c.value.op"
+          start_us: "= state.ops[vars.c.value.op].start_us"
+          end_us: "= state.ops[vars.c.value.op].end_us"
+          cost_us: "= vars.c.value.cost_us"
+          waited_ms: "= vars.c.value.waited_ms + vars.w.value.waited_ms"
+
+  # ---- kernels ------------------------------------------------------------------------------
+  - component: cuda-runtime
+    name: launch-kernel
+    kind: function
+    summary: >-
+      cudaLaunchKernel (<<<blocks, threads, shared, stream>>>): validate the configuration, queue
+      the kernel and return at once. Occupancy: resident blocks per SM is the least of the block
+      limit, threads, registers and shared memory per SM; resident blocks are that times the SM
+      count, and the grid runs in ceil(blocks / resident) waves. Cost: cuda-launch-overhead-us
+      plus the roofline time, max(flops / peak, bytes / achieved bandwidth), stretched by wave
+      quantization (waves * resident / blocks). Achieved bandwidth falls linearly below
+      cuda-full-bandwidth-occupancy. Kernels on different streams overlap fully (SM sharing is
+      not modeled). `writes` names the buffers the kernel writes, recorded when it completes.
+    sources: ["https://docs.nvidia.com/cuda/cuda-runtime-api/group__CUDART__EXECUTION.html#group__CUDART__EXECUTION_1g5064cdf5d8e6741ace56fd8be951783c", "https://docs.nvidia.com/cuda/cuda-c-best-practices-guide/index.html#occupancy", "https://docs.nvidia.com/cuda/cuda-occupancy-calculator/index.html", "https://docs.nvidia.com/deeplearning/performance/dl-performance-gpu-background/index.html#understand-perf", "https://docs.nvidia.com/cuda/cuda-c-programming-guide/index.html#concurrent-kernel-execution"]
+    latency_ms: 0
+    request: KernelLaunch
+    response:
+      type: object
+      properties:
+        op: {type: string}
+        stream: {type: string}
+        queued_us: {type: integer}
+        cost_us: {type: integer}
+        blocks_per_sm: {type: integer}
+        occupancy: {type: number}
+        waves: {type: integer}
+        bound: {type: string, enum: [compute, memory]}
+    errors: [{code: cudaErrorInvalidConfiguration}, {code: cudaErrorInvalidValue}, {code: cudaErrorLaunchOutOfResources}, {code: cudaErrorInvalidResourceHandle}]
+    behavior:
+      - if: "input.blocks < 1 || input.threads_per_block < 1 || input.threads_per_block > config['cuda-max-threads-per-block']"
+        title: Invalid launch configuration
+        source: "https://docs.nvidia.com/cuda/cuda-runtime-api/group__CUDART__TYPES.html#group__CUDART__TYPES_1g3f51e3575c2178246db0a94a430e0038"
+        then: [{fail: {code: cudaErrorInvalidConfiguration, message: "invalid configuration argument", data: {cuda_error: 9}}}]
+      - set:
+          vars.shared: "= has(input.shared_bytes) ? input.shared_bytes : 0"
+          vars.regs: "= has(input.regs_per_thread) ? input.regs_per_thread : 32"
+          vars.flops: "= has(input.flops) ? input.flops : 0"
+          vars.bytes: "= has(input.bytes) ? input.bytes : 0"
+      - if: "vars.shared > config['cuda-shared-bytes-per-block']"
+        then: [{fail: {code: cudaErrorInvalidValue, message: "invalid argument: shared memory per block exceeds the limit", data: {cuda_error: 1}}}]
+      - if: "vars.regs * input.threads_per_block > config['cuda-registers-per-sm']"
+        then: [{fail: {code: cudaErrorLaunchOutOfResources, message: "too many resources requested for launch", data: {cuda_error: 701}}}]
+      - if: "input.stream != '0' && (!(input.stream in state.streams) || state.streams[input.stream].destroyed || state.streams[input.stream].device != input.device)"
+        then: [{fail: {code: cudaErrorInvalidResourceHandle, message: "invalid resource handle", data: {cuda_error: 400}}}]
+      - set:
+          vars.bps: >-
+            = math.least([int(config['cuda-max-blocks-per-sm']),
+                int(config['cuda-max-threads-per-sm'] / input.threads_per_block),
+                int(config['cuda-registers-per-sm'] / (vars.regs * input.threads_per_block)),
+                int(vars.shared > 0 ? config['cuda-shared-bytes-per-sm'] / vars.shared : config['cuda-max-blocks-per-sm'])])
+      - set:
+          vars.resident: "= vars.bps * config['cuda-sm-count']"
+          vars.occupancy: "= double(vars.bps * input.threads_per_block) / double(config['cuda-max-threads-per-sm'])"
+      - set:
+          vars.waves: "= (input.blocks + vars.resident - 1) / vars.resident"
+          vars.compute_us: "= double(vars.flops) / (double(config['cuda-peak-tflops']) * 1000000.0)"
+          vars.memory_us: "= double(vars.bytes) / (double(config['cuda-mem-bandwidth-gbps']) * 1000.0 * (vars.occupancy >= double(config['cuda-full-bandwidth-occupancy']) ? 1.0 : vars.occupancy / double(config['cuda-full-bandwidth-occupancy'])))"
+      - set:
+          vars.kernel_us: "= int(math.ceil(math.greatest([vars.compute_us, vars.memory_us]) * double(vars.waves * vars.resident) / double(input.blocks)))"
+          vars.bound: "= vars.compute_us >= vars.memory_us ? 'compute' : 'memory'"
+      - call: cuda-runtime.enqueue
+        input: {device: "= input.device", stream: "= input.stream", kind: kernel, cost_us: "= config['cuda-launch-overhead-us'] + vars.kernel_us", op: "= 'kernel ' + input.name", writes: "= has(input.writes) ? input.writes : []"}
+        as: q
+      - return:
+          op: "= vars.q.value.op"
+          stream: "= vars.q.value.stream"
+          queued_us: "= vars.q.value.queued_us"
+          cost_us: "= config['cuda-launch-overhead-us'] + vars.kernel_us"
+          blocks_per_sm: "= vars.bps"
+          occupancy: "= vars.occupancy"
+          waves: "= vars.waves"
+          bound: "= vars.bound"
+
+  # ---- the device (internal) ----------------------------------------------------------------
+  - component: cuda-runtime
+    name: enqueue
+    kind: function
+    summary: >-
+      Queue an operation on a stream (a row of ops, status queued) and let the device start
+      whatever can start now. Its class says how it orders against other streams: the legacy
+      default stream waits for every blocking stream and they wait for it; a non-blocking stream
+      orders only against itself. A record marker becomes its event's last record here.
+    sources: ["https://docs.nvidia.com/cuda/cuda-c-programming-guide/index.html#streams", "https://docs.nvidia.com/cuda/cuda-runtime-api/stream-sync-behavior.html"]
+    latency_ms: 0
+    request:
+      type: object
+      required: [device, stream, kind, cost_us]
+      properties:
+        device: {type: integer}
+        stream: {type: string}
+        kind: {type: string, enum: [kernel, copy, record, wait]}
+        cost_us: {type: integer}
+        engine: {type: string, default: "", description: "<device>/h2d, /d2h or /copy for host copies; \"\" otherwise"}
+        op: {type: string, default: ""}
+        after: {type: string, default: "", description: "an op that must complete first (a wait marker's event record)"}
+        writes: {type: array, items: {type: string}, default: []}
+        event: {type: string, default: "", description: "a record marker's event"}
+    response: Queued
+    behavior:
+      - set:
+          vars.key: "= input.stream == '0' ? string(input.device) + '/0' : input.stream"
+          vars.n: "= seq('op')"
+      - set:
+          vars.id: "= 'op-' + string(vars.n)"
+          vars.cls: "= input.stream == '0' ? 'legacy' : (state.streams[input.stream].non_blocking ? 'nonblocking' : 'blocking')"
+      - transact:
+          - table: ops
+            op: put
+            key: "= vars.id"
+            value:
+              id: "= vars.id"
+              seq: "= vars.n"
+              op: "= has(input.op) ? input.op : ''"
+              kind: "= input.kind"
+              device: "= input.device"
+              stream: "= vars.key"
+              cls: "= vars.cls"
+              engine: "= has(input.engine) ? input.engine : ''"
+              cost_us: "= input.cost_us"
+              after: "= has(input.after) ? input.after : ''"
+              writes: "= has(input.writes) ? input.writes : []"
+              event: "= has(input.event) ? input.event : ''"
+              status: queued
+              queued_us: "= now_us"
+              start_us: -1
+              end_us: -1
+      - transact:
+          - {table: events, op: update, key: "= input.event", value: {recorded: true, op: "= vars.id", at_us: 0, stream: "= vars.key"}}
+        when: "input.kind == 'record'"
+        title: The event's last record is this marker
+      - call: cuda-runtime.dispatch
+      - return: {op: "= vars.id", stream: "= vars.key", queued_us: "= now_us"}
+
+  - component: cuda-runtime
+    name: dispatch
+    kind: function
+    summary: >-
+      Start every queued operation that nothing pending holds back, oldest first: no earlier
+      unfinished operation on its stream, none on a stream it synchronizes with (legacy versus
+      blocking, same device), its copy engine idle, and its awaited record done. A kernel or a
+      copy starts running and completes through a timer after cost_us; a marker completes at once.
+    sources: ["https://docs.nvidia.com/cuda/cuda-c-programming-guide/index.html#asynchronous-concurrent-execution", "https://docs.nvidia.com/cuda/cuda-c-programming-guide/index.html#overlap-of-data-transfer-and-kernel-execution", "https://docs.nvidia.com/cuda/cuda-runtime-api/stream-sync-behavior.html"]
+    latency_ms: 0
+    request: {type: object}
+    behavior:
+      - foreach: "= lists.range(100)"
+        as: i
+        steps:
+          - set:
+              vars.open: "= state.ops.filter(k, state.ops[k].status != 'done')"
+          - set:
+              vars.ready: >-
+                = vars.open.filter(k, state.ops[k].status == 'queued' &&
+                    !vars.open.exists(j, state.ops[j].seq < state.ops[k].seq && (state.ops[j].stream == state.ops[k].stream ||
+                      (state.ops[j].device == state.ops[k].device &&
+                        ((state.ops[k].cls == 'legacy' && state.ops[j].cls != 'nonblocking') ||
+                         (state.ops[k].cls == 'blocking' && state.ops[j].cls == 'legacy'))))) &&
+                    (state.ops[k].engine == '' || !vars.open.exists(j, state.ops[j].status == 'running' && state.ops[j].engine == state.ops[k].engine)) &&
+                    (state.ops[k].after == '' || state.ops[state.ops[k].after].status == 'done')).sortBy(k, state.ops[k].seq)
+          - if: "size(vars.ready) == 0"
+            then: [{break: true}]
+          - set: {vars.id: "= vars.ready[0]"}
+          - if: "state.ops[vars.id].kind in ['record', 'wait']"
+            title: A marker completes as soon as it can start
+            then:
+              - transact:
+                  - {table: ops, op: update, key: "= vars.id", value: {status: running, start_us: "= now_us"}}
+              - call: cuda-runtime.finish
+                input: {op: "= vars.id"}
+            else:
+              - transact:
+                  - {table: ops, op: update, key: "= vars.id", value: {status: running, start_us: "= now_us"}}
+                title: The device starts it
+              - emit: cuda-runtime.complete
+                input: {op: "= vars.id"}
+                after_ms: "= double(state.ops[vars.id].cost_us) / 1000.0"
+                title: It completes after its cost, on the scheduler's clock
+      - return: {}
+
+  - component: cuda-runtime
+    name: complete
+    kind: function
+    summary: A running operation's timer fired; it is done, and the device starts what it unblocked.
+    sources: ["https://docs.nvidia.com/cuda/cuda-c-programming-guide/index.html#streams"]
+    latency_ms: 0
+    request: {type: object, required: [op], properties: {op: {type: string}}}
+    behavior:
+      - call: cuda-runtime.finish
+        input: {op: "= input.op"}
+      - call: cuda-runtime.dispatch
+      - return: {}
+
+  - component: cuda-runtime
+    name: finish
+    kind: function
+    summary: >-
+      Mark an operation done at now: log it in completion order, record it as the last writer
+      of the buffers it writes, and give a record marker's event its time (when it is still the
+      event's last record).
+    sources: ["https://docs.nvidia.com/cuda/cuda-runtime-api/group__CUDART__EVENT.html#group__CUDART__EVENT_1gf4fcb74343aa689f4159791967868446"]
+    latency_ms: 0
+    request: {type: object, required: [op], properties: {op: {type: string}}}
+    behavior:
+      - set: {vars.o: "= state.ops[input.op]"}
+      - transact:
+          - {table: ops, op: update, key: "= input.op", value: {status: done, end_us: "= now_us"}}
+      - set:
+          state.completed: "= state.completed + [input.op]"
+      - foreach: "= vars.o.writes.filter(p, p in state.allocs)"
+        as: p
+        title: The buffer now holds what this operation wrote
+        steps:
+          - transact:
+              - {table: allocs, op: update, key: "= vars.p", value: {written_by: "= vars.o.op", written_us: "= now_us"}}
+      - transact:
+          - {table: events, op: update, key: "= vars.o.event", value: {at_us: "= now_us"}}
+        when: "vars.o.kind == 'record' && vars.o.event in state.events && state.events[vars.o.event].op == input.op"
+      - return: {}
+
+  - component: cuda-runtime
+    name: host-wait
+    kind: function
+    summary: >-
+      The host thread blocks until every listed operation is done, woken by their completions on
+      the scheduler's clock. Returns how long it waited (fractional ms) and when it resumed.
+    sources: ["https://docs.nvidia.com/cuda/cuda-c-programming-guide/index.html#explicit-synchronization"]
+    latency_ms: 0
+    request: {type: object, required: [ops], properties: {ops: {type: array, items: {type: string}}}}
+    response: {type: object, properties: {waited_ms: {type: number}, done_us: {type: integer}}}
+    behavior:
+      - set: {vars.t0: "= now_us"}
+      - wait:
+          until: "input.ops.all(o, state.ops[o].status == 'done')"
+        title: Blocked until the device finishes them
+      - return: {waited_ms: "= double(now_us - vars.t0) / 1000.0", done_us: "= now_us"}

@@ -1,0 +1,492 @@
+# distributed area, part 4 (reconciliation): encoder-cache (EC) transfer loops, RL weight-sync
+# loops, parallel-state checkpoint hooks, and the area seed fixture.
+schema_version: 1
+id: vllm
+
+fixtures:
+  - id: distributed-seed
+    summary: "Distributed area seed: a started worker whose TP group follows tensor-parallel-size, on an H100 (sm 9.0) NVLink node with flashinfer installed. Every value equals the components' initial state; it is listed so merged worlds carry it explicitly."
+    state:
+      parallel-state: {world_initialized: true, mp_initialized: true}
+      cuda-communicator: {device_capability: "9.0", flashinfer_available: true, platform: cuda}
+      custom-allreduce: {disabled: false, fully_connected: true, same_node: true}
+
+components:
+  - id: ec-zmq-server-transport
+    name: ZmqServerTransport (EC CPU connector)
+    kind: module
+    layer: ec-transfer
+    parent: gpu-worker
+    capacity: {concurrency: 1}   # one router thread polls and drains (zmq.py:188-216)
+    summary: "ROUTER-socket server of the encoder-cache CPU connector's control plane: each poll waits up to timeout_ms, then drains every pending (identity, payload) message."
+    sources: ["vllm/distributed/ec_transfer/ec_connector/cpu/control/zmq.py:168-187"]
+    state:
+      schema: {type: object, properties: {inbox: {type: array}, terminated: {type: boolean}, drained: {type: array}}}
+      initial: {inbox: [], terminated: false, drained: []}
+  - id: ec-consumer-control-server
+    name: ConsumerControlServer (EC Mooncake)
+    kind: module
+    layer: ec-transfer
+    parent: gpu-worker
+    summary: "One per receiving TP rank: a REP loop serves reservation operations (reserve, status, complete, cancel, peers, event_port) and a PUSH socket publishes newly ready encoder-cache items to the scheduler."
+    sources: ["vllm/distributed/ec_transfer/ec_connector/mooncake/control.py:240-276"]
+    state:
+      schema: {type: object, properties: {inbox: {type: array}, replies: {type: array}, reservations: {type: object}, ready_events: {type: array}, stop: {type: boolean}}}
+      initial: {inbox: [], replies: [], reservations: {}, ready_events: [], stop: false}
+  - id: ec-mooncake-worker
+    name: ECMooncakeWorker
+    kind: module
+    layer: ec-transfer
+    parent: gpu-worker
+    summary: "Producer side of the EC Mooncake connector: the ec-mooncake-ready thread submits push batches of encoder outputs once the producer pushes are ready, except while sources are being collected."
+    sources: ["vllm/distributed/ec_transfer/ec_connector/mooncake/worker.py:84-160"]
+    state:
+      schema: {type: object, properties: {stop: {type: boolean}, collecting_sources: {type: boolean}, ready_pushes: {type: array}, pushed: {type: array}}}
+      initial: {stop: false, collecting_sources: false, ready_pushes: [], pushed: []}
+  - id: sharded-rdt-weight-transfer-engine
+    name: ShardedRDTWeightTransferEngine
+    kind: module
+    layer: weight-transfer
+    parent: gpu-worker
+    summary: "Inference-side RL weight sync over sharded RDT: a post-processing thread scatters received weight groups into the model, and a quant thread re-quantizes completed modules; the first error is recorded and re-raised on the RPC thread."
+    sources: ["vllm/distributed/weight_transfer/sharded_rdt_engine.py:267-280"]
+    state:
+      schema: {type: object, properties: {proc_queue: {type: array}, quant_queue: {type: array}, processed: {type: array}, quantized: {type: array}, proc_error: {type: string}}}
+      initial: {proc_queue: [], quant_queue: [], processed: [], quantized: [], proc_error: ""}
+  - id: sharded-rdt-trainer-weight-transfer-engine
+    name: ShardedRDTTrainerWeightTransferEngine
+    kind: module
+    layer: weight-transfer
+    parent: python-user
+    summary: "Trainer-side half of the sharded RDT weight sync (runs in the RL trainer process, which drives vLLM): gathers each owned weight group, keeps at most gather_lookahead groups in flight, publishes them, and ends the sync."
+    sources: ["vllm/distributed/weight_transfer/sharded_rdt_trainer.py:799-810"]
+    state:
+      schema: {type: object, properties: {owned: {type: array}, yielded: {type: array}, inflight: {type: array}, published: {type: array}, lookahead: {type: integer}, ended: {type: boolean}, gather_error: {type: string}}}
+      initial: {owned: [], yielded: [], inflight: [], published: [], lookahead: 1, ended: false, gather_error: ""}
+
+interfaces:
+  - component: parallel-state
+    name: checkpoint-prepare-distributed-state
+    kind: function
+    summary: "checkpoint_prepare_distributed_state: synchronize, then let every device communicator prepare for a process checkpoint (NCCL communicators are suspended)."
+    sources: ["vllm/distributed/parallel_state.py:2418-2422"]
+    request: {type: object, properties: {}}
+    response: {type: object, properties: {prepared: {type: boolean}}}
+    behavior:
+      - if: "!state.world_initialized"
+        then:
+          - title: No device communicators registered yet
+            source: "vllm/distributed/parallel_state.py:166-186"
+            return: {prepared: false}
+      - set: {state.checkpointed: true}
+      - return: {prepared: true}
+
+  - component: parallel-state
+    name: checkpoint-restore-distributed-state
+    kind: function
+    summary: "checkpoint_restore_distributed_state: synchronize, then let every device communicator restore after a checkpoint."
+    sources: ["vllm/distributed/parallel_state.py:2425-2429"]
+    request: {type: object, properties: {}}
+    response: {type: object, properties: {restored: {type: boolean}}}
+    behavior:
+      - if: "!has(state.checkpointed) || !state.checkpointed"
+        then:
+          - return: {restored: false}
+      - set: {state.checkpointed: false}
+      - return: {restored: true}
+
+  - component: ec-zmq-server-transport
+    name: poll
+    kind: function
+    summary: "ZmqServerTransport.poll: with a timeout, wait on the poller (a terminated context or poller failure returns nothing); then drain every pending message without blocking."
+    sources: ["vllm/distributed/ec_transfer/ec_connector/cpu/control/zmq.py:188-216"]
+    request: {type: object, properties: {timeout_ms: {type: integer, default: 100}}}
+    response: {type: object, properties: {messages: {type: array}}}
+    behavior:
+      - if: "state.terminated"
+        then:
+          - source: "vllm/distributed/ec_transfer/ec_connector/cpu/control/zmq.py:196-197"
+            return: {messages: []}
+      - if: "size(state.inbox) == 0"
+        then:
+          - title: Nothing arrived within the timeout
+            source: "vllm/distributed/ec_transfer/ec_connector/cpu/control/zmq.py:201-202"
+            wait: "= has(input.timeout_ms) ? input.timeout_ms : 100"
+          - return: {messages: []}
+      - title: Drain every pending message (recv_multipart NOBLOCK until zmq.Again)
+        source: "vllm/distributed/ec_transfer/ec_connector/cpu/control/zmq.py:204-216"
+        set:
+          vars.msgs: "= state.inbox"
+          state.drained: "= state.drained + state.inbox"
+          state.inbox: []
+      - return: {messages: "= vars.msgs"}
+
+  - component: ec-consumer-control-server
+    name: loop
+    kind: function
+    summary: "One request of the ec-mooncake-control REP loop: flush pending readiness events, then decode and dispatch the op; a malformed frame or a failing op still gets an {ok: false} reply, since REP owes one."
+    sources: ["vllm/distributed/ec_transfer/ec_connector/mooncake/control.py:324-427"]
+    request: {type: object, properties: {}}
+    response: {type: object, properties: {reply: {type: [object, "null"]}, stopped: {type: boolean}}}
+    behavior:
+      - if: "state.stop"
+        then:
+          - source: "vllm/distributed/ec_transfer/ec_connector/mooncake/control.py:324"
+            return: {reply: null, stopped: true}
+      - if: "size(state.inbox) == 0"
+        then:
+          - title: "recv_json times out after 100 ms (RCVTIMEO); loop again"
+            source: "vllm/distributed/ec_transfer/ec_connector/mooncake/control.py:337-340"
+            return: {reply: null, stopped: false}
+      - set:
+          vars.req: "= state.inbox[0]"
+          state.inbox: "= state.inbox.slice(1, size(state.inbox))"
+      - if: "!has(vars.req.op)"
+        then:
+          - title: Undecodable request still gets a reply
+            source: "vllm/distributed/ec_transfer/ec_connector/mooncake/control.py:341-352"
+            set: {vars.reply: {ok: false, error: malformed control request}}
+        else:
+          - if: "vars.req.op == 'reserve'"
+            then:
+              - title: Reserve the destination; a ready reservation queues a readiness event
+                source: "vllm/distributed/ec_transfer/ec_connector/mooncake/control.py:356-375"
+                set:
+                  state.reservations: "= merge(state.reservations, {vars.req.transfer_id: {'ready': has(vars.req.ready) && vars.req.ready, 'completed': false}})"
+                  state.ready_events: "= has(vars.req.ready) && vars.req.ready ? state.ready_events + [vars.req.transfer_id] : state.ready_events"
+                  vars.reply: {ok: true}
+            else:
+              - if: "vars.req.op == 'status'"
+                then:
+                  - source: "vllm/distributed/ec_transfer/ec_connector/mooncake/control.py:376-377"
+                    set:
+                      vars.reply: "= {'ok': true, 'result': vars.req.transfer_id in state.reservations ? state.reservations[vars.req.transfer_id] : null}"
+                else:
+                  - if: "vars.req.op == 'complete'"
+                    then:
+                      - title: Complete; a reservation that becomes ready queues its event
+                        source: "vllm/distributed/ec_transfer/ec_connector/mooncake/control.py:382-408"
+                        set:
+                          vars.known: "= vars.req.transfer_id in state.reservations"
+                      - set:
+                          state.reservations: "= vars.known ? merge(state.reservations, {vars.req.transfer_id: {'ready': true, 'completed': true}}) : state.reservations"
+                          state.ready_events: "= vars.known ? state.ready_events + [vars.req.transfer_id] : state.ready_events"
+                          vars.reply: "= {'ok': true, 'result': {'completed': vars.known, 'became_ready': vars.known}}"
+                    else:
+                      - if: "vars.req.op == 'cancel'"
+                        then:
+                          - source: "vllm/distributed/ec_transfer/ec_connector/mooncake/control.py:409-417"
+                            set:
+                              vars.reply: "= {'ok': true, 'result': {'cancelled': vars.req.transfer_id in state.reservations}}"
+                              state.reservations: "= omit(state.reservations, vars.req.transfer_id)"
+                        else:
+                          - title: Unknown op becomes an error reply
+                            source: "vllm/distributed/ec_transfer/ec_connector/mooncake/control.py:418-421"
+                            set: {vars.reply: "= {'ok': false, 'error': 'unknown control op: ' + vars.req.op}"}
+      - set: {state.replies: "= state.replies + [vars.reply]"}
+      - return: {reply: "= vars.reply", stopped: false}
+
+  - component: ec-mooncake-worker
+    name: dispatch-pushes
+    kind: function
+    summary: "One wake-up of the ec-mooncake-ready thread (_dispatch_pushes): exit when stopped; skip while sources are being collected; otherwise submit the ready push batches to the IO executor."
+    sources: ["vllm/distributed/ec_transfer/ec_connector/mooncake/worker.py:162-172"]
+    request: {type: object, properties: {}}
+    response: {type: object, properties: {submitted: {type: integer}, exited: {type: boolean}}}
+    behavior:
+      - if: "state.stop"
+        then:
+          - source: "vllm/distributed/ec_transfer/ec_connector/mooncake/worker.py:166-167"
+            return: {submitted: 0, exited: true}
+      - if: "state.collecting_sources"
+        then:
+          - title: Sources are being collected; wait for the next wake-up
+            source: "vllm/distributed/ec_transfer/ec_connector/mooncake/worker.py:168-170"
+            return: {submitted: 0, exited: false}
+      - title: submit_batches(io_executor, push_batch)
+        source: "vllm/distributed/ec_transfer/ec_connector/mooncake/worker.py:171-172"
+        set:
+          vars.n: "= size(state.ready_pushes)"
+          state.pushed: "= state.pushed + state.ready_pushes"
+          state.ready_pushes: []
+      - return: {submitted: "= vars.n", exited: false}
+
+  - component: sharded-rdt-weight-transfer-engine
+    name: proc-worker-loop
+    kind: function
+    summary: "One item of the RDT post-processing thread: None exits; otherwise _process_item scatters the received group into the model; an exception is recorded in _proc_error (re-raised on the RPC thread) and the loop goes on."
+    sources: ["vllm/distributed/weight_transfer/sharded_rdt_engine.py:1012-1034"]
+    request: {type: object, properties: {}}
+    response: {type: object, properties: {processed: {type: [string, "null"]}, exited: {type: boolean}}}
+    behavior:
+      - if: "size(state.proc_queue) == 0 || state.proc_queue[0] == null"
+        then:
+          - source: "vllm/distributed/weight_transfer/sharded_rdt_engine.py:1024-1025"
+            set: {state.proc_queue: "= size(state.proc_queue) == 0 ? [] : state.proc_queue.slice(1, size(state.proc_queue))"}
+          - return: {processed: null, exited: true}
+      - set:
+          vars.item: "= state.proc_queue[0]"
+          state.proc_queue: "= state.proc_queue.slice(1, size(state.proc_queue))"
+      - if: "has(vars.item.corrupt) && vars.item.corrupt"
+        then:
+          - title: The failure is recorded, not raised, on this thread
+            source: "vllm/distributed/weight_transfer/sharded_rdt_engine.py:1029-1031"
+            set: {state.proc_error: "= 'group ' + vars.item.group + ' failed'"}
+          - return: {processed: null, exited: false}
+      - source: "vllm/distributed/weight_transfer/sharded_rdt_engine.py:1026-1028"
+        set: {state.processed: "= state.processed + [vars.item.group]"}
+      - return: {processed: "= vars.item.group", exited: false}
+
+  - component: sharded-rdt-weight-transfer-engine
+    name: quant-worker-loop
+    kind: function
+    summary: "One batch of the RDT quant thread: None exits; otherwise re-quantize the completed modules once their scatter event is done; errors go to _proc_error."
+    sources: ["vllm/distributed/weight_transfer/sharded_rdt_engine.py:1404-1420"]
+    request: {type: object, properties: {}}
+    response: {type: object, properties: {quantized: {type: integer}, exited: {type: boolean}}}
+    behavior:
+      - if: "size(state.quant_queue) == 0 || state.quant_queue[0] == null"
+        then:
+          - source: "vllm/distributed/weight_transfer/sharded_rdt_engine.py:1413-1414"
+            return: {quantized: 0, exited: true}
+      - set:
+          vars.b: "= state.quant_queue[0]"
+          state.quant_queue: "= state.quant_queue.slice(1, size(state.quant_queue))"
+      - if: "state.proc_error != '' && has(vars.b.fail) && vars.b.fail"
+        then:
+          - source: "vllm/distributed/weight_transfer/sharded_rdt_engine.py:1416-1418"
+            return: {quantized: 0, exited: false}
+      - source: "vllm/distributed/weight_transfer/sharded_rdt_engine.py:1415"
+        set: {state.quantized: "= state.quantized + vars.b.layers"}
+      - return: {quantized: "= size(vars.b.layers)", exited: false}
+
+  - component: sharded-rdt-trainer-weight-transfer-engine
+    name: run-gather-loop
+    kind: function
+    summary: "Trainer side of one sharded RDT sync: for each owned group, wait for freed slots while more than gather_lookahead groups are in flight, check the source yields the expected names (else RuntimeError), keep it in flight and publish it; then end_sync."
+    sources: ["vllm/distributed/weight_transfer/sharded_rdt_trainer.py:1325-1494"]
+    request: {type: object, properties: {}}
+    response: {type: object, properties: {published: {type: integer}, waits: {type: integer}}}
+    errors:
+      - {code: runtime-error, status: 0, retryable: false}
+    behavior:
+      - set: {vars.waits: 0, state.ended: false}
+      - foreach: "= lists.range(size(state.owned))"
+        as: gi
+        steps:
+          - if: "size(state.inflight) > state.lookahead"
+            then:
+              - title: "while len(inflight) > bound: wait_freed drops the oldest"
+                source: "vllm/distributed/weight_transfer/sharded_rdt_trainer.py:1387-1391"
+                set:
+                  state.inflight: "= state.inflight.slice(1, size(state.inflight))"
+                  vars.waits: "= vars.waits + 1"
+          - if: "vars.gi >= size(state.yielded) || state.yielded[vars.gi] != state.owned[vars.gi]"
+            then:
+              - title: The WeightSource yielded groups in a different order than the metadata
+                source: "vllm/distributed/weight_transfer/sharded_rdt_trainer.py:1392-1398"
+                set: {state.gather_error: mismatch, state.inflight: []}
+              - fail: {code: runtime-error, status: 0, message: "WeightSource group yielded names that do not match the metadata; iteration order must match metadata."}
+          - source: "vllm/distributed/weight_transfer/sharded_rdt_trainer.py:1470-1480"
+            set:
+              state.inflight: "= state.inflight + [state.owned[vars.gi]]"
+              state.published: "= state.published + [state.owned[vars.gi]]"
+      - title: end_sync frees the remaining groups
+        source: "vllm/distributed/weight_transfer/sharded_rdt_trainer.py:1483-1485"
+        set: {state.inflight: [], state.ended: true}
+      - return: {published: "= size(state.published)", waits: "= vars.waits"}
+
+flows:
+  - id: distributed-checkpoint-distributed-state
+    name: Prepare and restore device communicators around a process checkpoint
+    tags: [writes]
+    entry: {caller: gpu-worker, interface: parallel-state.checkpoint-prepare-distributed-state}
+    sources: ["vllm/distributed/parallel_state.py:2418-2422"]
+  - id: distributed-ec-zmq-poll
+    name: EC CPU connector control-plane poll loop
+    entry: {caller: gpu-worker, interface: ec-zmq-server-transport.poll, repeat: {count: 2, interval_ms: 1}}
+    sources: ["vllm/distributed/ec_transfer/ec_connector/cpu/control/zmq.py:188-216"]
+  - id: distributed-ec-control-server
+    name: EC Mooncake consumer control loop
+    entry: {caller: gpu-worker, interface: ec-consumer-control-server.loop, repeat: {count: 3, interval_ms: 1}}
+    sources: ["vllm/distributed/ec_transfer/ec_connector/mooncake/control.py:324-427"]
+  - id: distributed-ec-dispatch-pushes
+    name: EC Mooncake push dispatcher thread
+    entry: {caller: gpu-worker, interface: ec-mooncake-worker.dispatch-pushes, repeat: {count: 2, interval_ms: 1}}
+    sources: ["vllm/distributed/ec_transfer/ec_connector/mooncake/worker.py:162-172"]
+  - id: distributed-rdt-proc-loop
+    name: RDT weight-sync post-processing thread
+    tags: [writes]
+    entry: {caller: gpu-worker, interface: sharded-rdt-weight-transfer-engine.proc-worker-loop, repeat: {count: 3, interval_ms: 1}}
+    sources: ["vllm/distributed/weight_transfer/sharded_rdt_engine.py:1012-1034"]
+  - id: distributed-rdt-quant-loop
+    name: RDT weight-sync quant thread
+    entry: {caller: gpu-worker, interface: sharded-rdt-weight-transfer-engine.quant-worker-loop, repeat: {count: 2, interval_ms: 1}}
+    sources: ["vllm/distributed/weight_transfer/sharded_rdt_engine.py:1404-1420"]
+  - id: distributed-rdt-trainer-gather
+    name: Trainer-side RDT gather loop
+    tags: [writes]
+    entry: {caller: python-user, interface: sharded-rdt-trainer-weight-transfer-engine.run-gather-loop}
+    sources: ["vllm/distributed/weight_transfer/sharded_rdt_trainer.py:1325-1494"]
+
+scenarios:
+  - id: distributed-checkpoint-prepare-then-restore
+    flow: distributed-checkpoint-distributed-state
+    fixtures: [tp1-llama-8b, distributed-seed]
+    steps:
+      - {flow: distributed-checkpoint-distributed-state, as: prep}
+      - {interface: parallel-state.checkpoint-restore-distributed-state, caller: gpu-worker, as: rest}
+      - {interface: parallel-state.checkpoint-restore-distributed-state, caller: gpu-worker, as: again}
+    expect:
+      - "steps.prep.result.value.prepared && steps.rest.result.value.restored && !steps.again.result.value.restored"
+      - "!state['parallel-state@rank0'].checkpointed"
+  - id: distributed-checkpoint-before-init
+    flow: distributed-checkpoint-distributed-state
+    fixtures: [tp1-llama-8b]
+    state:
+      parallel-state: {world_initialized: false}
+    expect:
+      - "result.ok && !result.value.prepared && !has(state['parallel-state@rank0'].checkpointed)"
+  - id: distributed-ec-zmq-poll-drains
+    flow: distributed-ec-zmq-poll
+    fixtures: [tp1-llama-8b, distributed-seed]
+    state:
+      ec-zmq-server-transport: {inbox: [{identity: p0, payload: reserve}, {identity: p1, payload: status}]}
+    steps:
+      - {flow: distributed-ec-zmq-poll, as: p}
+      - {interface: ec-zmq-server-transport.poll, caller: gpu-worker, as: idle, input: {timeout_ms: 50}}
+    expect:
+      - "size(steps.p.result.value.messages) == 2 && size(steps.idle.result.value.messages) == 0"
+      - "size(state['ec-zmq-server-transport@rank0'].drained) == 2 && steps.idle.duration_ms >= 50"
+  - id: distributed-ec-zmq-poll-terminated
+    flow: distributed-ec-zmq-poll
+    fixtures: [tp1-llama-8b]
+    state:
+      ec-zmq-server-transport: {terminated: true, inbox: [{identity: p0, payload: x}]}
+    expect:
+      - "passes[0].result.value.messages == []"
+  - id: distributed-ec-control-reserve-complete-status
+    name: A reservation completed by the producer becomes ready and its status reads back
+    flow: distributed-ec-control-server
+    fixtures: [tp1-llama-8b, distributed-seed]
+    state:
+      ec-consumer-control-server: {inbox: [{op: reserve, transfer_id: t1}, {op: complete, transfer_id: t1, reservation_id: r1}, {op: status, transfer_id: t1}]}
+    steps:
+      - {flow: distributed-ec-control-server, as: run}
+      - {interface: ec-consumer-control-server.loop, caller: gpu-worker, as: done}
+      - {interface: ec-consumer-control-server.loop, caller: gpu-worker, as: st}
+      - {interface: ec-consumer-control-server.loop, caller: gpu-worker, as: idle}
+    expect:
+      - "state['ec-consumer-control-server@rank0'].replies[2].result.ready && state['ec-consumer-control-server@rank0'].ready_events == ['t1']"
+      - "steps.idle.result.value.reply == null"
+  - id: distributed-ec-control-errors
+    flow: distributed-ec-control-server
+    fixtures: [tp1-llama-8b]
+    state:
+      ec-consumer-control-server: {inbox: [{garbage: true}, {op: frobnicate, transfer_id: t2}, {op: cancel, transfer_id: t3}]}
+    expect:
+      - "state['ec-consumer-control-server@rank0'].replies.map(r, r.ok) == [false, false, true]"
+  - id: distributed-ec-control-ready-reserve-and-stop
+    flow: distributed-ec-control-server
+    fixtures: [tp1-llama-8b]
+    state:
+      ec-consumer-control-server: {inbox: [{op: reserve, transfer_id: t4, ready: true}, {op: complete, transfer_id: t9, reservation_id: r9}]}
+    steps:
+      - {flow: distributed-ec-control-server, as: run}
+      - {interface: ec-consumer-control-server.loop, caller: gpu-worker, as: stopped}
+    expect:
+      - "state['ec-consumer-control-server@rank0'].ready_events == ['t4'] && !state['ec-consumer-control-server@rank0'].replies[1].result.completed"
+  - id: distributed-ec-control-stop
+    flow: distributed-ec-control-server
+    fixtures: [tp1-llama-8b]
+    state:
+      ec-consumer-control-server: {stop: true, inbox: [{op: status, transfer_id: t1}]}
+    expect:
+      - "passes[0].result.value.stopped"
+  - id: distributed-ec-dispatch-pushes-submits
+    flow: distributed-ec-dispatch-pushes
+    fixtures: [tp1-llama-8b, distributed-seed]
+    state:
+      ec-mooncake-worker: {ready_pushes: [mm-1, mm-2]}
+    steps:
+      - {flow: distributed-ec-dispatch-pushes, as: d}
+      - {interface: ec-mooncake-worker.dispatch-pushes, caller: gpu-worker, as: d2}
+    expect:
+      - "steps.d.result.value.submitted == 2 && steps.d2.result.value.submitted == 0"
+      - "state['ec-mooncake-worker@rank0'].pushed == ['mm-1', 'mm-2']"
+  - id: distributed-ec-dispatch-pushes-collecting-and-stop
+    flow: distributed-ec-dispatch-pushes
+    fixtures: [tp1-llama-8b]
+    state:
+      ec-mooncake-worker: {collecting_sources: true, ready_pushes: [mm-3]}
+    steps:
+      - {flow: distributed-ec-dispatch-pushes, as: hold}
+      - {interface: ec-mooncake-worker.dispatch-pushes, caller: gpu-worker, as: hold2}
+    expect:
+      - "steps.hold.result.value.submitted == 0"
+  - id: distributed-ec-dispatch-pushes-stopped
+    flow: distributed-ec-dispatch-pushes
+    fixtures: [tp1-llama-8b]
+    state:
+      ec-mooncake-worker: {stop: true, ready_pushes: [mm-4]}
+    expect:
+      - "passes[0].result.value.exited"
+  - id: distributed-rdt-proc-records-error
+    name: A failed group is recorded in _proc_error while later groups still apply; the sentinel exits
+    flow: distributed-rdt-proc-loop
+    fixtures: [tp1-llama-8b, distributed-seed]
+    state:
+      sharded-rdt-weight-transfer-engine: {proc_queue: [{group: g0}, {group: g1, corrupt: true}, null]}
+    steps:
+      - {flow: distributed-rdt-proc-loop, as: run}
+      - {interface: sharded-rdt-weight-transfer-engine.proc-worker-loop, caller: gpu-worker, as: bad}
+      - {flow: distributed-rdt-quant-loop, as: q}
+    expect:
+      - "state['sharded-rdt-weight-transfer-engine@rank0'].processed == ['g0'] && state['sharded-rdt-weight-transfer-engine@rank0'].proc_error == 'group g1 failed'"
+  - id: distributed-rdt-quant-batches
+    flow: distributed-rdt-quant-loop
+    fixtures: [tp1-llama-8b]
+    state:
+      sharded-rdt-weight-transfer-engine: {proc_error: "group g1 failed", quant_queue: [{layers: [l0, l1]}, {layers: [l2], fail: true}]}
+    expect:
+      - "passes[0].result.value.quantized == 2 && passes[1].result.value.quantized == 0"
+      - "state['sharded-rdt-weight-transfer-engine@rank0'].quantized == ['l0', 'l1']"
+  - id: distributed-rdt-quant-exit
+    flow: distributed-rdt-quant-loop
+    fixtures: [tp1-llama-8b]
+    expect:
+      - "passes[0].result.value.exited"
+  - id: distributed-rdt-trainer-gather-bounded
+    name: With lookahead 1 the trainer waits for a freed group before each new one past the bound
+    flow: distributed-rdt-trainer-gather
+    fixtures: [tp1-llama-8b, distributed-seed]
+    state:
+      sharded-rdt-trainer-weight-transfer-engine: {owned: [a, b, c, d], yielded: [a, b, c, d], lookahead: 1}
+    steps:
+      - {flow: distributed-rdt-trainer-gather, as: sync}
+      - {flow: distributed-rdt-proc-loop, as: recv}
+    expect:
+      - "steps.sync.result.value.published == 4 && steps.sync.result.value.waits == 2"
+      - "state['sharded-rdt-trainer-weight-transfer-engine'].ended && size(state['sharded-rdt-trainer-weight-transfer-engine'].inflight) == 0"
+  - id: distributed-rdt-trainer-gather-order-mismatch
+    flow: distributed-rdt-trainer-gather
+    fixtures: [tp1-llama-8b]
+    state:
+      sharded-rdt-trainer-weight-transfer-engine: {owned: [a, b], yielded: [a, c]}
+    expect:
+      - "!result.ok && result.error.code == 'runtime-error' && state['sharded-rdt-trainer-weight-transfer-engine'].gather_error == 'mismatch'"
+  - id: distributed-collectives-lone-rank-times-out
+    name: A rank alone in a collective (its peers never call) fails after the process-group timeout
+    flow: distributed-tp-all-gather
+    fixtures: [tp4-llama-70b, distributed-seed]
+    config: {distributed-timeout-seconds: 1}
+    state:
+      custom-allreduce: {fully_connected: true}
+    steps:
+      - {flow: distributed-tp-all-gather, as: ag}
+      - {flow: distributed-tp-reduce-scatter, as: rs}
+      - {flow: distributed-sp-custom-collectives, as: cag, input: {num_tokens: 64, hidden_size: 8192}}
+      - {flow: distributed-sp-custom-reduce-scatter, as: crs, input: {num_tokens: 512, hidden_size: 8192}}
+    expect:
+      - "[steps.ag, steps.rs, steps.cag, steps.crs].all(st, !st.result.ok && st.result.error.code == 'dist-backend-error' && st.result.error.message == 'collective timed out: 1 of 4 ranks arrived')"
+      - "trace.filter(e, e.type == 'rendezvous' && e.error != null).size() == 4"

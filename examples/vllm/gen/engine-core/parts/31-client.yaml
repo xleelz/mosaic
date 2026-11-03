@@ -1,0 +1,333 @@
+interfaces:
+  # ------------------------------------------------------------------ AsyncMPClient
+  - component: async-mp-client
+    name: ensure-alive
+    kind: function
+    summary: "MPClient.ensure_alive: raise EngineDeadError once BackgroundResources.engine_dead is set."
+    sources: ["vllm/v1/engine/core_client.py:785-787"]
+    errors: [{code: engine-dead-error, status: 500, retryable: false}]
+    behavior:
+      - if: "state.engine_dead"
+        then:
+          - fail: {code: engine-dead-error, status: 500, message: "EngineCore encountered an issue. See stack trace (above) for the root cause."}
+      - return: {alive: true}
+
+  - component: async-mp-client
+    name: add-request-async
+    kind: rpc
+    latency_ms: 0
+    summary: "AsyncMPClient.add_request_async: stamp client_index and send ADD over the ZMQ input socket (refused once the engine is dead)."
+    sources: ["vllm/v1/engine/core_client.py:1296-1299"]
+    request: EngineCoreClientRequest
+    errors: [{code: engine-dead-error, status: 500, retryable: false}]
+    behavior:
+      - if: "state.engine_dead"
+        then:
+          - title: "_send_input_message calls ensure_alive first"
+            source: "vllm/v1/engine/core_client.py:1250-1257"
+            fail: {code: engine-dead-error, status: 500, message: "EngineCore encountered an issue. See stack trace (above) for the root cause."}
+      - title: "ADD frame to the engine core's input socket"
+        source: "vllm/v1/engine/core_client.py:1238-1248"
+        call: engine-core-proc.process-input-sockets
+        input: {request_type: ADD, request: "= merge(input, {'client_index': 0})"}
+
+  - component: async-mp-client
+    name: abort-requests-async
+    kind: rpc
+    summary: "AsyncMPClient.abort_requests_async: send ABORT unless the list is empty or the engine is dead."
+    sources: ["vllm/v1/engine/core_client.py:1301-1303"]
+    request: {type: object, properties: {request_ids: {type: array, items: {type: string}}}}
+    behavior:
+      - if: "size(input.request_ids) == 0 || state.engine_dead"
+        then: [{return: {sent: false}}]
+      - call: engine-core-proc.process-input-sockets
+        input: {request_type: ABORT, request_ids: "= input.request_ids"}
+      - return: {sent: true}
+
+  - component: async-mp-client
+    name: call-utility-async
+    kind: rpc
+    summary: "AsyncMPClient._call_utility_async: send UTILITY(client_index, call_id, method, args) and await the future the output socket task resolves; a failure_message becomes Exception."
+    description: "The reply really travels back on the output socket (process_outputs_socket -> _process_utility_output); here the round trip is the call's return."
+    sources: ["vllm/v1/engine/core_client.py:1259-1291", "vllm/v1/engine/core_client.py:892-911"]
+    request: EngineCoreUtilityCall
+    errors:
+      - {code: engine-dead-error, status: 500, retryable: false}
+      - {code: exception, status: 0, retryable: false, summary: "the engine-side failure_message"}
+    behavior:
+      - call: async-mp-client.ensure-alive
+      - if: "has(input.engine) && input.engine != null && input.engine != ''"
+        then:
+          - title: "_send_input_message(message, engine): to one DP engine's identity"
+            source: "vllm/v1/engine/core_client.py:1279-1291"
+            call: engine-core-proc.process-input-sockets
+            on: "= input.engine"
+            input: {request_type: UTILITY, method: "= input.method", args: "= has(input.args) ? input.args : {}", client_index: 0}
+            as: dres
+          - if: "vars.dres.value.failure_message != null"
+            then:
+              - fail: {code: exception, message: "= vars.dres.value.failure_message"}
+          - return: "= vars.dres.value.result"
+      - call: engine-core-proc.process-input-sockets
+        input: {request_type: UTILITY, method: "= input.method", args: "= has(input.args) ? input.args : {}", client_index: 0}
+        as: res
+      - if: "vars.res.value.failure_message != null"
+        then:
+          - title: "_process_utility_output: future.set_exception(Exception(failure_message))"
+            source: "vllm/v1/engine/core_client.py:900-903"
+            fail: {code: exception, message: "= vars.res.value.failure_message"}
+      - return: "= vars.res.value.result"
+
+  - component: async-mp-client
+    name: process-outputs-socket
+    kind: rpc
+    summary: "AsyncMPClient's output-socket task (one message): validate_alive, route FT status replies, otherwise hand EngineCoreOutputs to the output handler."
+    description: "The task puts outputs on outputs_queue and output_handler awaits get_output_async; the simulation calls one output_handler pass per message."
+    sources: ["vllm/v1/engine/core_client.py:1171-1221"]
+    request:
+      type: object
+      properties:
+        dead: {type: boolean, default: false}
+        outputs: {$ref: EngineCoreOutputs}
+    behavior:
+      - if: "has(input.dead) && input.dead"
+        then:
+          - title: "validate_alive: ENGINE_CORE_DEAD marks the engine dead and raises EngineDeadError"
+            source: "vllm/v1/engine/core_client.py:570-574"
+            set: {state.engine_dead: true}
+          - title: "The exception goes on outputs_queue; get_output_async raises it in the output handler"
+            source: "vllm/v1/engine/core_client.py:1218-1219"
+            call: async-llm.output-handler
+            input: {error: {code: engine-dead-error, message: "EngineCore encountered an issue. See stack trace (above) for the root cause.", status: 500}}
+          - return: {dead: true}
+      - if: "has(input.outputs.utility_output) && input.outputs.utility_output != null"
+        then:
+          - title: "An FT status push refreshes the cached engine status"
+            source: "vllm/v1/engine/core_client.py:1196-1203"
+            set: {state.engine_status: "= merge(state.engine_status, {string(has(input.outputs.engine_index) ? input.outputs.engine_index : 0): input.outputs.utility_output})"}
+          - return: {status: true}
+      - title: "Outputs or stats go to the output handler"
+        source: "vllm/v1/engine/core_client.py:1216-1217"
+        call: async-llm.output-handler
+        input: {outputs: "= input.outputs"}
+      - return: {dead: false}
+
+  - component: async-mp-client
+    name: handle-fault
+    kind: rpc
+    summary: "AsyncMPClient.handle_fault: send the FT instruction as a utility call; record a failed result in the cached engine status."
+    sources: ["vllm/v1/engine/core_client.py:1399-1409"]
+    request: {type: object, properties: {request_id: {type: string, examples: [ft-1]}, instruction: {type: string, examples: [retry]}, params: {type: object, default: {}}}}
+    behavior:
+      - call: async-mp-client.call-utility-async
+        input: {method: handle_fault_tolerance, args: "= input"}
+        as: res
+      - if: "!vars.res.value.success"
+        then:
+          - set: {state.engine_status: "= merge(state.engine_status, {'0': {'last_ft_request_id': input.request_id, 'ft_error': vars.res.value.reason}})"}
+      - return: "= vars.res.value"
+
+  # ------------------------------------------------------------------ SyncMPClient
+  - component: sync-mp-client
+    name: add-request
+    kind: rpc
+    summary: "SyncMPClient.add_request: send ADD (ensure_alive first)."
+    sources: ["vllm/v1/engine/core_client.py:1021-1024"]
+    request: EngineCoreClientRequest
+    errors: [{code: engine-dead-error, status: 500, retryable: false}]
+    behavior:
+      - if: "state.engine_dead"
+        then:
+          - title: "_send_input calls ensure_alive"
+            source: "vllm/v1/engine/core_client.py:1001-1008"
+            fail: {code: engine-dead-error, status: 500, message: "EngineCore encountered an issue. See stack trace (above) for the root cause."}
+      - call: engine-core-proc.process-input-sockets
+        input: {request_type: ADD, request: "= merge(input, {'client_index': 0})"}
+
+  - component: sync-mp-client
+    name: abort-requests
+    kind: rpc
+    sources: ["vllm/v1/engine/core_client.py:1026-1028"]
+    request: {type: object, properties: {request_ids: {type: array, items: {type: string}}}}
+    behavior:
+      - if: "size(input.request_ids) == 0 || state.engine_dead"
+        then: [{return: {sent: false}}]
+      - call: engine-core-proc.process-input-sockets
+        input: {request_type: ABORT, request_ids: "= input.request_ids"}
+      - return: {sent: true}
+
+  - component: sync-mp-client
+    name: call-utility
+    kind: rpc
+    summary: "SyncMPClient.call_utility: send UTILITY and block on the future."
+    sources: ["vllm/v1/engine/core_client.py:1010-1016"]
+    request: EngineCoreUtilityCall
+    errors: [{code: exception, status: 0, retryable: false}, {code: engine-dead-error, status: 500, retryable: false}]
+    behavior:
+      - if: "state.engine_dead"
+        then:
+          - fail: {code: engine-dead-error, status: 500, message: "EngineCore encountered an issue. See stack trace (above) for the root cause."}
+      - call: engine-core-proc.process-input-sockets
+        input: {request_type: UTILITY, method: "= input.method", args: "= has(input.args) ? input.args : {}", client_index: 0}
+        as: res
+      - if: "vars.res.value.failure_message != null"
+        then:
+          - fail: {code: exception, message: "= vars.res.value.failure_message"}
+      - return: "= vars.res.value.result"
+
+  - component: sync-mp-client
+    name: process-outputs-socket
+    kind: rpc
+    summary: "SyncMPClient's output thread (one message): validate_alive, resolve utility futures, else queue the outputs for get_output."
+    sources: ["vllm/v1/engine/core_client.py:948-976"]
+    request:
+      type: object
+      properties:
+        dead: {type: boolean, default: false}
+        outputs: {$ref: EngineCoreOutputs}
+    behavior:
+      - if: "has(input.dead) && input.dead"
+        then:
+          - title: "validate_alive raises EngineDeadError; the thread forwards it to outputs_queue"
+            source: "vllm/v1/engine/core_client.py:964-972"
+            set:
+              state.engine_dead: true
+              state.outputs_queue: "= state.outputs_queue + [{'error': {'code': 'engine-dead-error', 'status': 500, 'message': 'EngineCore encountered an issue. See stack trace (above) for the root cause.'}}]"
+          - return: {dead: true}
+      - title: "outputs_queue.put_nowait(outputs)"
+        source: "vllm/v1/engine/core_client.py:969-970"
+        set: {state.outputs_queue: "= state.outputs_queue + [{'outputs': input.outputs}]"}
+      - return: {dead: false}
+
+  - component: sync-mp-client
+    name: get-output
+    kind: function
+    summary: "SyncMPClient.get_output: block on outputs_queue; a queued exception is re-raised (as EngineDeadError once the engine is dead)."
+    sources: ["vllm/v1/engine/core_client.py:989-999"]
+    response: EngineCoreOutputs
+    errors: [{code: engine-dead-error, status: 500, retryable: false}]
+    behavior:
+      - title: "outputs_queue.get() blocks while the engine process keeps stepping: each empty poll runs one busy-loop iteration (bounded at 64)"
+        foreach: "= lists.range(64)"
+        as: tick
+        max: 64
+        steps:
+          - if: "size(state.outputs_queue) > 0"
+            then:
+              - set:
+                  vars.item: "= state.outputs_queue[0]"
+                  state.outputs_queue: "= state.outputs_queue.slice(1, size(state.outputs_queue))"
+              - if: "has(vars.item.error)"
+                then:
+                  - title: "An exception from the output thread is raised (formatted as EngineDeadError when the engine is dead)"
+                    source: "vllm/v1/engine/core_client.py:993-995"
+                    fail: "= vars.item.error"
+              - return: "= vars.item.outputs"
+          - if: "state.engine_dead"
+            then:
+              - fail: {code: engine-dead-error, status: 500, message: "EngineCore encountered an issue. See stack trace (above) for the root cause."}
+          - title: "The engine-core process runs its busy loop meanwhile"
+            source: "vllm/v1/engine/core.py:1547-1558"
+            call: engine-core-proc.drive-step
+            on_error: continue
+          - wait: 1
+      - return: {outputs: []}
+
+  # ------------------------------------------------------------------ DPLBAsyncMPClient (data parallel)
+  - component: dp-lb-async-mp-client
+    name: get-core-engine-for-request
+    kind: function
+    summary: "DPLBAsyncMPClient.get_core_engine_for_request: keep a streaming session's engine; honour data_parallel_rank; else scan the engines from eng_start_index and take the lowest score max(in-flight, waiting + running), then count the request locally and rotate the start index."
+    sources: ["vllm/v1/engine/core_client.py:1642-1697"]
+    request: EngineCoreClientRequest
+    response: {type: object, properties: {engine: {type: string}}}
+    behavior:
+      - if: "input.request_id in state.reqs_in_flight"
+        then:
+          - title: "Streaming-input session affinity"
+            source: "vllm/v1/engine/core_client.py:1643-1645"
+            return: {engine: "= state.reqs_in_flight[input.request_id]"}
+      - set:
+          vars.n: "= int(config['data-parallel-size'])"
+      - set:
+          vars.engines: "= lists.range(vars.n).map(i, 'dp' + string(i))"
+          vars.order: "= lists.range(vars.n).map(i, (state.eng_start_index + i) % vars.n)"
+      - set:
+          vars.score: "= vars.engines.transformMapEntry(i, e, {e: math.greatest([double(e in state.engine_inflight ? state.engine_inflight[e] : 0), double(size(state.lb_engines) > i ? state.lb_engines[i][0] + state.lb_engines[i][1] : 0)])})"
+      - set:
+          vars.best: "= has(input.data_parallel_rank) && input.data_parallel_rank != null ? int(input.data_parallel_rank) : vars.order.filter(i, vars.order.all(j, vars.score[vars.engines[i]] <= vars.score[vars.engines[j]]))[0]"
+      - title: "Record the chosen engine (for aborts) and its in-flight count; rotate the scan start"
+        source: "vllm/v1/engine/core_client.py:1680-1697"
+        set:
+          vars.engine: "= vars.engines[vars.best]"
+      - set:
+          state.reqs_in_flight: "= merge(state.reqs_in_flight, {input.request_id: vars.engine})"
+          state.engine_inflight: "= merge(state.engine_inflight, {vars.engine: (vars.engine in state.engine_inflight ? state.engine_inflight[vars.engine] : 0) + 1})"
+          state.eng_start_index: "= has(input.data_parallel_rank) && input.data_parallel_rank != null ? state.eng_start_index : (state.eng_start_index + 1) % vars.n"
+      - return: {engine: "= vars.engine"}
+
+  - component: dp-lb-async-mp-client
+    name: add-request-async
+    kind: rpc
+    summary: "DPAsyncMPClient.add_request_async: stamp the wave and client index, pick the engine, and send the ADD to that engine's input socket."
+    sources: ["vllm/v1/engine/core_client.py:1582-1597"]
+    request: EngineCoreClientRequest
+    errors: [{code: engine-dead-error, status: 500, retryable: false}]
+    behavior:
+      - call: async-mp-client.ensure-alive
+      - call: dp-lb-async-mp-client.get-core-engine-for-request
+        input: "= input"
+        as: eng
+      - title: "_send_input(ADD, request, chosen_engine)"
+        source: "vllm/v1/engine/core_client.py:1590"
+        call: engine-core-proc.process-input-sockets
+        on: "= vars.eng.value.engine"
+        input: {request_type: ADD, request: "= merge(input, {'client_index': 0})"}
+      - return: {engine: "= vars.eng.value.engine"}
+
+  - component: dp-lb-async-mp-client
+    name: abort-requests-async
+    kind: rpc
+    summary: "DPLBAsyncMPClient.abort_requests_async: send each id's ABORT to the engine that holds it."
+    sources: ["vllm/v1/engine/core_client.py:1758-1778"]
+    request: {type: object, properties: {request_ids: {type: array, items: {type: string}}}}
+    behavior:
+      - foreach: "= input.request_ids.filter(r, r in state.reqs_in_flight)"
+        as: rid
+        steps:
+          - call: engine-core-proc.process-input-sockets
+            on: "= state.reqs_in_flight[vars.rid]"
+            input: {request_type: ABORT, request_ids: ["= vars.rid"]}
+          - set:
+              state.engine_inflight: "= merge(state.engine_inflight, {state.reqs_in_flight[vars.rid]: state.engine_inflight[state.reqs_in_flight[vars.rid]] - 1})"
+              state.reqs_in_flight: "= omit(state.reqs_in_flight, vars.rid)"
+      - return: {sent: "= size(input.request_ids)"}
+
+  - component: async-mp-client
+    name: call-utility-all-async
+    kind: rpc
+    summary: "AsyncMPClient.call_utility_all_async: one _call_utility_async per managed engine (dp0, dp1, ... when data_parallel_size > 1), gathered: one result per engine in rank order."
+    sources: ["vllm/v1/engine/core_client.py:1262-1269"]
+    request: EngineCoreUtilityCall
+    response: {type: array}
+    errors: [{code: exception, status: 0, retryable: false}]
+    behavior:
+      - if: "int(config['data-parallel-size']) <= 1"
+        then:
+          - call: async-mp-client.call-utility-async
+            input: {method: "= input.method", args: "= has(input.args) ? input.args : {}"}
+            as: one
+          - return: ["= vars.one.value"]
+      - title: "asyncio.gather over self.core_engines"
+        source: "vllm/v1/engine/core_client.py:1264-1269"
+        parallel: "= lists.range(int(config['data-parallel-size'])).map(i, 'dp' + string(i))"
+        as: engine
+        steps:
+          - call: async-mp-client.call-utility-async
+            input: {method: "= input.method", args: "= has(input.args) ? input.args : {}", engine: "= vars.engine"}
+            as: res
+          - return: "= vars.res.value"
+        join: {need: all}
+        on_insufficient: {code: exception, summary: "a utility call failed on one of the engines"}
+        as_result: all
+      - return: "= vars.all.results.map(r, r.value)"

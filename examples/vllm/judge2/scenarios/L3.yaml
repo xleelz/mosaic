@@ -1,0 +1,32 @@
+schema_version: 1
+id: vllm
+scenarios:
+  - id: bench-l3
+    name: "L3 engine-core process killed after startup while idle"
+    description: >-
+      The kill stops engine-core-proc; nothing in the simulator wakes the client's monitor thread
+      on a process exit, so the step that follows plays the sentinel firing
+      (CoreEngineProcManager.monitor_engine_liveness returning with exitcode -9).
+    fixtures: [full-tp1-llama-8b]
+    max_events: 200000
+    steps:
+      - {interface: api-server-entry.run-server, caller: operator, input: {}, as: up, await: false}
+      - {kill: {component: engine-core-proc}, at_ms: 1000}
+      - {interface: core-engine-proc-manager.monitor-engine-liveness, caller: api-server, input: {exitcode: -9}, at_ms: 1001, as: mon}
+      - {flow: serving-api-health, at_ms: 1100, as: health}
+      - {flow: serving-api-chat-completion, at_ms: 1200, as: chat}
+    expect:
+      - "steps.up.result.ok"
+      # (a) corrected: the monitor thread (process sentinel), not the output socket, marks the client dead and shuts it down; the output handler then ends with EngineDeadError
+      - "steps.mon.result.value.handled"
+      - "state['async-mp-client'].engine_dead && state['async-llm'].output_handler_done"
+      - "trace.exists(m, m.type == 'call.start' && m.interface == 'async-mp-client.mark-dead' && trace.exists(o, o.type == 'call.start' && o.interface == 'async-llm.output-handler' && o.seq > m.seq))"
+      # (b) /health is 503
+      - "steps.health.result.ok && steps.health.result.value.status_code == 503"
+      # (c) a new request fails at once with 500, never reaching the engine
+      - "!steps.chat.result.ok && steps.chat.result.error.status == 500 && steps.chat.result.error.code == 'InternalServerError'"
+      - "steps.chat.duration_ms < 1000"
+      - "!trace.exists(e, e.type == 'call.start' && e.interface == 'async-llm.generate' && e.t >= 1200)"
+      # (d) the server terminates itself: engine_error_handler, then the 5 s watchdog
+      - "state.launcher.server_should_exit"
+      - "trace.filter(e, e.type == 'call.end' && e.interface == 'launcher.terminate-if-errored').size() >= 2"

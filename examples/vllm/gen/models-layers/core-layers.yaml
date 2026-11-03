@@ -1,0 +1,870 @@
+# models-layers: Llama (dense) model and the layers it uses.
+# {{GEMM_LAT}} and {{GEMM_LAT_FP8}} are filled in by build.py.
+components:
+  - id: llama-for-causal-lm
+    name: LlamaForCausalLM
+    kind: module
+    parent: model-executor
+    layer: models
+    summary: "The Llama causal LM: LlamaModel plus the parallel LM head and logits processor. Holds this rank's loaded weights."
+    sources: ["vllm/model_executor/models/llama.py:464-521"]
+    state:
+      initial:
+        loaded: false
+  - id: llama-model
+    name: LlamaModel
+    kind: module
+    parent: llama-for-causal-lm
+    layer: models
+    summary: "Embedding, the decoder layer stack and the final RMSNorm; compiled with torch.compile (support_torch_compile)."
+    sources: ["vllm/model_executor/models/llama.py:338-401"]
+  - id: llama-decoder-layer
+    name: LlamaDecoderLayer
+    kind: module
+    parent: llama-model
+    layer: models
+    summary: "Pre-norm decoder layer: RMSNorm, self-attention, fused add+RMSNorm, MLP."
+    sources: ["vllm/model_executor/models/llama.py:251-330"]
+  - id: llama-attention
+    name: LlamaAttention
+    kind: module
+    parent: llama-decoder-layer
+    layer: models
+    summary: "QKV projection (column parallel), rotary embedding, paged attention, output projection (row parallel, all-reduce)."
+    sources: ["vllm/model_executor/models/llama.py:125-234"]
+  - id: llama-mlp
+    name: LlamaMLP
+    kind: module
+    parent: llama-decoder-layer
+    layer: models
+    summary: "gate_up_proj (merged column parallel), SiLU-and-mul, down_proj (row parallel, all-reduce)."
+    sources: ["vllm/model_executor/models/llama.py:82-122"]
+  - id: column-parallel-linear
+    name: ColumnParallelLinear (QKV and merged gate_up use its forward)
+    kind: module
+    parent: model-executor
+    layer: layers
+    summary: "Output-dimension sharded linear; QKVParallelLinear and MergedColumnParallelLinear inherit this forward."
+    sources: ["vllm/model_executor/layers/linear.py:433-440"]
+  - id: qkv-parallel-linear
+    name: QKVParallelLinear
+    kind: module
+    parent: column-parallel-linear
+    layer: layers
+    summary: "Fused q/k/v projection; partitions heads across TP ranks and replicates KV heads when there are fewer KV heads than ranks."
+    sources: ["vllm/model_executor/layers/linear.py:998-1060"]
+  - id: row-parallel-linear
+    name: RowParallelLinear
+    kind: module
+    parent: model-executor
+    layer: layers
+    summary: "Input-dimension sharded linear whose partial outputs are all-reduced across the TP group."
+    sources: ["vllm/model_executor/layers/linear.py:1626-1690"]
+  - id: unquantized-linear-method
+    name: UnquantizedLinearMethod
+    kind: module
+    parent: model-executor
+    layer: layers
+    summary: "The BF16/FP16 GEMM (dispatch_unquantized_gemm, cuBLAS) or, under VLLM_BATCH_INVARIANT, the persistent Triton matmul."
+    sources: ["vllm/model_executor/layers/linear.py:165-240"]
+  - id: unquantized-embedding-method
+    name: UnquantizedEmbeddingMethod
+    kind: module
+    parent: model-executor
+    layer: layers
+    summary: "Embedding lookup and the LM-head GEMM for unquantized vocab-parallel embeddings."
+    sources: ["vllm/model_executor/layers/vocab_parallel_embedding.py:39-90"]
+  - id: vocab-parallel-embedding
+    name: VocabParallelEmbedding
+    kind: module
+    parent: model-executor
+    layer: layers
+    summary: "Vocabulary-sharded embedding: each rank looks up its shard and the shards are summed by all-reduce."
+    sources: ["vllm/model_executor/layers/vocab_parallel_embedding.py:522-565"]
+  - id: logits-processor
+    name: LogitsProcessor
+    kind: module
+    parent: model-executor
+    layer: layers
+    summary: "Projects hidden states through the LM head, gathers the vocab shards, strips padding and applies soft cap and scale."
+    sources: ["vllm/model_executor/layers/logits_processor.py:56-97"]
+  - id: rotary-embedding
+    name: RotaryEmbedding (get_rope factory)
+    kind: module
+    parent: model-executor
+    layer: layers
+    summary: "get_rope picks and caches the rotary class for the rope type; RotaryEmbedding.forward_cuda rotates q and k in place."
+    sources: ["vllm/model_executor/layers/rotary_embedding/__init__.py:32-86", "vllm/model_executor/layers/rotary_embedding/base.py:139-160"]
+    state:
+      initial:
+        rope_cache: {}
+        scaling_types:
+          default: RotaryEmbedding
+          llama3: Llama3RotaryEmbedding
+          linear: LinearScalingRotaryEmbedding
+          ntk: NTKScalingRotaryEmbedding
+          dynamic: DynamicNTKScalingRotaryEmbedding
+          yarn: YaRNScalingRotaryEmbedding
+          longrope: Phi3LongRoPEScaledRotaryEmbedding
+          mllama4: Llama4VisionRotaryEmbedding
+          proportional: Gemma4RotaryEmbedding
+          bailing_mrope: BailingMRotaryEmbedding
+          openpangu: MRotaryEmbeddingInterleaved
+  - id: m-rotary-embedding
+    name: MRotaryEmbedding
+    kind: module
+    parent: rotary-embedding
+    layer: layers
+    summary: "Multimodal (3-D position) rotary embedding used by Qwen2/2.5/3-VL; the Triton M-RoPE kernel rotates per-section positions."
+    sources: ["vllm/model_executor/layers/rotary_embedding/mrope.py:305-320"]
+  - id: rms-norm
+    name: RMSNorm
+    kind: module
+    parent: model-executor
+    layer: layers
+    summary: "RMSNorm and fused residual-add RMSNorm via the vLLM IR ops, or the batch-invariant Triton kernel."
+    sources: ["vllm/model_executor/layers/layernorm.py:37-72"]
+  - id: silu-and-mul
+    name: SiluAndMul
+    kind: module
+    parent: model-executor
+    layer: layers
+    summary: "silu(gate) * up on the merged gate_up output, via torch.ops._C.silu_and_mul on CUDA."
+    sources: ["vllm/model_executor/layers/activation.py:120-151"]
+  - id: attention-layer
+    name: Attention (layer)
+    kind: module
+    parent: model-executor
+    layer: layers
+    summary: "The model-side attention layer: writes K/V into the paged KV cache and calls the selected backend through opaque torch custom ops."
+    sources: ["vllm/model_executor/layers/attention/attention.py:443-452", "vllm/model_executor/layers/attention/attention.py:700-721"]
+  - id: batch-invariant
+    name: determinism/batch_invariant.py
+    kind: module
+    parent: model-executor
+    layer: layers
+    summary: "Batch-invariant Triton kernels (persistent matmul, RMSNorm) used when VLLM_BATCH_INVARIANT=1, so results do not depend on batch composition."
+    sources: ["vllm/model_executor/determinism/batch_invariant.py:1126-1132"]
+
+interfaces:
+  # ---------------------------------------------------------------- LlamaForCausalLM
+  - component: llama-for-causal-lm
+    name: init
+    kind: function
+    summary: "LlamaForCausalLM(vllm_config, prefix): build LlamaModel; LlamaAttention checks head divisibility by TP and LlamaMLP refuses non-SiLU activations."
+    sources: ["vllm/model_executor/models/llama.py:484-521"]
+    tags: [writes]
+    request:
+      type: object
+      required: [hf_config, quant]
+      properties: {hf_config: ModelsHfConfig, quant: {type: string, examples: [unquantized]}}
+    errors:
+      - {code: value-error, status: 0, retryable: false}
+      - {code: assertion-error, status: 0, retryable: false}
+    behavior:
+      - set:
+          vars.hf: "= input.hf_config"
+          vars.tp: "= config['tensor-parallel-size']"
+      - title: LlamaMLP supports SiLU only
+        source: "vllm/model_executor/models/llama.py:112-115"
+        if: "has(vars.hf.hidden_act) && vars.hf.hidden_act != 'silu'"
+        then:
+          - fail: {code: value-error, status: 0, message: "= 'Unsupported activation: ' + vars.hf.hidden_act + '. Only silu is supported for now.'"}
+      - title: Attention heads must divide across TP ranks
+        source: "vllm/model_executor/models/llama.py:143-145"
+        if: "vars.hf.num_attention_heads % vars.tp != 0"
+        then:
+          - fail: {code: assertion-error, status: 0, message: "assert self.total_num_heads % tp_size == 0"}
+      - title: KV heads are partitioned (>= TP) or replicated (< TP)
+        source: "vllm/model_executor/models/llama.py:146-155"
+        if: "(vars.hf.num_key_value_heads >= vars.tp && vars.hf.num_key_value_heads % vars.tp != 0) || (vars.hf.num_key_value_heads < vars.tp && vars.tp % vars.hf.num_key_value_heads != 0)"
+        then:
+          - fail: {code: assertion-error, status: 0, message: "KV heads do not partition or replicate evenly across TP ranks"}
+      - title: _init_rotary_emb -> get_rope (neox style)
+        source: "vllm/model_executor/models/llama.py:236-248"
+        call: rotary-embedding.get-rope
+        input:
+          head_size: "= vars.hf.hidden_size / vars.hf.num_attention_heads"
+          max_position: "= vars.hf.max_position_embeddings"
+          rope_parameters: "= has(vars.hf.rope_parameters) && vars.hf.rope_parameters != null ? vars.hf.rope_parameters : {}"
+        as: rope
+      - title: Parameters are created on this rank's GPU (column/row shards), still uninitialized
+        source: "vllm/model_executor/models/llama.py:360-401"
+        set:
+          state.loaded: false
+          state.tp_size: "= vars.tp"
+          state.quant: "= input.quant"
+          state.rope: "= vars.rope.value.cls"
+          state.cfg:
+            hidden_size: "= vars.hf.hidden_size"
+            num_heads: "= vars.hf.num_attention_heads"
+            num_kv_heads: "= vars.hf.num_key_value_heads"
+            head_dim: "= vars.hf.hidden_size / vars.hf.num_attention_heads"
+            intermediate_size: "= has(vars.hf.intermediate_size) && vars.hf.intermediate_size != null ? vars.hf.intermediate_size : vars.hf.hidden_size * 7 / 2"
+            num_layers: "= vars.hf.num_hidden_layers"
+            vocab_size: "= vars.hf.vocab_size"
+            bytes_per_weight: "= input.quant == 'unquantized' ? 2.0 : (input.quant in ['modelopt_fp4', 'modelopt_mixed'] ? 0.5 : 1.0)"
+      - return: {initialized: true, rope: "= vars.rope.value.cls"}
+
+  - component: llama-for-causal-lm
+    name: load-weights
+    kind: function
+    summary: "LlamaForCausalLM.load_weights: AutoWeightsLoader maps q/k/v and gate/up checkpoint tensors onto the fused qkv_proj and gate_up_proj shards."
+    sources: ["vllm/model_executor/models/llama.py:559-561", "vllm/model_executor/models/llama.py:338-347"]
+    tags: [writes]
+    request:
+      type: object
+      properties:
+        model: {type: string, examples: [meta-llama/Llama-3.1-8B-Instruct]}
+        weights_bytes: {type: integer}
+        missing_params: {type: array, items: {type: string}}
+    response: {type: object, properties: {weights_bytes_per_rank: {type: integer}}}
+    behavior:
+      - title: Stacked q/k/v shards go through QKVParallelLinear.weight_loader
+        source: "vllm/model_executor/models/llama.py:338-346"
+        call: qkv-parallel-linear.weight-loader
+        input: {num_heads: "= state.cfg.num_heads", num_kv_heads: "= state.cfg.num_kv_heads", head_dim: "= state.cfg.head_dim", tp_size: "= state.tp_size", shard_id: q}
+      - source: "vllm/model_executor/models/llama.py:559-561"
+        call: auto-weights-loader.load-weights
+        input: {model: "= input.model", weights_bytes: "= input.weights_bytes"}
+        as: awl
+      - set:
+          state.loaded: true
+          state.model: "= input.model"
+          state.weights_bytes_per_rank: "= vars.awl.value.weights_bytes_per_rank"
+      - return: {weights_bytes_per_rank: "= vars.awl.value.weights_bytes_per_rank"}
+
+  - component: llama-for-causal-lm
+    name: forward
+    kind: function
+    summary: "LlamaForCausalLM.forward: run LlamaModel on this step's flattened tokens and return the final hidden states."
+    sources: ["vllm/model_executor/models/llama.py:534-544"]
+    request: ModelsForwardRequest
+    response: ModelsForwardResult
+    errors:
+      - {code: attribute-error, status: 0, retryable: false}
+    behavior:
+      - title: The runner only has a model after load_model
+        if: "!state.loaded"
+        then:
+          - fail: {code: attribute-error, status: 0, message: "model weights are not loaded on this rank"}
+      - title: The attention metadata the runner put in the forward context (or a fresh-prefill layout when none is sent)
+        source: "vllm/model_executor/layers/attention/attention.py:700-721"
+        call: attention-layer.get-attention-context
+        input: "= input"
+        as: md
+      - source: "vllm/model_executor/models/llama.py:541-543"
+        call: llama-model.forward
+        input: {num_tokens: "= input.num_tokens", cfg: "= state.cfg", tp: "= config['tensor-parallel-size']", quant: "= state.quant", attn_metadata: "= vars.md.value"}
+        as: out
+      - return: {num_tokens: "= input.num_tokens", hidden_size: "= state.cfg.hidden_size", num_layers: "= state.cfg.num_layers", owner_ms: "= vars.out.value.owner_ms"}
+
+  - component: attention-layer
+    name: get-attention-context
+    kind: function
+    summary: "The attention metadata get_attention_context reads from the forward context: the runner's metadata when sent; otherwise a fresh-prefill layout (equal-length requests, consecutive blocks, slots 0..n-1) built from the batch shape."
+    sources: ["vllm/model_executor/layers/attention/attention.py:700-721"]
+    request: ModelsForwardRequest
+    behavior:
+      - title: Dummy (profiling) batch - the runner sets no attention metadata
+        source: "vllm/model_executor/layers/attention/attention.py:703-705"
+        if: "has(input.is_profile) && input.is_profile"
+        then:
+          - return: {}
+      - title: forward_context.attn_metadata set by the model runner
+        source: "vllm/model_executor/layers/attention/attention.py:703-713"
+        if: "has(input.attn_metadata) && size(input.attn_metadata) > 0"
+        then:
+          - return: "= input.attn_metadata"
+      - set:
+          vars.r: "= has(input.num_reqs) && input.num_reqs > 0 ? input.num_reqs : 1"
+      - set:
+          vars.q: "= math.greatest(1, input.num_tokens / vars.r)"
+      - set:
+          vars.nb: "= (vars.q + int(config['block-size']) - 1) / int(config['block-size'])"
+      - title: No runner metadata - every request is a fresh prefill of q tokens in consecutive blocks
+        source: "vllm/model_executor/layers/attention/attention.py:714-721"
+        return:
+          num_actual_tokens: "= input.num_tokens"
+          num_reqs: "= vars.r"
+          max_query_len: "= vars.q"
+          max_seq_len: "= vars.q"
+          seq_lens: "= lists.range(vars.r).map(i, vars.q)"
+          query_lens: "= lists.range(vars.r).map(i, vars.q)"
+          block_table: "= lists.range(vars.r).map(i, lists.range(vars.nb).map(j, i * vars.nb + j))"
+          slot_mapping: "= lists.range(input.num_tokens)"
+          causal: true
+          num_prefill_reqs: "= vars.q > 1 ? vars.r : 0"
+          num_decode_reqs: "= vars.q == 1 ? vars.r : 0"
+
+  - component: llama-for-causal-lm
+    name: compute-logits
+    kind: function
+    summary: "LlamaForCausalLM.compute_logits: the logits processor applied with the LM head."
+    sources: ["vllm/model_executor/models/llama.py:546-551"]
+    request: ModelsLogitsRequest
+    response: ModelsLogitsResult
+    errors:
+      - {code: attribute-error, status: 0, retryable: false}
+    behavior:
+      - if: "!state.loaded"
+        then:
+          - fail: {code: attribute-error, status: 0, message: "model weights are not loaded on this rank"}
+      - source: "vllm/model_executor/models/llama.py:550"
+        call: logits-processor.forward
+        input: {num_tokens: "= input.num_tokens", hidden_size: "= state.cfg.hidden_size", vocab_size: "= state.cfg.vocab_size", tp: "= config['tensor-parallel-size']"}
+        as: lg
+      - return: "= vars.lg.value"
+
+  - component: llama-model
+    name: forward
+    kind: function
+    summary: "LlamaModel.forward: embed (first PP rank), run the decoder layers, final RMSNorm (last PP rank)."
+    sources: ["vllm/model_executor/models/llama.py:406-457"]
+    request: {type: object, required: [num_tokens, cfg, tp, quant], properties: {num_tokens: {type: integer}, cfg: {type: object}, tp: {type: integer}, quant: {type: string}}}
+    behavior:
+      - title: First PP rank embeds input_ids
+        source: "vllm/model_executor/models/llama.py:414-419"
+        call: vocab-parallel-embedding.forward
+        input: {num_tokens: "= input.num_tokens", vocab_size: "= input.cfg.vocab_size", hidden_size: "= input.cfg.hidden_size", tp: "= input.tp"}
+        as: emb
+      - set: {vars.t0: "= now_us"}
+      - title: Decoder layer 0 runs in full with real per-layer latencies
+        source: "vllm/model_executor/models/llama.py:432-442"
+        call: llama-decoder-layer.forward
+        input: {num_tokens: "= input.num_tokens", cfg: "= input.cfg", tp: "= input.tp", quant: "= input.quant", layer_repeat: "= input.cfg.num_layers", attn_metadata: "= input.attn_metadata"}
+        as: layer
+      - title: "Layers 1..n-1 cost what layer 0 cost (same shapes) - (num_layers - 1) x layer 0's duration"
+        wait: "= double(input.cfg.num_layers - 1) * double(now_us - vars.t0) / 1000.0"
+      - title: Last PP rank applies the final norm
+        source: "vllm/model_executor/models/llama.py:451"
+        call: rms-norm.forward-cuda
+        input: {num_tokens: "= input.num_tokens", hidden_size: "= input.cfg.hidden_size", residual: true, layer_repeat: 1}
+      - return: {owner_ms: "= vars.emb.value.owner_ms + vars.layer.value.owner_ms * input.cfg.num_layers"}
+
+  - component: llama-decoder-layer
+    name: forward
+    kind: function
+    summary: "LlamaDecoderLayer.forward: input RMSNorm (residual add after the first layer), self-attention, post-attention fused add+RMSNorm, MLP."
+    sources: ["vllm/model_executor/models/llama.py:313-330"]
+    request: ModelsLayerInput
+    behavior:
+      - title: First layer - residual is None, plain RMSNorm
+        source: "vllm/model_executor/models/llama.py:320-322"
+        call: rms-norm.forward-cuda
+        input: {num_tokens: "= input.num_tokens", hidden_size: "= input.cfg.hidden_size", residual: false, layer_repeat: "= input.layer_repeat"}
+      - source: "vllm/model_executor/models/llama.py:325"
+        call: llama-attention.forward
+        input: "= input"
+        as: attn
+      - title: Fused residual add + RMSNorm
+        source: "vllm/model_executor/models/llama.py:328"
+        call: rms-norm.forward-cuda
+        input: {num_tokens: "= input.num_tokens", hidden_size: "= input.cfg.hidden_size", residual: true, layer_repeat: "= input.layer_repeat"}
+      - source: "vllm/model_executor/models/llama.py:329"
+        call: llama-mlp.forward
+        input: "= input"
+        as: mlp
+      - return: {owner_ms: "= vars.attn.value.owner_ms + vars.mlp.value.owner_ms"}
+
+  - component: llama-attention
+    name: forward
+    kind: function
+    summary: "LlamaAttention.forward: qkv_proj, split, rotary on q and k, attention, o_proj."
+    sources: ["vllm/model_executor/models/llama.py:224-234"]
+    request: ModelsLayerInput
+    behavior:
+      - set:
+          vars.q_heads: "= input.cfg.num_heads / input.tp"
+          vars.kv_heads: "= math.greatest(1, input.cfg.num_kv_heads / input.tp)"
+          vars.bpw: "= input.cfg.bytes_per_weight"
+      - title: qkv_proj (QKVParallelLinear, column parallel, no gather)
+        source: "vllm/model_executor/models/llama.py:229"
+        call: column-parallel-linear.forward
+        input: {num_tokens: "= input.num_tokens", in_features: "= input.cfg.hidden_size", out_features: "= (vars.q_heads + 2 * vars.kv_heads) * input.cfg.head_dim", bytes_per_weight: "= vars.bpw", layer_repeat: "= input.layer_repeat", quant: "= input.quant", tp: "= input.tp", gather_output: false}
+        as: qkv
+      - title: Rotary embedding on q and k
+        source: "vllm/model_executor/models/llama.py:231"
+        call: rotary-embedding.forward-cuda
+        input: {num_tokens: "= input.num_tokens", num_heads: "= vars.q_heads", num_kv_heads: "= vars.kv_heads", head_size: "= input.cfg.head_dim"}
+        as: rope
+      - source: "vllm/model_executor/models/llama.py:232"
+        call: attention-layer.forward
+        input: {num_tokens: "= input.num_tokens", num_heads: "= vars.q_heads", num_kv_heads: "= vars.kv_heads", head_size: "= input.cfg.head_dim", attn_metadata: "= input.attn_metadata"}
+        as: attn
+      - title: o_proj (RowParallelLinear, all-reduce when TP > 1)
+        source: "vllm/model_executor/models/llama.py:233"
+        call: row-parallel-linear.forward
+        input: {num_tokens: "= input.num_tokens", in_features: "= vars.q_heads * input.cfg.head_dim", out_features: "= input.cfg.hidden_size", bytes_per_weight: "= vars.bpw", layer_repeat: "= input.layer_repeat", quant: "= input.quant", tp: "= input.tp", reduce_results: true, collective_key: 1}
+        as: o
+      - return: {owner_ms: "= vars.qkv.value.owner_ms + vars.rope.value.owner_ms + vars.attn.value.owner_ms + vars.o.value.owner_ms"}
+
+  - component: llama-mlp
+    name: forward
+    kind: function
+    summary: "LlamaMLP.forward: gate_up_proj, SiLU-and-mul (optionally fused with the down_proj input quant), down_proj."
+    sources: ["vllm/model_executor/models/llama.py:118-122"]
+    request: ModelsLayerInput
+    behavior:
+      - set:
+          vars.i_shard: "= input.cfg.intermediate_size / input.tp"
+      - title: gate_up_proj (MergedColumnParallelLinear)
+        source: "vllm/model_executor/models/llama.py:119"
+        call: column-parallel-linear.forward
+        input: {num_tokens: "= input.num_tokens", in_features: "= input.cfg.hidden_size", out_features: "= 2 * vars.i_shard", bytes_per_weight: "= input.cfg.bytes_per_weight", layer_repeat: "= input.layer_repeat", quant: "= input.quant", tp: "= input.tp", gather_output: false}
+        as: gu
+      - source: "vllm/model_executor/models/llama.py:120"
+        call: silu-and-mul.forward-cuda
+        input: {num_tokens: "= input.num_tokens", d: "= vars.i_shard", layer_repeat: "= input.layer_repeat"}
+      - title: down_proj (RowParallelLinear, all-reduce when TP > 1)
+        source: "vllm/model_executor/models/llama.py:121"
+        call: row-parallel-linear.forward
+        input: {num_tokens: "= input.num_tokens", in_features: "= vars.i_shard", out_features: "= input.cfg.hidden_size", bytes_per_weight: "= input.cfg.bytes_per_weight", layer_repeat: "= input.layer_repeat", quant: "= input.quant", tp: "= input.tp", reduce_results: true, collective_key: 2}
+        as: down
+      - return: {owner_ms: "= vars.gu.value.owner_ms + vars.down.value.owner_ms"}
+
+  # ---------------------------------------------------------------- linear layers
+  - component: column-parallel-linear
+    name: forward
+    kind: function
+    summary: "ColumnParallelLinear.forward: the quant method's GEMM on this rank's output shard, all-gathered only when gather_output is set."
+    sources: ["vllm/model_executor/layers/linear.py:603-623"]
+    request: ModelsLinearInput
+    response: {type: object, properties: {owner_ms: {type: integer}}}
+    behavior:
+      - title: quant_method.apply(self, input_, bias)
+        source: "vllm/model_executor/layers/linear.py:610"
+        call: "= input.quant == 'unquantized' ? 'unquantized-linear-method.apply' : (input.quant.startsWith('modelopt') ? 'model-opt-linear-method.apply' : 'fp8-linear-method.apply')"
+        targets: [unquantized-linear-method.apply, fp8-linear-method.apply, model-opt-linear-method.apply]
+        input: "= input"
+        as: mm
+      - title: All-gather across the partitions
+        source: "vllm/model_executor/layers/linear.py:612-614"
+        if: "has(input.gather_output) && input.gather_output && input.tp > 1"
+        then:
+          - call: tensor-model-parallel.all-gather
+            input: {num_tokens: "= input.num_tokens", hidden_size: "= input.out_features * input.tp", layer: 0}
+            as: ag
+          - return: {owner_ms: "= vars.mm.value.owner_ms + vars.ag.duration_ms"}
+      - return: {owner_ms: "= vars.mm.value.owner_ms"}
+
+  - component: row-parallel-linear
+    name: forward
+    kind: function
+    summary: "RowParallelLinear.forward: GEMM on this rank's input shard (bias only on rank 0), then all-reduce of the partial sums when TP > 1."
+    sources: ["vllm/model_executor/layers/linear.py:1762-1786"]
+    request: ModelsLinearInput
+    response: {type: object, properties: {owner_ms: {type: integer}}}
+    behavior:
+      - title: quant_method.apply on the input shard
+        source: "vllm/model_executor/layers/linear.py:1774-1778"
+        call: "= input.quant == 'unquantized' ? 'unquantized-linear-method.apply' : (input.quant.startsWith('modelopt') ? 'model-opt-linear-method.apply' : 'fp8-linear-method.apply')"
+        targets: [unquantized-linear-method.apply, fp8-linear-method.apply, model-opt-linear-method.apply]
+        input: "= input"
+        as: mm
+      - title: tensor_model_parallel_all_reduce(output_parallel)
+        source: "vllm/model_executor/layers/linear.py:1780-1781"
+        if: "(!has(input.reduce_results) || input.reduce_results) && input.tp > 1"
+        then:
+          - call: tensor-model-parallel.all-reduce
+            input: {num_tokens: "= input.num_tokens", hidden_size: "= input.out_features", layer: "= has(input.collective_key) ? input.collective_key : 0"}
+            as: ar
+          - return: {owner_ms: "= vars.mm.value.owner_ms + vars.ar.duration_ms"}
+      - return: {owner_ms: "= vars.mm.value.owner_ms"}
+
+  - component: qkv-parallel-linear
+    name: weight-loader
+    kind: function
+    summary: "QKVParallelLinear.weight_loader: a q, k or v checkpoint shard lands at its offset in this rank's fused qkv weight (q at 0, k after the rank's q heads, v after its k heads), narrowed from the checkpoint at shard_rank * shard_size, where KV heads replicate when there are fewer KV heads than TP ranks."
+    sources: ["vllm/model_executor/layers/linear.py:1198-1240", "vllm/model_executor/layers/linear.py:1260-1297", "vllm/model_executor/layers/linear.py:1080-1086"]
+    request:
+      type: object
+      required: [num_heads, num_kv_heads, head_dim, tp_size, shard_id]
+      properties:
+        num_heads: {type: integer, examples: [32]}
+        num_kv_heads: {type: integer, examples: [8]}
+        head_dim: {type: integer, examples: [128]}
+        tp_size: {type: integer, examples: [1]}
+        tp_rank: {type: integer, default: 0}
+        shard_id: {type: string, examples: [q]}
+    response: {type: object, properties: {shard_rows: {type: integer}, kv_replicas: {type: integer}, shard_offset: {type: integer}, shard_size: {type: integer}, start_idx: {type: integer}}}
+    errors:
+      - {code: value-error, status: 0, retryable: false}
+    behavior:
+      - title: validate_shard_id
+        source: "vllm/model_executor/layers/linear.py:1080-1086"
+        if: "!(input.shard_id in ['q', 'k', 'v'])"
+        then:
+          - fail: {code: value-error, status: 0, message: "= 'Shard id for QKVParallelLinear should be \\'q\\', \\'k\\', or \\'v\\', got shard id ' + input.shard_id + '.'"}
+      - title: Per-rank heads; KV heads replicate when fewer than TP ranks (num_kv_head_replicas)
+        source: "vllm/model_executor/layers/linear.py:1050-1060"
+        set:
+          vars.nh: "= input.num_heads / input.tp_size"
+          vars.nkv: "= math.greatest(1, input.num_kv_heads / input.tp_size)"
+          vars.rep: "= input.num_kv_heads >= input.tp_size ? 1 : input.tp_size / input.num_kv_heads"
+      - title: q at 0, k after the q heads, v after the k heads; q narrows at tp_rank, k and v at tp_rank // replicas
+        source: "vllm/model_executor/layers/linear.py:1268-1297"
+        set:
+          vars.off: "= input.shard_id == 'q' ? 0 : (input.shard_id == 'k' ? vars.nh * input.head_dim : (vars.nh + vars.nkv) * input.head_dim)"
+          vars.size: "= input.shard_id == 'q' ? vars.nh * input.head_dim : vars.nkv * input.head_dim"
+          vars.srank: "= input.shard_id == 'q' ? input.tp_rank : input.tp_rank / vars.rep"
+      - return:
+          shard_rows: "= vars.size"
+          kv_replicas: "= vars.rep"
+          shard_offset: "= vars.off"
+          shard_size: "= vars.size"
+          start_idx: "= vars.srank * vars.size"
+
+  - component: unquantized-linear-method
+    name: apply
+    kind: kernel
+    summary: "UnquantizedLinearMethod.apply: BF16 GEMM (cuBLAS via dispatch_unquantized_gemm), or the batch-invariant persistent matmul; latency is a roofline of the shapes."
+    sources: ["vllm/model_executor/layers/linear.py:229-239"]
+    request: ModelsLinearInput
+    response: {type: object, properties: {owner_ms: {type: integer}}}
+    latency_ms: "{{GEMM_LAT}}"
+    behavior:
+      - title: VLLM_BATCH_INVARIANT routes the GEMM to the persistent Triton matmul
+        source: "vllm/model_executor/layers/linear.py:235-238"
+        if: "config['vllm-batch-invariant']"
+        then:
+          - call: batch-invariant.linear-batch-invariant
+            input: {num_tokens: "= input.num_tokens", in_features: "= input.in_features", out_features: "= input.out_features"}
+      - title: self._gemm_impl -> dispatch_unquantized_gemm (torch F.linear on CUDA)
+        source: "vllm/model_executor/layers/linear.py:239"
+        return: {owner_ms: 0}
+
+  - component: batch-invariant
+    name: linear-batch-invariant
+    kind: kernel
+    summary: "linear_batch_invariant -> mm_batch_invariant -> matmul_persistent: a persistent Triton GEMM with a fixed tile order (descriptor variant on XPU)."
+    sources: ["vllm/model_executor/determinism/batch_invariant.py:1126-1132", "vllm/model_executor/determinism/batch_invariant.py:772-778"]
+    request: {type: object, properties: {num_tokens: {type: integer}, in_features: {type: integer}, out_features: {type: integer}}}
+    latency_ms: 0
+    behavior:
+      - title: matmul_persistent launches matmul_kernel_persistent
+        source: "vllm/model_executor/determinism/batch_invariant.py:284-338"
+      - title: "Triton kernel matmul_kernel_persistent (tile ids via _compute_pid)"
+        source: "vllm/model_executor/determinism/batch_invariant.py:49-137"
+      - title: "Triton device function _compute_pid"
+        source: "vllm/model_executor/determinism/batch_invariant.py:39-45"
+      - title: "On XPU: matmul_descriptor_persistent launches matmul_kernel_descriptor_persistent"
+        source: "vllm/model_executor/determinism/batch_invariant.py:141-222"
+      - return: {owner_ms: 0}
+
+  - component: batch-invariant
+    name: rms-norm-batch-invariant
+    kind: kernel
+    summary: "rms_norm_batch_invariant: the per-row Triton RMSNorm with a fixed reduction order."
+    sources: ["vllm/model_executor/determinism/batch_invariant.py:1065-1124"]
+    request: {type: object, properties: {num_tokens: {type: integer}, hidden_size: {type: integer}}}
+    latency_ms: 0
+    behavior:
+      - title: "Triton kernel _rms_norm_kernel, launched one program per row"
+        source: "vllm/model_executor/determinism/batch_invariant.py:1014-1062"
+      - source: "vllm/model_executor/determinism/batch_invariant.py:1112"
+        return: {owner_ms: 0}
+
+  - component: unquantized-embedding-method
+    name: apply
+    kind: kernel
+    summary: "UnquantizedEmbeddingMethod.apply: the LM-head GEMM (hidden x vocab shard); roofline latency."
+    sources: ["vllm/model_executor/layers/vocab_parallel_embedding.py:73-83"]
+    request: ModelsLinearInput
+    latency_ms: "{{GEMM_LAT}}"
+    behavior:
+      - source: "vllm/model_executor/layers/vocab_parallel_embedding.py:73-83"
+        return: {owner_ms: 0}
+
+  - component: vocab-parallel-embedding
+    name: forward
+    kind: function
+    summary: "VocabParallelEmbedding.forward: TP 1 looks up directly; otherwise mask ids outside this rank's shard, look up, zero masked rows and all-reduce."
+    sources: ["vllm/model_executor/layers/vocab_parallel_embedding.py:522-565"]
+    request: {type: object, required: [num_tokens, vocab_size, hidden_size, tp], properties: {num_tokens: {type: integer}, vocab_size: {type: integer}, hidden_size: {type: integer}, tp: {type: integer}}}
+    response: {type: object, properties: {owner_ms: {type: integer}}}
+    behavior:
+      - title: TP 1 - plain embedding lookup
+        source: "vllm/model_executor/layers/vocab_parallel_embedding.py:524-525"
+        if: "input.tp == 1"
+        then:
+          - return: {owner_ms: 0}
+      - title: Mask ids outside the shard, look up, zero masked rows
+        source: "vllm/model_executor/layers/vocab_parallel_embedding.py:541-555"
+      - title: Sum the shards across the TP group
+        source: "vllm/model_executor/layers/vocab_parallel_embedding.py:556-561"
+        call: tensor-model-parallel.all-reduce
+        input: {num_tokens: "= input.num_tokens", hidden_size: "= input.hidden_size", layer: 0}
+        as: ar
+      - return: {owner_ms: "= vars.ar.duration_ms"}
+
+  - component: logits-processor
+    name: forward
+    kind: function
+    summary: "LogitsProcessor.forward: LM-head GEMM on the vocab shard, all-gather of the shards (TP > 1), strip vocab padding, soft cap and scale."
+    sources: ["vllm/model_executor/layers/logits_processor.py:98-120", "vllm/model_executor/layers/logits_processor.py:180-199"]
+    request:
+      type: object
+      required: [num_tokens, hidden_size, vocab_size, tp]
+      properties:
+        num_tokens: {type: integer}
+        hidden_size: {type: integer}
+        vocab_size: {type: integer}
+        tp: {type: integer}
+    response: ModelsLogitsResult
+    behavior:
+      - title: _apply_head - lm_head.quant_method.apply
+        source: "vllm/model_executor/layers/logits_processor.py:143-146"
+        call: unquantized-embedding-method.apply
+        input: {num_tokens: "= input.num_tokens", in_features: "= input.hidden_size", out_features: "= input.vocab_size / input.tp", bytes_per_weight: 2, layer_repeat: 1, quant: unquantized, tp: "= input.tp"}
+      - set: {vars.gather_ms: 0}
+      - title: Gather the vocab shards (all-gather on platforms where use_all_gather, the default)
+        source: "vllm/model_executor/layers/logits_processor.py:122-134"
+        if: "input.tp > 1"
+        then:
+          - call: tensor-model-parallel.all-gather
+            input: {num_tokens: "= input.num_tokens", hidden_size: "= input.vocab_size", dim: -1, layer: 0}
+            as: ag
+          - set: {vars.gather_ms: "= vars.ag.duration_ms"}
+      - title: Soft cap (Gemma 2) - tanh(logits / cap) * cap
+        source: "vllm/model_executor/layers/logits_processor.py:113-116"
+        when: "has(input.soft_cap)"
+        set: {ctx.logits_soft_capped: true}
+      - title: Remove vocab padding, then scale
+        source: "vllm/model_executor/layers/logits_processor.py:196-198"
+        return: {num_tokens: "= input.num_tokens", vocab_size: "= input.vocab_size", owner_ms: "= vars.gather_ms"}
+
+  # ---------------------------------------------------------------- rotary embedding
+  - component: rotary-embedding
+    name: get-rope
+    kind: function
+    summary: "get_rope: validate partial_rotary_factor, return the cached instance for the same key, else build the class for rope_type."
+    sources: ["vllm/model_executor/layers/rotary_embedding/__init__.py:32-350"]
+    tags: [writes]
+    request:
+      type: object
+      required: [head_size, max_position]
+      properties:
+        head_size: {type: integer, examples: [128]}
+        max_position: {type: integer, examples: [131072]}
+        rope_parameters: {type: object, default: {}}
+    response: {type: object, properties: {cls: {type: string}, cached: {type: boolean}}}
+    errors:
+      - {code: value-error, status: 0, retryable: false}
+    behavior:
+      - set:
+          vars.params: "= has(input.rope_parameters) ? input.rope_parameters : {}"
+      - set:
+          vars.type: "= has(vars.params.rope_type) ? vars.params.rope_type : 'default'"
+          vars.prf: "= has(vars.params.partial_rotary_factor) ? double(vars.params.partial_rotary_factor) : 1.0"
+      - title: partial_rotary_factor must be in (0, 1]
+        source: "vllm/model_executor/layers/rotary_embedding/__init__.py:69-72"
+        if: "vars.prf <= 0.0 || vars.prf > 1.0"
+        then:
+          - fail: {code: value-error, status: 0, message: "= 'partial_rotary_factor=' + string(vars.prf) + ' must be between 0.0 and 1.0'"}
+      - set:
+          vars.key: "= 'h' + string(input.head_size) + '_p' + string(input.max_position) + '_' + vars.type"
+      - title: _ROPE_DICT cache hit
+        source: "vllm/model_executor/layers/rotary_embedding/__init__.py:84-85"
+        if: "vars.key in state.rope_cache"
+        then:
+          - return: {cls: "= state.rope_cache[vars.key]", cached: true}
+      - title: Unknown rope type
+        source: "vllm/model_executor/layers/rotary_embedding/__init__.py:349-350"
+        if: "!(vars.type in state.scaling_types)"
+        then:
+          - fail: {code: value-error, status: 0, message: "= 'Unknown RoPE scaling type ' + vars.type"}
+      - title: default with mrope_section builds MRotaryEmbedding
+        source: "vllm/model_executor/layers/rotary_embedding/__init__.py:112-124"
+        set:
+          vars.cls: "= vars.type == 'default' && has(vars.params.mrope_section) ? 'MRotaryEmbedding' : state.scaling_types[vars.type]"
+      - title: llama3 reads factor, low/high freq factors and the original context length
+        source: "vllm/model_executor/layers/rotary_embedding/__init__.py:167-183"
+        if: "vars.type == 'llama3' && !has(vars.params.factor)"
+        then:
+          - fail: {code: key-error, status: 0, message: "'factor'"}
+      - source: "vllm/model_executor/layers/rotary_embedding/__init__.py:351-352"
+        set:
+          "= 'state.rope_cache.' + vars.key": "= vars.cls"
+      - return: {cls: "= vars.cls", cached: false}
+
+  - component: rotary-embedding
+    name: forward-cuda
+    kind: function
+    summary: "RotaryEmbedding.forward_cuda: FlashInfer's in-place rope when enabled, else vLLM's ops.rotary_embedding custom op."
+    sources: ["vllm/model_executor/layers/rotary_embedding/base.py:221-252"]
+    request: {type: object, required: [num_tokens], properties: {num_tokens: {type: integer}, num_heads: {type: integer}, num_kv_heads: {type: integer}, head_size: {type: integer}, use_flashinfer: {type: boolean, default: false}}}
+    response: {type: object, properties: {owner_ms: {type: integer}}}
+    behavior:
+      - title: use_flashinfer - torch.ops.vllm.flashinfer_rotary_embedding
+        source: "vllm/model_executor/layers/rotary_embedding/base.py:227-236"
+        if: "has(input.use_flashinfer) && input.use_flashinfer"
+        then:
+          - call: rotary-embedding.flashinfer-rotary-embedding
+            input: {num_tokens: "= input.num_tokens", num_heads: "= input.num_heads", head_size: "= input.head_size"}
+          - return: {owner_ms: 0}
+      - title: ops.rotary_embedding updates q and k in place
+        source: "vllm/model_executor/layers/rotary_embedding/base.py:238-251"
+        call: custom-ops.rotary-embedding
+        input: {num_tokens: "= input.num_tokens", hidden_size: "= (input.num_heads + input.num_kv_heads) * input.head_size", dtype_bytes: 2}
+        as: op
+      - return: {owner_ms: "= vars.op.duration_ms"}
+
+  - component: rotary-embedding
+    name: flashinfer-rotary-embedding
+    kind: kernel
+    summary: "torch.ops.vllm.flashinfer_rotary_embedding: FlashInfer apply_rope_with_cos_sin_cache_inplace, registered as a vLLM custom op."
+    sources: ["vllm/model_executor/layers/rotary_embedding/common.py:79-108"]
+    request: {type: object, properties: {num_tokens: {type: integer}, num_heads: {type: integer}, head_size: {type: integer}}}
+    latency_ms: 0
+    behavior:
+      - title: direct_register_custom_op(flashinfer_rotary_embedding), mutates query and key
+        source: "vllm/model_executor/layers/rotary_embedding/common.py:103-108"
+        set: {ctx.rope_impl: flashinfer}
+
+  - component: m-rotary-embedding
+    name: forward-cuda
+    kind: function
+    summary: "MRotaryEmbedding.forward_cuda: 3-D (t, h, w) positions use the Triton M-RoPE kernel; 1-D positions fall back to the plain rotation."
+    sources: ["vllm/model_executor/layers/rotary_embedding/mrope.py:439-488"]
+    request: {type: object, required: [num_tokens, positions_ndim], properties: {num_tokens: {type: integer, examples: [256]}, positions_ndim: {type: integer, examples: [2]}}}
+    response: {type: object, properties: {path: {type: string}}}
+    behavior:
+      - title: Multimodal positions (3 x num_tokens) need mrope_section
+        source: "vllm/model_executor/layers/rotary_embedding/mrope.py:455-470"
+        if: "input.positions_ndim == 2"
+        then:
+          - call: m-rotary-embedding.triton-mrope
+            input: {num_tokens: "= input.num_tokens"}
+          - return: {path: triton_mrope}
+      - title: Text-only positions - apply_rotary_emb on the rotary slice
+        source: "vllm/model_executor/layers/rotary_embedding/mrope.py:472-488"
+        return: {path: apply_rotary_emb}
+
+  - component: m-rotary-embedding
+    name: triton-mrope
+    kind: kernel
+    summary: "triton_mrope: one Triton program per token row rotates q and k with the section-interleaved (t, h, w) cos/sin."
+    sources: ["vllm/model_executor/layers/rotary_embedding/mrope.py:163-230"]
+    request: {type: object, properties: {num_tokens: {type: integer}}}
+    latency_ms: 0
+    behavior:
+      - title: "Triton kernel _triton_mrope_forward, grid (n_row,)"
+        source: "vllm/model_executor/layers/rotary_embedding/mrope.py:16-160"
+      - source: "vllm/model_executor/layers/rotary_embedding/mrope.py:211"
+        set: {ctx.rope_impl: triton_mrope}
+      - title: "On ROCm, forward_hip uses the registered torch.ops.vllm.mrope op instead"
+        source: "vllm/model_executor/layers/rotary_embedding/mrope.py:296-301"
+
+  # ---------------------------------------------------------------- norms and activation
+  - component: rms-norm
+    name: forward-cuda
+    kind: kernel
+    summary: "RMSNorm.forward_cuda: ir.ops.rms_norm, or ir.ops.fused_add_rms_norm when a residual is passed; the batch-invariant Triton kernel under VLLM_BATCH_INVARIANT."
+    sources: ["vllm/model_executor/layers/layernorm.py:96-115", "vllm/model_executor/layers/layernorm.py:74-94"]
+    request: {type: object, required: [num_tokens, hidden_size, residual], properties: {num_tokens: {type: integer}, hidden_size: {type: integer}, residual: {type: boolean}, layer_repeat: {type: integer}}}
+    latency_ms: "= double(input.num_tokens) * double(input.hidden_size) * (input.residual ? 8.0 : 4.0) / (double(config['gpu-hbm-bandwidth-gbps']) * 1000000.0)"
+    behavior:
+      - title: Batch-invariant mode
+        source: "vllm/model_executor/layers/layernorm.py:101-113"
+        if: "config['vllm-batch-invariant']"
+        then:
+          - call: batch-invariant.rms-norm-batch-invariant
+            input: {num_tokens: "= input.num_tokens", hidden_size: "= input.hidden_size"}
+          - return: {owner_ms: 0}
+      - title: Residual - fused add + RMSNorm in place
+        source: "vllm/model_executor/layers/layernorm.py:87-94"
+        when: "input.residual"
+        set: {ctx.last_norm: fused_add_rms_norm}
+      - title: No residual - RMSNorm
+        source: "vllm/model_executor/layers/layernorm.py:80-86"
+        when: "!input.residual"
+        set: {ctx.last_norm: rms_norm}
+      - return: {owner_ms: 0}
+
+  - component: silu-and-mul
+    name: forward-cuda
+    kind: kernel
+    summary: "SiluAndMul.forward_cuda: allocate [.., d] and run torch.ops._C.silu_and_mul; memory-bound latency."
+    sources: ["vllm/model_executor/layers/activation.py:146-151"]
+    request: {type: object, required: [num_tokens, d], properties: {num_tokens: {type: integer}, d: {type: integer}, layer_repeat: {type: integer}}}
+    latency_ms: "= double(input.num_tokens) * double(input.d) * 6.0 / (double(config['gpu-hbm-bandwidth-gbps']) * 1000000.0)"
+    behavior:
+      - source: "vllm/model_executor/layers/activation.py:147-150"
+        return: {owner_ms: 0}
+
+  # ---------------------------------------------------------------- attention layer
+  - component: attention-layer
+    name: forward
+    kind: function
+    summary: "Attention.forward: reshape q/k/v by heads, write K/V into the paged cache (unless the backend does it in forward or the layer shares a cache), then run the backend."
+    sources: ["vllm/model_executor/layers/attention/attention.py:488-584"]
+    request:
+      type: object
+      required: [num_tokens, num_heads, num_kv_heads, head_size]
+      properties:
+        num_tokens: {type: integer, examples: [16]}
+        num_heads: {type: integer, examples: [32]}
+        num_kv_heads: {type: integer, examples: [8]}
+        head_size: {type: integer, examples: [128]}
+        backend_updates_kv_in_forward: {type: boolean, default: false}
+    response: {type: object, properties: {owner_ms: {type: integer}}}
+    behavior:
+      - set: {vars.kv_ms: 0}
+      - title: unified_kv_cache_update unless the backend writes K/V in forward or the cache is shared
+        source: "vllm/model_executor/layers/attention/attention.py:563-572"
+        if: "!has(input.kv_sharing_target_layer) && !(has(input.backend_updates_kv_in_forward) && input.backend_updates_kv_in_forward) && has(input.attn_metadata) && size(input.attn_metadata) > 0"
+        then:
+          - call: attention-layer.unified-kv-cache-update
+            input: {num_tokens: "= input.num_tokens", num_kv_heads: "= input.num_kv_heads", head_size: "= input.head_size", attn_metadata: "= has(input.attn_metadata) ? input.attn_metadata : {}"}
+            as: kv
+          - set: {vars.kv_ms: "= vars.kv.duration_ms"}
+      - title: torch.ops.vllm.unified_attention_with_output
+        source: "vllm/model_executor/layers/attention/attention.py:573-581"
+        call: attention-layer.unified-attention-with-output
+        input: {num_tokens: "= input.num_tokens", num_heads: "= input.num_heads", num_kv_heads: "= input.num_kv_heads", head_size: "= input.head_size", attn_metadata: "= has(input.attn_metadata) ? input.attn_metadata : {}"}
+        as: at
+      - return: {owner_ms: "= vars.kv_ms + vars.at.duration_ms"}
+
+  - component: attention-layer
+    name: unified-kv-cache-update
+    kind: kernel
+    summary: "torch.ops.vllm.unified_kv_cache_update: look up the layer's KV cache and slot mapping in the forward context and have the backend write K/V."
+    sources: ["vllm/model_executor/layers/attention/attention.py:724-762"]
+    request: {type: object, properties: {num_tokens: {type: integer}, num_kv_heads: {type: integer}, head_size: {type: integer}, attn_metadata: {type: object, default: {}}}}
+    latency_ms: 0
+    behavior:
+      - title: attn_layer.impl.do_kv_cache_update(layer, key, value, kv_cache, slot_mapping)
+        source: "vllm/model_executor/layers/attention/attention.py:734-745"
+        call: flash-attention-impl.do-kv-cache-update
+        input:
+          num_tokens: "= input.num_tokens"
+          num_kv_heads: "= input.num_kv_heads"
+          head_size: "= input.head_size"
+          attn_type: decoder
+          slot_mapping: "= has(input.attn_metadata.slot_mapping) ? input.attn_metadata.slot_mapping : lists.range(input.num_tokens)"
+      - title: direct_register_custom_op(unified_kv_cache_update)
+        source: "vllm/model_executor/layers/attention/attention.py:757-762"
+
+  - component: attention-layer
+    name: unified-attention-with-output
+    kind: kernel
+    summary: "torch.ops.vllm.unified_attention_with_output: fetch the layer's metadata and KV cache from the forward context and call the backend impl's forward into output."
+    sources: ["vllm/model_executor/layers/attention/attention.py:765-801"]
+    request: {type: object, properties: {num_tokens: {type: integer}, num_heads: {type: integer}, num_kv_heads: {type: integer}, head_size: {type: integer}, attn_metadata: {type: object, default: {}}}}
+    latency_ms: 0
+    behavior:
+      - title: self.impl.forward(self, q, k, v, kv_cache, attn_metadata, output=output)
+        source: "vllm/model_executor/layers/attention/attention.py:782-794"
+        call: flash-attention-impl.forward
+        input:
+          num_tokens: "= input.num_tokens"
+          num_heads: "= input.num_heads"
+          num_kv_heads: "= input.num_kv_heads"
+          head_size: "= input.head_size"
+          attn_type: decoder
+          layer_name: model.layers.0.self_attn.attn
+          metadata: "= size(input.attn_metadata) > 0 ? input.attn_metadata : null"
+          profiling_run: "= size(input.attn_metadata) == 0"
+      - title: direct_register_custom_op(unified_attention_with_output)
+        source: "vllm/model_executor/layers/attention/attention.py:797-801"

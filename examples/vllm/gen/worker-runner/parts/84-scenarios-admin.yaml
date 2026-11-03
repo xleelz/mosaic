@@ -1,0 +1,581 @@
+scenarios:
+- id: wr-sleep-level1-then-wake
+  name: Level-1 sleep offloads weights and discards the KV cache; wake_up restores both (KV content lost)
+  fixtures:
+  - full-tp1-llama-8b
+  config:
+    enable-sleep-mode: true
+  state:
+    gpu-memory@rank0:
+      kv_cache_bytes: 59743666176
+      cudagraph_bytes: 536870912
+  steps:
+  - flow: wr-load-model
+    as: load
+  - flow: wr-sleep
+    as: sl
+  - interface: gpu-memory.snapshot
+    caller: cu-mem-allocator
+    as: asleep
+  - interface: gpu-worker-impl.wake-up
+    caller: engine-core
+    as: wk
+    input: {}
+  - interface: gpu-memory.snapshot
+    caller: engine-core
+    as: awake
+  expect:
+  - steps.sl.result.value.freed_bytes == 59743666176 + 16060522496 + 536870912
+  - steps.asleep.result.value.free_bytes == 85899345920 - 1073741824
+  - steps.wk.result.value.restored == ['weights', 'kv_cache', 'cudagraph'] && !steps.wk.result.value.buffers_restored
+  - steps.awake.result.value.kv_cache_bytes == 59743666176 && steps.awake.result.value.weights_bytes == 16060522496 && trace.exists(e, e.type == 'call.end' && e.interface == 'gpu-memory.snapshot')
+- id: wr-sleep-level2-wake-weights-only
+  name: Level-2 sleep saves buffers and discards weights; waking only weights restores the buffers, the KV cache stays discarded
+  fixtures:
+  - full-tp1-llama-8b
+  config:
+    enable-sleep-mode: true
+  state:
+    gpu-memory@rank0:
+      kv_cache_bytes: 1000000
+  steps:
+  - flow: wr-load-model
+    as: load
+  - flow: wr-sleep
+    as: sl
+    input:
+      level: 2
+  - interface: gpu-worker-impl.wake-up
+    caller: engine-core
+    as: wk
+    input:
+      tags:
+      - weights
+  - interface: gpu-memory.snapshot
+    caller: engine-core
+    as: after
+  expect:
+  - steps.wk.result.value.buffers_restored && steps.wk.result.value.restored == ['weights']
+  - steps.after.result.value.kv_cache_bytes == 0 && steps.after.result.value.weights_bytes == 16060522496 && trace.exists(e, e.type == 'call.end' && e.interface == 'gpu-memory.snapshot')
+- id: wr-sleep-wake-kv-only
+  name: Waking only the KV cache leaves the worker asleep
+  fixtures:
+  - full-tp1-llama-8b
+  config:
+    enable-sleep-mode: true
+  state:
+    gpu-memory@rank0:
+      kv_cache_bytes: 1000000
+  steps:
+  - flow: wr-load-model
+    as: load
+  - flow: wr-sleep
+    as: sl
+    input:
+      level: 2
+  - interface: gpu-worker-impl.wake-up
+    caller: engine-core
+    as: wk
+    input:
+      tags:
+      - kv_cache
+  expect:
+  - '!steps.wk.result.value.buffers_restored && state[''gpu-worker-impl@rank0''].sleep_level == 2'
+- id: wr-sleep-discard-weights
+  name: discard(weights) after a level-1 sleep drops the host copy
+  fixtures:
+  - full-tp1-llama-8b
+  config:
+    enable-sleep-mode: true
+  steps:
+  - flow: wr-load-model
+    as: load
+  - flow: wr-sleep
+    as: sl
+  - interface: gpu-worker-impl.discard
+    caller: engine-core
+    as: d
+    input:
+      tags:
+      - weights
+  expect:
+  - steps.d.result.value.discarded == ['kv_cache', 'weights']
+  - state['cu-mem-allocator@rank0'].offloaded_weights_bytes == 0 && !('weights' in state['cu-mem-allocator@rank0'].offloaded)
+- id: wr-sleep-without-sleep-mode
+  name: Without enable_sleep_mode nothing is in the CuMem pool, so sleep, wake_up and discard free nothing
+  fixtures:
+  - full-tp1-llama-8b
+  steps:
+  - flow: wr-load-model
+    as: load
+  - flow: wr-sleep
+    as: sl
+  - interface: gpu-worker-impl.wake-up
+    caller: engine-core
+    as: wk
+    input: {}
+  - interface: gpu-worker-impl.discard
+    caller: engine-core
+    as: d
+    input:
+      tags:
+      - weights
+  - interface: gpu-memory.snapshot
+    caller: engine-core
+    as: after
+  expect:
+  - steps.sl.result.value.freed_bytes == 0 && steps.wk.result.value.restored == [] && steps.d.result.value.discarded == []
+  - steps.after.result.value.weights_bytes == 16060522496 && trace.exists(e, e.type == 'call.end' && e.interface == 'gpu-memory.snapshot')
+- id: wr-weight-update-session
+  name: init, start, two update chunks and finish; the target update resets LoRA state
+  fixtures:
+  - full-tp1-llama-8b
+  config:
+    weight-transfer-backend: nccl
+    enable-lora: true
+  state:
+    gpu-worker-impl:
+      weight_transfer_engine: true
+    gpu-model-runner:
+      loras:
+      - 1
+  steps:
+  - interface: gpu-worker-impl.init-weight-transfer-engine
+    caller: engine-core
+    as: init
+    input:
+      init_info:
+        master_address: trainer-0
+        master_port: 29500
+  - flow: wr-weight-update
+    as: start
+  - interface: gpu-worker-impl.update-weights
+    caller: engine-core
+    as: u1
+    input:
+      update_info:
+        names:
+        - model.layers.0.mlp.up_proj.weight
+  - interface: gpu-worker-impl.update-weights
+    caller: engine-core
+    as: u2
+    input:
+      update_info:
+        names:
+        - lm_head.weight
+  - interface: gpu-worker-impl.finish-weight-update
+    caller: engine-core
+    as: fin
+  - interface: gpu-worker-impl.shutdown-weight-transfer-engine
+    caller: engine-core
+    as: rel
+  expect:
+  - steps.start.result.value.active && !steps.start.result.value.is_draft && steps.u2.result.value.chunks == 2
+  - steps.fin.result.value.lora_reset && state['gpu-model-runner@rank0'].loras == []
+- id: wr-weight-update-misuse
+  name: Weight-update calls out of order or without configuration are RuntimeErrors
+  fixtures:
+  - full-tp1-llama-8b
+  steps:
+  - interface: gpu-worker-impl.init-weight-transfer-engine
+    caller: engine-core
+    as: noinit
+  - flow: wr-weight-update
+    as: nostart
+  - interface: gpu-worker-impl.update-weights
+    caller: engine-core
+    as: noupd
+  - interface: gpu-worker-impl.finish-weight-update
+    caller: engine-core
+    as: nofin
+  - interface: gpu-worker-impl.shutdown-weight-transfer-engine
+    caller: engine-core
+    as: norel
+  expect:
+  - steps.noinit.result.error.message.startsWith('Weight transfer not configured') && steps.nostart.result.error.code == 'runtime-error'
+  - steps.noupd.result.error.code == 'runtime-error' && steps.nofin.result.error.code == 'runtime-error' && !steps.norel.result.value.released
+  - '!(''session'' in state[''weight-update-session@rank0''].sessions) || !state[''weight-update-session@rank0''].sessions[''session''].active'
+- id: wr-weight-update-session-order
+  name: A second start, an update or finish without a session, and releasing during a session are refused
+  fixtures:
+  - full-tp1-llama-8b
+  state:
+    gpu-worker-impl:
+      weight_transfer_engine: true
+  steps:
+  - interface: gpu-worker-impl.update-weights
+    caller: engine-core
+    as: early
+  - interface: gpu-worker-impl.finish-weight-update
+    caller: engine-core
+    as: earlyfin
+  - flow: wr-weight-update
+    as: s1
+  - flow: wr-weight-update
+    as: s2
+  - interface: gpu-worker-impl.shutdown-weight-transfer-engine
+    caller: engine-core
+    as: rel
+  - interface: gpu-worker-impl.start-draft-weight-update
+    caller: engine-core
+    as: draft
+  expect:
+  - steps.early.result.error.message == 'start_weight_update must be called before update_weights.'
+  - steps.earlyfin.result.error.message.startsWith('finish_weight_update called without')
+  - steps.s1.result.ok && steps.s2.result.error.message.startsWith('start_weight_update called while')
+  - steps.rel.result.error.message == 'Cannot release a trainer connection during a weight update'
+  - steps.draft.result.error.message == 'Draft model weight update requested, but no draft model is configured.' && state['weight-update-session@rank0'].sessions['session'].active
+- id: wr-weight-update-draft-and-failing-chunk
+  name: A draft-model session skips the LoRA reset; a failing chunk ends the session
+  fixtures:
+  - full-tp1-llama-8b
+  config:
+    speculative-method: eagle3
+    num-speculative-tokens: 3
+  state:
+    gpu-worker-impl:
+      weight_transfer_engine: true
+  faults:
+  - target: weight-transfer-engine.update-weights
+    type: error
+    code: runtime-error
+    message: NCCL broadcast failed
+    calls:
+    - 1
+  steps:
+  - interface: gpu-worker-impl.supports-draft-weight-updates
+    caller: engine-core
+    as: sup
+  - interface: gpu-worker-impl.start-draft-weight-update
+    caller: engine-core
+    as: d
+  - interface: gpu-worker-impl.update-weights
+    caller: engine-core
+    as: bad
+  - interface: gpu-worker-impl.start-draft-weight-update
+    caller: engine-core
+    as: d2
+  - interface: gpu-worker-impl.finish-weight-update
+    caller: engine-core
+    as: fin
+  expect:
+  - steps.sup.result.value.supported && steps.d.result.value.is_draft
+  - steps.bad.result.error.message == 'NCCL broadcast failed' && steps.d2.result.ok
+  - steps.fin.result.ok && !steps.fin.result.value.lora_reset && !state['weight-update-session@rank0'].sessions['session'].active
+- id: wr-supports-draft-weight-updates-off
+  name: Without a draft model draft weight updates are unsupported
+  fixtures:
+  - full-tp1-llama-8b
+  steps:
+  - interface: gpu-worker-impl.supports-draft-weight-updates
+    caller: engine-core
+    as: sup
+  expect:
+  - '!steps.sup.result.value.supported'
+  - trace.exists(e, e.type == 'call.end' && e.interface == 'gpu-worker-impl.supports-draft-weight-updates')
+- id: wr-lora-disabled
+  name: LoRA RPCs fail without --enable-lora
+  flow: wr-lora
+  fixtures:
+  - full-tp1-llama-8b
+  expect:
+  - '!result.ok && result.error.code == ''runtime-error'' && result.error.message == ''LoRA is not enabled. Use --enable-lora to enable LoRA.'''
+  - calls['lru-cache-worker-lora-manager.add-adapter'] == 0 && !has(state['gpu-model-runner@rank0'].loras)
+- id: wr-lora-add-pin-list-remove
+  name: With --enable-lora an adapter is added, pinned, listed and removed
+  fixtures:
+  - full-tp1-llama-8b
+  config:
+    enable-lora: true
+  state:
+    local-disk:
+      files:
+        /adapters/sql-lora/adapter_config.json:
+          r: 8
+          bias: none
+  steps:
+  - flow: wr-lora
+    as: add
+  - interface: gpu-worker-impl.pin-lora
+    caller: engine-core
+    as: pin
+    input:
+      lora_int_id: 1
+  - interface: gpu-worker-impl.list-loras
+    caller: engine-core
+    as: ls
+  - interface: gpu-worker-impl.remove-lora
+    caller: engine-core
+    as: rm
+    input:
+      lora_int_id: 1
+  - interface: gpu-worker-impl.list-loras
+    caller: engine-core
+    as: ls2
+  expect:
+  - steps.add.result.value.added && steps.pin.result.value.pinned && steps.ls.result.value.lora_ids == [1]
+  - steps.rm.result.value.removed && steps.ls2.result.value.lora_ids == []
+  - state['gpu-model-runner@rank0'].loras == []
+- id: wr-profile-not-enabled
+  name: profile() without --profiler-config is a RuntimeError
+  flow: wr-profile
+  fixtures:
+  - full-tp1-llama-8b
+  expect:
+  - '!result.ok && result.error.code == ''runtime-error'' && result.error.message.startsWith(''Profiling is not enabled'')'
+  - '!state[''gpu-worker-impl@rank0''].profiler_running'
+- id: wr-profile-start-stop
+  name: A stop before any start only warns; start names the trace prefix_dp0_pp0_tp0; stop stops it
+  fixtures:
+  - full-tp1-llama-8b
+  config:
+    profiler: torch
+  steps:
+  - interface: gpu-worker-impl.profile
+    caller: engine-core
+    as: early
+    input:
+      is_start: false
+  - flow: wr-profile
+    as: start
+  - interface: gpu-worker-impl.profile
+    caller: engine-core
+    as: stop
+    input:
+      is_start: false
+  - interface: gpu-worker-impl.check-health
+    caller: engine-core
+    as: health
+  expect:
+  - steps.early.result.ok && steps.early.result.value.trace_name == ''
+  - steps.start.result.value.trace_name == 'bench_dp0_pp0_tp0' && steps.stop.result.value.trace_name == 'bench_dp0_pp0_tp0'
+  - '!state[''gpu-worker-impl@rank0''].profiler_running'
+- id: wr-init-worker-and-env
+  name: init_worker loads plugins and records worker_cls; update_environment_variables applies this rank's env
+  fixtures:
+  - full-tp1-llama-8b
+  steps:
+  - flow: wr-init-worker
+    as: init
+  - interface: worker-wrapper-base.update-environment-variables
+    caller: engine-core
+    as: env
+    input:
+      envs_list:
+      - CUDA_VISIBLE_DEVICES: '0'
+      rpc_rank: 0
+  - interface: worker-wrapper-base.update-environment-variables
+    caller: engine-core
+    as: bad
+    input:
+      envs_list: []
+      rpc_rank: 1
+  expect:
+  - steps.init.result.value.worker_cls == 'vllm.v1.worker.gpu_worker.Worker' && calls['plugins.load-general-plugins'] == 1
+  - 'steps.env.result.value.applied == {''CUDA_VISIBLE_DEVICES'': ''0''} && steps.bad.result.error.code == ''index-error'''
+  - state['worker-wrapper-base@rank0'].worker_cls == 'vllm.v1.worker.gpu_worker.Worker'
+- id: wr-init-worker-empty-class
+  name: A worker_cls that is not a qualified-name string is refused
+  flow: wr-init-worker
+  fixtures:
+  - full-tp1-llama-8b
+  input:
+    worker_cls: ''
+  expect:
+  - '!result.ok && result.error.code == ''value-error'''
+  - '!has(state[''worker-wrapper-base@rank0''].worker_cls)'
+- id: wr-admin-rpcs
+  name: Health, tasks, caches, checksums, checkpoints, saving, max_model_len, KV layouts, inspection and the KV connector handshake
+  fixtures:
+  - full-tp1-llama-8b
+  steps:
+  - interface: gpu-worker-impl.check-health
+    caller: engine-core
+    as: health
+  - interface: gpu-worker-impl.get-supported-tasks
+    caller: engine-core
+    as: tasks
+  - interface: gpu-worker-impl.reset-mm-cache
+    caller: engine-core
+    as: mm
+  - interface: gpu-worker-impl.reset-encoder-cache
+    caller: engine-core
+    as: enc
+  - interface: gpu-worker-impl.get-encoder-timing-stats
+    caller: engine-core
+    as: ets
+  - interface: gpu-worker-impl.compute-weight-checksums
+    caller: engine-core
+    as: ck
+    input:
+      tp_rank: 0
+  - interface: gpu-worker-impl.reset-weights
+    caller: engine-core
+    as: rw
+  - interface: gpu-worker-impl.reload-weights
+    caller: engine-core
+    as: rl
+  - interface: gpu-worker-impl.checkpoint-prepare
+    caller: engine-core
+    as: cp
+  - interface: gpu-worker-impl.checkpoint-restore
+    caller: engine-core
+    as: cr
+  - interface: gpu-worker-impl.save-sharded-state
+    caller: engine-core
+    as: ss
+    input:
+      path: /models/llama-8b-sharded
+  - interface: gpu-worker-impl.save-tensorized-model
+    caller: engine-core
+    as: st
+    input:
+      tensorizer_uri: /models/llama-8b.tensors
+  - interface: gpu-worker-impl.update-max-model-len
+    caller: engine-core
+    as: ml
+    input:
+      max_model_len: 65536
+  - interface: gpu-worker-impl.get-kv-connector-handshake-metadata
+    caller: engine-core
+    as: hs
+  - interface: gpu-worker-impl.elastic-ep-execute
+    caller: engine-core
+    as: ep
+    input:
+      execute_method: receive_weights
+  - interface: gpu-worker-impl.execute-dummy-batch
+    caller: engine-core
+    as: dummy
+  - interface: worker-base.get-supported-kv-cache-layouts
+    caller: engine-core
+    as: lay
+  - interface: worker-base.set-kv-cache-layout
+    caller: engine-core
+    as: setlay
+    input:
+      kv_cache_layout: HND
+  - interface: worker-base.synchronize-device
+    caller: engine-core
+    as: sync
+  - interface: worker-base.apply-model
+    caller: engine-core
+    as: am
+    input:
+      fn: count_parameters
+  - interface: worker-base.get-model-inspection
+    caller: engine-core
+    as: insp
+  expect:
+  - steps.health.result.value.healthy && steps.tasks.result.value.tasks == ['generate'] && steps.ets.result.value.stats == {}
+  - steps.ck.result.value.checksums.all(k, k.startsWith('dp0:pp0:pcp0:tp0:'))
+  - steps.ml.result.value.max_model_len == 65536 && state['gpu-model-runner@rank0'].max_model_len == 65536
+  - steps.hs.result.value == null && steps.dummy.result.value.num_tokens == 1
+  - steps.am.result.value.architecture == 'LlamaForCausalLM' && steps.insp.result.value.inspection == 'LlamaForCausalLM(layers=32)'
+  - steps.setlay.result.value.kv_cache_layout == 'HND' && steps.sync.result.value.synchronized
+  - calls['weight-checksum.zero-weights'] == 1 && calls['base-model-loader.load-model'] == 1 && calls['sharded-state-loader.save-model'] == 1
+- id: wr-admin-rpcs-multimodal-and-kv-transfer
+  name: Multimodal timing stats, an mm-cache reset, a KV connector handshake, an empty layout list and a bad max_model_len
+  fixtures:
+  - full-tp1-llama-8b
+  config:
+    kv-transfer-config: NixlConnector
+  state:
+    gpu-model-runner:
+      model:
+        architecture: Qwen2VLForConditionalGeneration
+        num_hidden_layers: 28
+        num_kv_heads: 4
+        head_size: 128
+        dtype_bytes: 2
+        vocab_size: 151936
+        hidden_size: 3584
+        is_hybrid: false
+        uses_mrope: true
+        uses_prompt_embeds: false
+  steps:
+  - interface: gpu-worker-impl.get-encoder-timing-stats
+    caller: engine-core
+    as: ets
+  - interface: gpu-worker-impl.reset-mm-cache
+    caller: engine-core
+    as: mm
+  - interface: gpu-worker-impl.get-kv-connector-handshake-metadata
+    caller: engine-core
+    as: hs
+  - interface: gpu-model-runner.update-max-model-len
+    caller: gpu-worker-impl
+    as: bad
+    input:
+      max_model_len: 0
+  - interface: worker-base.synchronize-device
+    caller: engine-core
+    as: nosync
+    input:
+      accelerator_available: false
+  expect:
+  - steps.ets.result.value.stats.encoder.num_calls == 0 && steps.hs.result.value.key == 'pp0:tp0'
+  - steps.bad.result.error.code == 'value-error' && !steps.nosync.result.value.synchronized
+  - state['gpu-model-runner@rank0'].max_model_len == 131072
+- id: wr-handle-ft-command
+  name: FT commands need enable_fault_tolerance; retry synchronizes the device; unknown instructions fail
+  fixtures:
+  - full-tp1-llama-8b
+  steps:
+  - interface: gpu-worker-impl.handle-ft-command
+    caller: engine-core
+    as: disabled
+    input:
+      instruction: retry
+  expect:
+  - steps.disabled.result.error.code == 'assertion-error'
+  - calls['worker-sentinel.handle-command'] == 0 && trace.exists(e, e.type == 'call.end' && e.interface == 'gpu-worker-impl.handle-ft-command')
+- id: wr-handle-ft-command-enabled
+  name: With enable_fault_tolerance the sentinel runs retry and rejects unknown instructions
+  fixtures:
+  - full-tp1-llama-8b
+  config:
+    enable-fault-tolerance: true
+  steps:
+  - interface: gpu-worker-impl.handle-ft-command
+    caller: engine-core
+    as: retry
+    input:
+      instruction: retry
+  - interface: gpu-worker-impl.handle-ft-command
+    caller: engine-core
+    as: bogus
+    input:
+      instruction: explode
+  expect:
+  - steps.retry.result.value.done && calls['worker-base.synchronize-device'] == 1
+  - steps.bogus.result.error.code == 'attribute-error'
+  - trace.exists(e, e.type == 'call.start' && e.interface == 'worker-sentinel.handle-command')
+- id: wr-shutdown-then-inspect
+  name: Shutdown releases the model and KV cache; inspecting the model afterwards fails
+  fixtures:
+  - full-tp1-llama-8b
+  config:
+    weight-transfer-backend: nccl
+  state:
+    gpu-worker-impl:
+      weight_transfer_engine: true
+    gpu-memory@rank0:
+      kv_cache_bytes: 59743666176
+  steps:
+  - flow: wr-load-model
+    as: load
+  - flow: wr-shutdown
+    as: down
+  - interface: worker-base.apply-model
+    caller: engine-core
+    as: am
+    input:
+      fn: count_parameters
+  - interface: gpu-worker-impl.reload-weights
+    caller: engine-core
+    as: rl
+  expect:
+  - steps.down.result.value.shut_down && state['gpu-worker-impl@rank0'].shut_down
+  - steps.am.result.error.code == 'attribute-error' && steps.rl.result.error.code == 'attribute-error'
+  - calls['weight-transfer-engine.shutdown'] == 1

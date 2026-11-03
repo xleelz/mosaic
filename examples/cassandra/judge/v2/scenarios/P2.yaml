@@ -1,0 +1,70 @@
+schema_version: 1
+id: cassandra
+scenarios:
+  - id: bench-p2
+    flow: rs-nodetool-repair-incremental
+    fixtures: [three-node-rf3]
+    name: "P2: incremental repair, n3 diverged: PREPARE_CONSISTENT + anticompaction marks sstables pending, validation and sync, FINALIZE_PROPOSE/COMMIT, then a background task promotes pending -> repaired"
+    state:
+      cassandra-table-repair-manager@n3:
+        digests: {ks1.users: 9f86d081}
+      tracker@n2:
+        views:
+          ks1.users:
+            strategy: SizeTieredCompactionStrategy
+            auto_compaction_enabled: true
+            min_threshold: 4
+            max_threshold: 32
+            compacting: []
+            sstables:
+              - {id: u-1, size_mb: 10, level: 0, age_s: 3600, tombstones: 0, purgeable_tombstones: 0, droppable_tombstone_ratio: 0, fully_expired: false, repaired: false, pending_repair: '', unowned_mb: 0, window: 0, read_rate: 0, max_timestamp: 1000}
+              - {id: u-2, size_mb: 12, level: 0, age_s: 3600, tombstones: 0, purgeable_tombstones: 0, droppable_tombstone_ratio: 0, fully_expired: false, repaired: false, pending_repair: '', unowned_mb: 0, window: 0, read_rate: 0, max_timestamp: 1001}
+              - {id: r-0, size_mb: 50, level: 0, age_s: 9000, tombstones: 0, purgeable_tombstones: 0, droppable_tombstone_ratio: 0, fully_expired: false, repaired: true, pending_repair: '', unowned_mb: 0, window: 0, read_rate: 0, max_timestamp: 500}
+    expect:
+      - "result.ok && ctx.repairOutcome == 'completed'"
+      - "calls['repair-message-verb-handler.do-verb-prepare-consistent-req'] == 3 && calls['pending-anti-compaction.run'] == 3"
+      - "trace.exists(e, e.type == 'call.start' && e.interface == 'compaction-manager.submit-pending-anti-compaction' && e.instance == 'n2')"
+      - "calls['repair-message-verb-handler.do-verb-validation-req'] == 3 && ctx.syncTasks == 2 && calls['stream-plan.execute'] == 2"
+      - "calls['repair-message-verb-handler.do-verb-finalize-propose-msg'] == 3 && calls['repair-message-verb-handler.do-verb-finalize-commit-msg'] == 3"
+      - "state['local-sessions@n2'].sessions['6f2b1a40-9d3c-11ef-a8d2-5b1c0e7f4a21'].state == 'FINALIZED' && state['coordinator-sessions@n1'].sessions['6f2b1a40-9d3c-11ef-a8d2-5b1c0e7f4a21'].state == 'FINALIZED'"
+      # promotion after finalize, through PendingRepairManager's RepairFinishedCompactionTask
+      - "trace.exists(e, e.type == 'call.start' && e.interface == 'pending-repair-manager-repair-finished-compaction-task.run-may-throw' && e.instance == 'n2')"
+      - "state['tracker@n2'].views['ks1.users'].sstables.filter(s, s.id in ['u-1', 'u-2', 'r-0']).all(s, s.repaired && s.pending_repair == '')"
+      - "ctx.repair_finished == 'promoted'"
+  # Round 3: the round-2 probe bench-p2-probe-streamed-not-pending pinned the wrong claim (a streamed 'added-' sstable
+  # left unrepaired). The fix streams with the session's pendingRepair, so the probe is replaced by the code's behavior.
+  - id: bench-p2-streamed-sstables-pending-then-promoted
+    flow: rs-nodetool-repair-incremental
+    fixtures:
+    - three-node-rf3
+    name: 'P2 (round 3, replaces the round-2 probe): sstables streamed in during incremental repair are written with the session''s pendingRepair (CassandraStreamReader.java:105,135; CassandraStreamReceiver.java:256-260), so after FINALIZED they are promoted
+      to repaired with the anticompacted ones'
+    state:
+      cassandra-table-repair-manager@n3:
+        digests:
+          ks1.users: 9f86d081
+    expect:
+    - result.ok && ctx.repairOutcome == 'completed'
+    - trace.filter(e, e.type == 'call.start' && e.interface == 'column-family-store.add-sstables').size() >= 1
+    - trace.filter(e, e.type == 'call.start' && e.interface == 'column-family-store.add-sstables').all(e, has(e.input.pending_repair) && e.input.pending_repair == '6f2b1a40-9d3c-11ef-a8d2-5b1c0e7f4a21')
+    - state['tracker@n2'].views['ks1.users'].sstables.exists(s, s.id.startsWith('added-'))
+    - state['tracker@n2'].views['ks1.users'].sstables.filter(s, s.id.startsWith('added-')).all(s, s.repaired && s.pending_repair == '')
+  - id: bench-p2-pending-before-finalize
+    fixtures: [three-node-rf3]
+    name: "P2: anticompaction leaves the sstables UNREPAIRED with pendingRepair = session (not repaired) while the session is not finalized"
+    state:
+      tracker@n2:
+        views:
+          ks1.users:
+            strategy: SizeTieredCompactionStrategy
+            auto_compaction_enabled: true
+            min_threshold: 4
+            max_threshold: 32
+            compacting: []
+            sstables:
+              - {id: u-1, size_mb: 10, level: 0, age_s: 3600, tombstones: 0, purgeable_tombstones: 0, droppable_tombstone_ratio: 0, fully_expired: false, repaired: false, pending_repair: '', unowned_mb: 0, window: 0, read_rate: 0, max_timestamp: 1000}
+    steps:
+      - {interface: compaction-manager.submit-pending-anti-compaction, caller: repair-streaming, on: n2, as: ac, input: {keyspace: ks1, tables: [users], session_id: s-1}}
+    expect:
+      - "steps.ac.result.ok && steps.ac.result.value.marked == 1"
+      - "state['tracker@n2'].views['ks1.users'].sstables[0].pending_repair == 's-1' && !state['tracker@n2'].views['ks1.users'].sstables[0].repaired"

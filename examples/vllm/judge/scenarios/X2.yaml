@@ -1,0 +1,41 @@
+schema_version: 1
+id: vllm
+scenarios:
+  - id: bench-x2-tp4-step
+    name: "X2: TP 4 step: execute_model broadcast to 4 ranks, row-parallel all-reduce, rank0 replies"
+    description: >
+      MultiprocExecutor.execute_model -> collective_rpc(unique_reply_rank=output_rank=0)
+      (vllm/v1/executor/multiproc_executor.py:341-352, 548-562). The RPC is broadcast on the shared
+      MessageQueue to every worker; only the output rank enqueues a reply
+      (multiproc_executor.py:1053-1054) and the executor dequeues only response_mqs[output_rank]
+      (multiproc_executor.py:425-427). Every rank runs the forward; RowParallelLinear all-reduces
+      (o_proj, down_proj) and VocabParallelEmbedding all-reduces the embedding.
+    fixtures: [full-tp4-llama-70b]
+    steps:
+      - interface: async-llm.add-request
+        caller: api-server
+        input: {prompt_token_ids: [128000, 9906, 11, 856, 836, 374], request_id: chatcmpl-x2, sampling_params: {max_tokens: 4, n: 1}}
+        as: add
+      - flow: engine-core-busy-loop
+        input: {iterations: 2}
+        as: loop
+    expect:
+      - "steps.loop.result.ok"
+      - "calls['multiproc-executor.execute-model'] == 2 && calls['uni-proc-executor.execute-model'] == 0"
+      # broadcast: every rank runs execute_model and sample_tokens on each of the two steps
+      - >
+        ['rank0', 'rank1', 'rank2', 'rank3'].all(r, trace.filter(e, e.type == 'call.start' &&
+        e.interface == 'gpu-worker-impl.execute-model' && e.instance == r).size() == 2 &&
+        trace.filter(e, e.type == 'call.start' && e.interface == 'gpu-worker-impl.sample-tokens' && e.instance == r).size() == 2)
+      # each rank's first (piecewise, traced) forward: embedding all-reduce, then after attention (o_proj) and after the MLP (down_proj)
+      - >
+        ['rank0', 'rank1', 'rank2', 'rank3'].all(r, trace.filter(e, e.type == 'call.start' && e.instance == r &&
+        e.interface in ['tensor-model-parallel.all-reduce', 'flash-attention-impl.forward', 'llama-mlp.forward']).map(e, e.interface) ==
+        ['tensor-model-parallel.all-reduce', 'flash-attention-impl.forward', 'tensor-model-parallel.all-reduce', 'llama-mlp.forward', 'tensor-model-parallel.all-reduce'])
+      # the executor returns rank0's output
+      - >
+        trace.filter(e, e.type == 'call.end' && e.interface == 'multiproc-executor.collective-rpc')[0].output.results[0].rank == 'rank0'
+      # code path: only the output rank replies, and only its response queue is read (multiproc_executor.py:425-427, 1053-1054)
+      - >
+        trace.filter(e, e.type == 'call.end' && e.interface == 'multiproc-executor.collective-rpc').all(e, size(e.output.results) == 1)
+      - "state.scheduler.requests.exists(k, k.startsWith('chatcmpl-x2') && size(state.scheduler.requests[k].output_token_ids) == 1)"

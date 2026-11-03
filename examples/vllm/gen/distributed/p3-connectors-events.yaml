@@ -1,0 +1,1940 @@
+# distributed area, part 3: MoRIIO, Mooncake (P2P and store), HF3FS connectors, KV cache events,
+# the auxiliary-output store and the shared-memory ring buffer.
+schema_version: 1
+id: vllm
+
+configs:
+  - id: enable-kv-cache-events
+    type: boolean
+    value: false
+    default: false
+    summary: "kv_events_config.enable_kv_cache_events: off unless --kv-events-config enables it; then the scheduler's EventPublisherFactory builds a ZMQ publisher."
+    sources: ["vllm/config/kv_events.py:14", "vllm/engine/arg_utils.py:771"]
+    attributes: {key: kv_events_config.enable_kv_cache_events}
+  - id: kv-events-publisher
+    type: string
+    value: null
+    default: null
+    summary: "kv_events_config.publisher: null | zmq (no default; KVEventsConfig.__post_init__ resolves it)."
+    sources: ["vllm/config/kv_events.py:19"]
+    attributes: {key: kv_events_config.publisher}
+  - id: kv-events-buffer-steps
+    type: integer
+    value: 10000
+    default: 10000
+    summary: "kv_events_config.buffer_steps: batches kept in the replay buffer (deque maxlen)."
+    sources: ["vllm/config/kv_events.py:31", "vllm/distributed/kv_events.py:345"]
+    attributes: {key: kv_events_config.buffer_steps}
+
+schemas:
+  - id: DistMoriioMessage
+    schema:
+      type: object
+      properties:
+        kind: {type: string, enum: [structured, string, binary], default: structured}
+        type: {type: [string, "null"], examples: [remote_blocks]}
+        transfer_id: {type: string, examples: [xfer-1]}
+        block_notify_list: {type: array, items: {type: integer}}
+        consumer_tp_size: {type: integer, default: 1}
+        text: {type: string}
+
+components:
+  # ---------------------------------------------------------------- MoRIIO
+  - id: moriio-connector-scheduler
+    name: MoRIIOConnectorScheduler
+    kind: module
+    layer: kv-transfer
+    parent: engine-core
+    summary: "Scheduler side of the AMD MoRI-IO connector (ROCm RDMA). In WRITE mode the prefill node RDMA-writes into blocks the decode node allocated; in READ mode the decoder pulls and recomputes the last token."
+    sources: ["vllm/distributed/kv_transfer/kv_connector/v1/moriio/moriio_connector.py:640-686"]
+    state:
+      schema:
+        type: object
+        properties:
+          is_producer: {type: boolean}
+          mode: {type: string}
+          has_mamba: {type: boolean}
+          attn_group_ids: {type: array}
+          mamba_group_ids: {type: array}
+          num_ssm_scratch_blocks: {type: integer}
+          is_kv_master: {type: boolean}
+          reqs_need_recv: {type: object}
+          reqs_need_save: {type: object}
+          req_kv_params: {type: object}
+          transfer_id_to_request_id: {type: object}
+          request_id_to_transfer_id: {type: object}
+          notifies: {type: array}
+      initial: {is_producer: false, mode: WRITE, has_mamba: false, attn_group_ids: [0], mamba_group_ids: [], num_ssm_scratch_blocks: 0, is_kv_master: true, reqs_need_recv: {}, reqs_need_save: {}, req_kv_params: {}, transfer_id_to_request_id: {}, request_id_to_transfer_id: {}, notifies: []}
+  - id: moriio-connector-worker
+    name: MoRIIOConnectorWorker
+    kind: module
+    layer: kv-transfer
+    parent: gpu-worker
+    summary: "Worker side of the MoRI-IO connector: serves engine/KV-layout metadata to peers on a handshake ROUTER socket."
+    sources: ["vllm/distributed/kv_transfer/kv_connector/v1/moriio/moriio_connector.py:2006-2051"]
+    state:
+      schema: {type: object, properties: {handshake_inbox: {type: array}, replies: {type: array}, done_recv: {type: array}}}
+      initial: {handshake_inbox: [], replies: [], done_recv: []}
+  - id: moriio-wrapper
+    name: MoRIIOWrapper
+    kind: module
+    layer: kv-transfer
+    parent: moriio-connector-worker
+    summary: "The MoRI-IO engine wrapper: a notify listener thread turns peer messages into remote-block allocations, write completions and releases."
+    sources: ["vllm/distributed/kv_transfer/kv_connector/v1/moriio/moriio_engine.py:745-762"]
+    state:
+      schema:
+        type: object
+        properties:
+          role: {type: string}
+          notify_inbox: {type: array}
+          done_remote_allocate: {type: object}
+          done_req_ids: {type: array}
+          done_write_cache_req_ids: {type: array}
+          terminal: {type: array}
+      initial: {role: PRODUCER, notify_inbox: [], done_remote_allocate: {}, done_req_ids: [], done_write_cache_req_ids: [], terminal: []}
+  - id: moriio-writer
+    name: MoRIIOWriter
+    kind: module
+    layer: kv-transfer
+    parent: moriio-wrapper
+    capacity: {concurrency: 1}   # one write-worker thread owns the deferred list (moriio_engine.py:184-215)
+    summary: "Prefill-side write thread: runs a write task once the decoder has reported its allocated blocks, defers it otherwise, and gives up after defer_timeout."
+    sources: ["vllm/distributed/kv_transfer/kv_connector/v1/moriio/moriio_engine.py:184-249"]
+    state:
+      schema: {type: object, properties: {write_tasks: {type: array}, deferred: {type: array}, written: {type: array}, defer_timeout_ms: {type: integer}}}
+      initial: {write_tasks: [], deferred: [], written: [], defer_timeout_ms: 30000}
+  - id: moriio-heartbeat
+    name: moriio_heartbeat (subprocess)
+    kind: module
+    layer: kv-transfer
+    parent: moriio-connector-worker
+    summary: "Discovery-heartbeat child process (python moriio_heartbeat.py endpoint interval max_retries): sends the msgpack payload on a DEALER socket every interval until stdin closes, so heartbeats survive the worker's GIL."
+    sources: ["vllm/distributed/kv_transfer/kv_connector/v1/moriio/moriio_heartbeat.py:19-37"]
+    state:
+      schema: {type: object, properties: {failures: {type: integer}, sent: {type: integer}, stdin_closed: {type: boolean}, max_retries: {type: integer}}}
+      initial: {failures: 0, sent: 0, stdin_closed: false, max_retries: 100}
+  # ---------------------------------------------------------------- Mooncake P2P
+  - id: mooncake-connector-worker
+    name: MooncakeConnectorWorker
+    kind: module
+    layer: kv-transfer
+    parent: gpu-worker
+    summary: "Mooncake transfer-engine connector worker. The prefill side runs an asyncio ZMQ listener with sender tasks that RDMA-write KV to the decoder once its request is ready; the decode side requests KV from each prefill worker and handles failures as load errors."
+    sources: ["vllm/distributed/kv_transfer/kv_connector/v1/mooncake/mooncake_connector.py:1439-1496"]
+    state:
+      schema:
+        type: object
+        properties:
+          tp_rank: {type: integer}
+          listener_inbox: {type: array}
+          sender_queue: {type: array}
+          reqs_need_send: {type: object}
+          sent: {type: array}
+          error_responses: {type: array}
+          finished_recving: {type: array}
+          invalid_block_ids: {type: array}
+          failed_recv: {type: integer}
+      initial: {tp_rank: 0, listener_inbox: [], sender_queue: [], reqs_need_send: {}, sent: [], error_responses: [], finished_recving: [], invalid_block_ids: [], failed_recv: 0}
+  - id: mooncake-transfer-engine
+    name: Mooncake TransferEngine
+    kind: external
+    layer: kv-transfer
+    parent: mooncake-connector-worker
+    summary: "Mooncake's RDMA transfer engine (batch_transfer_sync_write); third-party, latency only."
+    sources: ["vllm/distributed/kv_transfer/kv_connector/v1/mooncake/mooncake_connector.py:1600-1640"]
+  # ---------------------------------------------------------------- Mooncake store
+  - id: mooncake-store-worker
+    name: MooncakeStoreWorker
+    kind: module
+    layer: kv-transfer
+    parent: gpu-worker
+    summary: "Mooncake distributed KV store connector worker: sending/receiving threads move blocks between the paged KV cache and the store; a LookupKeyServer answers the scheduler's prefix lookups over ZMQ."
+    sources: ["vllm/distributed/kv_transfer/kv_connector/v1/mooncake/store/worker.py:2095-2110"]
+    state:
+      schema: {type: object, properties: {store_keys: {type: array}, request_queue: {type: array}, block_size: {type: integer}, finished: {type: array}, lookup_inbox: {type: array}, replies: {type: array}}}
+      initial: {store_keys: [], request_queue: [], block_size: 16, finished: [], lookup_inbox: [], replies: []}
+  # ---------------------------------------------------------------- HF3FS
+  - id: hf3fs-async-operation-manager
+    name: AsyncOperationManager (HF3FS)
+    kind: module
+    layer: kv-transfer
+    parent: gpu-worker
+    summary: "HF3FS connector's two background threads: the save worker gathers blocks and writes 3FS pages, the load worker reads pages and scatters them into the KV cache. Each polls its queue with a 1 s timeout."
+    sources: ["vllm/distributed/kv_transfer/kv_connector/v1/hf3fs/hf3fs_connector.py:100-130"]
+    state:
+      schema: {type: object, properties: {rank: {type: integer}, save_queue: {type: array}, load_queue: {type: array}, completed: {type: array}, failed: {type: array}, stop: {type: boolean}, write_ok: {type: boolean}}}
+      initial: {rank: 0, save_queue: [], load_queue: [], completed: [], failed: [], stop: false, write_ok: true}
+  - id: hf3fs-gather-scatter-helper
+    name: gather_scatter_helper (Triton)
+    kind: module
+    layer: kernels
+    parent: hf3fs-async-operation-manager
+    summary: "Triton kernels that copy KV blocks between the paged cache and contiguous 3FS page buffers."
+    sources: ["vllm/distributed/kv_transfer/kv_connector/v1/hf3fs/utils/gather_scatter_helper.py:110-226"]
+  - id: hf3fs-metadata-server
+    name: Hf3fsMetadataServer
+    kind: service
+    layer: kv-transfer
+    parent: engine-core
+    summary: "Standalone HTTP metadata server (python hf3fs_metadata_server.py --port 18000) that allocates 3FS pages per rank and tracks which keys every TP rank has written. Not a GPU process; parented under engine-core only because its clients are."
+    sources: ["vllm/distributed/kv_transfer/kv_connector/v1/hf3fs/hf3fs_metadata_server.py:244-395", "vllm/distributed/kv_transfer/kv_connector/v1/hf3fs/hf3fs_metadata_server.py:85-99"]
+    state:
+      schema: {type: object, properties: {serving: {type: boolean}, port: {type: integer}, ranks: {type: object}, keys: {type: object}}}
+      initial: {serving: true, port: 18000, ranks: {"0": {num_pages: 4, free_pages: [0, 1, 2, 3]}}, keys: {}}
+  # ---------------------------------------------------------------- KV cache events
+  - id: event-publisher-factory
+    name: EventPublisherFactory
+    kind: module
+    layer: kv-transfer
+    parent: engine-core
+    summary: "Builds the scheduler's KV-event publisher: NullEventPublisher unless events are enabled with a non-null publisher."
+    sources: ["vllm/distributed/kv_events.py:566-598"]
+  - id: zmq-event-publisher
+    name: ZmqEventPublisher
+    kind: module
+    layer: kv-transfer
+    parent: engine-core
+    summary: "PUB socket publisher with a replay ROUTER: the scheduler enqueues KV-cache event batches; a background thread numbers them, publishes them and keeps the last buffer_steps for replay."
+    sources: ["vllm/distributed/kv_events.py:306-384"]
+    state:
+      schema: {type: object, properties: {running: {type: boolean}, queue: {type: array}, buffer: {type: array}, next_seq: {type: integer}, published: {type: array}, replay_inbox: {type: array}, replay_sent: {type: array}, dp_rank: {type: integer}}}
+      initial: {running: true, queue: [], buffer: [], next_seq: 0, published: [], replay_inbox: [], replay_sent: [], dp_rank: 0}
+  # ---------------------------------------------------------------- aux outputs
+  - id: background-block-object-store
+    name: BackgroundBlockObjectStore
+    kind: module
+    layer: kv-transfer
+    parent: gpu-worker
+    capacity: {concurrency: 1}   # put hands updates to the single writer thread through a locked queue.Queue (store.py:27-43)
+    summary: "Serializes auxiliary-output (for example routed-experts) store mutations on a writer thread; the first failure is sticky and surfaces on the next put or read."
+    sources: ["vllm/distributed/aux_output_connector/store.py:27-43"]
+    state:
+      schema: {type: object, properties: {queue: {type: array}, error: {type: string}, closed: {type: boolean}}}
+      initial: {queue: [], error: "", closed: false}
+  - id: block-object-store
+    name: BlockObjectStore
+    kind: datastore
+    layer: kv-transfer
+    parent: background-block-object-store
+    summary: "Single-owner bounded LRU arena of fixed-size objects; it fails closed when a batch cannot fit without evicting objects still in use."
+    sources: ["vllm/distributed/aux_output_connector/store.py:100-123"]
+    state:
+      schema: {type: object, properties: {num_slots: {type: integer}, lru: {type: array}, objects: {type: object}, references: {type: object}}}
+      initial: {num_slots: 4, lru: [], objects: {}, references: {}}
+  # ---------------------------------------------------------------- shared-memory ring buffer
+  - id: single-writer-shm-ring-buffer
+    name: SingleWriterShmRingBuffer
+    kind: module
+    layer: distributed
+    parent: gpu-worker
+    summary: "Single-writer, multi-reader ring buffer in POSIX shared memory (backs the shared-memory object store); the writer creates the segment, readers attach by (size, name)."
+    sources: ["vllm/distributed/device_communicators/shm_object_storage.py:25-60"]
+  - id: posix-shared-memory
+    name: POSIX shared memory (/dev/shm)
+    kind: datastore
+    layer: storage
+    parent: single-writer-shm-ring-buffer
+    summary: "multiprocessing.shared_memory segments by name: size, owner's ring-buffer cursors."
+    sources: ["vllm/distributed/device_communicators/shm_object_storage.py:139-155"]
+    state:
+      schema: {type: object, properties: {segments: {type: object}}}
+      initial: {segments: {}}
+
+interfaces:
+  # ---------------------------------------------------------------- MoRIIO scheduler
+  - component: moriio-connector-scheduler
+    name: get-num-new-matched-tokens
+    kind: function
+    summary: "MoRIIOConnectorScheduler.get_num_new_matched_tokens: producers load nothing; WRITE-mode consumers load every uncomputed prompt token asynchronously while do_remote_prefill is set; READ-mode consumers load all but the last token synchronously."
+    sources: ["vllm/distributed/kv_transfer/kv_connector/v1/moriio/moriio_connector.py:744-787"]
+    request: DistKvRequest
+    response: DistKvMatch
+    behavior:
+      - if: "state.is_producer"
+        then:
+          - title: The prefill side never loads external KV
+            source: "vllm/distributed/kv_transfer/kv_connector/v1/moriio/moriio_connector.py:763-767"
+            return: {num_external_tokens: 0, load_async: false}
+      - set:
+          vars.nprompt: "= has(input.num_prompt_tokens) ? input.num_prompt_tokens : (has(input.prompt_token_ids) ? size(input.prompt_token_ids) : 0)"
+          vars.computed: "= has(input.num_computed_tokens) ? input.num_computed_tokens : 0"
+      - set:
+          vars.ext: "= math.greatest(vars.nprompt - vars.computed, 0)"
+      - if: "state.mode == 'WRITE'"
+        then:
+          - set:
+              vars.p: "= has(input.kv_transfer_params) && input.kv_transfer_params != null ? input.kv_transfer_params : {}"
+          - if: "!('do_remote_prefill' in vars.p) || !vars.p.do_remote_prefill"
+            then:
+              - title: No remote prefill pending (for example resumed after preemption); nothing to load
+                source: "vllm/distributed/kv_transfer/kv_connector/v1/moriio/moriio_connector.py:771-774"
+                return: {num_external_tokens: 0, load_async: false}
+          - title: The producer RDMA-writes the whole prompt; the request waits for it
+            source: "vllm/distributed/kv_transfer/kv_connector/v1/moriio/moriio_connector.py:775-778"
+            return: {num_external_tokens: "= vars.ext", load_async: true}
+      - title: READ mode recomputes the last token locally and loads synchronously
+        source: "vllm/distributed/kv_transfer/kv_connector/v1/moriio/moriio_connector.py:780-787"
+        return: {num_external_tokens: "= math.greatest(vars.ext - 1, 0)", load_async: false}
+
+  # ---------------------------------------------------------------- MoRIIO worker threads
+  - component: moriio-connector-worker
+    name: moriio-handshake-listener
+    kind: function
+    summary: "One receive of the MoRIIO handshake listener thread: GET_META_MSG gets the engine metadata then the per-layer KV-cache metadata; POP_DONE_RECV reads the request id; anything else raises HandshakeError, ending the thread."
+    sources: ["vllm/distributed/kv_transfer/kv_connector/v1/moriio/moriio_connector.py:2006-2051"]
+    request: {type: object, properties: {}}
+    response: {type: object, properties: {handled: {type: [string, "null"]}}}
+    errors:
+      - {code: handshake-error, status: 0, retryable: false}
+    behavior:
+      - if: "size(state.handshake_inbox) == 0"
+        then:
+          - title: recv_multipart blocks until a peer connects
+            return: {handled: null}
+      - set:
+          vars.msg: "= state.handshake_inbox[0]"
+          state.handshake_inbox: "= state.handshake_inbox.slice(1, size(state.handshake_inbox))"
+      - if: "vars.msg.msg == 'get_meta_msg'"
+        then:
+          - title: Send engine metadata, then the KV-cache tensor metadata per layer
+            source: "vllm/distributed/kv_transfer/kv_connector/v1/moriio/moriio_connector.py:2039-2045"
+            set: {state.replies: "= state.replies + ['engine-meta', 'layer-meta']"}
+          - return: {handled: get_meta_msg}
+      - if: "vars.msg.msg == 'pop_done_recv'"
+        then:
+          - source: "vllm/distributed/kv_transfer/kv_connector/v1/moriio/moriio_connector.py:2046-2051"
+            set: {state.done_recv: "= state.done_recv + [vars.msg.req_id]"}
+          - return: {handled: pop_done_recv}
+      - title: Unexpected message type
+        source: "vllm/distributed/kv_transfer/kv_connector/v1/moriio/moriio_connector.py:2034-2038"
+        fail: {code: handshake-error, status: 0, message: "handshake failed, unexpected msg type"}
+
+  - component: moriio-wrapper
+    name: async-wait-reqid
+    kind: function
+    summary: "One message of the moriio-notify-listener thread (_async_wait): decode it as a structured msgpack dict (remote_blocks / write_done / release) or as a completion string; any processing error is re-raised as HandshakeError and ends the thread."
+    sources: ["vllm/distributed/kv_transfer/kv_connector/v1/moriio/moriio_engine.py:745-762", "vllm/distributed/kv_transfer/kv_connector/v1/moriio/moriio_engine.py:764-809"]
+    request: {type: object, properties: {}}
+    response: {type: object, properties: {handled: {type: [string, "null"]}}}
+    errors:
+      - {code: handshake-error, status: 0, retryable: false}
+    behavior:
+      - if: "size(state.notify_inbox) == 0"
+        then:
+          - return: {handled: null}
+      - set:
+          vars.m: "= state.notify_inbox[0]"
+          state.notify_inbox: "= state.notify_inbox.slice(1, size(state.notify_inbox))"
+      - call: moriio-wrapper.handle-message
+        input: "= vars.m"
+        on_error:
+          - title: Errors become HandshakeError and stop the listener
+            source: "vllm/distributed/kv_transfer/kv_connector/v1/moriio/moriio_engine.py:755-757"
+            fail: {code: handshake-error, status: 0, message: "= 'Error processing message: ' + error.message"}
+        as: h
+      - return: {handled: "= vars.h.value.handled"}
+
+  - component: moriio-wrapper
+    name: handle-message
+    kind: function
+    summary: "MoRIIOWrapper._handle_message: remote_blocks (prefill learns the decoder's allocated blocks), write_done (decode learns a write finished), release (prefill frees after the decoder's ack), or a plain-string completion."
+    sources: ["vllm/distributed/kv_transfer/kv_connector/v1/moriio/moriio_engine.py:764-862"]
+    request: DistMoriioMessage
+    response: {type: object, properties: {handled: {type: string}}}
+    errors:
+      - {code: moriio-error, status: 0, retryable: false}
+      - {code: assertion-error, status: 0, retryable: false}
+    behavior:
+      - if: "input.kind == 'binary'"
+        then:
+          - title: Neither msgpack nor UTF-8
+            source: "vllm/distributed/kv_transfer/kv_connector/v1/moriio/moriio_engine.py:791-794"
+            fail: {code: moriio-error, status: 0, message: "Unhandled message format"}
+      - if: "input.kind == 'string'"
+        then:
+          - title: Completion string
+            source: "vllm/distributed/kv_transfer/kv_connector/v1/moriio/moriio_engine.py:855-862"
+            if: "state.role == 'PRODUCER'"
+            then:
+              - set:
+                  state.done_req_ids: "= state.done_req_ids + [input.text]"
+                  state.done_remote_allocate: "= omit(state.done_remote_allocate, input.text)"
+                  state.terminal: "= state.terminal + [input.text]"
+            else:
+              - set: {state.done_write_cache_req_ids: "= state.done_write_cache_req_ids + [input.text]"}
+          - return: {handled: completion}
+      - set:
+          vars.type: "= has(input.type) && input.type != null ? input.type : (has(input.transfer_id) ? 'remote_blocks' : 'none')"
+      - if: "vars.type == 'remote_blocks'"
+        then:
+          - if: "state.role != 'PRODUCER'"
+            then:
+              - source: "vllm/distributed/kv_transfer/kv_connector/v1/moriio/moriio_engine.py:812"
+                fail: {code: assertion-error, status: 0, message: "Only prefill can get block messages"}
+          - if: "!has(input.block_notify_list) || size(input.block_notify_list) == 0"
+            then:
+              - source: "vllm/distributed/kv_transfer/kv_connector/v1/moriio/moriio_engine.py:816-819"
+                fail: {code: moriio-error, status: 0, message: "block_notify_list cannot be empty in remote allocate message"}
+          - if: "input.transfer_id in state.terminal"
+            then:
+              - title: Ignore a late allocation for a finished transfer
+                source: "vllm/distributed/kv_transfer/kv_connector/v1/moriio/moriio_engine.py:822-827"
+                return: {handled: ignored}
+          - source: "vllm/distributed/kv_transfer/kv_connector/v1/moriio/moriio_engine.py:828-830"
+            set: {state.done_remote_allocate: "= merge(state.done_remote_allocate, {input.transfer_id: {'block_ids': input.block_notify_list}})"}
+          - return: {handled: remote_blocks}
+      - if: "vars.type == 'write_done'"
+        then:
+          - if: "state.role == 'PRODUCER'"
+            then:
+              - source: "vllm/distributed/kv_transfer/kv_connector/v1/moriio/moriio_engine.py:833-835"
+                fail: {code: assertion-error, status: 0, message: "Only decode can get WRITE completion messages"}
+          - source: "vllm/distributed/kv_transfer/kv_connector/v1/moriio/moriio_engine.py:836-838"
+            set: {state.done_write_cache_req_ids: "= state.done_write_cache_req_ids + [input.transfer_id]"}
+          - return: {handled: write_done}
+      - if: "vars.type == 'release'"
+        then:
+          - if: "has(input.consumer_tp_size) && input.consumer_tp_size <= 0"
+            then:
+              - source: "vllm/distributed/kv_transfer/kv_connector/v1/moriio/moriio_engine.py:845-848"
+                fail: {code: moriio-error, status: 0, message: "Invalid consumer_tp_size in release message"}
+          - source: "vllm/distributed/kv_transfer/kv_connector/v1/moriio/moriio_engine.py:849-852"
+            set:
+              state.done_req_ids: "= state.done_req_ids + [input.transfer_id]"
+              state.done_remote_allocate: "= omit(state.done_remote_allocate, input.transfer_id)"
+              state.terminal: "= state.terminal + [input.transfer_id]"
+          - return: {handled: release}
+      - source: "vllm/distributed/kv_transfer/kv_connector/v1/moriio/moriio_engine.py:808-809"
+        fail: {code: moriio-error, status: 0, message: "= 'Unhandled structured message type: ' + vars.type"}
+
+  - component: moriio-wrapper
+    name: pop-finished-req-ids
+    kind: function
+    summary: "MoRIIOWrapper.pop_finished_req_ids: hand the acknowledged transfers to the connector (which frees their blocks) and clear the list."
+    sources: ["vllm/distributed/kv_transfer/kv_connector/v1/moriio/moriio_engine.py:742-744"]
+    request: {type: object, properties: {}}
+    response: {type: object, properties: {done: {type: array, items: {type: string}}}}
+    behavior:
+      - set: {vars.done: "= state.done_req_ids"}
+      - set: {state.done_req_ids: []}
+      - return: {done: "= vars.done"}
+
+  - component: moriio-writer
+    name: write-worker-loop
+    kind: function
+    summary: "One iteration of MoRIIOWriter._write_worker_loop: retry deferred tasks (expire after defer_timeout), then take one queued task; skip terminal transfers, defer those whose remote blocks are not allocated yet, execute the rest (a failed write still marks the request done)."
+    sources: ["vllm/distributed/kv_transfer/kv_connector/v1/moriio/moriio_engine.py:184-249"]
+    request: {type: object, properties: {}}
+    response: {type: object, properties: {written: {type: integer}, deferred: {type: integer}, expired: {type: integer}}}
+    behavior:
+      - set: {vars.written: 0, vars.expired: 0, vars.keep: []}
+      - title: _process_deferred_tasks
+        source: "vllm/distributed/kv_transfer/kv_connector/v1/moriio/moriio_engine.py:216-249"
+        foreach: "= state.deferred"
+        as: t
+        steps:
+          - call: moriio-wrapper.transfer-status
+            input: {transfer_id: "= vars.t.transfer_id"}
+            as: st
+          - if: "vars.st.value.terminal"
+            then:
+              - continue: true
+          - if: "now - vars.t.enqueued_at > state.defer_timeout_ms"
+            then:
+              - title: Remote blocks never arrived; mark done so the blocks are freed
+                source: "vllm/distributed/kv_transfer/kv_connector/v1/moriio/moriio_engine.py:228-236"
+                call: moriio-wrapper.mark-request-done
+                input: {transfer_id: "= vars.t.transfer_id"}
+              - set: {vars.expired: "= vars.expired + 1"}
+              - continue: true
+          - if: "vars.st.value.remote_ready"
+            then:
+              - call: moriio-writer.execute-write-task
+                input: "= vars.t"
+              - set: {vars.written: "= vars.written + 1"}
+            else:
+              - set: {vars.keep: "= vars.keep + [vars.t]"}
+      - set: {state.deferred: "= vars.keep"}
+      - if: "size(state.write_tasks) == 0"
+        then:
+          - title: "_write_task_q.get(timeout=0.01) is empty"
+            return: {written: "= vars.written", deferred: "= size(state.deferred)", expired: "= vars.expired"}
+      - set:
+          vars.task: "= state.write_tasks[0]"
+          state.write_tasks: "= state.write_tasks.slice(1, size(state.write_tasks))"
+      - call: moriio-wrapper.transfer-status
+        input: {transfer_id: "= vars.task.transfer_id"}
+        as: s
+      - if: "vars.s.value.terminal"
+        then:
+          - source: "vllm/distributed/kv_transfer/kv_connector/v1/moriio/moriio_engine.py:195-196"
+            return: {written: "= vars.written", deferred: "= size(state.deferred)", expired: "= vars.expired"}
+      - if: "!vars.s.value.remote_ready"
+        then:
+          - title: Remote blocks not allocated yet; defer
+            source: "vllm/distributed/kv_transfer/kv_connector/v1/moriio/moriio_engine.py:198-206"
+            set: {state.deferred: "= state.deferred + [vars.task]"}
+          - return: {written: "= vars.written", deferred: "= size(state.deferred)", expired: "= vars.expired"}
+      - source: "vllm/distributed/kv_transfer/kv_connector/v1/moriio/moriio_engine.py:208-215"
+        call: moriio-writer.execute-write-task
+        input: "= vars.task"
+        on_error:
+          - title: A failed write still marks the request done
+            source: "vllm/distributed/kv_transfer/kv_connector/v1/moriio/moriio_engine.py:210-215"
+            call: moriio-wrapper.mark-request-done
+            input: {transfer_id: "= vars.task.transfer_id"}
+          - return: {written: "= vars.written", deferred: "= size(state.deferred)", expired: "= vars.expired"}
+      - return: {written: "= vars.written + 1", deferred: "= size(state.deferred)", expired: "= vars.expired"}
+
+  - component: moriio-writer
+    name: execute-write-task
+    kind: function
+    summary: "MoRIIOWriter._execute_write_task: RDMA-write this layer's blocks into the decoder's allocated blocks (latency from the block count)."
+    sources: ["vllm/distributed/kv_transfer/kv_connector/v1/moriio/moriio_engine.py:306-330"]
+    request: {type: object, properties: {transfer_id: {type: string}, request_id: {type: string}, num_blocks: {type: integer}, enqueued_at: {type: integer}}}
+    response: {type: object, properties: {ok: {type: boolean}}}
+    latency_ms: "= (double(has(input.num_blocks) ? input.num_blocks : 1) * 2097152.0 / (double(config['dist-nixl-rdma-gbps']) * 1000000.0))"
+    behavior:
+      - set: {state.written: "= state.written + [input.transfer_id]"}
+      - return: {ok: true}
+
+  - component: moriio-wrapper
+    name: transfer-status
+    kind: function
+    summary: "_is_transfer_terminal and _is_remote_ready under the wrapper lock."
+    sources: ["vllm/distributed/kv_transfer/kv_connector/v1/moriio/moriio_engine.py:256-284"]
+    request: {type: object, required: [transfer_id], properties: {transfer_id: {type: string}}}
+    response: {type: object, properties: {terminal: {type: boolean}, remote_ready: {type: boolean}}}
+    behavior:
+      - return: {terminal: "= input.transfer_id in state.terminal", remote_ready: "= input.transfer_id in state.done_remote_allocate"}
+
+  - component: moriio-wrapper
+    name: mark-request-done
+    kind: function
+    summary: "MoRIIOWriter._mark_request_done: ack the transfer (blocks are freed even on failure), drop its allocation and mark it terminal."
+    sources: ["vllm/distributed/kv_transfer/kv_connector/v1/moriio/moriio_engine.py:263-270"]
+    request: {type: object, required: [transfer_id], properties: {transfer_id: {type: string}}}
+    response: {type: object, properties: {ok: {type: boolean}}}
+    behavior:
+      - set:
+          state.done_req_ids: "= state.done_req_ids + [input.transfer_id]"
+          state.done_remote_allocate: "= omit(state.done_remote_allocate, input.transfer_id)"
+          state.terminal: "= state.terminal + [input.transfer_id]"
+      - return: {ok: true}
+
+  - component: moriio-heartbeat
+    name: main
+    kind: cli
+    summary: "One interval of the heartbeat child's loop: stop on stdin EOF; send the payload; zmq.Again resets the failure count; other ZMQ errors count, and max_retries consecutive failures re-raise and end the child."
+    sources: ["vllm/distributed/kv_transfer/kv_connector/v1/moriio/moriio_heartbeat.py:65-92", "vllm/distributed/kv_transfer/kv_connector/v1/moriio/moriio_heartbeat.py:95-96"]
+    request: {type: object, properties: {}}
+    response: {type: object, properties: {sent: {type: boolean}, stopped: {type: boolean}}}
+    errors:
+      - {code: zmq-error, status: 0, retryable: false}
+    behavior:
+      - if: "state.stdin_closed"
+        then:
+          - title: EOF on stdin stops the child
+            source: "vllm/distributed/kv_transfer/kv_connector/v1/moriio/moriio_heartbeat.py:78"
+            return: {sent: false, stopped: true}
+      - choice: send
+        default: ok
+        options:
+          ok:
+            - source: "vllm/distributed/kv_transfer/kv_connector/v1/moriio/moriio_heartbeat.py:80-81"
+              set: {state.failures: 0, state.sent: "= state.sent + 1"}
+            - return: {sent: true, stopped: false}
+          again:
+            - title: Send timed out (SNDTIMEO); warn and retry next interval
+              source: "vllm/distributed/kv_transfer/kv_connector/v1/moriio/moriio_heartbeat.py:82-84"
+              set: {state.failures: 0}
+            - return: {sent: false, stopped: false}
+          zmq_error:
+            - source: "vllm/distributed/kv_transfer/kv_connector/v1/moriio/moriio_heartbeat.py:85-89"
+              set: {state.failures: "= state.failures + 1"}
+            - if: "state.failures >= state.max_retries"
+              then:
+                - fail: {code: zmq-error, status: 0, message: "MoRIIO discovery heartbeat send failed"}
+            - return: {sent: false, stopped: false}
+
+  # ---------------------------------------------------------------- Mooncake P2P
+  - component: mooncake-connector-worker
+    name: mooncake-sender-listener
+    kind: function
+    summary: "One receive of the prefill side's asyncio listener (ROUTER socket): queue the decoder's transfer request for the sender tasks."
+    sources: ["vllm/distributed/kv_transfer/kv_connector/v1/mooncake/mooncake_connector.py:1439-1474"]
+    request: {type: object, properties: {}}
+    response: {type: object, properties: {queued: {type: integer}}}
+    behavior:
+      - if: "size(state.listener_inbox) == 0"
+        then:
+          - return: {queued: "= size(state.sender_queue)"}
+      - source: "vllm/distributed/kv_transfer/kv_connector/v1/mooncake/mooncake_connector.py:1462-1464"
+        set:
+          state.sender_queue: "= state.sender_queue + [state.listener_inbox[0]]"
+          state.listener_inbox: "= state.listener_inbox.slice(1, size(state.listener_inbox))"
+      - return: {queued: "= size(state.sender_queue)"}
+
+  - component: mooncake-connector-worker
+    name: sender-worker
+    kind: function
+    summary: "One item of a sender task: decode the transfer metadata and send_kv_to_decode; an unpaired TP rank, a not-ready request after VLLM_MOONCAKE_ABORT_REQUEST_TIMEOUT, or an exception answers the decoder with an ERROR response."
+    sources: ["vllm/distributed/kv_transfer/kv_connector/v1/mooncake/mooncake_connector.py:1477-1496", "vllm/distributed/kv_transfer/kv_connector/v1/mooncake/mooncake_connector.py:1498-1600"]
+    request: {type: object, properties: {}}
+    response: {type: object, properties: {status: {type: [string, "null"]}}}
+    behavior:
+      - if: "size(state.sender_queue) == 0"
+        then:
+          - return: {status: null}
+      - set:
+          vars.meta: "= state.sender_queue[0]"
+          state.sender_queue: "= state.sender_queue.slice(1, size(state.sender_queue))"
+      - if: "has(vars.meta.remote_tp_rank) && vars.meta.remote_tp_rank != state.tp_rank"
+        then:
+          - title: This decode TP rank is not paired with this prefill TP rank
+            source: "vllm/distributed/kv_transfer/kv_connector/v1/mooncake/mooncake_connector.py:1502-1515"
+            set: {state.error_responses: "= state.error_responses + [vars.meta.transfer_id]"}
+          - return: {status: ERROR}
+      - if: "!(vars.meta.transfer_id in state.reqs_need_send) || !state.reqs_need_send[vars.meta.transfer_id].ready"
+        then:
+          - title: P side never became ready before the abort timeout
+            source: "vllm/distributed/kv_transfer/kv_connector/v1/mooncake/mooncake_connector.py:1583-1599"
+            set: {state.error_responses: "= state.error_responses + [vars.meta.transfer_id]"}
+          - return: {status: ERROR}
+      - title: RDMA-write the ready blocks to the decoder, then FINISH
+        call: mooncake-transfer-engine.batch-transfer-sync-write
+        input: {num_blocks: "= size(state.reqs_need_send[vars.meta.transfer_id].block_ids)"}
+        as: xfer
+        on_error:
+          - title: Transfer exception becomes an ERROR response
+            source: "vllm/distributed/kv_transfer/kv_connector/v1/mooncake/mooncake_connector.py:1484-1492"
+            set: {state.error_responses: "= state.error_responses + [vars.meta.transfer_id]"}
+          - return: {status: ERROR}
+      - set:
+          state.sent: "= state.sent + [vars.meta.transfer_id]"
+          state.reqs_need_send: "= omit(state.reqs_need_send, vars.meta.transfer_id)"
+      - return: {status: FINISH}
+
+  - component: mooncake-connector-worker
+    name: receive-kv-from-single-worker
+    kind: function
+    summary: "Decode side: send MooncakeXferMetadata to one prefill worker and read responses until FINISH; an ERROR response or an exception marks every pulled request failed and its local blocks invalid (the scheduler then recomputes or fails them)."
+    sources: ["vllm/distributed/kv_transfer/kv_connector/v1/mooncake/mooncake_connector.py:2308-2373", "vllm/distributed/kv_transfer/kv_connector/v1/mooncake/mooncake_connector.py:2375-2405"]
+    request:
+      type: object
+      required: [pull_metas]
+      properties:
+        worker_addr: {type: string, default: "tcp://10.0.0.1:6000"}
+        pull_metas: {type: array, items: {type: object, properties: {req_id: {type: string}, local_block_ids: {type: array, items: {type: integer}}}}}
+    response: {type: object, properties: {status: {type: string}, failed: {type: array, items: {type: string}}}}
+    latency_ms: 2
+    behavior:
+      - choice: response
+        default: finish
+        options:
+          finish:
+            - title: Responses until FINISH; each processed as pulling results
+              source: "vllm/distributed/kv_transfer/kv_connector/v1/mooncake/mooncake_connector.py:2354-2366"
+              set: {state.finished_recving: "= state.finished_recving + input.pull_metas.map(m, m.req_id)"}
+            - return: {status: FINISH, failed: []}
+          error:
+            - source: "vllm/distributed/kv_transfer/kv_connector/v1/mooncake/mooncake_connector.py:2357-2363"
+              set: {vars.reason: transfer error}
+          exception:
+            - source: "vllm/distributed/kv_transfer/kv_connector/v1/mooncake/mooncake_connector.py:2367-2373"
+              set: {vars.reason: transfer failed}
+      - title: _handle_failed_recv
+        detail: "A pull with no local blocks only released P's blocks; nothing waits on it, so it is not reported."
+        source: "vllm/distributed/kv_transfer/kv_connector/v1/mooncake/mooncake_connector.py:2375-2405"
+        set:
+          vars.failed: "= input.pull_metas.filter(m, size(m.local_block_ids) > 0)"
+      - set:
+          state.invalid_block_ids: "= state.invalid_block_ids + vars.failed.map(m, m.local_block_ids).flatten()"
+          state.finished_recving: "= state.finished_recving + vars.failed.map(m, m.req_id)"
+          state.failed_recv: "= state.failed_recv + size(input.pull_metas)"
+      - return: {status: ERROR, failed: "= vars.failed.map(m, m.req_id)"}
+
+  - component: mooncake-connector-worker
+    name: get-block-ids-with-load-errors
+    kind: function
+    summary: "Drain the local block ids whose remote load failed since the last call (the model runner reports them to the scheduler)."
+    sources: ["vllm/distributed/kv_transfer/kv_connector/v1/mooncake/mooncake_connector.py:2407-2416"]
+    request: {type: object, properties: {}}
+    response: {type: object, properties: {block_ids: {type: array, items: {type: integer}}}}
+    behavior:
+      - set: {vars.out: "= state.invalid_block_ids"}
+      - set: {state.invalid_block_ids: []}
+      - return: {block_ids: "= vars.out"}
+
+  - component: mooncake-transfer-engine
+    name: batch-transfer-sync-write
+    kind: kernel
+    summary: "RDMA write of the request's blocks (2 MiB per block across layers, assumed) at the configured RDMA bandwidth."
+    sources: ["vllm/distributed/kv_transfer/kv_connector/v1/mooncake/mooncake_connector.py:1600-1640"]
+    request: {type: object, properties: {num_blocks: {type: integer}}}
+    response: {type: object, properties: {ok: {type: boolean}}}
+    latency_ms: "= (double(input.num_blocks) * 2097152.0 / (double(config['dist-nixl-rdma-gbps']) * 1000000.0))"
+
+  # ---------------------------------------------------------------- Mooncake store
+  - component: mooncake-store-worker
+    name: kv-transfer-thread-run
+    kind: function
+    summary: "One item of KVTransferThread.run (the KVCacheStoreSendingThread subclass here): a None request is logged and skipped; otherwise the request's block keys are put into the store; errors are logged and the thread continues."
+    sources: ["vllm/distributed/kv_transfer/kv_connector/v1/mooncake/store/worker.py:349-360", "vllm/distributed/kv_transfer/kv_connector/v1/mooncake/store/worker.py:397-410"]
+    request: {type: object, properties: {}}
+    response: {type: object, properties: {handled: {type: [string, "null"]}}}
+    behavior:
+      - if: "size(state.request_queue) == 0"
+        then:
+          - title: request_queue.get() blocks
+            return: {handled: null}
+      - set:
+          vars.r: "= state.request_queue[0]"
+          state.request_queue: "= state.request_queue.slice(1, size(state.request_queue))"
+      - if: "vars.r == null"
+        then:
+          - source: "vllm/distributed/kv_transfer/kv_connector/v1/mooncake/store/worker.py:353-356"
+            return: {handled: none-request}
+      - title: Put the request's blocks into the Mooncake store
+        source: "vllm/distributed/kv_transfer/kv_connector/v1/mooncake/store/worker.py:357"
+        set:
+          state.store_keys: "= state.store_keys + vars.r.block_hashes.filter(h, !(h in state.store_keys))"
+          state.finished: "= state.finished + [vars.r.req_id]"
+      - return: {handled: "= vars.r.req_id"}
+
+  - component: mooncake-store-worker
+    name: lookup-key-server-process-request
+    kind: function
+    summary: "One request of the LookupKeyServer REP loop: LOOKUP returns how many prefix tokens are in the store; RESET drains in-flight puts and wipes the store; anything else gets RESP_ERR."
+    sources: ["vllm/distributed/kv_transfer/kv_connector/v1/mooncake/store/worker.py:2332-2364"]
+    request: {type: object, properties: {}}
+    response: {type: object, properties: {reply: {type: [string, "null"]}, num_tokens: {type: integer}}}
+    behavior:
+      - if: "size(state.lookup_inbox) == 0"
+        then:
+          - return: {reply: null, num_tokens: 0}
+      - set:
+          vars.m: "= state.lookup_inbox[0]"
+          state.lookup_inbox: "= state.lookup_inbox.slice(1, size(state.lookup_inbox))"
+      - if: "vars.m.type == 'LOOKUP'"
+        then:
+          - title: Count the stored prefix; a full hit stops one block short so the last token is recomputed
+            source: "vllm/distributed/kv_transfer/kv_connector/v1/mooncake/store/worker.py:2095-2110"
+            set:
+              vars.hits: "= vars.m.block_hashes.exists(h, !(h in state.store_keys)) ? lists.range(size(vars.m.block_hashes)).filter(i, !(vars.m.block_hashes[i] in state.store_keys))[0] : size(vars.m.block_hashes)"
+          - set:
+              vars.tokens: "= vars.hits * state.block_size >= vars.m.num_tokens ? (vars.m.num_tokens - 1) / state.block_size * state.block_size : vars.hits * state.block_size"
+          - set: {state.replies: "= state.replies + ['lookup']"}
+          - return: {reply: lookup, num_tokens: "= vars.tokens"}
+      - if: "vars.m.type == 'RESET'"
+        then:
+          - title: Drain the send queue, then store.remove_all(force=True)
+            source: "vllm/distributed/kv_transfer/kv_connector/v1/mooncake/store/worker.py:2347-2358"
+            set: {state.store_keys: [], state.request_queue: [], state.replies: "= state.replies + ['ok']"}
+          - return: {reply: ok, num_tokens: 0}
+      - title: Unknown message type
+        source: "vllm/distributed/kv_transfer/kv_connector/v1/mooncake/store/worker.py:2360-2364"
+        set: {state.replies: "= state.replies + ['err']"}
+      - return: {reply: err, num_tokens: 0}
+
+  # ---------------------------------------------------------------- HF3FS
+  - component: hf3fs-async-operation-manager
+    name: save-worker
+    kind: function
+    summary: "One poll of the HF3FS save thread: take a save task (1 s timeout), allocate a page per block hash from the metadata server, gather the blocks into buffers (Triton), batch-write the pages, then confirm the keys (or release the pages on a failed write)."
+    sources: ["vllm/distributed/kv_transfer/kv_connector/v1/hf3fs/hf3fs_connector.py:241-251", "vllm/distributed/kv_transfer/kv_connector/v1/hf3fs/hf3fs_connector.py:265-349"]
+    request: {type: object, properties: {}}
+    response: {type: object, properties: {task: {type: [string, "null"]}, ok: {type: boolean}, reason: {type: string}}}
+    behavior:
+      - if: "state.stop"
+        then:
+          - return: {task: null, ok: false, reason: stopped}
+      - if: "size(state.save_queue) == 0"
+        then:
+          - title: "queue.Empty after the 1 s timeout: poll again"
+            source: "vllm/distributed/kv_transfer/kv_connector/v1/hf3fs/hf3fs_connector.py:248-249"
+            return: {task: null, ok: false, reason: empty}
+      - set:
+          vars.t: "= state.save_queue[0]"
+          state.save_queue: "= state.save_queue.slice(1, size(state.save_queue))"
+      - call: hf3fs-metadata-server.allocate-pages-for-keys
+        input: {rank: "= state.rank", keys: "= vars.t.block_hashes"}
+        as: alloc
+      - if: "vars.alloc.value.pages.exists(p, p < 0)"
+        then:
+          - title: Page allocation failed
+            source: "vllm/distributed/kv_transfer/kv_connector/v1/hf3fs/hf3fs_connector.py:279-283"
+            set: {state.failed: "= state.failed + [vars.t.request_id]"}
+          - return: {task: "= vars.t.request_id", ok: false, reason: "Page allocation failed"}
+      - title: Gather KV blocks into contiguous buffers on the save stream
+        source: "vllm/distributed/kv_transfer/kv_connector/v1/hf3fs/hf3fs_connector.py:297-305"
+        call: hf3fs-gather-scatter-helper.gather-kv-caches
+        input: {num_blocks: "= size(vars.t.block_hashes)"}
+      - if: "state.write_ok"
+        then:
+          - source: "vllm/distributed/kv_transfer/kv_connector/v1/hf3fs/hf3fs_connector.py:325-334"
+            call: hf3fs-metadata-server.confirm-write-for-keys
+            input: {rank: "= state.rank", confirmations: "= lists.range(size(vars.t.block_hashes)).map(i, {'key': vars.t.block_hashes[i], 'page': vars.alloc.value.pages[i]})", release: []}
+          - set: {state.completed: "= state.completed + [vars.t.request_id]"}
+          - return: {task: "= vars.t.request_id", ok: true, reason: ""}
+      - title: Write failed; release the pages
+        source: "vllm/distributed/kv_transfer/kv_connector/v1/hf3fs/hf3fs_connector.py:335-343"
+        call: hf3fs-metadata-server.confirm-write-for-keys
+        input: {rank: "= state.rank", confirmations: [], release: "= vars.alloc.value.pages"}
+      - set: {state.failed: "= state.failed + [vars.t.request_id]"}
+      - return: {task: "= vars.t.request_id", ok: false, reason: "Write operation failed"}
+
+  - component: hf3fs-async-operation-manager
+    name: load-worker
+    kind: function
+    summary: "One poll of the HF3FS load thread: take a load task, look up each block hash's page on this rank, fail if any is missing, read the pages and scatter them into the KV cache (Triton)."
+    sources: ["vllm/distributed/kv_transfer/kv_connector/v1/hf3fs/hf3fs_connector.py:253-263", "vllm/distributed/kv_transfer/kv_connector/v1/hf3fs/hf3fs_connector.py:351-419"]
+    request: {type: object, properties: {}}
+    response: {type: object, properties: {task: {type: [string, "null"]}, ok: {type: boolean}, reason: {type: string}}}
+    behavior:
+      - if: "state.stop"
+        then:
+          - return: {task: null, ok: false, reason: stopped}
+      - if: "size(state.load_queue) == 0"
+        then:
+          - source: "vllm/distributed/kv_transfer/kv_connector/v1/hf3fs/hf3fs_connector.py:260-261"
+            return: {task: null, ok: false, reason: empty}
+      - set:
+          vars.t: "= state.load_queue[0]"
+          state.load_queue: "= state.load_queue.slice(1, size(state.load_queue))"
+      - call: hf3fs-metadata-server.get-key-locations
+        input: {rank: "= state.rank", keys: "= vars.t.block_hashes"}
+        as: loc
+      - if: "vars.loc.value.locations.exists(p, p == null)"
+        then:
+          - title: Blocks not found (or not yet written by every rank)
+            source: "vllm/distributed/kv_transfer/kv_connector/v1/hf3fs/hf3fs_connector.py:362-363"
+            set: {state.failed: "= state.failed + [vars.t.request_id]"}
+          - return: {task: "= vars.t.request_id", ok: false, reason: "Blocks not found"}
+      - title: Read the pages, then scatter into the paged KV cache on the load stream
+        source: "vllm/distributed/kv_transfer/kv_connector/v1/hf3fs/hf3fs_connector.py:400-408"
+        call: hf3fs-gather-scatter-helper.scatter-kv-caches
+        input: {num_blocks: "= size(vars.t.block_hashes)"}
+      - set: {state.completed: "= state.completed + [vars.t.request_id]"}
+      - return: {task: "= vars.t.request_id", ok: true, reason: ""}
+
+  - component: hf3fs-gather-scatter-helper
+    name: gather-kv-caches
+    kind: kernel
+    summary: "gather_kv_caches launches kv_cache_gather_kernel[grid] to copy blocks from the paged KV cache into page buffers."
+    sources: ["vllm/distributed/kv_transfer/kv_connector/v1/hf3fs/utils/gather_scatter_helper.py:167-224", "vllm/distributed/kv_transfer/kv_connector/v1/hf3fs/utils/gather_scatter_helper.py:60-107"]
+    request: {type: object, properties: {num_blocks: {type: integer}}}
+    response: {type: object, properties: {ok: {type: boolean}}}
+    latency_ms: "= 0.01 + double(input.num_blocks) * 0.0014"
+
+  - component: hf3fs-gather-scatter-helper
+    name: scatter-kv-caches
+    kind: kernel
+    summary: "scatter_kv_caches launches kv_cache_scatter_kernel[grid] to copy page buffers back into the paged KV cache."
+    sources: ["vllm/distributed/kv_transfer/kv_connector/v1/hf3fs/utils/gather_scatter_helper.py:110-165", "vllm/distributed/kv_transfer/kv_connector/v1/hf3fs/utils/gather_scatter_helper.py:10-57"]
+    request: {type: object, properties: {num_blocks: {type: integer}}}
+    response: {type: object, properties: {ok: {type: boolean}}}
+    latency_ms: "= 0.01 + double(input.num_blocks) * 0.0014"
+
+  - component: hf3fs-metadata-server
+    name: main
+    kind: cli
+    summary: "python hf3fs_metadata_server.py [--host 0.0.0.0] [--port 18000]: build Hf3fsMetadataServer (empty global state) and serve it with uvicorn."
+    sources: ["vllm/distributed/kv_transfer/kv_connector/v1/hf3fs/hf3fs_metadata_server.py:522-532", "vllm/distributed/kv_transfer/kv_connector/v1/hf3fs/hf3fs_metadata_server.py:512-519"]
+    request: {type: object, properties: {host: {type: string, default: "0.0.0.0"}, port: {type: integer, default: 18000}}}
+    response: {type: object, properties: {serving: {type: boolean}, port: {type: integer}}}
+    behavior:
+      - if: "state.serving && state.port == input.port"
+        then:
+          - title: Another server already owns the port; uvicorn fails to bind
+            fail: {code: os-error, status: 0, message: "address already in use"}
+      - source: "vllm/distributed/kv_transfer/kv_connector/v1/hf3fs/hf3fs_metadata_server.py:247-253"
+        set: {state.serving: true, state.port: "= input.port", state.ranks: {}, state.keys: {}}
+      - return: {serving: true, port: "= input.port"}
+
+  - component: hf3fs-metadata-server
+    name: initialize-rank
+    kind: http
+    summary: "POST /rank/{rank}/initialize: create the rank's page pool once."
+    sources: ["vllm/distributed/kv_transfer/kv_connector/v1/hf3fs/hf3fs_metadata_server.py:100-107"]
+    request: {type: object, required: [rank, num_pages], properties: {rank: {type: integer}, num_pages: {type: integer}}}
+    response: {type: object, properties: {initialized: {type: boolean}}}
+    behavior:
+      - if: "string(input.rank) in state.ranks"
+        then:
+          - return: {initialized: false}
+      - set: {state.ranks: "= merge(state.ranks, {string(input.rank): {'num_pages': input.num_pages, 'free_pages': lists.range(input.num_pages)}})"}
+      - return: {initialized: true}
+
+  - component: hf3fs-metadata-server
+    name: allocate-pages-for-keys
+    kind: http
+    summary: "GlobalMetadataState.allocate_pages_for_keys: allocate one page per key on the rank (all or nothing from the free list); keys already fully written reuse their page and release the fresh one; missing pages are -1."
+    sources: ["vllm/distributed/kv_transfer/kv_connector/v1/hf3fs/hf3fs_metadata_server.py:109-155", "vllm/distributed/kv_transfer/kv_connector/v1/hf3fs/hf3fs_metadata_server.py:40-47"]
+    request: {type: object, required: [rank, keys], properties: {rank: {type: integer}, keys: {type: array, items: {type: string}}}}
+    response: {type: object, properties: {pages: {type: array, items: {type: integer}}}}
+    errors:
+      - {code: value-error, status: 0, retryable: false}
+    behavior:
+      - set: {vars.r: "= string(input.rank)"}
+      - if: "!(vars.r in state.ranks)"
+        then:
+          - source: "vllm/distributed/kv_transfer/kv_connector/v1/hf3fs/hf3fs_metadata_server.py:122-123"
+            fail: {code: value-error, status: 0, message: "= 'Rank ' + vars.r + ' not initialized'"}
+      - set:
+          vars.free: "= state.ranks[vars.r].free_pages"
+          vars.n: "= size(input.keys)"
+      - set:
+          vars.got: "= size(vars.free) < vars.n ? [] : vars.free.slice(0, vars.n)"
+      - title: Reuse complete keys; others take their allocated page or -1
+        source: "vllm/distributed/kv_transfer/kv_connector/v1/hf3fs/hf3fs_metadata_server.py:136-155"
+        set:
+          vars.pages: "= lists.range(vars.n).map(i, input.keys[i] in state.keys && vars.r in state.keys[input.keys[i]].pages ? state.keys[input.keys[i]].pages[vars.r] : (i < size(vars.got) ? vars.got[i] : -1))"
+          vars.released: "= lists.range(size(vars.got)).filter(i, input.keys[i] in state.keys && vars.r in state.keys[input.keys[i]].pages).map(i, vars.got[i])"
+      - set:
+          state.ranks: "= merge(state.ranks, {vars.r: {'num_pages': state.ranks[vars.r].num_pages, 'free_pages': (size(vars.free) < vars.n ? vars.free : vars.free.slice(vars.n, size(vars.free))) + vars.released}})"
+      - return: {pages: "= vars.pages"}
+
+  - component: hf3fs-metadata-server
+    name: confirm-write-for-keys
+    kind: http
+    summary: "GlobalMetadataState.confirm_write_for_keys: record (key, page) for this rank (a key is complete once every initialized rank confirmed) and release pages of failed writes."
+    sources: ["vllm/distributed/kv_transfer/kv_connector/v1/hf3fs/hf3fs_metadata_server.py:157-190"]
+    request: {type: object, required: [rank], properties: {rank: {type: integer}, confirmations: {type: array, items: {type: object, properties: {key: {type: string}, page: {type: integer}}}}, release: {type: array, items: {type: integer}}}}
+    response: {type: object, properties: {confirmed: {type: integer}}}
+    behavior:
+      - set: {vars.r: "= string(input.rank)"}
+      - set:
+          state.keys: "= merge(state.keys, input.confirmations.transformMapEntry(i, c, {c.key: {'tp': size(state.ranks), 'pages': merge(c.key in state.keys ? state.keys[c.key].pages : {}, {vars.r: c.page})}}))"
+      - if: "size(input.release) > 0"
+        then:
+          - source: "vllm/distributed/kv_transfer/kv_connector/v1/hf3fs/hf3fs_metadata_server.py:183-190"
+            set:
+              state.ranks: "= merge(state.ranks, {vars.r: {'num_pages': state.ranks[vars.r].num_pages, 'free_pages': state.ranks[vars.r].free_pages + input.release.filter(p, !(p in state.ranks[vars.r].free_pages))}})"
+      - return: {confirmed: "= size(input.confirmations)"}
+
+  - component: hf3fs-metadata-server
+    name: batch-key-exists
+    kind: http
+    summary: "POST /keys/batch_exists: for each key, whether every TP rank has confirmed its write (KeyMetadata.is_complete)."
+    sources: ["vllm/distributed/kv_transfer/kv_connector/v1/hf3fs/hf3fs_metadata_server.py:346-360", "vllm/distributed/kv_transfer/kv_connector/v1/hf3fs/hf3fs_metadata_server.py:192-211"]
+    attributes: {method: POST, path: /keys/batch_exists}
+    request: {type: object, required: [keys], properties: {keys: {type: array, items: {type: string}}}}
+    response: {type: object, properties: {exists: {type: array, items: {type: boolean}}}}
+    behavior:
+      - set: {vars.out: []}
+      - foreach: "= input.keys"
+        as: k
+        steps:
+          - call: hf3fs-metadata-server.key-metadata-get
+            input: {key: "= vars.k"}
+            as: km
+            on_error: continue
+          - title: Complete when every initialized rank has a confirmed page
+            source: "vllm/distributed/kv_transfer/kv_connector/v1/hf3fs/hf3fs_metadata_server.py:80-83"
+            set: {vars.out: "= vars.out + [vars.km.ok && size(vars.km.value.pages) >= vars.km.value.tp]"}
+      - return: {exists: "= vars.out"}
+
+  - component: hf3fs-metadata-server
+    name: key-metadata-get
+    kind: io
+    summary: "key_metadata.get(key): the ranks' confirmed pages for one key."
+    sources: ["vllm/distributed/kv_transfer/kv_connector/v1/hf3fs/hf3fs_metadata_server.py:204-209"]
+    request: {type: object, required: [key], properties: {key: {type: string}}}
+    errors:
+      - {code: not_found, status: 404, retryable: false}
+    store: {table: keys, op: get, key: "= input.key"}
+
+  - component: hf3fs-metadata-server
+    name: get-key-locations
+    kind: http
+    summary: "GlobalMetadataState.get_key_locations: this rank's page per key, or None when the key is unknown or not yet written by every rank."
+    sources: ["vllm/distributed/kv_transfer/kv_connector/v1/hf3fs/hf3fs_metadata_server.py:213-242"]
+    request: {type: object, required: [rank, keys], properties: {rank: {type: integer}, keys: {type: array, items: {type: string}}}}
+    response: {type: object, properties: {locations: {type: array}}}
+    errors:
+      - {code: value-error, status: 0, retryable: false}
+    behavior:
+      - set: {vars.r: "= string(input.rank)"}
+      - if: "!(vars.r in state.ranks)"
+        then:
+          - source: "vllm/distributed/kv_transfer/kv_connector/v1/hf3fs/hf3fs_metadata_server.py:226-227"
+            fail: {code: value-error, status: 0, message: "= 'Rank ' + vars.r + ' not initialized'"}
+      - return:
+          locations: "= input.keys.map(k, k in state.keys && size(state.keys[k].pages) >= state.keys[k].tp && vars.r in state.keys[k].pages ? state.keys[k].pages[vars.r] : null)"
+
+  # ---------------------------------------------------------------- KV cache events
+  - component: event-publisher-factory
+    name: create
+    kind: function
+    summary: "EventPublisherFactory.create: NullEventPublisher unless events are enabled and the publisher is not 'null'; unknown names raise ValueError; 'zmq' starts a ZmqEventPublisher (and its thread) with ports offset by the DP rank."
+    sources: ["vllm/distributed/kv_events.py:578-598"]
+    request: {type: object, properties: {has_config: {type: boolean, default: true}, data_parallel_rank: {type: integer, default: 0}}}
+    response: {type: object, properties: {publisher: {type: string}}}
+    errors:
+      - {code: value-error, status: 0, retryable: false}
+    behavior:
+      - if: "(has(input.has_config) && !input.has_config) || !config['enable-kv-cache-events'] || !('kv-events-publisher' in config) || config['kv-events-publisher'] == null || config['kv-events-publisher'] == 'null'"
+        then:
+          - source: "vllm/distributed/kv_events.py:582-587"
+            return: {publisher: "null"}
+      - if: "config['kv-events-publisher'] != 'zmq'"
+        then:
+          - source: "vllm/distributed/kv_events.py:592-597"
+            fail: {code: value-error, status: 0, message: "= 'Unknown event publisher \\'' + config['kv-events-publisher'] + '\\''"}
+      - title: ZmqEventPublisher binds PUB (and replay ROUTER) and starts its thread
+        source: "vllm/distributed/kv_events.py:334-384"
+        set: {vars.zmq: true}
+      - call: zmq-event-publisher.start
+        input: {data_parallel_rank: "= input.data_parallel_rank"}
+      - return: {publisher: zmq}
+
+  - component: zmq-event-publisher
+    name: start
+    kind: function
+    summary: "ZmqEventPublisher.__init__ tail: mark running and start the zmq-publisher thread."
+    sources: ["vllm/distributed/kv_events.py:374-384"]
+    request: {type: object, properties: {data_parallel_rank: {type: integer}}}
+    response: {type: object, properties: {running: {type: boolean}}}
+    behavior:
+      - set: {state.running: true, state.dp_rank: "= input.data_parallel_rank"}
+      - return: {running: true}
+
+  - component: zmq-event-publisher
+    name: publish
+    kind: function
+    summary: "ZmqEventPublisher.publish: refuse once closed; stamp the DP rank if missing and enqueue the batch for the publisher thread."
+    sources: ["vllm/distributed/kv_events.py:389-394"]
+    attributes: {seam: true, callers: [scheduler-kv]}
+    request:
+      type: object
+      properties:
+        ts: {type: number}
+        events: {type: array, items: {type: object, properties: {type: {type: string, enum: [BlockStored, BlockRemoved, AllBlocksCleared]}, block_hashes: {type: array, items: {type: string}}}}}
+        data_parallel_rank: {type: [integer, "null"], default: null}
+    response: {type: object, properties: {queued: {type: integer}}}
+    errors:
+      - {code: runtime-error, status: 0, retryable: false}
+    behavior:
+      - if: "!state.running"
+        then:
+          - source: "vllm/distributed/kv_events.py:390-391"
+            fail: {code: runtime-error, status: 0, message: "Publisher is closed"}
+      - set:
+          state.queue: "= state.queue + [{'events': has(input.events) ? input.events : [], 'dp_rank': has(input.data_parallel_rank) && input.data_parallel_rank != null ? input.data_parallel_rank : state.dp_rank}]"
+      - return: {queued: "= size(state.queue)"}
+
+  - component: zmq-event-publisher
+    name: publisher-thread
+    kind: function
+    summary: "One iteration of _publisher_thread: service a pending replay request first, then take one batch (0.1 s timeout); a None sentinel exits; otherwise number it, send (topic, seq, payload) on PUB and keep it in the replay buffer (last buffer_steps)."
+    sources: ["vllm/distributed/kv_events.py:472-507"]
+    request: {type: object, properties: {}}
+    response: {type: object, properties: {published: {type: [integer, "null"]}, exited: {type: boolean}}}
+    behavior:
+      - if: "!state.running && size(state.queue) == 0"
+        then:
+          - source: "vllm/distributed/kv_events.py:478"
+            return: {published: null, exited: true}
+      - if: "size(state.replay_inbox) > 0"
+        then:
+          - title: Replay requests are serviced before the main queue
+            source: "vllm/distributed/kv_events.py:479-484"
+            call: zmq-event-publisher.service-replay
+      - if: "size(state.queue) == 0"
+        then:
+          - source: "vllm/distributed/kv_events.py:487-492"
+            return: {published: null, exited: false}
+      - set:
+          vars.b: "= state.queue[0]"
+          state.queue: "= state.queue.slice(1, size(state.queue))"
+      - if: "vars.b == null"
+        then:
+          - title: Shutdown sentinel
+            source: "vllm/distributed/kv_events.py:489-490"
+            return: {published: null, exited: true}
+      - title: Publish with the next sequence number and buffer it for replay
+        source: "vllm/distributed/kv_events.py:494-502"
+        set:
+          state.published: "= state.published + [state.next_seq]"
+          state.buffer: "= (state.buffer + [{'seq': state.next_seq, 'batch': vars.b}]).slice(math.greatest(size(state.buffer) + 1 - config['kv-events-buffer-steps'], 0), size(state.buffer) + 1)"
+          state.next_seq: "= state.next_seq + 1"
+      - return: {published: "= state.next_seq - 1", exited: false}
+
+  - component: zmq-event-publisher
+    name: service-replay
+    kind: function
+    summary: "_service_replay: a well-formed request (3 frames) gets every buffered batch with seq >= start_seq, then the END_SEQ marker; a malformed one is logged and dropped."
+    sources: ["vllm/distributed/kv_events.py:509-528"]
+    request: {type: object, properties: {}}
+    response: {type: object, properties: {sent: {type: integer}}}
+    behavior:
+      - set:
+          vars.req: "= state.replay_inbox[0]"
+          state.replay_inbox: "= state.replay_inbox.slice(1, size(state.replay_inbox))"
+      - if: "vars.req.frames != 3"
+        then:
+          - source: "vllm/distributed/kv_events.py:514-516"
+            return: {sent: 0}
+      - set:
+          vars.out: "= state.buffer.filter(e, e.seq >= vars.req.start_seq).map(e, e.seq)"
+      - source: "vllm/distributed/kv_events.py:520-528"
+        set: {state.replay_sent: "= state.replay_sent + vars.out + [-1]"}
+      - return: {sent: "= size(vars.out)"}
+
+  - component: zmq-event-publisher
+    name: shutdown
+    kind: function
+    summary: "ZmqEventPublisher.shutdown: stop accepting, enqueue the None sentinel, wait up to 1 s for the queue to drain, join the thread, close sockets."
+    sources: ["vllm/distributed/kv_events.py:396-425"]
+    request: {type: object, properties: {}}
+    response: {type: object, properties: {pending: {type: integer}}}
+    behavior:
+      - set: {state.running: false, state.queue: "= state.queue + [null]"}
+      - return: {pending: "= size(state.queue)"}
+
+  # ---------------------------------------------------------------- aux output store
+  - component: background-block-object-store
+    name: put
+    kind: function
+    summary: "BackgroundBlockObjectStore.put: nothing to do for an empty update; refuse once closed; enqueue for the writer thread, then surface any earlier writer failure."
+    sources: ["vllm/distributed/aux_output_connector/store.py:68-82"]
+    request: {type: object, properties: {objects: {type: array, items: {type: object, properties: {key: {type: string}, payload: {type: string}}}}}}
+    response: {type: object, properties: {queued: {type: boolean}}}
+    errors:
+      - {code: runtime-error, status: 0, retryable: false}
+      - {code: block-object-store-error, status: 0, retryable: false}
+    behavior:
+      - if: "!has(input.objects) || size(input.objects) == 0"
+        then:
+          - source: "vllm/distributed/aux_output_connector/store.py:77-78"
+            return: {queued: false}
+      - if: "state.closed"
+        then:
+          - source: "vllm/distributed/aux_output_connector/store.py:79-80"
+            fail: {code: runtime-error, status: 0, message: "auxiliary output store is closed"}
+      - set: {state.queue: "= state.queue + [input.objects]"}
+      - if: "state.error != ''"
+        then:
+          - source: "vllm/distributed/aux_output_connector/store.py:62-66"
+            fail: {code: block-object-store-error, status: 0, message: "auxiliary output publication failed"}
+      - return: {queued: true}
+
+  - component: background-block-object-store
+    name: run
+    kind: function
+    summary: "One item of the vllm-aux-output-writer thread (_run): a None update exits; after a failure later updates are skipped; otherwise apply BlockObjectStore.put and remember the first error."
+    sources: ["vllm/distributed/aux_output_connector/store.py:44-60"]
+    request: {type: object, properties: {}}
+    response: {type: object, properties: {applied: {type: boolean}}}
+    behavior:
+      - if: "size(state.queue) == 0"
+        then:
+          - return: {applied: false}
+      - set:
+          vars.u: "= state.queue[0]"
+          state.queue: "= state.queue.slice(1, size(state.queue))"
+      - if: "vars.u == null"
+        then:
+          - source: "vllm/distributed/aux_output_connector/store.py:48-49"
+            return: {applied: false}
+      - if: "state.error != ''"
+        then:
+          - title: Sticky error; skip the update
+            source: "vllm/distributed/aux_output_connector/store.py:50"
+            return: {applied: false}
+      - source: "vllm/distributed/aux_output_connector/store.py:51-56"
+        call: block-object-store.put
+        input: {objects: "= vars.u"}
+        on_error:
+          - source: "vllm/distributed/aux_output_connector/store.py:57-58"
+            set: {state.error: "= error.code"}
+          - return: {applied: false}
+      - return: {applied: true}
+
+  - component: background-block-object-store
+    name: get-concatenated
+    kind: function
+    summary: "BackgroundBlockObjectStore.get_concatenated: wait for queued updates, surface a writer failure, then read the objects."
+    sources: ["vllm/distributed/aux_output_connector/store.py:84-87"]
+    request: {type: object, required: [keys], properties: {keys: {type: array, items: {type: string}}}}
+    response: {type: object, properties: {payload: {type: string}}}
+    errors:
+      - {code: block-object-store-error, status: 0, retryable: false}
+    behavior:
+      - if: "state.error != ''"
+        then:
+          - fail: {code: block-object-store-error, status: 0, message: "auxiliary output publication failed"}
+      - call: block-object-store.get-concatenated
+        input: {keys: "= input.keys"}
+        as: g
+      - return: "= vars.g.value"
+
+  - component: block-object-store
+    name: put
+    kind: function
+    summary: "BlockObjectStore.put: move the new keys to the LRU tail, evict the oldest unreferenced keys to fit num_slots, and fail closed (dropping the new keys) when not enough can be evicted."
+    sources: ["vllm/distributed/aux_output_connector/store.py:152-187", "vllm/distributed/aux_output_connector/store.py:125-143"]
+    request: {type: object, properties: {objects: {type: array, items: {type: object, properties: {key: {type: string}, payload: {type: string}}}}}}
+    response: {type: object, properties: {evicted: {type: array, items: {type: string}}}}
+    errors:
+      - {code: block-object-store-error, status: 0, retryable: false}
+    behavior:
+      - set:
+          vars.new: "= input.objects.map(o, o.key)"
+      - set:
+          vars.lru: "= state.lru.filter(k, !(k in vars.new)) + vars.new"
+      - set:
+          vars.excess: "= size(vars.lru) - state.num_slots"
+          vars.candidates: "= vars.lru.filter(k, !(k in state.references) && !(k in vars.new))"
+      - if: "vars.excess > 0 && size(vars.candidates) < vars.excess"
+        then:
+          - title: Cannot retain the batch
+            source: "vllm/distributed/aux_output_connector/store.py:135-139"
+            fail: {code: block-object-store-error, status: 0, message: "= 'auxiliary output store cannot retain the requested batch: limit=' + string(state.num_slots) + ' objects'"}
+      - set:
+          vars.victims: "= vars.excess > 0 ? vars.candidates.slice(0, vars.excess) : []"
+      - source: "vllm/distributed/aux_output_connector/store.py:178-187"
+        set:
+          state.lru: "= vars.lru.filter(k, !(k in vars.victims))"
+          state.objects: "= merge(omit(state.objects, vars.victims), input.objects.transformMapEntry(i, o, {o.key: o.payload}))"
+      - return: {evicted: "= vars.victims"}
+
+  - component: block-object-store
+    name: get-concatenated
+    kind: function
+    summary: "BlockObjectStore.get_concatenated: join the payloads of the keys in order; an evicted key raises."
+    sources: ["vllm/distributed/aux_output_connector/store.py:205-228"]
+    request: {type: object, required: [keys], properties: {keys: {type: array, items: {type: string}}}}
+    response: {type: object, properties: {payload: {type: string}}}
+    errors:
+      - {code: block-object-store-error, status: 0, retryable: false}
+    behavior:
+      - if: "input.keys.exists(k, !(k in state.objects))"
+        then:
+          - source: "vllm/distributed/aux_output_connector/store.py:209-217"
+            fail: {code: block-object-store-error, status: 0, message: "auxiliary output object does not exist; the object may have been evicted"}
+      - return: {payload: "= input.keys.map(k, state.objects[k]).join('')"}
+
+  # ---------------------------------------------------------------- shm ring buffer
+  - component: single-writer-shm-ring-buffer
+    name: init
+    kind: function
+    summary: "SingleWriterShmRingBuffer.__init__: the writer (create=True) creates a segment of data_buffer_size + 32 bytes (auth secret first); a reader attaches to an existing segment by name and asserts it is large enough."
+    sources: ["vllm/distributed/device_communicators/shm_object_storage.py:114-168"]
+    request:
+      type: object
+      required: [data_buffer_size]
+      properties:
+        data_buffer_size: {type: integer, examples: [4096]}
+        name: {type: [string, "null"], default: null}
+        create: {type: boolean, default: false}
+    response: {type: object, properties: {is_writer: {type: boolean}, name: {type: string}, data_buffer_size: {type: integer}}}
+    errors:
+      - {code: file-not-found-error, status: 0, retryable: false}
+      - {code: file-exists-error, status: 0, retryable: false}
+      - {code: assertion-error, status: 0, retryable: false}
+    behavior:
+      - if: "input.create"
+        then:
+          - set:
+              vars.name: "= has(input.name) && input.name != null ? input.name : 'psm_' + string(random(100000000))"
+          - title: SharedMemory(create=True, size=data_buffer_size + DATA_OFFSET), then write the auth secret
+            source: "vllm/distributed/device_communicators/shm_object_storage.py:135-144"
+            call: posix-shared-memory.create
+            input: {name: "= vars.name", size: "= input.data_buffer_size + 32", data_buffer_size: "= input.data_buffer_size"}
+          - return: {is_writer: true, name: "= vars.name", data_buffer_size: "= input.data_buffer_size"}
+      - title: Attach to the writer's segment by name
+        source: "vllm/distributed/device_communicators/shm_object_storage.py:145-154"
+        call: posix-shared-memory.open
+        input: {name: "= has(input.name) && input.name != null ? input.name : ''"}
+        as: seg
+      - if: "vars.seg.value.size < input.data_buffer_size + 32"
+        then:
+          - source: "vllm/distributed/device_communicators/shm_object_storage.py:159-161"
+            fail: {code: assertion-error, status: 0, message: "shared memory segment is smaller than the ring buffer"}
+      - return: {is_writer: false, name: "= vars.seg.value.name", data_buffer_size: "= input.data_buffer_size"}
+
+  - component: single-writer-shm-ring-buffer
+    name: allocate-buf
+    kind: function
+    summary: "SingleWriterShmRingBuffer.allocate_buf: writer only; reserve 8 metadata bytes + size, wrapping to the next lap when the tail lacks contiguous room; MemoryError when the ring would overrun its start."
+    sources: ["vllm/distributed/device_communicators/shm_object_storage.py:218-266"]
+    request: {type: object, required: [name, size], properties: {name: {type: string}, size: {type: integer, examples: [100]}, is_writer: {type: boolean, default: true}}}
+    response: {type: object, properties: {address: {type: integer}, monotonic_id: {type: integer}}}
+    errors:
+      - {code: assertion-error, status: 0, retryable: false}
+      - {code: memory-error, status: 0, retryable: false}
+    behavior:
+      - if: "has(input.is_writer) && !input.is_writer"
+        then:
+          - source: "vllm/distributed/device_communicators/shm_object_storage.py:223"
+            fail: {code: assertion-error, status: 0, message: "Only the writer can allocate buffers."}
+      - if: "input.size <= 0"
+        then:
+          - source: "vllm/distributed/device_communicators/shm_object_storage.py:224"
+            fail: {code: assertion-error, status: 0, message: "Size must be greater than 0"}
+      - call: posix-shared-memory.open
+        input: {name: "= input.name"}
+        as: seg
+      - set:
+          vars.s: "= vars.seg.value"
+          vars.sz: "= input.size + 8"
+      - set:
+          vars.reset: "= vars.s.end % vars.s.data_buffer_size + vars.sz > vars.s.data_buffer_size ? (vars.s.end / vars.s.data_buffer_size + 1) * vars.s.data_buffer_size : vars.s.end"
+      - if: "vars.reset + vars.sz - vars.s.start > vars.s.data_buffer_size"
+        then:
+          - source: "vllm/distributed/device_communicators/shm_object_storage.py:236-244"
+            fail: {code: memory-error, status: 0, message: "Not enough space in the data buffer, try calling free_buf() to free up space"}
+      - source: "vllm/distributed/device_communicators/shm_object_storage.py:246-266"
+        call: posix-shared-memory.update
+        input: {name: "= input.name", end: "= vars.reset + vars.sz", next_id: "= vars.s.next_id + 1", expected_id: "= vars.s.next_id"}
+      - return: {address: "= vars.reset", monotonic_id: "= vars.s.next_id"}
+
+  - component: posix-shared-memory
+    name: create
+    kind: io
+    summary: "shm_open(O_CREAT | O_EXCL): fails when the name exists."
+    sources: ["vllm/distributed/device_communicators/shm_object_storage.py:139-143"]
+    request: {type: object, required: [name, size], properties: {name: {type: string}, size: {type: integer}, data_buffer_size: {type: integer}}}
+    errors:
+      - {code: file-exists-error, status: 0, retryable: false}
+    store: {table: segments, op: put, key: "= input.name", value: {name: "= input.name", size: "= input.size", data_buffer_size: "= input.data_buffer_size", start: 0, end: 0, next_id: 0}, where: "row == null", conflict: file-exists-error}
+
+  - component: posix-shared-memory
+    name: open
+    kind: io
+    summary: "shm_open of an existing segment by name: FileNotFoundError when absent."
+    sources: ["vllm/distributed/device_communicators/shm_object_storage.py:154"]
+    request: {type: object, required: [name], properties: {name: {type: string}}}
+    errors:
+      - {code: file-not-found-error, status: 0, retryable: false}
+    store: {table: segments, op: get, key: "= input.name == '' ? '_unnamed' : input.name", not_found: file-not-found-error}
+
+  - component: posix-shared-memory
+    name: update
+    kind: io
+    summary: "The writer's cursor update after an allocation (data_buffer_end, monotonic_id_end)."
+    sources: ["vllm/distributed/device_communicators/shm_object_storage.py:259-265"]
+    request: {type: object, required: [name, expected_id], properties: {name: {type: string}, end: {type: integer}, next_id: {type: integer}, expected_id: {type: integer}}}
+    errors:
+      - {code: not_found, status: 404, retryable: false}
+      - {code: assertion-error, status: 0, retryable: false, summary: "another writer moved the cursor; only the creating process may allocate (is_writer)"}
+    store: {table: segments, op: update, key: "= input.name", value: {end: "= input.end", next_id: "= input.next_id"}, where: "row.next_id == input.expected_id", conflict: assertion-error}
+
+flows:
+  - id: distributed-moriio-handshake-listener
+    name: MoRIIO handshake listener thread
+    entry: {caller: gpu-worker, interface: moriio-connector-worker.moriio-handshake-listener, repeat: {count: 2, interval_ms: 1}}
+    sources: ["vllm/distributed/kv_transfer/kv_connector/v1/moriio/moriio_connector.py:2006-2051"]
+  - id: distributed-moriio-notify-listener
+    name: MoRIIO notify listener thread
+    tags: [writes]
+    entry: {caller: gpu-worker, interface: moriio-wrapper.async-wait-reqid, repeat: {count: 3, interval_ms: 1}}
+    sources: ["vllm/distributed/kv_transfer/kv_connector/v1/moriio/moriio_engine.py:751-757"]
+  - id: distributed-moriio-write-worker
+    name: MoRIIO write worker thread
+    tags: [writes]
+    entry: {caller: gpu-worker, interface: moriio-writer.write-worker-loop, repeat: {count: 2, interval_ms: 10}}
+    sources: ["vllm/distributed/kv_transfer/kv_connector/v1/moriio/moriio_engine.py:184-215"]
+  - id: distributed-moriio-finished
+    name: Collect finished MoRIIO transfers
+    entry: {caller: gpu-worker, interface: moriio-wrapper.pop-finished-req-ids}
+    sources: ["vllm/distributed/kv_transfer/kv_connector/v1/moriio/moriio_engine.py:742-744"]
+  - id: distributed-moriio-heartbeat
+    name: MoRIIO discovery heartbeat child
+    entry: {caller: gpu-worker, interface: moriio-heartbeat.main, repeat: {count: 3, interval_ms: 1000}}
+    sources: ["vllm/distributed/kv_transfer/kv_connector/v1/moriio/moriio_heartbeat.py:95-96"]
+  - id: distributed-mooncake-sender
+    name: Mooncake prefill-side listener and sender
+    tags: [writes]
+    entry: {caller: gpu-worker, interface: mooncake-connector-worker.mooncake-sender-listener, repeat: {count: 2, interval_ms: 1}}
+    sources: ["vllm/distributed/kv_transfer/kv_connector/v1/mooncake/mooncake_connector.py:1439-1496"]
+  - id: distributed-mooncake-receive
+    name: Mooncake decode-side pull from one prefill worker
+    tags: [writes]
+    entry: {caller: gpu-worker, interface: mooncake-connector-worker.receive-kv-from-single-worker, input: {pull_metas: [{req_id: chatcmpl-m1, local_block_ids: [10, 11]}]}}
+    sources: ["vllm/distributed/kv_transfer/kv_connector/v1/mooncake/mooncake_connector.py:2308-2373"]
+  - id: distributed-mooncake-load-errors
+    name: Drain Mooncake load errors
+    entry: {caller: gpu-worker, interface: mooncake-connector-worker.get-block-ids-with-load-errors}
+    sources: ["vllm/distributed/kv_transfer/kv_connector/v1/mooncake/mooncake_connector.py:2407-2416"]
+  - id: distributed-mooncake-store-send
+    name: Mooncake store sending thread
+    tags: [writes]
+    entry: {caller: gpu-worker, interface: mooncake-store-worker.kv-transfer-thread-run, repeat: {count: 2, interval_ms: 1}}
+    sources: ["vllm/distributed/kv_transfer/kv_connector/v1/mooncake/store/worker.py:349-360"]
+  - id: distributed-mooncake-store-lookup
+    name: Mooncake store lookup server
+    tags: [writes]
+    entry: {caller: engine-core, interface: mooncake-store-worker.lookup-key-server-process-request}
+    sources: ["vllm/distributed/kv_transfer/kv_connector/v1/mooncake/store/worker.py:2332-2364"]
+  - id: distributed-hf3fs-save
+    name: HF3FS save thread
+    tags: [writes]
+    entry: {caller: gpu-worker, interface: hf3fs-async-operation-manager.save-worker, repeat: {count: 2, interval_ms: 1000}}
+    sources: ["vllm/distributed/kv_transfer/kv_connector/v1/hf3fs/hf3fs_connector.py:241-251"]
+  - id: distributed-hf3fs-load
+    name: HF3FS load thread
+    entry: {caller: gpu-worker, interface: hf3fs-async-operation-manager.load-worker, repeat: {count: 2, interval_ms: 1000}}
+    sources: ["vllm/distributed/kv_transfer/kv_connector/v1/hf3fs/hf3fs_connector.py:253-263"]
+  - id: distributed-hf3fs-metadata-server
+    name: Run the HF3FS metadata server
+    tags: [writes]
+    entry: {caller: operator, interface: hf3fs-metadata-server.main, input: {port: 18001}}
+    sources: ["vllm/distributed/kv_transfer/kv_connector/v1/hf3fs/hf3fs_metadata_server.py:522-532"]
+  - id: distributed-kv-events-create
+    name: Build the scheduler's KV event publisher
+    entry: {caller: engine-core, interface: event-publisher-factory.create}
+    sources: ["vllm/distributed/kv_events.py:578-598"]
+  - id: distributed-kv-events-publish
+    name: Scheduler publishes a KV event batch
+    tags: [writes]
+    entry: {caller: engine-core, interface: zmq-event-publisher.publish, input: {events: [{type: BlockStored, block_hashes: [h1]}]}}
+    sources: ["vllm/distributed/kv_events.py:389-394"]
+  - id: distributed-kv-events-thread
+    name: ZMQ publisher thread
+    tags: [writes]
+    entry: {caller: engine-core, interface: zmq-event-publisher.publisher-thread, repeat: {count: 3, interval_ms: 100}}
+    sources: ["vllm/distributed/kv_events.py:472-507"]
+  - id: distributed-aux-store-put
+    name: Publish auxiliary outputs
+    tags: [writes]
+    entry: {caller: gpu-worker, interface: background-block-object-store.put, input: {objects: [{key: req-a/0, payload: aa}]}}
+    sources: ["vllm/distributed/aux_output_connector/store.py:68-82"]
+  - id: distributed-aux-store-writer
+    name: Auxiliary-output writer thread
+    tags: [writes]
+    entry: {caller: gpu-worker, interface: background-block-object-store.run, repeat: {count: 2, interval_ms: 1}}
+    sources: ["vllm/distributed/aux_output_connector/store.py:44-60"]
+  - id: distributed-aux-store-read
+    name: Read auxiliary outputs
+    entry: {caller: gpu-worker, interface: background-block-object-store.get-concatenated, input: {keys: [req-a/0]}}
+    sources: ["vllm/distributed/aux_output_connector/store.py:84-87"]
+  - id: distributed-shm-ring-buffer
+    name: Create or attach a shared-memory ring buffer
+    tags: [writes]
+    entry: {caller: gpu-worker, interface: single-writer-shm-ring-buffer.init, input: {data_buffer_size: 4096, create: true}}
+    sources: ["vllm/distributed/device_communicators/shm_object_storage.py:114-168"]
+  - id: distributed-shm-allocate
+    name: Allocate in the ring buffer
+    tags: [writes]
+    entry: {caller: gpu-worker, interface: single-writer-shm-ring-buffer.allocate-buf, input: {name: psm_test, size: 100}}
+    sources: ["vllm/distributed/device_communicators/shm_object_storage.py:218-266"]
+
+scenarios:
+  # ---- in-build oracle
+  - id: oracle-build-distributed-3
+    name: "test_moriio_connector.py::test_write_mode_does_not_reload_remote_kv_after_preemption"
+    description: "WRITE-mode consumer scheduler (is_producer False, tp_size 2): a 32-token request with do_remote_prefill loads 32 tokens asynchronously; once do_remote_prefill is cleared (as after preemption) it loads nothing."
+    flow: distributed-kv-match
+    fixtures: [tp1-llama-8b]
+    state:
+      moriio-connector-scheduler: {is_producer: false, mode: WRITE}
+    steps:
+      - {interface: moriio-connector-scheduler.get-num-new-matched-tokens, caller: engine-core, as: first, input: {request_id: "1", num_prompt_tokens: 32, num_computed_tokens: 0, kv_transfer_params: {do_remote_prefill: true, do_remote_decode: false}}}
+      - {interface: moriio-connector-scheduler.get-num-new-matched-tokens, caller: engine-core, as: second, input: {request_id: "1", num_prompt_tokens: 32, num_computed_tokens: 0, kv_transfer_params: {do_remote_prefill: false, do_remote_decode: false}}}
+    expect:
+      - "steps.first.result.ok && steps.first.result.value.num_external_tokens == 32 && steps.first.result.value.load_async"
+      - "steps.second.result.ok && steps.second.result.value.num_external_tokens == 0 && !steps.second.result.value.load_async"
+  - id: oracle-build-distributed-1
+    name: "test_shm_buffer.py::TestSingleWriterShmRingBuffer::test_buffer_opening"
+    description: "Create a 4096-byte ring buffer as the writer, then open it from its handle (size, name): the reader is not the writer and sees the same shared-memory name."
+    flow: distributed-shm-ring-buffer
+    fixtures: [tp1-llama-8b]
+    steps:
+      - {flow: distributed-shm-ring-buffer, as: writer, input: {data_buffer_size: 4096, create: true}}
+      - {flow: distributed-shm-ring-buffer, as: reader, input: {data_buffer_size: "= steps.writer.result.value.data_buffer_size", name: "= steps.writer.result.value.name", create: false}}
+    expect:
+      - "steps.writer.result.ok && steps.writer.result.value.is_writer"
+      - "steps.reader.result.ok && !steps.reader.result.value.is_writer"
+      - "steps.reader.result.value.name == steps.writer.result.value.name"
+      - "steps.writer.result.value.name in state['posix-shared-memory@rank0'].segments"
+  # ---- MoRIIO
+  - id: distributed-moriio-producer-loads-nothing
+    flow: distributed-kv-match
+    fixtures: [tp1-llama-8b]
+    config: {kv-connector: MoRIIOConnector, kv-role: kv_producer}
+    state:
+      moriio-connector-scheduler: {is_producer: true}
+    input: {request_id: chatcmpl-r1, num_prompt_tokens: 64, kv_transfer_params: {do_remote_decode: true}}
+    expect:
+      - "result.ok && result.value.num_external_tokens == 0 && result.value.connector == 'MoRIIOConnector'"
+  - id: distributed-moriio-read-mode-recomputes-last
+    flow: distributed-kv-match
+    fixtures: [tp1-llama-8b]
+    config: {kv-connector: MoRIIOConnector, kv-role: kv_consumer}
+    state:
+      moriio-connector-scheduler: {mode: READ}
+    input: {request_id: chatcmpl-r2, num_prompt_tokens: 64, num_computed_tokens: 16, kv_transfer_params: {do_remote_prefill: true}}
+    expect:
+      - "result.ok && result.value.num_external_tokens == 47 && !result.value.load_async"
+  - id: distributed-moriio-write-after-remote-blocks
+    name: The decoder's remote_blocks notice unblocks a deferred write; the ack is collected
+    flow: distributed-moriio-write-worker
+    fixtures: [tp1-llama-8b]
+    state:
+      moriio-writer: {defer_timeout_ms: 1000000000000000, write_tasks: [{transfer_id: xfer-1, request_id: chatcmpl-r3, num_blocks: 4, enqueued_at: 0}]}
+      moriio-wrapper: {notify_inbox: [{kind: structured, type: remote_blocks, transfer_id: xfer-1, block_notify_list: [5, 6, 7, 8]}]}
+    steps:
+      - {interface: moriio-writer.write-worker-loop, caller: gpu-worker, as: w1}
+      - {flow: distributed-moriio-notify-listener, as: n}
+      - {interface: moriio-writer.write-worker-loop, caller: gpu-worker, as: w2}
+      - {interface: moriio-wrapper.handle-message, caller: gpu-worker, as: release, input: {kind: structured, type: release, transfer_id: xfer-1, consumer_tp_size: 1}}
+      - {flow: distributed-moriio-finished, as: fin}
+    expect:
+      - "steps.w1.result.value.deferred == 1 && steps.w2.result.value.written == 1"
+      - "state['moriio-writer@rank0'].written == ['xfer-1']"
+      - "steps.fin.result.value.done == ['xfer-1']"
+  - id: distributed-moriio-notify-messages
+    name: The notify listener handles a completion string and rejects an empty block list
+    flow: distributed-moriio-notify-listener
+    fixtures: [tp1-llama-8b]
+    state:
+      moriio-wrapper: {notify_inbox: [{kind: string, text: xfer-9}, {kind: structured, type: remote_blocks, transfer_id: xfer-8, block_notify_list: []}]}
+    expect:
+      - "passes[0].result.ok && passes[0].result.value.handled == 'completion'"
+      - "!passes[1].result.ok && passes[1].result.error.code == 'handshake-error'"
+      - "'xfer-9' in state['moriio-wrapper@rank0'].terminal"
+  - id: distributed-moriio-handle-message-branches
+    flow: distributed-moriio-notify-listener
+    fixtures: [tp1-llama-8b]
+    state:
+      moriio-wrapper: {terminal: [xfer-t]}
+    steps:
+      - {interface: moriio-wrapper.handle-message, caller: gpu-worker, as: late, input: {kind: structured, type: remote_blocks, transfer_id: xfer-t, block_notify_list: [1]}}
+      - {interface: moriio-wrapper.handle-message, caller: gpu-worker, as: wd, input: {kind: structured, type: write_done, transfer_id: xfer-2}}
+      - {interface: moriio-wrapper.handle-message, caller: gpu-worker, as: badtp, input: {kind: structured, type: release, transfer_id: xfer-3, consumer_tp_size: 0}}
+      - {interface: moriio-wrapper.handle-message, caller: gpu-worker, as: bin, input: {kind: binary}}
+      - {interface: moriio-wrapper.handle-message, caller: gpu-worker, as: unk, input: {kind: structured, type: gossip, transfer_id: xfer-4}}
+    expect:
+      - "steps.late.result.value.handled == 'ignored'"
+      - "!steps.wd.result.ok && steps.wd.result.error.code == 'assertion-error'"
+      - "steps.badtp.result.error.code == 'moriio-error' && steps.bin.result.error.code == 'moriio-error' && steps.unk.result.error.message.contains('gossip')"
+  - id: distributed-moriio-consumer-messages
+    flow: distributed-moriio-notify-listener
+    fixtures: [tp1-llama-8b]
+    state:
+      moriio-wrapper: {role: CONSUMER}
+    steps:
+      - {interface: moriio-wrapper.handle-message, caller: gpu-worker, as: wd, input: {kind: structured, type: write_done, transfer_id: xfer-5}}
+      - {interface: moriio-wrapper.handle-message, caller: gpu-worker, as: s, input: {kind: string, text: xfer-6}}
+      - {interface: moriio-wrapper.handle-message, caller: gpu-worker, as: rb, input: {kind: structured, type: remote_blocks, transfer_id: xfer-7, block_notify_list: [1]}}
+    expect:
+      - "state['moriio-wrapper@rank0'].done_write_cache_req_ids == ['xfer-5', 'xfer-6']"
+      - "!steps.rb.result.ok && steps.rb.result.error.code == 'assertion-error'"
+  - id: distributed-moriio-deferred-expires
+    name: A deferred write whose remote blocks never arrive expires and is marked done
+    flow: distributed-moriio-write-worker
+    fixtures: [tp1-llama-8b]
+    state:
+      moriio-writer: {defer_timeout_ms: 5, deferred: [{transfer_id: xfer-e, request_id: chatcmpl-r4, num_blocks: 1, enqueued_at: 0}]}
+    expect:
+      - "passes[0].result.value.expired == 1 && 'xfer-e' in state['moriio-wrapper@rank0'].done_req_ids"
+  - id: distributed-moriio-terminal-task-skipped
+    flow: distributed-moriio-write-worker
+    fixtures: [tp1-llama-8b]
+    state:
+      moriio-wrapper: {terminal: [xfer-s, xfer-d]}
+      moriio-writer: {defer_timeout_ms: 1000000000000000, write_tasks: [{transfer_id: xfer-s, request_id: chatcmpl-r5, num_blocks: 1, enqueued_at: 0}], deferred: [{transfer_id: xfer-d, request_id: chatcmpl-r6, num_blocks: 1, enqueued_at: 0}, {transfer_id: xfer-w, request_id: chatcmpl-r7, num_blocks: 1, enqueued_at: 0}]}
+    expect:
+      - "passes[0].result.value.written == 0 && size(state['moriio-writer@rank0'].written) == 0 && size(state['moriio-writer@rank0'].deferred) == 1"
+  - id: distributed-moriio-write-fails-marks-done
+    flow: distributed-moriio-write-worker
+    fixtures: [tp1-llama-8b]
+    state:
+      moriio-wrapper: {done_remote_allocate: {xfer-f: {block_ids: [1]}}}
+      moriio-writer: {write_tasks: [{transfer_id: xfer-f, request_id: chatcmpl-r8, num_blocks: 1, enqueued_at: 0}]}
+    faults:
+      - {target: moriio-writer.execute-write-task, type: error, code: rdma-error}
+    expect:
+      - "passes[0].result.value.written == 0 && 'xfer-f' in state['moriio-wrapper@rank0'].done_req_ids"
+  - id: distributed-moriio-deferred-becomes-ready
+    flow: distributed-moriio-write-worker
+    fixtures: [tp1-llama-8b]
+    state:
+      moriio-wrapper: {done_remote_allocate: {xfer-g: {block_ids: [2]}}}
+      moriio-writer: {defer_timeout_ms: 1000000000000000, deferred: [{transfer_id: xfer-g, request_id: chatcmpl-r9, num_blocks: 2, enqueued_at: 0}]}
+    expect:
+      - "passes[0].result.value.written == 1 && state['moriio-writer@rank0'].written == ['xfer-g']"
+  - id: distributed-moriio-handshake
+    flow: distributed-moriio-handshake-listener
+    fixtures: [tp1-llama-8b]
+    state:
+      moriio-connector-worker: {handshake_inbox: [{msg: get_meta_msg}, {msg: pop_done_recv, req_id: chatcmpl-r10}]}
+    expect:
+      - "passes[0].result.value.handled == 'get_meta_msg' && passes[1].result.value.handled == 'pop_done_recv'"
+      - "state['moriio-connector-worker@rank0'].replies == ['engine-meta', 'layer-meta'] && state['moriio-connector-worker@rank0'].done_recv == ['chatcmpl-r10']"
+  - id: distributed-moriio-handshake-unexpected
+    flow: distributed-moriio-handshake-listener
+    fixtures: [tp1-llama-8b]
+    state:
+      moriio-connector-worker: {handshake_inbox: [{msg: hello}]}
+    expect:
+      - "!passes[0].result.ok && passes[0].result.error.code == 'handshake-error' && passes[1].result.value.handled == null && size(state['moriio-connector-worker@rank0'].replies) == 0"
+  - id: distributed-moriio-heartbeat-retries
+    name: ZMQ errors count up to max_retries, then the child raises; EOF stops it cleanly
+    flow: distributed-moriio-heartbeat
+    fixtures: [tp1-llama-8b]
+    state:
+      moriio-heartbeat: {max_retries: 2}
+    choices: {moriio-heartbeat.main.send: zmq_error}
+    expect:
+      - "passes[0].result.ok && !passes[0].result.value.sent"
+      - "!passes[1].result.ok && passes[1].result.error.code == 'zmq-error'"
+      - "state['moriio-heartbeat@rank0'].failures >= 2"
+  - id: distributed-moriio-heartbeat-ok-and-eof
+    flow: distributed-moriio-heartbeat
+    fixtures: [tp1-llama-8b]
+    steps:
+      - {flow: distributed-moriio-heartbeat, as: beats}
+      - {interface: moriio-heartbeat.main, caller: gpu-worker, as: again, choices: {moriio-heartbeat.main.send: again}}
+    expect:
+      - "steps.beats.result.value.sent && state['moriio-heartbeat@rank0'].sent >= 1 && state['moriio-heartbeat@rank0'].failures == 0"
+      - "steps.again.result.ok && !steps.again.result.value.sent"
+  - id: distributed-moriio-heartbeat-stdin-closed
+    flow: distributed-moriio-heartbeat
+    fixtures: [tp1-llama-8b]
+    state:
+      moriio-heartbeat: {stdin_closed: true}
+    expect:
+      - "passes[0].result.value.stopped"
+  # ---- Mooncake
+  - id: distributed-mooncake-send-ready-request
+    name: The listener queues a decoder's request and a sender writes the ready blocks
+    flow: distributed-mooncake-sender
+    fixtures: [tp1-llama-8b]
+    state:
+      mooncake-connector-worker: {listener_inbox: [{transfer_id: xfer-m1, remote_tp_rank: 0}], reqs_need_send: {xfer-m1: {ready: true, block_ids: [1, 2, 3]}}}
+    steps:
+      - {flow: distributed-mooncake-sender, as: listen}
+      - {interface: mooncake-connector-worker.sender-worker, caller: gpu-worker, as: send}
+    expect:
+      - "steps.send.result.value.status == 'FINISH' && state['mooncake-connector-worker@rank0'].sent == ['xfer-m1'] && size(state['mooncake-connector-worker@rank0'].listener_inbox) == 0"
+      - "calls['mooncake-transfer-engine.batch-transfer-sync-write'] == 1"
+  - id: distributed-mooncake-send-errors
+    flow: distributed-mooncake-sender
+    fixtures: [tp1-llama-8b]
+    state:
+      mooncake-connector-worker: {sender_queue: [{transfer_id: xfer-m2, remote_tp_rank: 3}, {transfer_id: xfer-m3, remote_tp_rank: 0}, {transfer_id: xfer-m4, remote_tp_rank: 0}], reqs_need_send: {xfer-m4: {ready: true, block_ids: [1]}}}
+    faults:
+      - {target: mooncake-transfer-engine.batch-transfer-sync-write, type: error, code: transfer-error}
+    steps:
+      - {interface: mooncake-connector-worker.sender-worker, caller: gpu-worker, as: unpaired}
+      - {interface: mooncake-connector-worker.sender-worker, caller: gpu-worker, as: notready}
+      - {interface: mooncake-connector-worker.sender-worker, caller: gpu-worker, as: boom}
+      - {interface: mooncake-connector-worker.sender-worker, caller: gpu-worker, as: idle}
+    expect:
+      - "steps.unpaired.result.value.status == 'ERROR' && steps.notready.result.value.status == 'ERROR' && steps.boom.result.value.status == 'ERROR'"
+      - "state['mooncake-connector-worker@rank0'].error_responses == ['xfer-m2', 'xfer-m3', 'xfer-m4'] && steps.idle.result.value.status == null"
+  - id: distributed-mooncake-receive-error-then-drain
+    name: A failed pull marks the local blocks invalid; the model runner drains them once
+    flow: distributed-mooncake-receive
+    fixtures: [tp1-llama-8b]
+    steps:
+      - {flow: distributed-mooncake-receive, as: pull, choices: {mooncake-connector-worker.receive-kv-from-single-worker.response: error}, input: {pull_metas: [{req_id: chatcmpl-m1, local_block_ids: [10, 11]}, {req_id: chatcmpl-m2, local_block_ids: []}]}}
+      - {flow: distributed-mooncake-load-errors, as: drain}
+      - {flow: distributed-mooncake-load-errors, as: drain2}
+    expect:
+      - "steps.pull.result.value.status == 'ERROR' && steps.pull.result.value.failed == ['chatcmpl-m1']"
+      - "steps.drain.result.value.block_ids == [10, 11] && size(steps.drain2.result.value.block_ids) == 0 && state['mooncake-connector-worker@rank0'].finished_recving == ['chatcmpl-m1']"
+  - id: distributed-mooncake-receive-finish
+    flow: distributed-mooncake-receive
+    fixtures: [tp1-llama-8b]
+    expect:
+      - "result.ok && result.value.status == 'FINISH' && state['mooncake-connector-worker@rank0'].finished_recving == ['chatcmpl-m1']"
+  - id: distributed-mooncake-receive-exception
+    flow: distributed-mooncake-receive
+    fixtures: [tp1-llama-8b]
+    choices: {mooncake-connector-worker.receive-kv-from-single-worker.response: exception}
+    expect:
+      - "result.ok && result.value.status == 'ERROR' && state['mooncake-connector-worker@rank0'].invalid_block_ids == [10, 11]"
+  - id: distributed-mooncake-store-put-then-lookup
+    name: Blocks put by the sending thread are found by the scheduler's lookup
+    flow: distributed-mooncake-store-send
+    fixtures: [tp1-llama-8b]
+    state:
+      mooncake-store-worker: {request_queue: [null, {req_id: chatcmpl-s1, block_hashes: [ha, hb]}], lookup_inbox: [{type: LOOKUP, num_tokens: 40, block_hashes: [ha, hb, hc]}, {type: LOOKUP, num_tokens: 32, block_hashes: [ha, hb]}]}
+    steps:
+      - {flow: distributed-mooncake-store-send, as: skip}
+      - {flow: distributed-mooncake-store-send, as: send}
+      - {flow: distributed-mooncake-store-lookup, as: partial}
+      - {flow: distributed-mooncake-store-lookup, as: full}
+    expect:
+      - "state['mooncake-store-worker@rank0'].finished == ['chatcmpl-s1']"
+      - "steps.partial.result.value.num_tokens == 32 && steps.full.result.value.num_tokens == 16"
+  - id: distributed-mooncake-store-reset-and-unknown
+    flow: distributed-mooncake-store-lookup
+    fixtures: [tp1-llama-8b]
+    state:
+      mooncake-store-worker: {store_keys: [ha], lookup_inbox: [{type: RESET}, {type: PING}]}
+    steps:
+      - {flow: distributed-mooncake-store-lookup, as: reset}
+      - {flow: distributed-mooncake-store-lookup, as: ping}
+      - {flow: distributed-mooncake-store-lookup, as: idle}
+    expect:
+      - "steps.reset.result.value.reply == 'ok' && size(state['mooncake-store-worker@rank0'].store_keys) == 0"
+      - "steps.ping.result.value.reply == 'err' && steps.idle.result.value.reply == null"
+  - id: distributed-mooncake-store-reset-then-refill
+    name: After RESET wipes the store, a new put is found again by LOOKUP
+    flow: distributed-mooncake-store-lookup
+    fixtures: [tp1-llama-8b]
+    state:
+      mooncake-store-worker: {store_keys: [ha, hb], request_queue: [], lookup_inbox: [{type: RESET}, {type: LOOKUP, num_tokens: 64, block_hashes: [ha, hb]}]}
+    steps:
+      - {flow: distributed-mooncake-store-lookup, as: reset}
+      - {interface: mooncake-store-worker.kv-transfer-thread-run, caller: gpu-worker, as: idle}
+      - {flow: distributed-mooncake-store-lookup, as: look}
+    expect:
+      - "steps.reset.result.value.reply == 'ok' && steps.look.result.value.num_tokens == 0 && size(state['mooncake-store-worker@rank0'].store_keys) == 0"
+  - id: distributed-mooncake-sender-idle
+    flow: distributed-mooncake-sender
+    fixtures: [tp1-llama-8b]
+    expect:
+      - "passes[0].result.value.queued == 0"
+  - id: distributed-mooncake-store-idle
+    flow: distributed-mooncake-store-send
+    fixtures: [tp1-llama-8b]
+    expect:
+      - "passes[0].result.value.handled == null"
+  # ---- HF3FS
+  - id: distributed-hf3fs-save-then-load
+    name: Blocks saved and confirmed by rank 0 are found and scattered by the load thread
+    flow: distributed-hf3fs-save
+    fixtures: [tp1-llama-8b]
+    state:
+      hf3fs-async-operation-manager: {save_queue: [{request_id: chatcmpl-h1, block_hashes: [k1, k2]}], load_queue: [{request_id: chatcmpl-h2, block_hashes: [k1, k2]}]}
+    steps:
+      - {flow: distributed-hf3fs-save, as: save}
+      - {flow: distributed-hf3fs-load, as: load}
+    expect:
+      - "state['hf3fs-metadata-server'].keys.k1.pages['0'] == 0 && state['hf3fs-metadata-server'].keys.k2.pages['0'] == 1"
+  - id: distributed-hf3fs-load-missing
+    flow: distributed-hf3fs-load
+    fixtures: [tp1-llama-8b]
+    state:
+      hf3fs-async-operation-manager: {load_queue: [{request_id: chatcmpl-h3, block_hashes: [k9]}]}
+    expect:
+      - "passes[0].result.value.reason == 'Blocks not found' && calls['hf3fs-gather-scatter-helper.scatter-kv-caches'] == 0 && state['hf3fs-async-operation-manager@rank0'].failed == ['chatcmpl-h3']"
+  - id: distributed-hf3fs-save-no-pages
+    flow: distributed-hf3fs-save
+    fixtures: [tp1-llama-8b]
+    state:
+      hf3fs-metadata-server: {ranks: {"0": {num_pages: 1, free_pages: [0]}}}
+      hf3fs-async-operation-manager: {save_queue: [{request_id: chatcmpl-h4, block_hashes: [k1, k2]}]}
+    expect:
+      - "passes[0].result.value.reason == 'Page allocation failed' && state['hf3fs-metadata-server'].ranks['0'].free_pages == [0]"
+  - id: distributed-hf3fs-save-write-fails
+    name: A failed 3FS write releases the pages instead of confirming the keys
+    flow: distributed-hf3fs-save
+    fixtures: [tp1-llama-8b]
+    state:
+      hf3fs-async-operation-manager: {write_ok: false, save_queue: [{request_id: chatcmpl-h5, block_hashes: [k1]}]}
+    expect:
+      - "passes[0].result.value.reason == 'Write operation failed' && size(state['hf3fs-metadata-server'].keys) == 0"
+      - "0 in state['hf3fs-metadata-server'].ranks['0'].free_pages"
+  - id: distributed-hf3fs-save-reuses-written-key
+    flow: distributed-hf3fs-save
+    fixtures: [tp1-llama-8b]
+    state:
+      hf3fs-metadata-server: {keys: {k1: {tp: 1, pages: {"0": 3}}}, ranks: {"0": {num_pages: 4, free_pages: [0, 1, 2]}}}
+      hf3fs-async-operation-manager: {save_queue: [{request_id: chatcmpl-h6, block_hashes: [k1]}]}
+    expect:
+      - "passes[0].result.value.ok && state['hf3fs-metadata-server'].keys.k1.pages['0'] == 3 && size(state['hf3fs-metadata-server'].ranks['0'].free_pages) == 3"
+  - id: distributed-hf3fs-unknown-rank
+    flow: distributed-hf3fs-save
+    fixtures: [tp1-llama-8b]
+    state:
+      hf3fs-async-operation-manager: {rank: 5, save_queue: [{request_id: chatcmpl-h7, block_hashes: [k1]}], load_queue: [{request_id: chatcmpl-h8, block_hashes: [k1]}]}
+    steps:
+      - {interface: hf3fs-async-operation-manager.save-worker, caller: gpu-worker, as: s}
+      - {interface: hf3fs-async-operation-manager.load-worker, caller: gpu-worker, as: l}
+    expect:
+      - "!steps.s.result.ok && steps.s.result.error.code == 'value-error' && !steps.l.result.ok && size(state['hf3fs-async-operation-manager@rank0'].save_queue) == 0"
+  - id: distributed-hf3fs-workers-stopped
+    flow: distributed-hf3fs-save
+    fixtures: [tp1-llama-8b]
+    state:
+      hf3fs-async-operation-manager: {stop: true}
+    steps:
+      - {interface: hf3fs-async-operation-manager.save-worker, caller: gpu-worker, as: s}
+      - {interface: hf3fs-async-operation-manager.load-worker, caller: gpu-worker, as: l}
+    expect:
+      - "steps.s.result.value.reason == 'stopped' && steps.l.result.value.reason == 'stopped'"
+      - "size(state['hf3fs-metadata-server'].keys) == 0"
+  - id: distributed-hf3fs-metadata-server-start
+    name: A fresh metadata server starts empty; ranks register before allocating
+    flow: distributed-hf3fs-metadata-server
+    fixtures: [tp1-llama-8b]
+    state:
+      hf3fs-metadata-server: {serving: false}
+    steps:
+      - {flow: distributed-hf3fs-metadata-server, as: main}
+      - {interface: hf3fs-metadata-server.initialize-rank, caller: gpu-worker, as: init, input: {rank: 0, num_pages: 2}}
+      - {interface: hf3fs-metadata-server.initialize-rank, caller: gpu-worker, as: init2, input: {rank: 0, num_pages: 8}}
+      - {interface: hf3fs-metadata-server.allocate-pages-for-keys, caller: gpu-worker, as: alloc, input: {rank: 0, keys: [k1]}}
+    expect:
+      - "steps.main.result.value.port == 18001 && steps.init.result.value.initialized && !steps.init2.result.value.initialized"
+      - "steps.alloc.result.value.pages == [0] && state['hf3fs-metadata-server'].ranks['0'].free_pages == [1]"
+  - id: distributed-hf3fs-metadata-server-port-busy
+    flow: distributed-hf3fs-metadata-server
+    fixtures: [tp1-llama-8b]
+    input: {port: 18000}
+    expect:
+      - "!result.ok && result.error.code == 'os-error'"
+  # ---- KV events
+  - id: distributed-kv-events-disabled
+    flow: distributed-kv-events-create
+    fixtures: [tp1-llama-8b]
+    expect:
+      - "result.ok && result.value.publisher == 'null'"
+  - id: distributed-kv-events-zmq
+    flow: distributed-kv-events-create
+    fixtures: [tp1-llama-8b]
+    config: {enable-kv-cache-events: true, kv-events-publisher: zmq}
+    input: {data_parallel_rank: 1}
+    expect:
+      - "result.ok && result.value.publisher == 'zmq' && state['zmq-event-publisher'].dp_rank == 1"
+  - id: distributed-kv-events-unknown-publisher
+    flow: distributed-kv-events-create
+    fixtures: [tp1-llama-8b]
+    config: {enable-kv-cache-events: true, kv-events-publisher: kafka}
+    expect:
+      - "!result.ok && result.error.code == 'value-error'"
+  - id: distributed-kv-events-publish-then-replay
+    name: Published batches get sequence numbers; a replay from seq 1 returns the later ones and END_SEQ
+    flow: distributed-kv-events-publish
+    fixtures: [tp1-llama-8b]
+    steps:
+      - {flow: distributed-kv-events-publish, as: p1}
+      - {flow: distributed-kv-events-publish, as: p2, input: {events: [{type: BlockRemoved, block_hashes: [h1]}]}}
+      - {flow: distributed-kv-events-thread, as: t}
+      - {flow: distributed-kv-events-thread, as: t2}
+      - {interface: zmq-event-publisher.publish, caller: engine-core, as: p3, input: {events: [{type: AllBlocksCleared}], data_parallel_rank: 2}}
+    state:
+      zmq-event-publisher: {replay_inbox: []}
+    expect:
+      - "steps.p2.result.value.queued == 2 && state['zmq-event-publisher'].published == [0, 1]"
+  - id: distributed-kv-events-replay
+    flow: distributed-kv-events-thread
+    fixtures: [tp1-llama-8b]
+    state:
+      zmq-event-publisher: {buffer: [{seq: 0, batch: {}}, {seq: 1, batch: {}}, {seq: 2, batch: {}}], next_seq: 3, replay_inbox: [{frames: 3, start_seq: 1}, {frames: 2, start_seq: 0}]}
+    expect:
+      - "state['zmq-event-publisher'].replay_sent == [1, 2, -1]"
+  - id: distributed-kv-events-thread-exits
+    flow: distributed-kv-events-thread
+    fixtures: [tp1-llama-8b]
+    state:
+      zmq-event-publisher: {running: false}
+    expect:
+      - "passes[0].result.value.exited"
+  - id: distributed-kv-events-buffer-bounded
+    flow: distributed-kv-events-thread
+    fixtures: [tp1-llama-8b]
+    config: {kv-events-buffer-steps: 2}
+    state:
+      zmq-event-publisher: {queue: [{events: []}, {events: []}, {events: []}]}
+    expect:
+      - "state['zmq-event-publisher'].published == [0, 1, 2] && state['zmq-event-publisher'].buffer.map(e, e.seq) == [1, 2]"
+  - id: distributed-kv-events-shutdown
+    name: After shutdown, publish refuses and the thread drains to the sentinel and exits
+    flow: distributed-kv-events-thread
+    fixtures: [tp1-llama-8b]
+    state:
+      zmq-event-publisher: {queue: [{events: []}]}
+    steps:
+      - {interface: zmq-event-publisher.shutdown, caller: engine-core, as: down}
+      - {flow: distributed-kv-events-publish, as: late}
+      - {flow: distributed-kv-events-thread, as: t1}
+      - {flow: distributed-kv-events-thread, as: t}
+    expect:
+      - "!steps.late.result.ok && steps.late.result.error.message == 'Publisher is closed'"
+      - "state['zmq-event-publisher'].published == [0] && steps.t.result.value.exited"
+  # ---- aux output store
+  - id: distributed-aux-store-put-then-read
+    flow: distributed-aux-store-put
+    fixtures: [tp1-llama-8b]
+    steps:
+      - {flow: distributed-aux-store-put, as: put}
+      - {flow: distributed-aux-store-writer, as: w}
+      - {flow: distributed-aux-store-read, as: r}
+    expect:
+      - "steps.put.result.value.queued && steps.r.result.value.payload == 'aa' && state['block-object-store@rank0'].lru == ['req-a/0']"
+  - id: distributed-aux-store-eviction-then-missing
+    name: An unreferenced old object is evicted to fit; reading it fails
+    flow: distributed-aux-store-writer
+    fixtures: [tp1-llama-8b]
+    state:
+      block-object-store: {num_slots: 2, lru: [old], objects: {old: zz}}
+      background-block-object-store: {queue: [[{key: n1, payload: x}, {key: n2, payload: y}]]}
+    steps:
+      - {flow: distributed-aux-store-writer, as: w}
+      - {flow: distributed-aux-store-read, as: r, input: {keys: [n1, n2]}}
+      - {flow: distributed-aux-store-read, as: gone, input: {keys: [old]}}
+    expect:
+      - "steps.r.result.value.payload == 'xy'"
+      - "!steps.gone.result.ok && steps.gone.result.error.code == 'block-object-store-error' && state['block-object-store@rank0'].lru == ['n1', 'n2']"
+  - id: distributed-aux-store-overflow-sticky
+    name: A batch larger than the arena fails the writer; the error surfaces on the next put and read
+    flow: distributed-aux-store-writer
+    fixtures: [tp1-llama-8b]
+    state:
+      block-object-store: {num_slots: 1}
+      background-block-object-store: {queue: [[{key: a, payload: x}, {key: b, payload: y}], [{key: c, payload: z}]]}
+    steps:
+      - {flow: distributed-aux-store-writer, as: w}
+      - {flow: distributed-aux-store-writer, as: skipped}
+      - {flow: distributed-aux-store-writer, as: idle}
+      - {flow: distributed-aux-store-put, as: put}
+      - {flow: distributed-aux-store-read, as: r}
+    expect:
+      - "state['background-block-object-store@rank0'].error == 'block-object-store-error'"
+      - "!steps.put.result.ok && steps.put.result.error.code == 'block-object-store-error' && !steps.r.result.ok"
+  - id: distributed-aux-store-closed-and-empty
+    flow: distributed-aux-store-put
+    fixtures: [tp1-llama-8b]
+    state:
+      background-block-object-store: {closed: true, queue: [null]}
+    steps:
+      - {flow: distributed-aux-store-put, as: closed}
+      - {flow: distributed-aux-store-put, as: empty, input: {objects: []}}
+      - {flow: distributed-aux-store-writer, as: w}
+    expect:
+      - "!steps.closed.result.ok && steps.closed.result.error.code == 'runtime-error' && !steps.empty.result.value.queued"
+      - "!steps.w.result.value.applied && state['background-block-object-store@rank0'].closed && size(state['background-block-object-store@rank0'].queue) == 0"
+  # ---- shm ring buffer
+  - id: distributed-shm-open-missing
+    flow: distributed-shm-ring-buffer
+    fixtures: [tp1-llama-8b]
+    input: {create: false, name: psm_nope}
+    expect:
+      - "!result.ok && result.error.code == 'file-not-found-error'"
+  - id: distributed-shm-create-twice
+    flow: distributed-shm-ring-buffer
+    fixtures: [tp1-llama-8b]
+    steps:
+      - {flow: distributed-shm-ring-buffer, as: a, input: {name: psm_dup}}
+      - {flow: distributed-shm-ring-buffer, as: b, input: {name: psm_dup}}
+      - {flow: distributed-shm-ring-buffer, as: small, input: {name: psm_dup, create: false, data_buffer_size: 8192}}
+    expect:
+      - "steps.a.result.ok && !steps.b.result.ok && steps.b.result.error.code == 'file-exists-error'"
+      - "!steps.small.result.ok && steps.small.result.error.code == 'assertion-error' && state['posix-shared-memory@rank0'].segments.psm_dup.size == 4128"
+  - id: distributed-shm-allocate-until-full
+    name: Allocations advance the ring; one that would overrun its start raises MemoryError
+    flow: distributed-shm-allocate
+    fixtures: [tp1-llama-8b]
+    steps:
+      - {flow: distributed-shm-ring-buffer, as: mk, input: {name: psm_test, data_buffer_size: 200}}
+      - {flow: distributed-shm-allocate, as: a1, input: {name: psm_test, size: 100}}
+      - {flow: distributed-shm-allocate, as: a2, input: {name: psm_test, size: 80}}
+      - {flow: distributed-shm-allocate, as: a3, input: {name: psm_test, size: 1}}
+      - {flow: distributed-shm-allocate, as: ro, input: {name: psm_test, size: 1, is_writer: false}}
+      - {flow: distributed-shm-allocate, as: zero, input: {name: psm_test, size: 0}}
+      - {flow: distributed-shm-ring-buffer, as: reader, input: {name: psm_test, data_buffer_size: 200, create: false}}
+    expect:
+      - "steps.a1.result.value.address == 0 && steps.a1.result.value.monotonic_id == 0 && steps.a2.result.value.address == 108"
+      - "!steps.a3.result.ok && steps.a3.result.error.code == 'memory-error'"
+      - "steps.ro.result.error.code == 'assertion-error' && steps.zero.result.error.code == 'assertion-error'"
+      - "steps.reader.result.ok && state['posix-shared-memory@rank0'].segments.psm_test.end == 196 && state['posix-shared-memory@rank0'].segments.psm_test.next_id == 2"

@@ -1,0 +1,280 @@
+# The Nomad substrate's own tests. Run with:
+#   go run ./internal/devtools/check -f substrates/nomad/nomad.yaml -f substrates/nomad/scenarios.yaml
+# Imports don't bring these along (MergeImports skips flows and scenarios).
+# Timeline: an evaluation is processed nomad-scheduler-delay-ms (50) after it is created, so a
+# job registered at t=0 is placed at ~52 ms and running one boot delay later.
+schema_version: 1
+id: nomad-scenarios
+
+components:
+  - {id: operator, name: Operator, kind: client, summary: "Whoever calls the Nomad API: a CLI, CI, or a service using the SDK."}
+
+fixtures:
+  - id: two-nodes
+    summary: "node-1 (dc1, 4000 MHz, 4096 MB) and node-2 (dc1, 4000 MHz, 8192 MB), both ready and eligible."
+    clock: {epoch: "2026-11-01T00:00:00Z"}
+    state:
+      nomad-server:
+        nodes:
+          node-1: {id: node-1, datacenter: dc1, node_class: "", cpu: 4000, memory_mb: 4096, status: ready, eligibility: eligible}
+          node-2: {id: node-2, datacenter: dc1, node_class: "", cpu: 4000, memory_mb: 8192, status: ready, eligibility: eligible}
+  - id: mixed-nodes
+    extends: [two-nodes]
+    summary: "Adds node-3 (ineligible), node-4 (down), node-5 (dc2) and node-6 (dc1, class gpu)."
+    state:
+      nomad-server:
+        nodes:
+          node-3: {id: node-3, datacenter: dc1, node_class: "", cpu: 8000, memory_mb: 16384, status: ready, eligibility: ineligible}
+          node-4: {id: node-4, datacenter: dc1, node_class: "", cpu: 8000, memory_mb: 16384, status: down, eligibility: eligible}
+          node-5: {id: node-5, datacenter: dc2, node_class: "", cpu: 8000, memory_mb: 16384, status: ready, eligibility: eligible}
+          node-6: {id: node-6, datacenter: dc1, node_class: gpu, cpu: 8000, memory_mb: 16384, status: ready, eligibility: eligible}
+
+flows:
+  - {id: job-register, tags: [writes], entry: {caller: operator, interface: nomad-server.job-register}}
+  - {id: job-stop, tags: [writes], entry: {caller: operator, interface: nomad-server.job-stop}}
+  - {id: job-get, tags: [reads], entry: {caller: operator, interface: nomad-server.job-get}}
+  - {id: allocations-by-job, tags: [reads], entry: {caller: operator, interface: nomad-server.allocations-by-job}}
+  - {id: allocations-by-node, tags: [reads], entry: {caller: operator, interface: nomad-server.allocations-by-node}}
+  - {id: node-register, tags: [writes], entry: {caller: operator, interface: nomad-server.node-register}}
+  - {id: node-crash, tags: [writes], entry: {caller: operator, interface: nomad-client.node-crash}}
+
+scenarios:
+  # ---- register, evaluation, boot delay, health ----
+  - id: vm-job-healthy-after-boot
+    name: A VM-like job is pending through its 45 s boot, running after it, healthy min_healthy_time later
+    fixtures: [two-nodes]
+    config: {nomad-boot-delay-ms: 45000}
+    steps:
+      - {flow: job-register, as: reg, await: false, input: {job: {id: vm, type: service, groups: [{name: vm, count: 1, cpu: 2000, memory_mb: 2048, check: passing}]}}}
+      - {flow: allocations-by-job, as: t1s, at_ms: 1000, input: {job_id: vm}}
+      - {flow: allocations-by-job, as: t44s, at_ms: 44000, input: {job_id: vm}}
+      - {flow: allocations-by-job, as: t46s, at_ms: 46000, input: {job_id: vm}}
+      - {flow: job-get, as: job46, at_ms: 46001, input: {job_id: vm}}
+      - {flow: allocations-by-job, as: t56s, at_ms: 56000, input: {job_id: vm}}
+    expect:
+      - "steps.reg.result.ok && steps.reg.result.value.eval_id != '' && steps.reg.result.value.job_modify_index == 0"
+      - "size(steps.t1s.result.value) == 1 && steps.t1s.result.value[0].status == 'pending' && steps.t1s.result.value[0].name == 'vm.vm[0]'"
+      - "steps.t44s.result.value[0].client_status == 'pending'"
+      - "steps.t46s.result.value[0].client_status == 'running' && steps.t46s.result.value[0].status == 'running'"
+      - "steps.job46.result.value.status == 'running'"
+      - "steps.t56s.result.value[0].status == 'healthy' && steps.t56s.result.value[0].deployment_health == true"
+      - "state['nomad-server'].allocs.exists(k, state['nomad-server'].allocs[k].job_id == 'vm' && state['nomad-server'].allocs[k].status == 'healthy')"
+
+  - id: register-returns-before-placement
+    name: Register returns the evaluation at once; the job is pending with no allocations until the scheduler runs
+    fixtures: [two-nodes]
+    steps:
+      - {flow: job-register, as: reg, await: false, input: {job: {id: web, groups: [{name: web, count: 2}]}}}
+      - {flow: job-get, as: job, at_ms: 10, input: {job_id: web}}
+      - {flow: allocations-by-job, as: before, at_ms: 20, input: {job_id: web}}
+      - {flow: allocations-by-job, as: after, at_ms: 100, input: {job_id: web}}
+    expect:
+      - "steps.reg.result.ok && steps.reg.result.value.eval_id in state['nomad-server'].evals"
+      - "steps.job.result.value.status == 'pending' && steps.job.result.value.stop == false"
+      - "size(steps.before.result.value) == 0"
+      - "size(steps.after.result.value) == 2 && steps.after.result.value.all(a, a.client_status == 'pending')"
+      - "state['nomad-server'].evals[steps.reg.result.value.eval_id].status == 'complete'"
+
+  # ---- placement ----
+  - id: placement-eligible-nodes-only
+    name: Placement skips ineligible, down and other-datacenter nodes, and bin-packs onto the fullest feasible node
+    fixtures: [mixed-nodes]
+    steps:
+      - {flow: job-register, as: reg, await: false, input: {job: {id: api, datacenters: [dc1], groups: [{name: api, count: 2, cpu: 500, memory_mb: 1024}]}}}
+      - {flow: allocations-by-job, as: placed, at_ms: 100, input: {job_id: api}}
+    expect:
+      - "size(steps.placed.result.value) == 2"
+      - "steps.placed.result.value.all(a, a.node_id == 'node-1')"
+      - "state['nomad-server'].allocs.all(k, !(state['nomad-server'].allocs[k].node_id in ['node-3', 'node-4', 'node-5']))"
+
+  - id: placement-node-class-constraint
+    name: A node_class constraint places only on matching nodes
+    fixtures: [mixed-nodes]
+    steps:
+      - {flow: job-register, as: reg, await: false, input: {job: {id: train, node_class: gpu, groups: [{name: train, count: 1, cpu: 4000, memory_mb: 8192}]}}}
+      - {flow: allocations-by-node, as: gpu, at_ms: 100, input: {node_id: node-6}}
+    expect:
+      - "size(steps.gpu.result.value) == 1 && steps.gpu.result.value[0].job_id == 'train'"
+      - "state['nomad-server'].jobs.train.node_class == 'gpu'"
+
+  - id: blocked-eval-unblocked-by-new-node
+    name: Allocations without capacity leave a blocked evaluation; a new node unblocks it and gets the placement
+    fixtures: [two-nodes]
+    steps:
+      - {flow: job-register, as: reg, await: false, input: {job: {id: big, groups: [{name: big, count: 4, cpu: 1000, memory_mb: 4096}]}}}
+      - {flow: allocations-by-job, as: three, at_ms: 100, input: {job_id: big}}
+      - {flow: job-get, as: job, at_ms: 101, input: {job_id: big}}
+      - {flow: node-register, as: join, at_ms: 10000, input: {node: {id: node-9, datacenter: dc1, cpu: 4000, memory_mb: 8192}}}
+      - {flow: allocations-by-node, as: n9, at_ms: 10100, input: {node_id: node-9}}
+    expect:
+      - "size(steps.three.result.value) == 3 && steps.job.result.value.status == 'pending'"
+      - "state['nomad-server'].evals[steps.reg.result.value.eval_id].queued_allocations == 1"
+      - "size(steps.join.result.value.unblocked) == 1"
+      - "size(steps.n9.result.value) == 1 && steps.n9.result.value[0].name == 'big.big[3]'"
+      - "state['nomad-server'].evals[steps.join.result.value.unblocked[0]].status == 'complete'"
+
+  # ---- allocation outcomes ----
+  - id: batch-job-completes
+    name: A batch task that exits 0 completes its allocation, and the job is dead
+    fixtures: [two-nodes]
+    steps:
+      - {flow: job-register, as: reg, input: {job: {id: report, type: batch, groups: [{name: run, count: 1, run_ms: 30000}]}}}
+      - {flow: allocations-by-job, as: done, input: {job_id: report}}
+      - {flow: job-get, as: job, input: {job_id: report}}
+    expect:
+      - "steps.done.result.value[0].client_status == 'complete' && steps.done.result.value[0].deployment_health == null"
+      - "steps.job.result.value.status == 'dead'"
+      - "steps.done.start_ms >= 35050"
+      - "state['nomad-server'].jobs.report.status == 'dead'"
+
+  - id: batch-job-fails
+    name: A task that exits non-zero fails its allocation (restarts are not modeled)
+    fixtures: [two-nodes]
+    steps:
+      - {flow: job-register, as: reg, input: {job: {id: etl, type: batch, groups: [{name: run, count: 1, run_ms: 1000, exit: failure}]}}}
+      - {flow: allocations-by-job, as: done, input: {job_id: etl}}
+    expect:
+      - "steps.done.result.value[0].client_status == 'failed' && steps.done.result.value[0].status == 'failed'"
+      - "state['nomad-server'].jobs.etl.status == 'dead'"
+
+  - id: service-unhealthy-at-deadline
+    name: A service whose checks fail is marked unhealthy at healthy_deadline but keeps running
+    fixtures: [two-nodes]
+    steps:
+      - {flow: job-register, as: reg, await: false, input: {job: {id: flaky, groups: [{name: web, count: 1, check: failing, healthy_deadline_ms: 60000}]}}}
+      - {flow: allocations-by-job, as: t30s, at_ms: 30000, input: {job_id: flaky}}
+      - {flow: allocations-by-job, as: t70s, at_ms: 70000, input: {job_id: flaky}}
+    expect:
+      - "steps.t30s.result.value[0].status == 'running' && steps.t30s.result.value[0].deployment_health == null"
+      - "steps.t70s.result.value[0].status == 'unhealthy' && steps.t70s.result.value[0].client_status == 'running'"
+      - "state['nomad-server'].jobs.flaky.status == 'running'"
+
+  # ---- stop and deregister ----
+  - id: stop-runs-until-kill-timeout
+    name: After a stop, a running allocation keeps running until its kill timeout, then completes
+    fixtures: [two-nodes]
+    steps:
+      - {flow: job-register, as: reg, input: {job: {id: web, groups: [{name: web, count: 1}]}}}
+      - {flow: job-stop, as: stop, at_ms: 30000, await: false, input: {job_id: web}}
+      - {flow: allocations-by-job, as: t31s, at_ms: 31000, input: {job_id: web}}
+      - {flow: job-get, as: job31, at_ms: 31001, input: {job_id: web}}
+      - {flow: allocations-by-job, as: t36s, at_ms: 36000, input: {job_id: web}}
+      - {flow: job-get, as: job36, at_ms: 36001, input: {job_id: web}}
+    expect:
+      - "steps.t31s.result.value[0].desired_status == 'stop' && steps.t31s.result.value[0].client_status == 'running' && steps.t31s.result.value[0].status == 'healthy'"
+      - "steps.job31.result.value.stop && steps.job31.result.value.status == 'running'"
+      - "steps.t36s.result.value[0].client_status == 'complete'"
+      - "steps.job36.result.value.status == 'dead'"
+      - "trace.exists(e, e.type == 'call.start' && e.interface == 'nomad-client.alloc-killed' && e.t >= 35000 && e.t < 35200)"
+      - "state['nomad-server'].jobs.web.status == 'dead'"
+
+  - id: stop-uses-group-kill-timeout
+    name: A group's kill_timeout overrides the default
+    fixtures: [two-nodes]
+    steps:
+      - {flow: job-register, as: reg, input: {job: {id: db, groups: [{name: db, count: 1, kill_timeout_ms: 20000}]}}}
+      - {flow: job-stop, as: stop, at_ms: 30000, await: false, input: {job_id: db}}
+      - {flow: allocations-by-job, as: t45s, at_ms: 45000, input: {job_id: db}}
+      - {flow: allocations-by-job, as: t51s, at_ms: 51000, input: {job_id: db}}
+    expect:
+      - "steps.t45s.result.value[0].client_status == 'running'"
+      - "steps.t51s.result.value[0].client_status == 'complete'"
+      - "state['nomad-server'].jobs.db.status == 'dead'"
+
+  - id: stop-before-boot-completes-at-once
+    name: Stopping a job whose allocation is still booting completes it at once; it never runs
+    fixtures: [two-nodes]
+    config: {nomad-boot-delay-ms: 45000}
+    steps:
+      - {flow: job-register, as: reg, await: false, input: {job: {id: vm, groups: [{name: vm, count: 1}]}}}
+      - {flow: job-stop, as: stop, at_ms: 1000, input: {job_id: vm}}
+      - {flow: allocations-by-job, as: after, input: {job_id: vm}}
+    expect:
+      - "steps.after.result.value[0].client_status == 'complete' && steps.after.result.value[0].desired_status == 'stop'"
+      - "trace.exists(e, e.type == 'call.end' && e.interface == 'nomad-client.alloc-start' && e.output.started == false)"
+      - "state['nomad-server'].jobs.vm.status == 'dead'"
+
+  - id: deregister-purge
+    name: A purge removes the job at once, but its allocations still run until the kill timeout
+    fixtures: [two-nodes]
+    steps:
+      - {flow: job-register, as: reg, input: {job: {id: web, groups: [{name: web, count: 2}]}}}
+      - {flow: job-stop, as: purge, at_ms: 30000, await: false, input: {job_id: web, purge: true}}
+      - {flow: job-get, as: gone, at_ms: 30010, input: {job_id: web}}
+      - {flow: allocations-by-job, as: t31s, at_ms: 31000, input: {job_id: web}}
+      - {flow: allocations-by-job, as: t36s, at_ms: 36000, input: {job_id: web}}
+    expect:
+      - "!steps.gone.result.ok && steps.gone.result.error.code == 'job_not_found' && steps.gone.result.error.status == 404"
+      - "steps.t31s.result.value.all(a, a.desired_status == 'stop' && a.client_status == 'running')"
+      - "size(steps.t36s.result.value) == 2 && steps.t36s.result.value.all(a, a.client_status == 'complete')"
+      - "!('web' in state['nomad-server'].jobs)"
+
+  - id: scale-up-then-down
+    name: Re-registering with a higher count adds allocations; a lower count stops the highest indexes
+    fixtures: [two-nodes]
+    steps:
+      - {flow: job-register, as: v0, input: {job: {id: web, groups: [{name: web, count: 1}]}}}
+      - {flow: job-register, as: v1, input: {job: {id: web, groups: [{name: web, count: 3}]}}}
+      - {flow: allocations-by-job, as: three, input: {job_id: web}}
+      - {flow: job-register, as: v2, input: {job: {id: web, groups: [{name: web, count: 1}]}}}
+      - {flow: allocations-by-job, as: one, input: {job_id: web}}
+    expect:
+      - "steps.v1.result.value.job_modify_index == 1 && steps.v2.result.value.job_modify_index == 2"
+      - "steps.three.result.value.map(a, a.name) == ['web.web[0]', 'web.web[1]', 'web.web[2]'] && steps.three.result.value.all(a, a.status == 'healthy')"
+      - "steps.one.result.value.filter(a, a.client_status == 'complete').map(a, a.name) == ['web.web[1]', 'web.web[2]']"
+      - "steps.one.result.value.filter(a, a.desired_status == 'run').map(a, a.name) == ['web.web[0]']"
+      - "state['nomad-server'].jobs.web.status == 'running'"
+
+  # ---- node loss ----
+  - id: node-loss-marks-lost-and-replaces
+    name: A node that stops heartbeating is marked down after TTL plus grace; its allocation is lost and replaced elsewhere
+    fixtures: [two-nodes]
+    steps:
+      - {flow: job-register, as: reg, input: {job: {id: web, groups: [{name: web, count: 1, memory_mb: 3000}]}}}
+      - {flow: allocations-by-node, as: n1, input: {node_id: node-1}}
+      - {flow: node-crash, as: crash, at_ms: 20000, await: false, input: {node_id: node-1}}
+      - {flow: allocations-by-node, as: n1_39s, at_ms: 39000, input: {node_id: node-1}}
+      - {flow: allocations-by-node, as: n1_41s, at_ms: 41000, input: {node_id: node-1}}
+      - {flow: allocations-by-job, as: all, at_ms: 60000, input: {job_id: web}}
+    expect:
+      - "size(steps.n1.result.value) == 1 && steps.n1.result.value[0].status == 'healthy'"
+      - "steps.n1_39s.result.value[0].client_status == 'running'"
+      - "steps.n1_41s.result.value[0].client_status == 'lost'"
+      - "state['nomad-server'].nodes['node-1'].status == 'down'"
+      - "size(steps.all.result.value) == 2 && steps.all.result.value[1].node_id == 'node-2' && steps.all.result.value[1].status == 'healthy' && steps.all.result.value[1].name == 'web.web[0]'"
+      - "state['nomad-server'].jobs.web.status == 'running'"
+
+  - id: node-loss-unknown-then-lost
+    name: With disconnect.lost_after, allocations on a lost node are unknown (and replaced) until it expires, then lost
+    fixtures: [two-nodes]
+    steps:
+      - {flow: job-register, as: reg, input: {job: {id: edge, groups: [{name: edge, count: 1, memory_mb: 3000, disconnect_lost_after_ms: 60000}]}}}
+      - {flow: node-crash, as: crash, at_ms: 20000, await: false, input: {node_id: node-1}}
+      - {flow: allocations-by-job, as: t41s, at_ms: 41000, input: {job_id: edge}}
+      - {flow: allocations-by-node, as: t101s, at_ms: 101000, input: {node_id: node-1}}
+    expect:
+      - "steps.t41s.result.value[0].client_status == 'unknown' && steps.t41s.result.value[1].node_id == 'node-2'"
+      - "state['nomad-server'].nodes['node-1'].status == 'disconnected'"
+      - "steps.t101s.result.value[0].client_status == 'lost'"
+
+  # ---- refusals ----
+  - id: register-invalid-job
+    name: A job without task groups is refused
+    fixtures: [two-nodes]
+    flow: job-register
+    input: {job: {id: bad, groups: []}}
+    expect: ["!result.ok && result.error.code == 'invalid_job' && result.error.status == 400", "size(state['nomad-server'].jobs) == 0"]
+
+  - id: stop-unknown-job
+    name: Stopping a job that doesn't exist is 404
+    fixtures: [two-nodes]
+    flow: job-stop
+    input: {job_id: nope}
+    expect: ["!result.ok && result.error.code == 'job_not_found'", "size(state['nomad-server'].evals) == 0"]
+
+  - id: allocations-unknown-node
+    name: Listing allocations of an unknown node is 404
+    fixtures: [two-nodes]
+    flow: allocations-by-node
+    input: {node_id: node-x}
+    expect: ["!result.ok && result.error.code == 'node_not_found' && result.error.status == 404"]

@@ -1,0 +1,71 @@
+schema_version: 1
+id: vllm
+scenarios:
+  - id: bench-e4
+    name: "E4: SIGTERM shutdown with a request in flight (shutdown_timeout 0)"
+    description: >-
+      Corrected expectation (v0.32.0). SIGTERM reaches serve_http's handler (launcher.py:249-289),
+      which first stops the engine client: AsyncLLM.shutdown(timeout=shutdown_timeout=0) ->
+      MPClient.shutdown -> CoreEngineProcManager.shutdown -> utils.shutdown(procs, 0)
+      (core_client.py:766-777, engine/utils.py:47-67,335-348, v1/utils.py:605-660) sends SIGTERM
+      to EngineCore. EngineCore's handler sets REQUESTED and wakes the loop (core.py:1444-1468);
+      _handle_shutdown in abort mode finishes every request FINISHED_ABORTED and sends abort
+      outputs, the loop exits once has_work() is false, and run_engine_core's finally calls
+      EngineCore.shutdown -> executor.shutdown -> worker shutdown (core.py:1626-1672, 824-840).
+      With a 0 s process grace on CUDA the manager then SIGKILLs the engine-core process tree
+      right away (kill_process_tree), so that teardown is best effort. Only after the engine
+      client is stopped does it set server.should_exit (the HTTP server stops last, not first).
+      The model's flow starts at AsyncLLM.shutdown; the API server's signal handler, the
+      should_exit ordering and the force kill are not modeled.
+    fixtures: [full-tp1-llama-8b]
+    steps:
+      - flow: engine-core-busy-loop
+        input: {iterations: 40}
+        as: loop
+        await: false
+      - flow: async-llm-generate
+        input:
+          priority: 0
+          prompt_token_ids: [128000, 9906, 11, 856, 836, 374]
+          request_id: chatcmpl-abc123
+          sampling_params: {max_tokens: 64, n: 1, stop: [], temperature: 0}
+        at_ms: 0
+        as: gen
+        await: false
+      - flow: engine-shutdown
+        at_ms: 150
+        as: sd
+    expect:
+      - "steps.sd.result.ok"
+      # engine-core side: SIGTERM handler -> abort mode -> loop exits -> EngineCore.shutdown -> executor -> worker
+      - >-
+        trace.filter(e, e.type == 'call.start' && e.interface in ['engine-core-proc.signal-handler', 'scheduler.finish-requests',
+        'engine-core-proc.send-abort-outputs', 'engine-core.shutdown', 'executor.shutdown', 'gpu-worker-impl.shutdown'])
+        .map(e, e.interface) == ['engine-core-proc.signal-handler', 'scheduler.finish-requests', 'engine-core-proc.send-abort-outputs',
+        'engine-core.shutdown', 'executor.shutdown', 'gpu-worker-impl.shutdown']
+      - "trace.exists(e, e.type == 'call.start' && e.interface == 'gpu-worker-impl.shutdown' && e.instance == 'rank0')"
+      - "state['engine-core-proc'].exited && state['engine-core-proc'].shutdown_state == 'SHUTTING_DOWN' && state.scheduler.requests == {}"
+      - "state['async-mp-client'].engine_dead"
+      # the in-flight request does not run to max_tokens
+      - "!steps.gen.result.ok || steps.gen.result.value.items[size(steps.gen.result.value.items)-1].finish_reason == 'abort'"
+  - id: bench-e4-tp4
+    name: "E4 on TP 4: the mp executor shuts down all four worker processes"
+    description: >-
+      MultiprocExecutor.shutdown closes each worker's death pipe and waits for (then kills) the
+      worker processes (multiproc_executor.py:509-542); each WorkerProc's death-pipe monitor shuts
+      the worker down (multiproc_executor.py:823-850). The model's multiproc-executor.shutdown only
+      sets shutting_down, so no rank's worker shutdown is traced.
+    fixtures: [full-tp4-llama-70b]
+    steps:
+      - flow: engine-core-busy-loop
+        input: {iterations: 6}
+        as: loop
+        await: false
+      - flow: engine-shutdown
+        at_ms: 2
+        as: sd
+    expect:
+      - "steps.sd.result.ok && state['engine-core-proc'].exited"
+      - "calls['engine-core.shutdown'] == 1 && calls['multiproc-executor.shutdown'] == 1 && state['multiproc-executor'].shutting_down"
+      # verified: every rank's worker process shuts down (fails: the model's mp shutdown only sets a flag)
+      - "trace.filter(e, e.type == 'call.start' && e.interface == 'gpu-worker-impl.shutdown').map(e, e.instance) == ['rank0', 'rank1', 'rank2', 'rank3']"

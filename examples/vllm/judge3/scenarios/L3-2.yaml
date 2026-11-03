@@ -1,0 +1,74 @@
+schema_version: 1
+id: vllm
+# L3-2 Pause and resume generation (blind judge, fix round 4).
+# Verified against vllm-0.32.0:
+#  rl/online/api_router.py:31-60 (/pause, defaults mode=abort, clear_cache=True), 75-85 (/resume), 142-156 (/is_paused);
+#  async_llm.py:952-992; core.py:914-919 (_finish_pause -> _reset_caches), 898-912 (reset_prefix_cache(reset_running_requests=True)),
+#  2061-2109 (EngineCoreProc.pause_scheduler: PAUSED_ALL for keep, idle-state callback; the utility future completes
+#  only when the engine is idle), 1573-1578 (_process_input_queue notifies idle callbacks);
+#  scheduler.py:615-617 (PAUSED_ALL -> token budget 0), 900-917, 2803-2811, 2840-2866 (preempt every running request).
+# Correction to (a): clear_cache is NOT ignored for keep in EngineCoreProc; once the engine is idle, _finish_pause(True)
+# preempts the frozen running requests (KV dropped, recomputed after /resume). They are not aborted.
+scenarios:
+  - id: bench-l3-2a
+    name: pause?mode=keep during a stream freezes it (PAUSED_ALL), not aborted; clear_cache preempts it
+    fixtures: [full-tp1-llama-8b]
+    config: {vllm-server-dev-mode: true}
+    max_events: 600000
+    max_iterations: 1000000
+    steps:
+      - {flow: serving-api-chat-stream, input: {body: {max_tokens: 6}}, as: chat, await: false}
+      - {interface: rl-online-router.post-pause, caller: api-client, input: {path: /pause, query: {mode: keep, clear_cache: true}}, as: pause, at_ms: 170}
+      - {interface: rl-online-router.get-is-paused, caller: api-client, input: {path: /is_paused}, as: isp, at_ms: 300}
+      - {interface: rl-online-router.post-resume, caller: api-client, input: {path: /resume}, as: res, at_ms: 600}
+    expect:
+      - "steps.pause.result.value == {'status': 'paused'} && steps.isp.result.value == {'is_paused': true}"
+      - "trace.exists(e, e.type == 'call.start' && e.interface == 'scheduler.set-pause-state' && e.input.pause_state == 'PAUSED_ALL')"
+      - "calls['scheduler.finish-requests'] == 0 || !trace.exists(e, e.type == 'call.start' && e.interface == 'scheduler.finish-requests' && e.input.finished_status == 'FINISHED_ABORTED')"
+      # clear_cache=true: the frozen running request is preempted (core.py:914-919 -> scheduler.py:2850-2866)
+      - "trace.exists(e, e.type == 'call.start' && e.interface == 'scheduler.preempt-request')"
+      # no scheduling between the pause and the resume (scheduler.py:615-617, 900)
+      - "!trace.exists(e, e.type == 'call.start' && e.interface == 'executor.execute-model' && e.t > 260 && e.t < 600)"
+      - "steps.res.result.value == {'status': 'resumed'}"
+      - "steps.chat.result.ok"
+
+  - id: bench-l3-2b
+    name: a request sent during a keep pause is queued; after /resume both finish normally
+    fixtures: [full-tp1-llama-8b]
+    config: {vllm-server-dev-mode: true}
+    max_events: 900000
+    max_iterations: 1000000
+    max_virtual_ms: 5000
+    steps:
+      - {flow: serving-api-chat-stream, input: {body: {max_tokens: 6}}, as: chat, await: false}
+      - {interface: rl-online-router.post-pause, caller: api-client, input: {path: /pause, query: {mode: keep, clear_cache: true}}, as: pause, at_ms: 170}
+      - {flow: serving-api-chat-completion, input: {body: {max_tokens: 4}}, as: chat2, await: false, at_ms: 220}
+      - {interface: rl-online-router.post-resume, caller: api-client, input: {path: /resume}, as: res, at_ms: 600}
+      - {interface: rl-online-router.get-is-paused, caller: api-client, input: {path: /is_paused}, as: late, at_ms: 2500}
+    expect:
+      - "steps.res.result.value == {'status': 'resumed'} && steps.late.result.value == {'is_paused': false}"
+      - "steps.chat2.result.ok && steps.chat2.result.value.choices[0].finish_reason == 'length'"
+      # nothing scheduled while paused, so chat2's first schedule is after the resume
+      - "!trace.exists(e, e.type == 'call.start' && e.interface == 'executor.execute-model' && e.t > 260 && e.t < 600)"
+      # the frozen stream must also finish normally after the resume
+      - "steps.chat.result.ok"
+
+  - id: bench-l3-2c
+    name: pause?mode=wait returns only after the in-flight request finishes; requests queued meanwhile don't delay it
+    fixtures: [full-tp1-llama-8b]
+    config: {vllm-server-dev-mode: true}
+    max_events: 900000
+    max_iterations: 1000000
+    steps:
+      - {flow: serving-api-chat-completion, input: {body: {max_tokens: 6}}, as: chat, await: false}
+      - {interface: rl-online-router.post-pause, caller: api-client, input: {path: /pause, query: {mode: wait}}, as: pause, at_ms: 170, await: false}
+      - {flow: serving-api-chat-completion, input: {body: {max_tokens: 4}}, as: chat2, await: false, at_ms: 200}
+      - {interface: rl-online-router.post-resume, caller: api-client, input: {path: /resume}, as: res, at_ms: 900}
+    expect:
+      - "steps.chat.result.ok && steps.chat.result.value.choices[0].finish_reason == 'length'"
+      - "steps.pause.result.value == {'status': 'paused'}"
+      - "trace.exists(e, e.type == 'call.start' && e.interface == 'scheduler.set-pause-state' && e.input.pause_state == 'PAUSED_NEW')"
+      # chat2 waits for the resume (PAUSED_NEW admits nothing new): its only output comes after 900 ms
+      - "steps.chat2.result.ok && steps.chat2.result.value.choices[0].finish_reason == 'length'"
+      # code: the /pause reply comes only after the in-flight request finished (core.py:2098-2103, 1573-1578)
+      - "trace.exists(e, e.type == 'call.end' && e.interface == 'rl-online-router.post-pause' && e.t >= 300)"

@@ -1,0 +1,77 @@
+schema_version: 1
+id: vllm
+scenarios:
+  - id: bench-p5
+    name: "P5: TP2 x PP2 (70B on 4 GPUs); the PP stage-1 worker rank2 dies mid-step"
+    fixtures: [full-tp4-llama-70b]
+    config:
+      tensor-parallel-size: 2
+      pipeline-parallel-size: 2
+    state:
+      gpu-worker-impl@rank0: {is_first_pp_rank: true, is_last_pp_rank: false, pp_rank: 0}
+      gpu-worker-impl@rank1: {is_first_pp_rank: true, is_last_pp_rank: false, pp_rank: 0}
+      gpu-worker-impl@rank2: {is_first_pp_rank: false, is_last_pp_rank: true, pp_rank: 1}
+      gpu-worker-impl@rank3: {is_first_pp_rank: false, is_last_pp_rank: true, pp_rank: 1}
+      gpu-model-runner@rank0: {is_first_pp_rank: true, is_last_pp_rank: false, pp_rank: 0}
+      gpu-model-runner@rank1: {is_first_pp_rank: true, is_last_pp_rank: false, pp_rank: 0}
+      gpu-model-runner@rank2: {is_first_pp_rank: false, is_last_pp_rank: true, pp_rank: 1}
+      gpu-model-runner@rank3: {is_first_pp_rank: false, is_last_pp_rank: true, pp_rank: 1}
+      output-processor:
+        request_states:
+          chatcmpl-inflight-0:
+            {external_req_id: chatcmpl-inflight, has_queue: true, is_prefilling: false, num_output_tokens: 3, output_text: 'abc', parent: null, prompt_len: 4, stop: []}
+      request-output-collector:
+        queues:
+          chatcmpl-inflight-0: {error: null, output: null}
+    steps:
+      # stage 1 (rank2) starts its step and waits for stage 0's intermediate tensors
+      - flow: wr-pipeline-parallel-step
+        input: &step
+          num_scheduled_tokens: {chatcmpl-abc123: 4}
+          scheduled_new_reqs:
+            - block_ids: [1]
+              num_computed_tokens: 0
+              prompt_token_ids: [128000, 9906, 1917, 1234]
+              req_id: chatcmpl-abc123
+              sampling_params: {temperature: 0}
+          total_num_scheduled_tokens: 4
+        'on': rank2
+        await: false
+        as: st1
+      # rank2's process dies mid-step
+      - kill: {component: gpu-worker-impl, instance: rank2}
+      # (a) stage 0 finishes its forward and sends (non-blocking isend) its intermediate tensors; nobody on rank2 answers
+      - flow: wr-pipeline-parallel-step
+        input: *step
+        'on': rank1
+        await: false
+        as: st0b
+      - flow: wr-pipeline-parallel-step
+        input: *step
+        'on': rank0
+        as: st0
+      # (b) the MultiprocWorkerMonitor sees rank2's sentinel
+      - interface: multiproc-executor.monitor-workers
+        caller: engine-core
+        input: {died_rank: rank2, exitcode: -9}
+        as: died
+      # (c) the busy loop raises on EXECUTOR_FAILED; the engine is dead
+      - flow: engine-core-busy-loop
+        input: {iterations: 3}
+        as: loop
+      - interface: request-output-collector.get
+        caller: api-server
+        input: {request_id: chatcmpl-inflight-0}
+        as: inflight
+      - flow: serving-api-chat-completion
+        as: chat
+    expect:
+      - "!steps.st1.result.ok"
+      - "steps.st0.result.ok && steps.st0.result.value == null && steps.st0b.result.ok"
+      - "trace.exists(e, e.type == 'put' && e.key == 'pp-hidden:1' && e.instance == 'rank0')"
+      - "!trace.exists(e, e.type == 'receive' && e.key == 'pp-hidden:1' && e.instance == 'rank2' && e.error == null)"
+      - "steps.died.result.value.handled && state['multiproc-executor'].is_failed"
+      - "!steps.loop.result.ok && steps.loop.result.error.message == 'Executor failed.'"
+      - "!steps.inflight.result.ok && steps.inflight.result.error.code == 'engine-dead-error'"
+      - "!steps.chat.result.ok && steps.chat.result.error.status == 500"
+      - "state.launcher.server_should_exit == true"

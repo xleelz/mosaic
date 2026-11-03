@@ -1,0 +1,138 @@
+schema_version: 1
+id: vllm
+# No MoE world exists in the shared fixtures; Mixtral-8x7B (8 experts, top-2) from models-layers-seed's hf-hub
+# stands in for Qwen3-30B-A3B on the 4-GPU hardware of full-tp4-llama-70b, with TP 1 and DP 4.
+scenarios:
+  # (a) FusedMoEParallelConfig.make (fused_moe/config.py:1189-1236): use_ep = DP*PCP*TP > 1 and enable_expert_parallel;
+  # with EP, ep_size = flattened TP = DP*TP = 4 and MoE tp = 1, so 8 experts -> 2 whole experts per GPU.
+  # Without EP, the MoE weights are TP-sharded over the flattened DP*TP = 4 devices.
+  - id: bench-p3-3a
+    name: MoE DP 4 + EP - each GPU owns a quarter of the experts whole
+    fixtures: [full-tp4-llama-70b]
+    config: {tensor-parallel-size: 1, data-parallel-size: 4, enable-expert-parallel: true}
+    steps:
+      - interface: mixtral-for-causal-lm.init
+        caller: gpu-worker
+        as: ep
+        input:
+          quant: unquantized
+          hf_config: {architectures: [MixtralForCausalLM], hidden_size: 4096, intermediate_size: 14336, max_position_embeddings: 32768, num_attention_heads: 32, num_experts_per_tok: 2, num_hidden_layers: 32, num_key_value_heads: 8, num_local_experts: 8, torch_dtype: bfloat16, vocab_size: 32000}
+      - interface: parallel-state.initialize-model-parallel
+        caller: gpu-worker
+        as: groups
+        input: {tensor_model_parallel_size: 1, pipeline_model_parallel_size: 1, data_parallel_size: 4, is_moe: true}
+    expect:
+      - "steps.ep.result.ok"
+      - "state['mixtral-for-causal-lm@rank0'].cfg.ep_size == 4"
+      - "state['mixtral-for-causal-lm@rank0'].cfg.moe_tp == 1"
+      - "state['mixtral-for-causal-lm@rank0'].cfg.num_local_physical_experts == 2"
+      - "state['parallel-state@rank0'].groups.ep.world_size == 4"
+
+  - id: bench-p3-3a-no-ep
+    name: MoE DP 4 without EP - expert weights TP-sharded over all 4 GPUs
+    fixtures: [full-tp4-llama-70b]
+    config: {tensor-parallel-size: 1, data-parallel-size: 4, enable-expert-parallel: false}
+    steps:
+      - interface: mixtral-for-causal-lm.init
+        caller: gpu-worker
+        as: noep
+        input:
+          quant: unquantized
+          hf_config: {architectures: [MixtralForCausalLM], hidden_size: 4096, intermediate_size: 14336, max_position_embeddings: 32768, num_attention_heads: 32, num_experts_per_tok: 2, num_hidden_layers: 32, num_key_value_heads: 8, num_local_experts: 8, torch_dtype: bfloat16, vocab_size: 32000}
+    expect:
+      - "steps.noep.result.ok && state['mixtral-for-causal-lm@rank0'].cfg.ep_size == 1"
+      - "state['mixtral-for-causal-lm@rank0'].cfg.moe_tp == 4"
+
+  # (b) MoE + DP: every rank runs a DPEngineCoreProc (core.py:1473-1476); the coordinator runs with
+  # enable_wave_coordination = is_moe (engine/utils.py:1227-1235).
+  - id: bench-p3-3b
+    name: MoE DP 4 - every rank is a DPEngineCoreProc, coordinator with waves
+    fixtures: [full-tp4-llama-70b]
+    config: {tensor-parallel-size: 1, data-parallel-size: 4, enable-expert-parallel: true, model: mistralai/Mixtral-8x7B-Instruct-v0.1}
+    topology:
+      engine-core-proc: [dp0, dp1, dp2, dp3]
+      dp-engine-core-proc: [dp0, dp1, dp2, dp3]
+    steps:
+      - {interface: vllm-config.needs-dp-coordinator, caller: engine-core, input: {data_parallel_size: 4, is_moe: true, data_parallel_external_lb: true}, as: coord}
+      - {interface: engine-core-proc.run-engine-core, caller: engine-core, input: {iterations: 1}, 'on': dp0, as: e0}
+    expect:
+      - "steps.coord.result.value.needs_dp_coordinator == true"
+      - "trace.exists(e, e.type == 'call.start' && e.interface == 'dp-engine-core-proc.run-busy-loop')"
+      - "calls['engine-core-proc.run-busy-loop'] == 0"
+
+  # (c) one request on a paused server: the client sends FIRST_REQ to the coordinator (core_client.py:1590-1593),
+  # which broadcasts START_DP_WAVE to the other engines (coordinator.py:355-374,468-478); the target rank
+  # steps the request while the idle ranks each run a dummy batch (core.py:2357-2363); the step-1 all-reduce
+  # spans all 4 ranks.
+  - id: bench-p3-3c
+    name: MoE DP 4 - one request wakes all ranks; idle ranks run dummy batches
+    fixtures: [full-tp4-llama-70b]
+    config: {tensor-parallel-size: 1, data-parallel-size: 4}
+    topology:
+      engine-core-proc: [dp0, dp1, dp2, dp3]
+      dp-engine-core-proc: [dp0, dp1, dp2, dp3]
+    # dp1..dp3 already received START_DP_WAVE (seeded, since no coordinator is modeled)
+    state:
+      dp-engine-core-proc@dp1: {engines_running: true}
+      dp-engine-core-proc@dp2: {engines_running: true}
+      dp-engine-core-proc@dp3: {engines_running: true}
+    steps:
+      - {flow: dp-client-add-request, input: {request_id: chatcmpl-w1-00000001, sampling_params: {max_tokens: 2, n: 1, logprobs: -1, temperature: 0.0}}, as: add}
+      - {interface: dp-engine-core-proc.run-busy-loop, caller: engine-core, input: {dp_rank: 0}, 'on': dp0, as: l0, await: false}
+      - {interface: dp-engine-core-proc.run-busy-loop, caller: engine-core, input: {dp_rank: 1}, 'on': dp1, as: l1, await: false}
+      - {interface: dp-engine-core-proc.run-busy-loop, caller: engine-core, input: {dp_rank: 2}, 'on': dp2, as: l2, await: false}
+      - {interface: dp-engine-core-proc.run-busy-loop, caller: engine-core, input: {dp_rank: 3}, 'on': dp3, as: l3}
+    expect:
+      - "steps.add.result.value.engine == 'dp0'"
+      # FIRST_REQ to the coordinator / START_DP_WAVE broadcast
+      - "trace.exists(e, e.type == 'call.start' && (e.interface == 'dp-lb-async-mp-client.run-engine-stats-update-task' || e.interface.startsWith('dp-coordinator.')))"
+      - "steps.l0.result.ok && steps.l1.result.ok && steps.l2.result.ok && steps.l3.result.ok"
+      - "steps.l0.result.value.engines_running && !steps.l0.result.value.dummy"
+      - "steps.l1.result.value.dummy && steps.l2.result.value.dummy && steps.l3.result.value.dummy"
+
+  # (d) all ranks in a live wave with nothing left: dummy batch, step-1 all-reduce says done; only rank 0
+  # sends wave_complete; every rank increments the wave and resets the step counter (core.py:2369-2393).
+  - id: bench-p3-3d-wave-end
+    name: MoE DP 4 - the wave ends on the step-1 sync; rank 0 reports wave_complete
+    fixtures: [full-tp4-llama-70b]
+    config: {tensor-parallel-size: 1, data-parallel-size: 4}
+    topology:
+      dp-engine-core-proc: [dp0, dp1, dp2, dp3]
+    state:
+      dp-engine-core-proc@dp0: {engines_running: true}
+      dp-engine-core-proc@dp1: {engines_running: true}
+      dp-engine-core-proc@dp2: {engines_running: true}
+      dp-engine-core-proc@dp3: {engines_running: true}
+    steps:
+      - {interface: dp-engine-core-proc.run-busy-loop, caller: engine-core, input: {dp_rank: 0}, 'on': dp0, as: l0, await: false}
+      - {interface: dp-engine-core-proc.run-busy-loop, caller: engine-core, input: {dp_rank: 1}, 'on': dp1, as: l1, await: false}
+      - {interface: dp-engine-core-proc.run-busy-loop, caller: engine-core, input: {dp_rank: 2}, 'on': dp2, as: l2, await: false}
+      - {interface: dp-engine-core-proc.run-busy-loop, caller: engine-core, input: {dp_rank: 3}, 'on': dp3, as: l3}
+    expect:
+      - "[steps.l0, steps.l1, steps.l2, steps.l3].all(s, s.result.ok && !s.result.value.engines_running && s.result.value.dummy)"
+      - "state['dp-engine-core-proc@dp0'].wave_complete == [0]"
+      - "[1, 2, 3].all(i, state['dp-engine-core-proc@dp' + string(i)].wave_complete == [])"
+      - "[0, 1, 2, 3].all(i, state['dp-engine-core-proc@dp' + string(i)].current_wave == 1 && state['dp-engine-core-proc@dp' + string(i)].step_counter == 0)"
+      - "trace.filter(e, e.type == 'call.start' && e.interface == 'engine-core.execute-dummy-batch').size() == 4"
+
+  # (d) sync cadence: step 1 syncs, steps 2..15 don't, step 16 does (core.py:2410-2418, parallel.py:162).
+  - id: bench-p3-3d-cadence
+    name: MoE DP 2 - the unfinished all-reduce runs on step 1 and every 16th step
+    fixtures: [full-tp4-llama-70b]
+    config: {tensor-parallel-size: 1, data-parallel-size: 2}
+    topology:
+      dp-engine-core-proc: [dp0, dp1]
+    state:
+      dp-engine-core-proc@dp0: {step_counter: 1}
+      dp-engine-core-proc@dp1: {step_counter: 1}
+    steps:
+      # step 2: no sync, keeps running even though nothing is unfinished
+      - {interface: dp-engine-core-proc.has-global-unfinished-reqs, caller: engine-core, input: {local_unfinished: false}, 'on': dp0, as: s2}
+      - set: {"dp-engine-core-proc@dp0": {step_counter: 15}, "dp-engine-core-proc@dp1": {step_counter: 15}}
+      # step 16: both ranks sync; rank 1 still has work
+      - {interface: dp-engine-core-proc.has-global-unfinished-reqs, caller: engine-core, input: {local_unfinished: false}, 'on': dp0, as: s16a, await: false}
+      - {interface: dp-engine-core-proc.has-global-unfinished-reqs, caller: engine-core, input: {local_unfinished: true}, 'on': dp1, as: s16b}
+    expect:
+      - "steps.s2.result.value == true"
+      - "steps.s16a.result.value == true && steps.s16b.result.value == true"
+      - "state['dp-engine-core-proc@dp0'].step_counter == 16"

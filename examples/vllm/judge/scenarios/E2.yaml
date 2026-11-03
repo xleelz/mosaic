@@ -1,0 +1,44 @@
+schema_version: 1
+id: vllm
+scenarios:
+  - id: bench-e2
+    name: "E2: the engine-core busy loop: idle, ADD, step, outputs over ZMQ, idle again"
+    description: >-
+      Verified against v0.32.0 core.py:1547-1620: while _handle_shutdown(): _process_input_queue()
+      (blocks on input_queue.get while has_work() is false, after notifying idle callbacks and
+      clearing the aborts queue), then _process_engine_step() runs step_fn and puts the outputs on
+      output_queue, which the process_output_sockets thread sends over ZMQ (core.py:1933). With the
+      default config async scheduling is on (vllm.py:1585-1644), so max_concurrent_batches is 2 and
+      step_fn is step_with_batch_queue (core.py:219-243), not step().
+    fixtures: [full-tp1-llama-8b]
+    steps:
+      - flow: engine-core-busy-loop
+        input: {iterations: 12}
+        as: loop
+        await: false
+      - flow: async-llm-generate
+        at_ms: 0
+        as: gen
+    expect:
+      - "steps.gen.result.ok && steps.gen.result.value.items[size(steps.gen.result.value.items)-1].finished && steps.gen.result.value.items[size(steps.gen.result.value.items)-1].finish_reason == 'length' && size(steps.gen.result.value.items[size(steps.gen.result.value.items)-1].token_ids) == 4"
+      # idle iterations before the ADD arrives: no engine step
+      - "trace.filter(e, e.type == 'call.start' && e.interface == 'engine-core-proc.notify-idle-state-callbacks')[0].seq < trace.filter(e, e.type == 'call.start' && e.interface == 'engine-core-proc.handle-add')[0].seq"
+      - "trace.filter(e, e.type == 'call.start' && e.interface == 'engine-core-proc.process-engine-step')[0].seq > trace.filter(e, e.type == 'call.start' && e.interface == 'engine-core-proc.handle-add')[0].seq"
+      # ADD arrives over the input socket thread, then through the input queue to the scheduler
+      - >-
+        trace.filter(e, e.type == 'call.start' && e.interface in ['engine-core-proc.process-input-sockets', 'engine-core-proc.handle-add', 'scheduler.add-request'])
+        .map(e, e.interface).slice(0, 3) == ['engine-core-proc.process-input-sockets', 'engine-core-proc.handle-add', 'scheduler.add-request']
+      # default async scheduling: step_with_batch_queue, never step()
+      - "calls['engine-core.step-with-batch-queue'] >= 4 && calls['engine-core.step'] == 0"
+      # each step: schedule -> execute_model -> sample_tokens -> update_from_output, then outputs to the client over ZMQ
+      - >-
+        trace.filter(e, e.type == 'call.start' && e.interface in ['scheduler.schedule', 'executor.execute-model', 'executor.sample-tokens', 'scheduler.update-from-output', 'engine-core-proc.process-output-sockets'])
+        .map(e, e.interface).slice(0, 8) == ['scheduler.schedule', 'executor.execute-model', 'executor.sample-tokens',
+        'scheduler.schedule', 'executor.execute-model', 'executor.sample-tokens', 'scheduler.update-from-output', 'engine-core-proc.process-output-sockets']
+      - "trace.exists(e, e.type == 'call.start' && e.interface == 'gpu-worker-impl.execute-model' && e.instance == 'rank0')"
+      - "calls['engine-core-proc.process-output-sockets'] >= 4 && calls['async-llm.output-handler'] >= 4"
+      # once the request finishes the loop goes idle again: the last iterations step nothing
+      - "trace.exists(i, i.type == 'call.start' && i.interface == 'engine-core-proc.notify-idle-state-callbacks' && trace.all(s, !(s.type == 'call.start' && s.interface == 'engine-core-proc.process-engine-step') || s.seq < i.seq))"
+      # round 2: the busy loop now blocks on an input-channel receive instead of polling a 1 ms
+      # iteration budget, so it parks (still active, not exited) on an empty input queue
+      - "state['engine-core-proc'].loop_active && !state['engine-core-proc'].exited && channel_len('engine-core-input:engine-core-proc') == 0 && state.scheduler.requests == {} && state.scheduler.running == []"

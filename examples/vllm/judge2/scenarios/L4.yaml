@@ -1,0 +1,43 @@
+schema_version: 1
+id: vllm
+scenarios:
+  - id: bench-l4
+    name: "L4 (a-c) abort a request still waiting (never scheduled)"
+    fixtures: [full-tp1-llama-8b]
+    state:
+      output-processor:
+        external_req_ids: {chatcmpl-abc123: [chatcmpl-abc123-00000001]}
+        request_states:
+          chatcmpl-abc123-00000001: {external_req_id: chatcmpl-abc123, has_queue: true, is_prefilling: true, num_output_tokens: 0, output_text: "", parent: null, prompt_len: 3, stop: []}
+      request-output-collector:
+        queues:
+          chatcmpl-abc123-00000001: {error: null, output: null}
+    steps:
+      - {interface: scheduler.add-request, caller: engine-core, input: {request_id: chatcmpl-abc123-00000001, prompt_token_ids: [128000, 9906, 1917]}, as: add}
+      - {flow: async-llm-abort, input: {request_ids: [chatcmpl-abc123], internal: false}, as: ab}
+      - {interface: request-output-collector.get, caller: api-server, input: {request_id: chatcmpl-abc123-00000001}, as: got}
+      - {flow: engine-core-busy-loop, input: {iterations: 1}, as: loop}
+      - {interface: scheduler.get-request-counts, caller: engine-core, as: cnt}
+    expect:
+      - "steps.add.result.value.status == 'WAITING'"
+      # (a) ABORT crosses to the engine core and the scheduler drops it from the waiting queue
+      - "steps.ab.result.value == null || steps.ab.result.ok"
+      - "trace.exists(e, e.type == 'call.start' && e.interface == 'engine-core-proc.handle-abort')"
+      - "trace.exists(e, e.type == 'call.start' && e.interface == 'scheduler.finish-requests' && e.input.request_ids == ['chatcmpl-abc123-00000001'])"
+      - "steps.cnt.result.value.num_waiting == 0 && size(state.scheduler.waiting) == 0"
+      # (b) nothing to free: no blocks were ever allocated
+      - "size(state['block-pool'].ref_cnt) == 0 && state['block-pool'].next_fresh == 1 && size(state['full-attention-manager'].req_to_blocks) == 0"
+      - "!trace.exists(e, e.type == 'call.start' && e.interface == 'block-pool.free-blocks')"
+      # (c) finish_reason abort; never in a SchedulerOutput as scheduled
+      - "steps.got.result.value.output.finish_reason == 'abort' && steps.got.result.value.output.finished"
+      - "trace.filter(e, e.type == 'call.end' && e.interface == 'scheduler.schedule').all(e, !e.output.scheduled_new_reqs.exists(r, r.req_id == 'chatcmpl-abc123-00000001'))"
+      - "trace.exists(e, e.type == 'call.end' && e.interface == 'scheduler.schedule' && e.output.finished_req_ids == ['chatcmpl-abc123-00000001'])"
+  - id: bench-l4d
+    name: "L4 (d) abort a request in WAITING_FOR_STRUCTURED_OUTPUT_GRAMMAR"
+    fixtures: [full-tp1-llama-8b]
+    steps:
+      - {interface: scheduler.add-request, caller: engine-core, input: {request_id: so-1, prompt_token_ids: [128000, 9906, 1917], grammar_id: g1, sampling_params: {max_tokens: 16, structured_outputs: {json: {type: object}}}}, as: add}
+      - {interface: scheduler.finish-requests, caller: engine-core, input: {request_ids: [so-1]}, as: abort}
+    expect:
+      - "steps.add.result.value.status == 'WAITING_FOR_STRUCTURED_OUTPUT_GRAMMAR'"
+      - "steps.abort.result.value.finished == ['so-1']"

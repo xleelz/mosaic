@@ -1,0 +1,360 @@
+# Round 4: tokenizer and renderer registries, the HF tokenizer behind TokenizerLike, the Cohere renderer.
+configs:
+  - id: tokenizer-mode
+    type: string
+    value: auto
+    default: auto
+    summary: "ModelConfig.tokenizer_mode (--tokenizer-mode): auto resolves to hf (or mistral for Mistral-format repos); it also names the renderer (owned by config-platform)"
+    sources: ["vllm/config/model.py:172", "vllm/tokenizers/registry.py:136-140"]
+    attributes: {key: tokenizer_mode, boundary: true, owner: config-platform}
+  - id: skip-tokenizer-init
+    type: boolean
+    value: false
+    default: false
+    summary: "ModelConfig.skip_tokenizer_init: no tokenizer at all (token-in/token-out only) (owned by config-platform)"
+    sources: ["vllm/tokenizers/registry.py:285-287"]
+    attributes: {key: skip_tokenizer_init, boundary: true, owner: config-platform}
+components:
+  - {id: media-connector, name: MediaConnector (merge_media_io_kwargs), kind: module, parent: multi-modal-registry, layer: multimodal, summary: "Owned by models-layers: merges --media-io-kwargs and a request's media_io_kwargs per modality.", sources: ["vllm/multimodal/media/connector.py:51-55"], attributes: {boundary: true, owner: models-layers}}
+  - id: tokenizer-registry
+    name: tokenizers.registry
+    kind: module
+    parent: api-server
+    layer: api
+    summary: "get_tokenizer and the TokenizerRegistry: resolve the tokenizer mode and arguments, pick the class by mode, load it from the hub or a local path."
+    sources: ["vllm/tokenizers/registry.py:38-298"]
+    tags: [cache]
+    state:
+      schema: {type: object, properties: {tokenizers: {type: object}}}
+      initial:
+        tokenizers: {cohere: CachedHfTokenizer, deepseek_v32: DeepseekV32Tokenizer, deepseek_v4: DeepseekV4Tokenizer, deepseek_v41: DeepseekV41Tokenizer, hf: CachedHfTokenizer, kimi_audio: KimiAudioTokenizer, kimi_k3: CachedHfTokenizer, mistral: MistralTokenizer, inkling: CachedHfTokenizer}
+  - id: hf-tokenizer
+    name: CachedHfTokenizer
+    kind: module
+    parent: api-server
+    layer: api
+    summary: "The TokenizerLike protocol as the HF fast tokenizer implements it (AutoTokenizer, with cached special ids, vocab and length): encode, decode, get_vocab. Token texts are the model's stand-in (' t<id>'), the same the detokenizer uses."
+    sources: ["vllm/tokenizers/protocol.py:13-130", "vllm/tokenizers/hf.py:106-215"]
+  - id: renderer-registry
+    name: RendererRegistry
+    kind: module
+    parent: api-server
+    layer: api
+    summary: "renderer_from_config: the renderer class registered for the tokenizer mode (hf, cohere, mistral, deepseek, kimi, inkling, terratorch)."
+    sources: ["vllm/renderers/registry.py:21-88"]
+    state:
+      schema: {type: object, properties: {renderers: {type: object}}}
+      initial:
+        renderers: {cohere: CohereRenderer, deepseek_v32: DeepseekV32Renderer, deepseek_v4: DeepseekV4Renderer, deepseek_v41: DeepseekV4Renderer, hf: HfRenderer, kimi_audio: HfRenderer, kimi_k3: KimiK3Renderer, mistral: MistralRenderer, terratorch: TerratorchRenderer, inkling: InklingRenderer}
+  - id: cohere-renderer
+    name: CohereRenderer
+    kind: module
+    parent: api-server
+    layer: api
+    summary: "Renders Cohere Command prompts through the melody bindings (render_cmd3 / render_cmd4) instead of a jinja chat template; enabled with --tokenizer-mode cohere."
+    sources: ["vllm/renderers/cohere.py:238-829"]
+interfaces:
+  - component: media-connector
+    name: merge-media-io-kwargs
+    kind: function
+    summary: "merge_media_io_kwargs (models-layers): defaults (null reads --media-io-kwargs) merged with a request's overrides per modality; VideoMediaIO.merge_kwargs strips a request GPU video backend; None when both are empty."
+    sources: ["vllm/multimodal/media/connector.py:129-148"]
+    attributes: {boundary: true, owner: models-layers}
+    request: {type: object, properties: {defaults: {type: [object, "null"], default: null}, overrides: {type: [object, "null"], default: null}}}
+    response: {type: [object, "null"]}
+  - component: tokenizer-registry
+    name: resolve-tokenizer-args
+    kind: function
+    summary: "resolve_tokenizer_args: truncation side from the runner (generate: left, pooling: right); auto mode becomes mistral for a Mistral-format repo (tekken.json or tokenizer.model.v*), else hf; hf refuses mistral_format."
+    sources: ["vllm/tokenizers/registry.py:90-158", "vllm/transformers_utils/repo_utils.py:209-243"]
+    request:
+      type: object
+      properties:
+        tokenizer_name: {type: string, examples: [meta-llama/Llama-3.1-8B-Instruct]}
+        tokenizer_mode: {type: string, default: auto}
+        runner_type: {type: string, default: generate}
+        truncation_side: {type: [string, "null"], default: null}
+        mistral_format: {type: boolean, default: false}
+      required: [tokenizer_name]
+    errors: [{code: value-error, status: 0, retryable: false}]
+    behavior:
+      - title: "truncation_side defaults by runner: generate/draft truncate on the left, pooling on the right"
+        source: "vllm/tokenizers/registry.py:114-120"
+        set:
+          vars.side: "= has(input.truncation_side) && input.truncation_side != null ? input.truncation_side : (has(input.runner_type) && input.runner_type == 'pooling' ? 'right' : 'left')"
+          vars.mode: "= has(input.tokenizer_mode) ? input.tokenizer_mode : 'auto'"
+      - if: "vars.mode == 'auto'"
+        then:
+          - title: "is_mistral_model_repo and any_pattern_in_repo_files(tekken.json, tokenizer.model.v*): list_repo_files through the shared, lazily created HfApi client (hf_api())"
+            source: "vllm/transformers_utils/repo_utils.py:33-41"
+            call: hf-hub.list-repo-files
+            input: {repo_id: "= input.tokenizer_name"}
+            as: files
+          - set:
+              vars.mode: "= input.tokenizer_name.startsWith('mistralai/') && vars.files.value.files.exists(f, f == 'tekken.json' || f.startsWith('tokenizer.model.v')) ? 'mistral' : 'hf'"
+      - if: "vars.mode == 'hf' && has(input.mistral_format) && input.mistral_format"
+        then: [{source: "vllm/tokenizers/registry.py:139-143", fail: {code: value-error, message: "mistral_format=True is not supported with tokenizer_mode='hf'"}}]
+      - return: {tokenizer_mode: "= vars.mode", tokenizer_name: "= input.tokenizer_name", truncation_side: "= vars.side"}
+  - component: tokenizer-registry
+    name: get-tokenizer
+    kind: function
+    summary: "get_tokenizer: resolve the mode, load the class registered for it (unknown mode: ValueError), read the model config when available (errors suppressed), from_pretrained, and keep the requested name as name_or_path for HF tokenizers."
+    sources: ["vllm/tokenizers/registry.py:196-279", "vllm/tokenizers/registry.py:68-82"]
+    request:
+      type: object
+      properties:
+        tokenizer_name: {type: string, examples: [meta-llama/Llama-3.1-8B-Instruct]}
+        tokenizer_mode: {type: string, default: auto}
+        runner_type: {type: string, default: generate}
+        trust_remote_code: {type: boolean, default: false}
+      required: [tokenizer_name]
+    errors: [{code: value-error, status: 0, retryable: false}, {code: os-error, status: 0, retryable: false}]
+    behavior:
+      - source: "vllm/tokenizers/registry.py:212-219"
+        call: tokenizer-registry.resolve-tokenizer-args
+        input: {tokenizer_name: "= input.tokenizer_name", tokenizer_mode: "= has(input.tokenizer_mode) ? input.tokenizer_mode : 'auto'", runner_type: "= has(input.runner_type) ? input.runner_type : 'generate'"}
+        as: args
+      - title: "TokenizerRegistry.load_tokenizer_cls: the class registered for the mode"
+        source: "vllm/tokenizers/registry.py:68-75"
+        if: "!(vars.args.value.tokenizer_mode in state.tokenizers)"
+        then: [{fail: {code: value-error, message: "= 'No tokenizer registered for tokenizer_mode=\\'' + vars.args.value.tokenizer_mode + '\\'.'"}}]
+      - set: {vars.cls: "= state.tokenizers[vars.args.value.tokenizer_mode]"}
+      - title: "get_config with ValueError/OSError suppressed: the model_type decides a TokenizersBackend override"
+        source: "vllm/tokenizers/registry.py:227-245"
+        call: hf-hub.download-config
+        input: {model: "= input.tokenizer_name"}
+        as: cfg
+        on_error: continue
+      - if: "vars.cls == 'MistralTokenizer'"
+        then:
+          - source: "vllm/tokenizers/registry.py:253"
+            call: mistral-tokenizer.from-pretrained
+            input: {path_or_repo_id: "= input.tokenizer_name"}
+      - title: "from_pretrained: AutoTokenizer from the repo; a missing repo is an OSError"
+        source: "vllm/tokenizers/hf.py:171-190"
+        if: "!vars.cfg.ok"
+        then: [{fail: {code: os-error, message: "= 'Can\\'t load tokenizer for \\'' + input.tokenizer_name + '\\'.'"}}]
+      - title: "An HF tokenizer keeps the requested name as name_or_path; the cached wrapper fixes its special ids, vocab and max_token_id"
+        source: "vllm/tokenizers/registry.py:253-262"
+        return:
+          tokenizer_class: "= vars.cls"
+          tokenizer_mode: "= vars.args.value.tokenizer_mode"
+          name_or_path: "= input.tokenizer_name"
+          truncation_side: "= vars.args.value.truncation_side"
+          is_fast: true
+          max_token_id: "= has(vars.cfg.value.vocab_size) ? vars.cfg.value.vocab_size - 1 : 128255"
+  - component: tokenizer-registry
+    name: cached-tokenizer-from-config
+    kind: function
+    summary: "cached_tokenizer_from_config: None when skip_tokenizer_init, else the (cached) get_tokenizer for the model config's tokenizer, mode and runner."
+    sources: ["vllm/tokenizers/registry.py:285-298"]
+    request: {type: object, properties: {runner_type: {type: string, default: generate}}}
+    behavior:
+      - if: "config['skip-tokenizer-init']"
+        then: [{source: "vllm/tokenizers/registry.py:286-287", return: {tokenizer: null}}]
+      - source: "vllm/tokenizers/registry.py:291-298"
+        call: tokenizer-registry.get-tokenizer
+        input: {tokenizer_name: "= config['model']", tokenizer_mode: "= config['tokenizer-mode']", runner_type: "= has(input.runner_type) ? input.runner_type : 'generate'"}
+        as: tok
+      - return: {tokenizer: "= vars.tok.value"}
+  - component: renderer-registry
+    name: renderer-from-config
+    kind: function
+    summary: "renderer_from_config: load the tokenizer, resolve the tokenizer mode, and build the renderer registered for that mode (unknown: ValueError)."
+    sources: ["vllm/renderers/registry.py:54-88"]
+    request: {type: object, properties: {}}
+    errors: [{code: value-error, status: 0, retryable: false}]
+    behavior:
+      - source: "vllm/renderers/registry.py:85"
+        call: tokenizer-registry.cached-tokenizer-from-config
+        as: tok
+      - source: "vllm/renderers/registry.py:86"
+        call: tokenizer-registry.resolve-tokenizer-args
+        input: {tokenizer_name: "= config['model']", tokenizer_mode: "= config['tokenizer-mode']"}
+        as: args
+      - if: "!(vars.args.value.tokenizer_mode in state.renderers)"
+        then: [{source: "vllm/renderers/registry.py:55-56", fail: {code: value-error, message: "= 'No renderer registered for renderer_mode=\\'' + vars.args.value.tokenizer_mode + '\\'.'"}}]
+      - return: {renderer_class: "= state.renderers[vars.args.value.tokenizer_mode]", tokenizer: "= vars.tok.value.tokenizer"}
+  - component: hf-tokenizer
+    name: encode
+    kind: function
+    summary: "TokenizerLike.encode(text, add_special_tokens): <|begin_of_text|> first when special tokens are added, then one token per word (ASSUMPTION: the model's word-level stand-in for byte-level BPE, the same ids the renderer produces)."
+    sources: ["vllm/tokenizers/protocol.py:91-98"]
+    request: {type: object, properties: {text: {type: string, examples: [hello world]}, add_special_tokens: {type: boolean, default: true}}, required: [text]}
+    behavior:
+      - set:
+          vars.words: "= input.text.trim() == '' ? [] : input.text.trim().split(' ').filter(w, w != '').map(w, 1000 + size(w))"
+      - return: {ids: "= (has(input.add_special_tokens) && !input.add_special_tokens ? [] : [128000]) + vars.words"}
+  - component: hf-tokenizer
+    name: decode
+    kind: function
+    summary: "TokenizerLike.decode(ids, skip_special_tokens): the special tokens' texts unless skipped, other ids by the model's stand-in text ' t<id>'."
+    sources: ["vllm/tokenizers/protocol.py:120-123"]
+    request: {type: object, properties: {ids: {type: array, items: {type: integer}}, skip_special_tokens: {type: boolean, default: false}}, required: [ids]}
+    behavior:
+      - call: hf-tokenizer.get-vocab
+        as: v
+      - title: "Special tokens (Llama-3.1's) are kept or dropped by skip_special_tokens"
+        source: "vllm/tokenizers/protocol.py:120-123"
+        return: {text: "= input.ids.filter(i, !(has(input.skip_special_tokens) && input.skip_special_tokens && string(i) in vars.v.value.special)).map(i, string(i) in vars.v.value.special ? vars.v.value.special[string(i)] : ' t' + string(i)).join('')"}
+  - component: hf-tokenizer
+    name: get-vocab
+    kind: function
+    summary: "TokenizerLike.get_vocab, cached by get_cached_tokenizer: Llama-3.1's 128,256-token vocabulary, of which the model keeps only the size and the special tokens."
+    sources: ["vllm/tokenizers/protocol.py:85-86", "vllm/tokenizers/hf.py:113-130"]
+    request: {type: object, properties: {}}
+    behavior:
+      - title: "get_cached_tokenizer caches the vocab, the special ids and max_token_id once"
+        source: "vllm/tokenizers/hf.py:113-130"
+        return:
+          size: 128256
+          max_token_id: 128255
+          special: {"128000": "<|begin_of_text|>", "128001": "<|end_of_text|>", "128006": "<|start_header_id|>", "128007": "<|end_header_id|>", "128008": "<|eom_id|>", "128009": "<|eot_id|>"}
+  - component: cohere-renderer
+    name: role-to-melody
+    kind: function
+    summary: "_role_to_melody: lowercase the role; assistant -> chatbot, developer -> system; system, user, chatbot and tool pass; anything else is refused (the cmd3/cmd4 templates would silently drop it)."
+    sources: ["vllm/renderers/cohere.py:290-317", "vllm/renderers/cohere.py:252"]
+    request: {type: object, properties: {role: {type: string, examples: [ASSISTANT]}}, required: [role]}
+    errors: [{code: value-error, status: 0, retryable: false}]
+    behavior:
+      - set: {vars.r: "= input.role.lowerAscii()"}
+      - if: "vars.r == 'assistant'"
+        then: [{source: "vllm/renderers/cohere.py:307-308", return: {role: chatbot}}]
+      - if: "vars.r == 'developer'"
+        then: [{source: "vllm/renderers/cohere.py:309-310", return: {role: system}}]
+      - if: "vars.r in ['system', 'user', 'chatbot', 'tool']"
+        then: [{source: "vllm/renderers/cohere.py:311-312", return: {role: "= vars.r"}}]
+      - source: "vllm/renderers/cohere.py:313-316"
+        fail: {code: value-error, message: "= 'Unsupported message role for the cohere renderer: \\'' + vars.r + '\\'. Expected one of: system, developer, user, assistant, chatbot, tool.'"}
+  - component: cohere-renderer
+    name: render-messages
+    kind: function
+    summary: "CohereRenderer.render_messages: parse the messages, map each to melody's shape (roles via _role_to_melody, text content blocks, reasoning as a thinking block on chatbot turns), render with melody and tokenize the prompt text."
+    sources: ["vllm/renderers/cohere.py:777-803", "vllm/renderers/cohere.py:519-598"]
+    request: {type: object, properties: {messages: {type: array, items: {type: object}}}, required: [messages]}
+    errors: [{code: value-error, status: 0, retryable: false}]
+    behavior:
+      - set: {vars.out: []}
+      - title: "_conversation_to_melody_messages: one melody message per conversation message"
+        source: "vllm/renderers/cohere.py:553-598"
+        foreach: "= input.messages"
+        as: m
+        max: 64
+        steps:
+          - call: cohere-renderer.role-to-melody
+            input: {role: "= has(vars.m.role) ? vars.m.role : 'user'"}
+            as: role
+          - set:
+              vars.blocks: "= has(vars.m.content) && vars.m.content != null ? (type(vars.m.content) == string ? [{'type': 'text', 'text': vars.m.content}] : vars.m.content) : []"
+          - set:
+              vars.out: "= vars.out + [{'role': vars.role.value.role, 'content': vars.role.value.role == 'chatbot' && has(vars.m.reasoning) && vars.m.reasoning != null && vars.m.reasoning != '' ? [{'type': 'thinking', 'thinking': vars.m.reasoning}] + vars.blocks : vars.blocks, 'tool_calls': has(vars.m.tool_calls) && vars.m.tool_calls != null ? vars.m.tool_calls : []}]"
+      - title: "melody render_cmd3/cmd4 builds the prompt text (ASSUMPTION: the model joins role-tagged texts), tokenized like any text prompt"
+        source: "vllm/renderers/cohere.py:794-797"
+        set:
+          vars.text: "= vars.out.map(m, '<|START_OF_TURN_TOKEN|><|' + m.role.upperAscii() + '_TOKEN|> ' + m.content.filter(b, has(b.text)).map(b, b.text).join(' ') + ' <|END_OF_TURN_TOKEN|>').join(' ')"
+      - call: hf-tokenizer.encode
+        input: {text: "= vars.text"}
+        as: ids
+      - return: {conversation: "= vars.out", prompt_token_ids: "= vars.ids.value.ids"}
+  - component: hf-renderer
+    name: safe-apply-chat-template
+    kind: function
+    summary: "safe_apply_chat_template: resolve the template; when the conversation uses the developer role and the template doesn't mention it, convert developer to system and merge all system messages into one leading message; apply the template (a template that raises is a 400 with its reason)."
+    sources: ["vllm/renderers/hf.py:770-835", "vllm/renderers/hf.py:511-567"]
+    request:
+      type: object
+      properties:
+        conversation: {type: array, items: {type: object}}
+        chat_template: {type: [string, "null"], default: llama-3.1, description: "the template text, or llama-3.1 for the tokenizer's own (which has no developer role)"}
+        tokenize: {type: boolean, default: true}
+        add_generation_prompt: {type: boolean, default: true}
+      required: [conversation]
+    errors: [{code: vllm-validation-error, status: 0, retryable: false}]
+    behavior:
+      - set:
+          vars.tpl: "= has(input.chat_template) && input.chat_template != null ? input.chat_template : 'llama-3.1'"
+          vars.conv: "= input.conversation"
+      - title: "_detect_developer_role_support: the template text names the 'developer' role"
+        source: "vllm/renderers/hf.py:511-513"
+        set:
+          vars.dev_ok: "= vars.tpl.contains('\"developer\"') || vars.tpl.contains(\"'developer'\")"
+      - if: "vars.conv.exists(m, m.role == 'developer') && !vars.dev_ok"
+        then:
+          - title: "_convert_developer_to_system: developer messages become system messages (their tools dropped)"
+            source: "vllm/renderers/hf.py:516-528"
+            set:
+              vars.conv: "= vars.conv.map(m, m.role == 'developer' ? merge(omit(m, 'tools'), {'role': 'system'}) : m)"
+          - title: "_consolidate_system_messages: a system message after position 0 (or a second one) merges every system text, joined by blank lines, into one leading message"
+            source: "vllm/renderers/hf.py:531-567"
+            set:
+              vars.sys_idx: "= lists.range(size(vars.conv)).filter(i, vars.conv[i].role == 'system')"
+          - if: "size(vars.sys_idx) > 1 || (size(vars.sys_idx) == 1 && vars.sys_idx[0] > 0)"
+            then:
+              - set:
+                  vars.conv: "= [{'role': 'system', 'content': vars.sys_idx.map(i, type(vars.conv[i].content) == string ? vars.conv[i].content : vars.conv[i].content.filter(p, has(p.text)).map(p, p.text).join('\\n')).filter(c, c != '').join('\\n\\n')}] + vars.conv.filter(m, m.role != 'system')"
+      - title: "The template raises on input it rejects (here: a system message that is not first, for templates that say so); the error's reason becomes a VLLMValidationError (400)"
+        source: "vllm/renderers/hf.py:822-835"
+        if: "vars.tpl.contains('System message must be at the beginning') && lists.range(size(vars.conv)).exists(i, i > 0 && vars.conv[i].role == 'system')"
+        then: [{fail: {code: vllm-validation-error, message: System message must be at the beginning.}}]
+      - title: "Rendered text: ChatML for <|im_start|> templates, else Llama-3.1's header format (ASSUMPTION: the two template shapes the model knows), with the generation prompt"
+        source: "vllm/renderers/hf.py:812-828"
+        set:
+          vars.chatml: "= vars.tpl.contains('<|im_start|>')"
+      - return:
+          conversation: "= vars.conv"
+          prompt: "= vars.chatml ? vars.conv.map(m, '<|im_start|>' + m.role + '\\n' + (type(m.content) == string ? m.content : '') + '<|im_end|>\\n').join('') + (has(input.add_generation_prompt) && !input.add_generation_prompt ? '' : '<|im_start|>assistant\\n') : '<|begin_of_text|>' + vars.conv.map(m, '<|start_header_id|>' + m.role + '<|end_header_id|>\\n\\n' + (type(m.content) == string ? m.content : '') + '<|eot_id|>').join('') + (has(input.add_generation_prompt) && !input.add_generation_prompt ? '' : '<|start_header_id|>assistant<|end_header_id|>\\n\\n')"
+scenarios:
+  - id: serving-api-cohere-renderer-roles
+    name: "Cohere renderer: roles map case-insensitively (ASSISTANT -> chatbot, Developer -> system); an unknown role is refused; --tokenizer-mode cohere renders /cohere/v2/chat/render with melody roles"
+    fixtures: [full-tp1-llama-8b]
+    config: {vllm-enable-cohere-api: true, tokenizer-mode: cohere}
+    steps:
+      - {interface: cohere-renderer.role-to-melody, caller: api-server, as: a, input: {role: ASSISTANT}}
+      - {interface: cohere-renderer.role-to-melody, caller: api-server, as: d, input: {role: Developer}}
+      - {interface: cohere-renderer.role-to-melody, caller: api-server, as: u, input: {role: User}}
+      - {interface: cohere-renderer.role-to-melody, caller: api-server, as: s, input: {role: SYSTEM}}
+      - {interface: cohere-renderer.role-to-melody, caller: api-server, as: bad, input: {role: narrator}}
+      - interface: cohere-serving-chat-v2.post-cohere-v2-chat-render
+        caller: api-client
+        as: r
+        input:
+          path: /cohere/v2/chat/render
+          body: {model: llama-8b, messages: [{role: SYSTEM, content: be brief}, {role: Developer, content: use French}, {role: User, content: hi}, {role: ASSISTANT, content: bonjour}, {role: user, content: again}]}
+    expect:
+      - "steps.a.result.value.role == 'chatbot' && steps.d.result.value.role == 'system' && steps.u.result.value.role == 'user' && steps.s.result.value.role == 'system'"
+      - "!steps.bad.result.ok && steps.bad.result.error.message.startsWith('Unsupported message role for the cohere renderer')"
+      - "steps.r.result.ok && trace.exists(e, e.type == 'call.end' && e.interface == 'cohere-renderer.render-messages' && e.output.conversation.map(m, m.role) == ['system', 'system', 'user', 'chatbot', 'user'])"
+  - id: serving-api-tokenizer-registry
+    name: "get_tokenizer resolves auto to hf (Llama) or mistral (a Mistral-format repo), refuses an unregistered mode and a missing repo; the renderer follows the mode"
+    fixtures: [full-tp1-llama-8b]
+    state:
+      hf-hub:
+        repos: {"mistralai/Mistral-7B-Instruct-v0.3": {files: [tekken.json, params.json]}}
+        models: {"mistralai/Mistral-7B-Instruct-v0.3": {architectures: [MistralForCausalLM], vocab_size: 32768, max_position_embeddings: 32768, num_attention_heads: 32, num_key_value_heads: 8}}
+    steps:
+      - {interface: tokenizer-registry.get-tokenizer, caller: api-server, as: llama, input: {tokenizer_name: meta-llama/Llama-3.1-8B-Instruct}}
+      - {interface: tokenizer-registry.get-tokenizer, caller: api-server, as: mistral, input: {tokenizer_name: mistralai/Mistral-7B-Instruct-v0.3}}
+      - {interface: tokenizer-registry.get-tokenizer, caller: api-server, as: pool, input: {tokenizer_name: meta-llama/Llama-3.1-8B-Instruct, runner_type: pooling}}
+      - {interface: tokenizer-registry.get-tokenizer, caller: api-server, as: badmode, input: {tokenizer_name: meta-llama/Llama-3.1-8B-Instruct, tokenizer_mode: nope}}
+      - {interface: tokenizer-registry.get-tokenizer, caller: api-server, as: missing, input: {tokenizer_name: no-such/repo}}
+      - {interface: tokenizer-registry.resolve-tokenizer-args, caller: api-server, as: hfmistral, input: {tokenizer_name: meta-llama/Llama-3.1-8B-Instruct, tokenizer_mode: hf, mistral_format: true}}
+      - {interface: renderer-registry.renderer-from-config, caller: api-server, as: renderer, input: {}}
+    expect:
+      - "steps.llama.result.value.tokenizer_class == 'CachedHfTokenizer' && steps.llama.result.value.tokenizer_mode == 'hf' && steps.llama.result.value.truncation_side == 'left' && steps.llama.result.value.max_token_id == 128255"
+      - "steps.mistral.result.value.tokenizer_class == 'MistralTokenizer' && steps.pool.result.value.truncation_side == 'right'"
+      - "steps.badmode.result.error.message == 'No tokenizer registered for tokenizer_mode=\\'nope\\'.' && steps.missing.result.error.code == 'os-error'"
+      - "steps.hfmistral.result.error.code == 'value-error' && steps.renderer.result.value.renderer_class == 'HfRenderer'"
+  - id: serving-api-tokenizer-encode-decode
+    name: "TokenizerLike encode/decode/get_vocab: BOS added by default; skip_special_tokens drops <|eot_id|>"
+    fixtures: [full-tp1-llama-8b]
+    steps:
+      - {interface: hf-tokenizer.encode, caller: api-server, as: enc, input: {text: "hello world"}}
+      - {interface: hf-tokenizer.encode, caller: api-server, as: raw, input: {text: "hello world", add_special_tokens: false}}
+      - {interface: hf-tokenizer.decode, caller: api-server, as: keep, input: {ids: [34173, 128009]}}
+      - {interface: hf-tokenizer.decode, caller: api-server, as: skip, input: {ids: [34173, 128009], skip_special_tokens: true}}
+      - {interface: hf-tokenizer.get-vocab, caller: api-server, as: v, input: {}}
+    expect:
+      - "steps.enc.result.value.ids == [128000, 1005, 1005] && steps.raw.result.value.ids == [1005, 1005]"
+      - "steps.keep.result.value.text == ' t34173<|eot_id|>' && steps.skip.result.value.text == ' t34173'"
+      - "steps.v.result.value.size == 128256"

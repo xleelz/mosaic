@@ -1,0 +1,475 @@
+# The CUDA substrate's own tests. Run with:
+#   go run ./internal/devtools/check -f substrates/cuda/cuda.yaml -f substrates/cuda/scenarios.yaml
+# and explore the device's choice points (operations finishing at the same instant) with:
+#   go run ./internal/devtools/check -f substrates/cuda/cuda.yaml -f substrates/cuda/scenarios.yaml --scenario '^$' --explore . --schedules 10
+# Imports don't bring these along (MergeImports skips flows and scenarios).
+# Numbers (the A100 80GB defaults): a 250 MB pinned H2D over PCIe Gen4 (25 GB/s) costs
+# 10 + 10000 = 10010 µs; a kernel of 864 blocks x 256 threads doing 1.95e11 FLOPs is one full
+# wave at 19.5 TFLOP/s, 5 + 10000 = 10005 µs. The clock is in microseconds.
+# A host thread's sequence of calls is a run of steps in one `lane: host` (DESIGN §17 item 11):
+# asynchronous calls (kernel launches, async copies, event records, stream waits) are
+# `await: false`, so the host moves straight on, and synchronizing calls are awaited. The lane
+# keeps the calls in program order under --explore; the device's completions still race.
+schema_version: 1
+id: cuda-scenarios
+
+components:
+  - {id: host, name: Host program, kind: client, summary: "The host thread calling the CUDA runtime API."}
+
+fixtures:
+  - id: one-gpu
+    summary: "One A100 80GB on PCIe Gen4, with two blocking streams already created: s1 and s2."
+    state:
+      cuda-runtime:
+        streams:
+          s1: {id: s1, device: 0, non_blocking: false, destroyed: false}
+          s2: {id: s2, device: 0, non_blocking: false, destroyed: false}
+  - id: one-gpu-buffers
+    extends: [one-gpu]
+    summary: "Adds two 1 GiB device buffers, buf-a and buf-b, on device 0."
+    state:
+      cuda-runtime:
+        allocs:
+          buf-a: {ptr: buf-a, device: 0, bytes: 1073741824, alloc_bytes: 1073741824}
+          buf-b: {ptr: buf-b, device: 0, bytes: 1073741824, alloc_bytes: 1073741824}
+  - id: two-gpus
+    extends: [one-gpu-buffers]
+    summary: "Two GPUs joined by NVLink 3; buf-c (1 GiB) lives on device 1."
+    config: {cuda-device-count: 2}
+    state:
+      cuda-runtime:
+        allocs:
+          buf-c: {ptr: buf-c, device: 1, bytes: 1073741824, alloc_bytes: 1073741824}
+
+flows:
+  - {id: get-device-count, tags: [reads], entry: {caller: host, interface: cuda-runtime.get-device-count}}
+  - {id: get-device-properties, tags: [reads], entry: {caller: host, interface: cuda-runtime.get-device-properties}}
+  - {id: mem-get-info, tags: [reads], entry: {caller: host, interface: cuda-runtime.mem-get-info, input: {device: 0}}}
+  - {id: malloc, tags: [writes], entry: {caller: host, interface: cuda-runtime.malloc, input: {device: 0}}}
+  - {id: free, tags: [writes], entry: {caller: host, interface: cuda-runtime.free}}
+  - {id: stream-create, tags: [writes], entry: {caller: host, interface: cuda-runtime.stream-create, input: {device: 0, non_blocking: false}}}
+  - {id: stream-destroy, tags: [writes], entry: {caller: host, interface: cuda-runtime.stream-destroy}}
+  - {id: stream-query, tags: [reads], entry: {caller: host, interface: cuda-runtime.stream-query, input: {device: 0}}}
+  - {id: stream-synchronize, tags: [reads], entry: {caller: host, interface: cuda-runtime.stream-synchronize, input: {device: 0}}}
+  - {id: stream-wait-event, tags: [writes], entry: {caller: host, interface: cuda-runtime.stream-wait-event, input: {device: 0}}}
+  - {id: device-synchronize, tags: [reads], entry: {caller: host, interface: cuda-runtime.device-synchronize, input: {device: 0}}}
+  - {id: event-create, tags: [writes], entry: {caller: host, interface: cuda-runtime.event-create, input: {device: 0}}}
+  - {id: event-record, tags: [writes], entry: {caller: host, interface: cuda-runtime.event-record, input: {device: 0}}}
+  - {id: event-query, tags: [reads], entry: {caller: host, interface: cuda-runtime.event-query}}
+  - {id: event-synchronize, tags: [reads], entry: {caller: host, interface: cuda-runtime.event-synchronize}}
+  - {id: event-elapsed-time, tags: [reads], entry: {caller: host, interface: cuda-runtime.event-elapsed-time}}
+  - {id: memcpy, tags: [writes], entry: {caller: host, interface: cuda-runtime.memcpy, input: {device: 0, pinned: true}}}
+  - {id: memcpy-async, tags: [writes], entry: {caller: host, interface: cuda-runtime.memcpy-async, input: {device: 0, pinned: true}}}
+  - {id: launch-kernel, tags: [writes], entry: {caller: host, interface: cuda-runtime.launch-kernel, input: {device: 0, shared_bytes: 0, regs_per_thread: 32, flops: 0, bytes: 0}}}
+
+scenarios:
+  # ---- devices and memory ----
+  - id: device-properties-and-count
+    name: One device by default; its properties come from config; device 1 is invalid
+    fixtures: [one-gpu]
+    steps:
+      - {flow: get-device-count, as: n}
+      - {flow: get-device-properties, as: p, input: {device: 0}}
+      - {flow: get-device-properties, as: bad, input: {device: 1}}
+    expect:
+      - "steps.n.result.value.count == 1"
+      - "steps.p.result.value.total_global_mem == 85899345920 && steps.p.result.value.multi_processor_count == 108 && steps.p.result.value.max_threads_per_block == 1024"
+      - "!steps.bad.result.ok && steps.bad.result.error.code == 'cudaErrorInvalidDevice'"
+
+  - id: malloc-reduces-free-memory
+    name: cudaMalloc rounds up to 256 bytes and cudaMemGetInfo reports less free; cudaFree gives it back
+    fixtures: [one-gpu]
+    steps:
+      - {flow: mem-get-info, as: before}
+      - {flow: malloc, as: m, input: {bytes: 1000}}
+      - {flow: mem-get-info, as: during}
+      - {flow: free, as: f, input: {ptr: "= steps.m.result.value.ptr"}}
+      - {flow: mem-get-info, as: after}
+    expect:
+      - "steps.before.result.value.free == 85899345920 - 536870912 && steps.before.result.value.total == 85899345920"
+      - "steps.m.result.ok && steps.m.result.value.alloc_bytes == 1024"
+      - "steps.during.result.value.free == steps.before.result.value.free - 1024"
+      - "steps.f.result.value.freed == 1024 && steps.after.result.value.free == steps.before.result.value.free"
+      - "size(state['cuda-runtime'].allocs) == 0"
+
+  - id: malloc-out-of-memory
+    name: An allocation larger than free memory fails cudaErrorMemoryAllocation and allocates nothing
+    fixtures: [one-gpu-buffers]
+    steps:
+      - {flow: malloc, as: big, input: {bytes: 85899345920}}
+      - {flow: malloc, as: fits, input: {bytes: 80530636800}}
+      - {flow: malloc, as: over, input: {bytes: 3221225472}}
+      - {flow: mem-get-info, as: info}
+    expect:
+      - "!steps.big.result.ok && steps.big.result.error.code == 'cudaErrorMemoryAllocation' && steps.big.result.error.data.cuda_error == 2"
+      - "steps.fits.result.ok"
+      - "!steps.over.result.ok && steps.over.result.error.code == 'cudaErrorMemoryAllocation'"
+      - "steps.info.result.value.free == 85899345920 - 536870912 - 2 * 1073741824 - 80530636800"
+      - "size(state['cuda-runtime'].allocs) == 3"
+
+  - id: malloc-zero-and-bad-free
+    name: cudaMalloc(0) returns the null pointer; freeing null is fine; freeing twice is cudaErrorInvalidValue
+    fixtures: [one-gpu-buffers]
+    steps:
+      - {flow: malloc, as: zero, input: {bytes: 0}}
+      - {flow: free, as: null_free, input: {ptr: "0"}}
+      - {flow: free, as: once, input: {ptr: buf-a}}
+      - {flow: free, as: twice, input: {ptr: buf-a}}
+      - {flow: malloc, as: baddev, input: {device: 3, bytes: 16}}
+    expect:
+      - "steps.zero.result.value.ptr == '0' && steps.null_free.result.ok"
+      - "steps.once.result.ok && !steps.twice.result.ok && steps.twice.result.error.code == 'cudaErrorInvalidValue'"
+      - "!steps.baddev.result.ok && steps.baddev.result.error.code == 'cudaErrorInvalidDevice'"
+      - "!('buf-a' in state['cuda-runtime'].allocs)"
+
+  - id: free-synchronizes-device
+    name: cudaFree waits for the device's queued work before freeing
+    fixtures: [one-gpu-buffers]
+    steps:
+      - {flow: launch-kernel, as: k, lane: host, await: false, input: {stream: s1, name: gemm, blocks: 864, threads_per_block: 256, flops: 195000000000}}
+      - {flow: free, as: f, lane: host, input: {ptr: buf-b}}
+    expect:
+      - "steps.f.start_us == 0 && state['cuda-runtime'].ops[steps.k.result.value.op].end_us == 10005"
+      - "steps.f.result.value.waited_ms == 10.005 && steps.f.duration_us == 10005"
+      - "!('buf-b' in state['cuda-runtime'].allocs)"
+
+  # ---- memcpy cost model ----
+  - id: h2d-1gib-pcie4
+    name: A synchronous 1 GiB pinned H2D over PCIe Gen4 takes 10 µs plus 1 GiB / 25 GB/s, and the host waits for it
+    fixtures: [one-gpu-buffers]
+    steps:
+      - {flow: memcpy, as: c, input: {kind: h2d, dst: buf-a, src: host-buf, bytes: 1073741824}}
+    expect:
+      - "steps.c.result.value.cost_us == 42960 && steps.c.result.value.start_us == 0 && steps.c.result.value.end_us == 42960"
+      - "steps.c.result.value.waited_ms == 42.96 && steps.c.duration_ms == 42"
+      - "state['cuda-runtime'].ops[steps.c.result.value.op].stream == '0/0' && state['cuda-runtime'].ops[steps.c.result.value.op].engine == '0/h2d'"
+      - "state['cuda-runtime'].allocs['buf-a'].written_by == 'memcpy h2d' && state['cuda-runtime'].allocs['buf-a'].written_us == 42960"
+
+  - id: h2d-link-from-config
+    name: The same copy over PCIe Gen5 takes half as long
+    fixtures: [one-gpu-buffers]
+    steps:
+      - {flow: memcpy, as: gen5, input: {kind: h2d, dst: buf-a, src: host-buf, bytes: 1073741824}}
+    config: {cuda-host-link: pcie5}
+    expect:
+      - "steps.gen5.result.value.cost_us == 21485 && steps.gen5.result.value.waited_ms == 21.485"
+      - "steps.gen5.result.value.end_us == 21485"
+
+  - id: h2d-nvlink-c2c
+    name: Over NVLink-C2C (Grace Hopper) a 1 GiB H2D costs 2397 µs
+    fixtures: [one-gpu-buffers]
+    config: {cuda-host-link: nvlink-c2c}
+    steps:
+      - {flow: memcpy, as: c, input: {kind: h2d, dst: buf-a, src: host-buf, bytes: 1073741824}}
+    expect:
+      - "steps.c.result.value.cost_us == 2397 && steps.c.result.value.waited_ms == 2.397"
+      - "steps.c.result.value.end_us == 2397"
+
+  - id: pageable-copy-is-slower-and-synchronous
+    name: cudaMemcpyAsync from pageable memory runs at the pageable rate and the host waits for it
+    fixtures: [one-gpu-buffers]
+    steps:
+      - {flow: memcpy-async, as: c, input: {stream: s1, kind: h2d, dst: buf-a, src: host-buf, bytes: 1073741824, pinned: false}}
+    expect:
+      - "steps.c.result.value.cost_us == 107385 && steps.c.result.value.waited_ms == 107.385 && steps.c.duration_ms == 107"
+      - "state['cuda-runtime'].ops[steps.c.result.value.op].stream == 's1' && state['cuda-runtime'].ops[steps.c.result.value.op].end_us == 107385"
+
+  - id: d2h-and-d2d-costs
+    name: D2H uses the host link; D2D within a device reads and writes HBM (half its bandwidth); across devices it uses NVLink
+    fixtures: [two-gpus]
+    steps:
+      - {flow: memcpy, as: d2h, input: {kind: d2h, dst: host-buf, src: buf-a, bytes: 250000000}}
+      - {flow: memcpy, as: d2d, input: {kind: d2d, dst: buf-b, src: buf-a, bytes: 1019500000}}
+      - {flow: memcpy, as: peer, input: {kind: d2d, dst: buf-c, src: buf-a, bytes: 1000000000}}
+    expect:
+      - "steps.d2h.result.value.cost_us == 10010"
+      - "steps.d2d.result.value.cost_us == 1010 && steps.d2d.result.value.start_us == 10010"
+      - "steps.peer.result.value.cost_us == 3344 && steps.peer.result.value.end_us == 10010 + 1010 + 3344"
+      - "size(state['cuda-runtime'].completed) == 3 && state['cuda-runtime'].ops.all(k, state['cuda-runtime'].ops[k].stream == '0/0')"
+      - "state['cuda-runtime'].allocs['buf-c'].written_by == 'memcpy d2d' && !has(state['cuda-runtime'].allocs['buf-a'].written_by)"
+
+  - id: memcpy-invalid-arguments
+    name: An unknown direction, a dead pointer or a copy past the allocation is refused
+    fixtures: [one-gpu-buffers]
+    steps:
+      - {flow: memcpy, as: dir, input: {kind: h2h, dst: x, src: y, bytes: 8}}
+      - {flow: memcpy, as: dead, input: {kind: h2d, dst: nope, src: host-buf, bytes: 8}}
+      - {flow: memcpy, as: past, input: {kind: d2h, dst: host-buf, src: buf-a, bytes: 1073741825}}
+      - {flow: memcpy-async, as: badstream, input: {stream: s9, kind: h2d, dst: buf-a, src: host-buf, bytes: 8}}
+    expect:
+      - "steps.dir.result.error.code == 'cudaErrorInvalidMemcpyDirection'"
+      - "steps.dead.result.error.code == 'cudaErrorInvalidValue' && steps.past.result.error.code == 'cudaErrorInvalidValue'"
+      - "steps.badstream.result.error.code == 'cudaErrorInvalidResourceHandle'"
+      - "size(state['cuda-runtime'].ops) == 0"
+
+  # ---- streams: ordering and concurrency ----
+  - id: two-streams-overlap
+    name: A kernel on s1 and an H2D on s2 overlap; device synchronize waits for the longer, not the sum
+    fixtures: [one-gpu-buffers]
+    steps:
+      - {flow: launch-kernel, as: k, lane: host, await: false, input: {stream: s1, name: gemm, blocks: 864, threads_per_block: 256, flops: 195000000000}}
+      - {flow: memcpy-async, as: c, lane: host, await: false, input: {stream: s2, kind: h2d, dst: buf-a, src: host-buf, bytes: 250000000}}
+      - {flow: device-synchronize, as: sync, lane: host}
+    expect:
+      - "steps.c.start_us == 0 && steps.sync.start_us == 0"
+      - "state['cuda-runtime'].ops[steps.k.result.value.op].start_us == 0 && state['cuda-runtime'].ops[steps.c.result.value.op].start_us == 0"
+      - "steps.sync.result.value.done_us == 10010 && steps.sync.result.value.waited_ms == 10.01"
+      - "state['cuda-runtime'].completed == [steps.k.result.value.op, steps.c.result.value.op]"
+
+  - id: same-stream-serial
+    name: The same two operations on one stream run in order; the copy starts when the kernel ends
+    fixtures: [one-gpu-buffers]
+    steps:
+      - {flow: launch-kernel, as: k, lane: host, await: false, input: {stream: s1, name: gemm, blocks: 864, threads_per_block: 256, flops: 195000000000}}
+      - {flow: memcpy-async, as: c, lane: host, await: false, input: {stream: s1, kind: h2d, dst: buf-a, src: host-buf, bytes: 250000000}}
+      - {flow: stream-synchronize, as: sync, lane: host, input: {stream: s1}}
+    expect:
+      - "state['cuda-runtime'].ops[steps.c.result.value.op].start_us == state['cuda-runtime'].ops[steps.k.result.value.op].end_us"
+      - "steps.sync.result.value.done_us == 20015 && steps.sync.result.value.waited_ms == 20.015"
+      - "state['cuda-runtime'].completed.map(o, state['cuda-runtime'].ops[o].op) == ['kernel gemm', 'memcpy h2d']"
+
+  - id: copy-engines
+    name: Two H2D copies on different streams serialize on the H2D engine, while an H2D and a D2H overlap
+    fixtures: [one-gpu-buffers]
+    steps:
+      - {flow: stream-create, as: s3}
+      - {flow: memcpy-async, as: a, lane: host, await: false, input: {stream: s1, kind: h2d, dst: buf-a, src: h1, bytes: 250000000}}
+      - {flow: memcpy-async, as: b, lane: host, await: false, input: {stream: s2, kind: h2d, dst: buf-b, src: h2, bytes: 250000000}}
+      - {flow: memcpy-async, as: d, lane: host, await: false, input: {stream: "= steps.s3.result.value.stream", kind: d2h, dst: h3, src: buf-a, bytes: 250000000}}
+      - {flow: device-synchronize, as: sync, lane: host}
+    expect:
+      - "state['cuda-runtime'].ops[steps.a.result.value.op].end_us == 10010"
+      - "state['cuda-runtime'].ops[steps.b.result.value.op].start_us == 10010 && state['cuda-runtime'].ops[steps.b.result.value.op].end_us == 20020"
+      - "state['cuda-runtime'].ops[steps.d.result.value.op].start_us == 0 && state['cuda-runtime'].ops[steps.d.result.value.op].engine == '0/d2h'"
+      - "steps.sync.result.value.done_us == 20020"
+
+  - id: one-copy-engine
+    name: With a single copy engine an H2D and a D2H serialize
+    fixtures: [one-gpu-buffers]
+    config: {cuda-copy-engines: 1}
+    steps:
+      - {flow: memcpy-async, as: a, lane: host, await: false, input: {stream: s1, kind: h2d, dst: buf-a, src: h1, bytes: 250000000}}
+      - {flow: memcpy-async, as: d, lane: host, await: false, input: {stream: s2, kind: d2h, dst: h3, src: buf-b, bytes: 250000000}}
+    expect:
+      - "state['cuda-runtime'].ops[steps.d.result.value.op].start_us == 10010 && state['cuda-runtime'].ops[steps.d.result.value.op].end_us == 20020"
+      - "state['cuda-runtime'].ops[steps.d.result.value.op].engine == '0/copy'"
+
+  - id: legacy-default-stream-synchronizes
+    name: Work on the legacy default stream waits for blocking streams, and later blocking-stream work waits for it; a non-blocking stream doesn't
+    fixtures: [one-gpu-buffers]
+    steps:
+      - {flow: stream-create, as: nb, input: {non_blocking: true}}
+      - {flow: launch-kernel, as: k, lane: host, await: false, input: {stream: s1, name: gemm, blocks: 864, threads_per_block: 256, flops: 195000000000}}
+      - {flow: memcpy-async, as: dflt, lane: host, await: false, input: {stream: "0", kind: d2h, dst: h, src: buf-a, bytes: 25000000}}
+      - {flow: memcpy-async, as: after, lane: host, await: false, input: {stream: s2, kind: h2d, dst: buf-b, src: h, bytes: 25000000}}
+      - {flow: launch-kernel, as: free_run, lane: host, await: false, input: {stream: "= steps.nb.result.value.stream", name: small, blocks: 864, threads_per_block: 256, flops: 19500000}}
+      - {flow: device-synchronize, as: sync, lane: host}
+    expect:
+      - "state['cuda-runtime'].ops[steps.dflt.result.value.op].start_us == 10005 && state['cuda-runtime'].ops[steps.dflt.result.value.op].end_us == 11015"
+      - "state['cuda-runtime'].ops[steps.after.result.value.op].start_us == 11015"
+      - "state['cuda-runtime'].ops[steps.free_run.result.value.op].start_us == 0"
+      - "steps.sync.result.value.done_us == 12025"
+
+  - id: synchronous-memcpy-waits-for-streams
+    name: cudaMemcpy runs on the legacy stream, so it waits for a kernel queued on a blocking stream and the host waits for both
+    fixtures: [one-gpu-buffers]
+    steps:
+      - {flow: launch-kernel, as: k, lane: host, await: false, input: {stream: s1, name: gemm, blocks: 864, threads_per_block: 256, flops: 195000000000}}
+      - {flow: memcpy, as: c, lane: host, input: {kind: d2h, dst: h, src: buf-a, bytes: 25000000}}
+    expect:
+      - "steps.c.result.value.start_us == 10005 && steps.c.result.value.end_us == 11015"
+      - "steps.c.start_us == 0 && steps.c.duration_us == 11015 && steps.c.result.value.waited_ms == 11.015"
+
+  - id: stream-query-and-destroy
+    name: cudaStreamQuery is not ready while work runs and ready after; a destroyed stream's work still finishes but its handle is invalid
+    fixtures: [one-gpu-buffers]
+    steps:
+      - {flow: stream-create, as: s}
+      - {flow: launch-kernel, as: k, lane: host, await: false, input: {stream: "= steps.s.result.value.stream", name: gemm, blocks: 864, threads_per_block: 256, flops: 195000000000}}
+      - {flow: stream-query, as: busy, lane: host, input: {stream: "= steps.s.result.value.stream"}}
+      - {flow: stream-destroy, as: d, lane: host, input: {stream: "= steps.s.result.value.stream"}}
+      - {flow: stream-query, as: gone, lane: host, input: {stream: "= steps.s.result.value.stream"}}
+      - {flow: device-synchronize, as: sync, lane: host}
+      - {flow: stream-query, as: idle, lane: host, input: {stream: s1}}
+      - {flow: stream-destroy, as: twice, lane: host, input: {stream: "= steps.s.result.value.stream"}}
+    expect:
+      - "!steps.busy.result.ok && steps.busy.result.error.code == 'cudaErrorNotReady'"
+      - "steps.d.result.ok && steps.gone.result.error.code == 'cudaErrorInvalidResourceHandle'"
+      - "steps.sync.result.value.done_us == 10005 && steps.sync.result.value.waited_ms == 10.005"
+      - "steps.idle.result.ok && steps.twice.result.error.code == 'cudaErrorInvalidResourceHandle'"
+      - "state['cuda-runtime'].streams[steps.s.result.value.stream].destroyed && state['cuda-runtime'].ops[steps.k.result.value.op].status == 'done'"
+
+  - id: stream-of-other-device
+    name: A stream belongs to its device; using it from another device is an invalid handle
+    fixtures: [two-gpus]
+    steps:
+      - {flow: launch-kernel, as: k, input: {device: 1, stream: s1, name: gemm, blocks: 1, threads_per_block: 32}}
+      - {flow: stream-synchronize, as: sync, input: {device: 1, stream: s1}}
+    expect:
+      - "steps.k.result.error.code == 'cudaErrorInvalidResourceHandle' && steps.sync.result.error.code == 'cudaErrorInvalidResourceHandle'"
+
+  # ---- events ----
+  - id: event-cross-stream-dependency
+    name: An event recorded after a kernel on s1 makes later copies on s2 wait for it (cudaStreamWaitEvent); the host isn't blocked
+    fixtures: [one-gpu-buffers]
+    steps:
+      - {flow: event-create, as: e}
+      - {flow: launch-kernel, as: k, lane: host, await: false, input: {stream: s1, name: produce, blocks: 864, threads_per_block: 256, flops: 195000000000}}
+      - {flow: event-record, as: rec, lane: host, await: false, input: {stream: s1, event: "= steps.e.result.value.event"}}
+      - {flow: stream-wait-event, as: w, lane: host, await: false, input: {stream: s2, event: "= steps.e.result.value.event"}}
+      - {flow: memcpy-async, as: c, lane: host, await: false, input: {stream: s2, kind: d2h, dst: h, src: buf-a, bytes: 25000000}}
+      - {flow: memcpy-async, as: other, lane: host, await: false, input: {stream: s1, kind: h2d, dst: buf-b, src: h, bytes: 25000000}}
+      - {flow: device-synchronize, as: sync, lane: host}
+    expect:
+      - "steps.sync.start_us == 0 && state['cuda-runtime'].events[steps.e.result.value.event].at_us == 10005"
+      - "state['cuda-runtime'].ops[steps.c.result.value.op].start_us == 10005 && state['cuda-runtime'].ops[steps.c.result.value.op].end_us == 11015"
+      - "state['cuda-runtime'].ops[steps.other.result.value.op].start_us == 10005"
+      - "steps.sync.result.value.done_us == 11015"
+
+  - id: event-query-and-synchronize
+    name: cudaEventQuery is ready for a never-recorded event, not ready before the work completes, ready after cudaEventSynchronize
+    fixtures: [one-gpu-buffers]
+    steps:
+      - {flow: event-create, as: e}
+      - {flow: event-query, as: fresh, lane: host, input: {event: "= steps.e.result.value.event"}}
+      - {flow: launch-kernel, as: k, lane: host, await: false, input: {stream: s1, name: gemm, blocks: 864, threads_per_block: 256, flops: 195000000000}}
+      - {flow: event-record, as: rec, lane: host, await: false, input: {stream: s1, event: "= steps.e.result.value.event"}}
+      - {flow: event-query, as: busy, lane: host, input: {event: "= steps.e.result.value.event"}}
+      - {flow: event-synchronize, as: sync, lane: host, input: {event: "= steps.e.result.value.event"}}
+      - {flow: event-query, as: done, lane: host, input: {event: "= steps.e.result.value.event"}}
+      - {flow: event-query, as: unknown, lane: host, input: {event: event-99}}
+    expect:
+      - "steps.fresh.result.ok"
+      - "!steps.busy.result.ok && steps.busy.result.error.code == 'cudaErrorNotReady'"
+      - "steps.sync.result.value.waited_ms == 10.005 && steps.sync.duration_us == 10005"
+      - "steps.done.result.ok && steps.done.result.value.at_us == 10005"
+      - "steps.unknown.result.error.code == 'cudaErrorInvalidResourceHandle'"
+
+  - id: event-elapsed-time
+    name: cudaEventElapsedTime between events around a kernel is the kernel's device time, in fractional ms; before completion it is not ready
+    fixtures: [one-gpu-buffers]
+    steps:
+      - {flow: event-create, as: start}
+      - {flow: event-create, as: stop}
+      - {flow: event-create, as: never}
+      - {flow: event-record, as: r1, lane: host, await: false, input: {stream: s1, event: "= steps.start.result.value.event"}}
+      - {flow: launch-kernel, as: k, lane: host, await: false, input: {stream: s1, name: gemm, blocks: 864, threads_per_block: 256, flops: 195000000000}}
+      - {flow: event-record, as: r2, lane: host, await: false, input: {stream: s1, event: "= steps.stop.result.value.event"}}
+      - {flow: event-elapsed-time, as: early, lane: host, input: {start: "= steps.start.result.value.event", end: "= steps.stop.result.value.event"}}
+      - {flow: event-elapsed-time, as: unrecorded, lane: host, input: {start: "= steps.start.result.value.event", end: "= steps.never.result.value.event"}}
+      - {flow: event-synchronize, as: sync, lane: host, input: {event: "= steps.stop.result.value.event"}}
+      - {flow: event-elapsed-time, as: dt, lane: host, input: {start: "= steps.start.result.value.event", end: "= steps.stop.result.value.event"}}
+    expect:
+      - "steps.early.result.error.code == 'cudaErrorNotReady'"
+      - "steps.unrecorded.result.error.code == 'cudaErrorInvalidResourceHandle'"
+      - "steps.dt.result.value.ms == 10.005"
+      - "state['cuda-runtime'].events[steps.stop.result.value.event].at_us == 10005 && state['cuda-runtime'].events[steps.start.result.value.event].at_us == 0"
+
+  - id: event-record-wrong-device
+    name: Recording an event on another device's stream is an invalid handle
+    fixtures: [two-gpus]
+    steps:
+      - {flow: event-create, as: e, input: {device: 1}}
+      - {flow: event-record, as: rec, input: {device: 0, stream: s1, event: "= steps.e.result.value.event"}}
+      - {flow: stream-wait-event, as: w, input: {stream: s1, event: event-404}}
+    expect:
+      - "steps.rec.result.error.code == 'cudaErrorInvalidResourceHandle' && steps.w.result.error.code == 'cudaErrorInvalidResourceHandle'"
+      - "!state['cuda-runtime'].events[steps.e.result.value.event].recorded && state['cuda-runtime'].events[steps.e.result.value.event].device == 1"
+
+  # ---- races between streams (run with --explore) ----
+  - id: cross-stream-race
+    name: Two streams write one buffer with no event between them; the kernels finish together, so which write lands last is up to the device
+    tags: [race]
+    fixtures: [one-gpu-buffers]
+    steps:
+      - {flow: launch-kernel, as: a, lane: host, await: false, input: {stream: s1, name: fill-a, blocks: 864, threads_per_block: 256, flops: 195000000000, writes: [buf-a]}}
+      - {flow: launch-kernel, as: b, lane: host, await: false, input: {stream: s2, name: fill-b, blocks: 864, threads_per_block: 256, flops: 195000000000, writes: [buf-a]}}
+      - {flow: device-synchronize, as: sync, lane: host}
+    expect:
+      - "state['cuda-runtime'].ops[steps.a.result.value.op].start_us == 0 && state['cuda-runtime'].ops[steps.b.result.value.op].start_us == 0"
+      - "steps.sync.result.value.done_us == 10005"
+    invariants:
+      - "state['cuda-runtime'].allocs['buf-a'].written_by == 'kernel fill-b'"
+
+  - id: cross-stream-fenced
+    name: The same two writes with an event recorded after the first and awaited by the second stream; the second write always lands last
+    tags: [race]
+    fixtures: [one-gpu-buffers]
+    steps:
+      - {flow: event-create, as: e}
+      - {flow: launch-kernel, as: a, lane: host, await: false, input: {stream: s1, name: fill-a, blocks: 864, threads_per_block: 256, flops: 195000000000, writes: [buf-a]}}
+      - {flow: event-record, as: rec, lane: host, await: false, input: {stream: s1, event: "= steps.e.result.value.event"}}
+      - {flow: stream-wait-event, as: w, lane: host, await: false, input: {stream: s2, event: "= steps.e.result.value.event"}}
+      - {flow: launch-kernel, as: b, lane: host, await: false, input: {stream: s2, name: fill-b, blocks: 864, threads_per_block: 256, flops: 195000000000, writes: [buf-a]}}
+      - {flow: device-synchronize, as: sync, lane: host}
+    expect:
+      - "state['cuda-runtime'].ops[steps.b.result.value.op].start_us == 10005"
+      - "steps.sync.result.value.done_us == 20010 && state['cuda-runtime'].allocs['buf-a'].written_us == 20010"
+    invariants:
+      - "state['cuda-runtime'].allocs['buf-a'].written_by == 'kernel fill-b'"
+
+  # ---- kernels: occupancy and roofline ----
+  - id: kernel-launch-is-async
+    name: A kernel launch returns to the host at once; the device runs it later
+    fixtures: [one-gpu]
+    steps:
+      - {flow: launch-kernel, as: k, lane: host, await: false, input: {stream: s1, name: gemm, blocks: 864, threads_per_block: 256, flops: 195000000000}}
+      - {flow: stream-query, as: q, lane: host, input: {stream: s1}}
+      - {flow: stream-synchronize, as: sync, lane: host, input: {stream: s1}}
+      - {flow: stream-query, as: q2, lane: host, input: {stream: s1}}
+    expect:
+      - "steps.q.start_us == 0 && steps.k.result.value.cost_us == 10005 && steps.k.result.value.bound == 'compute'"
+      - "steps.k.result.value.blocks_per_sm == 8 && steps.k.result.value.occupancy == 1.0 && steps.k.result.value.waves == 1"
+      - "steps.q.result.error.code == 'cudaErrorNotReady' && steps.sync.duration_us == 10005 && steps.q2.result.ok"
+      - "state['cuda-runtime'].ops[steps.k.result.value.op].end_us == 10005"
+
+  - id: kernel-invalid-configuration
+    name: More than 1024 threads per block, an empty grid, too much shared memory or too many registers are refused at launch
+    fixtures: [one-gpu]
+    steps:
+      - {flow: launch-kernel, as: tpb, input: {stream: s1, name: k, blocks: 1, threads_per_block: 1025}}
+      - {flow: launch-kernel, as: empty, input: {stream: s1, name: k, blocks: 0, threads_per_block: 128}}
+      - {flow: launch-kernel, as: smem, input: {stream: s1, name: k, blocks: 1, threads_per_block: 128, shared_bytes: 65536}}
+      - {flow: launch-kernel, as: regs, input: {stream: s1, name: k, blocks: 1, threads_per_block: 1024, regs_per_thread: 128}}
+      - {flow: launch-kernel, as: max, input: {stream: s1, name: k, blocks: 1, threads_per_block: 1024, regs_per_thread: 64}}
+    expect:
+      - "steps.tpb.result.error.code == 'cudaErrorInvalidConfiguration' && steps.empty.result.error.code == 'cudaErrorInvalidConfiguration'"
+      - "steps.smem.result.error.code == 'cudaErrorInvalidValue'"
+      - "steps.regs.result.error.code == 'cudaErrorLaunchOutOfResources'"
+      - "steps.max.result.ok && steps.max.result.value.blocks_per_sm == 1 && steps.max.result.value.occupancy == 0.5"
+      - "size(state['cuda-runtime'].ops) == 1"
+
+  - id: kernel-wave-quantization
+    name: A grid of 1.5 waves pays for 2 waves (the tail effect)
+    fixtures: [one-gpu]
+    steps:
+      - {flow: launch-kernel, as: k, input: {stream: s1, name: gemm, blocks: 1296, threads_per_block: 256, flops: 195000000000}}
+    expect:
+      - "steps.k.result.value.waves == 2 && steps.k.result.value.cost_us == 13339"
+      - "state['cuda-runtime'].ops[steps.k.result.value.op].end_us == 13339"
+
+  - id: kernel-memory-bound-and-occupancy
+    name: A memory-bound kernel is limited by HBM bandwidth, and at low occupancy (shared memory limits it to 4 blocks per SM) it gets half
+    fixtures: [one-gpu]
+    steps:
+      - {flow: launch-kernel, as: full, lane: host, await: false, input: {stream: s1, name: copy, blocks: 1728, threads_per_block: 128, bytes: 20390000000, flops: 1000}}
+      - {flow: launch-kernel, as: low, lane: host, await: false, input: {stream: s2, name: copy-smem, blocks: 432, threads_per_block: 128, shared_bytes: 40960, bytes: 20390000000}}
+    expect:
+      - "steps.full.result.value.bound == 'memory' && steps.full.result.value.blocks_per_sm == 16 && steps.full.result.value.cost_us == 10005"
+      - "steps.low.result.value.blocks_per_sm == 4 && steps.low.result.value.occupancy == 0.25 && steps.low.result.value.cost_us == 20005"
+      - "state['cuda-runtime'].ops[steps.full.result.value.op].end_us == 10005 && state['cuda-runtime'].ops[steps.low.result.value.op].end_us == 20005"
+
+  - id: invalid-device-and-handles
+    name: Every per-device call refuses an out-of-range device; synchronizing an unknown event is an invalid handle; a negative size is invalid
+    fixtures: [one-gpu]
+    steps:
+      - {flow: mem-get-info, as: info, input: {device: 1}}
+      - {flow: stream-create, as: sc, input: {device: 1}}
+      - {flow: event-create, as: ec, input: {device: -1}}
+      - {flow: device-synchronize, as: ds, input: {device: 2}}
+      - {flow: event-synchronize, as: es, input: {event: event-7}}
+      - {flow: malloc, as: neg, input: {bytes: -1}}
+    expect:
+      - "[steps.info, steps.sc, steps.ec, steps.ds].all(s, !s.result.ok && s.result.error.code == 'cudaErrorInvalidDevice')"
+      - "steps.es.result.error.code == 'cudaErrorInvalidResourceHandle' && steps.neg.result.error.code == 'cudaErrorInvalidValue'"
+      - "size(state['cuda-runtime'].streams) == 2 && size(state['cuda-runtime'].events) == 0"

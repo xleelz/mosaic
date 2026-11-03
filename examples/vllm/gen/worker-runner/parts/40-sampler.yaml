@@ -1,0 +1,603 @@
+interfaces:
+  # ================= Sampler (V2) =================
+  - component: sampler
+    name: add-request
+    kind: function
+    summary: "Sampler.add_request: stages temperature/top-k/top-p/min-p/seed/logprobs into the slot and asks each logits processor (logit bias, penalties, bad words, custom) and the thinking budget whether the slot needs logits processing."
+    sources: ["vllm/v1/worker/gpu/sample/sampler.py:96-107", "vllm/v1/worker/gpu/sample/states.py:41-71"]
+    latency_ms: 0
+    request:
+      type: object
+      required: [slot]
+      properties:
+        slot: {type: integer, examples: [127]}
+        sampling_params: {type: object}
+    response: {type: object, properties: {needs_processing: {type: boolean}}}
+    behavior:
+      - set:
+          vars.sp: "= has(input.sampling_params) ? input.sampling_params : {}"
+      - set:
+          vars.t: "= has(vars.sp.temperature) ? double(vars.sp.temperature) : 1.0"
+          vars.top_p: "= has(vars.sp.top_p) ? double(vars.sp.top_p) : 1.0"
+          vars.top_k: "= (has(vars.sp.top_k) && vars.sp.top_k > 0 && vars.sp.top_k <= state.vocab_size) ? vars.sp.top_k : state.vocab_size"
+          vars.min_p: "= has(vars.sp.min_p) ? double(vars.sp.min_p) : 0.0"
+      - set:
+          vars.base: "= vars.t != 0.0 && (vars.t != 1.0 || vars.min_p != 0.0 || vars.top_k != state.vocab_size || vars.top_p != 1.0)"
+          vars.penalties: "= (has(vars.sp.repetition_penalty) && double(vars.sp.repetition_penalty) != 1.0) || (has(vars.sp.frequency_penalty) && double(vars.sp.frequency_penalty) != 0.0) || (has(vars.sp.presence_penalty) && double(vars.sp.presence_penalty) != 0.0)"
+          vars.logit_bias: "= (has(vars.sp.logit_bias) && size(vars.sp.logit_bias) > 0) || (has(vars.sp.allowed_token_ids) && size(vars.sp.allowed_token_ids) > 0) || (has(vars.sp.min_tokens) && vars.sp.min_tokens > 0 && has(vars.sp.stop_token_ids) && size(vars.sp.stop_token_ids) > 0)"
+          vars.thinking: "= has(vars.sp.thinking_token_budget)"
+      - if: "vars.penalties"
+        then:
+          - title: Count the prompt's tokens for penalties
+            source: "vllm/v1/worker/gpu/sample/penalties.py:62-80"
+            call: penalties-state.bincount-kernel
+            input: {num_rows: 1}
+      - title: Bad words are staged (or the slot's count reset to 0) on every add
+        source: "vllm/v1/worker/gpu/sample/sampler.py:101-102"
+        call: bad-words-state.add-request
+        input: {slot: "= input.slot", bad_words_token_ids: "= has(vars.sp.bad_words_token_ids) ? vars.sp.bad_words_token_ids : []"}
+        as: bw
+      - set: {vars.custom_needs: false}
+      - title: "Each custom logits processor initializes its slot state and says whether it modifies this request's logits"
+        source: "vllm/v1/worker/gpu/sample/sampler.py:101-102"
+        foreach: "= has(state.custom_processors) ? state.custom_processors : []"
+        as: proc
+        steps:
+          - call: custom-logits-processor.add-request
+            input: {processor: "= vars.proc", slot: "= input.slot", sampling_params: "= vars.sp"}
+            as: cp
+          - set: {vars.custom_needs: "= vars.custom_needs || vars.cp.value.modifies_logits"}
+      - set:
+          vars.needs: "= vars.base || vars.penalties || vars.logit_bias || vars.thinking || vars.bw.value.uses_bad_words || vars.custom_needs"
+      - set:
+          state.slots: "= merge(state.slots, {string(input.slot): {'temperature': vars.t, 'top_p': vars.top_p, 'top_k': vars.top_k, 'min_p': vars.min_p, 'min_tokens': has(vars.sp.min_tokens) && vars.sp.min_tokens != null ? int(vars.sp.min_tokens) : 0, 'seeded': has(vars.sp.seed) && vars.sp.seed != null, 'seed': has(vars.sp.seed) && vars.sp.seed != null ? int(vars.sp.seed) : 0, 'logprobs': has(vars.sp.logprobs) ? vars.sp.logprobs : -1, 'penalties': vars.penalties, 'logit_bias': vars.logit_bias, 'thinking': vars.thinking, 'needs_processing': vars.needs}})"
+      - return: {needs_processing: "= vars.needs"}
+  - component: sampler
+    name: sample
+    kind: function
+    summary: "Sampler.__call__: (NaN count) -> logits processors when any row needs them (logit bias, penalties, bad words, custom, thinking budget) -> temperature -> min_p -> top-k/top-p -> Gumbel-max sample (FlashInfer when eligible) -> logprobs -> per-request sampled counts (a chunked prefill that has not finished samples nothing)."
+    sources: ["vllm/v1/worker/gpu/sample/sampler.py:134-224", "vllm/v1/worker/gpu/sample/sampler.py:226-356", "vllm/v1/worker/gpu/sample/output.py:16-23"]
+    latency_ms: 0
+    request: {type: object, properties: {rows: {type: array}}}
+    response: {type: object, properties: {req_ids: {type: array}, sampled_token_ids: {type: array}, masked: {type: array}}}
+    behavior:
+      - if: "input.rows.exists(r, !(string(r.slot) in state.slots))"
+        then:
+          - fail: {code: key-error, status: 0, message: "= 'no sampling state for slot ' + string(input.rows.filter(r, !(string(r.slot) in state.slots))[0].slot)"}
+      - set:
+          vars.p: "= input.rows.map(r, state.slots[string(r.slot)])"
+      - if: "config['vllm-compute-nans-in-logits']"
+        then:
+          - title: Count NaNs before any processing
+            source: "vllm/v1/worker/gpu/sample/sampler.py:148-150"
+            call: gpu-logits-metrics.num-nans-kernel
+            input: {num_rows: "= size(input.rows)"}
+      - title: "Logits processors, thinking budget, temperature and min_p (top-k/top-p is applied below, with the sampling)"
+        source: "vllm/v1/worker/gpu/sample/sampler.py:289-299"
+        call: sampler.apply-sampling-params
+        input: {rows: "= input.rows", skip_top_k_top_p: true}
+        as: asp
+      - set: {vars.masked: "= vars.asp.value.masked"}
+      - if: "vars.p.exists(s, s.top_k < state.vocab_size || s.top_p < 1.0)"
+        then:
+          - title: Top-k / top-p truncation (Triton)
+            source: "vllm/v1/worker/gpu/sample/sampler.py:345"
+            call: topk-topp-triton.apply-top-k-top-p
+            input:
+              batch_size: "= size(input.rows)"
+              topk_enabled: "= vars.p.exists(s, s.top_k < state.vocab_size)"
+              topp_enabled: "= vars.p.exists(s, s.top_p < 1.0)"
+      - if: "config['watermark-enabled']"
+        then:
+          - call: gpu-watermark-sampler.sample
+            input: {num_rows: "= size(input.rows)"}
+        else:
+          - title: Gumbel-max sampling (argmax at temperature 0, per-request seeds)
+            source: "vllm/v1/worker/gpu/sample/sampler.py:346-355"
+            call: gumbel.gumbel-sample-kernel
+            input: {num_rows: "= size(input.rows)"}
+      - if: "config['enable-trace-replay']"
+        then:
+          - call: trace-replay-state.apply-trace
+            input: {num_rows: "= size(input.rows)"}
+      - if: "vars.p.exists(s, s.logprobs >= 0)"
+        then:
+          - title: Top-k logprobs and the sampled token's rank
+            source: "vllm/v1/worker/gpu/sample/sampler.py:171-186"
+            call: logprob.compute-topk-scores
+            input: {num_rows: "= size(input.rows)", num_logprobs: "= vars.p.map(s, s.logprobs).sortBy(x, -x)[0]"}
+      - title: One token per request; unfinished prefill chunks sample none
+        source: "vllm/v1/worker/gpu/sample/sampler.py:190-199"
+        call: input-batch.get-num-sampled-and-rejected-kernel
+        input: {num_rows: "= size(input.rows)"}
+      - if: "config['return-sampling-mask']"
+        then:
+          - call: sampling-mask-tensors.compact-sampling-mask-kernel
+            input: {num_rows: "= size(input.rows)"}
+      - return:
+          req_ids: "= input.rows.map(r, r.req_id)"
+          sampled_token_ids: "= lists.range(size(input.rows)).map(i, !input.rows[i].is_final ? [] : [vars.asp.value.tokens[i][0]])"
+          masked: "= vars.masked"
+
+  - component: sampler
+    name: apply-sampling-params
+    kind: function
+    summary: "Sampler.apply_sampling_params: when any row needs processing, copies the logits to FP32, builds the step's LogitsContext and runs the logits processors in order (logit bias and min_tokens, penalties, bad words, then custom processors), the thinking-budget forcing last, then temperature and min_p, and top-k/top-p unless skipped. The rejection sampler calls it for the target's logits too. The model holds no logits, so it returns, for each logits row, the token the processed logits would yield (a labeled stand-in; -1 for a chunked prefill that samples nothing): the model's EOS at the request's natural output length (masked until min_tokens), else a deterministic token for greedy or seeded rows and a random one otherwise."
+    sources: ["vllm/v1/worker/gpu/sample/sampler.py:226-276", "vllm/v1/worker/gpu/sample/logits_processor/interface.py:63-89"]
+    latency_ms: 0
+    request:
+      type: object
+      properties:
+        rows: {type: array, description: "one per request: slot, prompt_hash, prompt_len, eos_token_id, drafts, seq_len, and positions (the sequence length each logits row samples at; default [seq_len])"}
+        skip_top_k_top_p: {type: boolean, default: false}
+    response: {type: object, properties: {tokens: {type: array, items: {type: array, items: {type: integer}}}, greedy: {type: array, items: {type: boolean}}, masked: {type: array}}}
+    behavior:
+      - set:
+          vars.p: "= input.rows.map(r, string(r.slot) in state.slots ? state.slots[string(r.slot)] : {'temperature': 1.0, 'top_p': 1.0, 'top_k': state.vocab_size, 'min_p': 0.0, 'min_tokens': 0, 'seeded': false, 'seed': 0, 'logprobs': -1, 'penalties': false, 'logit_bias': false, 'thinking': false, 'needs_processing': false})"
+          vars.masked: []
+      - if: "vars.p.exists(s, s.needs_processing)"
+        then:
+          - title: "LogitsContext: this step's row -> slot mapping, positions and input ids, passed to every processor's apply()"
+            source: "vllm/v1/worker/gpu/sample/sampler.py:242-250"
+            set:
+              vars.ctx:
+                idx_mapping: "= input.rows.map(r, r.slot)"
+                expanded_idx_mapping: "= input.rows.map(r, (has(r.drafts) ? lists.range(size(r.drafts) + 1) : [0]).map(j, r.slot)).flatten()"
+          - title: Logits processors in pipeline order (bias adds, penalties scale, then bad words)
+            source: "vllm/v1/worker/gpu/sample/sampler.py:254-256"
+            when: "vars.p.exists(s, s.logit_bias)"
+            call: logit-bias-state.bias-kernel
+            input: {num_rows: "= size(input.rows)"}
+          - when: "vars.p.exists(s, s.penalties)"
+            call: penalties-state.penalties-kernel
+            input: {num_rows: "= size(input.rows)"}
+          - call: bad-words-state.apply
+            input: {rows: "= input.rows"}
+            as: bw
+          - set: {vars.masked: "= vars.bw.value.masked"}
+          - title: Custom logits processors run after the built-in stages
+            source: "vllm/v1/worker/gpu/sample/sampler.py:254-256"
+            foreach: "= has(state.custom_processors) ? state.custom_processors : []"
+            as: proc
+            steps:
+              - call: custom-logits-processor.apply
+                input: {processor: "= vars.proc", ctx: "= vars.ctx"}
+          - title: Thinking-budget forcing runs last
+            source: "vllm/v1/worker/gpu/sample/sampler.py:258-260"
+            when: "vars.p.exists(s, s.thinking)"
+            call: thinking-budget-state.apply
+            input: {num_rows: "= size(input.rows)"}
+          - title: Temperature, skipped when every row is 0 or 1
+            source: "vllm/v1/worker/gpu/sample/states.py:79-93"
+            when: "vars.p.exists(s, s.temperature != 0.0 && s.temperature != 1.0)"
+            call: gumbel.temperature-kernel
+            input: {num_rows: "= size(input.rows)"}
+          - title: min_p
+            source: "vllm/v1/worker/gpu/sample/sampler.py:267-268"
+            when: "vars.p.exists(s, s.min_p != 0.0)"
+            call: min-p.min-p-kernel
+            input: {num_rows: "= size(input.rows)"}
+          - if: "!(has(input.skip_top_k_top_p) && input.skip_top_k_top_p) && vars.p.exists(s, s.top_k < state.vocab_size || s.top_p < 1.0)"
+            then:
+              - title: Top-k / top-p (the rejection sampler's path; the sampler applies it while sampling)
+                source: "vllm/v1/worker/gpu/sample/sampler.py:273-276"
+                call: topk-topp-triton.apply-top-k-top-p
+                input:
+                  batch_size: "= size(input.rows)"
+                  topk_enabled: "= vars.p.exists(s, s.top_k < state.vocab_size)"
+                  topp_enabled: "= vars.p.exists(s, s.top_p < 1.0)"
+      - set:
+          vars.pos: "= input.rows.map(r, has(r.positions) ? r.positions : [has(r.seq_len) ? r.seq_len : -1])"
+      - title: Where the model would emit EOS
+        detail: "The model holds no logits, so each request has a natural output length, base + prompt_hash % spread tokens (labeled assumption), at which the sampled token is the model's EOS. min_tokens keeps EOS masked (LogitBiasState masks the stop ids while seq_len < prompt_len + min_tokens) until enough tokens exist; ignore_eos does not change sampling, only the scheduler's stop check."
+        source: "vllm/v1/worker/gpu/sample/logit_bias.py:96-112"
+        set:
+          vars.eos: "= lists.range(size(input.rows)).map(i, vars.pos[i].map(s, s >= 0 && has(input.rows[i].prompt_len) && s - input.rows[i].prompt_len >= int(config['worker-runner-natural-output-tokens-base']) + (has(input.rows[i].prompt_hash) ? input.rows[i].prompt_hash : 0) % int(config['worker-runner-natural-output-tokens-spread']) - 1 && s - input.rows[i].prompt_len >= (has(vars.p[i].min_tokens) ? vars.p[i].min_tokens : 0)))"
+      - title: Token values stand in for logits
+        detail: "A greedy row (temperature 0: plain argmax in the Gumbel kernel) or a seeded row gets a deterministic token from the request's prompt and the position, so identical requests produce identical outputs and a greedy target's verdict on a draft is reproducible; an unseeded random row gets a seeded-per-run random token."
+        source: "vllm/v1/worker/gpu/sample/gumbel.py:21-44"
+        return:
+          tokens: "= lists.range(size(input.rows)).map(i, lists.range(size(vars.pos[i])).map(j, (has(input.rows[i].is_final) && !input.rows[i].is_final) ? -1 : (!has(input.rows[i].grammar) ? (vars.eos[i][j] ? (has(input.rows[i].eos_token_id) ? input.rows[i].eos_token_id : 128009) : ((vars.p[i].temperature == 0.0 || vars.p[i].seeded) ? ((has(input.rows[i].prompt_hash) ? input.rows[i].prompt_hash : 0) * 31 + (vars.pos[i][j] >= 0 ? vars.pos[i][j] : 0) * 7919 + (has(vars.p[i].seed) ? vars.p[i].seed % 1000003 : 0)) % 127900 + 100 : random(127900) + 100)) : ((vars.eos[i][j] && input.rows[i].grammar.stop) ? (has(input.rows[i].eos_token_id) ? input.rows[i].eos_token_id : 128009) : (input.rows[i].grammar.content ? ((vars.p[i].temperature == 0.0 || vars.p[i].seeded) ? ((has(input.rows[i].prompt_hash) ? input.rows[i].prompt_hash : 0) * 31 + (vars.pos[i][j] >= 0 ? vars.pos[i][j] : 0) * 7919 + (has(vars.p[i].seed) ? vars.p[i].seed % 1000003 : 0)) % 127900 + 100 : random(127900) + 100) : (input.rows[i].grammar.quote ? 1 : (input.rows[i].grammar.stop ? (has(input.rows[i].eos_token_id) ? input.rows[i].eos_token_id : 128009) : ((vars.p[i].temperature == 0.0 || vars.p[i].seeded) ? ((has(input.rows[i].prompt_hash) ? input.rows[i].prompt_hash : 0) * 31 + (vars.pos[i][j] >= 0 ? vars.pos[i][j] : 0) * 7919 + (has(vars.p[i].seed) ? vars.p[i].seed % 1000003 : 0)) % 127900 + 100 : random(127900) + 100))))))))"
+          greedy: "= vars.p.map(s, s.temperature == 0.0)"
+          masked: "= vars.masked"
+  - component: sampler
+    name: apply-staged-writes
+    kind: function
+    summary: "Sampler.apply_staged_writes: flushes the sampling states, every logits processor's staged writes (built-in and custom), the thinking-budget, logprob-token-id and trace-replay states."
+    sources: ["vllm/v1/worker/gpu/sample/sampler.py:109-116"]
+    latency_ms: 0
+    response: {type: object, properties: {flushed: {type: array, items: {type: string}}}}
+    behavior:
+      - call: staged-write-tensor.apply-write-kernel
+        input: {num_rows: 1}
+      - title: Each custom processor flushes what its add_request staged
+        source: "vllm/v1/worker/gpu/sample/sampler.py:111-112"
+        foreach: "= has(state.custom_processors) ? state.custom_processors : []"
+        as: proc
+        steps:
+          - call: custom-logits-processor.apply-staged-writes
+            input: {processor: "= vars.proc"}
+      - return: {flushed: "= ['sampling_states'] + (has(state.custom_processors) ? state.custom_processors : [])"}
+
+  # ---- logits processors ----
+  - component: bad-words-state
+    name: add-request
+    kind: function
+    summary: "BadWordsState.add_request: no bad words resets the slot's count to 0 (so a recycled slot stops masking); otherwise flattens them with offsets, rejecting more than VLLM_MAX_NUM_BAD_WORDS words or VLLM_MAX_BAD_WORDS_TOTAL_TOKENS tokens."
+    sources: ["vllm/v1/worker/gpu/sample/bad_words.py:40-71"]
+    latency_ms: 0
+    errors: [{code: value-error, status: 0, retryable: false}]
+    request:
+      type: object
+      required: [slot]
+      properties:
+        slot: {type: integer, examples: [127]}
+        bad_words_token_ids: {type: array, items: {type: array, items: {type: integer}}}
+    response: {type: object, properties: {uses_bad_words: {type: boolean}}}
+    behavior:
+      - set: {vars.key: "= string(input.slot)"}
+      - if: "!has(input.bad_words_token_ids) || size(input.bad_words_token_ids) == 0"
+        then:
+          - title: No bad words, the slot's count is overwritten with 0
+            source: "vllm/v1/worker/gpu/sample/bad_words.py:41-44"
+            set:
+              state.num_bad_words: "= merge(state.num_bad_words, {vars.key: 0})"
+          - return: {uses_bad_words: false}
+      - if: "size(input.bad_words_token_ids) > int(config['vllm-max-num-bad-words'])"
+        then:
+          - title: Too many bad words
+            source: "vllm/v1/worker/gpu/sample/bad_words.py:46-52"
+            fail: {code: value-error, status: 0, message: "= 'Too many bad words: ' + string(size(input.bad_words_token_ids)) + '. The max number is ' + string(int(config[\"vllm-max-num-bad-words\"])) + '.'"}
+      - set: {vars.total: "= sum(input.bad_words_token_ids.map(w, size(w)))"}
+      - if: "vars.total > int(config['vllm-max-bad-words-total-tokens'])"
+        then:
+          - title: Too many total bad-word tokens
+            source: "vllm/v1/worker/gpu/sample/bad_words.py:61-66"
+            fail: {code: value-error, status: 0, message: "= 'Too many total bad word tokens: ' + string(vars.total) + '. The max is ' + string(int(config[\"vllm-max-bad-words-total-tokens\"])) + '.'"}
+      - title: Stage flattened tokens and offsets for the slot
+        source: "vllm/v1/worker/gpu/sample/bad_words.py:68-71"
+        set:
+          state.bad_words: "= merge(state.bad_words, {vars.key: input.bad_words_token_ids})"
+          state.num_bad_words: "= merge(state.num_bad_words, {vars.key: size(input.bad_words_token_ids)})"
+      - return: {uses_bad_words: true}
+  - component: bad-words-state
+    name: apply
+    kind: function
+    summary: "BadWordsState.apply: skips the kernel when no scheduled slot has bad words; else, for each logits row (local position p: committed output plus the first p drafts), masks a bad word's last token when that context ends with the word's prefix."
+    sources: ["vllm/v1/worker/gpu/sample/bad_words.py:78-98", "vllm/v1/worker/gpu/sample/bad_words.py:101-165"]
+    latency_ms: 0
+    request:
+      type: object
+      properties:
+        rows:
+          type: array
+          items:
+            type: object
+            properties:
+              slot: {type: integer}
+              context_token_ids: {type: array, items: {type: integer}}
+              drafts: {type: array, items: {type: integer}}
+    response: {type: object, properties: {masked: {type: array}, kernel_launched: {type: boolean}}}
+    behavior:
+      - set:
+          vars.counts: "= input.rows.map(r, string(r.slot) in state.num_bad_words ? state.num_bad_words[string(r.slot)] : 0)"
+      - if: "size(vars.counts) == 0 || vars.counts.sortBy(c, -c)[0] == 0"
+        then:
+          - title: No request uses bad words, skip the kernel launch
+            source: "vllm/v1/worker/gpu/sample/bad_words.py:79-82"
+            return: {masked: [], kernel_launched: false}
+      - call: bad-words-state.bad-words-kernel
+        input: {num_rows: "= size(input.rows)"}
+      - set:
+          vars.masked: "= input.rows.filter(r, string(r.slot) in state.num_bad_words && state.num_bad_words[string(r.slot)] > 0).map(r, lists.range((has(r.drafts) ? size(r.drafts) : 0) + 1).map(p, state.bad_words[string(r.slot)].filter(w, size(r.context_token_ids + (has(r.drafts) ? r.drafts : []).slice(0, p)) >= size(w) - 1 && (r.context_token_ids + (has(r.drafts) ? r.drafts : []).slice(0, p)).slice(size(r.context_token_ids) + p - (size(w) - 1), size(r.context_token_ids) + p) == w.slice(0, size(w) - 1)).map(w, {'slot': r.slot, 'local_pos': p, 'token': w[size(w) - 1]}))).flatten().flatten()"
+      - return: {masked: "= vars.masked", kernel_launched: true}
+  - component: thinking-budget-state
+    name: apply
+    kind: function
+    summary: "ThinkingBudgetState.apply: updates the committed-marker cache, then forces the end-of-thinking token for rows past their budget."
+    sources: ["vllm/v1/worker/gpu/sample/thinking_budget.py:113-134", "vllm/v1/worker/gpu/sample/thinking_budget.py:368-410"]
+    latency_ms: 0
+    behavior:
+      - call: thinking-budget-state.update-committed-marker-cache-kernel
+        input: {num_rows: "= input.num_rows"}
+      - call: thinking-budget-state.thinking-budget-kernel
+        input: {num_rows: "= input.num_rows"}
+  - component: topk-topp-triton
+    name: apply-top-k-top-p
+    kind: function
+    summary: "apply_top_k_top_p_triton: small batches (<= 64) with top-p only use the split-row pipeline; otherwise the monolithic kernel, followed by the split pipeline for top-p rows when both apply."
+    sources: ["vllm/v1/sample/ops/topk_topp_triton.py:1613-1717", "vllm/v1/sample/ops/topk_topp_sampler.py:460-470"]
+    latency_ms: 0
+    request: {type: object, properties: {batch_size: {type: integer}, topk_enabled: {type: boolean}, topp_enabled: {type: boolean}}}
+    response: {type: object, properties: {path: {type: string}}}
+    behavior:
+      - set: {vars.use_split: "= input.topp_enabled && input.batch_size <= 64"}
+      - if: "vars.use_split && !input.topk_enabled"
+        then:
+          - title: Split-row top-p pipeline only
+            source: "vllm/v1/sample/ops/topk_topp_triton.py:1671-1676"
+            call: topk-topp-triton.topp-split-kernels
+            input: {num_rows: "= input.batch_size"}
+          - return: {path: split}
+      - call: topk-topp-triton.topk-topp-kernel
+        input: {num_rows: "= input.batch_size"}
+      - if: "vars.use_split"
+        then:
+          - call: topk-topp-triton.topp-split-kernels
+            input: {num_rows: "= input.batch_size"}
+          - return: {path: monolithic+split}
+      - return: {path: monolithic}
+  - component: logprob
+    name: compute-topk-scores
+    kind: function
+    summary: "compute_topk_scores: log-softmax of the top-k (and requested) token ids plus the sampled token's rank."
+    sources: ["vllm/v1/worker/gpu/sample/logprob.py:111-190"]
+    latency_ms: 0
+    request: {type: object, properties: {num_rows: {type: integer}, num_logprobs: {type: integer}, extra_token_ids: {type: integer, default: 0}}}
+    response: {type: object, properties: {num_logprobs: {type: integer}}}
+    behavior:
+      - call: logprob.topk-log-softmax-kernel
+        input: {num_rows: "= input.num_rows"}
+      - call: logprob.ranks-kernel
+        input: {num_rows: "= input.num_rows"}
+      - if: "has(input.extra_token_ids) && input.extra_token_ids > 0"
+        then:
+          - call: logprob.fill-logprob-token-ids-kernel
+            input: {num_rows: "= input.num_rows"}
+      - return: {num_logprobs: "= input.num_logprobs"}
+  - component: prompt-logprobs-worker
+    name: compute-prompt-logprobs
+    kind: function
+    summary: "compute_prompt_logprobs: only for new requests whose sampling params ask for prompt_logprobs (computed over their prefill chunk)."
+    sources: ["vllm/v1/worker/gpu/sample/prompt_logprob.py:120-230"]
+    latency_ms: 0
+    request: {type: object, properties: {new_reqs: {type: object}}}
+    response: {type: object, properties: {req_ids: {type: array}}}
+    behavior:
+      - set:
+          vars.ids: "= input.new_reqs.map(k, k).filter(k, has(input.new_reqs[k].sampling_params) && has(input.new_reqs[k].sampling_params.prompt_logprobs)).sort()"
+      - if: "size(vars.ids) == 0"
+        then: [{return: {req_ids: []}}]
+      - call: prompt-logprobs-worker.prompt-logprobs-token-ids-kernel
+        input: {num_rows: "= size(vars.ids)"}
+      - call: llama-for-causal-lm.compute-logits
+        input: {num_tokens: "= size(vars.ids)"}
+      - return: {req_ids: "= vars.ids"}
+  - component: structured-outputs-worker
+    name: apply-grammar-bitmask
+    kind: function
+    summary: "apply_grammar_bitmask: returns at once when no structured-output request is in the batch; else copies the bitmask to the GPU and masks the matching logit rows."
+    sources: ["vllm/v1/worker/gpu/structured_outputs.py:95-160"]
+    latency_ms: 0
+    request: {type: object, properties: {structured_output_request_ids: {type: array, items: {type: string}}, batch_req_ids: {type: array}, grammar_ids: {type: array, default: [], items: {type: string}}, eos_token_id: {type: integer, default: 128009}}}
+    response: {type: object, properties: {masked_req_ids: {type: array}, allowed: {type: object, description: "req_id -> which token classes the grammar's bitmask row leaves open: quote (token 1), stop (the EOS), content (any other token)"}}}
+    behavior:
+      - if: "size(input.structured_output_request_ids) == 0"
+        then: [{return: {masked_req_ids: [], allowed: {}}}]
+      - call: structured-outputs-worker.apply-grammar-bitmask-kernel
+        input: {num_rows: "= size(input.structured_output_request_ids)"}
+      - set: {vars.allowed: {}}
+      - title: "Each masked row keeps only the tokens its grammar's bitmask row allows (the bitmask the scheduler filled from the grammar's state)"
+        source: "vllm/v1/worker/gpu/structured_outputs.py:120-160"
+        foreach: "= has(input.grammar_ids) ? lists.range(size(input.grammar_ids)).filter(i, input.structured_output_request_ids[i] in input.batch_req_ids) : []"
+        as: i
+        steps:
+          - call: xgrammar-grammar.fill-bitmask
+            input: {grammar_id: "= input.grammar_ids[vars.i]", token_ids: "= [1, input.eos_token_id, 2]"}
+            as: bm
+          - set:
+              vars.allowed: "= merge(vars.allowed, {input.structured_output_request_ids[vars.i]: {'quote': vars.bm.value.allowed['1'], 'stop': vars.bm.value.allowed[string(input.eos_token_id)], 'content': vars.bm.value.allowed['2']}})"
+      - return: {masked_req_ids: "= input.structured_output_request_ids.filter(id, id in input.batch_req_ids)", allowed: "= vars.allowed"}
+  - component: trace-replay-state
+    name: apply-trace
+    kind: function
+    summary: "TraceReplayState.apply_trace: overwrites sampled tokens with the replay trace before logprobs."
+    sources: ["vllm/v1/worker/gpu/sample/trace_replay.py:46-60"]
+    latency_ms: 0
+    behavior:
+      - call: trace-replay-state.trace-replay-kernel
+        input: {num_rows: "= input.num_rows"}
+  - component: gpu-watermark-sampler
+    name: sample
+    kind: function
+    summary: "GPUWatermarkSampler: Philox-keyed Gumbel sampling; deduplicate_contexts first masks repeated contexts."
+    sources: ["vllm/v1/watermarking/gpu_sampler.py:20-120", "vllm/v1/worker/gpu/sample/watermark.py:706-772"]
+    latency_ms: 0
+    behavior:
+      - title: "GumbelWatermarker (create_watermarker): the sampling score is keyed by a Philox PRF of the preceding context_width tokens"
+        source: "vllm/v1/watermarking/gumbel.py:42-104"
+      - title: Philox PRF that keys the watermark
+        source: "vllm/v1/watermarking/prfs/philox.py:58-130"
+      - call: gpu-watermark-sampler.repeated-context-mask-kernel
+        input: {num_rows: "= input.num_rows"}
+      - call: gpu-watermark-sampler.philox-gumbel-kernel
+        input: {num_rows: "= input.num_rows"}
+  - component: batch-sharder
+    name: shard-sampler-inputs
+    kind: function
+    summary: "BatchSharder.shard_sampler_inputs: request i is owned by TP rank idx_mapping[i] % tp_size (round-robin over slots, identical on every rank, no communication). This rank keeps its owned requests in batch order (a stable owner sort) and builds the shard metadata: logits rows per owner rank (the all-to-all splits, summing to the batch's), its own logits count, the most requests any rank owns, the largest logits count of one request, and each request's source index in the rank-major gathered result."
+    sources: ["vllm/v1/worker/gpu/sample/batch_shard.py:162-288", "vllm/v1/worker/gpu/sample/batch_shard.py:19-50"]
+    latency_ms: 0
+    request:
+      type: object
+      properties:
+        req_ids: {type: array, default: [], items: {type: string}}
+        idx_mapping: {type: array, items: {type: integer}, description: "batch position -> request slot"}
+        cu_num_logits: {type: array, items: {type: integer}, description: "cumulative logits rows per request (1 + drafts each)"}
+        num_reqs: {type: integer, default: 0}
+        tp_rank: {type: integer, default: -1, description: "the TP group's rank_in_group; -1 (default): this instance's rank mod tp_size"}
+        tp_size: {type: integer, default: 0, description: "the TP group's world size; 0 (default): tensor-parallel-size"}
+    response:
+      type: object
+      properties:
+        local_batch: {type: object, properties: {req_ids: {type: array}, num_reqs: {type: integer}, idx_mapping: {type: array}, cu_num_logits: {type: array}}}
+        metadata: {type: object, properties: {tp_size: {type: integer}, num_logits_per_rank: {type: array}, num_local_logits: {type: integer}, num_local_reqs: {type: integer}, max_num_reqs_per_rank: {type: integer}, gathered_src_indices: {type: array}, max_num_logits_per_req: {type: integer}}}
+    behavior:
+      - set:
+          vars.tp: "= has(input.tp_size) && input.tp_size > 0 ? input.tp_size : int(config['tensor-parallel-size'])"
+          vars.n: "= size(input.idx_mapping)"
+      - set:
+          vars.rank: "= has(input.tp_rank) && input.tp_rank >= 0 ? input.tp_rank : (self == '' ? 0 : int(self.substring(4)) % vars.tp)"
+          vars.owner: "= input.idx_mapping.map(s, s % vars.tp)"
+          vars.per_req: "= lists.range(vars.n).map(i, input.cu_num_logits[i + 1] - input.cu_num_logits[i])"
+      - title: "Owner of each request: its slot index mod tp_size; this rank's requests in batch order"
+        source: "vllm/v1/worker/gpu/sample/batch_shard.py:177-185"
+        set:
+          vars.local: "= lists.range(vars.n).filter(i, vars.owner[i] == vars.rank)"
+          vars.reqs_per_rank: "= lists.range(vars.tp).map(r, size(lists.range(vars.n).filter(i, vars.owner[i] == r)))"
+          vars.per_rank: "= lists.range(vars.tp).map(r, sum(lists.range(vars.n).filter(i, vars.owner[i] == r).map(i, vars.per_req[i])))"
+      - title: "Logits rows per owner rank (bincount weighted by each request's rows), this rank's local cumulative counts, and the per-request maximum"
+        source: "vllm/v1/worker/gpu/sample/batch_shard.py:186-198"
+        set:
+          vars.maxpr: "= vars.n > 0 ? vars.reqs_per_rank.sortBy(x, -x)[0] : 1"
+          vars.local_cu: "= lists.range(size(vars.local) + 1).map(j, sum(vars.local.slice(0, j).map(i, vars.per_req[i])))"
+          vars.max_logits: "= vars.n > 0 ? vars.per_req.sortBy(x, -x)[0] : 1"
+      - title: The plan kernel writes the owner-sorted logits indices, the gather map and this rank's sub-batch tensors
+        source: "vllm/v1/worker/gpu/sample/batch_shard.py:225-248"
+        when: "vars.n > 0"
+        call: batch-sharder.build-shard-plan-kernel
+        input: {num_rows: "= vars.n"}
+      - title: "The local batch keeps only the owned entries; the metadata drives the all-to-all and the all-gather"
+        source: "vllm/v1/worker/gpu/sample/batch_shard.py:259-288"
+        return:
+          local_batch:
+            req_ids: "= has(input.req_ids) ? vars.local.map(i, input.req_ids[i]) : []"
+            num_reqs: "= size(vars.local)"
+            idx_mapping: "= vars.local.map(i, input.idx_mapping[i])"
+            cu_num_logits: "= vars.local_cu"
+          metadata:
+            tp_size: "= vars.tp"
+            num_logits_per_rank: "= vars.per_rank"
+            num_local_logits: "= vars.per_rank[vars.rank]"
+            num_local_reqs: "= size(vars.local)"
+            max_num_reqs_per_rank: "= vars.maxpr"
+            gathered_src_indices: "= lists.range(vars.n).map(i, vars.owner[i] * vars.maxpr + size(lists.range(i).filter(j, vars.owner[j] == vars.owner[i])))"
+            max_num_logits_per_req: "= vars.max_logits"
+  - component: batch-sharder
+    name: gather-sampler-output
+    kind: function
+    summary: "gather_sampler_output: all-gathers the per-rank sampler outputs (and logprobs) back into global order."
+    sources: ["vllm/v1/worker/gpu/sample/batch_shard.py:522-660"]
+    latency_ms: 0
+    behavior:
+      - call: batch-sharder.pack-sampler-output-kernel
+        input: {num_rows: "= input.num_reqs"}
+      - call: batch-sharder.unpack-gathered-output-kernel
+        input: {num_rows: "= input.num_reqs"}
+      - call: batch-sharder.pack-logprobs-kernel
+        input: {num_rows: "= input.num_reqs"}
+      - call: batch-sharder.unpack-logprobs-kernel
+        input: {num_rows: "= input.num_reqs"}
+
+  # ================= custom logits processor loaders =================
+  - component: logits-processor-loader
+    name: build-custom-logits-processors
+    kind: function
+    summary: "build_custom_logits_processors (V2): pooling models reject custom processors; otherwise entry-point plugins (group vllm.logits_processors) load first and must be V2 LogitsProcessor subclasses, then the configured classes/FQCNs; each class is built with (vllm_config, LogitsProcRequestState)."
+    sources: ["vllm/v1/worker/gpu/sample/logits_processor/loader.py:156-183", "vllm/v1/worker/gpu/sample/logits_processor/interface.py:27-60"]
+    latency_ms: 0
+    errors:
+      - {code: value-error, status: 0, retryable: false}
+      - {code: runtime-error, status: 0, retryable: false}
+    request:
+      type: object
+      properties:
+        is_pooling_model: {type: boolean, default: false}
+        max_num_reqs: {type: integer, examples: [128]}
+        custom:
+          type: array
+          items:
+            type: object
+            properties:
+              kind: {type: string, enum: [class, fqcn]}
+              name: {type: string}
+    response: {type: object, properties: {processors: {type: array, items: {type: string}}, req_state: {type: object}}}
+    behavior:
+      - if: "input.is_pooling_model"
+        then:
+          - if: "size(input.custom) > 0"
+            then:
+              - title: Pooling models reject custom logits processors
+                source: "vllm/v1/worker/gpu/sample/logits_processor/loader.py:172-174"
+                fail: {code: value-error, status: 0, message: "Custom logits processors are not supported for pooling models."}
+          - return: {processors: [], req_state: {}}
+      - set: {vars.classes: []}
+      - title: Load installed plugins (entry_points group vllm.logits_processors)
+        source: "vllm/v1/worker/gpu/sample/logits_processor/loader.py:37-74"
+        foreach: "= state.installed_plugins"
+        as: ep
+        steps:
+          - if: "!(vars.ep.value in state.classes)"
+            then:
+              - fail: {code: runtime-error, status: 0, message: "= 'Failed to load LogitsProcessor plugin ' + vars.ep.name"}
+          - if: "!state.classes[vars.ep.value].is_type || !state.classes[vars.ep.value].v2"
+            then:
+              - title: V1-interface plugins are rejected by the V2 runner
+                source: "vllm/v1/worker/gpu/sample/logits_processor/loader.py:67-72"
+                fail: {code: value-error, status: 0, message: "= 'LogitsProcessor plugin ' + vars.ep.name + ' is not a subclass of vllm.v1.worker.gpu.sample.logits_processor.LogitsProcessor; V1-interface plugins are not supported by the V2 model runner.'"}
+          - set: {vars.classes: "= vars.classes + [state.classes[vars.ep.value].cls]"}
+      - title: Resolve the configured classes and FQCNs (<module>:<type>)
+        source: "vllm/v1/worker/gpu/sample/logits_processor/loader.py:77-133"
+        foreach: "= input.custom"
+        as: lp
+        steps:
+          - if: "vars.lp.kind == 'class'"
+            then:
+              - if: "!(vars.lp.name in state.classes) || !state.classes[vars.lp.name].v2"
+                then:
+                  - fail: {code: value-error, status: 0, message: "= vars.lp.name + ' is not a subclass of vllm.v1.worker.gpu.sample.logits_processor.LogitsProcessor'"}
+              - set: {vars.classes: "= vars.classes + [state.classes[vars.lp.name].cls]"}
+              - continue: true
+          - if: "size(vars.lp.name.split(':')) != 2"
+            then:
+              - fail: {code: value-error, status: 0, message: "= 'Invalid logits processor FQCN ' + vars.lp.name + \". Expected format: '<module>:<type>'\""}
+          - if: "!(vars.lp.name in state.classes)"
+            then:
+              - fail: {code: runtime-error, status: 0, message: "= 'Failed to load logits processor plugin ' + vars.lp.name"}
+          - if: "!state.classes[vars.lp.name].is_type"
+            then:
+              - fail: {code: value-error, status: 0, message: "Loaded logit processor must be a type."}
+          - if: "!state.classes[vars.lp.name].v2"
+            then:
+              - fail: {code: value-error, status: 0, message: "= state.classes[vars.lp.name].cls + ' is not a subclass of vllm.v1.worker.gpu.sample.logits_processor.LogitsProcessor'"}
+          - set: {vars.classes: "= vars.classes + [state.classes[vars.lp.name].cls]"}
+      - title: Construct each class with (vllm_config, LogitsProcRequestState)
+        source: "vllm/v1/worker/gpu/sample/logits_processor/loader.py:181-183"
+      - return:
+          processors: "= vars.classes"
+          req_state: {max_num_reqs: "= input.max_num_reqs"}
+  - component: logits-processor-v1-loader
+    name: build-logitsprocs
+    kind: function
+    summary: "build_logitsprocs (V1 runner): pooling models and speculative decoding reject custom processors; otherwise built-ins (min_tokens, logit_bias, min_p) plus installed plugins and the configured FQCNs."
+    sources: ["vllm/v1/sample/logits_processor/__init__.py:191-228", "vllm/v1/sample/logits_processor/__init__.py:57-83"]
+    latency_ms: 0
+    errors:
+      - {code: value-error, status: 0, retryable: false}
+      - {code: runtime-error, status: 0, retryable: false}
+    request: {type: object, properties: {is_pooling_model: {type: boolean, default: false}, custom: {type: array, items: {type: string}}}}
+    response: {type: object, properties: {processors: {type: array, items: {type: string}}}}
+    behavior:
+      - if: "input.is_pooling_model"
+        then:
+          - if: "size(input.custom) > 0"
+            then: [{fail: {code: value-error, status: 0, message: "Custom logits processors are not supported for pooling models."}}]
+          - return: {processors: []}
+      - if: "config['speculative-method'] != ''"
+        then:
+          - if: "size(input.custom) > 0"
+            then:
+              - title: Speculative decoding rejects custom logits processors (V1)
+                source: "vllm/v1/sample/logits_processor/__init__.py:207-210"
+                fail: {code: value-error, status: 0, message: "Custom logits processors are not supported when speculative decoding is enabled."}
+          - title: Only MinTokens survives under speculative decoding (min_p and logit_bias do not apply)
+            source: "vllm/v1/sample/logits_processor/__init__.py:211-216"
+            return: {processors: [MinTokensLogitsProcessor]}
+      - title: Load installed plugins (any load failure is a RuntimeError)
+        source: "vllm/v1/sample/logits_processor/__init__.py:61-83"
+        foreach: "= state.installed_plugins"
+        as: ep
+        steps:
+          - if: "!has(vars.ep.loadable) || !vars.ep.loadable"
+            then: [{fail: {code: runtime-error, status: 0, message: "= 'Failed to load LogitsProcessor plugin ' + vars.ep.name"}}]
+      - return: {processors: "= ['MinTokensLogitsProcessor', 'LogitBiasLogitsProcessor', 'MinPLogitsProcessor'] + state.installed_plugins.map(p, p.name) + input.custom"}

@@ -1,0 +1,70 @@
+schema_version: 1
+id: vllm
+scenarios:
+  # (a)+(b) with EAGLE num_speculative_tokens 3: min_p and logit_bias are refused with 400 (sampling_params.py:1182-1194, input_processor.py:157-162)
+  - id: bench-p3-5-ab-spec
+    name: "P3-5 (a)(b) with EAGLE speculative decoding, min_p 0.1 and logit_bias give 400"
+    fixtures: [full-tp1-llama-8b]
+    config: {speculative-method: eagle, num-speculative-tokens: 3}
+    steps:
+      - flow: serving-api-chat-completion
+        as: minp
+        input: {body: {model: llama-8b, messages: [{role: user, content: hi}], min_p: 0.1, max_tokens: 4}}
+      - flow: serving-api-chat-completion
+        as: bias
+        input: {body: {model: llama-8b, messages: [{role: user, content: hi}], logit_bias: {"1234": 5}, max_tokens: 4}}
+      - interface: sampling-params.verify
+        caller: input-processor
+        as: verify_minp
+        input: {sampling_params: {min_p: 0.1, temperature: 1.0}}
+    expect:
+      - "!steps.minp.result.ok && steps.minp.result.error.status == 400 && steps.minp.result.error.message.contains('The min_p and logit_bias sampling parameters are not yet supported with speculative decoding.')"
+      - "!steps.bias.result.ok && steps.bias.result.error.status == 400 && steps.bias.result.error.message.contains('not yet supported with speculative decoding')"
+      - "!steps.verify_minp.result.ok && steps.verify_minp.result.error.message == 'The min_p and logit_bias sampling parameters are not yet supported with speculative decoding.'"
+      - "calls['async-llm.generate'] == 0 || !trace.exists(e, e.type == 'call.start' && e.interface == 'engine-core.add-request')"
+  # (a) control: without spec decode the same request is accepted
+  - id: bench-p3-5-a-nospec
+    name: "P3-5 (a) control: without speculative decoding min_p 0.1 is accepted"
+    fixtures: [full-tp1-llama-8b]
+    steps:
+      - flow: serving-api-chat-completion
+        as: minp
+        input: {body: {model: llama-8b, messages: [{role: user, content: hi}], min_p: 0.1, max_tokens: 4}}
+    expect:
+      - "steps.minp.result.ok"
+  # (c)+(d): ngram turns async scheduling off by default (warning), EAGLE keeps it; explicit --async-scheduling with ngram fails
+  - id: bench-p3-5-cd
+    name: "P3-5 (c)(d) async scheduling resolution with ngram vs EAGLE, and an explicit --async-scheduling with ngram"
+    fixtures: [full-tp1-llama-8b]
+    steps:
+      - interface: vllm-config.resolve-async-scheduling
+        caller: vllm-config
+        as: ngram
+        input: {async_scheduling: {$null: true}, speculative_method: ngram}
+      - interface: vllm-config.resolve-async-scheduling
+        caller: vllm-config
+        as: eagle
+        input: {async_scheduling: {$null: true}, speculative_method: eagle}
+      - interface: vllm-config.resolve-async-scheduling
+        caller: vllm-config
+        as: forced
+        input: {async_scheduling: true, speculative_method: ngram}
+      - flow: config-create-engine-config
+        as: cfg_ngram
+        input: {speculative_config: {method: ngram, num_speculative_tokens: 3, prompt_lookup_max: 4}}
+    expect:
+      - "steps.ngram.result.ok && steps.ngram.result.value.async_scheduling == false && steps.ngram.result.value.reason.contains('Async scheduling not supported with ngram-based speculative decoding')"
+      - "steps.eagle.result.ok && steps.eagle.result.value.async_scheduling == true"
+      - "!steps.forced.result.ok && steps.forced.result.error.code == 'value-error' && steps.forced.result.error.message.startsWith('Currently, async scheduling is only supported with EAGLE/MTP/Draft Model/NGram GPU')"
+      - "steps.cfg_ngram.result.ok && steps.cfg_ngram.result.value.scheduler_config.async_scheduling == false"
+  # (c) the engine core under ngram falls back to sync step(): drive the engine with the resolved value
+  - id: bench-p3-5-c-engine
+    name: "P3-5 (c) with ngram the derived async_scheduling=false should size the batch queue to 1 (sync step)"
+    fixtures: [full-tp1-llama-8b]
+    config: {speculative-method: ngram, num-speculative-tokens: 3}
+    steps:
+      - interface: engine-core.init
+        caller: engine-core-proc
+        as: init
+    expect:
+      - "steps.init.result.ok && steps.init.result.value.batch_queue_size == 1"

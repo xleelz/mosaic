@@ -1,0 +1,81 @@
+schema_version: 1
+id: vllm
+scenarios:
+  - id: bench-x5-worker-crash-mid-generation
+    name: "X5: a worker process dies mid-generation: executor failed -> EXECUTOR_FAILED -> engine dead -> EngineDeadError"
+    description: >
+      Verified: MultiprocWorkerMonitor (vllm/v1/executor/multiproc_executor.py:299-333) sees the
+      sentinel, sets is_failed, shuts the executor down and calls the failure callback, which puts
+      EXECUTOR_FAILED on the engine core's input queue (vllm/v1/engine/core.py:1149-1150); the busy loop
+      raises RuntimeError('Executor failed.') (core.py:1701-1702); fault tolerance is off by default
+      (vllm/config/parallel.py:462) so fault_tolerant_wrapper re-raises
+      (vllm/v1/fault_tolerance/engine_core_sentinel.py:181-183); run_engine_core sends ENGINE_CORE_DEAD
+      (core.py:1512-1513, 1771-1774); the client raises EngineDeadError into every stream
+      (vllm/v1/engine/core_client.py:571-573) and generate() re-raises it without aborting
+      (vllm/v1/engine/async_llm.py:786-789).
+    fixtures: [full-tp4-llama-70b]
+    steps:
+      - flow: engine-core-busy-loop
+        input: {iterations: 12}
+        as: loop
+        await: false
+      - flow: async-llm-generate
+        input: {priority: 0, prompt_token_ids: [128000, 9906, 11, 856, 836, 374], request_id: chatcmpl-x5, sampling_params: {max_tokens: 32, n: 1, stop: [], temperature: 0}}
+        at_ms: 0
+        as: gen
+        await: false
+      - interface: multiproc-executor.monitor-workers
+        caller: engine-core
+        input: {died_rank: rank2, exitcode: -9}
+        at_ms: 560
+        as: died
+      - interface: async-llm.check-health
+        caller: api-server
+        at_ms: 3000
+        as: health
+    expect:
+      - "steps.died.result.value.handled && state['multiproc-executor'].is_failed"
+      # the in-flight request errors out with the engine-dead error, and is not aborted
+      - "!steps.gen.result.ok && steps.gen.result.error.code == 'engine-dead-error' && calls['async-llm.abort'] == 0"
+      # the engine core is dead and later calls fail the same way
+      - "state['engine-core-proc'].dead && state['async-mp-client'].engine_dead"
+      - "!steps.health.result.ok && steps.health.result.error.code == 'engine-dead-error'"
+      # the path, in order
+      - >
+        trace.filter(e, e.type == 'call.start' && e.interface in ['multiproc-executor.monitor-workers', 'multiproc-executor.shutdown',
+        'engine-core-proc.executor-fail-callback', 'engine-core-proc.handle-executor-failed', 'engine-core-proc.send-engine-dead',
+        'output-processor.propagate-error']).map(e, e.interface).slice(0, 6) ==
+        ['multiproc-executor.monitor-workers', 'multiproc-executor.shutdown', 'engine-core-proc.executor-fail-callback',
+         'engine-core-proc.handle-executor-failed', 'engine-core-proc.send-engine-dead', 'output-processor.propagate-error']
+      - "trace.exists(e, e.type == 'call.end' && e.interface == 'engine-core-proc.handle-executor-failed' && has(e.error) && e.error != null && e.error.message == 'Executor failed.')"
+      # the request produced some tokens before the crash, but did not finish
+      - "trace.filter(e, e.type == 'call.start' && e.interface == 'scheduler.update-from-output').size() >= 1"
+
+  - id: bench-x5-nonoutput-rank-raises
+    name: "X5 (path probe): an exception on a non-output rank is not replied; rank0 waits out VLLM_EXECUTE_MODEL_TIMEOUT_SECONDS"
+    description: >
+      In the code a worker only replies when output_rank is None or rank == output_rank
+      (multiproc_executor.py:1053-1054, 1062-1064), and execute_model passes unique_reply_rank=output_rank=0
+      (multiproc_executor.py:341-352), so rank2's exception is logged in rank2 but never reaches the
+      executor; rank0 (which did reply-path work) blocks in the TP collective, and the executor's dequeue
+      on response_mqs[0] times out after VLLM_EXECUTE_MODEL_TIMEOUT_SECONDS=300 s with TimeoutError
+      ('RPC call to execute_model timed out.', multiproc_executor.py:434-441), after which the engine dies.
+      The model fails the step at once with rank2's FAILURE reply.
+    fixtures: [full-tp4-llama-70b]
+    faults:
+      - {target: gpu-worker-impl.execute-model, instance: rank2, type: error, code: cuda-error, message: "CUDA error: an illegal memory access was encountered", calls: [2]}
+    steps:
+      - flow: engine-core-busy-loop
+        input: {iterations: 6}
+        as: loop
+        await: false
+      - flow: async-llm-generate
+        input: {priority: 0, prompt_token_ids: [128000, 9906, 11, 856, 836, 374], request_id: chatcmpl-x5b, sampling_params: {max_tokens: 8, n: 1, stop: [], temperature: 0}}
+        at_ms: 0
+        as: gen
+    expect:
+      - "!steps.gen.result.ok && steps.gen.result.error.code == 'engine-dead-error'"
+      - "state['engine-core-proc'].dead"
+      # code path: the step fails by timeout, not by rank2's reply
+      - "trace.exists(e, e.type == 'call.end' && e.interface == 'executor.collective-rpc' && has(e.error) && e.error != null && e.error.code == 'timeout-error')"
+      - "!trace.exists(e, e.type == 'call.end' && e.interface == 'worker-proc.execute-worker-rpc' && has(e.error) && e.error != null)"

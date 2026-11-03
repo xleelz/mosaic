@@ -1,0 +1,1127 @@
+  # ========================================================= structured output
+  - component: structured-output-manager
+    name: grammar-init
+    kind: function
+    latency_ms: 0
+    summary: "Create the request's grammar with the configured backend; a compile failure is kept (as a failed Future) so only that request fails."
+    sources: ["vllm/v1/structured_output/__init__.py:126-187", "vllm/v1/structured_output/backend_types.py:19-25"]
+    errors: [{code: value-error, status: 0, retryable: false}]
+    request:
+      type: object
+      required: [request_id, backend, request_type, grammar_spec]
+      properties:
+        request_id: {type: string, examples: [chatcmpl-abc123]}
+        backend: {type: string, enum: [xgrammar, guidance, outlines, lm-format-enforcer, bogus], default: xgrammar}
+        request_type: {type: string, examples: [json], description: "StructuredOutputOptions: json, json_object, grammar, regex or structural_tag."}
+        grammar_spec: {type: string, default: '{"type": "string"}'}
+        stop_token_ids: {type: array, items: {type: integer}, default: []}
+    response: {type: object, properties: {grammar_id: {type: string}, status: {type: string}, error: {}}}
+    behavior:
+      - if: "!(input.backend in ['xgrammar', 'guidance', 'outlines', 'lm-format-enforcer'])"
+        then:
+          - title: Unsupported backend
+            source: "vllm/v1/structured_output/__init__.py:175-176"
+            fail: {code: value-error, status: 0, message: "= 'Unsupported structured output backend: ' + input.backend"}
+      - if: "input.backend == 'outlines'"
+        then:
+          - title: Outlines backend compiles the request's grammar
+            source: "vllm/v1/structured_output/__init__.py:157-163"
+            call: backend-outlines.compile-grammar
+            input: {grammar_id: "= input.request_id", request_type: "= input.request_type", grammar_spec: "= input.grammar_spec"}
+            as: og
+            on_error: continue
+          - if: "!vars.og.ok"
+            then: [{set: {state.grammars: "= merge(state.grammars, {input.request_id: {'status': 'failed', 'error': vars.og.error.code}})"}}, {return: {grammar_id: "= input.request_id", status: failed, error: "= vars.og.error.code"}}]
+          - set: {state.grammars: "= merge(state.grammars, {input.request_id: {'status': 'ready', 'error': null}})"}
+          - return: {grammar_id: "= input.request_id", status: ready, error: null}
+      - if: "input.backend != 'xgrammar'"
+        then:
+          - title: guidance and lm-format-enforcer backends are not modeled; the grammar is assumed ready
+            source: "vllm/v1/structured_output/__init__.py:151-171"
+            set: {state.grammars: "= merge(state.grammars, {input.request_id: {'status': 'ready', 'error': null}})"}
+          - return: {grammar_id: "= input.request_id", status: ready, error: null}
+      - title: Compile with the request's stop tokens
+        detail: "_create_grammar passes sampling_params.all_stop_token_ids to the xgrammar backend."
+        source: "vllm/v1/structured_output/__init__.py:189-211"
+        call: xgrammar-backend.compile-grammar
+        input:
+          grammar_id: "= input.request_id"
+          request_type: "= input.request_type"
+          grammar_spec: "= input.grammar_spec"
+          stop_token_ids: "= has(input.stop_token_ids) ? input.stop_token_ids : []"
+        as: g
+        on_error: continue
+      - if: "!vars.g.ok"
+        then:
+          - title: Compile failed; the error is carried to the scheduler
+            source: "vllm/v1/structured_output/__init__.py:181-187"
+            set: {state.grammars: "= merge(state.grammars, {input.request_id: {'status': 'failed', 'error': vars.g.error.code}})"}
+          - return: {grammar_id: "= input.request_id", status: failed, error: "= vars.g.error.code"}
+      - set: {state.grammars: "= merge(state.grammars, {input.request_id: {'status': 'ready', 'error': null}})"}
+      - return: {grammar_id: "= input.request_id", status: ready, error: null}
+
+  - component: structured-output-manager
+    name: grammar-status
+    kind: function
+    latency_ms: 0
+    summary: "Whether the request's grammar has finished compiling: pending while the compile Future runs, then the grammar (ready) or the exception it raised (failed)."
+    description: "StructuredOutputRequest.grammar resolves the Future once it is done; the scheduler reads it to promote a request out of WAITING_FOR_STRUCTURED_OUTPUT_GRAMMAR. The outcome is kept here, keyed by request id."
+    sources: ["vllm/v1/structured_output/request.py:42-62"]
+    request: {type: object, required: [request_id], properties: {request_id: {type: string, examples: [chatcmpl-abc123]}}}
+    response: {type: object, properties: {status: {type: string, enum: [pending, ready, failed]}, error: {}}}
+    behavior:
+      - if: "!(input.request_id in state.grammars)"
+        then:
+          - title: The compile Future is not done yet
+            source: "vllm/v1/structured_output/request.py:43-46"
+            return: {status: pending, error: null}
+      - title: Done - the grammar, or the exception it raised
+        source: "vllm/v1/structured_output/request.py:47-51"
+        return: {status: "= state.grammars[input.request_id].status", error: "= state.grammars[input.request_id].error"}
+
+  - component: structured-output-manager
+    name: accept-tokens
+    kind: function
+    latency_ms: 0
+    summary: "Advance the request's grammar with the newly sampled tokens; false means the grammar rejected them."
+    sources: ["vllm/v1/structured_output/__init__.py:462-482", "vllm/v1/structured_output/backend_types.py:34-46"]
+    request: {type: object, required: [grammar_id, new_token_ids], properties: {request_id: {type: string}, grammar_id: {type: string}, new_token_ids: {type: array, items: {type: integer}}}}
+    response: {type: object, properties: {accepted: {type: boolean}}}
+    behavior:
+      - if: "size(input.new_token_ids) == 0"
+        then: [{return: {accepted: true}}]
+      - call: xgrammar-grammar.accept-tokens
+        input: {grammar_id: "= input.grammar_id", tokens: "= input.new_token_ids"}
+        as: acc
+      - return: {accepted: "= vars.acc.value.accepted"}
+
+  - component: xgrammar-backend
+    name: compile-grammar
+    kind: function
+    latency_ms: 5
+    summary: "Compile a JSON schema, JSON object, grammar, regex or structural tag; stop_token_ids become the matcher's override_stop_tokens."
+    sources: ["vllm/v1/structured_output/backend_xgrammar.py:86-164", "vllm/v1/structured_output/backend_types.py:104-124"]
+    errors: [{code: value-error, status: 0, retryable: false}]
+    request:
+      type: object
+      required: [grammar_id, request_type, grammar_spec]
+      properties:
+        grammar_id: {type: string}
+        request_type: {type: string}
+        grammar_spec: {type: string}
+        stop_token_ids: {type: array, items: {type: integer}, default: []}
+    response: {type: object, properties: {grammar_id: {type: string}, override_stop_tokens: {}}}
+    behavior:
+      - if: "!(input.request_type in ['json', 'json_object', 'grammar', 'regex', 'structural_tag'])"
+        then:
+          - title: Not a supported grammar type
+            source: "vllm/v1/structured_output/backend_xgrammar.py:148-154"
+            fail: {code: value-error, status: 0, message: "grammar is not of valid supported types."}
+      - if: "input.request_type == 'regex'"
+        then:
+          - title: Regexes compile under the ReDoS timeout guard
+            source: "vllm/v1/structured_output/backend_xgrammar.py:128-132"
+            call: structured-output-utils.compile-regex-with-timeout
+            input: {pattern: "= input.grammar_spec"}
+      - title: Build the GrammarMatcher with override_stop_tokens
+        detail: "A non-empty stop set replaces the tokenizer's single EOS as the tokens that may end the grammar."
+        source: "vllm/v1/structured_output/backend_xgrammar.py:156-164"
+        call: xgrammar-grammar.create
+        input:
+          grammar_id: "= input.grammar_id"
+          override_stop_tokens: "= has(input.stop_token_ids) && size(input.stop_token_ids) > 0 ? input.stop_token_ids : null"
+          tokenizer_eos_token_id: "= state.tokenizer_eos_token_id"
+        as: made
+      - return: {grammar_id: "= input.grammar_id", override_stop_tokens: "= vars.made.value.stop_tokens"}
+
+  - component: backend-outlines
+    name: validate-structured-output-request-outlines
+    kind: function
+    latency_ms: 0
+    summary: "Request validation for the outlines backend (run from SamplingParams.verify): the regex (or the JSON schema's / choices' regex) must be buildable by regex-automata; json_object and grammar specs are rejected."
+    sources: ["vllm/v1/structured_output/backend_outlines.py:195-238"]
+    errors: [{code: vllm-validation-error, status: 400, retryable: false}]
+    request:
+      type: object
+      properties:
+        structured_outputs:
+          type: [object, "null"]
+          properties:
+            regex: {type: string, default: ""}
+            json: {default: null}
+            choice: {type: array, default: [], items: {type: string}}
+            json_object: {type: boolean, default: false}
+            grammar: {type: string, default: ""}
+    response: {type: object, properties: {valid: {type: boolean}}}
+    behavior:
+      - if: "!has(input.structured_outputs) || input.structured_outputs == null"
+        then: [{return: {valid: true}}]
+      - set: {vars.so: "= input.structured_outputs"}
+      - if: "has(vars.so.regex) && vars.so.regex != ''"
+        then:
+          - call: backend-outlines.validate-regex-is-buildable
+            input: {pattern: "= vars.so.regex"}
+          - return: {valid: true}
+      - if: "has(vars.so.choice) && size(vars.so.choice) > 0"
+        then:
+          - title: Choices become an escaped alternation
+            source: "vllm/v1/structured_output/backend_outlines.py:225-228"
+            call: backend-outlines.validate-regex-is-buildable
+            input: {pattern: "= '(' + vars.so.choice.join('|') + ')'"}
+          - return: {valid: true}
+      - if: "has(vars.so.json_object) && vars.so.json_object"
+        then:
+          - source: "vllm/v1/structured_output/backend_outlines.py:229-233"
+            fail: {code: vllm-validation-error, status: 400, message: "Outlines structured outputs backend does not support json_object specifications"}
+      - if: "has(vars.so.grammar) && vars.so.grammar != ''"
+        then:
+          - source: "vllm/v1/structured_output/backend_outlines.py:234-238"
+            fail: {code: vllm-validation-error, status: 400, message: "Outlines structured outputs backend does not support grammar specifications"}
+      - return: {valid: true}
+
+  - component: backend-outlines
+    name: validate-regex-is-buildable
+    kind: function
+    latency_ms: 0
+    summary: "Reject regexes regex-automata can't build: backreferences, look-arounds, \\b/\\B word boundaries (anywhere, including inside groups and repeats), and anchors before the first consuming token."
+    description: "The sre_parse walk is approximated with RE2 matches on the pattern text; an escaped backslash before b (\\\\b) is a false positive."
+    sources: ["vllm/v1/structured_output/backend_outlines.py:307-366"]
+    errors: [{code: vllm-validation-error, status: 400, retryable: false}]
+    request: {type: object, required: [pattern], properties: {pattern: {type: string, examples: ['[a-z]+']}}}
+    response: {type: object, properties: {valid: {type: boolean}}}
+    behavior:
+      - if: 'input.pattern.matches(r"\\[1-9]") || input.pattern.contains("(?P=")'
+        then:
+          - title: Backreferences are unsupported
+            source: "vllm/v1/structured_output/backend_outlines.py:312-314"
+            fail: {code: vllm-validation-error, status: 400, message: "Regex uses unsupported feature for structured outputs: Backreferences are unsupported."}
+      - if: "input.pattern.contains('(?=') || input.pattern.contains('(?!') || input.pattern.contains('(?<=') || input.pattern.contains('(?<!')"
+        then:
+          - title: Look-around assertions are unsupported
+            source: "vllm/v1/structured_output/backend_outlines.py:316-318"
+            fail: {code: vllm-validation-error, status: 400, message: "Regex uses unsupported feature for structured outputs: Look-Around assertion are unsupported."}
+      - if: 'input.pattern.matches(r"\\[bB]")'
+        then:
+          - title: Unicode word boundaries are unsupported
+            source: "vllm/v1/structured_output/backend_outlines.py:320-323"
+            fail: {code: vllm-validation-error, status: 400, message: "Regex uses unsupported feature for structured outputs: Unicode word boundaries are unsupported."}
+      - if: 'input.pattern.matches(r"^\(*(\^|\$|\\A)")'
+        then:
+          - title: An anchor before any consuming token needs context
+            source: "vllm/v1/structured_output/backend_outlines.py:358-366"
+            fail: {code: vllm-validation-error, status: 400, message: "Regex does not have a anchored universal start state"}
+      - return: {valid: true}
+
+  - component: backend-outlines
+    name: compile-grammar
+    kind: function
+    latency_ms: 5
+    summary: "OutlinesBackend.compile_grammar: build a regex guide (JSON schemas and choices are first turned into a regex)."
+    sources: ["vllm/v1/structured_output/backend_outlines.py:59-100"]
+    errors: [{code: value-error, status: 0, retryable: false}]
+    request: {type: object, required: [grammar_id, request_type, grammar_spec], properties: {grammar_id: {type: string}, request_type: {type: string}, grammar_spec: {type: string}}}
+    response: {type: object, properties: {grammar_id: {type: string}}}
+    behavior:
+      - if: "!(input.request_type in ['json', 'regex', 'choice'])"
+        then:
+          - title: Only JSON, regex and choice are supported by outlines
+            source: "vllm/v1/structured_output/backend_outlines.py:59-100"
+            fail: {code: value-error, status: 0, message: "= 'Invalid request type for Outlines backend (' + input.request_type + ')'"}
+      - set: {state.grammars: "= merge(state.grammars, {input.grammar_id: {'request_type': input.request_type, 'spec': input.grammar_spec, 'terminated': false}})"}
+      - return: {grammar_id: "= input.grammar_id"}
+
+  - component: structured-output-utils
+    name: compile-regex-with-timeout
+    kind: function
+    latency_ms: 0
+    summary: "Run the regex compile in a worker thread and give up after VLLM_REGEX_COMPILATION_TIMEOUT_S (ValueError 'timed out'); 0 runs it inline with no limit."
+    sources: ["vllm/v1/structured_output/utils.py:62-98"]
+    errors: [{code: value-error, status: 0, retryable: false}]
+    request: {type: object, required: [pattern], properties: {pattern: {type: string, examples: ['[a-z]+']}}}
+    response: {type: object, properties: {compiled: {type: boolean}}}
+    behavior:
+      - if: "int(config['vllm-regex-compilation-timeout-s']) <= 0"
+        then:
+          - title: Timeout disabled - compile inline
+            source: "vllm/v1/structured_output/utils.py:79-81"
+            call: xgrammar-compiler.compile-regex
+            input: {pattern: "= input.pattern"}
+          - return: {compiled: true}
+      - title: future.result(timeout)
+        source: "vllm/v1/structured_output/utils.py:83-86"
+        call: xgrammar-compiler.compile-regex
+        input: {pattern: "= input.pattern"}
+        timeout_ms: "= int(config['vllm-regex-compilation-timeout-s']) * 1000"
+        as: c
+        on_error:
+          - title: Timed out - cancel and raise ValueError
+            source: "vllm/v1/structured_output/utils.py:87-95"
+            fail: {code: value-error, status: 0, message: "= 'Regex compilation timed out after ' + string(int(config['vllm-regex-compilation-timeout-s'])) + 's. The pattern may be too complex or contain constructs that cause exponential state-space explosion (e.g. nested quantifiers). Pattern: ' + input.pattern"}
+      - return: {compiled: true}
+
+  - component: xgrammar-compiler
+    name: compile-regex
+    kind: function
+    summary: "GrammarCompiler.compile_regex (library). ASSUMPTION: nested quantifiers blow up (scheduler-kv-redos-compile-ms), anything else takes 2 ms."
+    sources: ["vllm/v1/structured_output/backend_xgrammar.py:128-132"]
+    latency_ms: '= input.pattern.matches(r"\([^)]*[+*]\)[+*]") ? int(config["scheduler-kv-redos-compile-ms"]) : 2'
+    request: {type: object, required: [pattern], properties: {pattern: {type: string}}}
+    response: {type: object, properties: {compiled: {type: boolean, default: true}}}
+
+  - component: xgrammar-backend
+    name: validate-xgrammar-grammar
+    kind: function
+    latency_ms: 0
+    summary: "Request validation for the xgrammar backend: a JSON schema or structural tag nested deeper than 64 levels (80 for a structural tag) is rejected before any grammar conversion; a regex must compile under the timeout; NUL is refused."
+    sources: ["vllm/v1/structured_output/backend_xgrammar.py:407-504", "vllm/sampling_params.py:213-258"]
+    errors: [{code: vllm-validation-error, status: 400, retryable: false}, {code: value-error, status: 0, retryable: false}]
+    request:
+      type: object
+      properties:
+        structured_outputs:
+          type: [object, "null"]
+          properties:
+            json: {default: null, description: "A JSON schema: object, or JSON text."}
+            structural_tag: {type: [string, "null"], default: null}
+            regex: {type: string, default: ""}
+    response: {type: object, properties: {valid: {type: boolean}}}
+    behavior:
+      - if: "!has(input.structured_outputs) || input.structured_outputs == null"
+        then: [{return: {valid: true}}]
+      - set: {vars.so: "= input.structured_outputs"}
+      - if: "has(vars.so.regex) && vars.so.regex != ''"
+        then:
+          - if: 'vars.so.regex.contains("\u0000")'
+            then:
+              - title: NUL in a regex is refused before native code sees it
+                source: "vllm/v1/structured_output/backend_xgrammar.py:418-426"
+                fail: {code: value-error, status: 0, message: "structured_outputs.regex must not contain a NUL character"}
+          - title: The regex must compile within the timeout
+            source: "vllm/v1/structured_output/backend_xgrammar.py:427-435"
+            call: structured-output-utils.compile-regex-with-timeout
+            input: {pattern: "= vars.so.regex"}
+            as: rc
+            on_error:
+              - fail: {code: vllm-validation-error, status: 400, message: "= 'Failed to transform regex into a grammar: ' + error.message"}
+          - return: {valid: true}
+      - set:
+          vars.spec: "= has(vars.so.json) && vars.so.json != null ? vars.so.json : (has(vars.so.structural_tag) && vars.so.structural_tag != null ? vars.so.structural_tag : dyn(null))"
+          vars.limit: "= has(vars.so.json) && vars.so.json != null ? 64 : 80"
+      - if: "vars.spec == null"
+        then: [{return: {valid: true}}]
+      - title: check_json_nesting - walk the containers level by level
+        detail: "A JSON text is measured by the containers opened before the first one closes (a lower bound on its depth); an object is walked level by level, as _exceeds_json_nesting does."
+        source: "vllm/sampling_params.py:213-236"
+        set:
+          vars.depth_text: "= type(vars.spec) == string ? size(vars.spec.split('}')[0].split(']')[0].split('{')) - 1 + size(vars.spec.split('}')[0].split(']')[0].split('[')) - 1 : 0"
+          vars.level: "= type(vars.spec) == string ? [] : [vars.spec]"
+      - foreach: "= lists.range(vars.limit)"
+        as: lv
+        max: 100
+        steps:
+          - if: "size(vars.level) == 0"
+            then: [{break: true}]
+          - set:
+              vars.level: "= vars.level.map(n, type(n) == map ? n.transformList(k, v, v) : n).flatten().filter(c, type(c) == map || type(c) == list)"
+      - if: "vars.depth_text > vars.limit || size(vars.level) > 0"
+        then:
+          - title: Nested too deeply
+            source: "vllm/sampling_params.py:253-258"
+            fail: {code: vllm-validation-error, status: 400, message: "The JSON schema is nested too deeply: objects and arrays may nest at most 64 levels"}
+      - return: {valid: true}
+
+  - component: xgrammar-grammar
+    name: create
+    kind: function
+    latency_ms: 0
+    summary: "A fresh matcher for one grammar (XgrammarGrammar dataclass): not terminated, no tokens processed."
+    sources: ["vllm/v1/structured_output/backend_xgrammar.py:174-188"]
+    request: {type: object, required: [grammar_id, tokenizer_eos_token_id], properties: {grammar_id: {type: string}, override_stop_tokens: {}, tokenizer_eos_token_id: {type: integer}}}
+    response: {type: object, properties: {stop_tokens: {type: array, items: {type: integer}}}}
+    behavior:
+      - set:
+          vars.stop: "= input.override_stop_tokens != null ? input.override_stop_tokens : [input.tokenizer_eos_token_id]"
+      - set:
+          state.grammars: "= merge(state.grammars, {input.grammar_id: {'fsm': 'start', 'terminated': false, 'num_processed_tokens': 0, 'stop_tokens': vars.stop}})"
+      - return: {stop_tokens: "= vars.stop"}
+
+  - component: xgrammar-grammar
+    name: accept-tokens
+    kind: function
+    latency_ms: 0
+    summary: "Advance the FSM token by token; tokens after termination are ignored; a token the FSM can't take returns false."
+    sources: ["vllm/v1/structured_output/backend_xgrammar.py:190-212"]
+    errors: [{code: key-error, status: 0, retryable: false}]
+    request: {type: object, required: [grammar_id, tokens], properties: {grammar_id: {type: string}, tokens: {type: array, items: {type: integer}}}}
+    response: {type: object, properties: {accepted: {type: boolean}, terminated: {type: boolean}}}
+    behavior:
+      - if: "!(input.grammar_id in state.grammars)"
+        then: [{fail: {code: key-error, status: 0, message: "= 'no grammar ' + input.grammar_id"}}]
+      - set: {vars.g: "= state.grammars[input.grammar_id]"}
+      - if: "vars.g.terminated"
+        then:
+          - title: Already terminated; tokens are ignored
+            source: "vllm/v1/structured_output/backend_xgrammar.py:197-198"
+            return: {accepted: true, terminated: true}
+      - foreach: "= input.tokens"
+        as: tok
+        steps:
+          - set:
+              vars.is_stop: "= vars.tok in vars.g.stop_tokens"
+          - set:
+              vars.ok: "= vars.is_stop ? vars.g.fsm == 'complete' : (vars.tok == 1 ? vars.g.fsm in ['start', 'in_string'] : vars.g.fsm == 'in_string')"
+          - if: "!vars.ok"
+            then:
+              - title: FSM failed to advance
+                source: "vllm/v1/structured_output/backend_xgrammar.py:199-206"
+                set: {state.grammars: "= merge(state.grammars, {input.grammar_id: vars.g})"}
+              - return: {accepted: false, terminated: false}
+          - set:
+              vars.g: "= merge(vars.g, {'num_processed_tokens': vars.g.num_processed_tokens + 1, 'terminated': vars.is_stop, 'fsm': vars.is_stop ? 'terminated' : (vars.tok == 1 ? (vars.g.fsm == 'start' ? 'in_string' : 'complete') : vars.g.fsm)})"
+          - if: "vars.g.terminated"
+            then: [{break: true}]
+      - set: {state.grammars: "= merge(state.grammars, {input.grammar_id: vars.g})"}
+      - return: {accepted: true, terminated: "= vars.g.terminated"}
+
+  - component: xgrammar-grammar
+    name: fill-bitmask
+    kind: function
+    latency_ms: 0
+    summary: "Next-token bitmask for the grammar's state, reported for the given candidate token ids (stop tokens only once the grammar can end)."
+    sources: ["vllm/v1/structured_output/backend_xgrammar.py:241-242"]
+    request: {type: object, required: [grammar_id, token_ids], properties: {grammar_id: {type: string}, token_ids: {type: array, items: {type: integer}}}}
+    response: {type: object, properties: {allowed: {type: object}}}
+    behavior:
+      - if: "!(input.grammar_id in state.grammars)"
+        then: [{fail: {code: key-error, status: 0, message: "= 'no grammar ' + input.grammar_id"}}]
+      - set: {vars.g: "= state.grammars[input.grammar_id]"}
+      - title: matcher.fill_next_token_bitmask
+        detail: "Stop tokens are allowed only in an accepting state; a quote opens or closes the string; other tokens are string content."
+        source: "vllm/v1/structured_output/backend_xgrammar.py:241-242"
+        return:
+          allowed: "= input.token_ids.transformMapEntry(i, t, {string(t): t in vars.g.stop_tokens ? vars.g.fsm == 'complete' : (t == 1 ? vars.g.fsm in ['start', 'in_string'] : vars.g.fsm == 'in_string')})"
+
+  - component: xgrammar-grammar
+    name: is-terminated
+    kind: function
+    latency_ms: 0
+    summary: "Whether a stop token has ended the grammar (complete is not terminated)."
+    sources: ["vllm/v1/structured_output/backend_xgrammar.py:244-245"]
+    request: {type: object, required: [grammar_id], properties: {grammar_id: {type: string}}}
+    response: {type: object, properties: {terminated: {type: boolean}}}
+    behavior:
+      - if: "!(input.grammar_id in state.grammars)"
+        then: [{fail: {code: key-error, status: 0, message: "= 'no grammar ' + input.grammar_id"}}]
+      - return: {terminated: "= state.grammars[input.grammar_id].terminated"}
+
+  # ============================================================ KV offload: CPU
+  - component: host-register
+    name: host-register
+    kind: function
+    latency_ms: 2
+    summary: "Pin a host range for fast DMA: cudaHostRegister on CUDA, the xpu_host_register op on XPU, pageable fallback elsewhere."
+    sources: ["vllm/v1/kv_offload/cpu/host_register.py:33-76"]
+    request: {type: object, required: [ptr, num_bytes], properties: {ptr: {type: integer, examples: [140000000000]}, num_bytes: {type: integer, examples: [68719476736]}}}
+    response: {type: object, properties: {registered: {type: boolean}}}
+    behavior:
+      - if: "input.ptr == 0 || input.num_bytes <= 0"
+        then:
+          - title: Nothing to register
+            source: "vllm/v1/kv_offload/cpu/host_register.py:44-45"
+            return: {registered: false}
+      - choice: platform
+        default: cuda
+        options:
+          cuda:
+            - set:
+                vars.pinned_total: "= sum(state.pinned.transformList(k, v, v))"
+            - if: "vars.pinned_total + input.num_bytes > state.pinnable_bytes"
+              then:
+                - title: cudaHostRegister failed; stays pageable
+                  detail: "The driver refuses to page-lock more host memory; transfers still work, unpinned and slower."
+                  source: "vllm/v1/kv_offload/cpu/host_register.py:51-59"
+                  return: {registered: false}
+            - title: cudaHostRegister succeeded
+              source: "vllm/v1/kv_offload/cpu/host_register.py:51-60"
+              set: {state.pinned: "= merge(state.pinned, {string(input.ptr): input.num_bytes})"}
+            - return: {registered: true}
+          xpu:
+            - title: XPU host registration op
+              source: "vllm/v1/kv_offload/cpu/host_register.py:62-69"
+              call: vllm-xpu-kernels.xpu-host-register
+              input: {ptr: "= input.ptr", num_bytes: "= input.num_bytes"}
+              as: x
+            - if: "!vars.x.value.ok"
+              then: [{return: {registered: false}}]
+            - set: {state.pinned: "= merge(state.pinned, {string(input.ptr): input.num_bytes})"}
+            - return: {registered: true}
+          other:
+            - title: Not implemented on this platform; unpinned host memory
+              source: "vllm/v1/kv_offload/cpu/host_register.py:71-76"
+              return: {registered: false}
+
+  - component: host-register
+    name: host-unregister
+    kind: function
+    latency_ms: 1
+    summary: "Release a range registered by host_register."
+    sources: ["vllm/v1/kv_offload/cpu/host_register.py:79-97"]
+    request: {type: object, required: [ptr], properties: {ptr: {type: integer}}}
+    response: {type: object, properties: {unregistered: {type: boolean}}}
+    behavior:
+      - if: "input.ptr == 0"
+        then: [{return: {unregistered: false}}]
+      - choice: platform
+        default: cuda
+        options:
+          cuda:
+            - title: cudaHostUnregister
+              source: "vllm/v1/kv_offload/cpu/host_register.py:84-92"
+              set: {state.pinned: "= omit(state.pinned, string(input.ptr))"}
+            - return: {unregistered: true}
+          xpu:
+            - title: XPU host unregistration op
+              source: "vllm/v1/kv_offload/cpu/host_register.py:94-97"
+              call: vllm-xpu-kernels.xpu-host-unregister
+              input: {ptr: "= input.ptr"}
+            - set: {state.pinned: "= omit(state.pinned, string(input.ptr))"}
+            - return: {unregistered: true}
+
+  - component: kv-offload-cpu-gpu-worker
+    name: pin-mmap-region
+    kind: function
+    latency_ms: 0
+    summary: "Pin the shared offload region in row-aligned chunks of at most 64 GiB; if one chunk fails, unregister the pinned ones and leave the region pageable."
+    sources: ["vllm/v1/kv_offload/cpu/gpu_worker.py:201-240"]
+    request: {type: object, required: [base_ptr, total_size, row_stride], properties: {base_ptr: {type: integer, examples: [140000000000]}, total_size: {type: integer, examples: [161061273600]}, row_stride: {type: integer, examples: [2097152]}}}
+    response: {type: object, properties: {is_pinned: {type: boolean}, pinned_addresses: {type: array, items: {type: integer}}}}
+    behavior:
+      - set:
+          vars.chunk: "= math.greatest(68719476736 / input.row_stride, 1) * input.row_stride"
+      - set:
+          vars.offsets: "= lists.range((input.total_size + vars.chunk - 1) / vars.chunk).map(i, i * vars.chunk)"
+          vars.addresses: []
+      - title: Register chunk by chunk
+        source: "vllm/v1/kv_offload/cpu/gpu_worker.py:214-219"
+        foreach: "= vars.offsets"
+        as: off
+        steps:
+          - call: host-register.host-register
+            input: {ptr: "= input.base_ptr + vars.off", num_bytes: "= math.least(vars.chunk, input.total_size - vars.off)"}
+            as: reg
+          - if: "vars.reg.value.registered"
+            then:
+              - set: {vars.addresses: "= vars.addresses + [input.base_ptr + vars.off]"}
+              - continue: true
+          - title: A chunk failed; roll back and stay pageable
+            source: "vllm/v1/kv_offload/cpu/gpu_worker.py:220-229"
+            foreach: "= vars.addresses.reverse()"
+            as: done
+            steps:
+              - call: host-register.host-unregister
+                input: {ptr: "= vars.done"}
+          - return: {is_pinned: false, pinned_addresses: []}
+      - title: Region pinned
+        source: "vllm/v1/kv_offload/cpu/gpu_worker.py:231-233"
+        set: {state.pinned_addresses: "= vars.addresses"}
+      - return: {is_pinned: true, pinned_addresses: "= vars.addresses"}
+
+  - component: shared-offload-region
+    name: init
+    kind: function
+    latency_ms: 0
+    summary: "Map the shared region: num_chunks rows of kv_bytes_per_chunk; a ranked worker owns cpu_page_size bytes per row starting at rank * cpu_page_size."
+    sources: ["vllm/v1/kv_offload/cpu/shared_offload_region.py:89-116"]
+    errors: [{code: assertion-error, status: 0, retryable: false}, {code: value-error, status: 0, retryable: false}]
+    request:
+      type: object
+      required: [num_chunks, kv_bytes_per_chunk, cpu_page_size]
+      properties:
+        num_chunks: {type: integer, examples: [4]}
+        rank: {type: [integer, "null"], default: null}
+        kv_bytes_per_chunk: {type: integer, examples: [8192]}
+        cpu_page_size: {type: integer, examples: [8192]}
+        page_size: {type: integer, default: 4096}
+        populate_only_on_creator: {type: boolean, default: false}
+        has_barrier: {type: boolean, default: true}
+    response: {type: object, properties: {total_size_bytes: {type: integer}}}
+    behavior:
+      - if: "has(input.populate_only_on_creator) && input.populate_only_on_creator && has(input.has_barrier) && !input.has_barrier"
+        then: [{fail: {code: value-error, status: 0, message: "Creator-only population requires a barrier."}}]
+      - set: {vars.page: "= has(input.page_size) ? input.page_size : 4096"}
+      - if: "input.kv_bytes_per_chunk % vars.page != 0"
+        then:
+          - title: Rows must be page aligned
+            source: "vllm/v1/kv_offload/cpu/shared_offload_region.py:104"
+            fail: {code: assertion-error, status: 0, message: "kv_bytes_per_chunk must be a multiple of the page size"}
+      - title: Lay out rows and this worker's slot
+        source: "vllm/v1/kv_offload/cpu/shared_offload_region.py:105-116"
+        set:
+          state.num_chunks: "= input.num_chunks"
+          state.row_stride: "= input.kv_bytes_per_chunk"
+          state.rank: "= has(input.rank) ? input.rank : null"
+          state.worker_offset: "= has(input.rank) && input.rank != null ? input.rank * input.cpu_page_size : 0"
+          state.worker_area_end: "= has(input.rank) && input.rank != null ? (input.rank + 1) * input.cpu_page_size : 0"
+          state.views: []
+      - return: {total_size_bytes: "= input.num_chunks * input.kv_bytes_per_chunk"}
+
+  - component: shared-offload-region
+    name: create-next-worker-view
+    kind: function
+    latency_ms: 0
+    summary: "Carve this worker's next tensor view: shape (num_chunks, tensor_page_size), stride (row_stride, 1), advancing the worker cursor."
+    sources: ["vllm/v1/kv_offload/cpu/shared_offload_region.py:245-283"]
+    errors: [{code: assertion-error, status: 0, retryable: false}]
+    request: {type: object, required: [tensor_page_size], properties: {tensor_page_size: {type: integer, examples: [4096]}}}
+    response: {type: object, properties: {shape: {type: array, items: {type: integer}}, stride: {type: array, items: {type: integer}}, storage_offset: {type: integer}}}
+    behavior:
+      - if: "state.rank == null"
+        then: [{fail: {code: assertion-error, status: 0, message: "rank is required for worker views"}}]
+      - set: {vars.new_offset: "= state.worker_offset + input.tensor_page_size"}
+      - if: "vars.new_offset > state.worker_area_end"
+        then:
+          - title: View would overflow this worker's slot
+            source: "vllm/v1/kv_offload/cpu/shared_offload_region.py:268-273"
+            fail: {code: assertion-error, status: 0, message: "= 'Worker offset ' + string(vars.new_offset) + ' exceeds worker area end ' + string(state.worker_area_end)"}
+      - set:
+          vars.view: {shape: ["= state.num_chunks", "= input.tensor_page_size"], stride: ["= state.row_stride", 1], storage_offset: "= state.worker_offset"}
+      - title: as_strided view and advance the cursor
+        source: "vllm/v1/kv_offload/cpu/shared_offload_region.py:274-283"
+        set:
+          state.worker_offset: "= vars.new_offset"
+          state.views: "= state.views + [vars.view]"
+      - return: "= vars.view"
+
+  - component: shared-offload-region
+    name: create-kv-memoryview
+    kind: function
+    latency_ms: 0
+    summary: "Zero-copy view of the whole buffer, shape (num_chunks, row_stride); secondary tiers address chunk b as view[b]."
+    sources: ["vllm/v1/kv_offload/cpu/shared_offload_region.py:330-342"]
+    request: {type: object}
+    response: {type: object, properties: {shape: {type: array, items: {type: integer}}, num_views: {type: integer}}}
+    behavior:
+      - return: {shape: ["= state.num_chunks", "= state.row_stride"], num_views: "= size(state.views)"}
+
+  - component: swap-blocks-triton
+    name: swap-blocks-batch
+    kind: function
+    latency_ms: 0
+    summary: "Batched CPU->GPU block copy: Triton kernel for 16+ descriptors, otherwise the C++ swap_blocks_batch op (DMA)."
+    sources: ["vllm/v1/kv_offload/cpu/swap_blocks_triton.py:49-74"]
+    request:
+      type: object
+      required: [num_descriptors, bytes_per_descriptor]
+      properties:
+        num_descriptors: {type: integer, examples: [32]}
+        bytes_per_descriptor: {type: integer, examples: [16384]}
+        bytes_per_chunk: {type: integer, examples: [4096]}
+    response: {type: object, properties: {path: {type: string}}}
+    behavior:
+      - if: "input.num_descriptors < 16"
+        then:
+          - title: Too few descriptors to amortize a Triton launch; use DMA
+            source: "vllm/v1/kv_offload/cpu/swap_blocks_triton.py:58-67"
+            call: custom-ops.swap-blocks-batch
+            input: {num_blocks: "= input.num_descriptors", block_bytes: "= input.bytes_per_descriptor"}
+          - return: {path: dma}
+      - title: Launch _swap_blocks_kernel on min(12, n) programs
+        detail: "Each program copies whole jobs in BYTES_PER_CHUNK pieces (the Triton kernel _swap_blocks_kernel)."
+        source: "vllm/v1/kv_offload/cpu/swap_blocks_triton.py:68-74"
+        call: swap-blocks-triton.swap-blocks-kernel
+        input: {num_descriptors: "= input.num_descriptors", total_bytes: "= input.num_descriptors * input.bytes_per_descriptor"}
+      - return: {path: triton}
+
+  - component: swap-blocks-triton
+    name: swap-blocks-kernel
+    kind: kernel
+    summary: "Triton kernel _swap_blocks_kernel: grid-strided jobs, each copied in BYTES_PER_CHUNK words with a mask."
+    sources: ["vllm/v1/kv_offload/cpu/swap_blocks_triton.py:24-46"]
+    latency_ms: "= 0.005 + double(input.total_bytes) / double(config['scheduler-kv-host-device-bytes-per-ms'])"
+    request: {type: object, properties: {num_descriptors: {type: integer}, total_bytes: {type: integer}}}
+    response: {type: object}
+
+  # ============================================================ simple KV offload
+  - component: cuda-mem-ops
+    name: copy-blocks
+    kind: function
+    summary: "cuMemcpyBatchAsync of a list of blocks on the given stream (latency ~ bytes over the host-device link)."
+    sources: ["vllm/v1/simple_kv_offload/cuda_mem_ops.py:1-40"]
+    latency_ms: "= 0.002 + double(size(input.src_blocks) * 2097152) / double(config['scheduler-kv-host-device-bytes-per-ms'])"
+    request: {type: object, required: [src_blocks, dst_blocks], properties: {src_blocks: {type: array, items: {type: integer}}, dst_blocks: {type: array, items: {type: integer}}}}
+    response: {type: object}
+
+  - component: dma-copy-backend
+    name: launch-copy
+    kind: function
+    latency_ms: 0
+    summary: "Queue a block copy (store GPU->CPU or load CPU->GPU) for the copy thread."
+    sources: ["vllm/v1/simple_kv_offload/copy_backend.py:71-92"]
+    request:
+      type: object
+      required: [src_blocks, dst_blocks, is_store, event_idx]
+      properties:
+        src_blocks: {type: array, items: {type: integer}, examples: [[5, 6, 7]]}
+        dst_blocks: {type: array, items: {type: integer}, examples: [[0, 1, 2]]}
+        is_store: {type: boolean, examples: [true]}
+        event_idx: {type: integer, examples: [1]}
+    response: {type: object, properties: {queued: {type: integer}}}
+    behavior:
+      - title: queue.put
+        source: "vllm/v1/simple_kv_offload/copy_backend.py:80-92"
+        set: {state.queue: "= state.queue + [{'src_blocks': input.src_blocks, 'dst_blocks': input.dst_blocks, 'is_store': input.is_store, 'event_idx': input.event_idx}]"}
+      - return: {queued: "= size(state.queue)"}
+
+  - component: dma-copy-backend
+    name: shutdown
+    kind: function
+    latency_ms: 0
+    summary: "Put the None sentinel so the copy thread exits (idempotent)."
+    sources: ["vllm/v1/simple_kv_offload/copy_backend.py:94-101"]
+    request: {type: object}
+    response: {type: object, properties: {queued: {type: integer}}}
+    behavior:
+      - if: "state.queue.exists(i, i == null)"
+        then: [{return: {queued: "= size(state.queue)"}}]
+      - set: {state.queue: "= state.queue + [null]"}
+      - return: {queued: "= size(state.queue)"}
+
+  - component: dma-copy-backend
+    name: copy-loop
+    kind: function
+    latency_ms: 0
+    summary: "One turn of the copy thread: take a queued copy, run it on the store or load stream, record a completion event; None ends the thread."
+    sources: ["vllm/v1/simple_kv_offload/copy_backend.py:103-130"]
+    request: {type: object}
+    response: {type: object, properties: {did: {type: string}}}
+    behavior:
+      - if: "!state.running"
+        then: [{return: {did: exited}}]
+      - if: "size(state.queue) == 0"
+        then:
+          - title: q.get() blocks; nothing queued this turn
+            source: "vllm/v1/simple_kv_offload/copy_backend.py:112"
+            return: {did: idle}
+      - set:
+          vars.item: "= state.queue[0]"
+          state.queue: "= state.queue.slice(1, size(state.queue))"
+      - if: "vars.item == null"
+        then:
+          - title: Shutdown sentinel; the thread returns
+            source: "vllm/v1/simple_kv_offload/copy_backend.py:113-114"
+            set: {state.running: false}
+          - return: {did: exited}
+      - title: copy_blocks on the store or load stream
+        detail: "Stores read the live KV cache (stream order); loads read stable pinned host memory."
+        source: "vllm/v1/simple_kv_offload/copy_backend.py:124-127"
+        call: cuda-mem-ops.copy-blocks
+        input: {src_blocks: "= vars.item.src_blocks", dst_blocks: "= vars.item.dst_blocks"}
+      - title: Record the completion event
+        source: "vllm/v1/simple_kv_offload/copy_backend.py:128-130"
+        set: {state.events: "= state.events + [{'event_idx': vars.item.event_idx, 'is_store': vars.item.is_store, 'at': now}]"}
+      - return: {did: "= vars.item.is_store ? 'store' : 'load'"}
+
+  - component: disk-backend
+    name: launch-copy
+    kind: function
+    latency_ms: 0
+    summary: "Route a copy to the store queue or the load queue (separate threads)."
+    sources: ["vllm/v1/simple_kv_offload/disk_backend.py:189-199"]
+    request:
+      type: object
+      required: [src_blocks, dst_blocks, is_store, event_idx]
+      properties:
+        src_blocks: {type: array, items: {type: integer}, examples: [[5, 6]]}
+        dst_blocks: {type: array, items: {type: integer}, examples: [[0, 1]]}
+        is_store: {type: boolean, examples: [true]}
+        event_idx: {type: integer, examples: [1]}
+    response: {type: object}
+    behavior:
+      - set: {vars.item: {src_blocks: "= input.src_blocks", dst_blocks: "= input.dst_blocks", event_idx: "= input.event_idx"}}
+      - title: q.put on the store or the load queue
+        source: "vllm/v1/simple_kv_offload/disk_backend.py:198-199"
+        call: "= input.is_store ? 'disk-store-thread.put' : 'disk-load-thread.put'"
+        targets: [disk-store-thread.put, disk-load-thread.put]
+        input: {item: "= vars.item"}
+        as: q
+      - return: {queued: "= vars.q.value.queued", is_store: "= input.is_store"}
+
+  - component: disk-store-thread
+    name: put
+    kind: function
+    latency_ms: 0
+    summary: "SimpleQueue.put on the store queue."
+    sources: ["vllm/v1/simple_kv_offload/disk_backend.py:198-199"]
+    request: {type: object, required: [item], properties: {item: {}}}
+    response: {type: object, properties: {queued: {type: integer}}}
+    behavior:
+      - set: {state.queue: "= state.queue + [input.item]"}
+      - return: {queued: "= size(state.queue)"}
+
+  - component: disk-load-thread
+    name: put
+    kind: function
+    latency_ms: 0
+    summary: "SimpleQueue.put on the load queue."
+    sources: ["vllm/v1/simple_kv_offload/disk_backend.py:198-199"]
+    request: {type: object, required: [item], properties: {item: {}}}
+    response: {type: object, properties: {queued: {type: integer}}}
+    behavior:
+      - set: {state.queue: "= state.queue + [input.item]"}
+      - return: {queued: "= size(state.queue)"}
+
+  - component: disk-store-thread
+    name: store-loop
+    kind: function
+    latency_ms: 0
+    summary: "One turn of the store thread: GPU -> pinned staging slot (DMA) -> disk (pwritev), double-buffered; a short write raises OSError and ends the thread."
+    sources: ["vllm/v1/simple_kv_offload/disk_backend.py:236-252", "vllm/v1/simple_kv_offload/disk_backend.py:288-315"]
+    errors: [{code: os-error, status: 0, retryable: false}]
+    request: {type: object}
+    response: {type: object, properties: {did: {type: string}, events: {type: array, items: {type: integer}}, queued: {type: integer}}}
+    behavior:
+      - if: "!state.alive"
+        then: [{return: {did: exited, events: "= state.events.map(e, e.event_idx)", queued: "= size(state.queue)"}}]
+      - if: "size(state.queue) == 0"
+        then: [{return: {did: idle, events: "= state.events.map(e, e.event_idx)", queued: 0}}]
+      - set:
+          vars.item: "= state.queue[0]"
+          state.queue: "= state.queue.slice(1, size(state.queue))"
+      - if: "vars.item == null"
+        then:
+          - title: Shutdown sentinel
+            source: "vllm/v1/simple_kv_offload/disk_backend.py:243-245"
+            set: {state.alive: false}
+          - return: {did: exited, events: "= state.events.map(e, e.event_idx)", queued: "= size(state.queue)"}
+      - title: Stage each block over DMA, then pwritev the slot
+        source: "vllm/v1/simple_kv_offload/disk_backend.py:300-315"
+        foreach: "= lists.range(size(vars.item.src_blocks))"
+        as: i
+        steps:
+          - call: cuda-mem-ops.copy-blocks
+            input: {src_blocks: ["= vars.item.src_blocks[vars.i]"], dst_blocks: ["= vars.i % 2"]}
+          - call: local-disk.pwritev
+            input: {offset: "= vars.item.dst_blocks[vars.i] * state.total_block_bytes", num_bytes: "= state.total_block_bytes"}
+            as: w
+            on_error:
+              - title: pwritev raised; the store thread dies
+                source: "vllm/v1/simple_kv_offload/disk_backend.py:254-260"
+                set: {state.alive: false}
+              - fail: {code: os-error, status: 0, message: "= 'pwritev failed: ' + error.code"}
+          - if: "vars.w.value.bytes_written < state.total_block_bytes"
+            then:
+              - title: Short write
+                source: "vllm/v1/simple_kv_offload/disk_backend.py:256-260"
+                set: {state.alive: false}
+              - fail: {code: os-error, status: 0, message: "= 'Short write: expected ' + string(state.total_block_bytes) + ' bytes, wrote ' + string(vars.w.value.bytes_written)"}
+      - title: Record the completion event
+        source: "vllm/v1/simple_kv_offload/disk_backend.py:250-252"
+        set: {state.events: "= state.events + [{'event_idx': vars.item.event_idx, 'is_store': true, 'at': now}]"}
+      - return: {did: store, events: "= state.events.map(e, e.event_idx)", queued: "= size(state.queue)"}
+
+  - component: disk-load-thread
+    name: load-loop
+    kind: function
+    latency_ms: 0
+    summary: "One turn of the load thread: disk (preadv) -> staging slot -> GPU (DMA); a short read raises OSError and ends the thread."
+    sources: ["vllm/v1/simple_kv_offload/disk_backend.py:270-286", "vllm/v1/simple_kv_offload/disk_backend.py:317-343"]
+    errors: [{code: os-error, status: 0, retryable: false}]
+    request: {type: object}
+    response: {type: object, properties: {did: {type: string}, events: {type: array, items: {type: integer}}, queued: {type: integer}}}
+    behavior:
+      - if: "!state.alive"
+        then: [{return: {did: exited, events: "= state.events.map(e, e.event_idx)", queued: "= size(state.queue)"}}]
+      - if: "size(state.queue) == 0"
+        then: [{return: {did: idle, events: "= state.events.map(e, e.event_idx)", queued: 0}}]
+      - set:
+          vars.item: "= state.queue[0]"
+          state.queue: "= state.queue.slice(1, size(state.queue))"
+      - if: "vars.item == null"
+        then:
+          - title: Shutdown sentinel
+            source: "vllm/v1/simple_kv_offload/disk_backend.py:277-279"
+            set: {state.alive: false}
+          - return: {did: exited, events: "= state.events.map(e, e.event_idx)", queued: "= size(state.queue)"}
+      - title: preadv each slot, then DMA it to the GPU
+        source: "vllm/v1/simple_kv_offload/disk_backend.py:328-343"
+        foreach: "= lists.range(size(vars.item.src_blocks))"
+        as: i
+        steps:
+          - call: local-disk.preadv
+            input: {offset: "= vars.item.src_blocks[vars.i] * state.total_block_bytes", num_bytes: "= state.total_block_bytes"}
+            as: r
+            on_error:
+              - title: preadv raised; the load thread dies
+                source: "vllm/v1/simple_kv_offload/disk_backend.py:262-268"
+                set: {state.alive: false}
+              - fail: {code: os-error, status: 0, message: "= 'preadv failed: ' + error.code"}
+          - if: "vars.r.value.bytes_read < state.total_block_bytes"
+            then:
+              - title: Short read
+                source: "vllm/v1/simple_kv_offload/disk_backend.py:264-268"
+                set: {state.alive: false}
+              - fail: {code: os-error, status: 0, message: "= 'Short read: expected ' + string(state.total_block_bytes) + ' bytes'"}
+          - call: cuda-mem-ops.copy-blocks
+            input: {src_blocks: ["= vars.i % 2"], dst_blocks: ["= vars.item.dst_blocks[vars.i]"]}
+      - title: Record the completion event
+        source: "vllm/v1/simple_kv_offload/disk_backend.py:284-286"
+        set: {state.events: "= state.events + [{'event_idx': vars.item.event_idx, 'is_store': false, 'at': now}]"}
+      - return: {did: load, events: "= state.events.map(e, e.event_idx)", queued: "= size(state.queue)"}
+
+  # ============================================================ tiered offload
+  - component: async-lookup-manager
+    name: lookup
+    kind: function
+    latency_ms: 0
+    summary: "Non-blocking existence check from the scheduler thread: true/false once resolved, null while pending (retry next step)."
+    sources: ["vllm/v1/kv_offload/tiering/async_lookup.py:140-161"]
+    request: {type: object, required: [key, req_id], properties: {key: {type: string, examples: [blk-sys-0]}, req_id: {type: string, examples: [chatcmpl-abc123]}}}
+    response: {type: object, properties: {result: {}}}
+    behavior:
+      - call: async-lookup-manager.drain-results
+      - if: "!(input.key in state.lookup_state)"
+        then:
+          - title: New key; batch it for this step's flush
+            source: "vllm/v1/kv_offload/tiering/async_lookup.py:153-158"
+            set:
+              state.lookup_state: "= merge(state.lookup_state, {input.key: {'generation': state.next_generation, 'phase': 'PENDING', 'result': null, 'request_ids': []}})"
+              state.lookup_batch: "= state.lookup_batch + [{'key': input.key, 'req_id': input.req_id, 'generation': state.next_generation}]"
+              state.next_generation: "= state.next_generation + 1"
+      - set:
+          state.lookup_state: "= merge(state.lookup_state, {input.key: {'request_ids': state.lookup_state[input.key].request_ids.filter(r, r != input.req_id) + [input.req_id]}})"
+      - return: {result: "= state.lookup_state[input.key].result"}
+
+  - component: async-lookup-manager
+    name: flush
+    kind: function
+    latency_ms: 0
+    summary: "Called once per step: drain results, then post this step's PENDING keys to the worker thread as one batch (IN_FLIGHT)."
+    sources: ["vllm/v1/kv_offload/tiering/async_lookup.py:163-185"]
+    request: {type: object}
+    response: {type: object, properties: {posted: {type: integer}}}
+    behavior:
+      - call: async-lookup-manager.drain-results
+      - set:
+          vars.batch: "= state.lookup_batch.filter(e, e.key in state.lookup_state && state.lookup_state[e.key].generation == e.generation)"
+      - set:
+          state.lookup_batch: []
+          state.lookup_state: "= merge(state.lookup_state, vars.batch.transformMapEntry(i, e, {e.key: {'phase': 'IN_FLIGHT'}}))"
+      - if: "size(vars.batch) > 0"
+        then:
+          - title: One queue item per step
+            source: "vllm/v1/kv_offload/tiering/async_lookup.py:184-185"
+            set: {state.lookup_queue: "= state.lookup_queue + [vars.batch]"}
+      - return: {posted: "= size(vars.batch)"}
+
+  - component: async-lookup-manager
+    name: drain-results
+    kind: function
+    latency_ms: 0
+    summary: "Apply worker results: stale generations are dropped, keys no request wants are deleted, the rest become RESOLVED."
+    sources: ["vllm/v1/kv_offload/tiering/async_lookup.py:187-214"]
+    request: {type: object}
+    response: {type: object, properties: {applied: {type: integer}}}
+    behavior:
+      - set:
+          vars.results: "= state.pending_results.flatten()"
+      - if: "size(vars.results) == 0"
+        then: [{return: {applied: 0}}]
+      - set:
+          vars.live: "= vars.results.filter(r, r.key in state.lookup_state && state.lookup_state[r.key].generation == r.generation)"
+      - set:
+          vars.orphans: "= vars.live.filter(r, size(state.lookup_state[r.key].request_ids) == 0).map(r, r.key)"
+          vars.apply: "= vars.live.filter(r, size(state.lookup_state[r.key].request_ids) > 0)"
+      - title: Resolve live lookups; drop orphaned ones
+        source: "vllm/v1/kv_offload/tiering/async_lookup.py:197-214"
+        set:
+          state.pending_results: []
+          state.lookup_state: "= merge(state.lookup_state.transformMap(k, v, !(k in vars.orphans), v), vars.apply.transformMapEntry(i, r, {r.key: {'result': r.found, 'phase': 'RESOLVED'}}))"
+      - return: {applied: "= size(vars.apply)"}
+
+  - component: async-lookup-manager
+    name: worker
+    kind: function
+    latency_ms: 0
+    summary: "One turn of the lookup thread: take a step's batch, group it by request, run batch_lookup per request (a failure counts as all misses), post the results."
+    sources: ["vllm/v1/kv_offload/tiering/async_lookup.py:248-284"]
+    request: {type: object}
+    response: {type: object, properties: {did: {type: string}}}
+    behavior:
+      - if: "size(state.lookup_queue) == 0"
+        then: [{return: {did: idle}}]
+      - set:
+          vars.pending: "= state.lookup_queue[0]"
+          state.lookup_queue: "= state.lookup_queue.slice(1, size(state.lookup_queue))"
+      - if: "vars.pending == null"
+        then:
+          - title: Shutdown sentinel
+            source: "vllm/v1/kv_offload/tiering/async_lookup.py:250-252"
+            return: {did: exited}
+      - set:
+          vars.results: []
+      - title: Group by request and batch_lookup each group
+        source: "vllm/v1/kv_offload/tiering/async_lookup.py:255-280"
+        foreach: "= vars.pending.map(e, e.req_id).distinct()"
+        as: rid
+        steps:
+          - set: {vars.entries: "= vars.pending.filter(e, e.req_id == vars.rid)"}
+          - call: async-lookup-manager.batch-lookup
+            input: {keys: "= vars.entries.map(e, e.key)", req_id: "= vars.rid"}
+            as: hits
+            on_error: continue
+          - if: "!vars.hits.ok"
+            then:
+              - title: batch_lookup failed; every key counts as a miss
+                source: "vllm/v1/kv_offload/tiering/async_lookup.py:268-277"
+                set: {vars.results: "= vars.results + vars.entries.map(e, {'key': e.key, 'generation': e.generation, 'found': false})"}
+            else:
+              - set: {vars.results: "= vars.results + lists.range(size(vars.entries)).map(i, {'key': vars.entries[i].key, 'generation': vars.entries[i].generation, 'found': vars.hits.value.found[i]})"}
+      - if: "size(vars.results) > 0"
+        then:
+          - title: Post the whole batch as one item
+            source: "vllm/v1/kv_offload/tiering/async_lookup.py:282-284"
+            set: {state.pending_results: "= state.pending_results + [vars.results]"}
+      - return: {did: lookup}
+
+  - component: async-lookup-manager
+    name: batch-lookup
+    kind: function
+    latency_ms: 1
+    summary: "The tier's own existence check (abstract; subclasses implement it). Modeled as a lookup in the tier's key set."
+    sources: ["vllm/v1/kv_offload/tiering/async_lookup.py:123-134"]
+    request: {type: object, required: [keys], properties: {keys: {type: array, items: {type: string}}, req_id: {type: string}}}
+    response: {type: object, properties: {found: {type: array, items: {type: boolean}}}}
+    behavior:
+      - return: {found: "= input.keys.map(k, k in state.tier_keys)"}
+
+  - component: dual-queue-thread-pool
+    name: enqueue-load
+    kind: function
+    latency_ms: 0
+    summary: "Queue a load job's per-block tasks on the load queue (load-priority threads take them first)."
+    sources: ["vllm/v1/kv_offload/tiering/fs/thread_pool.py:102-114"]
+    request: {type: object, required: [job_id, tasks], properties: {job_id: {type: integer, examples: [7]}, tasks: {type: array, items: {type: object, properties: {block: {type: integer}, fails: {type: boolean}}}}}}
+    response: {type: object}
+    behavior:
+      - set:
+          state.inflight_jobs: "= state.inflight_jobs + 1"
+          state.jobs: "= merge(state.jobs, {string(input.job_id): {'n_tasks': size(input.tasks), 'completed': 0, 'success': true}})"
+          state.load_q: "= state.load_q + input.tasks.map(t, {'job_id': input.job_id, 'task': t})"
+      - return: {queued: "= size(input.tasks)"}
+
+  - component: dual-queue-thread-pool
+    name: enqueue-store
+    kind: function
+    latency_ms: 0
+    summary: "Queue a store job's per-block tasks on the store queue (store-priority threads take them first)."
+    sources: ["vllm/v1/kv_offload/tiering/fs/thread_pool.py:116-128"]
+    request: {type: object, required: [job_id, tasks], properties: {job_id: {type: integer, examples: [8]}, tasks: {type: array, items: {type: object, properties: {block: {type: integer}, fails: {type: boolean}}}}}}
+    response: {type: object}
+    behavior:
+      - set:
+          state.inflight_jobs: "= state.inflight_jobs + 1"
+          state.jobs: "= merge(state.jobs, {string(input.job_id): {'n_tasks': size(input.tasks), 'completed': 0, 'success': true}})"
+          state.store_q: "= state.store_q + input.tasks.map(t, {'job_id': input.job_id, 'task': t})"
+      - return: {queued: "= size(input.tasks)"}
+
+  - component: dual-queue-thread-pool
+    name: worker
+    kind: function
+    latency_ms: 0
+    summary: "One turn of an IO thread: pop from its primary queue (load or store), else the other; run the block IO; when a job's last task ends, post (job, success, time)."
+    sources: ["vllm/v1/kv_offload/tiering/fs/thread_pool.py:162-194"]
+    request: {type: object, properties: {load_priority: {type: boolean, default: true}}}
+    response: {type: object, properties: {did: {type: string}}}
+    behavior:
+      - if: "state.stop"
+        then:
+          - title: Pool stopped; the thread returns
+            source: "vllm/v1/kv_offload/tiering/fs/thread_pool.py:169-170"
+            return: {did: exited}
+      - if: "size(state.load_q) == 0 && size(state.store_q) == 0"
+        then: [{return: {did: idle}}]
+      - set: {vars.lp: "= has(input.load_priority) ? input.load_priority : true"}
+      - set:
+          vars.from_load: "= vars.lp ? size(state.load_q) > 0 : size(state.store_q) == 0"
+      - title: Primary queue first, then the other
+        source: "vllm/v1/kv_offload/tiering/fs/thread_pool.py:171-173"
+        set:
+          vars.item: "= vars.from_load ? state.load_q[0] : state.store_q[0]"
+          state.load_q: "= vars.from_load ? state.load_q.slice(1, size(state.load_q)) : state.load_q"
+          state.store_q: "= vars.from_load ? state.store_q : state.store_q.slice(1, size(state.store_q))"
+      - call: "= vars.from_load ? 'local-disk.preadv' : 'local-disk.pwritev'"
+        targets: [local-disk.preadv, local-disk.pwritev]
+        input: {offset: "= vars.item.task.block * 2097152", num_bytes: 2097152}
+        as: io
+        on_error: continue
+      - set: {vars.key: "= string(vars.item.job_id)"}
+      - set:
+          vars.job: "= state.jobs[vars.key]"
+      - title: task_done
+        detail: "An exception in the task marks the whole job failed but the thread carries on."
+        source: "vllm/v1/kv_offload/tiering/fs/thread_pool.py:174-188"
+        set:
+          vars.job: "= merge(vars.job, {'completed': vars.job.completed + 1, 'success': vars.job.success && vars.io.ok})"
+      - if: "vars.job.completed == vars.job.n_tasks"
+        then:
+          - title: Job finished; post it and drop the in-flight count
+            source: "vllm/v1/kv_offload/tiering/fs/thread_pool.py:190-194"
+            set:
+              state.finished_q: "= state.finished_q + [{'job_id': vars.item.job_id, 'success': vars.job.success}]"
+              state.inflight_jobs: "= state.inflight_jobs - 1"
+              state.jobs: "= omit(state.jobs, vars.key)"
+        else:
+          - set: {state.jobs: "= merge(state.jobs, {vars.key: vars.job})"}
+      - return: {did: "= vars.from_load ? 'load' : 'store'"}
+
+  - component: dual-queue-thread-pool
+    name: get-finished
+    kind: function
+    latency_ms: 0
+    summary: "Drain finished (job_id, success, time) tuples; the manager is the only popper."
+    sources: ["vllm/v1/kv_offload/tiering/fs/thread_pool.py:130-136"]
+    request: {type: object}
+    response: {type: object, properties: {jobs: {type: array}}}
+    behavior:
+      - set:
+          vars.jobs: "= state.finished_q"
+          state.finished_q: []
+      - return: {jobs: "= vars.jobs"}
+
+  # ======================================================= boundary stubs (others)
+  - component: vllm-xpu-kernels
+    name: xpu-host-register
+    kind: kernel
+    summary: "torch.ops._C.xpu_host_register(ptr, num_bytes) -> bool (owner kernels-ops)."
+    attributes: {boundary: true, owner: kernels-ops}
+    request: {type: object, required: [ptr, num_bytes], properties: {ptr: {type: integer, examples: [140000000000]}, num_bytes: {type: integer, examples: [68719476736]}}}
+    response: {type: object, properties: {ok: {type: boolean, default: true}}}
+  - component: vllm-xpu-kernels
+    name: xpu-host-unregister
+    kind: kernel
+    summary: "torch.ops._C.xpu_host_unregister(ptr) -> bool (owner kernels-ops)."
+    attributes: {boundary: true, owner: kernels-ops}
+    request: {type: object, required: [ptr], properties: {ptr: {type: integer, examples: [140000000000]}}}
+    response: {type: object, properties: {ok: {type: boolean, default: true}}}
+  - component: custom-ops
+    name: swap-blocks-batch
+    kind: function
+    summary: "Python wrapper swap_blocks_batch -> torch.ops._C_cache_ops.swap_blocks_batch (kernels-ops)."
+    attributes: {boundary: true, owner: kernels-ops}
+    request: KernelsOpsBlockCopyShape
+  - component: local-disk
+    name: pwritev
+    kind: io
+    summary: "os.pwritev to the offload file (shared infrastructure)."
+    attributes: {boundary: true, owner: shared}
+    latency_ms: "= 0.01 + double(input.num_bytes) / double(config['scheduler-kv-nvme-bytes-per-ms'])"
+    request: {type: object, properties: {offset: {type: integer}, num_bytes: {type: integer}}}
+    response: {type: object, properties: {bytes_written: {type: integer, default: 2097152}}}
+  - component: local-disk
+    name: preadv
+    kind: io
+    summary: "os.preadv from the offload file (shared infrastructure)."
+    attributes: {boundary: true, owner: shared}
+    latency_ms: "= 0.01 + double(input.num_bytes) / double(config['scheduler-kv-nvme-bytes-per-ms'])"
+    request: {type: object, properties: {offset: {type: integer}, num_bytes: {type: integer}}}
+    response: {type: object, properties: {bytes_read: {type: integer, default: 2097152}}}

@@ -1,0 +1,67 @@
+schema_version: 1
+id: vllm
+scenarios:
+  - id: bench-l3-6
+    name: "execute_model raises with a streaming and a non-streaming chat in flight (VLLM_KEEP_ALIVE_ON_ENGINE_DEATH=1)"
+    fixtures: [full-tp1-llama-8b]
+    config: {vllm-keep-alive-on-engine-death: true}
+    max_events: 200000
+    max_iterations: 100000
+    faults:
+      - {target: gpu-worker-impl.execute-model, type: error, code: cuda-error, message: "CUDA error: an illegal memory access was encountered", calls: [4]}
+    steps:
+      - {flow: engine-core-busy-loop, input: {iterations: 200}, as: loop, await: false}
+      - flow: serving-api-chat-stream
+        input: {body: {model: llama-8b, messages: [{role: user, content: "Hello"}], max_tokens: 64, ignore_eos: true, stream: true}}
+        at_ms: 0
+        as: stream
+        await: false
+      - flow: serving-api-chat-completion
+        input: {body: {model: llama-8b, messages: [{role: user, content: "Hello"}], max_tokens: 64, ignore_eos: true, stream: false}}
+        at_ms: 0
+        as: full
+        await: false
+      - {flow: serving-api-health, at_ms: 3000, as: health}
+      - flow: serving-api-chat-completion
+        input: {body: {model: llama-8b, messages: [{role: user, content: "Hi again"}], max_tokens: 8, stream: false}}
+        as: after
+      - {interface: launcher.terminate-if-errored, caller: api-server, as: wd}
+    expect:
+      # (a) the step fails in the batch-queue path; log_error_detail dumps and re-raises; ENGINE_CORE_DEAD is sent; no recovery
+      - "config['async-scheduling'] && trace.exists(e, e.type == 'call.end' && e.interface == 'gpu-worker-impl.execute-model' && has(e.error) && e.error != null && e.error.code == 'cuda-error')"
+      - "trace.exists(e, e.type == 'note' && e.title == 'log_error_detail dumps the scheduler state, then re-raises')"
+      - "trace.filter(e, e.type == 'call.start' && e.interface == 'engine-core-proc.send-engine-dead').size() == 1"
+      - "trace.exists(e, e.type == 'call.end' && e.interface == 'engine-core-proc.run-busy-loop' && has(e.error) && e.error != null && e.error.code == 'cuda-error')"
+      - "trace.filter(e, e.type == 'call.start' && e.interface == 'engine-core-proc.run-busy-loop' && e.t > 300).size() == 0"
+      - "!trace.exists(e, e.type == 'call.start' && e.interface.startsWith('engine-core-sentinel.'))"
+      # (b) non-streaming: 500 EngineDeadError; streaming: 200 chunks, then an error chunk, then [DONE]
+      - "!steps.full.result.ok && steps.full.result.error.status == 500 && steps.full.result.error.message == 'EngineCore encountered an issue. See stack trace (above) for the root cause.'"
+      - "steps.stream.result.ok && steps.stream.result.value.items.size() >= 3"
+      - "steps.stream.result.value.items[steps.stream.result.value.items.size() - 2].error.message == 'EngineCore encountered an issue. See stack trace (above) for the root cause.'"
+      - "steps.stream.result.value.items[steps.stream.result.value.items.size() - 1].data == '[DONE]'"
+      # (c) /health 503; a new request is 500 in preflight without reaching the engine
+      - "steps.health.result.value.status_code == 503"
+      - "!steps.after.result.ok && steps.after.result.error.status == 500"
+      - "trace.exists(e, e.type == 'call.end' && e.interface == 'generate-base-serving.preflight' && has(e.error) && e.error != null && e.t >= 3000)"
+      - "!trace.exists(e, e.type == 'call.start' && e.interface == 'async-llm.add-request' && e.t >= 3000)"
+      # (d) keep-alive: the server stays up
+      - "!steps.wd.result.value.should_exit && state.launcher.server_should_exit == false"
+  - id: bench-l3-6d-no-keepalive
+    name: "(d) without VLLM_KEEP_ALIVE_ON_ENGINE_DEATH the watchdog / handler stops uvicorn"
+    fixtures: [full-tp1-llama-8b]
+    max_events: 200000
+    max_iterations: 100000
+    faults:
+      - {target: gpu-worker-impl.execute-model, type: error, code: cuda-error, calls: [4]}
+    steps:
+      - {flow: engine-core-busy-loop, input: {iterations: 200}, as: loop, await: false}
+      - flow: serving-api-chat-completion
+        input: {body: {model: llama-8b, messages: [{role: user, content: "Hello"}], max_tokens: 64, ignore_eos: true, stream: false}}
+        at_ms: 0
+        as: full
+        await: false
+      - {flow: serving-api-engine-watchdog, at_ms: 1000, as: wd}
+    expect:
+      - "!config['vllm-keep-alive-on-engine-death']"
+      - "!steps.full.result.ok && steps.full.result.error.status == 500"
+      - "state.launcher.server_should_exit == true"

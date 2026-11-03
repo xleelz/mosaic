@@ -1,0 +1,433 @@
+scenarios:
+- id: wr-spec-decode-gpu-resident-drafts
+  name: 'Async-scheduled EAGLE3: the scheduler sends -1 placeholders; the runner verifies its own GPU-resident drafts, then the next step verifies the drafts it just proposed'
+  description: With async scheduling the scheduler schedules 1 + k tokens per decoding request with -1 draft placeholders; the V2 runner reads its drafts from req_states.draft_tokens, verifies them in one
+    target forward (rejection sampler) and proposes the next ones (gpu/model_runner.py:1643-1652, 2224-2253).
+  fixtures:
+  - full-tp1-llama-8b
+  config:
+    speculative-method: eagle3
+    num-speculative-tokens: 3
+  state:
+    gpu-model-runner:
+      slots:
+        chatcmpl-abc123:
+          slot: 1023
+          prefill_len: 100
+          prompt_len: 100
+          prompt_hash: 4242
+      fresh_slots_used: 1
+      speculator: target-dependent-ar-speculator
+      draft_tokens:
+        chatcmpl-abc123:
+        - 201
+        - 202
+        - 203
+    sampler:
+      slots:
+        '1023':
+          temperature: 0.0
+          top_p: 1.0
+          top_k: 128256
+          min_p: 0.0
+          seeded: false
+          seed: 0
+          logprobs: -1
+          penalties: false
+          logit_bias: false
+          thinking: false
+          needs_processing: false
+    cuda-graph-manager:
+      decode_query_len: 4
+  steps:
+  - flow: wr-spec-decode-step
+    as: e1
+    input:
+      scheduled_cached_reqs:
+        req_ids:
+        - chatcmpl-abc123
+        num_computed_tokens:
+        - 100
+        new_block_ids:
+        - []
+      num_scheduled_tokens:
+        chatcmpl-abc123: 4
+      total_num_scheduled_tokens: 4
+      scheduled_spec_decode_tokens:
+        chatcmpl-abc123:
+        - -1
+        - -1
+        - -1
+  - flow: wr-sample-tokens
+    as: s1
+  - flow: wr-spec-decode-step
+    as: e2
+    input:
+      scheduled_cached_reqs:
+        req_ids:
+        - chatcmpl-abc123
+        num_computed_tokens:
+        - 104
+        new_block_ids:
+        - []
+      num_scheduled_tokens:
+        chatcmpl-abc123: 4
+      total_num_scheduled_tokens: 4
+      scheduled_spec_decode_tokens:
+        chatcmpl-abc123:
+        - -1
+        - -1
+        - -1
+  - flow: wr-sample-tokens
+    as: s2
+  - interface: gpu-worker-impl.take-draft-token-ids
+    caller: engine-core
+    as: d
+  expect:
+  - steps.s1.result.value.sampled_token_ids[0].slice(0, 3) == [201, 202, 203] && size(steps.s1.result.value.sampled_token_ids[0]) == 4
+  - steps.s2.result.value.sampled_token_ids[0].slice(0, 3) == [200, 201, 202]
+  - steps.d.result.value.draft_token_ids == [[-1, -1, -1]] && state['gpu-model-runner@rank0'].draft_tokens['chatcmpl-abc123'] == [200, 201, 202]
+- id: wr-greedy-is-deterministic
+  name: Two identical greedy requests produce identical tokens; a seeded random request is repeatable, an unseeded one is not tied to the prompt
+  fixtures:
+  - full-tp1-llama-8b
+  steps:
+  - flow: wr-execute-model
+    as: e1
+    input:
+      scheduled_new_reqs:
+      - req_id: chatcmpl-g1
+        prompt_token_ids:
+        - 128000
+        - 9906
+        - 1917
+        block_ids:
+        - 1
+        num_computed_tokens: 0
+        sampling_params:
+          temperature: 0.0
+      - req_id: chatcmpl-g2
+        prompt_token_ids:
+        - 128000
+        - 9906
+        - 1917
+        block_ids:
+        - 2
+        num_computed_tokens: 0
+        sampling_params:
+          temperature: 0.0
+      - req_id: chatcmpl-s1
+        prompt_token_ids:
+        - 128000
+        - 9906
+        - 1917
+        block_ids:
+        - 3
+        num_computed_tokens: 0
+        sampling_params:
+          temperature: 0.8
+          seed: 7
+      - req_id: chatcmpl-s2
+        prompt_token_ids:
+        - 128000
+        - 9906
+        - 1917
+        block_ids:
+        - 4
+        num_computed_tokens: 0
+        sampling_params:
+          temperature: 0.8
+          seed: 7
+      num_scheduled_tokens:
+        chatcmpl-g1: 3
+        chatcmpl-g2: 3
+        chatcmpl-s1: 3
+        chatcmpl-s2: 3
+      total_num_scheduled_tokens: 12
+  - flow: wr-sample-tokens
+    as: s1
+  expect:
+  - steps.s1.result.value.req_ids == ['chatcmpl-g1', 'chatcmpl-g2', 'chatcmpl-s1', 'chatcmpl-s2']
+  - steps.s1.result.value.sampled_token_ids[0] == steps.s1.result.value.sampled_token_ids[1]
+  - steps.s1.result.value.sampled_token_ids[2] == steps.s1.result.value.sampled_token_ids[3] && steps.s1.result.value.sampled_token_ids[2] != steps.s1.result.value.sampled_token_ids[0]
+  - state['sampler@rank0'].slots[string(state['gpu-model-runner@rank0'].slots['chatcmpl-s1'].slot)].seed == 7
+- id: wr-pipeline-parallel-two-stages
+  name: 'PP 2: rank0 runs the first half and sends its intermediate tensors; rank1 receives them, samples and broadcasts; rank0 records the receive and applies the tokens at its next step'
+  fixtures:
+  - full-tp1-llama-8b
+  topology:
+    gpu-worker:
+    - rank0
+    - rank1
+  config:
+    pipeline-parallel-size: 2
+  state:
+    gpu-worker-impl@rank0:
+      pp_rank: 0
+      is_first_pp_rank: true
+      is_last_pp_rank: false
+    gpu-worker-impl@rank1:
+      pp_rank: 1
+      is_first_pp_rank: false
+      is_last_pp_rank: true
+    gpu-model-runner@rank0:
+      pp_rank: 0
+      is_first_pp_rank: true
+      is_last_pp_rank: false
+    gpu-model-runner@rank1:
+      pp_rank: 1
+      is_first_pp_rank: false
+      is_last_pp_rank: true
+    pp-handler@rank0:
+      queue:
+      - null
+      - null
+  steps:
+  - flow: wr-pipeline-parallel-step
+    as: first
+    'on': rank0
+    await: false
+    input:
+      scheduled_new_reqs:
+      - req_id: chatcmpl-abc123
+        prompt_token_ids:
+        - 128000
+        - 9906
+        - 1917
+        - 1234
+        block_ids:
+        - 1
+        num_computed_tokens: 0
+        sampling_params:
+          temperature: 0.0
+      num_scheduled_tokens:
+        chatcmpl-abc123: 4
+      total_num_scheduled_tokens: 4
+  - flow: wr-pipeline-parallel-step
+    as: last
+    'on': rank1
+    input:
+      scheduled_new_reqs:
+      - req_id: chatcmpl-abc123
+        prompt_token_ids:
+        - 128000
+        - 9906
+        - 1917
+        - 1234
+        block_ids:
+        - 1
+        num_computed_tokens: 0
+        sampling_params:
+          temperature: 0.0
+      num_scheduled_tokens:
+        chatcmpl-abc123: 4
+      total_num_scheduled_tokens: 4
+  - flow: wr-sample-tokens
+    as: s_last
+    'on': rank1
+  - flow: wr-sample-tokens
+    as: s_first
+    'on': rank0
+  - flow: wr-pipeline-parallel-step
+    as: first2
+    'on': rank0
+    input:
+      scheduled_cached_reqs:
+        req_ids:
+        - chatcmpl-abc123
+        num_computed_tokens:
+        - 4
+        new_block_ids:
+        - []
+      num_scheduled_tokens:
+        chatcmpl-abc123: 1
+      total_num_scheduled_tokens: 1
+  - flow: wr-pipeline-parallel-step
+    as: first3
+    'on': rank0
+    input:
+      scheduled_cached_reqs:
+        req_ids:
+        - chatcmpl-abc123
+        num_computed_tokens:
+        - 5
+        new_block_ids:
+        - []
+      num_scheduled_tokens:
+        chatcmpl-abc123: 1
+      total_num_scheduled_tokens: 1
+  expect:
+  - steps.first.result.value == null && steps.last.result.value == null
+  - size(steps.s_last.result.value.sampled_token_ids[0]) == 1 && steps.s_first.result.value.req_ids == []
+  - calls_by_instance['sampler.sample@rank1'] == 1 && calls_by_instance['sampler.sample@rank0'] == 0
+  - calls_by_instance['pp-handler.broadcast@rank1'] == 1 && calls_by_instance['pp-handler.receive@rank0'] == 1
+  - trace.exists(e, e.type == 'put' && e.key == 'pp-hidden:1') && trace.exists(e, e.type == 'receive' && e.key == 'pp-hidden:1' && e.instance == 'rank1')
+  - trace.exists(e, e.type == 'receive' && e.key == 'pp-sampled' && e.instance == 'rank0')
+  - state['pp-handler@rank0'].queue == [null, null]
+- id: wr-pp-runner-init-roles
+  name: With PP 2 and TP 1, rank0 is the first stage and rank1 the last; the last stage's handler keeps no receive ring
+  fixtures:
+  - full-tp1-llama-8b
+  topology:
+    gpu-worker:
+    - rank0
+    - rank1
+  config:
+    pipeline-parallel-size: 2
+  steps:
+  - interface: gpu-model-runner.init
+    caller: gpu-worker-impl
+    as: i0
+    'on': rank0
+  - interface: gpu-model-runner.init
+    caller: gpu-worker-impl
+    as: i1
+    'on': rank1
+  expect:
+  - '!state[''gpu-model-runner@rank0''].is_last_pp_rank && state[''gpu-model-runner@rank0''].is_first_pp_rank'
+- id: wr-pp-no-sample-needed
+  name: A non-last rank whose batch is a non-final prefill chunk leaves its ring slot empty and, on a hybrid model, resets Mamba state with 0 sampled
+  fixtures:
+  - full-tp1-llama-8b
+  state:
+    gpu-model-runner:
+      is_last_pp_rank: false
+      model:
+        is_hybrid: true
+    pp-handler:
+      queue:
+      - null
+      - null
+  steps:
+  - flow: wr-execute-model
+    as: e
+    input:
+      scheduled_new_reqs:
+      - req_id: chatcmpl-long1
+        prompt_token_ids: = lists.range(300)
+        block_ids:
+        - 1
+        num_computed_tokens: 0
+      num_scheduled_tokens:
+        chatcmpl-long1: 64
+      total_num_scheduled_tokens: 64
+  - flow: wr-sample-tokens
+    as: s
+  - interface: pp-handler.broadcast
+    caller: gpu-model-runner
+    as: b
+    input:
+      need_sampled:
+      - false
+      sampled_token_ids:
+      - []
+      receivers: 1
+  expect:
+  - steps.s.result.value.req_ids == [] && calls['mamba-hybrid-model-state.fill-num-accepted-kernel'] == 1
+- id: wr-eplb-registers-moe
+  name: With enable_eplb a MoE model is registered with the EPLB state and the async loop starts; a dense model or dummy weights do less
+  fixtures:
+  - full-tp1-llama-8b
+  config:
+    enable-eplb: true
+  steps:
+  - interface: eplb-controller.load
+    caller: gpu-model-runner
+    as: moe
+    input:
+      is_moe: true
+      load_dummy_weights: false
+      model: Qwen/Qwen3-30B-A3B
+  - interface: eplb-controller.load
+    caller: gpu-model-runner
+    as: dummy
+    input:
+      is_moe: true
+      load_dummy_weights: true
+      model: Qwen/Qwen3-30B-A3B
+  - interface: eplb-controller.load
+    caller: gpu-model-runner
+    as: dense
+    input:
+      is_moe: false
+      load_dummy_weights: false
+      model: meta-llama/Llama-3.1-8B-Instruct
+  expect:
+  - steps.moe.result.value.registered && steps.moe.result.value.async_loop
+  - steps.dummy.result.value.registered && !steps.dummy.result.value.async_loop && !steps.dense.result.value.registered
+  - calls['eplb-state.add-model'] == 2 && calls['eplb-state.start-async-loop'] == 1
+- id: wr-eplb-mixtral-tp4
+  name: With enable_eplb, loading Mixtral-8x7B on TP 4 registers it with EPLB on every rank, hands it the EPLB tensors and starts the async loop
+  fixtures:
+  - full-tp4-llama-70b
+  config:
+    enable-eplb: true
+  state:
+    gpu-model-runner:
+      model:
+        name: mistralai/Mixtral-8x7B-Instruct-v0.1
+        architecture: MixtralForCausalLM
+        num_hidden_layers: 32
+        num_kv_heads: 8
+        num_attention_heads: 32
+        head_size: 128
+        dtype_bytes: 2
+        torch_dtype: bfloat16
+        vocab_size: 32000
+        hidden_size: 4096
+        max_position_embeddings: 32768
+        weights_bytes: 93405585408
+        is_hybrid: false
+        uses_mrope: false
+        uses_prompt_embeds: false
+      model_loaded: false
+  steps:
+  - interface: executor.collective-rpc
+    caller: engine-core
+    as: load
+    input:
+      method: load_model
+      args: {}
+  expect:
+  - steps.load.result.ok
+  - calls_by_instance['eplb-state.add-model@rank0'] == 1 && calls['eplb-state.add-model'] == 4
+  - calls_by_instance['mixtral-for-causal-lm.set-eplb-state@rank0'] == 1 && calls['eplb-state.start-async-loop'] == 4
+  - state['gpu-model-runner@rank0'].model_loaded
+- id: wr-pcp-non-last-pp-uses-global-batch
+  name: 'PCP 2 on a non-last PP rank: the rank forwards half of a 10-token final prefill chunk, but the PP feedback uses the global batch, so the request still needs its sampled token'
+  description: 'tests/v1/worker/test_gpu_model_runner_v2.py:28-62: receive and postprocess_num_computed_tokens get pcp_manager.global_batch (model_runner.py:2111-2114).'
+  fixtures:
+  - full-tp1-llama-8b
+  config:
+    prefill-context-parallel-size: 2
+  state:
+    gpu-model-runner:
+      is_last_pp_rank: false
+      slots:
+        chatcmpl-abc123:
+          slot: 1023
+          prefill_len: 100
+          prompt_len: 100
+      fresh_slots_used: 1
+    pp-handler:
+      queue:
+      - null
+      - null
+  steps:
+  - flow: wr-execute-model
+    as: e
+    input:
+      scheduled_cached_reqs:
+        req_ids:
+        - chatcmpl-abc123
+        num_computed_tokens:
+        - 90
+        new_block_ids:
+        - []
+      num_scheduled_tokens:
+        chatcmpl-abc123: 10
+      total_num_scheduled_tokens: 10
+  - flow: wr-sample-tokens
+    as: s
+  expect:
+  - trace.exists(e, e.type == 'call.start' && e.interface == 'pp-handler.receive' && e.input.need_sampled == [true])

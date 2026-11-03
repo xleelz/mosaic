@@ -1,0 +1,487 @@
+interfaces:
+  # ---------------- shared gpu-memory operations (gpu-memory sits under gpu-worker) ----------------
+  - component: gpu-memory
+    name: snapshot
+    kind: io
+    summary: "MemorySnapshot.measure: total and free device memory as torch.accelerator.get_memory_info reports it (weights, KV cache, CUDA graph pools, runtime/non-torch allocations and other processes all reduce free)."
+    sources: ["vllm/utils/mem_utils.py:120-190"]
+    latency_ms: 0
+    request: {type: object, properties: {at_init: {type: boolean, default: false}, after_profile: {type: boolean, default: false}}}
+    response:
+      type: object
+      properties:
+        total_bytes: {type: integer}
+        free_bytes: {type: integer}
+        weights_bytes: {type: integer}
+        kv_cache_bytes: {type: integer}
+    behavior:
+      - set:
+          vars.used: "= state.weights_bytes + state.kv_cache_bytes + (has(state.runtime_bytes) ? state.runtime_bytes : 0) + (has(state.non_torch_bytes) ? state.non_torch_bytes : 0) + (has(state.cudagraph_bytes) ? state.cudagraph_bytes : 0) + (has(state.other_process_bytes) ? state.other_process_bytes : 0)"
+      - if: "has(input.at_init) && input.at_init"
+        then:
+          - title: The init snapshot precedes this process's own allocations
+            detail: "init_device snapshots before load_model, the profile run, KV allocation and graph capture, so only other processes' memory is in use then. A world seeded with this engine's weights, KV cache or graph pools (the started fixtures) must not count them against its own budget."
+            source: "vllm/v1/worker/gpu_worker.py:533-534"
+            return:
+              total_bytes: "= state.total_bytes"
+              free_bytes: "= state.total_bytes - (has(state.other_process_bytes) ? state.other_process_bytes : 0)"
+              weights_bytes: 0
+              kv_cache_bytes: 0
+      - if: "has(input.after_profile) && input.after_profile"
+        then:
+          - title: The profiling snapshot precedes KV cache allocation and graph capture
+            detail: "determine_available_memory measures after the profile run and before initialize_from_config and capture_model, so a KV cache or graph pool already in the world belongs to this engine's later stages and is not counted."
+            source: "vllm/v1/worker/gpu_worker.py:713-714"
+            return:
+              total_bytes: "= state.total_bytes"
+              free_bytes: "= state.total_bytes - (vars.used - state.kv_cache_bytes - (has(state.cudagraph_bytes) ? state.cudagraph_bytes : 0))"
+              weights_bytes: "= state.weights_bytes"
+              kv_cache_bytes: 0
+      - return:
+          total_bytes: "= state.total_bytes"
+          free_bytes: "= state.total_bytes - vars.used"
+          weights_bytes: "= state.weights_bytes"
+          kv_cache_bytes: "= state.kv_cache_bytes"
+  - component: gpu-memory
+    name: profile-peak
+    kind: io
+    summary: "The memory profiler's view of a dummy forward: the transient torch peak above persistent allocations, and the non-torch runtime memory startup leaves allocated."
+    sources: ["vllm/utils/mem_utils.py:296-321"]
+    latency_ms: 0
+    request: {type: object, required: [num_tokens], properties: {num_tokens: {type: integer, examples: [2048]}}}
+    response: {type: object, properties: {peak_activation_bytes: {type: integer}, runtime_bytes: {type: integer}}}
+    behavior:
+      - title: Transient activation peak grows with the profiled token count
+        detail: "torch_peak - torch_allocated after the dummy run (transient_peak_headroom); bytes per token is a labeled assumption. Non-torch memory grown since the init snapshot is the device fact non_torch_bytes when the world gives it, else the 1 GiB assumption."
+        source: "vllm/utils/mem_utils.py:318-321"
+        set:
+          state.peak_activation_bytes: "= input.num_tokens * int(config['worker-runner-activation-bytes-per-token'])"
+          state.runtime_bytes: "= has(state.non_torch_bytes) ? 0 : int(config['worker-runner-non-torch-memory-bytes'])"
+      - return: {peak_activation_bytes: "= state.peak_activation_bytes", runtime_bytes: "= has(state.non_torch_bytes) ? state.non_torch_bytes : state.runtime_bytes"}
+  - component: gpu-memory
+    name: allocate
+    kind: io
+    summary: "Allocates device memory for one pool (kv_cache, cudagraph, weights, runtime); fails like torch.OutOfMemoryError when it does not fit."
+    sources: ["vllm/v1/worker/gpu/attn_utils.py:396-455"]
+    latency_ms: 0
+    errors: [{code: out-of-memory-error, status: 0, retryable: false}]
+    request: {type: object, required: [kind, bytes], properties: {kind: {type: string, enum: [kv_cache, cudagraph, weights, runtime]}, bytes: {type: integer}, pool: {type: ["string", "null"], default: null, description: "the CuMem memory-pool tag the allocation is made under (sleep mode), or None"}}}
+    response: {type: object, properties: {kind: {type: string}, bytes: {type: integer}, free_bytes: {type: integer}, pool: {type: ["string", "null"]}}}
+    behavior:
+      - set:
+          vars.used: "= state.weights_bytes + state.kv_cache_bytes + (has(state.runtime_bytes) ? state.runtime_bytes : 0) + (has(state.non_torch_bytes) ? state.non_torch_bytes : 0) + (has(state.cudagraph_bytes) ? state.cudagraph_bytes : 0) + (has(state.other_process_bytes) ? state.other_process_bytes : 0)"
+      - title: Weights, KV cache and graph pools are one per rank; a repeat allocation replaces the old one
+        detail: "A rank's process holds one model, one KV cache and one graph pool; loading or allocating again (a new engine in the same world, reload, wake_up) replaces it instead of adding a second copy."
+        source: "vllm/v1/worker/gpu/attn_utils.py:396-455"
+        set:
+          vars.prev: "= input.kind == 'kv_cache' ? state.kv_cache_bytes : (input.kind == 'weights' ? state.weights_bytes : (input.kind == 'cudagraph' && has(state.cudagraph_bytes) ? state.cudagraph_bytes : 0))"
+      - if: "input.bytes > state.total_bytes - (vars.used - vars.prev)"
+        then:
+          - title: CUDA out of memory
+            fail: {code: out-of-memory-error, status: 0, message: "= 'CUDA out of memory: tried to allocate ' + string(input.bytes) + ' bytes for ' + input.kind + ', ' + string(state.total_bytes - vars.used) + ' free'"}
+      - {when: "input.kind == 'kv_cache'", set: {state.kv_cache_bytes: "= input.bytes"}}
+      - {when: "input.kind == 'cudagraph'", set: {state.cudagraph_bytes: "= input.bytes"}}
+      - {when: "input.kind == 'weights'", set: {state.weights_bytes: "= input.bytes"}}
+      - {when: "input.kind == 'runtime'", set: {state.runtime_bytes: "= (has(state.runtime_bytes) ? state.runtime_bytes : 0) + input.bytes"}}
+      - return: {kind: "= input.kind", bytes: "= input.bytes", free_bytes: "= state.total_bytes - (vars.used - vars.prev) - input.bytes", pool: "= has(input.pool) ? input.pool : null"}
+  - component: gpu-memory
+    name: free
+    kind: io
+    summary: "Releases (or unmaps) one pool's device memory, as sleep mode does for discarded or offloaded tags."
+    sources: ["vllm/device_allocator/cumem.py:233-299"]
+    latency_ms: 0
+    request: {type: object, required: [kind], properties: {kind: {type: string, enum: [kv_cache, cudagraph, weights, runtime]}}}
+    response: {type: object, properties: {kind: {type: string}, freed_bytes: {type: integer}}}
+    behavior:
+      - set:
+          vars.freed: "= input.kind == 'kv_cache' ? state.kv_cache_bytes : (input.kind == 'weights' ? state.weights_bytes : (input.kind == 'cudagraph' ? (has(state.cudagraph_bytes) ? state.cudagraph_bytes : 0) : (has(state.runtime_bytes) ? state.runtime_bytes : 0)))"
+      - {when: "input.kind == 'kv_cache'", set: {state.kv_cache_bytes: 0}}
+      - {when: "input.kind == 'weights'", set: {state.weights_bytes: 0}}
+      - {when: "input.kind == 'cudagraph'", set: {state.cudagraph_bytes: 0}}
+      - {when: "input.kind == 'runtime'", set: {state.runtime_bytes: 0}}
+      - return: {kind: "= input.kind", freed_bytes: "= vars.freed"}
+
+  # ---------------- WorkerWrapperBase ----------------
+  - component: worker-wrapper-base
+    name: init-worker
+    kind: rpc
+    summary: "collective_rpc init_worker: loads general plugins, lets the platform override Triton kernels, resolves parallel_config.worker_cls (must be a qualified-name string) and constructs the worker."
+    sources: ["vllm/v1/worker/worker_base.py:259-338"]
+    latency_ms: 0
+    errors: [{code: value-error, status: 0, retryable: false}]
+    request:
+      type: object
+      properties:
+        worker_cls: {type: string, examples: ["vllm.v1.worker.gpu_worker.Worker"]}
+        rank: {type: integer, examples: [0]}
+    response: {type: object, properties: {worker_cls: {type: string}}}
+    behavior:
+      - title: Load general plugins before any worker code runs
+        source: "vllm/v1/worker/worker_base.py:276-278"
+        call: plugins.load-general-plugins
+        input: {}
+      - title: worker_cls must be a qualified-name string
+        source: "vllm/v1/worker/worker_base.py:285-295"
+        if: "input.worker_cls == ''"
+        then:
+          - fail: {code: value-error, status: 0, message: "passing worker_cls is no longer supported. Please pass keep the class in a separate module and pass the qualified name of the class as a string."}
+      - title: Construct the worker inside set_current_vllm_config
+        source: "vllm/v1/worker/worker_base.py:336-338"
+        set: {state.worker_cls: "= input.worker_cls"}
+      - return: {worker_cls: "= input.worker_cls"}
+  - component: worker-wrapper-base
+    name: update-environment-variables
+    kind: rpc
+    summary: "collective_rpc update_environment_variables (Ray executor): applies this rank's entry of the per-rank env list."
+    sources: ["vllm/v1/worker/worker_base.py:252-257"]
+    latency_ms: 0
+    request: {type: object, properties: {envs_list: {type: array, items: {type: object}}, rpc_rank: {type: integer, examples: [0]}}}
+    response: {type: object, properties: {applied: {type: object}}}
+    behavior:
+      - if: "input.rpc_rank >= size(input.envs_list)"
+        then:
+          - fail: {code: index-error, status: 0, message: "list index out of range"}
+      - set: {state.env: "= input.envs_list[input.rpc_rank]"}
+      - return: {applied: "= state.env"}
+
+  # ---------------- WorkerBase ----------------
+  - component: worker-base
+    name: get-supported-kv-cache-layouts
+    kind: rpc
+    summary: "Layouts every configured attention backend supports, most preferred first; the engine core picks one and calls set_kv_cache_layout."
+    sources: ["vllm/v1/worker/worker_base.py:107-110"]
+    latency_ms: 0
+    response: {type: object, properties: {layouts: {type: array, items: {type: string}}}}
+    behavior:
+      - title: Layouts every current attention backend supports
+        source: "vllm/v1/worker/worker_base.py:109-110"
+        call: attention-backend-utils.get-supported-kv-cache-layouts
+        input: {}
+        as: be
+      - if: "size(vars.be.value.layouts) == 0"
+        then: [{return: {layouts: []}}]
+      - return: {layouts: "= vars.be.value.layouts"}
+  - component: worker-base
+    name: set-kv-cache-layout
+    kind: rpc
+    summary: "Adopts the KV cache layout resolved by the engine core (recorded in cache_config)."
+    sources: ["vllm/v1/worker/worker_base.py:112-114"]
+    latency_ms: 0
+    request: {type: object, required: [kv_cache_layout], properties: {kv_cache_layout: {type: string, examples: [NHD]}}}
+    response: {type: object, properties: {kv_cache_layout: {type: string}}}
+    behavior:
+      - call: attention-backend-utils.record-kv-cache-layout
+        input: {kv_cache_layout: "= input.kv_cache_layout"}
+      - return: {kv_cache_layout: "= input.kv_cache_layout"}
+  - component: worker-base
+    name: synchronize-device
+    kind: rpc
+    summary: "Blocks until in-flight device work completes (torch.accelerator.synchronize)."
+    sources: ["vllm/v1/worker/worker_base.py:129-133"]
+    latency_ms: 0
+    response: {type: object, properties: {synchronized: {type: boolean}}}
+    behavior:
+      - if: "has(input.accelerator_available) && !input.accelerator_available"
+        then: [{return: {synchronized: false}}]
+      - return: {synchronized: true}
+  - component: worker-base
+    name: release-late-interaction-query-cache
+    kind: rpc
+    summary: "Releases cached late-interaction query embeddings on the model runner, if it has that hook."
+    sources: ["vllm/v1/worker/worker_base.py:146-151"]
+    latency_ms: 0
+    request: {type: object, properties: {query_keys: {type: array, items: {type: string}, examples: [["q-1"]]}}}
+    response: {type: object, properties: {released: {type: integer}}}
+    behavior:
+      - call: gpu-model-runner.release-late-interaction-query-cache
+        input: {query_keys: "= input.query_keys"}
+        as: rel
+      - return: {released: "= vars.rel.value.released"}
+  - component: worker-base
+    name: apply-model
+    kind: rpc
+    summary: "Applies a caller-supplied function to the model inside the worker and returns its result."
+    sources: ["vllm/v1/worker/worker_base.py:160-162"]
+    latency_ms: 0
+    request: {type: object, properties: {fn: {type: string, examples: ["count_parameters"]}}}
+    response: {type: object, properties: {fn: {type: string}, architecture: {type: string}}}
+    behavior:
+      - call: gpu-model-runner.get-model
+        as: m
+      - return: {fn: "= input.fn", architecture: "= vars.m.value.architecture"}
+  - component: worker-base
+    name: get-model-inspection
+    kind: rpc
+    summary: "Returns a transformers-style hierarchical view of the loaded model."
+    sources: ["vllm/v1/worker/worker_base.py:164-168"]
+    latency_ms: 0
+    response: {type: object, properties: {inspection: {type: string}}}
+    behavior:
+      - call: gpu-model-runner.get-model
+        as: m
+      - return: {inspection: "= vars.m.value.architecture + '(layers=' + string(vars.m.value.num_hidden_layers) + ')'"}
+
+  # ---------------- worker-utils ----------------
+  - component: worker-utils
+    name: request-memory
+    kind: function
+    summary: "request_memory: the instance's budget is ceil(total * gpu_memory_utilization); startup fails when free memory is below it (or below the budget minus externally held weights)."
+    sources: ["vllm/v1/worker/utils.py:716-772"]
+    latency_ms: 0
+    errors: [{code: value-error, status: 0, retryable: false}]
+    request:
+      type: object
+      required: [total_bytes, free_bytes]
+      properties:
+        total_bytes: {type: integer, examples: [85899345920]}
+        free_bytes: {type: integer, examples: [85899345920]}
+        external_weight_memory: {type: integer, examples: [0]}
+    response: {type: object, properties: {requested_memory: {type: integer}}}
+    behavior:
+      - set: {vars.requested: "= int(math.ceil(double(input.total_bytes) * config['gpu-memory-utilization']))"}
+      - if: "has(input.external_weight_memory) && input.external_weight_memory > 0"
+        then:
+          - set: {vars.engine: "= vars.requested - input.external_weight_memory"}
+          - if: "vars.engine <= 0"
+            then:
+              - title: Externally held weights exceed the utilization budget
+                source: "vllm/v1/worker/utils.py:729-739"
+                fail: {code: value-error, status: 0, message: "Externally held weights exceed the desired GPU memory utilization. Increase GPU memory utilization or reduce GPU memory used by other processes."}
+          - if: "input.free_bytes < vars.engine"
+            then:
+              - title: Free memory below the engine's budget after external weights
+                source: "vllm/v1/worker/utils.py:740-750"
+                fail: {code: value-error, status: 0, message: "Free memory on device on startup is less than the engine's budget after excluding external process's weights. Decrease GPU memory utilization or reduce GPU memory used by other processes."}
+          - return: {requested_memory: "= vars.engine"}
+      - if: "input.free_bytes < vars.requested"
+        then:
+          - title: Free memory below the requested budget
+            detail: "Another process (or another vLLM instance) holds memory: free < ceil(total * gpu_memory_utilization)."
+            source: "vllm/v1/worker/utils.py:761-770"
+            fail: {code: value-error, status: 0, message: "= 'Free memory on device (' + string(input.free_bytes) + ' bytes) on startup is less than desired GPU memory utilization (' + string(config[\"gpu-memory-utilization\"]) + ', ' + string(vars.requested) + ' bytes). Decrease GPU memory utilization or reduce GPU memory used by other processes.'"}
+      - return: {requested_memory: "= vars.requested"}
+
+  # ---------------- WorkerSentinel ----------------
+  - component: worker-sentinel
+    name: handle-command
+    kind: function
+    summary: "Dispatches a fault-tolerance command by instruction name (run_method on the sentinel)."
+    sources: ["vllm/v1/worker/sentinel/gpu_worker_sentinel.py:47-50"]
+    latency_ms: 0
+    errors: [{code: attribute-error, status: 0, retryable: false}]
+    request: {type: object, properties: {instruction: {type: string, examples: [retry]}}}
+    response: {type: object, properties: {instruction: {type: string}, done: {type: boolean}}}
+    behavior:
+      - if: "!(input.instruction in ['retry', 'pause'])"
+        then:
+          - fail: {code: attribute-error, status: 0, message: "= 'WorkerSentinel has no method ' + input.instruction"}
+      - title: retry synchronizes the device and cleans worker state
+        source: "vllm/v1/worker/sentinel/gpu_worker_sentinel.py:52-55"
+        when: "input.instruction == 'retry'"
+        call: worker-base.synchronize-device
+        input: {}
+      - return: {instruction: "= input.instruction", done: true}
+
+  # ---------------- CuMemAllocator (sleep mode) ----------------
+  - component: cu-mem-allocator
+    name: sleep
+    kind: function
+    summary: "CuMemBackend.suspend -> CuMemAllocator.sleep: level 1 offloads weights (and runtime/cudagraph pools) to host and discards the KV cache; level 2 also discards the weights. Only memory allocated in the CuMem pool (enable_sleep_mode) is affected."
+    sources: ["vllm/device_allocator/sleep_mode_backend.py:127-137", "vllm/device_allocator/cumem.py:233-299"]
+    latency_ms: 0
+    request: {type: object, required: [level], properties: {level: {type: integer, enum: [1, 2], examples: [1]}}}
+    response: {type: object, properties: {freed_bytes: {type: integer}, offloaded: {type: array}, discarded: {type: array}}}
+    behavior:
+      - if: "!config['enable-sleep-mode']"
+        then:
+          - title: Nothing was allocated in the CuMem pool
+            detail: "Without enable_sleep_mode the worker uses nullcontext() for every pool, so the allocator holds no allocations and sleep frees nothing."
+            source: "vllm/v1/worker/gpu_worker.py:385-389"
+            return: {freed_bytes: 0, offloaded: [], discarded: []}
+      - set:
+          vars.offload: "= input.level == 1 ? ['weights', 'runtime', 'cudagraph'] : ['runtime', 'cudagraph']"
+          vars.discard: "= input.level == 1 ? ['kv_cache'] : ['weights', 'kv_cache']"
+      - call: gpu-memory.free
+        input: {kind: kv_cache}
+        as: kv
+      - call: gpu-memory.free
+        input: {kind: weights}
+        as: w
+      - call: gpu-memory.free
+        input: {kind: cudagraph}
+        as: cg
+      - set:
+          state.offloaded: "= vars.offload"
+          state.discarded: "= vars.discard"
+          state.offloaded_weights_bytes: "= input.level == 1 ? vars.w.value.freed_bytes : 0"
+          state.weights_bytes_before_sleep: "= vars.w.value.freed_bytes"
+          state.kv_cache_bytes_before_sleep: "= vars.kv.value.freed_bytes"
+          state.cudagraph_bytes_before_sleep: "= vars.cg.value.freed_bytes"
+      - return:
+          freed_bytes: "= vars.kv.value.freed_bytes + vars.w.value.freed_bytes + vars.cg.value.freed_bytes"
+          offloaded: "= vars.offload"
+          discarded: "= vars.discard"
+  - component: cu-mem-allocator
+    name: wake-up
+    kind: function
+    summary: "CuMemAllocator.wake_up: re-maps the given tags (all when None); offloaded tags are copied back from host, discarded ones come back uninitialized."
+    sources: ["vllm/device_allocator/sleep_mode_backend.py:139-145", "vllm/device_allocator/cumem.py:331-360"]
+    latency_ms: 0
+    request: {type: object, properties: {tags: {type: array, items: {type: string}, default: []}}}
+    response: {type: object, properties: {restored: {type: array}, content_lost: {type: array}}}
+    behavior:
+      - if: "!config['enable-sleep-mode']"
+        then: [{return: {restored: [], content_lost: []}}]
+      - set:
+          vars.tags: "= has(input.tags) && size(input.tags) > 0 ? input.tags : ['weights', 'kv_cache', 'cudagraph']"
+      - if: "'weights' in vars.tags && has(state.weights_bytes_before_sleep) && state.weights_bytes_before_sleep > 0"
+        then:
+          - call: gpu-memory.allocate
+            input: {kind: weights, bytes: "= state.weights_bytes_before_sleep"}
+      - if: "'kv_cache' in vars.tags && has(state.kv_cache_bytes_before_sleep) && state.kv_cache_bytes_before_sleep > 0"
+        then:
+          - call: gpu-memory.allocate
+            input: {kind: kv_cache, bytes: "= state.kv_cache_bytes_before_sleep"}
+      - if: "'weights' in vars.tags && has(state.cudagraph_bytes_before_sleep) && state.cudagraph_bytes_before_sleep > 0"
+        then:
+          - call: gpu-memory.allocate
+            input: {kind: cudagraph, bytes: "= state.cudagraph_bytes_before_sleep"}
+      - set:
+          vars.lost: "= state.discarded.filter(t, t in vars.tags)"
+          state.offloaded: "= state.offloaded.filter(t, !(t in vars.tags))"
+          state.discarded: "= state.discarded.filter(t, !(t in vars.tags))"
+      - return: {restored: "= vars.tags", content_lost: "= vars.lost"}
+  - component: cu-mem-allocator
+    name: discard
+    kind: function
+    summary: "CuMemAllocator.discard: drops the host copies (or mappings) of the given tags so they cannot be restored."
+    sources: ["vllm/device_allocator/sleep_mode_backend.py:147-151", "vllm/device_allocator/cumem.py:300-330"]
+    latency_ms: 0
+    request: {type: object, properties: {tags: {type: array, items: {type: string}, examples: [["weights"]]}}}
+    response: {type: object, properties: {discarded: {type: array}}}
+    behavior:
+      - if: "!config['enable-sleep-mode']"
+        then: [{return: {discarded: []}}]
+      - set:
+          state.discarded: "= state.discarded + input.tags.filter(t, !(t in state.discarded))"
+          state.offloaded: "= state.offloaded.filter(t, !(t in input.tags))"
+      - {when: "'weights' in input.tags", set: {state.offloaded_weights_bytes: 0}}
+      - return: {discarded: "= state.discarded"}
+
+  # ---------------- boundary stubs (other areas' interfaces) ----------------
+  - {component: plugins, name: load-general-plugins, kind: function, summary: "Loads vllm.general_plugins entry points (owned by config-platform).", sources: ["vllm/plugins/__init__.py"], attributes: {boundary: true, owner: config-platform}, request: {type: object}, response: {type: object, properties: {loaded: {type: array, items: {type: string}}}}, latency_ms: 0}
+  - {component: parallel-state, name: init-distributed-environment, kind: function, summary: "torch.distributed init for this rank (owned by distributed).", sources: ["vllm/distributed/parallel_state.py"], attributes: {boundary: true, owner: distributed}, request: {type: object, required: [world_size, rank], properties: {world_size: {type: integer, examples: [1]}, rank: {type: integer, examples: [0]}, backend: {type: string, default: nccl}}}, response: {type: object, properties: {world_size: {type: integer}, backend: {type: string}, already_initialized: {type: boolean}}}, latency_ms: 0}
+  - {component: parallel-state, name: ensure-model-parallel-initialized, kind: function, summary: "Creates the TP/PP/PCP/DCP groups (owned by distributed).", sources: ["vllm/distributed/parallel_state.py"], attributes: {boundary: true, owner: distributed}, request: {type: object, required: [tensor_model_parallel_size, pipeline_model_parallel_size], properties: {tensor_model_parallel_size: {type: integer, examples: [1]}, pipeline_model_parallel_size: {type: integer, default: 1}, data_parallel_size: {type: integer, default: 1}, enable_eplb: {type: boolean, default: false}, is_moe: {type: boolean, default: false}}}, response: {type: object, properties: {created: {type: boolean}, tp_world_size: {type: integer}, pp_world_size: {type: integer}}}, latency_ms: 0}
+  - {component: parallel-state, name: checkpoint-prepare-distributed-state, kind: function, summary: "Prepares process groups for a checkpoint (owned by distributed).", sources: ["vllm/distributed/parallel_state.py"], attributes: {boundary: true, owner: distributed}, request: {type: object}, response: {type: object, properties: {ok: {type: boolean, examples: [true]}}}, latency_ms: 0}
+  - {component: parallel-state, name: checkpoint-restore-distributed-state, kind: function, summary: "Restores process groups after a checkpoint (owned by distributed).", sources: ["vllm/distributed/parallel_state.py"], attributes: {boundary: true, owner: distributed}, request: {type: object}, response: {type: object, properties: {ok: {type: boolean, examples: [true]}}}, latency_ms: 0}
+  - {component: weight-checksum, name: compute-tensor-digests, kind: function, summary: "Per-parameter digests (owned by models-layers).", sources: ["vllm/model_executor/model_loader/weight_checksum.py"], attributes: {boundary: true, owner: models-layers}, request: {type: object}, response: {type: object, properties: {digests: {type: object, examples: [{"model.embed_tokens.weight": "9f2c"}]}}}, latency_ms: 0}
+  - {component: weight-checksum, name: zero-weights, kind: function, summary: "Zeroes every parameter (owned by models-layers).", sources: ["vllm/model_executor/model_loader/weight_checksum.py"], attributes: {boundary: true, owner: models-layers}, request: {type: object}, response: {type: object, properties: {ok: {type: boolean, examples: [true]}}}, latency_ms: 0}
+  - {component: sharded-state-loader, name: save-model, kind: function, summary: "Writes this rank's shard to path (owned by models-layers).", sources: ["vllm/model_executor/model_loader/sharded_state_loader.py"], attributes: {boundary: true, owner: models-layers}, request: {type: object, properties: {path: {type: string, examples: [/models/llama-8b-sharded]}}}, response: {type: object, properties: {ok: {type: boolean, examples: [true]}}}}
+  - {component: tensorizer-loader, name: save-model, kind: function, summary: "Serializes the model with tensorizer (owned by models-layers).", sources: ["vllm/model_executor/model_loader/tensorizer_loader.py"], attributes: {boundary: true, owner: models-layers}, request: {type: object, properties: {tensorizer_uri: {type: string, examples: [/models/llama-8b.tensors]}}}, response: {type: object, properties: {ok: {type: boolean, examples: [true]}}}}
+  - {component: elastic-ep-scaling-executor, name: execute, kind: function, summary: "Runs one elastic EP reconfiguration step on the worker (owned by distributed).", sources: ["vllm/distributed/elastic_ep/elastic_execute.py"], attributes: {boundary: true, owner: distributed}, request: {type: object, properties: {execute_method: {type: string, examples: [receive_weights]}}}, response: {type: object, properties: {ok: {type: boolean, examples: [true]}}}, latency_ms: 0}
+  - component: weight-transfer-engine
+    name: init-transfer-engine
+    kind: rpc
+    summary: "Connects to the trainer (for NCCL: creates a process group) (owned by distributed)."
+    sources: ["vllm/distributed/weight_transfer/base.py"]
+    attributes: {boundary: true, owner: distributed}
+    request: {type: object, properties: {init_info: {type: object}}}
+    response: {type: object, properties: {ok: {type: boolean, examples: [true]}}}
+  - {component: weight-transfer-engine, name: start-weight-update, kind: function, summary: "Begins an update session (owned by distributed).", sources: ["vllm/distributed/weight_transfer/base.py"], attributes: {boundary: true, owner: distributed}, request: {type: object}, response: {type: object, properties: {ok: {type: boolean, examples: [true]}}}}
+  - {component: weight-transfer-engine, name: update-weights, kind: rpc, summary: "Receives one weight chunk into the target model (owned by distributed).", sources: ["vllm/distributed/weight_transfer/base.py"], attributes: {boundary: true, owner: distributed}, request: {type: object, properties: {update_info: {type: object}}}, response: {type: object, properties: {ok: {type: boolean, examples: [true]}}}}
+  - {component: weight-transfer-engine, name: finish-weight-update, kind: function, summary: "Ends the session (owned by distributed).", sources: ["vllm/distributed/weight_transfer/base.py"], attributes: {boundary: true, owner: distributed}, request: {type: object}, response: {type: object, properties: {ok: {type: boolean, examples: [true]}}}}
+  - {component: weight-transfer-engine, name: shutdown, kind: function, summary: "Releases the trainer connection (owned by distributed).", sources: ["vllm/distributed/weight_transfer/base.py"], attributes: {boundary: true, owner: distributed}, request: {type: object}, response: {type: object, properties: {ok: {type: boolean, examples: [true]}}}}
+  - {component: lru-cache-worker-lora-manager, name: add-adapter, kind: function, summary: "Loads a LoRA adapter into the worker cache (owned by models-layers).", sources: ["vllm/lora/worker_manager.py"], attributes: {boundary: true, owner: models-layers}, request: {type: object, required: [lora_name, lora_int_id, lora_path], properties: {lora_name: {type: string, examples: [sql-lora]}, lora_int_id: {type: integer, examples: [1]}, lora_path: {type: string, examples: [/adapters/sql-lora]}, load_inplace: {type: boolean, default: false}}}, response: {type: object, properties: {loaded: {type: boolean, examples: [true]}}}}
+  - {component: lru-cache-worker-lora-manager, name: remove-adapter, kind: function, summary: "Removes a LoRA adapter (owned by models-layers).", sources: ["vllm/lora/worker_manager.py"], attributes: {boundary: true, owner: models-layers}, request: {type: object, properties: {lora_int_id: {type: integer, examples: [1]}}}, response: {type: object, properties: {removed: {type: boolean, examples: [true]}}}}
+  - {component: lru-cache-worker-lora-manager, name: pin-adapter, kind: function, summary: "Pins a LoRA adapter against eviction (owned by models-layers).", sources: ["vllm/lora/worker_manager.py"], attributes: {boundary: true, owner: models-layers}, request: {type: object, properties: {lora_int_id: {type: integer, examples: [1]}}}, response: {type: object, properties: {pinned: {type: boolean, examples: [true]}}}}
+  - {component: lru-cache-worker-lora-manager, name: list-adapters, kind: function, summary: "Lists registered and active LoRA ids (owned by models-layers).", sources: ["vllm/lora/worker_manager.py"], attributes: {boundary: true, owner: models-layers}, response: {type: object, properties: {registered: {type: array, items: {type: integer}, examples: [[1]]}, active: {type: array, items: {type: integer}, examples: [[1]]}}}}
+  - component: base-model-loader
+    name: load-model
+    kind: function
+    summary: "BaseModelLoader.load_model: build the model on the target device, load its weights, process them (owned by models-layers)."
+    sources: ["vllm/model_executor/model_loader/base_loader.py:62-115"]
+    attributes: {boundary: true, owner: models-layers}
+    request:
+      type: object
+      required: [loader, model, hf_config]
+      properties:
+        loader: {type: string, examples: [default-model-loader]}
+        model: {type: string, examples: [meta-llama/Llama-3.1-8B-Instruct]}
+        hf_config: {type: object}
+    response: {type: object, properties: {model: {type: string}, arch: {type: string}, weights_bytes_per_rank: {type: integer}}}
+  - component: llama-for-causal-lm
+    name: forward
+    kind: function
+    summary: "Model forward over the batch's tokens (owned by models-layers, which models its per-layer latency)."
+    sources: ["vllm/model_executor/models/llama.py"]
+    attributes: {boundary: true, owner: models-layers}
+    request:
+      type: object
+      required: [num_tokens]
+      properties:
+        num_tokens: {type: integer, examples: [16]}
+        num_reqs: {type: integer, examples: [16]}
+        num_prefill_tokens: {type: integer, examples: [16]}
+        num_decode_reqs: {type: integer, examples: [0]}
+    response: {type: object, properties: {hidden_size: {type: integer}, num_layers: {type: integer}, num_tokens: {type: integer}, owner_ms: {type: integer}}}
+    latency_ms: 0
+  - component: llama-for-causal-lm
+    name: compute-logits
+    kind: function
+    summary: "LM head over the sampled rows (owned by models-layers)."
+    sources: ["vllm/model_executor/models/llama.py"]
+    attributes: {boundary: true, owner: models-layers}
+    request: {type: object, required: [num_tokens], properties: {num_tokens: {type: integer, examples: [4]}}}
+    response: {type: object}
+    latency_ms: 0
+  - {component: attention-backend-utils, name: get-supported-kv-cache-layouts, kind: function, summary: "Layouts all given attention backends support, most preferred first (owned by attention).", sources: ["vllm/v1/attention/backends/utils.py:209-245"], attributes: {boundary: true, owner: attention}, request: {type: object}, response: {type: object, properties: {layouts: {type: array, items: {type: string}, examples: [[NHD, HND]]}}}, latency_ms: 0}
+  - {component: attention-backend-utils, name: record-kv-cache-layout, kind: function, summary: "Records the chosen KV cache layout in cache_config (owned by attention).", sources: ["vllm/v1/attention/backends/utils.py:247-260"], attributes: {boundary: true, owner: attention}, request: {type: object, properties: {kv_cache_layout: {type: string, examples: [NHD]}}}, response: {type: object, properties: {ok: {type: boolean, examples: [true]}}}, latency_ms: 0}
+  - component: flash-attention-metadata-builder
+    name: build
+    kind: function
+    summary: "Builds the attention metadata (query_start_loc, seq_lens, block_table, slot_mapping) for one KV cache group (owned by attention)."
+    sources: ["vllm/v1/attention/backends/flash_attn.py"]
+    attributes: {boundary: true, owner: attention}
+    request:
+      type: object
+      properties:
+        num_reqs: {type: integer, examples: [1]}
+        num_tokens: {type: integer, examples: [16]}
+        cg_mode: {type: string, examples: [PIECEWISE]}
+    response: {type: object, properties: {ok: {type: boolean, examples: [true]}}}
+    latency_ms: 0
+
+  - component: executor
+    name: collective-rpc
+    kind: function
+    summary: "Executor.collective_rpc: runs a worker method on every rank (multiproc: a parallel over the ranks with join all) (owned by engine-core)."
+    sources: ["vllm/v1/executor/abstract.py:199-231"]
+    attributes: {boundary: true, owner: engine-core}
+    errors:
+      - {code: timeout-error, status: 0}
+      - {code: runtime-error, status: 0}
+    request:
+      type: object
+      required: [method]
+      properties:
+        method: {type: string, examples: [determine_available_memory]}
+        args: {type: object}
+        timeout_s: {type: ["integer", "null"], default: null}
+        unique_reply_rank: {type: ["integer", "null"], default: null}
+    response: {type: object, properties: {results: {type: array}}}
+  - {component: eplb-state, name: add-model, kind: function, summary: "EplbState.add_model: registers a MoE model's expert layers (owned by distributed).", sources: ["vllm/distributed/eplb/eplb_state.py:362-380"], attributes: {boundary: true, owner: distributed}, request: {type: object, properties: {model: {type: string, examples: [mistralai/Mixtral-8x7B-Instruct-v0.1]}}}, response: {type: object}, latency_ms: 0}
+  - {component: eplb-state, name: start-async-loop, kind: function, summary: "EplbState.start_async_loop: starts the background rebalancing thread (owned by distributed).", sources: ["vllm/distributed/eplb/eplb_state.py:980-990"], attributes: {boundary: true, owner: distributed}, request: {type: object}, response: {type: object}, latency_ms: 0}
+  - component: mixtral-for-causal-lm
+    name: set-eplb-state
+    kind: function
+    summary: "MixtureOfExperts.set_eplb_state: hands every MoE layer the EPLB tensors (owned by models-layers)."
+    sources: ["vllm/model_executor/models/interfaces.py:1039-1072"]
+    attributes: {boundary: true, owner: models-layers}
+    errors: [{code: attribute-error, status: 0, retryable: false}]
+    request:
+      type: object
+      required: [logical_to_physical_map, logical_replica_count]
+      properties:
+        logical_to_physical_map: {type: array, items: {type: array, items: {type: integer}}}
+        logical_replica_count: {type: array, items: {type: integer}}
+    response: {type: object, properties: {registered_layers: {type: integer}}}

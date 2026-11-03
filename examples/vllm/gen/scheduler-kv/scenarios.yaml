@@ -1,0 +1,2969 @@
+scenarios:
+- id: scheduler-kv-add-request-then-schedule
+  name: A new request is admitted and fully prefilled in one step
+  fixtures:
+  - tp1-llama-8b
+  steps:
+  - flow: scheduler-add-request
+    as: add
+    input:
+      request_id: chatcmpl-abc123
+      prompt_token_ids:
+      - 128000
+      - 9906
+      - 1917
+      - 13
+      - 3639
+      - 374
+      - 279
+      - 6864
+      - 315
+      - 9822
+      - 30
+      sampling_params:
+        max_tokens: 16
+      priority: 0
+  - flow: scheduler-schedule
+    as: s1
+    input: {}
+  - interface: kv-cache-manager.get-block-ids
+    caller: engine-core
+    as: table
+    input:
+      request_id: chatcmpl-abc123
+  - interface: scheduler.get-request-counts
+    caller: engine-core
+    as: cnt
+  expect:
+  - steps.table.result.value.block_ids == [1]
+  - steps.add.result.ok && steps.add.result.value.status == 'WAITING' && steps.add.result.value.num_block_hashes == 0
+  - steps.s1.result.value.scheduled_new_reqs.size() == 1 && steps.s1.result.value.scheduled_new_reqs[0].req_id == 'chatcmpl-abc123'
+  - steps.s1.result.value.num_scheduled_tokens['chatcmpl-abc123'] == 11 && steps.s1.result.value.total_num_scheduled_tokens == 11
+  - steps.s1.result.value.scheduled_new_reqs[0].block_ids == [1]
+  - 'steps.cnt.result.value == {''num_running'': 1, ''num_waiting'': 0}'
+  - '// the async placeholder is the point: AsyncScheduler adds one per decoding request
+
+    state.scheduler.requests[''chatcmpl-abc123''].num_output_placeholders == 1 && !state.scheduler.requests[''chatcmpl-abc123''].is_prefill_chunk'
+- id: scheduler-kv-add-request-duplicate-id
+  name: A second request with the same id trips the duplicate assertion
+  fixtures:
+  - tp1-llama-8b
+  steps:
+  - flow: scheduler-add-request
+    as: a1
+    input:
+      request_id: chatcmpl-abc123
+      prompt_token_ids:
+      - 128000
+      - 9906
+  - flow: scheduler-add-request
+    as: a2
+    input:
+      request_id: chatcmpl-abc123
+      prompt_token_ids:
+      - 128000
+      - 9906
+  - interface: scheduler.get-request-counts
+    caller: engine-core
+    as: cnt
+  expect:
+  - steps.a1.result.ok
+  - '!steps.a2.result.ok && steps.a2.result.error.code == ''assertion-error'' && steps.a2.result.error.message == ''duplicate request id'''
+  - steps.cnt.result.value.num_waiting == 1
+  - trace.exists(e, e.type == 'call.end' && e.interface == 'scheduler.get-request-counts' && e.error == null)
+- id: scheduler-kv-schedule-chunked-prefill
+  name: A 200-token prompt prefills in 64-token chunks, then decodes
+  fixtures:
+  - small-batch-limits
+  steps:
+  - flow: scheduler-add-request
+    as: add
+    input:
+      request_id: chatcmpl-long1
+      prompt_segments:
+      - key: doc-long
+        num_tokens: 200
+      sampling_params:
+        max_tokens: 8
+  - flow: scheduler-schedule
+    as: s1
+    input: {}
+  - flow: scheduler-schedule
+    as: s2
+    input: {}
+  - flow: scheduler-schedule
+    as: s3
+    input: {}
+  - flow: scheduler-schedule
+    as: s4
+    input: {}
+  - interface: kv-cache-manager.get-block-ids
+    caller: engine-core
+    as: tbl
+    input:
+      request_id: chatcmpl-long1
+  expect:
+  - steps.s1.result.value.num_scheduled_tokens['chatcmpl-long1'] == 64 && steps.s1.result.value.scheduled_new_reqs.size() == 1
+  - steps.s2.result.value.num_scheduled_tokens['chatcmpl-long1'] == 64 && steps.s2.result.value.scheduled_cached_reqs.req_ids == ['chatcmpl-long1']
+  - steps.s3.result.value.num_scheduled_tokens['chatcmpl-long1'] == 64
+  - steps.s4.result.value.num_scheduled_tokens['chatcmpl-long1'] == 8
+  - steps.s1.result.value.scheduled_new_reqs[0].block_ids == [1, 2, 3, 4] && steps.s2.result.value.scheduled_cached_reqs.new_block_ids == [[5, 6, 7, 8]]
+  - size(steps.tbl.result.value.block_ids) == 13 && trace.exists(e, e.type == 'call.end' && e.interface == 'scheduler.schedule' && e.output.total_num_scheduled_tokens == 8)
+- id: scheduler-kv-partial-prefill-emits-nothing
+  name: The output of a partial prefill chunk produces no EngineCoreOutput
+  fixtures:
+  - small-batch-limits
+  steps:
+  - flow: scheduler-add-request
+    as: add
+    input:
+      request_id: chatcmpl-long1
+      prompt_segments:
+      - key: doc-long
+        num_tokens: 200
+      sampling_params:
+        max_tokens: 8
+  - flow: scheduler-schedule
+    as: s1
+    input: {}
+  - flow: scheduler-update-from-output
+    as: u1
+    input:
+      scheduler_output: = steps.s1.result.value
+      model_runner_output:
+        req_ids:
+        - chatcmpl-long1
+        sampled_token_ids:
+        - []
+  - flow: scheduler-schedule
+    as: s2
+    input: {}
+  expect:
+  - steps.u1.result.ok && steps.u1.result.value.outputs == []
+  - steps.s2.result.value.scheduled_cached_reqs.num_computed_tokens == [64] && trace.exists(e, e.type == 'call.end' && e.interface == 'scheduler.update-from-output' && e.output.outputs == [])
+- id: scheduler-kv-chunked-prefill-off-blocks-long-prompt
+  name: With chunked prefill off, a prompt longer than the token budget is not scheduled
+  fixtures:
+  - small-batch-limits
+  config:
+    enable-chunked-prefill: false
+  steps:
+  - flow: scheduler-add-request
+    as: add
+    input:
+      request_id: chatcmpl-long1
+      prompt_segments:
+      - key: doc-long
+        num_tokens: 200
+  - flow: scheduler-schedule
+    as: s1
+    input: {}
+  - interface: scheduler.get-request-counts
+    caller: engine-core
+    as: cnt
+  expect:
+  - steps.s1.result.value.total_num_scheduled_tokens == 0 && steps.s1.result.value.scheduled_new_reqs == []
+  - 'steps.cnt.result.value == {''num_running'': 0, ''num_waiting'': 1}'
+  - calls['kv-cache-manager.allocate-slots'] == 0
+  - trace.exists(e, e.type == 'call.end' && e.interface == 'scheduler.get-request-counts' && e.error == null)
+- id: scheduler-kv-continuous-batching-budget-and-max-seqs
+  name: Two requests share the 64-token budget; a third waits for a free sequence slot
+  fixtures:
+  - small-batch-limits
+  steps:
+  - flow: scheduler-add-request
+    as: a1
+    input:
+      request_id: chatcmpl-r1
+      prompt_segments:
+      - key: q1
+        num_tokens: 40
+      sampling_params:
+        max_tokens: 4
+  - flow: scheduler-add-request
+    as: a2
+    input:
+      request_id: chatcmpl-r2
+      prompt_segments:
+      - key: q2
+        num_tokens: 40
+      sampling_params:
+        max_tokens: 4
+  - flow: scheduler-add-request
+    as: a3
+    input:
+      request_id: chatcmpl-r3
+      prompt_segments:
+      - key: q3
+        num_tokens: 10
+      sampling_params:
+        max_tokens: 4
+  - flow: scheduler-schedule
+    as: s1
+    input: {}
+  - flow: scheduler-schedule
+    as: s2
+    input: {}
+  - interface: scheduler.get-request-counts
+    caller: engine-core
+    as: cnt
+  expect:
+  - 'steps.s1.result.value.num_scheduled_tokens == {''chatcmpl-r1'': 40, ''chatcmpl-r2'': 24}'
+  - 'steps.s2.result.value.num_scheduled_tokens == {''chatcmpl-r1'': 1, ''chatcmpl-r2'': 16}'
+  - 'steps.cnt.result.value == {''num_running'': 2, ''num_waiting'': 1}'
+  - trace.exists(e, e.type == 'note' && e.title == 'max_num_seqs requests already running')
+- id: scheduler-kv-long-prefill-threshold-caps-chunks
+  name: long_prefill_token_threshold caps each prefill chunk when several requests compete
+  fixtures:
+  - tp1-llama-8b
+  config:
+    long-prefill-token-threshold: 32
+  steps:
+  - flow: scheduler-add-request
+    as: a1
+    input:
+      request_id: chatcmpl-r1
+      prompt_segments:
+      - key: q1
+        num_tokens: 100
+  - flow: scheduler-add-request
+    as: a2
+    input:
+      request_id: chatcmpl-r2
+      prompt_segments:
+      - key: q2
+        num_tokens: 100
+  - flow: scheduler-schedule
+    as: s1
+    input: {}
+  - flow: scheduler-schedule
+    as: s2
+    input: {}
+  expect:
+  - 'steps.s1.result.value.num_scheduled_tokens == {''chatcmpl-r1'': 32, ''chatcmpl-r2'': 32}'
+  - 'steps.s2.result.value.num_scheduled_tokens == {''chatcmpl-r1'': 32, ''chatcmpl-r2'': 32} && trace.exists(e, e.type == ''call.end'' && e.interface == ''scheduler.schedule'' && e.output.total_num_scheduled_tokens == 64)'
+- id: scheduler-kv-async-scheduling-overlaps-decode
+  name: Async scheduling schedules the next decode before the previous output arrives
+  fixtures:
+  - tp1-llama-8b
+  steps:
+  - flow: scheduler-add-request
+    as: add
+    input:
+      request_id: chatcmpl-abc123
+      prompt_token_ids:
+      - 128000
+      - 9906
+      - 1917
+      - 13
+      - 3639
+      - 374
+      - 279
+      - 6864
+      - 315
+      - 9822
+      - 30
+      sampling_params:
+        max_tokens: 16
+  - flow: scheduler-schedule
+    as: s1
+    input: {}
+  - flow: scheduler-schedule
+    as: s2
+    input: {}
+  - flow: scheduler-update-from-output
+    as: u1
+    input:
+      scheduler_output: = steps.s1.result.value
+      model_runner_output:
+        req_ids:
+        - chatcmpl-abc123
+        sampled_token_ids:
+        - - 791
+  expect:
+  - 'steps.s2.result.value.num_scheduled_tokens == {''chatcmpl-abc123'': 1}'
+  - steps.u1.result.value.outputs[0].new_token_ids == [791] && steps.u1.result.value.outputs[0].finish_reason == null
+  - trace.exists(e, e.type == 'call.end' && e.interface == 'scheduler.update-from-output' && size(e.output.outputs) == 1)
+- id: scheduler-kv-sync-scheduling-waits-for-output
+  name: Without async scheduling, nothing is scheduled until the previous output is applied
+  fixtures:
+  - tp1-llama-8b
+  config:
+    async-scheduling: false
+  steps:
+  - flow: scheduler-add-request
+    as: add
+    input:
+      request_id: chatcmpl-abc123
+      prompt_token_ids:
+      - 128000
+      - 9906
+      - 1917
+      - 13
+      - 3639
+      - 374
+      - 279
+      - 6864
+      - 315
+      - 9822
+      - 30
+      sampling_params:
+        max_tokens: 16
+  - flow: scheduler-schedule
+    as: s1
+    input: {}
+  - flow: scheduler-schedule
+    as: s2
+    input: {}
+  - flow: scheduler-update-from-output
+    as: u1
+    input:
+      scheduler_output: = steps.s1.result.value
+      model_runner_output:
+        req_ids:
+        - chatcmpl-abc123
+        sampled_token_ids:
+        - - 791
+  - flow: scheduler-schedule
+    as: s3
+    input: {}
+  expect:
+  - steps.s2.result.value.total_num_scheduled_tokens == 0
+  - 'steps.s3.result.value.num_scheduled_tokens == {''chatcmpl-abc123'': 1}'
+  - trace.exists(e, e.type == 'call.end' && e.interface == 'scheduler.schedule' && e.error == null)
+- id: scheduler-kv-update-eos-finishes-and-frees
+  name: Sampling EOS finishes the request, frees its blocks and reports it to the workers next step
+  fixtures:
+  - tp1-llama-8b
+  steps:
+  - flow: scheduler-add-request
+    as: add
+    input:
+      request_id: chatcmpl-abc123
+      prompt_token_ids:
+      - 128000
+      - 9906
+      - 1917
+      sampling_params:
+        max_tokens: 16
+  - flow: scheduler-schedule
+    as: s1
+    input: {}
+  - flow: scheduler-update-from-output
+    as: u1
+    input:
+      scheduler_output: = steps.s1.result.value
+      model_runner_output:
+        req_ids:
+        - chatcmpl-abc123
+        sampled_token_ids:
+        - - 128009
+  - flow: scheduler-schedule
+    as: s2
+    input: {}
+  - interface: scheduler.get-request-counts
+    caller: engine-core
+    as: cnt
+  expect:
+  - steps.u1.result.value.outputs[0].finish_reason == 'stop' && steps.u1.result.value.outputs[0].new_token_ids == [128009]
+  - steps.s2.result.value.finished_req_ids == ['chatcmpl-abc123']
+  - 'steps.cnt.result.value == {''num_running'': 0, ''num_waiting'': 0}'
+  - trace.exists(e, e.type == 'call.end' && e.interface == 'scheduler.get-request-counts' && e.error == null)
+- id: scheduler-kv-update-max-tokens-length
+  name: Reaching max_tokens finishes with finish_reason length
+  fixtures:
+  - tp1-llama-8b
+  steps:
+  - flow: scheduler-add-request
+    as: add
+    input:
+      request_id: chatcmpl-abc123
+      prompt_token_ids:
+      - 128000
+      - 9906
+      - 1917
+      sampling_params:
+        max_tokens: 1
+  - flow: scheduler-schedule
+    as: s1
+    input: {}
+  - flow: scheduler-update-from-output
+    as: u1
+    input:
+      scheduler_output: = steps.s1.result.value
+      model_runner_output:
+        req_ids:
+        - chatcmpl-abc123
+        sampled_token_ids:
+        - - 791
+  - flow: scheduler-make-stats
+    as: st
+    input: {}
+  expect:
+  - steps.u1.result.value.outputs[0].finish_reason == 'length'
+  - steps.st.result.value.num_running_reqs == 0 && steps.st.result.value.kv_cache_usage == 0.0
+  - trace.exists(e, e.type == 'call.end' && e.interface == 'scheduler.update-from-output' && e.output.finished_req_ids == ['chatcmpl-abc123'])
+- id: scheduler-kv-update-stop-token-id
+  name: A stop token id finishes with stop_reason set to that token
+  fixtures:
+  - tp1-llama-8b
+  steps:
+  - flow: scheduler-add-request
+    as: add
+    input:
+      request_id: chatcmpl-abc123
+      prompt_token_ids:
+      - 128000
+      - 9906
+      - 1917
+      sampling_params:
+        max_tokens: 16
+        stop_token_ids:
+        - 128001
+        - 128008
+  - flow: scheduler-schedule
+    as: s1
+    input: {}
+  - flow: scheduler-update-from-output
+    as: u1
+    input:
+      scheduler_output: = steps.s1.result.value
+      model_runner_output:
+        req_ids:
+        - chatcmpl-abc123
+        sampled_token_ids:
+        - - 128008
+  - interface: scheduler.get-request-counts
+    caller: engine-core
+    as: cnt
+  expect:
+  - steps.u1.result.value.outputs[0].finish_reason == 'stop' && steps.u1.result.value.outputs[0].stop_reason == 128008
+  - steps.cnt.result.value.num_running == 0
+  - trace.exists(e, e.type == 'call.end' && e.interface == 'scheduler.get-request-counts' && e.error == null)
+- id: scheduler-kv-update-ignore-eos-keeps-going
+  name: With ignore_eos the EOS token is just another token
+  fixtures:
+  - tp1-llama-8b
+  steps:
+  - flow: scheduler-add-request
+    as: add
+    input:
+      request_id: chatcmpl-abc123
+      prompt_token_ids:
+      - 128000
+      - 9906
+      - 1917
+      sampling_params:
+        max_tokens: 16
+        ignore_eos: true
+  - flow: scheduler-schedule
+    as: s1
+    input: {}
+  - flow: scheduler-update-from-output
+    as: u1
+    input:
+      scheduler_output: = steps.s1.result.value
+      model_runner_output:
+        req_ids:
+        - chatcmpl-abc123
+        sampled_token_ids:
+        - - 128009
+  - flow: scheduler-schedule
+    as: s2
+    input: {}
+  expect:
+  - steps.u1.result.value.outputs[0].finish_reason == null
+  - steps.s2.result.value.scheduled_cached_reqs.num_output_tokens == [1]
+  - trace.exists(e, e.type == 'call.end' && e.interface == 'scheduler.schedule' && e.error == null)
+- id: scheduler-kv-decode-fills-block-and-caches-it
+  name: A decode token that completes a block hashes it and adds it to the prefix cache
+  fixtures:
+  - tp1-llama-8b
+  steps:
+  - flow: scheduler-add-request
+    as: add
+    input:
+      request_id: chatcmpl-r1
+      prompt_segments:
+      - key: q1
+        num_tokens: 15
+      sampling_params:
+        max_tokens: 8
+  - flow: scheduler-schedule
+    as: s1
+    input: {}
+  - flow: scheduler-update-from-output
+    as: u1
+    input:
+      scheduler_output: = steps.s1.result.value
+      model_runner_output:
+        req_ids:
+        - chatcmpl-r1
+        sampled_token_ids:
+        - - 791
+  - flow: scheduler-schedule
+    as: s2
+    input: {}
+  - interface: block-pool.get-cached-block
+    caller: kv-cache-manager
+    as: look
+    input:
+      block_hash: q1@15+791
+  expect:
+  - 'steps.s2.result.value.num_scheduled_tokens == {''chatcmpl-r1'': 1} && steps.s2.result.value.scheduled_cached_reqs.new_block_ids == [[]]'
+  - steps.look.result.value.block.block_id == 1 && trace.exists(e, e.type == 'call.end' && e.interface == 'block-pool.get-cached-block' && e.output.block != null)
+- id: scheduler-kv-prefix-cache-hit
+  name: A request sharing the cached system prompt computes only its own 40 tokens
+  fixtures:
+  - scheduler-kv-prefix-warm
+  steps:
+  - flow: scheduler-add-request
+    as: add
+    input:
+      request_id: chatcmpl-q1
+      prompt_segments:
+      - key: sys-prompt-v1
+        num_tokens: 1024
+      - key: user-q-1
+        num_tokens: 40
+  - flow: scheduler-schedule
+    as: s1
+    input: {}
+  - flow: scheduler-make-stats
+    as: st
+    input: {}
+  expect:
+  - 'steps.s1.result.value.num_scheduled_tokens == {''chatcmpl-q1'': 40}'
+  - steps.s1.result.value.scheduled_new_reqs[0].num_computed_tokens == 1024
+  - steps.s1.result.value.scheduled_new_reqs[0].block_ids == lists.range(67).map(i, i + 1)
+  - steps.st.result.value.prefix_cache_stats.hits == 1024 && steps.st.result.value.prefix_cache_stats.queries == 1064
+  - trace.exists(e, e.type == 'call.end' && e.interface == 'scheduler.schedule' && e.output.scheduled_new_reqs[0].num_computed_tokens == 1024)
+- id: scheduler-kv-prefix-full-hit-recomputes-last-block
+  name: A prompt that is fully cached still recomputes its last block to get logits
+  fixtures:
+  - scheduler-kv-prefix-warm
+  steps:
+  - flow: scheduler-add-request
+    as: add
+    input:
+      request_id: chatcmpl-q2
+      prompt_segments:
+      - key: sys-prompt-v1
+        num_tokens: 1024
+  - flow: scheduler-schedule
+    as: s1
+    input: {}
+  - interface: block-pool.get-cached-block
+    caller: kv-cache-manager
+    as: b64
+    input:
+      block_hash: sys-prompt-v1@1024
+  expect:
+  - 'steps.s1.result.value.num_scheduled_tokens == {''chatcmpl-q2'': 16}'
+  - steps.s1.result.value.scheduled_new_reqs[0].num_computed_tokens == 1008
+  - steps.s1.result.value.scheduled_new_reqs[0].block_ids[63] == 65
+  - 'steps.b64.result.value.block == {''block_id'': 64, ''ref_cnt'': 0}'
+  - trace.exists(e, e.type == 'call.end' && e.interface == 'block-pool.get-cached-block' && e.error == null)
+- id: scheduler-kv-prefix-caching-off-no-lookup
+  name: With prefix caching off the cached system prompt is ignored and recomputed
+  fixtures:
+  - scheduler-kv-prefix-warm
+  - prefix-caching-off
+  steps:
+  - flow: scheduler-add-request
+    as: add
+    input:
+      request_id: chatcmpl-q1
+      prompt_segments:
+      - key: sys-prompt-v1
+        num_tokens: 1024
+      - key: user-q-1
+        num_tokens: 40
+  - flow: scheduler-schedule
+    as: s1
+    input: {}
+  expect:
+  - 'steps.s1.result.value.num_scheduled_tokens == {''chatcmpl-q1'': 1064}'
+  - steps.s1.result.value.scheduled_new_reqs[0].num_computed_tokens == 0
+  - '// the point: no prefix-cache lookup at all with caching off
+
+    calls[''block-pool.get-cached-block''] == 0'
+  - steps.s1.result.value.scheduled_new_reqs[0].block_ids[0] == 65
+  - trace.exists(e, e.type == 'call.end' && e.interface == 'scheduler.schedule' && e.error == null)
+- id: scheduler-kv-prefix-lru-eviction
+  name: Allocating past the fresh blocks evicts the least recently freed cached blocks, tail block first
+  description: The deployment is launched with --num-gpu-blocks-override 2000 so one request reaches the cached tail.
+  fixtures:
+  - scheduler-kv-prefix-warm
+  config:
+    max-num-batched-tokens: 32768
+    num-gpu-blocks-override: 2000
+  state:
+    block-pool:
+      num_gpu_blocks: 2000
+  steps:
+  - flow: scheduler-add-request
+    as: add
+    input:
+      request_id: chatcmpl-big
+      prompt_segments:
+      - key: big-doc
+        num_tokens: 31000
+  - flow: scheduler-schedule
+    as: s1
+    input: {}
+  - interface: block-pool.get-cached-block
+    caller: kv-cache-manager
+    as: e1
+    input:
+      block_hash: sys-prompt-v1@1024
+  - interface: block-pool.get-cached-block
+    caller: kv-cache-manager
+    as: e2
+    input:
+      block_hash: sys-prompt-v1@992
+  - interface: block-pool.get-cached-block
+    caller: kv-cache-manager
+    as: e3
+    input:
+      block_hash: sys-prompt-v1@976
+  - interface: block-pool.get-num-free-blocks
+    caller: kv-cache-manager
+    as: free
+  expect:
+  - 'steps.s1.result.value.num_scheduled_tokens == {''chatcmpl-big'': 31000}'
+  - steps.e1.result.value.block == null && steps.e2.result.value.block == null && steps.e3.result.value.block != null
+  - steps.free.result.value.num_free_blocks == 61 && trace.exists(e, e.type == 'call.end' && e.interface == 'block-pool.get-cached-block' && e.output.block == null)
+- id: scheduler-kv-preempt-when-kv-full
+  name: A decode that needs a block in a full pool preempts the last running request (itself here)
+  fixtures:
+  - scheduler-kv-nearly-full
+  steps:
+  - flow: scheduler-schedule
+    as: s1
+    input: {}
+  - interface: scheduler.get-request-counts
+    caller: engine-core
+    as: cnt
+  expect:
+  - 'steps.s1.result.value.num_scheduled_tokens == {''chatcmpl-run-a'': 1}'
+  - steps.s1.result.value.preempted_req_ids == ['chatcmpl-run-b']
+  - steps.s1.result.value.scheduled_cached_reqs.new_block_ids == [[63]]
+  - '// preemption resets the victim for recompute; the request record is the point
+
+    state.scheduler.requests[''chatcmpl-run-b''].status == ''PREEMPTED'' && state.scheduler.requests[''chatcmpl-run-b''].num_computed_tokens == 0 && state.scheduler.requests[''chatcmpl-run-b''].num_preemptions == 1'
+  - 'steps.cnt.result.value == {''num_running'': 1, ''num_waiting'': 2}'
+  - trace.exists(e, e.type == 'note' && e.title == 'Preemption this step; no waiting request is admitted')
+- id: scheduler-kv-preempted-request-resumes-from-prefix-cache
+  name: After room frees up, the preempted request resumes and recomputes only its last token thanks to its cached blocks
+  fixtures:
+  - scheduler-kv-nearly-full
+  steps:
+  - flow: scheduler-schedule
+    as: s1
+    input: {}
+  - flow: scheduler-finish-requests
+    as: abort
+    input:
+      request_ids:
+      - chatcmpl-run-a
+  - flow: scheduler-schedule
+    as: s2
+    input: {}
+  expect:
+  - steps.abort.result.value.finished == ['chatcmpl-run-a']
+  - steps.s2.result.value.scheduled_new_reqs.map(r, r.req_id) == ['chatcmpl-wait-c', 'chatcmpl-run-b']
+  - 'steps.s2.result.value.num_scheduled_tokens == {''chatcmpl-run-b'': 1, ''chatcmpl-wait-c'': 100}'
+  - steps.s2.result.value.scheduled_new_reqs[1].num_computed_tokens == 496 && steps.s2.result.value.scheduled_new_reqs[1].block_ids.size() == 32
+  - steps.s2.result.value.finished_req_ids == ['chatcmpl-run-a']
+  - trace.exists(e, e.type == 'call.end' && e.interface == 'scheduler.schedule' && e.error == null)
+- id: scheduler-kv-priority-preempts-lowest-priority
+  name: Under the priority policy the lowest-priority running request is preempted and its tokens returned to the budget
+  fixtures:
+  - scheduler-kv-nearly-full
+  config:
+    scheduling-policy: priority
+  state:
+    scheduler:
+      requests:
+        chatcmpl-run-a:
+          priority: 5
+        chatcmpl-run-b:
+          priority: 0
+  steps:
+  - flow: scheduler-schedule
+    as: s1
+    input: {}
+  - interface: scheduler.get-request-counts
+    caller: engine-core
+    as: cnt
+  expect:
+  - 'steps.s1.result.value.num_scheduled_tokens == {''chatcmpl-run-b'': 1}'
+  - steps.s1.result.value.preempted_req_ids == ['chatcmpl-run-a']
+  - 'steps.cnt.result.value == {''num_running'': 1, ''num_waiting'': 2}'
+  - trace.exists(e, e.type == 'note' && e.title == 'Give back the victim\'s tokens scheduled earlier this step')
+- id: scheduler-kv-priority-admission-order
+  name: Under the priority policy a later high-priority request is admitted before an earlier low-priority one
+  fixtures:
+  - tp1-llama-8b
+  config:
+    scheduling-policy: priority
+    max-num-seqs: 1
+  steps:
+  - flow: scheduler-add-request
+    as: lo
+    input:
+      request_id: chatcmpl-low
+      prompt_token_ids:
+      - 128000
+      - 1
+      priority: 10
+  - flow: scheduler-add-request
+    as: hi
+    at_ms: 5
+    input:
+      request_id: chatcmpl-high
+      prompt_token_ids:
+      - 128000
+      - 2
+      priority: 0
+  - flow: scheduler-schedule
+    as: s1
+    input: {}
+  - interface: scheduler.get-request-counts
+    caller: engine-core
+    as: cnt
+  expect:
+  - steps.s1.result.value.scheduled_new_reqs.map(r, r.req_id) == ['chatcmpl-high']
+  - steps.cnt.result.value.num_waiting == 1
+  - calls['priority-request-queue.peek-request'] == 1 && calls['fcfs-request-queue.peek-request'] == 0
+  - trace.exists(e, e.type == 'call.end' && e.interface == 'scheduler.get-request-counts' && e.error == null)
+- id: scheduler-kv-fcfs-admission-order
+  name: Under FCFS the earlier request is admitted first whatever its priority
+  fixtures:
+  - tp1-llama-8b
+  config:
+    max-num-seqs: 1
+  steps:
+  - flow: scheduler-add-request
+    as: lo
+    input:
+      request_id: chatcmpl-low
+      prompt_token_ids:
+      - 128000
+      - 1
+      priority: 10
+  - flow: scheduler-add-request
+    as: hi
+    at_ms: 5
+    input:
+      request_id: chatcmpl-high
+      prompt_token_ids:
+      - 128000
+      - 2
+      priority: 0
+  - flow: scheduler-schedule
+    as: s1
+    input: {}
+  - interface: scheduler.get-request-counts
+    caller: engine-core
+    as: cnt
+  expect:
+  - steps.s1.result.value.scheduled_new_reqs.map(r, r.req_id) == ['chatcmpl-low']
+  - steps.cnt.result.value.num_waiting == 1 && trace.exists(e, e.type == 'call.end' && e.interface == 'scheduler.schedule' && e.output.scheduled_new_reqs.size() == 1)
+- id: scheduler-kv-reserve-full-isl-refuses-admission
+  name: A prompt whose full length doesn't fit is not admitted even though its first chunk would
+  fixtures:
+  - scheduler-kv-nearly-full
+  config:
+    max-num-batched-tokens: 64
+  steps:
+  - flow: scheduler-finish-requests
+    as: abort
+    input:
+      request_ids:
+      - chatcmpl-run-b
+      - chatcmpl-wait-c
+  - flow: scheduler-add-request
+    as: add
+    input:
+      request_id: chatcmpl-big
+      prompt_segments:
+      - key: doc-big
+        num_tokens: 600
+  - flow: scheduler-schedule
+    as: s1
+    input: {}
+  - interface: scheduler.get-request-counts
+    caller: engine-core
+    as: cnt
+  expect:
+  - 'steps.s1.result.value.num_scheduled_tokens == {''chatcmpl-run-a'': 1}'
+  - 'steps.cnt.result.value == {''num_running'': 1, ''num_waiting'': 1}'
+  - trace.exists(e, e.type == 'note' && e.title == 'The whole prompt would not fit; refuse admission')
+- id: scheduler-kv-reserve-full-isl-off-admits-first-chunk
+  name: With scheduler_reserve_full_isl off the same prompt is admitted on its first chunk
+  fixtures:
+  - scheduler-kv-nearly-full
+  config:
+    max-num-batched-tokens: 64
+    scheduler-reserve-full-isl: false
+  steps:
+  - flow: scheduler-finish-requests
+    as: abort
+    input:
+      request_ids:
+      - chatcmpl-run-b
+      - chatcmpl-wait-c
+  - flow: scheduler-add-request
+    as: add
+    input:
+      request_id: chatcmpl-big
+      prompt_segments:
+      - key: doc-big
+        num_tokens: 600
+  - flow: scheduler-schedule
+    as: s1
+    input: {}
+  - interface: scheduler.get-request-counts
+    caller: engine-core
+    as: cnt
+  expect:
+  - 'steps.s1.result.value.num_scheduled_tokens == {''chatcmpl-run-a'': 1, ''chatcmpl-big'': 63}'
+  - 'steps.cnt.result.value == {''num_running'': 2, ''num_waiting'': 0}'
+  - trace.exists(e, e.type == 'call.end' && e.interface == 'scheduler.get-request-counts' && e.error == null)
+- id: scheduler-kv-abort-frees-and-reports
+  name: Aborting a running request frees its blocks; an unknown id is ignored
+  fixtures:
+  - tp1-llama-8b
+  steps:
+  - flow: scheduler-add-request
+    as: add
+    input:
+      request_id: chatcmpl-abc123
+      prompt_token_ids:
+      - 128000
+      - 9906
+      - 1917
+  - flow: scheduler-schedule
+    as: s1
+    input: {}
+  - flow: scheduler-finish-requests
+    as: abort
+    input:
+      request_ids:
+      - chatcmpl-abc123
+      - chatcmpl-nope
+  - flow: scheduler-schedule
+    as: s2
+    input: {}
+  - interface: scheduler.get-request-counts
+    caller: engine-core
+    as: cnt
+  expect:
+  - steps.abort.result.value.finished == ['chatcmpl-abc123']
+  - steps.s2.result.value.finished_req_ids == ['chatcmpl-abc123'] && steps.s2.result.value.total_num_scheduled_tokens == 0
+  - 'steps.cnt.result.value == {''num_running'': 0, ''num_waiting'': 0} && trace.exists(e, e.type == ''call.end'' && e.interface == ''scheduler.finish-requests'' && e.output.finished == [''chatcmpl-abc123''])'
+- id: scheduler-kv-abort-waiting-request
+  name: Aborting a waiting request removes it from the queue before it ever runs
+  fixtures:
+  - tp1-llama-8b
+  steps:
+  - flow: scheduler-add-request
+    as: add
+    input:
+      request_id: chatcmpl-abc123
+      prompt_token_ids:
+      - 128000
+      - 9906
+      - 1917
+  - flow: scheduler-finish-requests
+    as: abort
+    input:
+      request_ids:
+      - chatcmpl-abc123
+  - flow: scheduler-schedule
+    as: s1
+    input: {}
+  - interface: scheduler.get-request-counts
+    caller: engine-core
+    as: cnt
+  expect:
+  - steps.abort.result.value.finished == ['chatcmpl-abc123']
+  - steps.s1.result.value.scheduled_new_reqs == [] && steps.s1.result.value.finished_req_ids == ['chatcmpl-abc123']
+  - steps.cnt.result.value.num_waiting == 0
+  - trace.exists(e, e.type == 'call.end' && e.interface == 'scheduler.get-request-counts' && e.error == null)
+- id: scheduler-kv-output-after-abort-is-dropped
+  name: Output that arrives for a request aborted mid-step is skipped
+  fixtures:
+  - tp1-llama-8b
+  steps:
+  - flow: scheduler-add-request
+    as: add
+    input:
+      request_id: chatcmpl-abc123
+      prompt_token_ids:
+      - 128000
+      - 9906
+      - 1917
+  - flow: scheduler-schedule
+    as: s1
+    input: {}
+  - flow: scheduler-finish-requests
+    as: abort
+    input:
+      request_ids:
+      - chatcmpl-abc123
+  - flow: scheduler-update-from-output
+    as: u1
+    input:
+      scheduler_output: = steps.s1.result.value
+      model_runner_output:
+        req_ids:
+        - chatcmpl-abc123
+        sampled_token_ids:
+        - - 791
+  expect:
+  - steps.u1.result.ok && steps.u1.result.value.outputs == []
+  - trace.exists(e, e.type == 'note' && e.title == 'Finished or aborted while the model ran; skip')
+- id: scheduler-kv-reset-prefix-cache-then-miss
+  name: Resetting an idle prefix cache drops every hash, so the next request misses
+  fixtures:
+  - scheduler-kv-prefix-warm
+  steps:
+  - flow: scheduler-reset-prefix-cache
+    as: r
+    input: {}
+  - flow: scheduler-add-request
+    as: add
+    input:
+      request_id: chatcmpl-q1
+      prompt_segments:
+      - key: sys-prompt-v1
+        num_tokens: 1024
+      - key: user-q-1
+        num_tokens: 40
+  - flow: scheduler-schedule
+    as: s1
+    input: {}
+  - flow: scheduler-make-stats
+    as: st
+    input: {}
+  expect:
+  - steps.r.result.value.reset
+  - 'steps.s1.result.value.num_scheduled_tokens == {''chatcmpl-q1'': 1064}'
+  - steps.st.result.value.prefix_cache_stats.reset && steps.st.result.value.prefix_cache_stats.hits == 0
+  - trace.exists(e, e.type == 'call.end' && e.interface == 'scheduler.make-stats' && e.error == null)
+- id: scheduler-kv-reset-prefix-cache-refused-while-running
+  name: The reset is refused while running requests hold blocks
+  fixtures:
+  - scheduler-kv-nearly-full
+  steps:
+  - flow: scheduler-reset-prefix-cache
+    as: r
+    input: {}
+  - flow: scheduler-make-stats
+    as: st
+    input: {}
+  expect:
+  - '!steps.r.result.value.reset'
+  - steps.st.result.value.num_running_reqs == 2 && steps.st.result.value.kv_cache_usage > 0.9 && trace.exists(e, e.type == 'call.end' && e.interface == 'scheduler.reset-prefix-cache' && !e.output.reset)
+- id: scheduler-kv-reset-prefix-cache-preempts-running
+  name: With reset_running_requests every running request is preempted (FIFO kept) and the reset succeeds
+  fixtures:
+  - scheduler-kv-nearly-full
+  steps:
+  - flow: scheduler-reset-prefix-cache
+    as: r
+    input:
+      reset_running_requests: true
+  - flow: scheduler-make-stats
+    as: st
+    input: {}
+  - interface: scheduler.get-request-counts
+    caller: engine-core
+    as: cnt
+  expect:
+  - steps.r.result.value.reset
+  - 'steps.cnt.result.value == {''num_running'': 0, ''num_waiting'': 3}'
+  - steps.st.result.value.kv_cache_usage == 0.0 && trace.exists(e, e.type == 'call.end' && e.interface == 'scheduler.reset-prefix-cache' && e.output.reset)
+- id: scheduler-kv-make-stats-resets-prefix-stats
+  name: make_stats hands out the prefix-cache stats once and starts a new window
+  fixtures:
+  - scheduler-kv-prefix-warm
+  steps:
+  - flow: scheduler-add-request
+    as: add
+    input:
+      request_id: chatcmpl-q1
+      prompt_segments:
+      - key: sys-prompt-v1
+        num_tokens: 1024
+      - key: user-q-1
+        num_tokens: 40
+  - flow: scheduler-schedule
+    as: s1
+    input: {}
+  - flow: scheduler-make-stats
+    as: st1
+    input: {}
+  - flow: scheduler-make-stats
+    as: st2
+    input: {}
+  - flow: scheduler-add-request
+    as: add2
+    input:
+      request_id: chatcmpl-q2
+      prompt_segments:
+      - key: sys-prompt-v1
+        num_tokens: 1024
+      - key: user-q-2
+        num_tokens: 8
+  - flow: scheduler-schedule
+    as: s2
+    input: {}
+  - interface: scheduler.get-request-counts
+    caller: engine-core
+    as: counts
+  - flow: scheduler-make-stats
+    as: st3
+    input: {}
+  expect:
+  - steps.st1.result.value.prefix_cache_stats.requests == 1 && steps.st2.result.value.prefix_cache_stats.requests == 0
+  - steps.st2.result.value.num_running_reqs == 1 && steps.st2.result.value.kv_cache_usage > 0.002
+  - steps.st3.result.value.prefix_cache_stats.requests == 1 && steps.st3.result.value.prefix_cache_stats.hits == 1024 && steps.st3.result.value.prefix_cache_stats.queries == 1032
+  - steps.counts.result.value.num_running == 2 && steps.counts.result.value.num_waiting == 0
+  - trace.exists(e, e.type == 'call.end' && e.interface == 'scheduler.make-stats' && e.error == null)
+- id: scheduler-kv-get-new-blocks-exhausted
+  name: Asking the pool for more blocks than are free raises ValueError
+  fixtures:
+  - scheduler-kv-nearly-full
+  steps:
+  - interface: block-pool.get-new-blocks
+    caller: kv-cache-manager
+    as: g
+    input:
+      num_blocks: 2
+  expect:
+  - '!steps.g.result.ok && steps.g.result.error.code == ''value-error'''
+  - trace.exists(e, e.type == 'call.end' && e.interface == 'block-pool.get-new-blocks' && e.error.code == 'value-error')
+- id: scheduler-kv-allocate-slots-nothing-to-do
+  name: allocate_slots with no new and no computed tokens raises ValueError
+  fixtures:
+  - tp1-llama-8b
+  steps:
+  - interface: kv-cache-manager.allocate-slots
+    caller: scheduler
+    as: a
+    input:
+      request_id: chatcmpl-abc123
+      num_new_tokens: 0
+  expect:
+  - '!steps.a.result.ok && steps.a.result.error.code == ''value-error'''
+  - trace.exists(e, e.type == 'call.end' && e.interface == 'kv-cache-manager.allocate-slots' && e.error != null)
+- id: scheduler-kv-preempt-non-running-asserts
+  name: Preempting a request that isn't running is an assertion error
+  fixtures:
+  - scheduler-kv-nearly-full
+  steps:
+  - interface: scheduler.preempt-request
+    caller: scheduler
+    as: p
+    input:
+      request_id: chatcmpl-wait-c
+  - interface: scheduler.get-request-counts
+    caller: engine-core
+    as: cnt
+  expect:
+  - '!steps.p.result.ok && steps.p.result.error.code == ''assertion-error'''
+  - 'steps.cnt.result.value == {''num_running'': 2, ''num_waiting'': 1}'
+- id: scheduler-kv-peek-empty-queues
+  name: Peeking an empty waiting queue raises IndexError under both policies
+  fixtures:
+  - tp1-llama-8b
+  steps:
+  - interface: fcfs-request-queue.peek-request
+    caller: scheduler
+    as: f
+    input:
+      queue: []
+  - interface: priority-request-queue.peek-request
+    caller: scheduler
+    as: p
+    input:
+      queue: []
+  expect:
+  - steps.f.result.error.code == 'index-error' && steps.p.result.error.code == 'index-error'
+- id: scheduler-kv-structured-output-grammar-rejects-token
+  name: A token the grammar can't accept terminates the request with an error
+  fixtures:
+  - tp1-llama-8b
+  steps:
+  - flow: structured-output-grammar-init
+    as: g
+    input:
+      request_id: chatcmpl-json1
+      backend: xgrammar
+      request_type: json
+      grammar_spec: '{"type": "string"}'
+      stop_token_ids:
+      - 128009
+  - flow: scheduler-add-request
+    as: add
+    input:
+      request_id: chatcmpl-json1
+      prompt_token_ids:
+      - 128000
+      - 9906
+      grammar_id: chatcmpl-json1
+  - flow: scheduler-schedule
+    as: s1
+    input: {}
+  - flow: scheduler-update-from-output
+    as: u1
+    input:
+      scheduler_output: = steps.s1.result.value
+      model_runner_output:
+        req_ids:
+        - chatcmpl-json1
+        sampled_token_ids:
+        - - 55
+  - interface: scheduler.get-request-counts
+    caller: engine-core
+    as: cnt
+  expect:
+  - steps.g.result.value.status == 'ready'
+  - steps.u1.result.value.outputs[0].finish_reason == 'error'
+  - steps.cnt.result.value.num_running == 0
+  - trace.exists(e, e.type == 'call.end' && e.interface == 'scheduler.get-request-counts' && e.error == null)
+- id: scheduler-kv-structured-output-grammar-accepts
+  name: Accepted tokens advance the request's grammar
+  fixtures:
+  - tp1-llama-8b
+  steps:
+  - flow: structured-output-grammar-init
+    as: g
+    input:
+      request_id: chatcmpl-json1
+      backend: xgrammar
+      request_type: json
+      grammar_spec: '{"type": "string"}'
+      stop_token_ids:
+      - 128009
+  - flow: scheduler-add-request
+    as: add
+    input:
+      request_id: chatcmpl-json1
+      prompt_token_ids:
+      - 128000
+      - 9906
+      grammar_id: chatcmpl-json1
+  - flow: scheduler-schedule
+    as: s1
+    input: {}
+  - flow: scheduler-update-from-output
+    as: u1
+    input:
+      scheduler_output: = steps.s1.result.value
+      model_runner_output:
+        req_ids:
+        - chatcmpl-json1
+        sampled_token_ids:
+        - - 1
+  - interface: xgrammar-grammar.fill-bitmask
+    caller: structured-output-manager
+    as: bm
+    input:
+      grammar_id: chatcmpl-json1
+      token_ids:
+      - 55
+      - 128009
+  expect:
+  - steps.u1.result.value.outputs[0].finish_reason == null
+  - 'steps.bm.result.value.allowed == {''55'': true, ''128009'': false}'
+  - trace.exists(e, e.type == 'call.end' && e.interface == 'xgrammar-grammar.fill-bitmask' && e.error == null)
+- id: scheduler-kv-structured-output-unsupported-backend
+  name: An unknown structured-output backend is a ValueError
+  fixtures:
+  - tp1-llama-8b
+  steps:
+  - flow: structured-output-grammar-init
+    as: g
+    input:
+      request_id: chatcmpl-json1
+      backend: bogus
+      request_type: json
+      grammar_spec: '{}'
+  expect:
+  - '!steps.g.result.ok && steps.g.result.error.code == ''value-error'''
+  - trace.exists(e, e.type == 'call.end' && e.interface == 'structured-output-manager.grammar-init' && e.error.code == 'value-error')
+- id: oracle-build-scheduler-kv-3
+  name: 'test_request_stop_tokens_gated_to_grammar_terminal: request stop tokens are masked until the grammar can end'
+  description: 'tests/v1/structured_output/test_backend_xgrammar_stop_tokens.py:44. gpt2 tokenizer: EOS 50256, quote 1, letter 55.'
+  fixtures:
+  - tp1-llama-8b
+  state:
+    xgrammar-backend:
+      tokenizer_eos_token_id: 50256
+  steps:
+  - interface: xgrammar-backend.compile-grammar
+    caller: structured-output-manager
+    as: cd
+    input:
+      grammar_id: g-default
+      request_type: json
+      grammar_spec: '{"type": "string"}'
+  - interface: xgrammar-backend.compile-grammar
+    caller: structured-output-manager
+    as: co
+    input:
+      grammar_id: g-override
+      request_type: json
+      grammar_spec: '{"type": "string"}'
+      stop_token_ids:
+      - 50256
+      - 55
+  - interface: xgrammar-grammar.accept-tokens
+    caller: structured-output-manager
+    as: ad1
+    input:
+      grammar_id: g-default
+      tokens:
+      - 1
+  - interface: xgrammar-grammar.accept-tokens
+    caller: structured-output-manager
+    as: ao1
+    input:
+      grammar_id: g-override
+      tokens:
+      - 1
+  - interface: xgrammar-grammar.fill-bitmask
+    caller: structured-output-manager
+    as: bd1
+    input:
+      grammar_id: g-default
+      token_ids:
+      - 55
+      - 50256
+  - interface: xgrammar-grammar.fill-bitmask
+    caller: structured-output-manager
+    as: bo1
+    input:
+      grammar_id: g-override
+      token_ids:
+      - 55
+      - 50256
+  - interface: xgrammar-grammar.accept-tokens
+    caller: structured-output-manager
+    as: ad2
+    input:
+      grammar_id: g-default
+      tokens:
+      - 1
+  - interface: xgrammar-grammar.accept-tokens
+    caller: structured-output-manager
+    as: ao2
+    input:
+      grammar_id: g-override
+      tokens:
+      - 1
+  - interface: xgrammar-grammar.is-terminated
+    caller: structured-output-manager
+    as: td
+    input:
+      grammar_id: g-default
+  - interface: xgrammar-grammar.is-terminated
+    caller: structured-output-manager
+    as: to
+    input:
+      grammar_id: g-override
+  - interface: xgrammar-grammar.fill-bitmask
+    caller: structured-output-manager
+    as: bd2
+    input:
+      grammar_id: g-default
+      token_ids:
+      - 55
+      - 50256
+  - interface: xgrammar-grammar.fill-bitmask
+    caller: structured-output-manager
+    as: bo2
+    input:
+      grammar_id: g-override
+      token_ids:
+      - 55
+      - 50256
+  expect:
+  - steps.ad1.result.value.accepted && steps.ao1.result.value.accepted
+  - steps.bd1.result.value.allowed['55'] && !steps.bo1.result.value.allowed['55']
+  - steps.ad2.result.value.accepted && steps.ao2.result.value.accepted
+  - '!steps.td.result.value.terminated && !steps.to.result.value.terminated'
+  - '!steps.bd2.result.value.allowed[''55''] && steps.bo2.result.value.allowed[''55'']'
+  - steps.bd2.result.value.allowed['50256'] && steps.bo2.result.value.allowed['50256']
+  - steps.cd.result.value.override_stop_tokens == [50256] && steps.co.result.value.override_stop_tokens == [50256, 55] && trace.exists(e, e.type == 'call.end' && e.interface == 'xgrammar-backend.compile-grammar' && e.output.grammar_id == 'g-override')
+- id: oracle-build-scheduler-kv-2
+  name: 'test_create_next_worker_view_shape_and_stride: the worker view has shape (num_chunks, page) and stride (cpu_page_size * num_workers, 1)'
+  description: tests/v1/kv_offload/cpu/test_shared_offload_region.py:252. One worker, 4 chunks, cpu_page_size 2 pages, PAGE_SIZE 4096.
+  fixtures:
+  - tp1-llama-8b
+  steps:
+  - interface: shared-offload-region.init
+    caller: kv-offload
+    as: init
+    input:
+      num_chunks: 4
+      rank: 0
+      kv_bytes_per_chunk: 8192
+      cpu_page_size: 8192
+  - flow: kv-offload-worker-view
+    as: v
+    input:
+      tensor_page_size: 4096
+  - interface: shared-offload-region.create-kv-memoryview
+    caller: kv-offload
+    as: mv
+    input: {}
+  expect:
+  - steps.v.result.value.shape == [4, 4096]
+  - steps.v.result.value.stride == [8192, 1]
+  - steps.mv.result.value.shape == [4, 8192] && steps.mv.result.value.num_views == 1
+  - steps.v.result.value.storage_offset == 0 && trace.exists(e, e.type == 'call.end' && e.interface == 'shared-offload-region.create-kv-memoryview' && e.output.num_views == 1)
+- id: kv-offload-worker-view-overflow
+  name: A view past the worker's slot fails the overflow assertion
+  fixtures:
+  - tp1-llama-8b
+  steps:
+  - interface: shared-offload-region.init
+    caller: kv-offload
+    as: init
+    input:
+      num_chunks: 4
+      rank: 1
+      kv_bytes_per_chunk: 8192
+      cpu_page_size: 4096
+  - flow: kv-offload-worker-view
+    as: v1
+    input:
+      tensor_page_size: 4096
+  - flow: kv-offload-worker-view
+    as: v2
+    input:
+      tensor_page_size: 4096
+  expect:
+  - steps.v1.result.value.storage_offset == 4096 && steps.v1.result.value.stride == [8192, 1]
+  - '!steps.v2.result.ok && steps.v2.result.error.code == ''assertion-error'''
+  - steps.v2.result.error.message.contains('exceeds worker area end 8192') && trace.exists(e, e.type == 'call.end' && e.interface == 'shared-offload-region.create-next-worker-view' && e.output.storage_offset == 4096)
+- id: kv-offload-region-init-unaligned
+  name: A row size that isn't page aligned fails the alignment assertion; a ranked view needs a rank
+  fixtures:
+  - tp1-llama-8b
+  steps:
+  - interface: shared-offload-region.init
+    caller: kv-offload
+    as: bad
+    input:
+      num_chunks: 4
+      rank: 0
+      kv_bytes_per_chunk: 5000
+      cpu_page_size: 5000
+  - interface: shared-offload-region.init
+    caller: kv-offload
+    as: nobarrier
+    input:
+      num_chunks: 4
+      rank: 0
+      kv_bytes_per_chunk: 8192
+      cpu_page_size: 8192
+      populate_only_on_creator: true
+      has_barrier: false
+  - interface: shared-offload-region.init
+    caller: kv-offload
+    as: norank
+    input:
+      num_chunks: 4
+      rank: null
+      kv_bytes_per_chunk: 8192
+      cpu_page_size: 8192
+  - flow: kv-offload-worker-view
+    as: v
+    input:
+      tensor_page_size: 4096
+  expect:
+  - steps.bad.result.error.code == 'assertion-error' && steps.nobarrier.result.error.code == 'value-error'
+  - '!steps.v.result.ok && steps.v.result.error.code == ''assertion-error'''
+  - trace.exists(e, e.type == 'call.start' && e.interface == 'shared-offload-region.init' && e.input.rank == null)
+- id: kv-offload-pin-region-in-chunks
+  name: A 150 GiB region is pinned in three row-aligned chunks of at most 64 GiB
+  fixtures:
+  - tp1-llama-8b
+  steps:
+  - flow: kv-offload-pin-mmap-region
+    as: pin
+    input:
+      base_ptr: 140000000000
+      total_size: 161061273600
+      row_stride: 2097152
+  - interface: host-register.host-unregister
+    caller: kv-offload
+    as: un
+    input:
+      ptr: 140000000000
+  expect:
+  - steps.pin.result.value.is_pinned && size(steps.pin.result.value.pinned_addresses) == 3
+  - steps.un.result.value.unregistered && trace.exists(e, e.type == 'call.end' && e.interface == 'host-register.host-unregister' && e.output.unregistered)
+  - steps.pin.result.value.pinned_addresses == [140000000000, 208719476736, 277438953472]
+- id: kv-offload-pin-region-rollback
+  name: When the driver refuses a later chunk, the pinned chunks are unregistered and the region stays pageable
+  fixtures:
+  - tp1-llama-8b
+  state:
+    host-register:
+      pinnable_bytes: 107374182400
+  steps:
+  - flow: kv-offload-pin-mmap-region
+    as: pin
+    input:
+      base_ptr: 140000000000
+      total_size: 161061273600
+      row_stride: 2097152
+  - interface: host-register.host-unregister
+    caller: kv-offload
+    as: un
+    input:
+      ptr: 0
+  expect:
+  - '!steps.pin.result.value.is_pinned && steps.pin.result.value.pinned_addresses == []'
+  - trace.exists(e, e.type == 'call.end' && e.interface == 'host-register.host-unregister' && !e.output.unregistered) && trace.exists(e, e.type == 'call.end' && e.interface == 'kv-offload-cpu-gpu-worker.pin-mmap-region' && !e.output.is_pinned)
+  - '!steps.un.result.value.unregistered'
+- id: kv-offload-pin-region-other-platform
+  name: On a platform without host registration the region stays pageable
+  fixtures:
+  - tp1-llama-8b
+  choices:
+    host-register.host-register.platform: other
+  steps:
+  - flow: kv-offload-pin-mmap-region
+    as: pin
+    input:
+      base_ptr: 140000000000
+      total_size: 2097152
+      row_stride: 2097152
+  - interface: host-register.host-register
+    caller: kv-offload
+    as: zero
+    input:
+      ptr: 0
+      num_bytes: 10
+  expect:
+  - '!steps.pin.result.value.is_pinned && !steps.zero.result.value.registered'
+  - trace.exists(e, e.type == 'call.end' && e.interface == 'kv-offload-cpu-gpu-worker.pin-mmap-region' && !e.output.is_pinned)
+- id: kv-offload-pin-region-xpu
+  name: On XPU registration goes through the xpu_host_register op
+  fixtures:
+  - tp1-llama-8b
+  choices:
+    host-register.host-register.platform: xpu
+    host-register.host-unregister.platform: xpu
+  steps:
+  - flow: kv-offload-pin-mmap-region
+    as: pin
+    input:
+      base_ptr: 140000000000
+      total_size: 2097152
+      row_stride: 2097152
+  - interface: host-register.host-unregister
+    caller: kv-offload
+    as: un
+    input:
+      ptr: 140000000000
+  expect:
+  - steps.pin.result.value.is_pinned && calls['vllm-xpu-kernels.xpu-host-register'] == 1 && calls['vllm-xpu-kernels.xpu-host-unregister'] == 1
+  - io.exists(c, c.interface == 'vllm-xpu-kernels.xpu-host-register') && trace.exists(e, e.type == 'call.end' && e.interface == 'host-register.host-unregister' && e.output.unregistered)
+- id: kv-offload-swap-blocks-paths
+  name: Small batches use the C++ DMA op; 16 or more descriptors launch the Triton kernel
+  fixtures:
+  - tp1-llama-8b
+  steps:
+  - flow: kv-offload-swap-blocks
+    as: small
+    input:
+      num_descriptors: 8
+      bytes_per_descriptor: 16384
+  - flow: kv-offload-swap-blocks
+    as: big
+    input:
+      num_descriptors: 64
+      bytes_per_descriptor: 16384
+  expect:
+  - steps.small.result.value.path == 'dma' && steps.big.result.value.path == 'triton'
+  - trace.exists(e, e.type == 'call.end' && e.interface == 'swap-blocks-triton.swap-blocks-batch' && e.output.path == 'dma')
+  - trace.exists(e, e.type == 'call.end' && e.interface == 'swap-blocks-triton.swap-blocks-batch' && e.output.path == 'triton')
+- id: kv-offload-dma-copy-loop-drains-queue
+  name: The copy thread runs queued copies in order, records their events, and exits on the sentinel
+  fixtures:
+  - tp1-llama-8b
+  steps:
+  - interface: dma-copy-backend.launch-copy
+    caller: kv-offload
+    as: l1
+    input:
+      src_blocks:
+      - 5
+      - 6
+      - 7
+      dst_blocks:
+      - 0
+      - 1
+      - 2
+      is_store: true
+      event_idx: 1
+  - interface: dma-copy-backend.launch-copy
+    caller: kv-offload
+    as: l2
+    input:
+      src_blocks:
+      - 0
+      dst_blocks:
+      - 9
+      is_store: false
+      event_idx: 2
+  - interface: dma-copy-backend.shutdown
+    caller: kv-offload
+    as: sd
+  - interface: dma-copy-backend.shutdown
+    caller: kv-offload
+    as: sd2
+  - flow: kv-offload-dma-copy-loop
+    as: loop1
+  - flow: kv-offload-dma-copy-loop
+    as: loop2
+  - flow: kv-offload-dma-copy-loop
+    as: loop3
+  - flow: kv-offload-dma-copy-loop
+    as: loop4
+  - interface: dma-copy-backend.launch-copy
+    caller: kv-offload
+    as: l3
+    input:
+      src_blocks:
+      - 1
+      dst_blocks:
+      - 1
+      is_store: true
+      event_idx: 3
+  expect:
+  - trace.exists(e, e.type == 'call.end' && e.interface == 'dma-copy-backend.copy-loop' && e.output.did == 'exited')
+  - steps.loop1.result.value.did == 'store' && steps.loop2.result.value.did == 'load' && steps.loop3.result.value.did == 'exited' && steps.loop4.result.value.did == 'exited'
+  - steps.sd2.result.value.queued == 3
+- id: kv-offload-dma-copy-loop-idle
+  name: With nothing queued the copy thread just waits
+  fixtures:
+  - tp1-llama-8b
+  steps:
+  - flow: kv-offload-dma-copy-loop
+    as: loop
+  - interface: dma-copy-backend.launch-copy
+    caller: kv-offload
+    as: l1
+    input:
+      src_blocks:
+      - 5
+      dst_blocks:
+      - 0
+      is_store: true
+      event_idx: 1
+  expect:
+  - steps.loop.result.value.did == 'idle' && steps.l1.result.value.queued == 1
+  - trace.exists(e, e.type == 'call.end' && e.interface == 'dma-copy-backend.launch-copy' && e.output.queued == 1)
+- id: kv-offload-disk-store-then-load
+  name: A store goes GPU -> staging -> disk on the store thread; the load thread reads it back
+  fixtures:
+  - tp1-llama-8b
+  steps:
+  - interface: disk-backend.launch-copy
+    caller: kv-offload
+    as: s
+    input:
+      src_blocks:
+      - 5
+      - 6
+      dst_blocks:
+      - 0
+      - 1
+      is_store: true
+      event_idx: 1
+  - flow: kv-offload-disk-store-loop
+    as: st
+  - interface: disk-backend.launch-copy
+    caller: kv-offload
+    as: l
+    input:
+      src_blocks:
+      - 0
+      - 1
+      dst_blocks:
+      - 8
+      - 9
+      is_store: false
+      event_idx: 2
+  - flow: kv-offload-disk-load-loop
+    as: ld
+  expect:
+  - steps.st.result.value.events == [1] && steps.ld.result.value.events == [2]
+  - trace.exists(e, e.type == 'call.end' && e.interface == 'disk-store-thread.store-loop' && e.output.did == 'store') && trace.exists(e, e.type == 'call.end' && e.interface == 'disk-load-thread.load-loop' && e.output.did == 'load')
+- id: kv-offload-disk-short-write-kills-store-thread
+  name: A short write raises OSError and the store thread dies; later stores are never processed
+  fixtures:
+  - tp1-llama-8b
+  state:
+    disk-store-thread:
+      total_block_bytes: 4194304
+  steps:
+  - interface: disk-backend.launch-copy
+    caller: kv-offload
+    as: s
+    input:
+      src_blocks:
+      - 5
+      dst_blocks:
+      - 0
+      is_store: true
+      event_idx: 1
+  - flow: kv-offload-disk-store-loop
+    as: st
+  - interface: disk-backend.launch-copy
+    caller: kv-offload
+    as: s2
+    input:
+      src_blocks:
+      - 6
+      dst_blocks:
+      - 1
+      is_store: true
+      event_idx: 2
+  - flow: kv-offload-disk-store-loop
+    as: st2
+  expect:
+  - '!steps.st.result.ok && steps.st.result.error.code == ''os-error'' && steps.st.result.error.message.startsWith(''Short write'')'
+  - steps.st2.result.value.did == 'exited' && steps.st2.result.value.queued == 1 && steps.st2.result.value.events == []
+  - trace.exists(e, e.type == 'call.end' && e.interface == 'disk-store-thread.store-loop' && e.output.did == 'exited')
+- id: kv-offload-disk-io-errors
+  name: A pwritev or preadv error raises OSError and ends that thread; the other keeps going
+  fixtures:
+  - tp1-llama-8b
+  faults:
+  - target: local-disk.pwritev
+    type: error
+    code: eio
+    status: 0
+  steps:
+  - interface: disk-backend.launch-copy
+    caller: kv-offload
+    as: s
+    input:
+      src_blocks:
+      - 5
+      dst_blocks:
+      - 0
+      is_store: true
+      event_idx: 1
+  - interface: disk-backend.launch-copy
+    caller: kv-offload
+    as: l
+    input:
+      src_blocks:
+      - 0
+      dst_blocks:
+      - 8
+      is_store: false
+      event_idx: 2
+  - flow: kv-offload-disk-store-loop
+    as: st
+  - flow: kv-offload-disk-load-loop
+    as: ld
+  expect:
+  - '!steps.st.result.ok && steps.st.result.error.code == ''os-error'' && steps.ld.result.value.did == ''load'' && steps.ld.result.value.events == [2]'
+  - trace.exists(e, e.type == 'call.end' && e.interface == 'disk-load-thread.load-loop' && e.output.did == 'load')
+- id: kv-offload-disk-read-errors
+  name: A short or failed read kills the load thread
+  fixtures:
+  - tp1-llama-8b
+  faults:
+  - target: local-disk.preadv
+    type: error
+    code: eio
+    status: 0
+    calls:
+    - 1
+  steps:
+  - interface: disk-backend.launch-copy
+    caller: kv-offload
+    as: l
+    input:
+      src_blocks:
+      - 0
+      dst_blocks:
+      - 8
+      is_store: false
+      event_idx: 2
+  - flow: kv-offload-disk-load-loop
+    as: ld
+  - interface: disk-backend.launch-copy
+    caller: kv-offload
+    as: l2
+    input:
+      src_blocks:
+      - 1
+      dst_blocks:
+      - 9
+      is_store: false
+      event_idx: 3
+  - flow: kv-offload-disk-load-loop
+    as: ld2
+  expect:
+  - '!steps.ld.result.ok && steps.ld.result.error.code == ''os-error'' && steps.ld2.result.value.did == ''exited'' && steps.ld2.result.value.events == []'
+  - trace.exists(e, e.type == 'call.end' && e.interface == 'disk-load-thread.load-loop' && e.output.did == 'exited')
+- id: kv-offload-disk-short-read
+  name: A short read raises OSError on the load thread
+  fixtures:
+  - tp1-llama-8b
+  state:
+    disk-load-thread:
+      total_block_bytes: 4194304
+      queue:
+      - src_blocks:
+        - 0
+        dst_blocks:
+        - 8
+        event_idx: 4
+  steps:
+  - flow: kv-offload-disk-load-loop
+    as: ld
+  - interface: disk-backend.launch-copy
+    caller: kv-offload
+    as: l2
+    input:
+      src_blocks:
+      - 1
+      dst_blocks:
+      - 9
+      is_store: false
+      event_idx: 5
+  expect:
+  - '!steps.ld.result.ok && steps.ld.result.error.code == ''os-error'' && steps.ld.result.error.message.startsWith(''Short read'')'
+  - steps.l2.result.value.queued == 1 && trace.exists(e, e.type == 'call.end' && e.interface == 'disk-backend.launch-copy' && true)
+- id: kv-offload-disk-sentinels
+  name: Shutdown sentinels end both disk threads
+  fixtures:
+  - tp1-llama-8b
+  state:
+    disk-store-thread:
+      queue:
+      - null
+    disk-load-thread:
+      queue:
+      - null
+  steps:
+  - flow: kv-offload-disk-store-loop
+    as: st
+  - flow: kv-offload-disk-load-loop
+    as: ld
+  - interface: disk-backend.launch-copy
+    caller: kv-offload
+    as: l2
+    input:
+      src_blocks:
+      - 1
+      dst_blocks:
+      - 9
+      is_store: false
+      event_idx: 5
+  expect:
+  - steps.st.result.value.did == 'exited' && steps.ld.result.value.did == 'exited'
+  - steps.l2.result.value.queued == 1 && trace.exists(e, e.type == 'call.end' && e.interface == 'disk-load-thread.load-loop' && e.output.did == 'exited')
+- id: kv-offload-async-lookup-resolves-next-step
+  name: A secondary-tier lookup returns null this step and the resolved answer after the worker runs
+  fixtures:
+  - tp1-llama-8b
+  state:
+    async-lookup-manager:
+      tier_keys:
+        blk-sys-0: true
+  steps:
+  - interface: async-lookup-manager.lookup
+    caller: kv-offload
+    as: q1
+    input:
+      key: blk-sys-0
+      req_id: chatcmpl-abc123
+  - interface: async-lookup-manager.lookup
+    caller: kv-offload
+    as: q1b
+    input:
+      key: blk-miss-1
+      req_id: chatcmpl-abc123
+  - interface: async-lookup-manager.flush
+    caller: kv-offload
+    as: fl
+  - flow: kv-offload-async-lookup-worker
+    as: w
+  - interface: async-lookup-manager.lookup
+    caller: kv-offload
+    as: q2
+    input:
+      key: blk-sys-0
+      req_id: chatcmpl-abc123
+  - interface: async-lookup-manager.lookup
+    caller: kv-offload
+    as: q2b
+    input:
+      key: blk-miss-1
+      req_id: chatcmpl-abc123
+  expect:
+  - steps.q1.result.value.result == null && steps.fl.result.value.posted == 2
+  - steps.q2.result.value.result == true && steps.q2b.result.value.result == false
+  - trace.exists(e, e.type == 'call.end' && e.interface == 'async-lookup-manager.lookup' && e.output.result == true)
+- id: kv-offload-async-lookup-failure-counts-as-miss
+  name: A failing batch_lookup marks every key of that request as a miss
+  fixtures:
+  - tp1-llama-8b
+  state:
+    async-lookup-manager:
+      tier_keys:
+        blk-sys-0: true
+  faults:
+  - target: async-lookup-manager.batch-lookup
+    type: error
+    code: oserror
+    status: 0
+  steps:
+  - interface: async-lookup-manager.lookup
+    caller: kv-offload
+    as: q1
+    input:
+      key: blk-sys-0
+      req_id: chatcmpl-abc123
+  - interface: async-lookup-manager.flush
+    caller: kv-offload
+    as: fl
+  - flow: kv-offload-async-lookup-worker
+    as: w
+  - interface: async-lookup-manager.lookup
+    caller: kv-offload
+    as: q2
+    input:
+      key: blk-sys-0
+      req_id: chatcmpl-abc123
+  expect:
+  - steps.q2.result.value.result == false
+  - trace.exists(e, e.type == 'call.end' && e.interface == 'async-lookup-manager.lookup' && e.output.result == false)
+- id: kv-offload-async-lookup-orphan-dropped
+  name: A result for a key no request wants any more is dropped; a stale generation is ignored; the sentinel ends the thread
+  fixtures:
+  - tp1-llama-8b
+  state:
+    async-lookup-manager:
+      lookup_state:
+        blk-orphan:
+          generation: 3
+          phase: IN_FLIGHT
+          result: null
+          request_ids: []
+        blk-live:
+          generation: 4
+          phase: IN_FLIGHT
+          result: null
+          request_ids:
+          - chatcmpl-abc123
+      pending_results:
+      - - key: blk-orphan
+          generation: 3
+          found: true
+        - key: blk-live
+          generation: 2
+          found: true
+      lookup_queue:
+      - null
+  steps:
+  - flow: kv-offload-async-lookup-worker
+    as: w
+  - interface: async-lookup-manager.flush
+    caller: kv-offload
+    as: fl
+  - interface: async-lookup-manager.lookup
+    caller: kv-offload
+    as: live
+    input:
+      key: blk-live
+      req_id: chatcmpl-abc123
+  expect:
+  - steps.w.result.value.did == 'exited'
+  - steps.live.result.value.result == null && trace.exists(e, e.type == 'call.end' && e.interface == 'async-lookup-manager.flush' && e.output.posted == 0)
+- id: kv-offload-fs-io-pool-jobs
+  name: Load-priority threads take loads first; a failed block IO fails the whole job
+  fixtures:
+  - tp1-llama-8b
+  faults:
+  - target: local-disk.pwritev
+    type: error
+    code: eio
+    status: 0
+    calls:
+    - 1
+  steps:
+  - interface: dual-queue-thread-pool.enqueue-store
+    caller: kv-offload
+    as: es
+    input:
+      job_id: 8
+      tasks:
+      - block: 3
+  - interface: dual-queue-thread-pool.enqueue-load
+    caller: kv-offload
+    as: el
+    input:
+      job_id: 7
+      tasks:
+      - block: 1
+      - block: 2
+  - flow: kv-offload-fs-io-worker
+    as: w1
+    input:
+      load_priority: true
+  - flow: kv-offload-fs-io-worker
+    as: w2
+    input:
+      load_priority: true
+  - flow: kv-offload-fs-io-worker
+    as: w3
+    input:
+      load_priority: true
+  - flow: kv-offload-fs-io-worker
+    as: w4
+    input:
+      load_priority: true
+  - interface: dual-queue-thread-pool.get-finished
+    caller: kv-offload
+    as: fin
+  expect:
+  - steps.w1.result.value.did == 'load' && steps.w3.result.value.did == 'store' && steps.w4.result.value.did == 'idle'
+  - 'steps.fin.result.value.jobs == [{''job_id'': 7, ''success'': true}, {''job_id'': 8, ''success'': false}]'
+  - trace.exists(e, e.type == 'call.end' && e.interface == 'dual-queue-thread-pool.get-finished' && size(e.output.jobs) == 2)
+- id: kv-offload-fs-io-pool-store-priority-and-stop
+  name: A store-priority thread takes stores first; a stopped pool's threads exit
+  fixtures:
+  - tp1-llama-8b
+  steps:
+  - interface: dual-queue-thread-pool.enqueue-load
+    caller: kv-offload
+    as: el
+    input:
+      job_id: 7
+      tasks:
+      - block: 1
+  - interface: dual-queue-thread-pool.enqueue-store
+    caller: kv-offload
+    as: es
+    input:
+      job_id: 8
+      tasks:
+      - block: 3
+  - flow: kv-offload-fs-io-worker
+    as: w1
+    input:
+      load_priority: false
+  - flow: kv-offload-fs-io-worker
+    as: w2
+    input:
+      load_priority: false
+  - interface: dual-queue-thread-pool.get-finished
+    caller: kv-offload
+    as: fin
+  expect:
+  - steps.fin.result.value.jobs.map(j, j.job_id) == [8, 7]
+  - steps.w1.result.value.did == 'store' && steps.w2.result.value.did == 'load' && trace.exists(e, e.type == 'call.end' && e.interface == 'dual-queue-thread-pool.get-finished' && true)
+- id: kv-offload-fs-io-pool-stopped
+  name: After shutdown the IO threads exit without running queued work
+  fixtures:
+  - tp1-llama-8b
+  state:
+    dual-queue-thread-pool:
+      stop: true
+  steps:
+  - flow: kv-offload-fs-io-worker
+    as: w
+    input:
+      load_priority: true
+  - interface: dual-queue-thread-pool.get-finished
+    caller: kv-offload
+    as: fin
+  expect:
+  - steps.w.result.value.did == 'exited' && steps.fin.result.value.jobs == []
+  - trace.exists(e, e.type == 'call.end' && e.interface == 'dual-queue-thread-pool.worker' && e.output.did == 'exited')
+- id: scheduler-kv-budget-exhausted-by-first-running
+  name: When the first running prefill uses the whole budget, later running requests wait a step
+  fixtures:
+  - small-batch-limits
+  steps:
+  - flow: scheduler-add-request
+    as: a1
+    input:
+      request_id: chatcmpl-r1
+      prompt_segments:
+      - key: q1
+        num_tokens: 300
+  - flow: scheduler-add-request
+    as: a2
+    input:
+      request_id: chatcmpl-r2
+      prompt_segments:
+      - key: q2
+        num_tokens: 300
+  - flow: scheduler-schedule
+    as: s1
+    input: {}
+  - flow: scheduler-schedule
+    as: s2
+    input: {}
+  - flow: scheduler-schedule
+    as: s3
+    input: {}
+  expect:
+  - 'steps.s1.result.value.num_scheduled_tokens == {''chatcmpl-r1'': 64}'
+  - 'steps.s2.result.value.num_scheduled_tokens == {''chatcmpl-r1'': 64}'
+  - steps.s3.result.value.scheduled_cached_reqs.num_computed_tokens == [128] && trace.exists(e, e.type == 'call.end' && e.interface == 'scheduler.schedule' && e.output.total_num_scheduled_tokens == 64)
+- id: scheduler-kv-async-no-step-past-max-tokens
+  name: With async scheduling a request whose in-flight step reaches max_tokens is not scheduled again
+  fixtures:
+  - tp1-llama-8b
+  steps:
+  - flow: scheduler-add-request
+    as: add
+    input:
+      request_id: chatcmpl-abc123
+      prompt_token_ids:
+      - 128000
+      - 9906
+      - 1917
+      sampling_params:
+        max_tokens: 1
+  - flow: scheduler-schedule
+    as: s1
+    input: {}
+  - flow: scheduler-schedule
+    as: s2
+    input: {}
+  expect:
+  - 'steps.s1.result.value.num_scheduled_tokens == {''chatcmpl-abc123'': 3}'
+  - steps.s2.result.value.total_num_scheduled_tokens == 0
+  - trace.exists(e, e.type == 'note' && e.title == 'Async - the in-flight step already reaches max_tokens')
+- id: scheduler-kv-structured-output-compile-failure
+  name: A grammar that fails to compile is kept as a failed grammar, not an engine error
+  fixtures:
+  - tp1-llama-8b
+  steps:
+  - flow: structured-output-grammar-init
+    as: g
+    input:
+      request_id: chatcmpl-json2
+      backend: xgrammar
+      request_type: xml
+      grammar_spec: <a/>
+  - interface: structured-output-manager.accept-tokens
+    caller: scheduler
+    as: acc
+    input:
+      request_id: chatcmpl-json2
+      grammar_id: chatcmpl-json2
+      new_token_ids: []
+  expect:
+  - steps.g.result.ok && steps.g.result.value.status == 'failed' && steps.g.result.value.error == 'value-error'
+  - steps.acc.result.value.accepted
+  - trace.exists(e, e.type == 'call.end' && e.interface == 'structured-output-manager.grammar-init' && e.output.status == 'failed')
+- id: scheduler-kv-grammar-terminates-on-stop-token
+  name: A stop token in an accepting state terminates the grammar; later tokens are ignored; unknown grammars are an error
+  fixtures:
+  - tp1-llama-8b
+  steps:
+  - interface: xgrammar-backend.compile-grammar
+    caller: structured-output-manager
+    as: c
+    input:
+      grammar_id: g1
+      request_type: json
+      grammar_spec: '{"type": "string"}'
+  - interface: xgrammar-grammar.accept-tokens
+    caller: structured-output-manager
+    as: a1
+    input:
+      grammar_id: g1
+      tokens:
+      - 1
+      - 55
+      - 1
+      - 128009
+      - 55
+  - interface: xgrammar-grammar.accept-tokens
+    caller: structured-output-manager
+    as: a2
+    input:
+      grammar_id: g1
+      tokens:
+      - 55
+  - interface: xgrammar-grammar.is-terminated
+    caller: structured-output-manager
+    as: t
+    input:
+      grammar_id: g1
+  - interface: xgrammar-grammar.accept-tokens
+    caller: structured-output-manager
+    as: u1
+    input:
+      grammar_id: nope
+      tokens:
+      - 1
+  - interface: xgrammar-grammar.fill-bitmask
+    caller: structured-output-manager
+    as: u2
+    input:
+      grammar_id: nope
+      token_ids:
+      - 1
+  - interface: xgrammar-grammar.is-terminated
+    caller: structured-output-manager
+    as: u3
+    input:
+      grammar_id: nope
+  expect:
+  - steps.a1.result.value.accepted && steps.a1.result.value.terminated && steps.a2.result.value.accepted
+  - steps.t.result.value.terminated && trace.exists(e, e.type == 'call.end' && e.interface == 'xgrammar-grammar.accept-tokens' && e.output.terminated)
+  - steps.u1.result.error.code == 'key-error' && steps.u2.result.error.code == 'key-error' && steps.u3.result.error.code == 'key-error'
+- id: kv-offload-threads-idle-and-dead
+  name: Idle threads wait on their queues; a dead load thread processes nothing
+  fixtures:
+  - tp1-llama-8b
+  state:
+    disk-load-thread:
+      alive: false
+      queue:
+      - src_blocks:
+        - 0
+        dst_blocks:
+        - 8
+        event_idx: 4
+  steps:
+  - flow: kv-offload-disk-store-loop
+    as: st
+  - flow: kv-offload-disk-load-loop
+    as: ld
+  - flow: kv-offload-async-lookup-worker
+    as: w
+  - interface: disk-backend.launch-copy
+    caller: kv-offload
+    as: l2
+    input:
+      src_blocks:
+      - 1
+      dst_blocks:
+      - 9
+      is_store: true
+      event_idx: 5
+  expect:
+  - steps.st.result.value.did == 'idle' && steps.ld.result.value.did == 'exited' && steps.w.result.value.did == 'idle'
+  - steps.ld.result.value.queued == 1 && steps.l2.result.value.queued == 1 && trace.exists(e, e.type == 'call.end' && e.interface == 'disk-load-thread.load-loop' && e.output.did == 'exited')
+- id: kv-offload-disk-load-idle
+  name: The load thread waits when nothing is queued
+  fixtures:
+  - tp1-llama-8b
+  steps:
+  - flow: kv-offload-disk-load-loop
+    as: ld
+  - interface: disk-backend.launch-copy
+    caller: kv-offload
+    as: l2
+    input:
+      src_blocks:
+      - 1
+      dst_blocks:
+      - 9
+      is_store: false
+      event_idx: 5
+  expect:
+  - steps.ld.result.value.did == 'idle' && steps.l2.result.value.queued == 1 && !steps.l2.result.value.is_store
+  - trace.exists(e, e.type == 'call.end' && e.interface == 'disk-backend.launch-copy' && true)
+- id: scheduler-kv-pool-sized-from-profiled-memory
+  name: Startup sizes the block pool from the workers' free memory; the first request gets block 1 of the new pool
+  fixtures:
+  - scheduler-kv-prefix-warm
+  steps:
+  - interface: kv-cache-utils.get-kv-cache-configs
+    caller: engine-core
+    as: kvc
+    input:
+      available_memory:
+      - 59745650279
+  - flow: scheduler-add-request
+    as: add
+    input:
+      request_id: chatcmpl-abc123
+      prompt_token_ids:
+      - 128000
+      - 9906
+      - 1917
+  - flow: scheduler-make-stats
+    as: st
+    input: {}
+  expect:
+  - steps.kvc.result.value.num_blocks == 28488
+  - steps.st.result.value.kv_cache_usage == 0.0
+  - trace.exists(e, e.type == 'call.end' && e.interface == 'scheduler.make-stats' && e.error == null)
+- id: scheduler-kv-pool-override-and-no-memory
+  name: num_gpu_blocks_override fixes the pool size; no free memory is a ValueError
+  fixtures:
+  - tp1-llama-8b
+  config:
+    num-gpu-blocks-override: 64
+  steps:
+  - interface: kv-cache-utils.get-kv-cache-configs
+    caller: engine-core
+    as: kvc
+    input:
+      available_memory:
+      - 59745650279
+      - 60000000000
+  - flow: scheduler-make-stats
+    as: st
+    input: {}
+  expect:
+  - steps.kvc.result.value.num_blocks == 64 && trace.exists(e, e.type == 'call.end' && e.interface == 'kv-cache-utils.get-kv-cache-configs' && e.output.num_blocks == 64)
+  - steps.st.result.value.kv_cache_usage == 0.0
+- id: scheduler-kv-pool-no-memory
+  name: A worker with no memory left for the KV cache fails startup
+  fixtures:
+  - tp1-llama-8b
+  steps:
+  - interface: kv-cache-utils.get-kv-cache-configs
+    caller: engine-core
+    as: kvc
+    input:
+      available_memory:
+      - 0
+  - interface: block-pool.init
+    caller: kv-cache-manager
+    as: bad
+    input:
+      num_gpu_blocks: 0
+  expect:
+  - '!steps.kvc.result.ok && steps.kvc.result.error.code == ''value-error'' && steps.bad.result.error.code == ''assertion-error'''
+  - trace.exists(e, e.type == 'call.end' && e.interface == 'block-pool.init' && e.error.code == 'assertion-error')
+- id: scheduler-kv-finish-all-requests
+  name: finish_requests(None) aborts every request, running and waiting
+  fixtures:
+  - scheduler-kv-nearly-full
+  steps:
+  - flow: scheduler-finish-requests
+    as: f
+    input:
+      request_ids: null
+  - flow: scheduler-schedule
+    as: s1
+    input: {}
+  - interface: scheduler.has-requests
+    caller: engine-core
+    as: h
+  expect:
+  - steps.f.result.value.finished == ['chatcmpl-run-a', 'chatcmpl-run-b', 'chatcmpl-wait-c']
+  - steps.s1.result.value.finished_req_ids == ['chatcmpl-run-a', 'chatcmpl-run-b', 'chatcmpl-wait-c']
+  - '!steps.h.result.value && trace.exists(e, e.type == ''call.end'' && e.interface == ''scheduler.has-requests'' && e.output == false)'
+- id: scheduler-kv-pause-new-and-all
+  name: PAUSED_NEW keeps running requests going but admits nothing; PAUSED_ALL schedules nothing and reports no work
+  fixtures:
+  - tp1-llama-8b
+  steps:
+  - flow: scheduler-add-request
+    as: a1
+    input:
+      request_id: chatcmpl-r1
+      prompt_token_ids:
+      - 128000
+      - 1
+      - 2
+  - flow: scheduler-schedule
+    as: s1
+    input: {}
+  - interface: scheduler.set-pause-state
+    caller: engine-core
+    as: p1
+    input:
+      pause_state: PAUSED_NEW
+  - flow: scheduler-add-request
+    as: a2
+    input:
+      request_id: chatcmpl-r2
+      prompt_token_ids:
+      - 128000
+      - 3
+  - flow: scheduler-schedule
+    as: s2
+    input: {}
+  - interface: scheduler.has-requests
+    caller: engine-core
+    as: h1
+  - interface: scheduler.set-pause-state
+    caller: engine-core
+    as: p2
+    input:
+      pause_state: PAUSED_ALL
+  - flow: scheduler-schedule
+    as: s3
+    input: {}
+  - interface: scheduler.has-requests
+    caller: engine-core
+    as: h2
+  - interface: scheduler.pause-state
+    caller: engine-core
+    as: ps
+  - interface: scheduler.reset-encoder-cache
+    caller: engine-core
+    as: rec
+  - interface: scheduler.shutdown
+    caller: engine-core
+    as: sd
+  expect:
+  - 'steps.s2.result.value.num_scheduled_tokens == {''chatcmpl-r1'': 1}'
+  - steps.h1.result.value && steps.s3.result.value.total_num_scheduled_tokens == 0 && !steps.h2.result.value
+  - steps.ps.result.value == 'PAUSED_ALL' && trace.exists(e, e.type == 'call.start' && e.interface == 'scheduler.set-pause-state' && e.input.pause_state == 'PAUSED_ALL')
+  - steps.rec.result.ok && steps.sd.result.ok
+- id: scheduler-kv-has-requests-finished-pending
+  name: has_requests stays true while finished ids still have to reach the workers
+  fixtures:
+  - tp1-llama-8b
+  steps:
+  - flow: scheduler-add-request
+    as: a1
+    input:
+      request_id: chatcmpl-r1
+      prompt_token_ids:
+      - 128000
+      - 1
+      - 2
+  - flow: scheduler-finish-requests
+    as: f
+    input:
+      request_ids:
+      - chatcmpl-r1
+  - interface: scheduler.has-requests
+    caller: engine-core
+    as: h1
+  - flow: scheduler-schedule
+    as: s1
+    input: {}
+  - interface: scheduler.has-requests
+    caller: engine-core
+    as: h2
+  expect:
+  - steps.h1.result.value && !steps.h2.result.value
+  - trace.exists(e, e.type == 'call.end' && e.interface == 'scheduler.schedule' && e.output.finished_req_ids == ['chatcmpl-r1'])
+- id: scheduler-kv-no-hashing-when-caching-off
+  name: With prefix caching off (and no connector) nothing is hashed or cached, on the sync and async paths
+  fixtures:
+  - prefix-caching-off
+  steps:
+  - flow: scheduler-add-request
+    as: a1
+    input:
+      request_id: chatcmpl-r1
+      prompt_segments:
+      - key: sys-512
+        num_tokens: 512
+      - key: user-a
+        num_tokens: 100
+      sampling_params:
+        max_tokens: 16
+  - flow: scheduler-schedule
+    as: s1
+    input: {}
+  - flow: scheduler-update-from-output
+    as: u1
+    input:
+      scheduler_output: = steps.s1.result.value
+      model_runner_output:
+        req_ids:
+        - chatcmpl-r1
+        sampled_token_ids:
+        - - 791
+  - flow: scheduler-schedule
+    as: s2
+    input: {}
+  expect:
+  - steps.a1.result.value.num_block_hashes == 0
+  - '// K7: nothing may be hashed or cached with prefix caching off; the internal path is the point
+
+    state[''block-pool''].cached == {} && state[''block-pool''].block_hash == {}'
+  - 'steps.s2.result.value.num_scheduled_tokens == {''chatcmpl-r1'': 1}'
+- id: scheduler-kv-spec-decode-async-schedule-and-rollback
+  name: With EAGLE3 (k=3) decode steps schedule 1+3 tokens with -1 draft slots; rejected drafts roll back num_computed_tokens
+  fixtures:
+  - tp1-llama-8b
+  config:
+    speculative-method: eagle3
+    num-speculative-tokens: 3
+  steps:
+  - flow: scheduler-add-request
+    as: add
+    input:
+      request_id: chatcmpl-x6
+      prompt_token_ids:
+      - 128000
+      - 9906
+      - 11
+      - 856
+      - 836
+      - 374
+      sampling_params:
+        max_tokens: 16
+  - flow: scheduler-schedule
+    as: s1
+    input: {}
+  - flow: scheduler-update-from-output
+    as: u1
+    input:
+      scheduler_output: = steps.s1.result.value
+      model_runner_output:
+        req_ids:
+        - chatcmpl-x6
+        sampled_token_ids:
+        - - 791
+  - flow: scheduler-schedule
+    as: s2
+    input: {}
+  - flow: scheduler-update-from-output
+    as: u2
+    input:
+      scheduler_output: = steps.s2.result.value
+      model_runner_output:
+        req_ids:
+        - chatcmpl-x6
+        sampled_token_ids:
+        - - 201
+          - 202
+  - flow: scheduler-schedule
+    as: s3
+    input: {}
+  expect:
+  - 'steps.s1.result.value.num_scheduled_tokens == {''chatcmpl-x6'': 6} && steps.s1.result.value.scheduled_spec_decode_tokens == {}'
+  - 'steps.s2.result.value.total_num_scheduled_tokens == 4 && steps.s2.result.value.scheduled_spec_decode_tokens == {''chatcmpl-x6'': [-1, -1, -1]}'
+  - steps.u2.result.value.outputs[0].new_token_ids == [201, 202]
+  - 'steps.s3.result.value.num_scheduled_tokens == {''chatcmpl-x6'': 4}'
+  - steps.s3.result.value.scheduled_cached_reqs.num_computed_tokens == [8] && steps.s3.result.value.scheduled_cached_reqs.num_output_tokens == [3]
+  - trace.exists(e, e.type == 'note' && e.title == 'Roll back the rejected draft tokens')
+- id: scheduler-kv-spec-decode-sync-draft-tokens
+  name: Without async scheduling the drafter's tokens arrive through update_draft_token_ids and are verified next step
+  fixtures:
+  - tp1-llama-8b
+  config:
+    speculative-method: eagle3
+    num-speculative-tokens: 3
+    async-scheduling: false
+  steps:
+  - flow: scheduler-add-request
+    as: add
+    input:
+      request_id: chatcmpl-x6
+      prompt_token_ids:
+      - 128000
+      - 9906
+      - 11
+      - 856
+      - 836
+      - 374
+      sampling_params:
+        max_tokens: 16
+  - flow: scheduler-schedule
+    as: s1
+    input: {}
+  - flow: scheduler-update-from-output
+    as: u1
+    input:
+      scheduler_output: = steps.s1.result.value
+      model_runner_output:
+        req_ids:
+        - chatcmpl-x6
+        sampled_token_ids:
+        - - 791
+  - flow: scheduler-update-draft-token-ids
+    as: d1
+    input:
+      req_ids:
+      - chatcmpl-x6
+      - chatcmpl-gone
+      draft_token_ids:
+      - - 201
+        - 202
+        - 203
+      - - 1
+  - flow: scheduler-schedule
+    as: s2
+    input: {}
+  - flow: scheduler-update-from-output
+    as: u2
+    input:
+      scheduler_output: = steps.s2.result.value
+      model_runner_output:
+        req_ids:
+        - chatcmpl-x6
+        sampled_token_ids:
+        - - 201
+          - 202
+          - 203
+          - 204
+  - flow: scheduler-schedule
+    as: s3
+    input: {}
+  expect:
+  - steps.d1.result.value.updated == ['chatcmpl-x6']
+  - 'steps.s2.result.value.scheduled_spec_decode_tokens == {''chatcmpl-x6'': [201, 202, 203]} && steps.s2.result.value.num_scheduled_tokens == {''chatcmpl-x6'': 4}'
+  - steps.s3.result.value.scheduled_cached_reqs.num_computed_tokens == [10] && steps.u2.result.value.outputs[0].new_token_ids == [201, 202, 203, 204]
+  - trace.exists(e, e.type == 'call.end' && e.interface == 'scheduler.schedule' && e.error == null)
+- id: scheduler-kv-draft-tokens-ignored-for-prefill-chunk
+  name: Draft tokens for a request still prefilling are dropped
+  fixtures:
+  - small-batch-limits
+  config:
+    speculative-method: eagle3
+    num-speculative-tokens: 3
+    async-scheduling: false
+  steps:
+  - flow: scheduler-add-request
+    as: add
+    input:
+      request_id: chatcmpl-long1
+      prompt_segments:
+      - key: doc-long
+        num_tokens: 200
+  - flow: scheduler-schedule
+    as: s1
+    input: {}
+  - flow: scheduler-update-draft-token-ids
+    as: d1
+    input:
+      req_ids:
+      - chatcmpl-long1
+      draft_token_ids:
+      - - 1
+        - 2
+        - 3
+  - flow: scheduler-schedule
+    as: s2
+    input: {}
+  expect:
+  - steps.d1.result.value.updated == [] && trace.exists(e, e.type == 'call.end' && e.interface == 'scheduler.update-draft-token-ids' && e.output.updated == [])
+  - steps.s2.result.value.scheduled_spec_decode_tokens == {}
+- id: scheduler-kv-external-computed-blocks-free-pool
+  name: External computed tokens already covered by a request's blocks take no blocks from the pool
+  description: tests/v1/core/test_single_type_kv_cache_manager.py:38 test_external_computed_blocks_do_not_corrupt_free_pool.
+  fixtures:
+  - prefix-caching-off
+  config:
+    block-size: 4
+  state:
+    block-pool:
+      num_gpu_blocks: 10
+      next_fresh: 1
+      free_front: []
+      free_tail: []
+      block_hash: {}
+      cached: {}
+      ref_cnt: {}
+  steps:
+  - interface: full-attention-manager.allocate-new-blocks
+    caller: kv-cache-manager
+    as: alloc
+    input:
+      request_id: request
+      num_tokens: 12
+  - interface: block-pool.get-num-free-blocks
+    caller: kv-cache-manager
+    as: before
+    input: {}
+  - interface: kv-cache-manager.allocate-slots
+    caller: scheduler
+    as: ext
+    input:
+      request_id: request
+      status: WAITING
+      num_new_tokens: 0
+      num_computed_tokens: 0
+      num_new_computed_tokens: 0
+      num_external_computed_tokens: 4
+  - interface: full-attention-manager.allocate-external-computed-blocks
+    caller: kv-cache-manager
+    as: more
+    input:
+      request_id: other
+      num_local_computed_tokens: 0
+      num_external_computed_tokens: 8
+  - interface: full-attention-manager.allocate-external-computed-blocks
+    caller: kv-cache-manager
+    as: none
+    input:
+      request_id: other
+      num_external_computed_tokens: 0
+  - interface: block-pool.get-num-free-blocks
+    caller: kv-cache-manager
+    as: after
+    input: {}
+  - interface: kv-cache-manager.get-block-ids
+    caller: scheduler
+    as: tbl
+    input:
+      request_id: request
+  expect:
+  - steps.ext.result.ok && steps.before.result.value.num_free_blocks == 6
+  - steps.after.result.value.num_free_blocks == 4 && size(steps.tbl.result.value.block_ids) == 3
+  - steps.more.result.value.new_block_ids == [4, 5] && steps.none.result.value.new_block_ids == []
+  - trace.exists(e, e.type == 'call.start' && e.interface == 'full-attention-manager.allocate-external-computed-blocks' && e.input.request_id == 'request')
+- id: scheduler-kv-kv-too-small-for-max-model-len
+  name: Startup fails when the KV budget can't hold one max_model_len request
+  fixtures:
+  - tp1-llama-8b
+  steps:
+  - interface: kv-cache-utils.get-kv-cache-configs
+    caller: engine-core
+    as: kvc
+    input:
+      available_memory:
+      - 15077990400
+  - interface: kv-cache-utils.get-kv-cache-configs
+    caller: engine-core
+    as: ok
+    input:
+      available_memory:
+      - 17181966336
+      - 17184063488
+  expect:
+  - '!steps.kvc.result.ok && steps.kvc.result.error.code == ''value-error'' && steps.kvc.result.error.message.contains(''max seq len (131072)'')'
+  - steps.ok.result.value.num_blocks == 8193 && trace.exists(e, e.type == 'call.end' && e.interface == 'kv-cache-utils.get-kv-cache-configs' && e.output.num_blocks == 8193)
+- id: scheduler-kv-nixl-remote-prefill-load
+  name: A decode node pulls the remote prefill asynchronously, waits in WAITING_FOR_REMOTE_KVS, then recomputes only the last token
+  fixtures:
+  - full-tp1-llama-8b
+  config:
+    kv-connector: NixlConnector
+    kv-role: kv_both
+  steps:
+  - flow: scheduler-add-request
+    as: add
+    input:
+      request_id: chatcmpl-pd1
+      prompt_segments:
+      - key: pd-doc
+        num_tokens: 100
+      sampling_params:
+        max_tokens: 4
+      kv_transfer_params:
+        do_remote_prefill: true
+        do_remote_decode: false
+        remote_engine_id: prefill-0
+        remote_request_id: chatcmpl-pd1-p
+        remote_block_ids:
+        - 11
+        - 12
+        - 13
+        - 14
+        - 15
+        - 16
+        - 17
+        remote_host: 10.0.0.2
+        remote_port: 5600
+  - flow: scheduler-schedule
+    as: s1
+    input: {}
+  - flow: scheduler-schedule
+    as: s2
+    input: {}
+  - flow: scheduler-update-from-output
+    as: u1
+    input:
+      scheduler_output: = steps.s1.result.value
+      model_runner_output:
+        req_ids: []
+        sampled_token_ids: []
+        kv_connector_output:
+          finished_recving:
+          - chatcmpl-pd1
+          finished_sending: []
+  - flow: scheduler-schedule
+    as: s3
+    input: {}
+  - interface: block-pool.get-cached-block
+    caller: kv-cache-manager
+    as: look
+    input:
+      block_hash: pd-doc@96
+  expect:
+  - steps.s1.result.value.total_num_scheduled_tokens == 0 && steps.s2.result.value.total_num_scheduled_tokens == 0
+  - trace.exists(e, e.type == 'call.start' && e.interface == 'kv-connector-base-v1.get-num-new-matched-tokens')
+  - trace.exists(e, e.type == 'call.start' && e.interface == 'kv-connector-base-v1.build-connector-meta')
+  - 'steps.s3.result.value.num_scheduled_tokens == {''chatcmpl-pd1'': 1} && steps.s3.result.value.scheduled_new_reqs[0].num_computed_tokens == 99'
+  - steps.look.result.value.block != null && trace.exists(e, e.type == 'call.end' && e.interface == 'scheduler.schedule' && e.output.total_num_scheduled_tokens == 1)
+- id: scheduler-kv-hybrid-replay-hits-mamba-checkpoint
+  name: On a hybrid model a replayed prompt hits up to the Mamba checkpoint; a prompt sharing only an earlier prefix gets no hit
+  fixtures:
+  - tp1-llama-8b
+  state:
+    kv-cache-manager:
+      kv_cache_groups:
+      - kind: full_attention
+        block_size: 16
+      - kind: mamba
+        block_size: 16
+  steps:
+  - flow: scheduler-add-request
+    as: a1
+    input:
+      request_id: chatcmpl-h1
+      prompt_segments:
+      - key: sess-0
+        num_tokens: 100
+  - flow: scheduler-schedule-hybrid
+    as: s1
+    input: {}
+  - flow: scheduler-finish-requests
+    as: f1
+    input:
+      request_ids:
+      - chatcmpl-h1
+      finished_status: FINISHED_STOPPED
+  - flow: scheduler-add-request
+    as: a2
+    input:
+      request_id: chatcmpl-h2
+      prompt_segments:
+      - key: sess-0
+        num_tokens: 100
+  - flow: scheduler-add-request
+    as: a3
+    input:
+      request_id: chatcmpl-h3
+      prompt_segments:
+      - key: sess-0
+        num_tokens: 64
+      - key: other
+        num_tokens: 40
+  - flow: scheduler-schedule-hybrid
+    as: s2
+    input: {}
+  - flow: scheduler-make-stats
+    as: st
+    input: {}
+  - interface: block-pool.get-cached-block
+    caller: kv-cache-manager
+    as: ck
+    input:
+      block_hash: sess-0@96#mamba
+  expect:
+  - steps.s1.result.value.scheduled_new_reqs[0].num_computed_tokens == 0
+  - steps.s2.result.value.scheduled_new_reqs[0].num_computed_tokens == 96 && steps.s2.result.value.num_scheduled_tokens['chatcmpl-h2'] == 4
+  - steps.s2.result.value.scheduled_new_reqs[1].num_computed_tokens == 0 && steps.s2.result.value.num_scheduled_tokens['chatcmpl-h3'] == 104
+  - '// the hybrid coordinator and the Mamba manager are the point of this test
+
+    calls[''hybrid-kv-cache-coordinator.find-longest-cache-hit''] == 3 && calls[''mamba-manager.cache-blocks''] >= 1'
+  - steps.ck.result.value.block != null && steps.st.result.value.prefix_cache_stats.hits == 96
+  - trace.exists(e, e.type == 'call.end' && e.interface == 'block-pool.get-cached-block' && e.error == null)
+- id: scheduler-kv-outlines-regex-validation
+  name: The outlines validator rejects backreferences, look-arounds, word boundaries, leading anchors, json_object and grammar specs
+  fixtures:
+  - tp1-llama-8b
+  steps:
+  - flow: structured-output-validate-outlines
+    as: wb
+    input:
+      structured_outputs:
+        regex: a\b
+  - flow: structured-output-validate-outlines
+    as: br
+    input:
+      structured_outputs:
+        regex: (a)\1
+  - flow: structured-output-validate-outlines
+    as: la
+    input:
+      structured_outputs:
+        regex: x(?=y)
+  - flow: structured-output-validate-outlines
+    as: an
+    input:
+      structured_outputs:
+        regex: ^abc
+  - flow: structured-output-validate-outlines
+    as: ok
+    input:
+      structured_outputs:
+        regex: '[a-z]+[0-9]{2}'
+  - flow: structured-output-validate-outlines
+    as: ch
+    input:
+      structured_outputs:
+        choice:
+        - 'yes'
+        - 'no'
+  - flow: structured-output-validate-outlines
+    as: jo
+    input:
+      structured_outputs:
+        json_object: true
+  - flow: structured-output-validate-outlines
+    as: gr
+    input:
+      structured_outputs:
+        grammar: root ::= "a"
+  - flow: structured-output-validate-outlines
+    as: none
+    input:
+      structured_outputs: null
+  - flow: structured-output-validate-outlines
+    as: empty
+    input:
+      structured_outputs: {}
+  - flow: structured-output-grammar-init
+    as: g1
+    input:
+      request_id: chatcmpl-o1
+      backend: outlines
+      request_type: regex
+      grammar_spec: '[a-z]+'
+  - flow: structured-output-grammar-init
+    as: g2
+    input:
+      request_id: chatcmpl-o2
+      backend: outlines
+      request_type: grammar
+      grammar_spec: root ::= "a"
+  - flow: structured-output-grammar-init
+    as: g3
+    input:
+      request_id: chatcmpl-g1
+      backend: guidance
+      request_type: json
+      grammar_spec: '{}'
+  expect:
+  - steps.wb.result.error.code == 'vllm-validation-error' && steps.br.result.error.code == 'vllm-validation-error' && steps.la.result.error.code == 'vllm-validation-error' && steps.an.result.error.code == 'vllm-validation-error'
+  - steps.ok.result.value.valid && steps.ch.result.value.valid && steps.none.result.value.valid && steps.empty.result.value.valid
+  - steps.jo.result.error.code == 'vllm-validation-error' && steps.gr.result.error.code == 'vllm-validation-error'
+  - steps.g1.result.value.status == 'ready' && steps.g2.result.value.status == 'failed' && steps.g3.result.value.status == 'ready'
+  - trace.exists(e, e.type == 'call.end' && e.interface == 'structured-output-manager.grammar-init' && e.output.grammar_id == 'chatcmpl-o1' && e.output.status == 'ready')
+- id: scheduler-kv-nixl-prefill-delays-free-until-sent
+  name: On a prefill node a finished request keeps its blocks until the decoder's pull finishes, and returns the pull parameters
+  fixtures:
+  - full-tp1-llama-8b
+  config:
+    kv-connector: NixlConnector
+    kv-role: kv_both
+  steps:
+  - flow: scheduler-add-request
+    as: add
+    input:
+      request_id: chatcmpl-pd2
+      prompt_segments:
+      - key: pd-doc2
+        num_tokens: 40
+      sampling_params:
+        max_tokens: 1
+      kv_transfer_params:
+        do_remote_decode: true
+        do_remote_prefill: false
+  - flow: scheduler-schedule
+    as: s1
+    input: {}
+  - flow: scheduler-update-from-output
+    as: u1
+    input:
+      scheduler_output: = steps.s1.result.value
+      model_runner_output:
+        req_ids:
+        - chatcmpl-pd2
+        sampled_token_ids:
+        - - 791
+  - interface: scheduler.has-requests
+    caller: engine-core
+    as: h1
+  - flow: scheduler-schedule
+    as: s2
+    input: {}
+  - interface: scheduler.has-requests
+    caller: engine-core
+    as: h2
+  - flow: scheduler-update-from-output
+    as: u2
+    input:
+      scheduler_output: = steps.s2.result.value
+      model_runner_output:
+        req_ids: []
+        sampled_token_ids: []
+        kv_connector_output:
+          finished_recving: []
+          finished_sending:
+          - chatcmpl-pd2
+  - interface: scheduler.has-requests
+    caller: engine-core
+    as: h3
+  - interface: scheduler.get-request-counts
+    caller: engine-core
+    as: cnt
+  expect:
+  - steps.u1.result.value.outputs[0].finish_reason == 'length' && steps.u1.result.value.outputs[0].kv_transfer_params.do_remote_prefill
+  - steps.u1.result.value.outputs[0].kv_transfer_params.remote_block_ids == [[1, 2, 3]]
+  - steps.h1.result.value && steps.h2.result.value && !steps.h3.result.value
+  - 'steps.cnt.result.value == {''num_running'': 0, ''num_waiting'': 0} && trace.exists(e, e.type == ''call.end'' && e.interface == ''scheduler.update-from-output'' && size(e.output.outputs) == 0)'
+- id: scheduler-kv-regex-compile-timeout
+  name: A nested-quantifier regex times out after VLLM_REGEX_COMPILATION_TIMEOUT_S and the grammar fails; a normal one compiles; 0 disables the guard
+  description: tests/v1/structured_output/test_regex_compilation_timeout.py
+  fixtures:
+  - tp1-llama-8b
+  steps:
+  - flow: structured-output-grammar-init
+    as: bad
+    input:
+      request_id: chatcmpl-re1
+      backend: xgrammar
+      request_type: regex
+      grammar_spec: (a+)+b
+  - flow: structured-output-grammar-init
+    as: good
+    input:
+      request_id: chatcmpl-re2
+      backend: xgrammar
+      request_type: regex
+      grammar_spec: '[a-z]+'
+  - interface: xgrammar-grammar.is-terminated
+    caller: structured-output-manager
+    as: g1
+    input:
+      grammar_id: chatcmpl-re1
+  expect:
+  - steps.bad.result.value.status == 'failed' && steps.bad.result.value.error == 'value-error' && steps.bad.duration_ms >= 5000 && steps.bad.duration_ms < 6000
+  - steps.good.result.value.status == 'ready' && steps.g1.result.error.code == 'key-error'
+  - trace.exists(e, e.type == 'call.end' && e.interface == 'structured-output-manager.grammar-init' && e.output.status == 'ready')
+- id: scheduler-kv-regex-compile-timeout-disabled
+  name: With the timeout set to 0 the compile runs inline however long it takes
+  fixtures:
+  - tp1-llama-8b
+  config:
+    vllm-regex-compilation-timeout-s: 0
+  steps:
+  - flow: structured-output-grammar-init
+    as: slow
+    input:
+      request_id: chatcmpl-re1
+      backend: xgrammar
+      request_type: regex
+      grammar_spec: (a+)+b
+  - interface: xgrammar-grammar.is-terminated
+    caller: structured-output-manager
+    as: g
+    input:
+      grammar_id: chatcmpl-re1
+  expect:
+  - steps.slow.result.value.status == 'ready' && steps.slow.duration_ms >= 60000
+  - steps.g.result.ok && trace.exists(e, e.type == 'call.end' && e.interface == 'xgrammar-grammar.is-terminated' && e.output.terminated == false)

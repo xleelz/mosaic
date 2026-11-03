@@ -1,0 +1,656 @@
+- component: search-service
+  name: text-search-split-sync-async
+  kind: function
+  summary: 'SearchService.textSearchSplitSyncAsync(query, token, onProgress): open editor models are matched synchronously and reported through onProgress at once (syncResults); then doSearch activates
+    onSearch:<scheme> and onSearch:file, drops missing folders and asks the text search provider for the scheme, forwarding each file match it reports through onProgress unless an open editor already
+    matched that file (asyncResults). Each onProgress item is a yield {resource, matches}; the return holds both completes.'
+  sources:
+  - src/vs/workbench/services/search/common/searchService.ts:116-163
+  - src/vs/workbench/services/search/common/searchService.ts:173-222
+  request:
+    type: object
+    required:
+    - query
+    properties:
+      query:
+        $ref: SearchTextQuery
+      token:
+        type: object
+        properties:
+          canceled:
+            type: boolean
+            default: false
+  response:
+    type: object
+    properties:
+      sync_results:
+        $ref: SearchComplete
+      async_results:
+        $ref: SearchComplete
+  errors:
+  - code: canceled
+    status: 0
+    retryable: false
+  behavior:
+  - title: Open editor results first (in-memory models)
+    source: src/vs/workbench/services/search/common/searchService.ts:127-136
+    call: text-file-models.find-matches
+    input:
+      pattern: = input.query.pattern
+      max_results: '= has(input.query.max_results) ? input.query.max_results : config[''search-max-results'']'
+    as: open_editors
+  - title: onProgress reports each open editor match synchronously
+    source: src/vs/workbench/services/search/common/searchService.ts:129-131
+    foreach: = vars.open_editors.value.results
+    as: fm
+    steps:
+    - yield: = vars.fm
+  - set:
+      vars.sync: '= {''results'': vars.open_editors.value.results, ''limit_hit'': vars.open_editors.value.limit_hit}'
+      vars.schemes: = input.query.folders.map(f, f.substring(0, f.indexOf(':')))
+  - title: Activate search providers for every scheme in the query plus onSearch:file
+    source: src/vs/workbench/services/search/common/searchService.ts:176-180
+    parallel: = vars.schemes.map(s, 'onSearch:' + s) + ['onSearch:file']
+    as: activation_event
+    steps:
+    - call: extension-service.activate-by-event
+      input:
+        activation_event: = vars.activation_event
+        activation_kind: normal
+    join:
+      need: all
+  - if: has(input.token) && input.token.canceled
+    then:
+    - title: Canceled while waiting for extensions
+      source: src/vs/workbench/services/search/common/searchService.ts:186-189
+      fail:
+        code: canceled
+        message: Canceled
+  - title: Drop folders that do not exist
+    source: src/vs/workbench/services/search/common/searchService.ts:197-198
+    parallel: = input.query.folders
+    as: folder
+    steps:
+    - call: file-service.exists
+      input:
+        resource: = vars.folder
+      as: ex
+    - return: = vars.ex.value.exists
+    join:
+      need: all
+    as_result: exists
+  - set:
+      vars.folders: = vars.exists.results.filter(r, r.ok && r.value).map(r, r.item)
+  - if: size(vars.folders) == 0
+    then:
+    - title: No folder left, an empty complete
+      source: src/vs/workbench/services/search/common/searchService.ts:201-208
+      return:
+        sync_results: = vars.sync
+        async_results:
+          results: []
+          limit_hit: false
+  - set:
+      vars.scheme: = vars.folders[0].substring(0, vars.folders[0].indexOf(':'))
+  - if: '!(vars.scheme in state.text_providers) || !state.text_providers[vars.scheme]'
+    then:
+    - title: No provider registered for the scheme; the search waits for one to register
+      source: src/vs/workbench/services/search/common/searchService.ts:288-306
+      return:
+        sync_results: = vars.sync
+        async_results:
+          results: []
+          limit_hit: false
+          pending: true
+  - set:
+      vars.open_resources: = vars.open_editors.value.results.map(r, r.resource)
+      vars.provider_matches: []
+      vars.fq: '= has(input.query.folder_queries) && size(input.query.folder_queries) > 0 ? input.query.folder_queries : vars.folders.map(f, {''folder'': f})'
+  - title: Query the provider (the extension host's text search over RPC) with the per-folder encodings; its progress reports file matches
+    source: src/vs/workbench/services/search/common/searchService.ts:316-327
+    call: ext-host-search.provide-text-search-results
+    'on': = 'eh' + self.substring(1)
+    stream: true
+    input:
+      scheme: = vars.scheme
+      query: '= merge(input.query, {''folders'': vars.folders})'
+      folder_encodings: '= vars.fq.filter(q, q.folder in vars.folders && has(q.file_encoding) && q.file_encoding != '''').transformMapEntry(i, q, {q.folder: q.file_encoding})'
+    as: provided
+    on_item:
+    - title: RemoteSearchProvider collects every match the provider reports (search.matches)
+      source: src/vs/workbench/api/browser/mainThreadSearch.ts:193-205
+      set:
+        vars.provider_matches: = vars.provider_matches + [vars.item]
+    - if: has(vars.item.resource) && !(vars.item.resource in vars.open_resources)
+      then:
+      - title: onProviderProgress forwards a file match unless an open editor already matched that file
+        source: src/vs/workbench/services/search/common/searchService.ts:141-150
+        yield: = vars.item
+  - title: doSearch's complete is the provider's (the collected matches, limitHit and stats; RemoteSearchProvider.doSearch)
+    source: src/vs/workbench/api/browser/mainThreadSearch.ts:170-183
+    return:
+      sync_results: = vars.sync
+      async_results:
+        results: = vars.provider_matches
+        limit_hit: = has(vars.provided.value.limit_hit) && vars.provided.value.limit_hit
+- component: search-service
+  name: text-search
+  kind: function
+  summary: 'ISearchService.textSearch(query, token, onProgress): runs textSearchSplitSyncAsync, passes every progress item through, and resolves with the async results followed by the open editor results;
+    limitHit if either hit it.'
+  sources:
+  - src/vs/workbench/services/search/common/searchService.ts:82-91
+  - src/vs/workbench/services/search/common/search.ts:264-267
+  request:
+    type: object
+    required:
+    - query
+    properties:
+      query:
+        $ref: SearchTextQuery
+      token:
+        type: object
+        properties:
+          canceled:
+            type: boolean
+            default: false
+  response: SearchComplete
+  errors:
+  - code: canceled
+    status: 0
+    retryable: false
+  behavior:
+  - call: search-service.text-search-split-sync-async
+    stream: true
+    input:
+      query: = input.query
+      token: '= has(input.token) ? input.token : {''canceled'': false}'
+    as: split
+    on_item:
+    - yield: = vars.item
+  - title: Await the async part, then merge the results; limitHit from either part
+    source: src/vs/workbench/services/search/common/searchService.ts:85-90
+    return:
+      results: = vars.split.value.async_results.results + vars.split.value.sync_results.results
+      limit_hit: = vars.split.value.async_results.limit_hit || vars.split.value.sync_results.limit_hit
+- component: search-model
+  name: search
+  kind: function
+  summary: 'SearchModelImpl.search/doSearch: cancels the running search, sets the new query on the result tree (clearing it), starts a CancellationTokenSource, then searches notebooks and text; every progress
+    item lands in the result tree as it arrives. A cancel keeps what arrived.'
+  sources:
+  - src/vs/workbench/contrib/search/browser/searchTreeModel/searchModel.ts:213-260
+  - src/vs/workbench/contrib/search/browser/searchTreeModel/searchModel.ts:155-204
+  request:
+    type: object
+    required:
+    - query
+    properties:
+      query:
+        $ref: SearchTextQuery
+      token:
+        type: object
+        properties:
+          canceled:
+            type: boolean
+            default: false
+  response: SearchComplete
+  behavior:
+  - if: has(state.current_token) && state.current_token != ''
+    then:
+    - title: cancelSearch(true) cancels the search still running
+      source: src/vs/workbench/contrib/search/browser/searchTreeModel/searchModel.ts:219
+      cancel: = state.current_token
+  - title: A new CancellationTokenSource for this search (currentCancelTokenSource)
+    source: src/vs/workbench/contrib/search/browser/searchTreeModel/searchModel.ts:170
+    set:
+      state.searches: = state.searches + 1
+      vars.tok: = 'search-' + self + '-' + string(state.searches + 1)
+  - title: The result tree takes the new query, which clears its matches
+    source: src/vs/workbench/contrib/search/browser/searchTreeModel/searchModel.ts:227
+    set:
+      state.current_token: = vars.tok
+      state.results: []
+      state.limit_hit: false
+  - title: Notebook search first, so text search can skip notebook files
+    source: src/vs/workbench/contrib/search/browser/searchTreeModel/searchModel.ts:172
+    call: notebook-search-service.notebook-search
+    input:
+      query: = input.query
+    as: nb
+  - title: Text search split into open editor (sync) and provider (async) results; onSearchProgress adds each file match to the result tree
+    source: src/vs/workbench/contrib/search/browser/searchTreeModel/searchModel.ts:173-179
+    call: search-service.text-search-split-sync-async
+    stream: true
+    token: = vars.tok
+    input:
+      query: = input.query
+      token: '= has(input.token) ? input.token : {''canceled'': false}'
+    as: text
+    on_item:
+    - title: onSearchProgress adds the file match (one per resource)
+      source: src/vs/workbench/contrib/search/browser/searchTreeModel/searchModel.ts:157-161
+      set:
+        state.results: '= state.results.filter(r, r.resource != vars.item.resource) + [vars.item]'
+    on_error:
+    - if: error.code == 'canceled'
+      then:
+      - title: Canceled; the results already received stay in the tree
+        source: src/vs/workbench/contrib/search/browser/searchTreeModel/searchModel.ts:381-387
+        set:
+          state.current_token: ''
+      - return:
+          results: = state.results
+          limit_hit: = state.limit_hit
+          canceled: true
+    - fail: = error
+  - set:
+      state.results: = state.results + vars.nb.value.results.filter(n, !(n.resource in state.results.map(r, r.resource)))
+      state.limit_hit: = vars.text.value.async_results.limit_hit || vars.text.value.sync_results.limit_hit || vars.nb.value.limit_hit
+      state.current_token: ''
+  - return:
+      results: = state.results
+      limit_hit: = state.limit_hit
+- component: search-model
+  name: cancel-search
+  kind: function
+  summary: 'SearchModelImpl.cancelSearch: cancels the current search''s token when one is running (the provider sees the cancellation); the results already shown stay.'
+  sources:
+  - src/vs/workbench/contrib/search/browser/searchTreeModel/searchModel.ts:381-387
+  request:
+    type: object
+  response:
+    type: object
+    properties:
+      canceled:
+        type: boolean
+  behavior:
+  - if: '!has(state.current_token) || state.current_token == '''''
+    then:
+    - title: No search running, nothing to cancel
+      source: src/vs/workbench/contrib/search/browser/searchTreeModel/searchModel.ts:387
+      return:
+        canceled: false
+  - title: currentCancelTokenSource.cancel()
+    source: src/vs/workbench/contrib/search/browser/searchTreeModel/searchModel.ts:383-385
+    cancel: = state.current_token
+  - set:
+      state.current_token: ''
+  - return:
+      canceled: true
+- component: search-view
+  name: cancel-search
+  kind: function
+  summary: 'SearchView.cancelSearch: asks the view model to cancel the text and AI searches; focuses the search box when something was canceled.'
+  sources:
+  - src/vs/workbench/contrib/search/browser/searchView.ts:1434-1440
+  request:
+    type: object
+  response:
+    type: object
+    properties:
+      canceled:
+        type: boolean
+  behavior:
+  - call: search-model.cancel-search
+    as: c
+  - return:
+      canceled: = vars.c.value.canceled
+- component: search-actions
+  name: cmd-search-action-cancel
+  kind: command
+  summary: 'search.action.cancel: Cancel Search (Escape in the search view) cancels the running search''s token through the search view; results already shown stay.'
+  sources:
+  - src/vs/workbench/contrib/search/browser/searchActionsTopBar.ts:42-52
+  - src/vs/workbench/contrib/search/browser/searchActionsTopBar.ts:282-286
+  attributes:
+    command_id: search.action.cancel
+  request: FilesCommandRequest
+  response:
+    type: object
+    properties:
+      handled:
+        type: boolean
+      result: {}
+  behavior:
+  - title: cancelSearch(accessor) -> SearchView.cancelSearch
+    source: src/vs/workbench/contrib/search/browser/searchActionsTopBar.ts:282-286
+    call: search-view.cancel-search
+    as: res
+  - return:
+      handled: true
+      result: = vars.res.value
+- component: text-search-manager
+  name: search
+  kind: function
+  summary: 'TextSearchManager.search (NativeTextSearchManager in the extension host): builds the provider options per folder query (encoding = toCanonicalName(fileEncoding), maxResults), runs the provider,
+    and forwards each file match through onProgress until maxResults; the match that crosses the limit is trimmed, limitHit is set and the provider''s token is canceled.'
+  sources:
+  - src/vs/workbench/services/search/common/textSearchManager.ts:49-102
+  - src/vs/workbench/services/search/common/textSearchManager.ts:174-182
+  - src/vs/workbench/services/search/node/textSearchManager.ts:12-19
+  request:
+    type: object
+    required:
+    - query
+    properties:
+      query:
+        $ref: SearchTextQuery
+      token_name:
+        type: string
+        default: ''
+  response:
+    type: object
+    properties:
+      limit_hit:
+        type: boolean
+      folder_options:
+        type: array
+        items:
+          type: object
+      stats:
+        type: object
+  behavior:
+  - set:
+      vars.max: '= has(input.query.max_results) ? input.query.max_results : 20000'
+      vars.fq: '= has(input.query.folder_queries) && size(input.query.folder_queries) > 0 ? input.query.folder_queries : input.query.folders.map(f, {''folder'': f})'
+      vars.count: 0
+      vars.limit_hit: false
+  - set:
+      vars.canon: '= {''shiftjis'': ''shift-jis'', ''utf16le'': ''utf-16le'', ''utf16be'': ''utf-16be'', ''big5hkscs'': ''big5-hkscs'', ''eucjp'': ''euc-jp'', ''euckr'': ''euc-kr'', ''koi8r'': ''koi8-r'', ''koi8u'': ''koi8-u'', ''macroman'': ''x-mac-roman'', ''utf8bom'': ''utf8''}'
+  - title: 'getSearchOptionsForFolder: encoding = toCanonicalName(fileEncoding) (windowsNNNN -> windows-NNNN, shiftjis -> shift-jis, utf16le -> utf-16le, ...)'
+    source: src/vs/workbench/services/search/common/textSearchManager.ts:223
+    set:
+      vars.folder_options: '= vars.fq.map(q, {''folder'': q.folder, ''encoding'': !has(q.file_encoding) || q.file_encoding == '''' ? '''' : (matches(q.file_encoding, ''windows[0-9]+'') ? ''windows-'' + replace(q.file_encoding,
+        ''^.*windows([0-9]+).*$'', ''$1'') : (q.file_encoding in vars.canon ? vars.canon[q.file_encoding] : q.file_encoding))})'
+  - title: provider.provideTextSearchResults(query, {folderOptions, maxResults}, progress, token)
+    source: src/vs/workbench/services/search/common/textSearchManager.ts:186-188
+    call: ripgrep-text-search-engine.provide-text-search-results
+    stream: true
+    input:
+      query:
+        pattern: = input.query.pattern
+        is_case_sensitive: = has(input.query.is_case_sensitive) && input.query.is_case_sensitive
+      options:
+        folder_options: = vars.folder_options
+        max_results: = vars.max
+      token_name: = input.token_name
+    as: rg
+    on_item:
+    - if: vars.limit_hit
+      then:
+      - title: Results after the limit are dropped (isCanceled)
+        source: src/vs/workbench/services/search/common/textSearchManager.ts:62-64
+        return:
+          limit_hit: true
+          folder_options: = vars.folder_options
+          stats:
+            type: textSearchProvider
+    - if: vars.count + vars.item.matches > vars.max
+      then:
+      - title: 'Crossing maxResults: limit hit, trim the match to what is left, cancel the provider''s token'
+        source: src/vs/workbench/services/search/common/textSearchManager.ts:66-74
+        set:
+          vars.limit_hit: true
+          vars.item: '= {''resource'': vars.item.resource, ''matches'': vars.max - vars.count}'
+    - set:
+        vars.count: = vars.count + vars.item.matches
+    - if: vars.item.matches > 0
+      then:
+      - title: The collector reports the file match through onProgress
+        source: src/vs/workbench/services/search/common/textSearchManager.ts:76-81
+        yield: = vars.item
+  - title: limitHit from the manager or the provider; stats type
+    source: src/vs/workbench/services/search/common/textSearchManager.ts:87-97
+    return:
+      limit_hit: = vars.limit_hit || (has(vars.rg.value.limit_hit) && vars.rg.value.limit_hit)
+      folder_options: = vars.folder_options
+      stats:
+        type: textSearchProvider
+- component: ripgrep-text-search-engine
+  name: provide-text-search-results
+  kind: function
+  summary: 'RipgrepTextSearchEngine.provideTextSearchResults: one rg process per folder; the parser reports each file''s matches as progress and, once it has counted maxResults, emits hitLimit, which kills
+    rg and resolves {limitHit: true}. An empty pattern returns at once; a canceled token kills rg.'
+  sources:
+  - src/vs/workbench/services/search/node/ripgrepTextSearchEngine.ts:29-51
+  - src/vs/workbench/services/search/node/ripgrepTextSearchEngine.ts:53-173
+  request:
+    type: object
+    required:
+    - query
+    - options
+    properties:
+      query:
+        type: object
+        properties:
+          pattern:
+            type: string
+            examples:
+            - add
+          is_case_sensitive:
+            type: boolean
+            default: false
+      options:
+        type: object
+        properties:
+          folder_options:
+            type: array
+            items:
+              type: object
+              properties:
+                folder:
+                  type: string
+                  examples:
+                  - file:///work/app
+                encoding:
+                  type: string
+                files:
+                  type: array
+                  items:
+                    type: string
+          max_results:
+            type: integer
+            default: 20000
+      token_name:
+        type: string
+        default: ''
+  response:
+    type: object
+    properties:
+      limit_hit:
+        type: boolean
+  behavior:
+  - if: input.query.pattern == ''
+    then:
+    - title: No pattern, nothing to search
+      source: src/vs/workbench/services/search/node/ripgrepTextSearchEngine.ts:63-65
+      return:
+        limit_hit: false
+  - set:
+      vars.num: 0
+      vars.limit_hit: false
+      vars.max: '= has(input.options.max_results) ? input.options.max_results : 20000'
+      vars.pattern: '= input.query.is_case_sensitive ? input.query.pattern : input.query.pattern.lowerAscii()'
+  - title: One rg run per folder option (Promise.all over folderOptions); the walk visits the folder's files
+    source: src/vs/workbench/services/search/node/ripgrepTextSearchEngine.ts:30-40
+    foreach: = input.options.folder_options
+    as: fo
+    steps:
+    - foreach: '= has(vars.fo.files) ? vars.fo.files : [''src/main.ts'', ''src/util.ts'', ''README.md'', ''package.json'']'
+      as: rel
+      steps:
+      - if: vars.limit_hit || (has(input.token_name) && input.token_name != '' && canceled(input.token_name))
+        then:
+        - title: hitLimit or token cancellation called cancel(), which kills rg; no more output
+          source: src/vs/workbench/services/search/node/ripgrepTextSearchEngine.ts:109-121
+          continue: true
+      - title: rg reads the file (one JSON line per match on stdout)
+        source: src/vs/workbench/services/search/node/ripgrepTextSearchEngine.ts:124-130
+        call: disk.read-file
+        input:
+          resource: = vars.fo.folder + '/' + vars.rel
+        as: f
+        on_error: continue
+      - if: '!vars.f.ok || !has(vars.f.value.content)'
+        then:
+        - continue: true
+      - wait: 5
+      - set:
+          vars.n: '= size((input.query.is_case_sensitive ? vars.f.value.content : vars.f.value.content.lowerAscii()).split(vars.pattern)) - 1'
+      - if: vars.n == 0
+        then:
+        - continue: true
+      - if: vars.num + vars.n >= vars.max
+        then:
+        - title: The parser counts submatches; reaching maxResults sets hitLimit after finishing the line
+          source: src/vs/workbench/services/search/node/ripgrepTextSearchEngine.ts:381-389
+          set:
+            vars.limit_hit: true
+            vars.n: = vars.max - vars.num
+      - set:
+          vars.num: = vars.num + vars.n
+      - title: ripgrepParser 'result' -> progress.report(match)
+        source: src/vs/workbench/services/search/node/ripgrepTextSearchEngine.ts:99-106
+        yield: '= {''resource'': vars.fo.folder + ''/'' + vars.rel, ''matches'': vars.n}'
+  - title: rg closed (or was killed on hitLimit); resolve {limitHit}
+    source: src/vs/workbench/services/search/node/ripgrepTextSearchEngine.ts:148-171
+    return:
+      limit_hit: = vars.limit_hit
+- component: workspace-symbol-provider-registry
+  name: register
+  kind: function
+  summary: 'WorkspaceSymbolProviderRegistry.register: adds a workspace symbol provider (the main thread registers one proxy per extension provider in $registerNavigateTypeSupport).'
+  sources:
+  - src/vs/workbench/contrib/search/common/search.ts:60-79
+  request:
+    type: object
+    required:
+    - handle
+    properties:
+      handle:
+        type: integer
+        examples:
+        - 1
+      extension_id:
+        type: string
+        examples:
+        - vscode.typescript-language-features
+  response:
+    type: object
+    properties:
+      count:
+        type: integer
+  behavior:
+  - set:
+      state.providers: '= state.providers + [{''handle'': input.handle, ''extension_id'': has(input.extension_id) ? input.extension_id : ''''}]'
+  - return:
+      count: = size(state.providers)
+- component: workspace-symbol-provider-registry
+  name: get-workspace-symbols
+  kind: function
+  summary: 'getWorkspaceSymbols(query, token): asks every registered provider at once (Promise.all); a provider error is swallowed (onUnexpectedExternalError); a canceled token yields []; results are
+    sorted and de-duplicated.'
+  sources:
+  - src/vs/workbench/contrib/search/common/search.ts:88-130
+  - src/vs/workbench/contrib/search/common/search.ts:81-83
+  request:
+    type: object
+    required:
+    - query
+    properties:
+      query:
+        type: string
+        examples:
+        - add
+      token:
+        type: object
+        properties:
+          canceled:
+            type: boolean
+            default: false
+  response:
+    type: object
+    properties:
+      symbols:
+        type: array
+        items:
+          type: object
+      provider_count:
+        type: integer
+  behavior:
+  - if: size(state.providers) == 0
+    then:
+    - return:
+        symbols: []
+        provider_count: 0
+  - title: provider.provideWorkspaceSymbols for every provider (MainThreadLanguageFeatures proxies it as $provideWorkspaceSymbols to the extension host)
+    source: src/vs/workbench/contrib/search/common/search.ts:92-104
+    parallel: = state.providers
+    as: p
+    steps:
+    - call: ext-host-language-features.provide-workspace-symbols
+      'on': = 'eh' + self.substring(1)
+      input:
+        handle: = vars.p.handle
+        search: = input.query
+        token:
+          canceled: false
+      as: r
+      on_error:
+      - title: onUnexpectedExternalError, the provider adds nothing
+        source: src/vs/workbench/contrib/search/common/search.ts:101-103
+        return: []
+    - return: '= has(vars.r.value.symbols) ? vars.r.value.symbols : []'
+    join:
+      need: all
+    as_result: all
+  - if: has(input.token) && input.token.canceled
+    then:
+    - title: A canceled token returns no symbols
+      source: src/vs/workbench/contrib/search/common/search.ts:108-110
+      return:
+        symbols: []
+        provider_count: = size(state.providers)
+  - return:
+      symbols: = vars.all.results.filter(x, x.ok).map(x, x.value).flatten()
+      provider_count: = size(state.providers)
+- component: search-actions
+  name: cmd-executeworkspacesymbolprovider
+  kind: command
+  summary: '_executeWorkspaceSymbolProvider (API command behind vscode.executeWorkspaceSymbolProvider): asserts the query is a string, runs getWorkspaceSymbols over the registered providers and returns
+    the symbols.'
+  sources:
+  - src/vs/workbench/contrib/search/browser/search.contribution.ts:242-247
+  attributes:
+    command_id: _executeWorkspaceSymbolProvider
+  request: FilesCommandRequest
+  response:
+    type: object
+    properties:
+      handled:
+        type: boolean
+      result: {}
+  errors:
+  - code: unexpected-type
+    status: 0
+    retryable: false
+  behavior:
+  - set:
+      vars.args: '= has(input.args) ? input.args : []'
+  - if: size(vars.args) == 0 || type(vars.args[0]) != string
+    then:
+    - title: assertType(typeof query === 'string') throws
+      source: src/vs/workbench/contrib/search/browser/search.contribution.ts:244
+      fail:
+        code: unexpected-type
+        message: Unexpected type
+  - title: getWorkspaceSymbols(query), then the symbols
+    source: src/vs/workbench/contrib/search/browser/search.contribution.ts:245-246
+    call: workspace-symbol-provider-registry.get-workspace-symbols
+    input:
+      query: = vars.args[0]
+    as: res
+  - return:
+      handled: true
+      result: = vars.res.value.symbols

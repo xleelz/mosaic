@@ -1,0 +1,431 @@
+components:
+  - id: vscode-api
+    name: vscode API (extension host)
+    kind: module
+    layer: extensions
+    parent: exthost-runtime
+    summary: "The vscode.* API implementation in the extension host; owned by exthost, stubbed here."
+    sources: ["src/vscode-dts/vscode.d.ts"]
+    attributes: {boundary: true, owner: exthost}
+
+interfaces:
+  # ---------------------------------------------------------------- git-binary (external, owned here)
+  - component: git-binary
+    name: exec
+    kind: process
+    summary: "One run of the git executable: argv, working directory and stdin. Models the repository at state.root: HEAD, staged, modified, untracked and conflicted paths, user config and an index.lock that fails the next N writes."
+    sources: ["extensions/git/src/git.ts:684-700"]
+    request: GitExecRequest
+    response: GitExecResult
+    errors: [{code: nonzero-exit, status: 0, retryable: false}, {code: enoent, status: 0, retryable: false}]
+    latency_ms: {min: 5, max: 30}
+    behavior:
+      - set:
+          vars.seed_root: "= has(state.repositories) && size(state.repositories) > 0 ? state.repositories.map(k, k)[0] : '/work/app'"
+      - set:
+          vars.seed: "= has(state.repositories) && vars.seed_root in state.repositories ? state.repositories[vars.seed_root] : {}"
+      - title: The repository base-workspace seeds (git-binary.repositories), flattened; fields a scenario sets win
+        set:
+          state.installed: "= has(state.installed) ? state.installed : true"
+          state.version: "= has(state.version) ? state.version : '2.47.1'"
+          state.root: "= has(state.root) ? state.root : vars.seed_root"
+          state.branch: "= has(state.branch) ? state.branch : (has(vars.seed.head) ? vars.seed.head : 'main')"
+          state.head_commit: "= has(state.head_commit) ? state.head_commit : 'c1'"
+          state.commits: "= has(state.commits) ? state.commits : 1"
+          state.staged: "= has(state.staged) ? state.staged : (has(vars.seed.staged) ? vars.seed.staged : [])"
+          state.modified: "= has(state.modified) ? state.modified : (has(vars.seed.changes) ? vars.seed.changes : [])"
+          state.untracked: "= has(state.untracked) ? state.untracked : []"
+          state.conflicted: "= has(state.conflicted) ? state.conflicted : []"
+          state.user_name: "= has(state.user_name) ? state.user_name : (has(vars.seed.user) ? vars.seed.user.name : 'dev')"
+          state.user_email: "= has(state.user_email) ? state.user_email : (has(vars.seed.user) ? vars.seed.user.email : 'dev@example.com')"
+          state.locked_attempts: "= has(state.locked_attempts) ? state.locked_attempts : 0"
+          state.editor_message: "= has(state.editor_message) ? state.editor_message : 'Edited in COMMIT_EDITMSG'"
+          state.last_message: "= has(state.last_message) ? state.last_message : ''"
+      - set: {vars.cmd: "= input.args[0] == '-c' ? input.args[2] : input.args[0]"}
+      - if: "vars.cmd == '--version'"
+        then:
+          - if: "!state.installed"
+            then:
+              - fail: {code: enoent, message: spawn git ENOENT}
+          - return: {exit_code: 0, stdout: "= 'git version ' + state.version"}
+      - if: "!(input.cwd == state.root || input.cwd.startsWith(state.root + '/'))"
+        then:
+          - fail: {code: nonzero-exit, message: "fatal: not a git repository (or any of the parent directories): .git", data: {exit_code: 128}}
+      - if: "vars.cmd in ['add', 'commit'] && state.locked_attempts > 0"
+        then:
+          - set: {state.locked_attempts: "= state.locked_attempts - 1"}
+          - fail: {code: nonzero-exit, message: "fatal: Unable to create '/work/app/.git/index.lock': File exists.\n\nAnother git process seems to be running in this repository", data: {exit_code: 128}}
+      - if: "vars.cmd == 'rev-parse'"
+        then:
+          - return: {exit_code: 0, stdout: "= state.root"}
+      - if: "vars.cmd == 'status'"
+        then:
+          - return: {exit_code: 0, stdout: "", staged: "= state.staged", modified: "= state.modified", untracked: "= state.untracked", conflicted: "= state.conflicted"}
+      - if: "vars.cmd == 'symbolic-ref' && state.branch == ''"
+        then:
+          - fail: {code: nonzero-exit, message: "fatal: ref HEAD is not a symbolic ref", data: {exit_code: 128}}
+      - if: "vars.cmd == 'symbolic-ref' || vars.cmd == 'for-each-ref'"
+        then:
+          - return: {exit_code: 0, stdout: "= state.branch", branch: "= state.branch", commit: "= state.head_commit"}
+      - if: "vars.cmd == 'add'"
+        then:
+          - set:
+              vars.paths: "= input.args.slice(3, size(input.args))"
+              vars.cands: "= input.args[1] == '-u' ? state.modified + state.conflicted : state.modified + state.untracked + state.conflicted"
+          - set: {vars.sel: "= vars.paths == ['.'] ? vars.cands : vars.cands.filter(p, p in vars.paths)"}
+          - set:
+              state.staged: "= state.staged + vars.sel.filter(p, !(p in state.staged))"
+              state.modified: "= state.modified.filter(p, !(p in vars.sel))"
+              state.untracked: "= state.untracked.filter(p, !(p in vars.sel))"
+              state.conflicted: "= state.conflicted.filter(p, !(p in vars.sel))"
+          - return: {exit_code: 0, stdout: ""}
+      - if: "vars.cmd == 'commit'"
+        then:
+          - if: "'user.useConfigOnly=true' in input.args && (state.user_name == '' || state.user_email == '')"
+            then:
+              - fail: {code: nonzero-exit, message: "Author identity unknown\n\n*** Please tell me who you are.", data: {exit_code: 128}}
+          - if: "size(state.conflicted) > 0"
+            then:
+              - fail: {code: nonzero-exit, message: "error: Committing is not possible because you have unmerged files.", data: {exit_code: 128}}
+          - set: {vars.to_commit: "= state.staged + ('--all' in input.args ? state.modified : [])"}
+          - if: "size(vars.to_commit) == 0 && !('--allow-empty' in input.args) && !('--amend' in input.args)"
+            then:
+              - fail: {code: nonzero-exit, message: "nothing to commit, working tree clean", data: {exit_code: 1}}
+          - set: {vars.message: "= '--file' in input.args ? input.input : state.editor_message"}
+          - if: "vars.message == '' && !('--allow-empty-message' in input.args)"
+            then:
+              - fail: {code: nonzero-exit, message: "Aborting commit due to empty commit message.", data: {exit_code: 1}}
+          - set:
+              state.commits: "= state.commits + 1"
+              state.head_commit: "= 'c' + string(state.commits + 1)"
+              state.staged: []
+              state.modified: "= '--all' in input.args ? [] : state.modified"
+              state.last_message: "= vars.message"
+          - return: {exit_code: 0, stdout: ""}
+      - if: "vars.cmd == 'config'"
+        then:
+          - set: {vars.value: "= input.args[2] == 'user.name' ? state.user_name : state.user_email"}
+          - if: "vars.value == ''"
+            then:
+              - fail: {code: nonzero-exit, message: "", data: {exit_code: 1}}
+          - return: {exit_code: 0, stdout: "= vars.value"}
+      - return: {exit_code: 0, stdout: ""}
+
+  # ---------------------------------------------------------------- language-server (external, owned here)
+  - component: language-server
+    name: start
+    kind: process
+    summary: "Spawn a language server process: tsserver (syntax, semantic or main) or the Markdown language server worker over IPC."
+    sources: ["extensions/typescript-language-features/src/tsServer/spawner.ts:130-161"]
+    request: {type: object, properties: {server: {type: string, enum: [tsserver, markdown]}, kind: {type: string}}}
+    latency_ms: {min: 50, max: 200}
+    behavior:
+      - set: {state.processes: "= has(state.processes) ? state.processes : []", state.spawns: "= has(state.spawns) ? state.spawns : 0", state.requests: "= has(state.requests) ? state.requests : []"}
+      - set: {state.processes: "= state.processes + [input.server + ':' + input.kind]", state.spawns: "= state.spawns + 1"}
+      - return: {pid: "= state.spawns"}
+  - component: language-server
+    name: request
+    kind: rpc
+    summary: "A request to a running server (tsserver protocol over stdio); refused when the server has no process."
+    sources: ["extensions/typescript-language-features/src/tsServer/server.ts:228-240"]
+    request: {type: object, properties: {server: {type: string, default: tsserver}, command: {type: string, examples: [quickinfo]}, args: {type: object}}}
+    response: {type: object, properties: {body: {type: object}}}
+    latency_ms: {min: 2, max: 40}
+    errors: [{code: server-not-running, status: 0, retryable: false}]
+    behavior:
+      - set: {state.processes: "= has(state.processes) ? state.processes : []", state.requests: "= has(state.requests) ? state.requests : []"}
+      - if: "!state.processes.exists(p, p.startsWith(input.server + ':'))"
+        then:
+          - fail: {code: server-not-running, message: no server process}
+      - set: {state.requests: "= state.requests + [input.command]"}
+      - return: {body: {}}
+  - component: language-server
+    name: kill
+    kind: process
+    summary: "Kill the server's processes."
+    sources: ["extensions/typescript-language-features/src/tsServer/server.ts:143-146"]
+    request: {type: object, properties: {server: {type: string, default: tsserver}}}
+    behavior:
+      - set: {state.processes: "= (has(state.processes) ? state.processes : []).filter(p, !p.startsWith(input.server + ':'))"}
+
+  # ---------------------------------------------------------------- vscode-api boundary stubs (owner exthost)
+  - component: vscode-api
+    name: window-create-output-channel
+    kind: rpc
+    summary: "window.createOutputChannel"
+    sources: ["src/vscode-dts/vscode.d.ts"]
+    attributes: {boundary: true, owner: exthost}
+    request: {type: object, properties: {name: {type: string}, log: {type: boolean}}}
+  - component: vscode-api
+    name: commands-register-command
+    kind: rpc
+    summary: "commands.registerCommand"
+    sources: ["src/vscode-dts/vscode.d.ts"]
+    attributes: {boundary: true, owner: exthost}
+    request: {type: object, properties: {command_id: {type: string}}}
+  - component: vscode-api
+    name: commands-execute-command
+    kind: rpc
+    summary: "commands.executeCommand"
+    sources: ["src/vscode-dts/vscode.d.ts"]
+    attributes: {boundary: true, owner: exthost}
+    request: {type: object, properties: {command_id: {type: string}, args: {type: array}}}
+  - component: vscode-api
+    name: window-show-warning-message
+    kind: rpc
+    summary: "window.showWarningMessage"
+    sources: ["src/vscode-dts/vscode.d.ts"]
+    attributes: {boundary: true, owner: exthost}
+    request: {type: object, properties: {message: {type: string}, modal: {type: boolean}, items: {type: array, items: {type: string}}}}
+  - component: vscode-api
+    name: window-show-error-message
+    kind: rpc
+    summary: "window.showErrorMessage"
+    sources: ["src/vscode-dts/vscode.d.ts"]
+    attributes: {boundary: true, owner: exthost}
+    request: {type: object, properties: {message: {type: string}, modal: {type: boolean}, items: {type: array, items: {type: string}}}}
+  - component: vscode-api
+    name: window-show-information-message
+    kind: rpc
+    summary: "window.showInformationMessage"
+    sources: ["src/vscode-dts/vscode.d.ts"]
+    attributes: {boundary: true, owner: exthost}
+    request: {type: object, properties: {message: {type: string}, modal: {type: boolean}, items: {type: array, items: {type: string}}}}
+  - component: vscode-api
+    name: workspace-workspace-folders
+    kind: rpc
+    summary: "workspace.workspaceFolders (read here as their URIs)"
+    sources: ["src/vscode-dts/vscode.d.ts"]
+    attributes: {boundary: true, owner: exthost}
+    response: {type: array, items: {type: string}, examples: [["file:///work/app"]]}
+  - component: vscode-api
+    name: workspace-create-file-system-watcher
+    kind: rpc
+    summary: "workspace.createFileSystemWatcher"
+    sources: ["src/vscode-dts/vscode.d.ts"]
+    attributes: {boundary: true, owner: exthost}
+    request: {type: object, properties: {glob_pattern: {type: string}}}
+  - component: vscode-api
+    name: workspace-request-resource-trust
+    kind: rpc
+    summary: "workspace.requestResourceTrust (proposed API)"
+    sources: ["src/vscode-dts/vscode.proposed.resolvers.d.ts"]
+    attributes: {boundary: true, owner: exthost}
+    request: {type: object, properties: {uri: {type: string}, message: {type: string}}}
+    response: {type: object, properties: {trusted: {type: boolean, default: true}}}
+  - component: vscode-api
+    name: scm-create-source-control
+    kind: rpc
+    summary: "scm.createSourceControl"
+    sources: ["src/vscode-dts/vscode.d.ts"]
+    attributes: {boundary: true, owner: exthost}
+    request: {type: object, properties: {id: {type: string}, label: {type: string}, root_uri: {type: string}}}
+  - component: vscode-api
+    name: text-document-save
+    kind: rpc
+    summary: "TextDocument.save"
+    sources: ["src/vscode-dts/vscode.d.ts"]
+    attributes: {boundary: true, owner: exthost}
+    request: {type: object, properties: {uri: {type: string}}}
+  - component: vscode-api
+    name: workspace-configuration-update
+    kind: rpc
+    summary: "WorkspaceConfiguration.update (from workspace.getConfiguration)"
+    sources: ["src/vscode-dts/vscode.d.ts"]
+    attributes: {boundary: true, owner: exthost}
+    request: {type: object, properties: {section: {type: string}, value: {}, global: {type: boolean}}}
+  - component: vscode-api
+    name: extensions-get-extension
+    kind: rpc
+    summary: "extensions.getExtension (read here as found or not)"
+    sources: ["src/vscode-dts/vscode.d.ts"]
+    attributes: {boundary: true, owner: exthost}
+    request: {type: object, properties: {extension_id: {type: string}}}
+    response: {type: object, properties: {found: {type: boolean, default: false}}}
+  - component: vscode-api
+    name: workspace-text-documents
+    kind: rpc
+    summary: "workspace.textDocuments (read here as uri and language id)"
+    sources: ["src/vscode-dts/vscode.d.ts"]
+    attributes: {boundary: true, owner: exthost}
+    response: {type: array, items: {type: object, properties: {uri: {type: string}, language_id: {type: string}}}, examples: [[{uri: "file:///work/app/src/main.ts", language_id: typescript}]]}
+  - component: vscode-api
+    name: window-register-custom-editor-provider
+    kind: rpc
+    summary: "window.registerCustomEditorProvider"
+    sources: ["src/vscode-dts/vscode.d.ts"]
+    attributes: {boundary: true, owner: exthost}
+    request: {type: object, properties: {view_type: {type: string}}}
+  - component: vscode-api
+    name: window-create-webview-panel
+    kind: rpc
+    summary: "window.createWebviewPanel"
+    sources: ["src/vscode-dts/vscode.d.ts"]
+    attributes: {boundary: true, owner: exthost}
+    request: {type: object, properties: {view_type: {type: string}, title: {type: string}, column: {type: string}}}
+  - component: vscode-api
+    name: window-show-text-document
+    kind: rpc
+    summary: "window.showTextDocument"
+    sources: ["src/vscode-dts/vscode.d.ts"]
+    attributes: {boundary: true, owner: exthost}
+    request: {type: object, properties: {uri: {type: string}}}
+
+schemas:
+  - id: BuiltinCommandRequest
+    summary: "A command invocation reaching a built-in extension's registered callback."
+    schema:
+      type: object
+      required: [command_id]
+      properties:
+        command_id: {type: string, examples: [git.refresh]}
+        args: {type: array, default: []}
+  - id: GitExecRequest
+    schema:
+      type: object
+      required: [args, cwd]
+      properties:
+        args: {type: array, items: {type: string}, examples: [[status, -z, -uall]]}
+        cwd: {type: string, default: "/work/app"}
+        input: {type: string, default: ""}
+  - id: GitExecResult
+    schema:
+      type: object
+      properties:
+        exit_code: {type: integer, default: 0}
+        stdout: {type: string}
+  - id: GitCommitRequest
+    schema:
+      type: object
+      properties:
+        root: {type: string, default: "/work/app"}
+        message: {type: string, default: "Update main.ts"}
+        all: {type: boolean, default: false}
+        amend: {type: boolean, default: false}
+        use_editor: {type: boolean, default: false}
+        empty: {type: boolean, default: false}
+        require_user_config: {type: boolean, default: true}
+  - id: GitRepositoryCommitRequest
+    schema:
+      type: object
+      properties:
+        message: {type: string, default: ""}
+        all: {}
+        amend: {type: boolean, default: false}
+        use_editor: {type: boolean, default: false}
+        empty: {type: boolean, default: false}
+  - id: GitRunRequest
+    schema:
+      type: object
+      required: [operation]
+      properties:
+        operation: {type: string, examples: [Status]}
+        read_only: {type: boolean, default: false}
+        resources: {type: array, items: {type: string}}
+        update: {type: boolean}
+        message: {type: string}
+        all: {}
+        amend: {type: boolean}
+        use_editor: {type: boolean}
+        empty: {type: boolean}
+        subcommand: {type: string}
+  - id: GitResourceGroups
+    schema:
+      type: object
+      properties:
+        root: {type: string}
+        index: {type: array, items: {type: string}}
+        working_tree: {type: array, items: {type: string}}
+        untracked: {type: array, items: {type: string}}
+        merge: {type: array, items: {type: string}}
+        head: {type: object}
+        input_box_value: {type: string}
+  - id: GitRepositoryState
+    schema:
+      type: [object, "null"]
+      properties:
+        HEAD: {type: object}
+        indexChanges: {type: array}
+        workingTreeChanges: {type: array}
+        mergeChanges: {type: array}
+  - id: TsExecuteRequest
+    schema:
+      type: object
+      required: [command]
+      properties:
+        command: {type: string, examples: [quickinfo]}
+        args: {type: object}
+        token: {type: object, properties: {canceled: {type: boolean, default: false}}}
+  - id: TsServerResponse
+    schema:
+      type: object
+      properties:
+        type: {type: string, enum: [response, noServer, cancelled]}
+        success: {type: boolean}
+        body: {type: object}
+
+configs:
+  - {id: git-enabled, type: boolean, value: true, default: true, summary: "git.enabled. Extension settings come from contributes.configuration; product.json does not override them.", sources: ["extensions/git/package.json:3289", "extensions/git/src/main.ts:209-210"], attributes: {key: git.enabled}}
+  - {id: git-autorefresh, type: boolean, value: true, default: true, summary: git.autorefresh, sources: ["extensions/git/package.json:3328", "extensions/git/src/repository.ts:3341"], attributes: {key: git.autorefresh}}
+  - {id: git-status-limit, type: integer, value: 10000, default: 10000, summary: "git.statusLimit (entries)", sources: ["extensions/git/package.json:4019", "extensions/git/src/repository.ts:3120"], attributes: {key: git.statusLimit}}
+  - {id: git-untracked-changes, type: string, value: mixed, default: mixed, summary: git.untrackedChanges, sources: ["extensions/git/package.json:3925", "extensions/git/src/repository.ts:3117"], attributes: {key: git.untrackedChanges}}
+  - {id: git-enable-smart-commit, type: boolean, value: false, default: false, summary: git.enableSmartCommit, sources: ["extensions/git/package.json:3543", "extensions/git/src/commands.ts:2387"], attributes: {key: git.enableSmartCommit}}
+  - {id: git-suggest-smart-commit, type: boolean, value: true, default: true, summary: git.suggestSmartCommit, sources: ["extensions/git/package.json:3563", "extensions/git/src/commands.ts:2428"], attributes: {key: git.suggestSmartCommit}}
+  - {id: git-smart-commit-changes, type: string, value: all, default: all, summary: git.smartCommitChanges, sources: ["extensions/git/package.json:3557", "extensions/git/src/commands.ts:2477"], attributes: {key: git.smartCommitChanges}}
+  - {id: git-use-editor-as-commit-input, type: boolean, value: true, default: true, summary: "git.useEditorAsCommitInput: with an empty input box the commit opens the git editor instead of an input box", sources: ["extensions/git/package.json:3531", "extensions/git/src/commands.ts:2468"], attributes: {key: git.useEditorAsCommitInput}}
+  - {id: git-require-git-user-config, type: boolean, value: true, default: true, summary: "git.requireGitUserConfig (adds -c user.useConfigOnly=true)", sources: ["extensions/git/package.json:3932", "extensions/git/src/repository.ts:1472-1475"], attributes: {key: git.requireGitUserConfig}}
+  - {id: git-optimistic-update, type: boolean, value: true, default: true, summary: git.optimisticUpdate, sources: ["extensions/git/package.json:4055", "extensions/git/src/repository.ts:3483-3486"], attributes: {key: git.optimisticUpdate}}
+  - {id: git-auto-repository-detection, type: boolean, value: true, default: true, summary: "git.autoRepositoryDetection (true, false, subFolders or openEditors)", sources: ["extensions/git/package.json:3323", "extensions/git/src/model.ts:318"], attributes: {key: git.autoRepositoryDetection}}
+  - {id: git-open-repository-in-parent-folders, type: string, value: prompt, default: prompt, summary: git.openRepositoryInParentFolders, sources: ["extensions/git/package.json:4074", "extensions/git/src/model.ts:632"], attributes: {key: git.openRepositoryInParentFolders}}
+  - {id: git-ignore-missing-git-warning, type: boolean, value: false, default: false, summary: git.ignoreMissingGitWarning, sources: ["extensions/git/package.json:3502", "extensions/git/src/main.ts:160-161"], attributes: {key: git.ignoreMissingGitWarning}}
+  - {id: git-allow-no-verify-commit, type: boolean, value: false, default: false, summary: git.allowNoVerifyCommit, sources: ["extensions/git/package.json:3878", "extensions/git/src/commands.ts:2508"], attributes: {key: git.allowNoVerifyCommit}}
+  - {id: js-ts-experimental-use-tsgo, type: boolean, value: false, default: false, summary: "js/ts.experimental.useTsgo (falls back to typescript.experimental.useTsgo)", sources: ["extensions/typescript-language-features/package.json:169-171", "extensions/typescript-language-features/src/extension.ts:62-64"], attributes: {key: js/ts.experimental.useTsgo}}
+  - {id: js-ts-tsserver-use-syntax-server, type: string, value: auto, default: auto, summary: "js/ts.tsserver.useSyntaxServer (falls back to typescript.tsserver.useSyntaxServer)", sources: ["extensions/typescript-language-features/package.json:2504-2508", "extensions/typescript-language-features/src/configuration/configuration.ts:243-250"], attributes: {key: js/ts.tsserver.useSyntaxServer}}
+  - {id: js-ts-tsserver-log, type: string, value: "off", default: "off", summary: "js/ts.tsserver.log (falls back to typescript.tsserver.log)", sources: ["extensions/typescript-language-features/package.json:2783", "extensions/typescript-language-features/src/typescriptServiceClient.ts:552"], attributes: {key: js/ts.tsserver.log}}
+  - {id: url-protocol, type: string, value: code-oss, summary: "product.json urlProtocol, seen by extensions as vscode.env.uriScheme. The OSS build deploys code-oss; Stable ships vscode.", sources: ["product.json:37", "extensions/typescript-language-features/src/typescriptServiceClient.ts:707"], attributes: {boundary: true, owner: platform-core, key: urlProtocol}}
+
+flows:
+  - id: git-activate
+    name: git extension activation
+    tags: [writes]
+    sources: ["extensions/git/src/main.ts:258-264", "extensions/git/package.json:51-56"]
+    entry: {caller: exthost-runtime, interface: git-extension.activate, input: {extension_id: vscode.git, activation_event: "*"}}
+  - id: git-command
+    name: A git command through createCommand
+    tags: [writes]
+    sources: ["extensions/git/src/commands.ts:5527-5552"]
+    entry: {caller: user, interface: git-command-center.run-command, input: {command_id: git.refresh, args: []}}
+  - id: git-file-change-refresh
+    name: A file change refreshes git status
+    tags: [writes]
+    sources: ["extensions/git/src/repository.ts:3339-3371"]
+    entry: {caller: exthost-runtime, interface: git-repository.on-file-change, input: {uri: "file:///work/app/src/main.ts"}}
+  - id: git-api-repository-state
+    name: git.api.getRepositoryState
+    sources: ["extensions/git/src/api/api1.ts:592-620"]
+    entry: {caller: user, interface: git-extension.cmd-git-api-getrepositorystate, input: {command_id: git.api.getRepositoryState, args: ["file:///work/app"]}}
+  - id: typescript-activate
+    name: TypeScript extension activation
+    tags: [writes]
+    sources: ["extensions/typescript-language-features/src/extension.ts:32-110"]
+    entry: {caller: exthost-runtime, interface: typescript-extension.activate, input: {extension_id: vscode.typescript-language-features, activation_event: "onLanguage:typescript"}}
+  - id: typescript-open-document
+    name: A document opens and may start tsserver
+    tags: [writes]
+    sources: ["extensions/typescript-language-features/src/lazyClientHost.ts:64-87"]
+    entry: {caller: exthost-runtime, interface: lazy-client-host.maybe-activate, input: {uri: "file:///work/app/src/main.ts", language_id: typescript}}
+  - id: typescript-server-exit
+    name: tsserver exits
+    tags: [writes]
+    sources: ["extensions/typescript-language-features/src/typescriptServiceClient.ts:491-524"]
+    entry: {caller: language-server, interface: typescript-service-client.on-exit, input: {code: 1, signal: "", token: 1}}
+  - id: markdown-activate
+    name: Markdown extension activation
+    tags: [writes]
+    sources: ["extensions/markdown-language-features/src/extension.ts:15-27"]
+    entry: {caller: exthost-runtime, interface: markdown-extension.activate, input: {extension_id: vscode.markdown-language-features, activation_event: "onLanguage:markdown"}}
+  - id: markdown-show-preview
+    name: markdown.showPreview
+    tags: [writes]
+    sources: ["extensions/markdown-language-features/src/commands/showPreview.ts:53-75"]
+    entry: {caller: user, interface: markdown-command-manager.cmd-markdown-showpreview, input: {command_id: markdown.showPreview, args: ["file:///work/app/README.md"]}}

@@ -1,0 +1,94 @@
+schema_version: 1
+id: vllm
+scenarios:
+  - id: bench-p1
+    name: "P1: n-gram speculative decoding (k=5, prompt_lookup_max=4 -> min resolves to 4), sync scheduling"
+    fixtures: [full-tp1-llama-8b]
+    config:
+      speculative-method: ngram
+      num-speculative-tokens: 5
+      prompt-lookup-max: 4
+      prompt-lookup-min: 4
+      async-scheduling: false
+    steps:
+      # (a) the proposer matches the last 4-gram, right-most occurrence, drafts the 5 tokens that followed
+      - interface: ngram-gpu-speculator.propose
+        caller: gpu-model-runner
+        input:
+          req_ids: [r1]
+          token_ids: [[10, 1, 2, 3, 4, 50, 51, 52, 53, 54, 1, 2, 3, 4, 60, 61, 62, 63, 64, 1, 2, 3, 4]]
+          num_sampled: [1]
+          last_sampled: [4]
+          num_speculative_tokens: 5
+        as: pa
+      # (d) no match: code still emits K drafts, each the last sampled token (speculator.py:141-148)
+      - interface: ngram-gpu-speculator.propose
+        caller: gpu-model-runner
+        input:
+          req_ids: [r2]
+          token_ids: [[1, 2, 3, 4, 5, 6, 7, 8]]
+          num_sampled: [1]
+          last_sampled: [8]
+          num_speculative_tokens: 5
+        as: pd
+      # (b) scheduler: drafts from update_draft_token_ids -> next step schedules 1 + 5 and allocates KV for them
+      - flow: scheduler-add-request
+        input:
+          request_id: chatcmpl-p1
+          prompt_token_ids: [128000, 9906, 11, 856, 836, 374, 9906, 11, 856, 836, 374, 9906, 11, 856, 836, 374]
+          sampling_params: {max_tokens: 64}
+        as: add
+      - flow: scheduler-schedule
+        input: {}
+        as: s1
+      - flow: scheduler-update-from-output
+        input:
+          model_runner_output: {req_ids: [chatcmpl-p1], sampled_token_ids: [[9906]]}
+          scheduler_output: "= steps.s1.result.value"
+        as: u1
+      - flow: scheduler-update-draft-token-ids
+        input:
+          req_ids: [chatcmpl-p1]
+          draft_token_ids: [[-1, -1, -1, -1, -1]]
+        as: d1
+      - flow: scheduler-schedule
+        input: {}
+        as: s2
+      # (c) one target forward verifies all 5 drafts; the rejection sampler accepts a prefix + 1 token
+      - flow: wr-spec-decode-step
+        input:
+          num_scheduled_tokens: {chatcmpl-abc123: 6}
+          scheduled_cached_reqs: {new_block_ids: [[]], num_computed_tokens: [100], req_ids: [chatcmpl-abc123]}
+          scheduled_spec_decode_tokens: {chatcmpl-abc123: [-1, -1, -1, -1, -1]}
+          total_num_scheduled_tokens: 6
+        as: e1
+      - flow: wr-sample-tokens
+        as: c1
+      - interface: gpu-worker-impl.take-draft-token-ids
+        caller: engine-core
+        as: take
+    state:
+      cuda-graph-manager: {decode_query_len: 6}
+      gpu-model-runner:
+        fresh_slots_used: 1
+        draft_tokens: {chatcmpl-abc123: [60, 61, 62, 63, 64]}
+        slots:
+          chatcmpl-abc123: {prefill_len: 100, prompt_len: 100, slot: 1023}
+        speculator: ngram-gpu-speculator
+      sampler:
+        slots:
+          '1023': {logit_bias: false, logprobs: -1, min_p: 0, needs_processing: false, penalties: false, seeded: false, temperature: 0, thinking: false, top_k: 128256, top_p: 1}
+    expect:
+      # (a)
+      - "steps.pa.result.value.draft_token_ids['r1'] == [60, 61, 62, 63, 64]"
+      # (d) corrected: still 5 drafts, all the last sampled token
+      - "steps.pd.result.value.draft_token_ids['r2'] == [8, 8, 8, 8, 8]"
+      # (b)
+      - "steps.s2.result.value.num_scheduled_tokens == {'chatcmpl-p1': 6} && size(steps.s2.result.value.scheduled_spec_decode_tokens['chatcmpl-p1']) == 5"
+      - "trace.exists(e, e.type == 'call.start' && e.interface == 'kv-cache-manager.allocate-slots' && e.input.num_new_tokens == 6)"
+      # (c)
+      - "size(steps.c1.result.value.sampled_token_ids[0]) >= 1 && size(steps.c1.result.value.sampled_token_ids[0]) <= 6"
+      - "steps.c1.result.value.sampled_token_ids[0].slice(0, 5) == [60, 61, 62, 63, 64]"
+      - "calls['rejection-sampler.sample'] == 1"
+      # (a) corrected: sync V2 runner without structured outputs hands the scheduler -1 placeholders (spec_decode/utils.py:84-91)
+      - "steps.take.result.value.draft_token_ids == [[-1, -1, -1, -1, -1]]"

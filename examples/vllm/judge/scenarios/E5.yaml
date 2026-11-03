@@ -1,0 +1,60 @@
+schema_version: 1
+id: vllm
+scenarios:
+  - id: bench-e5
+    name: "E5: offline LLM.generate with 3 prompts"
+    description: >-
+      Verified against v0.32.0 (corrected): LLM.generate -> _run_completion adds one request per
+      prompt with request ids from request_counter ("0", "1", "2") and output_kind FINAL_ONLY
+      (common/offline.py:340-363, 552-586), then _run_engine loops while
+      has_unfinished_requests(): step(), keeping finished outputs, and returns them sorted by
+      int(request_id) (offline.py:589-642). The engine core is NOT in-process by default:
+      VLLM_ENABLE_V1_MULTIPROCESSING defaults to 1 (envs.py:1463), so LLMEngine uses a
+      SyncMPClient and EngineCore runs its busy loop in a background process
+      (llm_engine.py:174-197). RequestOutput.request_id is the external id
+      (output_processor.py:394-413) and a FINAL_ONLY output carries all generated tokens
+      (output_processor.py:318-341).
+    fixtures: [full-tp1-llama-8b]
+    state:
+      engine-core-proc: {client_kind: sync}
+    steps:
+      - flow: serving-api-offline-generate
+        input:
+          prompts: [The capital of France is, The capital of Chile is, The capital of Peru is]
+          sampling_params: {max_tokens: 4, temperature: 0}
+        as: gen
+    expect:
+      # path: three adds in input order through the SyncMPClient, then step() until all finish
+      - "trace.filter(e, e.type == 'call.start' && e.interface == 'llm-engine.add-request').map(e, e.input.request_id) == ['0', '1', '2']"
+      - "calls['sync-mp-client.add-request'] == 3 && calls['engine-core-proc.handle-add'] == 3 && calls['scheduler.add-request'] == 3"
+      - "calls['llm-engine.step'] >= 4 && calls['sync-mp-client.get-output'] == calls['llm-engine.step']"
+      - "trace.filter(e, e.type == 'call.start' && e.interface == 'sync-mp-client.add-request')[2].seq < trace.filter(e, e.type == 'call.start' && e.interface == 'llm-engine.step')[0].seq"
+      - "trace.exists(e, e.type == 'call.start' && e.interface == 'gpu-worker-impl.execute-model' && e.instance == 'rank0')"
+      - "state.scheduler.requests == {} && state['output-processor'].request_states == {}"
+      # outcome: three finished outputs in input order, each with its 4 tokens
+      - "steps.gen.result.ok && size(steps.gen.result.value) == 3 && steps.gen.result.value.all(o, o.finished && o.finish_reason == 'length')"
+      - "steps.gen.result.value.map(o, o.request_id) == ['0', '1', '2']"
+      - "steps.gen.result.value.all(o, size(o.token_ids) == 4)"
+  - id: bench-e5-per-prompt-params
+    name: "E5 variant: per-prompt SamplingParams finish out of order but return in input order"
+    description: >-
+      sampling_params may be a list paired with the prompts (offline.py:258-263, 574-586). With
+      max_tokens 8, 2 and 4 the requests finish in the order 1, 2, 0, and _run_engine's sort
+      returns them as 0, 1, 2 with 8, 2 and 4 tokens.
+    fixtures: [full-tp1-llama-8b]
+    state:
+      engine-core-proc: {client_kind: sync}
+    steps:
+      - flow: serving-api-offline-generate
+        input:
+          prompts: [The capital of France is, The capital of Chile is, The capital of Peru is]
+          sampling_params:
+            - {max_tokens: 8, temperature: 0}
+            - {max_tokens: 2, temperature: 0}
+            - {max_tokens: 4, temperature: 0}
+        as: gen
+    expect:
+      - "steps.gen.result.ok && size(steps.gen.result.value) == 3"
+      - "trace.filter(e, e.type == 'call.start' && e.interface == 'llm-engine.add-request').map(e, e.input.sampling_params.max_tokens) == [8, 2, 4]"
+      - "steps.gen.result.value.map(o, o.request_id) == ['0', '1', '2']"
+      - "steps.gen.result.value.map(o, size(o.token_ids)) == [8, 2, 4]"

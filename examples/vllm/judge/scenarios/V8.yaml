@@ -1,0 +1,43 @@
+schema_version: 1
+id: vllm
+scenarios:
+  - id: bench-v8
+    name: "V8: GET /health while alive, then after the engine core dies"
+    description: >
+      Code: instrumentator/health.py:22-33 awaits AsyncLLM.check_health, which raises
+      EngineDeadError when engine_core.resources.engine_dead or the output handler task is done
+      (async_llm.py:1089-1092, 1299-1309); the route maps that to 503 (not 500). Here the engine
+      dies for real: execute_model fails on the second step, the busy loop dies and sends
+      ENGINE_CORE_DEAD, the client marks engine_dead; the next /health returns 503.
+    fixtures: [full-tp1-llama-8b]
+    faults:
+      - {target: gpu-worker-impl.execute-model, type: error, code: cuda-error, message: "CUDA error: an illegal memory access was encountered", calls: [2]}
+    steps:
+      - {flow: serving-api-health, as: alive, input: {path: /health}}
+      - {flow: engine-core-busy-loop, input: {iterations: 30}, as: loop, await: false}
+      - flow: async-llm-generate
+        as: gen
+        input:
+          prompt_token_ids: [128000, 9906, 11, 856]
+          request_id: chatcmpl-v8
+          sampling_params: {max_tokens: 16, n: 1}
+      - {flow: serving-api-health, as: dead, input: {path: /health}}
+    expect:
+      - "steps.alive.result.ok && steps.alive.result.value.status_code == 200"
+      - "!steps.gen.result.ok && steps.gen.result.error.code == 'engine-dead-error'"
+      - "state['async-mp-client'].engine_dead && state['engine-core-proc'].dead"
+      - "steps.dead.result.ok && steps.dead.result.value.status_code == 503"
+      # path: both health calls go through AsyncLLM.check_health -> errored
+      - "calls['async-llm.check-health'] == 2"
+      - "trace.exists(e, e.type == 'call.end' && e.interface == 'async-llm.check-health' && e.error != null && e.error.code == 'engine-dead-error')"
+  - id: bench-v8-handler-done
+    name: "V8: /health is 503 when the output handler task has exited"
+    description: errored is also true when the output handler is done (is_running false), async_llm.py:1299-1309.
+    fixtures: [full-tp1-llama-8b]
+    state:
+      async-llm: {output_handler_done: true, output_handler_running: false}
+    flow: serving-api-health
+    input: {path: /health}
+    expect:
+      - "result.ok && result.value.status_code == 503"
+      - "calls['async-llm.check-health'] == 1 && calls['async-mp-client.ensure-alive'] == 1"

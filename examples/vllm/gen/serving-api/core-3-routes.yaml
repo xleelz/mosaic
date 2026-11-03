@@ -1,0 +1,870 @@
+interfaces:
+  # ------------------------------------------------------------------ responses GET / cancel routes
+  - component: openai-serving-responses
+    name: get-v1-responses-response-id
+    kind: http
+    summary: "GET /v1/responses/{response_id}: retrieve a stored response (load-tracked)."
+    sources: ["vllm/entrypoints/openai/responses/api_router.py:80-107"]
+    attributes: {method: GET, path: "/v1/responses/{response_id}"}
+    request: {type: object, properties: {path: {type: string, examples: [/v1/responses/resp_1]}, headers: {$ref: ServingHttpHeaders}}, required: [path]}
+    errors: [{code: invalid_request_error, status: 404, reachable_by: "retrieve-responses fails invalid_request_error 404 for an unknown id (vllm/entrypoints/openai/responses/serving.py:1146-1147); the handler passes it through"}, {code: unauthorized, status: 401}]
+    behavior:
+      - call: scaling-middleware.call
+        input: {path: "= input.path"}
+      - call: authentication-middleware.call
+        input: {path: "= input.path", headers: "= input.headers"}
+      - when: "config['enable-server-load-tracking']"
+        source: "vllm/entrypoints/serve/utils/api_utils.py:110-117"
+        call: server-load-metrics.increment
+      - title: response_id is the path parameter
+        source: "vllm/entrypoints/openai/responses/api_router.py:82-96"
+        call: openai-serving-responses.retrieve-responses
+        input: {response_id: "= input.path.split('/')[3]"}
+        as: r
+        on_error:
+          - when: "config['enable-server-load-tracking']"
+            call: server-load-metrics.decrement
+          - call: exception-handling.vllm-error-handler
+            input: {code: "= error.code", status: "= error.status", message: "= error.message"}
+      - when: "config['enable-server-load-tracking']"
+        call: server-load-metrics.decrement
+      - return: "= vars.r.value"
+  - component: openai-serving-responses
+    name: post-v1-responses-response-id-cancel
+    kind: http
+    summary: "POST /v1/responses/{response_id}/cancel"
+    sources: ["vllm/entrypoints/openai/responses/api_router.py:110-124"]
+    attributes: {method: POST, path: "/v1/responses/{response_id}/cancel"}
+    request: {type: object, properties: {path: {type: string, examples: [/v1/responses/resp_1/cancel]}, headers: {$ref: ServingHttpHeaders}}, required: [path]}
+    errors: [{code: invalid_request_error, status: 404, reachable_by: "cancel-responses fails invalid_request_error 404 for an unknown id (vllm/entrypoints/openai/responses/serving.py:1161-1163); the handler passes it through"}, {code: invalid_request_error, status: 400, reachable_by: "cancel-responses fails invalid_request_error 400 for a finished response (vllm/entrypoints/openai/responses/serving.py:1165-1171)"}]
+    behavior:
+      - call: scaling-middleware.call
+        input: {path: "= input.path"}
+      - call: authentication-middleware.call
+        input: {path: "= input.path", headers: "= input.headers"}
+      - call: openai-serving-responses.cancel-responses
+        input: {response_id: "= input.path.split('/')[3]"}
+        as: r
+        on_error:
+          - call: exception-handling.vllm-error-handler
+            input: {code: "= error.code", status: "= error.status", message: "= error.message"}
+      - return: "= vars.r.value"
+  # ------------------------------------------------------------------ tokenizer info (conditional)
+  - component: serving-tokenization
+    name: get-tokenizer-info
+    kind: http
+    summary: "GET /tokenizer_info: registered only with --enable-tokenizer-info-endpoint."
+    sources: ["vllm/entrypoints/serve/tokenize/api_router.py:86-99", "vllm/entrypoints/serve/tokenize/serving.py:154-166"]
+    attributes: {method: GET, path: /tokenizer_info}
+    request: {type: object, properties: {path: {type: string, examples: [/tokenizer_info]}}}
+    errors: [{code: Not Found, status: 404}]
+    behavior:
+      - if: "!config['enable-tokenizer-info-endpoint']"
+        then: [{title: Route not registered, source: "vllm/entrypoints/serve/tokenize/api_router.py:86-88", fail: {code: Not Found, status: 404, message: Not Found}}]
+      - call: llm-engine.get-tokenizer
+        as: t
+      - return: {tokenizer_class: PreTrainedTokenizerFast, name_or_path: "= vars.t.value.name_or_path", model_max_length: "= config['max-model-len']"}
+  # ------------------------------------------------------------------ sagemaker
+  - component: sagemaker-router
+    name: get-ping
+    kind: http
+    summary: "GET /ping: SageMaker's health check, the same handler as GET /health."
+    sources: ["vllm/entrypoints/serve/sagemaker/api_router.py:91-96"]
+    attributes: {method: GET, path: /ping}
+    request: {type: object, properties: {path: {type: string, examples: [/ping]}}}
+    behavior:
+      - call: instrumentator-health.get-health
+        input: {path: /health}
+        as: h
+      - return: "= vars.h.value"
+  - component: sagemaker-router
+    name: post-ping
+    kind: http
+    summary: "POST /ping: same as GET /ping."
+    sources: ["vllm/entrypoints/serve/sagemaker/api_router.py:91-96"]
+    attributes: {method: POST, path: /ping}
+    request: {type: object, properties: {path: {type: string, examples: [/ping]}}}
+    behavior:
+      - call: instrumentator-health.get-health
+        input: {path: /health}
+        as: h
+      - return: "= vars.h.value"
+  - component: sagemaker-router
+    name: post-invocations
+    kind: http
+    summary: "POST /invocations: try each enabled endpoint's request type in order (chat, completion, then pooling) and call the first that validates."
+    sources: ["vllm/entrypoints/serve/sagemaker/api_router.py:98-140"]
+    attributes: {method: POST, path: /invocations}
+    request: {type: object, properties: {path: {type: string, examples: [/invocations]}, headers: {$ref: ServingHttpHeaders}, body: {type: object, properties: {model: {type: string, examples: [llama-8b]}, messages: {type: [array, "null"], items: {type: object}, default: null}, prompt: {type: [array, "null"], items: {type: string}, default: null}, max_tokens: {type: [integer, "null"], default: null}}}}, required: [path, body]}
+    errors: [{code: BadRequestError, status: 400}]
+    behavior:
+      - title: ChatCompletionRequest validates when messages is present
+        source: "vllm/entrypoints/serve/sagemaker/api_router.py:122-131"
+        if: "has(input.body.messages) && input.body.messages != null"
+        then:
+          - call: openai-serving-chat.post-v1-chat-completions
+            input: {path: /v1/chat/completions, headers: "= input.headers", body: "= input.body"}
+            as: c
+          - return: "= vars.c.value"
+      - if: "has(input.body.prompt) && input.body.prompt != null"
+        then:
+          - call: openai-serving-completion.post-v1-completions
+            input: {path: /v1/completions, headers: "= input.headers", body: "= input.body"}
+            as: p
+          - return: "= vars.p.value"
+      - title: No request type matched
+        source: "vllm/entrypoints/serve/sagemaker/api_router.py:133-139"
+        fail: {code: BadRequestError, status: 400, message: "Cannot find suitable handler for request. Expected one of: [ChatCompletionRequest, CompletionRequest]"}
+  # ------------------------------------------------------------------ dev rpc / server info
+  - component: dev-rpc-router
+    name: post-collective-rpc
+    kind: http
+    summary: "POST /collective_rpc (dev mode): run a named worker method on every worker with string args."
+    sources: ["vllm/entrypoints/serve/dev/rpc/api_router.py:23-59"]
+    attributes: {method: POST, path: /collective_rpc}
+    request: {type: object, properties: {path: {type: string, examples: [/collective_rpc]}, body: {type: object, properties: {method: {type: [string, "null"], default: null}, args: {type: [array, "null"], default: null}, kwargs: {type: [object, "null"], default: null}, timeout: {type: [number, "null"], default: null}}}}, required: [path]}
+    errors: [{code: Not Found, status: 404}, {code: Bad Request, status: 400}]
+    behavior:
+      - if: "!config['vllm-server-dev-mode']"
+        then: [{title: Dev routes not registered, source: "vllm/entrypoints/launchers/api_server/routers.py:40-43", fail: {code: Not Found, status: 404, message: Not Found}}]
+      - if: "!has(input.body) || !has(input.body.method) || input.body.method == null"
+        then: [{source: "vllm/entrypoints/serve/dev/rpc/api_router.py:38-43", fail: {code: Bad Request, status: 400, message: "Missing 'method' in request body"}}]
+      - call: async-llm.collective-rpc
+        input: {method: "= input.body.method", args: "= {'args': has(input.body.args) ? input.body.args : [], 'kwargs': has(input.body.kwargs) ? input.body.kwargs : {}}"}
+        as: res
+      - if: "vars.res.value == null"
+        then: [{source: "vllm/entrypoints/serve/dev/rpc/api_router.py:51-52", return: {status_code: 200}}]
+      - return: {results: "= vars.res.value"}
+  - component: server-info-router
+    name: get-server-info
+    kind: http
+    summary: "GET /server_info (dev mode): the VllmConfig (text or json), the VLLM_* env vars without keys, and system info."
+    sources: ["vllm/entrypoints/serve/dev/server_info/api_router.py:43-59"]
+    attributes: {method: GET, path: /server_info}
+    request: {type: object, properties: {path: {type: string, examples: [/server_info]}, query: {type: object, properties: {config_format: {type: string, default: text}}}}}
+    errors: [{code: Not Found, status: 404}]
+    behavior:
+      - if: "!config['vllm-server-dev-mode']"
+        then: [{source: "vllm/entrypoints/launchers/api_server/routers.py:40-43", fail: {code: Not Found, status: 404, message: Not Found}}]
+      - title: Env vars whose name contains KEY are left out
+        source: "vllm/entrypoints/serve/dev/server_info/api_router.py:25-34"
+        set: {vars.env: "= {'VLLM_SERVER_DEV_MODE': config['vllm-server-dev-mode']}"}
+      - if: "has(input.query) && has(input.query.config_format) && input.query.config_format == 'json'"
+        then: [{return: {vllm_config: {max_model_len: "= config['max-model-len']", served_model_name: "= config['served-model-name']"}, vllm_env: "= vars.env", system_env: {}}}]
+      - return: {vllm_config: "= 'model=' + config['model'] + ', max_model_len=' + string(config['max-model-len'])", vllm_env: "= vars.env", system_env: {}}
+  # ------------------------------------------------------------------ RL routes with logic
+  - component: rl-online-router
+    name: post-pause
+    kind: http
+    summary: "POST /pause (dev mode): pause generation (abort, wait or keep in-flight requests); ValueError -> 400, others -> 500."
+    sources: ["vllm/entrypoints/rl/online/api_router.py:31-72"]
+    attributes: {method: POST, path: /pause}
+    request: {type: object, properties: {path: {type: string, examples: [/pause]}, query: {type: object, properties: {mode: {type: string, default: abort}, clear_cache: {type: boolean, default: true}}}}}
+    errors: [{code: Not Found, status: 404}, {code: pause-error, status: 400}, {code: pause-error, status: 500}]
+    behavior:
+      - if: "!config['vllm-server-dev-mode']"
+        then: [{source: "vllm/entrypoints/launchers/api_server/routers.py:45-47", fail: {code: Not Found, status: 404, message: Not Found}}]
+      - call: async-llm.pause-generation
+        input: {mode: "= input.query.mode", clear_cache: "= input.query.clear_cache"}
+        on_error:
+          - when: "error.code == 'value-error'"
+            source: "vllm/entrypoints/rl/online/api_router.py:62-66"
+            fail: {code: pause-error, status: 400, message: "= error.message"}
+          - source: "vllm/entrypoints/rl/online/api_router.py:67-72"
+            fail: {code: pause-error, status: 500, message: "= 'Failed to pause generation: ' + error.message"}
+      - return: {status: paused}
+  - component: rl-online-router
+    name: post-resume
+    kind: http
+    summary: "POST /resume (dev mode)"
+    sources: ["vllm/entrypoints/rl/online/api_router.py:75-91"]
+    attributes: {method: POST, path: /resume}
+    request: {type: object, properties: {path: {type: string, examples: [/resume]}}}
+    errors: [{code: Not Found, status: 404}, {code: resume-error, status: 500}]
+    behavior:
+      - if: "!config['vllm-server-dev-mode']"
+        then: [{source: "vllm/entrypoints/launchers/api_server/routers.py:45-47", fail: {code: Not Found, status: 404, message: Not Found}}]
+      - call: async-llm.resume-generation
+        on_error: [{source: "vllm/entrypoints/rl/online/api_router.py:85-91", fail: {code: resume-error, status: 500, message: "= 'Failed to resume generation: ' + error.message"}}]
+      - return: {status: resumed}
+  - component: rl-online-router
+    name: post-abort-requests
+    kind: http
+    summary: "POST /abort_requests (dev mode): abort the given external ids, or every request the AsyncLLM output processor tracks."
+    sources: ["vllm/entrypoints/rl/online/api_router.py:94-139"]
+    attributes: {method: POST, path: /abort_requests}
+    request: {type: object, properties: {path: {type: string, examples: [/abort_requests]}, body: {type: [object, "null"], default: null}}}
+    errors: [{code: Not Found, status: 404}, {code: Bad Request, status: 400}]
+    behavior:
+      - if: "!config['vllm-server-dev-mode']"
+        then: [{source: "vllm/entrypoints/launchers/api_server/routers.py:45-47", fail: {code: Not Found, status: 404, message: Not Found}}]
+      - if: "!has(input.body) || input.body == null"
+        then: [{source: "vllm/entrypoints/rl/online/api_router.py:101-107", fail: {code: Bad Request, status: 400, message: Request body must be a JSON object}}]
+      - if: "has(input.body.request_ids) && size(input.body.request_ids) > 0"
+        then:
+          - source: "vllm/entrypoints/rl/online/api_router.py:110-112"
+            call: async-llm.abort
+            input: {request_ids: "= input.body.request_ids", internal: false}
+          - return: {status: aborted, aborted: "= size(input.body.request_ids)"}
+      - title: "No ids: abort every request_states / parent_requests id the output processor tracks (internal ids; the list lives in engine-core, passed here as empty)"
+        source: "vllm/entrypoints/rl/online/api_router.py:113-124"
+        call: async-llm.abort
+        input: {request_ids: [], internal: true}
+      - return: {status: aborted, aborted: 0}
+  - component: rl-online-router
+    name: get-is-paused
+    kind: http
+    summary: "GET /is_paused (dev mode)"
+    sources: ["vllm/entrypoints/rl/online/api_router.py:142-156"]
+    attributes: {method: GET, path: /is_paused}
+    request: {type: object, properties: {path: {type: string, examples: [/is_paused]}}}
+    errors: [{code: Not Found, status: 404}]
+    behavior:
+      - if: "!config['vllm-server-dev-mode']"
+        then: [{source: "vllm/entrypoints/launchers/api_server/routers.py:45-47", fail: {code: Not Found, status: 404, message: Not Found}}]
+      - call: async-llm.is-paused
+        as: p
+      - return: {is_paused: "= vars.p.value"}
+  - component: rl-online-router
+    name: post-weight-checker
+    kind: http
+    summary: "POST /weight_checker (dev mode): reset weights, or checksum every worker's weights and optionally compare with a baseline."
+    sources: ["vllm/entrypoints/rl/online/api_router.py:229-263"]
+    attributes: {method: POST, path: /weight_checker}
+    request: {type: object, properties: {path: {type: string, examples: [/weight_checker]}, body: {type: [object, array, "null"], default: null, properties: {action: {type: string, examples: [checksum]}, baseline: {type: [object, "null"], default: null}}}}, required: [path]}
+    errors: [{code: Not Found, status: 404}, {code: Bad Request, status: 400}, {code: Internal Server Error, status: 500}]
+    behavior:
+      - if: "!config['vllm-server-dev-mode']"
+        then: [{source: "vllm/entrypoints/launchers/api_server/routers.py:45-47", fail: {code: Not Found, status: 404, message: Not Found}}]
+      - title: "FastAPI body validation: action is a required embedded Literal['checksum', 'reset', 'compare']; a missing body, a non-object body or another action raises RequestValidationError, which the registered handler turns into 400"
+        source: "vllm/entrypoints/rl/online/api_router.py:229-234"
+        if: "!has(input.body) || input.body == null || type(input.body) != map || !('action' in input.body) || !(input.body.action in ['checksum', 'reset', 'compare'])"
+        then:
+          - source: "vllm/entrypoints/serve/exception_handling/handlers/validation.py:149-175"
+            fail: {code: Bad Request, status: 400, message: "= !has(input.body) || input.body == null || type(input.body) != map || !('action' in input.body) ? 'body.action: Field required' : 'body.action: Input should be checksum, reset or compare'", data: {param: body.action}}
+      - if: "input.body.action == 'reset'"
+        then:
+          - source: "vllm/entrypoints/rl/online/api_router.py:237-239"
+            call: async-llm.collective-rpc
+            input: {method: reset_weights}
+          - return: {status: reset}
+      - if: "input.body.action == 'compare' && (!has(input.body.baseline) || input.body.baseline == null)"
+        then: [{source: "vllm/entrypoints/rl/online/api_router.py:240-244", fail: {code: Bad Request, status: 400, message: "action='compare' requires a 'baseline' object"}}]
+      - call: async-llm.compute-weight-checksums
+        as: cs
+      - set: {vars.checksums: {}}
+      - title: Merge the per-worker maps; a key reported twice is a 500
+        source: "vllm/entrypoints/rl/online/api_router.py:245-253"
+        foreach: "= vars.cs.value"
+        as: wc
+        max: 8
+        steps:
+          - if: "vars.wc.exists(k, k in vars.checksums)"
+            then: [{fail: {code: Internal Server Error, status: 500, message: Duplicate weight checksum keys}}]
+          - set: {vars.checksums: "= merge(vars.checksums, vars.wc)"}
+      - if: "input.body.action == 'checksum'"
+        then: [{return: {checksums: "= vars.checksums"}}]
+      - source: "vllm/entrypoints/rl/online/api_router.py:255-263"
+        set: {vars.mismatches: "= vars.checksums.filter(k, !(k in input.body.baseline) || input.body.baseline[k] != vars.checksums[k]) + input.body.baseline.filter(k, !(k in vars.checksums))"}
+      - return: {match: "= size(vars.mismatches) == 0", mismatches: "= vars.mismatches"}
+  - component: rl-online-router
+    name: get-get-world-size
+    kind: http
+    summary: "GET /get_world_size (dev mode): TP*PP, times DP when include_dp."
+    sources: ["vllm/entrypoints/rl/online/api_router.py:266-286"]
+    attributes: {method: GET, path: /get_world_size}
+    request: {type: object, properties: {path: {type: string, examples: [/get_world_size]}, query: {type: object, properties: {include_dp: {type: boolean, default: true}}}}}
+    errors: [{code: Not Found, status: 404}]
+    behavior:
+      - if: "!config['vllm-server-dev-mode']"
+        then: [{source: "vllm/entrypoints/launchers/api_server/routers.py:45-47", fail: {code: Not Found, status: 404, message: Not Found}}]
+      - title: "parallel_config.world_size (TP*PP) or world_size_across_dp (also *DP; DP=1 here)"
+        source: "vllm/entrypoints/rl/online/api_router.py:281-286"
+        if: "input.query.include_dp"
+        then: [{return: {world_size: "= config['tensor-parallel-size'] * 1"}}]
+        else: [{return: {world_size: "= config['tensor-parallel-size']"}}]
+  # ------------------------------------------------------------------ elastic EP
+  - component: elastic-ep-router
+    name: post-scale-elastic-ep
+    kind: http
+    summary: "POST /scale_elastic_ep: validate the body, scale through AsyncLLM; drain timeout -> 408, ValueError -> 400, other -> 500."
+    sources: ["vllm/entrypoints/serve/elastic_ep/api_router.py:27-80"]
+    attributes: {method: POST, path: /scale_elastic_ep}
+    request: {type: object, properties: {path: {type: string, examples: [/scale_elastic_ep]}, body: {type: object, properties: {}}}, required: [path, body]}
+    errors: [{code: Bad Request, status: 400}, {code: Request Timeout, status: 408}, {code: Internal Server Error, status: 500}]
+    behavior:
+      - title: Registered with the generate routes
+        source: "vllm/entrypoints/launchers/api_server/routers.py:49-60"
+        call: app-state.supported-tasks
+        as: tasks
+      - if: "!('generate' in vars.tasks.value)"
+        then: [{fail: {code: Not Found, status: 404, message: Not Found}}]
+      - if: "!has(input.body.new_data_parallel_size) || input.body.new_data_parallel_size == null"
+        then: [{source: "vllm/entrypoints/serve/elastic_ep/api_router.py:45-48", fail: {code: Bad Request, status: 400, message: new_data_parallel_size is required}}]
+      - if: "type(input.body.new_data_parallel_size) != int || input.body.new_data_parallel_size <= 0"
+        then: [{source: "vllm/entrypoints/serve/elastic_ep/api_router.py:50-54", fail: {code: Bad Request, status: 400, message: new_data_parallel_size must be a positive integer}}]
+      - if: "has(input.body.drain_timeout) && (type(input.body.drain_timeout) != int || input.body.drain_timeout <= 0)"
+        then: [{source: "vllm/entrypoints/serve/elastic_ep/api_router.py:56-59", fail: {code: Bad Request, status: 400, message: drain_timeout must be a positive integer}}]
+      - call: async-llm.scale-elastic-ep
+        input: {new_data_parallel_size: "= input.body.new_data_parallel_size", drain_timeout: "= has(input.body.drain_timeout) ? input.body.drain_timeout : 120"}
+        on_error:
+          - when: "error.code == 'timeout-error'"
+            source: "vllm/entrypoints/serve/elastic_ep/api_router.py:70-75"
+            fail: {code: Request Timeout, status: 408, message: "= 'Scale failed due to request drain timeout after ' + string(has(input.body.drain_timeout) ? input.body.drain_timeout : 120) + ' seconds'"}
+          - when: "error.code == 'value-error'"
+            fail: {code: Bad Request, status: 400, message: "= error.message"}
+          - source: "vllm/entrypoints/serve/elastic_ep/api_router.py:78-80"
+            fail: {code: Internal Server Error, status: 500, message: Scale failed}
+      - return: {message: "= 'Scaled to ' + string(input.body.new_data_parallel_size) + ' data parallel engines'"}
+  - component: elastic-ep-router
+    name: post-is-scaling-elastic-ep
+    kind: http
+    summary: "POST /is_scaling_elastic_ep"
+    sources: ["vllm/entrypoints/serve/elastic_ep/api_router.py:83-85"]
+    attributes: {method: POST, path: /is_scaling_elastic_ep}
+    request: {type: object, properties: {path: {type: string, examples: [/is_scaling_elastic_ep]}}}
+    behavior:
+      - call: scaling-middleware.get-scaling-elastic-ep
+        as: s
+      - return: {is_scaling_elastic_ep: "= vars.s.value"}
+  # ------------------------------------------------------------------ fault tolerance
+  - component: fault-tolerance-router
+    name: post-fault-tolerance-apply
+    kind: http
+    summary: "POST /fault_tolerance/apply: validate the instruction (only retry), answer 202 and drive recovery as a background task."
+    sources: ["vllm/entrypoints/serve/fault_tolerance/api_router.py:37-73"]
+    attributes: {method: POST, path: /fault_tolerance/apply}
+    request: {type: object, properties: {path: {type: string, examples: [/fault_tolerance/apply]}, body: {type: object, properties: {instruction: {type: string, examples: [retry]}, params: {type: object}}}}, required: [path, body]}
+    errors: [{code: Not Found, status: 404}, {code: Bad Request, status: 400}]
+    behavior:
+      - if: "!config['enable-fault-tolerance']"
+        then: [{source: "vllm/entrypoints/launchers/api_server/routers.py:79-84", fail: {code: Not Found, status: 404, message: Not Found}}]
+      - if: "!has(input.body.instruction) || input.body.instruction == ''"
+        then: [{source: "vllm/entrypoints/serve/fault_tolerance/api_router.py:26-28", fail: {code: Bad Request, status: 400, message: "'instruction' is required."}}]
+      - if: "!(input.body.instruction in ['retry'])"
+        then: [{source: "vllm/entrypoints/serve/fault_tolerance/api_router.py:29-30", fail: {code: Bad Request, status: 400, message: "= 'Invalid instruction: \\'' + input.body.instruction + '\\'.'"}}]
+      - title: "FaultToleranceRequest(request_id=str(uuid.uuid4()))"
+        source: "vllm/entrypoints/serve/fault_tolerance/api_router.py:49-53"
+        set: {vars.ft_id: "= id('ft', seq('ft'))"}
+      - title: Recovery runs after the 202 is sent (cross-rank collectives complete only once every rank is dispatched)
+        source: "vllm/entrypoints/serve/fault_tolerance/api_router.py:55-73"
+        emit: async-llm.handle-fault
+        input: {instruction: "= input.body.instruction", params: "= has(input.body.params) ? input.body.params : {}", request_id: "= vars.ft_id"}
+      - return: {status_code: 202, message: "Request accepted; poll /fault_tolerance/status for updates.", request_id: "= vars.ft_id"}
+  - component: fault-tolerance-router
+    name: get-fault-tolerance-status
+    kind: http
+    summary: "GET /fault_tolerance/status"
+    sources: ["vllm/entrypoints/serve/fault_tolerance/api_router.py:93-96"]
+    attributes: {method: GET, path: /fault_tolerance/status}
+    request: {type: object, properties: {path: {type: string, examples: [/fault_tolerance/status]}}}
+    errors: [{code: Not Found, status: 404}]
+    behavior:
+      - if: "!config['enable-fault-tolerance']"
+        then: [{source: "vllm/entrypoints/launchers/api_server/routers.py:79-84", fail: {code: Not Found, status: 404, message: Not Found}}]
+      - call: async-llm.get-status
+        as: s
+      - return: "= vars.s.value"
+  # ------------------------------------------------------------------ DP supervisor and preload health
+  - component: dp-supervisor
+    name: get-health
+    kind: http
+    summary: "DP supervisor GET /health: 200 when every supervised server is ready, else 503."
+    sources: ["vllm/entrypoints/launchers/dp_supervisor.py:228-230"]
+    attributes: {method: GET, path: /health}
+    request: {type: object, properties: {path: {type: string, examples: [/health]}}}
+    behavior:
+      - if: "state.is_ready"
+        then: [{source: "vllm/entrypoints/launchers/dp_supervisor.py:222-225", return: {status_code: 200}}]
+      - return: {status_code: 503}
+  - component: dp-supervisor
+    name: get-ready
+    kind: http
+    summary: "DP supervisor GET /ready"
+    sources: ["vllm/entrypoints/launchers/dp_supervisor.py:232-235"]
+    attributes: {method: GET, path: /ready}
+    request: {type: object, properties: {path: {type: string, examples: [/ready]}}}
+    behavior:
+      - if: "state.is_ready"
+        then: [{return: {status_code: 200}}]
+      - return: {status_code: 503}
+  - component: dp-supervisor
+    name: get-readyz
+    kind: http
+    summary: "DP supervisor GET /readyz (same handler as /ready)"
+    sources: ["vllm/entrypoints/launchers/dp_supervisor.py:233-235"]
+    attributes: {method: GET, path: /readyz}
+    request: {type: object, properties: {path: {type: string, examples: [/readyz]}}}
+    behavior:
+      - if: "state.is_ready"
+        then: [{return: {status_code: 200}}]
+      - return: {status_code: 503}
+  - component: weight-cache-health-state
+    name: get-health
+    kind: http
+    summary: "`vllm preload` GET /health: 200 once ready and no daemon process exited, else 503."
+    sources: ["vllm/entrypoints/cli/preload.py:73-76", "vllm/entrypoints/cli/preload.py:64-68"]
+    attributes: {method: GET, path: /health}
+    request: {type: object, properties: {path: {type: string, examples: [/health]}}}
+    behavior:
+      - if: "state.ready && state.exited_processes == 0"
+        then: [{return: {status_code: 200}}]
+      - return: {status_code: 503}
+  # ------------------------------------------------------------------ scale-out: render, derender, tokens
+  - component: serving-render
+    name: check-scale-out
+    kind: function
+    summary: "register_scale_out_api_routers: unless render mode, --tokens-only or --enable-scale-out, every scale-out route answers 403."
+    sources: ["vllm/entrypoints/scale_out/factories.py:78-110"]
+    request: {type: object, properties: {}}
+    errors: [{code: PermissionDeniedError, status: 403}]
+    behavior:
+      - call: app-state.supported-tasks
+        as: tasks
+      - if: "!('render' in vars.tasks.value) && !config['tokens-only'] && !config['enable-scale-out']"
+        then:
+          - title: Scale-out endpoints are disabled
+            source: "vllm/entrypoints/scale_out/factories.py:84-96"
+            fail: {code: PermissionDeniedError, status: 403, message: Scale-out endpoints are disabled. Restart vllm serve with --enable-scale-out to enable them.}
+      - return: {enabled: true}
+  - component: serving-render
+    name: render-chat-request
+    kind: function
+    summary: "ServingRender.render_chat_request: model check, render, return a GenerateRequest (token ids + sampling params)."
+    sources: ["vllm/entrypoints/scale_out/render/serving.py:90-160"]
+    request: {type: object, properties: {body: {$ref: ServingChatCompletionRequest}}, required: [body]}
+    behavior:
+      - call: base-serving.check-model
+        input: {model: "= has(input.body.model) ? input.body.model : ''"}
+        as: m
+      - call: online-renderer.render-chat
+        input: {body: "= input.body"}
+        as: r
+      - call: api-utils.get-max-tokens
+        input: {prompt_len: "= size(vars.r.value.prompt_token_ids)", max_tokens: "= has(input.body.max_tokens) ? input.body.max_tokens : null"}
+        as: mt
+      - return: {model: "= vars.m.value.model_name", token_ids: "= vars.r.value.prompt_token_ids", sampling_params: {max_tokens: "= vars.mt.value.max_tokens"}}
+  - component: serving-tokens
+    name: serve-tokens
+    kind: function
+    summary: "ServingTokens.serve_tokens: token ids in, AsyncLLM.generate, token ids (and optionally text) out."
+    sources: ["vllm/entrypoints/scale_out/token_in_token_out/serving.py:150-330"]
+    request: {type: object, properties: {body: {type: object, properties: {model: {type: string, examples: [llama-8b]}, token_ids: {type: array, minItems: 4, maxItems: 4, items: {type: integer, minimum: 1, maximum: 128000}}, sampling_params: {type: object, properties: {max_tokens: {type: integer, examples: [8]}}}}}, x_request_id: {type: [string, "null"]}}, required: [body]}
+    behavior:
+      - title: "The body parses as a GenerateRequest; its validators run first"
+        source: "vllm/entrypoints/scale_out/token_in_token_out/api_router.py:46-60"
+        call: serving-tokens.validate-generate-request
+        input: {body: "= input.body"}
+      - call: base-serving.check-model
+        input: {model: "= has(input.body.model) ? input.body.model : ''"}
+      - call: generate-base-serving.preflight
+        input: {n: 1}
+      - call: base-renderer.tokenize-prompt
+        input: {prompt_token_ids: "= input.body.token_ids"}
+        as: tok
+      - call: async-llm.generate
+        input: {request_id: "= 'generate-tokens-' + (has(input.x_request_id) && input.x_request_id != null ? input.x_request_id : id('random-uuid', seq('random-uuid')))", prompt_token_ids: "= vars.tok.value.prompt_token_ids", sampling_params: "= has(input.body.sampling_params) ? input.body.sampling_params : {}"}
+        stream: true
+        as: g
+      - call: generate-base-serving.raise-if-error
+        input: {finish_reason: "= vars.g.value.finish_reason"}
+      - return: {request_id: "= vars.g.value.request_id", choices: [{index: 0, token_ids: "= vars.g.value.token_ids", finish_reason: "= vars.g.value.finish_reason"}]}
+  - component: serving-tokens
+    name: abort-requests
+    kind: function
+    summary: "abort_requests: parse request_ids and abort them in the background; 200 immediately."
+    sources: ["vllm/entrypoints/scale_out/token_in_token_out/api_router.py:76-99"]
+    request: {type: object, properties: {body: {type: object, properties: {}}}}
+    errors: [{code: Bad Request, status: 400}]
+    behavior:
+      - if: "!has(input.body) || !has(input.body.request_ids) || input.body.request_ids == null"
+        then: [{source: "vllm/entrypoints/scale_out/token_in_token_out/api_router.py:89-94", fail: {code: Bad Request, status: 400, message: "Missing 'request_ids' in request body"}}]
+      - title: asyncio.create_task(engine_client.abort(request_ids))
+        source: "vllm/entrypoints/scale_out/token_in_token_out/api_router.py:96-98"
+        emit: async-llm.abort
+        input: {request_ids: "= input.body.request_ids", internal: false}
+      - return: {status_code: 200}
+  - component: serving-derender
+    name: derender
+    kind: function
+    summary: "ServingDerender: detokenize a token-level generate response into a chat or text completion response."
+    sources: ["vllm/entrypoints/scale_out/derender/serving.py:80-250"]
+    request: {type: object, properties: {kind: {type: string, examples: [chat]}, body: {type: object, properties: {model: {type: string, examples: [llama-8b]}, generate_response: {type: object, properties: {request_id: {type: string, examples: [generate-tokens-req-1]}, token_ids: {type: array, minItems: 3, maxItems: 3, items: {type: integer, minimum: 1, maximum: 128000}}, finish_reason: {type: string, examples: [stop]}}}}}}, required: [kind, body]}
+    behavior:
+      - call: base-serving.check-model
+        input: {model: "= has(input.body.model) ? input.body.model : ''"}
+        as: m
+      - call: base-renderer.detokenize-prompt
+        input: {prompt_token_ids: "= input.body.generate_response.token_ids"}
+        as: d
+      - if: "input.kind == 'chat'"
+        then: [{return: {object: chat.completion, model: "= vars.m.value.model_name", choices: [{index: 0, message: {role: assistant, content: "= vars.d.value.prompt"}, finish_reason: "= input.body.generate_response.finish_reason"}]}}]
+      - return: {object: text_completion, model: "= vars.m.value.model_name", choices: [{index: 0, text: "= vars.d.value.prompt", finish_reason: "= input.body.generate_response.finish_reason"}]}
+  # ------------------------------------------------------------------ CLI and launchers
+  - component: cli-main
+    name: main
+    kind: cli
+    summary: "`vllm` main: delegate --omni, set up the env, build the subcommand parsers, validate and dispatch."
+    sources: ["vllm/entrypoints/cli/main.py:39-126"]
+    request: {type: object, properties: {argv: {type: array, items: {type: string}, default: [serve]}, args: {type: object}}, required: [argv]}
+    errors: [{code: system-exit, status: 0}]
+    behavior:
+      - if: "'--omni' in input.argv"
+        then: [{title: --omni needs vllm-omni installed, source: "vllm/entrypoints/cli/main.py:17-27", fail: {code: system-exit, message: --omni flag requires a valid instance of vllm-omni to be installed., data: {exit_code: 1}}}]
+      - if: "size(input.argv) == 0"
+        then: [{title: No subcommand prints the help, source: "vllm/entrypoints/cli/main.py:118-122", return: {printed_help: true}}]
+      - set:
+          vars.cmds: "= {'serve': 'serve-subcommand.cmd', 'chat': 'chat-command.cmd', 'complete': 'complete-command.cmd', 'run-batch': 'run-batch-subcommand.cmd', 'launch': 'launch-subcommand.cmd'}"
+      - if: "!(input.argv[0] in vars.cmds)"
+        then: [{title: argparse rejects an unknown subcommand, source: "vllm/entrypoints/cli/main.py:110", fail: {code: system-exit, message: "= 'invalid choice: ' + input.argv[0]", data: {exit_code: 2}}}]
+      - title: cmd.validate(args), then args.dispatch_function(args)
+        source: "vllm/entrypoints/cli/main.py:111-120"
+        call: "= vars.cmds[input.argv[0]]"
+        targets: [serve-subcommand.cmd, chat-command.cmd, complete-command.cmd, run-batch-subcommand.cmd, launch-subcommand.cmd]
+        input: "= has(input.args) ? input.args : {}"
+        as: r
+      - return: "= vars.r.value"
+  - component: serve-subcommand
+    name: cmd
+    kind: cli
+    summary: "ServeSubcommand.cmd: pick the serving mode from --grpc, --headless, the DP load-balancing flags and --api-server-count."
+    sources: ["vllm/entrypoints/cli/serve.py:53-161"]
+    request: {type: object, properties: {model_tag: {type: string, examples: [meta-llama/Llama-3.1-8B-Instruct]}, data_parallel_size: {type: integer, default: 1}, grpc: {type: boolean, default: false}, headless: {type: boolean, default: false}, api_server_count: {type: [integer, "null"], default: null}, data_parallel_external_lb: {type: boolean, default: false}, data_parallel_hybrid_lb: {type: boolean, default: false}, data_parallel_multi_port_external_lb: {type: boolean, default: false}, data_parallel_rank: {type: [integer, "null"], default: null}, data_parallel_start_rank: {type: [integer, "null"], default: null}, data_parallel_size_local: {type: [integer, "null"], default: null}, tensor_parallel_size: {type: [integer, "null"], default: null}, pipeline_parallel_size: {type: [integer, "null"], default: null}, max_model_len: {type: [integer, "null"], default: null}}}
+    errors: [{code: value-error, status: 0}]
+    behavior:
+      - if: "has(input.grpc) && input.grpc"
+        then:
+          - source: "vllm/entrypoints/cli/serve.py:59-63"
+            call: grpc-server.serve-grpc
+            as: g
+          - return: {mode: grpc}
+      - if: "has(input.headless) && input.headless && has(input.api_server_count) && input.api_server_count != null && input.api_server_count > 0"
+        then: [{source: "vllm/entrypoints/cli/serve.py:68-74", fail: {code: value-error, message: "= '--api-server-count=' + string(input.api_server_count) + ' cannot be used with --headless (no API servers are started in headless mode).'"}}]
+      - set:
+          vars.external_lb: "= (has(input.data_parallel_external_lb) && input.data_parallel_external_lb) || (has(input.data_parallel_rank) && input.data_parallel_rank != null)"
+          vars.multi_port: "= has(input.data_parallel_multi_port_external_lb) && input.data_parallel_multi_port_external_lb"
+          vars.hybrid_lb: "= (has(input.data_parallel_hybrid_lb) && input.data_parallel_hybrid_lb) || (has(input.data_parallel_start_rank) && input.data_parallel_start_rank != null)"
+      - if: "(vars.external_lb ? 1 : 0) + (vars.multi_port ? 1 : 0) + (vars.hybrid_lb ? 1 : 0) > 1"
+        then: [{source: "vllm/entrypoints/cli/serve.py:94-100", fail: {code: value-error, message: "Cannot use more than one data parallel load balancing mode."}}]
+      - title: Default api_server_count -- headless 0, external/multi-port 1, hybrid the local DP size, else the DP size
+        source: "vllm/entrypoints/cli/serve.py:76-131"
+        set:
+          vars.count: "= has(input.headless) && input.headless ? 0 : (has(input.api_server_count) && input.api_server_count != null ? input.api_server_count : (vars.multi_port || vars.external_lb ? 1 : (vars.hybrid_lb ? (has(input.data_parallel_size_local) && input.data_parallel_size_local != null ? input.data_parallel_size_local : 1) : (has(input.data_parallel_size) ? input.data_parallel_size : 1))))"
+      - if: "vars.multi_port"
+        then: [{source: "vllm/entrypoints/cli/serve.py:151-152", return: {mode: dp-supervisor}}]
+      - if: "vars.count < 1"
+        then:
+          - title: run_headless -- engine cores only, no API server
+            source: "vllm/entrypoints/cli/serve.py:153-154"
+            call: engine-args.create-engine-config
+            input: {model: "= config['model']"}
+            fill: true
+          - return: {mode: headless}
+      - if: "vars.count > 1"
+        then: [{title: run_multi_api_server, source: "vllm/entrypoints/cli/serve.py:155-156", return: {mode: multi-api-server, api_server_count: "= vars.count"}}]
+      - title: Single API server in this process
+        source: "vllm/entrypoints/cli/serve.py:157-161"
+        call: api-server-entry.run-server
+        input: {args: "= input"}
+        as: s
+      - return: {mode: single-api-server, listen_address: "= vars.s.value.listen_address"}
+  - component: api-server-entry
+    name: run-server
+    kind: function
+    summary: "run_server / run_server_worker: bind the socket, start the engine client, build the app and serve."
+    sources: ["vllm/entrypoints/launchers/api_server/entry.py:165-206"]
+    request: {type: object, properties: {args: {type: object, default: {}, description: "the parsed `vllm serve` arguments (engine args among them)"}}}
+    behavior:
+      - call: launcher.setup-server
+        as: addr
+      - call: api-server-entry.build-async-engine-client
+        input: {args: "= has(input.args) ? input.args : {}"}
+        as: ec
+      - call: api-server-entry.build-and-serve
+        input: {supported_tasks: "= vars.ec.value.supported_tasks"}
+      - return: {listen_address: "= vars.addr.value.listen_address"}
+  - component: api-server-entry
+    name: build-async-engine-client
+    kind: function
+    summary: "build_async_engine_client(_from_engine_args): create the VllmConfig, start AsyncLLM, reset the multi-modal cache; shut it down on exit."
+    sources: ["vllm/entrypoints/launchers/api_server/entry.py:35-113"]
+    request: {type: object, properties: {args: {type: object, default: {}, description: "the parsed `vllm serve` arguments"}}}
+    behavior:
+      - title: "AsyncEngineArgs.from_cli_args(args): the command line's engine args (the deployment's values where the command line gives none), then create_engine_config, which validates them before any engine starts"
+        source: "vllm/entrypoints/launchers/api_server/entry.py:53-83"
+        set:
+          vars.a: "= has(input.args) && input.args != null ? input.args : {}"
+      - call: engine-args.create-engine-config
+        input:
+          model: "= has(vars.a.model_tag) && vars.a.model_tag != null ? vars.a.model_tag : config['model']"
+          tensor_parallel_size: "= has(vars.a.tensor_parallel_size) && vars.a.tensor_parallel_size != null ? vars.a.tensor_parallel_size : config['tensor-parallel-size']"
+          pipeline_parallel_size: "= has(vars.a.pipeline_parallel_size) && vars.a.pipeline_parallel_size != null ? vars.a.pipeline_parallel_size : config['pipeline-parallel-size']"
+          data_parallel_size: "= has(vars.a.data_parallel_size) && vars.a.data_parallel_size != null ? vars.a.data_parallel_size : int(config['data-parallel-size'])"
+        fill: true
+      - source: "vllm/entrypoints/launchers/api_server/entry.py:94-104"
+        call: async-llm.from-vllm-config
+        input: {usage_context: OPENAI_API_SERVER}
+        as: llm
+        on_error:
+          - title: The finally block shuts down whatever was started
+            source: "vllm/entrypoints/launchers/api_server/entry.py:111-113"
+            fail: "= error"
+      - source: "vllm/entrypoints/launchers/api_server/entry.py:108"
+        call: async-llm.reset-mm-cache
+      - title: build_and_serve asks the engine client for its supported tasks
+        source: "vllm/entrypoints/launchers/api_server/entry.py:133"
+        call: async-llm.get-supported-tasks
+        as: tasks
+      - return: {supported_tasks: "= vars.tasks.value"}
+  - component: api-server-entry
+    name: build-and-serve
+    kind: function
+    summary: "build_and_serve: supported tasks -> build_app (routes, middleware) -> init_app_state -> serve_http."
+    sources: ["vllm/entrypoints/launchers/api_server/entry.py:116-162"]
+    request: {type: object, properties: {supported_tasks: {type: array, items: {type: string, examples: [generate]}}}}
+    behavior:
+      - source: "vllm/entrypoints/launchers/api_server/entry.py:133-138"
+        call: app-state.init-app-state
+        input: {supported_tasks: "= input.supported_tasks"}
+      - source: "vllm/entrypoints/launchers/api_server/entry.py:142-162"
+        call: launcher.serve-http
+        as: s
+      - return: "= vars.s.value"
+  - component: api-server-entry
+    name: main
+    kind: cli
+    summary: "`python -m vllm.entrypoints.launchers.api_server.entry`: parse and validate the serve args, run_server."
+    sources: ["vllm/entrypoints/launchers/api_server/entry.py:209-236"]
+    request: {type: object, properties: {}}
+    behavior:
+      - call: launcher.setup-server
+        as: a
+        on_error: [{title: validate_parsed_serve_args / validate_api_server_args refuse bad args, source: "vllm/entrypoints/launchers/api_server/entry.py:227-230", fail: "= error"}]
+      - call: api-server-entry.run-server
+        as: r
+      - return: "= vars.r.value"
+  - component: openai-api-server
+    name: main
+    kind: cli
+    summary: "Deprecated module main: warn, then launchers.api_server.entry.main()."
+    sources: ["vllm/entrypoints/openai/api_server.py:50-59"]
+    request: {type: object, properties: {}}
+    behavior:
+      - call: api-server-entry.main
+        as: r
+      - return: {deprecated: true, result: "= vars.r.value"}
+  - component: grpc-server
+    name: serve-grpc
+    kind: function
+    summary: "serve_grpc: build the AsyncLLM, start the gRPC servicer, wait for a signal, then stop the server and the engine."
+    sources: ["vllm/entrypoints/launchers/grpc_server.py:60-171"]
+    request: {type: object, properties: {}}
+    behavior:
+      - call: engine-args.create-engine-config
+        input: {model: "= config['model']"}
+        fill: true
+      - call: async-llm.from-vllm-config
+        input: {usage_context: OPENAI_API_SERVER}
+      - title: On shutdown stop the gRPC server (5 s grace) and then the engine
+        source: "vllm/entrypoints/launchers/grpc_server.py:160-170"
+        call: async-llm.shutdown
+        input: {timeout: 5}
+      - return: {served: true}
+  - component: grpc-server
+    name: main
+    kind: cli
+    summary: "gRPC launcher main (also the deprecated vllm.entrypoints.grpc_server): any exception exits 1."
+    sources: ["vllm/entrypoints/launchers/grpc_server.py:174-208", "vllm/entrypoints/grpc_server.py:18-27"]
+    request: {type: object, properties: {}}
+    errors: [{code: system-exit, status: 0}]
+    behavior:
+      - call: grpc-server.serve-grpc
+        as: s
+        on_error: [{title: Server failed -> sys.exit(1), source: "vllm/entrypoints/launchers/grpc_server.py:200-204", fail: {code: system-exit, message: "= 'Server failed: ' + error.message", data: {exit_code: 1}}}]
+      - return: "= vars.s.value"
+  - component: render-entry
+    name: run-launch-fastapi
+    kind: function
+    summary: "run_launch_fastapi: a render-only app (supported task render, no engine client) served over HTTP."
+    sources: ["vllm/entrypoints/launchers/render/entry.py:65-105"]
+    request: {type: object, properties: {}}
+    behavior:
+      - call: launcher.setup-server
+        as: addr
+      - title: build_and_serve_renderer -- the app state has supported_tasks (render,) and no engine
+        source: "vllm/entrypoints/launchers/render/entry.py:21-62"
+        call: engine-args.create-engine-config
+        input: {model: "= config['model']"}
+        fill: true
+      - return: {mode: render, listen_address: "= vars.addr.value.listen_address"}
+  - component: render-entry
+    name: main
+    kind: cli
+    summary: "`python -m vllm.entrypoints.launchers.render.entry`"
+    sources: ["vllm/entrypoints/launchers/render/entry.py:108-129"]
+    request: {type: object, properties: {}}
+    behavior:
+      - call: render-entry.run-launch-fastapi
+        as: r
+      - return: "= vars.r.value"
+  - component: launch-subcommand
+    name: cmd
+    kind: cli
+    summary: "LaunchSubcommand.cmd: positional model wins, then args.launch_command(args)."
+    sources: ["vllm/entrypoints/cli/launch.py:67-111"]
+    request: {type: object, properties: {}}
+    errors: [{code: system-exit, status: 0}]
+    behavior:
+      - if: "!has(input.launch_component) || input.launch_component != 'render'"
+        then: [{title: The launch sub-subcommand is required, source: "vllm/entrypoints/cli/launch.py:95-97", fail: {code: system-exit, message: the following arguments are required, data: {exit_code: 2}}}]
+      - call: render-subcommand.cmd
+        as: r
+      - return: "= vars.r.value"
+  - component: render-subcommand
+    name: cmd
+    kind: cli
+    summary: "RenderSubcommand.cmd: uvloop.run(run_launch_fastapi(args))."
+    sources: ["vllm/entrypoints/cli/launch.py:46-64"]
+    request: {type: object, properties: {}}
+    behavior:
+      - call: render-entry.run-launch-fastapi
+        as: r
+      - return: "= vars.r.value"
+  - component: chat-command
+    name: cmd
+    kind: cli
+    summary: "ChatCommand.cmd: pick the model (first listed if unset), then stream chat completions for -q or each stdin line."
+    sources: ["vllm/entrypoints/cli/openai.py:169-205"]
+    request: {type: object, properties: {}}
+    behavior:
+      - if: "!has(input.model_name) || input.model_name == null"
+        then:
+          - title: No --model-name -- use the first model from GET /v1/models
+            source: "vllm/entrypoints/cli/openai.py:33-38"
+            call: openai-serving-models.get-v1-models
+            input: {path: /v1/models}
+            as: models
+          - set: {vars.model: "= vars.models.value.data[0].id"}
+        else:
+          - set: {vars.model: "= input.model_name"}
+      - set:
+          vars.conversation: "= has(input.system_prompt) && input.system_prompt != null ? [{'role': 'system', 'content': input.system_prompt}] : []"
+          vars.outputs: []
+      - set:
+          vars.lines: "= has(input.quick) && input.quick != null ? [input.quick] : (has(input.lines) ? input.lines : [])"
+      - title: One streamed request per user line; the assistant output joins the conversation
+        source: "vllm/entrypoints/cli/openai.py:187-204"
+        foreach: "= vars.lines"
+        as: line
+        max: 8
+        steps:
+          - set: {vars.conversation: "= vars.conversation + [{'role': 'user', 'content': vars.line}]"}
+          - title: "The OpenAI client reads the SSE stream chunk by chunk"
+            source: "vllm/entrypoints/cli/openai.py:44-78"
+            call: openai-serving-chat.post-v1-chat-completions
+            input: {path: /v1/chat/completions, body: {model: "= vars.model", messages: "= vars.conversation", stream: true}}
+            as: s
+            stream: true
+          - set:
+              vars.text: "= vars.s.value.events.filter(e, has(e.choices) && size(e.choices) > 0 && has(e.choices[0].delta) && has(e.choices[0].delta.content)).map(e, e.choices[0].delta.content).join('')"
+          - set:
+              vars.conversation: "= vars.conversation + [{'role': 'assistant', 'content': vars.text}]"
+              vars.outputs: "= vars.outputs + [vars.text]"
+      - return: {model: "= vars.model", outputs: "= vars.outputs"}
+  - component: complete-command
+    name: cmd
+    kind: cli
+    summary: "CompleteCommand.cmd: stream completions for -q or each stdin line."
+    sources: ["vllm/entrypoints/cli/openai.py:251-290"]
+    request: {type: object, properties: {model_name: {type: string, examples: [llama-8b]}, quick: {type: string, examples: [The capital of France is]}}}
+    behavior:
+      - if: "!has(input.model_name) || input.model_name == null"
+        then:
+          - call: openai-serving-models.get-v1-models
+            input: {path: /v1/models}
+            as: models
+          - set: {vars.model: "= vars.models.value.data[0].id"}
+        else:
+          - set: {vars.model: "= input.model_name"}
+      - source: "vllm/entrypoints/cli/openai.py:262-276"
+        call: openai-serving-completion.post-v1-completions
+        input: {path: /v1/completions, body: {model: "= vars.model", prompt: "= [input.quick]", stream: true}}
+        as: s
+      - return: {model: "= vars.model", output: "= vars.s.value.events.filter(e, has(e.choices)).map(e, e.choices[0].text).join('')"}
+  - component: run-batch-subcommand
+    name: cmd
+    kind: cli
+    summary: "RunBatchSubcommand.cmd: asyncio.run(run_batch.main(args))."
+    sources: ["vllm/entrypoints/cli/run_batch.py:27-46"]
+    request: {type: object, properties: {lines: {type: array, items: {type: object}}}}
+    behavior:
+      - call: run-batch.main
+        input: {lines: "= has(input.lines) ? input.lines : []"}
+        as: r
+      - return: "= vars.r.value"
+  - component: run-batch
+    name: main
+    kind: cli
+    summary: "run_batch.main: validate args, start the engine client, run the batch file (also the module's __main__)."
+    sources: ["vllm/entrypoints/launchers/run_batch.py:874-901"]
+    request: {type: object, properties: {lines: {type: array, items: {type: object}}}}
+    behavior:
+      - call: api-server-entry.build-async-engine-client
+      - call: run-batch.run-batch
+        input: {lines: "= has(input.lines) ? input.lines : []"}
+        as: r
+      - return: "= vars.r.value"
+  - component: run-batch
+    name: run-batch
+    kind: function
+    summary: "run_batch: every line is routed by its URL's last segment and submitted concurrently (asyncio.gather); results go to the output file."
+    sources: ["vllm/entrypoints/launchers/run_batch.py:818-871"]
+    request: {type: object, properties: {lines: {type: array, items: {type: object}}}}
+    behavior:
+      - title: All requests in the file run concurrently
+        source: "vllm/entrypoints/launchers/run_batch.py:829-869"
+        parallel: "= input.lines"
+        as: line
+        steps:
+          - call: run-batch.run-request
+            input: "= vars.line"
+            as: o
+          - return: "= vars.o.value"
+        join: {need: all}
+        as_result: outs
+      - title: write_file(output_file, responses)
+        source: "vllm/entrypoints/launchers/run_batch.py:871"
+        return: {outputs: "= vars.outs.results.map(r, r.value)"}
+  - component: run-batch
+    name: run-request
+    kind: function
+    summary: "run_request: call the endpoint handler; an exception or ErrorResponse becomes an error line with the status code."
+    sources: ["vllm/entrypoints/launchers/run_batch.py:555-598"]
+    request: {type: object, properties: {custom_id: {type: string, examples: [request-1]}, url: {type: string, examples: [/v1/chat/completions]}, body: {$ref: ServingChatCompletionRequest}}, required: [url]}
+    behavior:
+      - if: "input.url.split('/')[size(input.url.split('/')) - 1] != 'completions' || !input.url.contains('chat')"
+        then:
+          - title: Unsupported URL (only chat, embeddings, audio, score and rerank endpoints are registered for a generate model's batch)
+            source: "vllm/entrypoints/launchers/run_batch.py:850-863"
+            return: {custom_id: "= input.custom_id", response: null, error: "= 'URL ' + input.url + ' was used. Supported endpoints: /v1/chat/completions, /v1/embeddings, /v1/audio/transcriptions, /v1/audio/translations, /score,  /rerank.'"}
+      - call: openai-serving-chat.create-chat-completion
+        input: {body: "= input.body"}
+        as: r
+        stream: true
+        on_error:
+          - title: The exception or ErrorResponse becomes the line's error
+            source: "vllm/entrypoints/launchers/run_batch.py:560-562"
+            return: {custom_id: "= input.custom_id", response: {status_code: "= error.status"}, error: "= error.message"}
+      - source: "vllm/entrypoints/launchers/run_batch.py:570-579"
+        return: {custom_id: "= input.custom_id", response: {status_code: 200, body: "= vars.r.value"}, error: null}
+  - component: openai-run-batch
+    name: main
+    kind: cli
+    summary: "Deprecated `python -m vllm.entrypoints.openai.run_batch`: forwards to launchers.run_batch.main."
+    sources: ["vllm/entrypoints/openai/run_batch.py:19-30"]
+    request: {type: object, properties: {lines: {type: array, items: {type: object}}}}
+    behavior:
+      - call: run-batch.main
+        input: {lines: "= has(input.lines) ? input.lines : []"}
+        as: r
+      - return: "= vars.r.value"

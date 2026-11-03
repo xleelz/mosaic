@@ -1,0 +1,925 @@
+x-fault-path: &fault_path
+  - title: "Fault tolerance on: the sentinel aborts everything and parks the engine until a recovery instruction"
+    source: "vllm/v1/fault_tolerance/engine_core_sentinel.py:182-188"
+    when: "config['enable-fault-tolerance']"
+    call: engine-core-sentinel.on-fault
+    input: {error: "= error"}
+  - when: "config['enable-fault-tolerance']"
+    emit: engine-core-proc.run-busy-loop
+    after_ms: 1
+    input: {iterations: "= input.iterations - 1"}
+  - when: "config['enable-fault-tolerance']"
+    return: {faulted: true, error: "= error.code"}
+  - title: "Otherwise run_engine_core logs 'EngineCore encountered a fatal error', sends ENGINE_CORE_DEAD and shuts the engine down"
+    source: "vllm/v1/engine/core.py:1508-1514"
+    call: engine-core-proc.send-engine-dead
+  - call: engine-core.shutdown
+  - fail: "= error"
+
+interfaces:
+  # ------------------------------------------------------------------ EngineCoreProc: sockets
+  - component: engine-core-proc
+    name: process-input-sockets
+    kind: rpc
+    latency_ms: 0
+    summary: "The input socket thread (one message): decode it; preprocess an ADD (a failure answers that request with an ERROR output); put aborts on both queues; route FT utility calls to the sentinel; push everything else to the input queue."
+    description: "UTILITY messages really queue for the busy loop and reply on the output socket; the simulation runs them on arrival and returns the UtilityOutput as the call's result."
+    sources: ["vllm/v1/engine/core.py:1831-1931"]
+    request:
+      type: object
+      required: [request_type]
+      properties:
+        request_type: {type: string, enum: [ADD, ABORT, UTILITY]}
+        request: {$ref: EngineCoreRequest}
+        request_ids: {type: array, items: {type: string}}
+        method: {type: string}
+        args: {type: object}
+        client_index: {type: integer, default: 0}
+    response: {type: object, properties: {queued: {type: boolean}, result: {}, failure_message: {type: ["string", "null"], default: null}}}
+    behavior:
+      - if: "input.request_type == 'ADD'"
+        then:
+          - title: "Decode the EngineCoreRequest and preprocess it in the input thread, overlapping the forward pass"
+            source: "vllm/v1/engine/core.py:1900-1903"
+            call: engine-core.preprocess-add-request
+            input: "= input.request"
+            as: pre
+            on_error:
+              - title: "A preprocessing error fails only this request: an ERROR output goes straight to its client"
+                source: "vllm/v1/engine/core.py:1909-1911"
+                call: engine-core-proc.send-finish-outputs-to-client
+                input: {request_ids: ["= input.request.request_id"], client_index: "= has(input.request.client_index) ? input.request.client_index : 0", finish_reason: error}
+              - return: {queued: false, result: null, failure_message: "= 'preprocess failed: ' + error.code"}
+          - title: Push to the input queue for the busy loop
+            source: "vllm/v1/engine/core.py:1930-1931"
+            put: "= 'engine-core-input:' + self"
+            value: {type: ADD, request: "= vars.pre.value"}
+          - return: {queued: true, result: null, failure_message: null}
+      - if: "input.request_type == 'ABORT'"
+        then:
+          - title: "Aborts go on both the aborts queue (seen mid-step) and the input queue (ordering)"
+            source: "vllm/v1/engine/core.py:1923-1928"
+            set:
+              state.aborts_queue: "= state.aborts_queue + [input.request_ids]"
+          - put: "= 'engine-core-input:' + self"
+            value: {type: ABORT, request_ids: "= input.request_ids"}
+          - return: {queued: true, result: null, failure_message: null}
+      - if: "input.method == 'handle_fault_tolerance'"
+        then:
+          - title: "FT instructions bypass the input queue: the sentinel answers them even while the busy loop is parked"
+            source: "vllm/v1/engine/core.py:1912-1919"
+            call: engine-core-sentinel.handle-command
+            input: "= input.args"
+            as: ft
+          - return: {queued: false, result: "= vars.ft.value", failure_message: null}
+      - call: engine-core-proc.handle-utility
+        input: {method: "= input.method", args: "= has(input.args) ? input.args : {}", client_index: "= has(input.client_index) ? input.client_index : 0"}
+        as: util
+      - return: "= merge(vars.util.value, {'queued': false})"
+
+  - component: engine-core-proc
+    name: process-output-sockets
+    kind: rpc
+    summary: "The output socket thread (one item of output_queue): ENGINE_CORE_DEAD goes to every client and ends the thread; otherwise the EngineCoreOutputs are msgpack-encoded and pushed to the client's socket."
+    sources: ["vllm/v1/engine/core.py:1933-1999"]
+    request:
+      type: object
+      properties:
+        dead: {type: boolean, default: false}
+        client_index: {type: integer, default: 0}
+        outputs: {$ref: EngineCoreOutputs}
+    behavior:
+      - set: {vars.client: "= state.client_kind == 'sync' ? 'sync-mp-client.process-outputs-socket' : 'async-mp-client.process-outputs-socket'"}
+      - if: "has(input.dead) && input.dead"
+        then:
+          - title: "ENGINE_CORE_DEAD is sent on every client socket, then the thread exits"
+            source: "vllm/v1/engine/core.py:1967-1971"
+            call: "= vars.client"
+            targets: [async-mp-client.process-outputs-socket, sync-mp-client.process-outputs-socket]
+            input: {dead: true}
+          - return: {sent: dead}
+      - title: "Encode into a reusable buffer and send zero-copy on the client's PUSH socket"
+        source: "vllm/v1/engine/core.py:1972-1999"
+        call: "= vars.client"
+        targets: [async-mp-client.process-outputs-socket, sync-mp-client.process-outputs-socket]
+        input: {outputs: "= merge(input.outputs, {'engine_index': 0})"}
+      - return: {sent: outputs}
+
+  - component: engine-core-proc
+    name: send-finish-outputs-to-client
+    kind: function
+    summary: "EngineCoreProc._send_finish_outputs_to_client (with its abort and error variants): one empty EngineCoreOutput per request with the finish reason, marked finished."
+    sources: ["vllm/v1/engine/core.py:2112-2130"]
+    request: {type: object, properties: {request_ids: {type: array, items: {type: string}}, client_index: {type: integer}, finish_reason: {type: string, enum: [abort, error]}}}
+    behavior:
+      - call: engine-core-proc.process-output-sockets
+        input:
+          client_index: "= input.client_index"
+          outputs: {outputs: "= input.request_ids.map(r, {'request_id': r, 'new_token_ids': [], 'finish_reason': input.finish_reason, 'stop_reason': null})", finished_requests: "= input.request_ids"}
+
+  - component: engine-core-proc
+    name: send-abort-outputs
+    kind: function
+    summary: "EngineCoreProc._send_abort_outputs: group the aborted Requests by client and send each client its ABORT outputs."
+    sources: ["vllm/v1/engine/core.py:2132-2140"]
+    request: {type: object, properties: {requests: {type: array, items: {type: object}}}}
+    behavior:
+      - if: "size(input.requests) == 0"
+        then: [{return: {sent: 0}}]
+      - call: engine-core-proc.send-finish-outputs-to-client
+        input: {request_ids: "= input.requests.map(r, r.request_id)", client_index: 0, finish_reason: abort}
+      - return: {sent: "= size(input.requests)"}
+
+  - component: engine-core-proc
+    name: send-engine-dead
+    kind: function
+    summary: "EngineCoreProc._send_engine_dead: queue ENGINE_CORE_DEAD for the output thread and wait (5 s) for it to go out."
+    sources: ["vllm/v1/engine/core.py:1771-1782"]
+    behavior:
+      - set: {state.dead: true}
+      - call: engine-core-proc.process-output-sockets
+        input: {dead: true}
+
+  # ------------------------------------------------------------------ EngineCoreProc: the busy loop
+  - component: engine-core-proc
+    name: run-busy-loop
+    kind: function
+    summary: "One iteration of EngineCoreProc.run_busy_loop under fault_tolerant_wrapper: handle shutdown, take client requests from the input queue (blocking on it while idle), step the engine, then loop."
+    description: "Each iteration re-emits the next one, so a scenario starts the loop once (await: false) and it keeps running alongside other steps; an idle loop blocks in a channel receive until the input thread puts a request. `iterations` bounds the loop for the simulation."
+    sources: ["vllm/v1/engine/core.py:1547-1558", "vllm/v1/fault_tolerance/engine_core_sentinel.py:176-194"]
+    request: {type: object, properties: {iterations: {type: integer, default: 60, minimum: 1}, pump: {type: boolean, default: false, description: "one non-blocking iteration driven by a waiting client when no loop task is running (simulation device)"}}}
+    behavior:
+      - set: {state.iterations: "= state.iterations + 1"}
+      - if: "state.dead || state.exited"
+        then:
+          - set: {state.loop_active: false}
+          - return: {stopped: true}
+      - if: "!(has(input.pump) && input.pump)"
+        then:
+          - set: {state.loop_active: "= input.iterations > 1"}
+      - if: "config['enable-fault-tolerance']"
+        then:
+          - title: "fault_tolerant_wrapper: while parked, wait on sentinel.resumed with engine_recovery_timeout_sec"
+            source: "vllm/v1/fault_tolerance/engine_core_sentinel.py:185-194"
+            call: engine-core-sentinel.wait-resumed
+            as: ft
+          - if: "vars.ft.value.timed_out"
+            then:
+              - title: "No recovery within the timeout: the exception is re-raised and the engine dies"
+                source: "vllm/v1/fault_tolerance/engine_core_sentinel.py:190-194"
+                call: engine-core-proc.send-engine-dead
+              - fail: {code: runtime-error, message: "= '[FT] No recovery within ' + string(config['engine-recovery-timeout-sec']) + 's timeout.'"}
+          - if: "!vars.ft.value.recovered"
+            then:
+              - emit: engine-core-proc.run-busy-loop
+                when: "input.iterations > 1"
+                after_ms: 1
+                input: {iterations: "= input.iterations - 1"}
+              - return: {parked: true}
+      - title: "while self._handle_shutdown(): exit once shutdown is underway and no work remains"
+        source: "vllm/v1/engine/core.py:1549"
+        call: engine-core-proc.handle-shutdown
+        as: sd
+      - if: "!vars.sd.value.keep_running"
+        then:
+          - title: "raise SystemExit; run_engine_core's finally shuts the engine down"
+            source: "vllm/v1/engine/core.py:1558"
+            call: engine-core.shutdown
+          - title: "The process exits; the parent's process manager sees it"
+            source: "vllm/v1/engine/core.py:1515-1521"
+            put: engine-core-exit
+            value: {exited: true}
+          - return: {exited: true}
+      - title: "1) Poll the input queue until there is work to do"
+        source: "vllm/v1/engine/core.py:1550-1551"
+        call: engine-core-proc.process-input-queue
+        input: {pump: "= has(input.pump) && input.pump"}
+        as: piq
+        on_error: *fault_path
+      - if: "!vars.piq.value.work"
+        then:
+          - emit: engine-core-proc.run-busy-loop
+            when: "input.iterations > 1 && !(has(input.pump) && input.pump)"
+            after_ms: 0
+            input: {iterations: "= input.iterations - 1"}
+          - return: {idle: true}
+      - title: "2) Step the engine core and return the outputs"
+        source: "vllm/v1/engine/core.py:1555-1556"
+        call: engine-core-proc.process-engine-step
+        as: st
+        on_error: *fault_path
+      - emit: engine-core-proc.run-busy-loop
+        when: "input.iterations > 1 && !(has(input.pump) && input.pump)"
+        after_ms: 0
+        input: {iterations: "= input.iterations - 1"}
+      - return: {stepped: true, model_executed: "= vars.st.value.model_executed"}
+
+  - component: engine-core-proc
+    name: drive-step
+    kind: function
+    summary: "Simulation device for the always-running engine-core process: when no busy-loop task is running (a scenario that never started one), a client waiting for outputs runs one non-blocking busy-loop iteration."
+    description: "In vLLM the engine-core process starts with AsyncLLM/LLMEngine and loops on its own (core.py:1391-1497); a scenario may not start that loop, so the waiting client drives it. With a loop task running this does nothing."
+    sources: ["vllm/v1/engine/core.py:1547-1558"]
+    behavior:
+      - if: "has(state.loop_active) && state.loop_active"
+        then: [{return: {driven: false}}]
+      - call: engine-core-proc.run-busy-loop
+        input: {iterations: 1, pump: true}
+        as: it
+        on_error: continue
+      - return: {driven: true}
+
+  - component: engine-core-proc
+    name: handle-shutdown
+    kind: function
+    summary: "EngineCoreProc._handle_shutdown: on a requested shutdown, abort in-flight requests (shutdown_timeout 0) or let them drain, then exit once no work remains."
+    sources: ["vllm/v1/engine/core.py:1626-1672"]
+    attributes: {racy_in_code: "the busy loop reads shutdown_state and then sets SHUTTING_DOWN with no lock (core.py:1626-1661), while the SIGTERM handler writes REQUESTED from the same main thread between bytecodes (core.py:1451-1462); a second signal between the read and the write is overwritten"}
+    response: {type: object, properties: {keep_running: {type: boolean}}}
+    behavior:
+      - if: "state.shutdown_state == 'RUNNING'"
+        then: [{return: {keep_running: true}}]
+      - if: "state.shutdown_state == 'REQUESTED'"
+        then:
+          - if: "config['shutdown-timeout'] == 0"
+            then:
+              - title: "mode=abort: finish every request as FINISHED_ABORTED and tell the clients"
+                source: "vllm/v1/engine/core.py:1640-1650"
+                call: scheduler.finish-requests
+                input: {request_ids: null, finished_status: FINISHED_ABORTED}
+                as: ab
+              - call: engine-core-proc.send-abort-outputs
+                input: {requests: "= vars.ab.value.finished.map(r, {'request_id': r, 'client_index': 0})"}
+            else:
+              - title: "mode=drain: keep stepping the in-flight requests (the process manager enforces the timeout)"
+                source: "vllm/v1/engine/core.py:1651-1658"
+                set: {ctx.shutdown_mode: drain}
+          - set: {state.shutdown_state: SHUTTING_DOWN}
+      - call: engine-core-proc.has-work
+        as: hw
+      - if: "!vars.hw.value"
+        then:
+          - title: "No work left: request processing complete, start resource teardown"
+            source: "vllm/v1/engine/core.py:1664-1670"
+            set: {state.exited: true, state.loop_active: false}
+          - return: {keep_running: false}
+      - return: {keep_running: true}
+
+  - component: engine-core-proc
+    name: has-work
+    kind: function
+    summary: "EngineCoreProc.has_work: step when DP engines are running, the scheduler has requests, or batches are in flight."
+    sources: ["vllm/v1/engine/core.py:1534-1540"]
+    response: {type: boolean}
+    behavior:
+      - if: "state.engines_running || state.batch_queue_len > 0"
+        then: [{return: true}]
+      - call: scheduler.has-requests
+        as: hr
+      - title: "The scheduler's answer decides; a scenario may pin it (idle) when it needs a drained scheduler without seeding scheduler-kv's state"
+        choice: scheduler_has_requests
+        default: "= vars.hr.value ? 'busy' : 'idle'"
+        options:
+          busy: [{return: true}]
+          idle: [{return: false}]
+
+  - component: engine-core-proc
+    name: process-input-queue
+    kind: function
+    summary: "EngineCoreProc._process_input_queue: while idle, run idle callbacks (completing pauses), drop stale aborts and block on input_queue.get(); then dispatch every queued client request."
+    sources: ["vllm/v1/engine/core.py:1573-1601"]
+    request: {type: object, properties: {pump: {type: boolean, default: false}}}
+    response: {type: object, properties: {work: {type: boolean}, handled: {type: integer}}}
+    behavior:
+      - set: {vars.ch: "= 'engine-core-input:' + self", vars.handled: 0}
+      - call: engine-core-proc.has-work
+        as: hw
+      - if: "has(input.pump) && input.pump && !vars.hw.value && channel_len(vars.ch) == 0"
+        then:
+          - title: "A driven iteration never blocks: nothing queued and nothing to step"
+            return: {work: false, handled: 0}
+      - if: "!vars.hw.value && state.shutdown_state == 'RUNNING'"
+        then:
+          - title: Notify callbacks waiting for the engine to become idle
+            source: "vllm/v1/engine/core.py:1578-1579"
+            call: engine-core-proc.notify-idle-state-callbacks
+          - if: "channel_len(vars.ch) == 0"
+            then:
+              - title: "Idle with an empty input queue: drop stale aborts"
+                source: "vllm/v1/engine/core.py:1580-1585"
+                set: {state.aborts_queue: []}
+          - title: "Block on input_queue.get() until the input thread puts a client request"
+            source: "vllm/v1/engine/core.py:1586-1589"
+            receive: "= vars.ch"
+            as: first
+          - call: "= 'engine-core-proc.handle-' + vars.first.type.lowerAscii().replace('_', '-')"
+            targets: [engine-core-proc.handle-add, engine-core-proc.handle-abort, engine-core-proc.handle-executor-failed, engine-core-proc.handle-wakeup]
+            input: "= vars.first"
+          - set: {vars.handled: 1}
+      - title: "Handle any more client requests without blocking"
+        source: "vllm/v1/engine/core.py:1597-1601"
+        foreach: "= lists.range(channel_len(vars.ch))"
+        as: k
+        steps:
+          - receive: "= vars.ch"
+            as: item
+          - call: "= 'engine-core-proc.handle-' + vars.item.type.lowerAscii().replace('_', '-')"
+            targets: [engine-core-proc.handle-add, engine-core-proc.handle-abort, engine-core-proc.handle-executor-failed, engine-core-proc.handle-wakeup]
+            input: "= vars.item"
+          - set: {vars.handled: "= vars.handled + 1"}
+      - if: "vars.hw.value"
+        then: [{return: {work: true, handled: "= vars.handled"}}]
+      - call: engine-core-proc.has-work
+        as: hw2
+      - return: {work: "= vars.hw2.value", handled: "= vars.handled"}
+
+  - component: engine-core-proc
+    name: notify-idle-state-callbacks
+    kind: function
+    summary: "Run the callbacks pause_scheduler registered: each finishes its pause (device sync, optional cache clear)."
+    sources: ["vllm/v1/engine/core.py:1621-1624"]
+    behavior:
+      - set:
+          vars.cbs: "= has(state.idle_callbacks) ? state.idle_callbacks : []"
+          state.idle_callbacks: []
+      - foreach: "= vars.cbs"
+        as: cb
+        steps:
+          - call: engine-core.finish-pause
+            input: {clear_cache: "= vars.cb.clear_cache"}
+
+  - component: engine-core-proc
+    name: process-engine-step
+    kind: function
+    summary: "EngineCoreProc._process_engine_step: run step_fn (step_with_batch_queue under async scheduling), queue the outputs for the output thread, post-step; yield 1 ms when nothing ran but work remains."
+    sources: ["vllm/v1/engine/core.py:1603-1619"]
+    response: {type: object, properties: {model_executed: {type: boolean}}}
+    behavior:
+      - title: "step_fn is step_with_batch_queue when max_concurrent_batches > 1 (async scheduling), else step"
+        source: "vllm/v1/engine/core.py:242-244"
+        call: "= config['async-scheduling'] ? 'engine-core.step-with-batch-queue' : 'engine-core.step'"
+        targets: [engine-core.step-with-batch-queue, engine-core.step]
+        as: st
+      - set: {state.batch_queue_len: "= vars.st.value.batch_queue_len"}
+      - if: "vars.st.value.outputs != null"
+        then:
+          - title: Put EngineCoreOutputs into the output queue (the output thread sends them)
+            source: "vllm/v1/engine/core.py:1607-1608"
+            call: engine-core-proc.process-output-sockets
+            input: {client_index: 0, outputs: "= vars.st.value.outputs"}
+      - title: Post-step hook
+        source: "vllm/v1/engine/core.py:1610-1611"
+        call: engine-core.post-step
+        input: {model_executed: "= vars.st.value.model_executed"}
+      - if: "!vars.st.value.model_executed"
+        then:
+          - call: scheduler.has-requests
+            as: hr
+          - if: "vars.hr.value"
+            then:
+              - title: "No model ran but scheduler work remains (e.g. waiting for remote KV): sleep 1 ms"
+                source: "vllm/v1/engine/core.py:1612-1617"
+                wait: 1
+      - return: {model_executed: "= vars.st.value.model_executed"}
+
+  # ------------------------------------------------------------------ EngineCoreProc: client requests
+  - component: engine-core-proc
+    name: handle-add
+    kind: function
+    summary: "ADD: refused with an ABORT output once shutdown started, else EngineCore.add_request."
+    sources: ["vllm/v1/engine/core.py:1680-1684", "vllm/v1/engine/core.py:1708-1717"]
+    request: {type: object, properties: {type: {type: string}, request: {$ref: EngineCoreRequest}}}
+    behavior:
+      - if: "state.shutdown_state != 'RUNNING'"
+        then:
+          - title: "Shutting down: reject the new request with an ABORT output"
+            source: "vllm/v1/engine/core.py:1708-1717"
+            call: engine-core-proc.send-finish-outputs-to-client
+            input: {request_ids: ["= input.request.request_id"], client_index: 0, finish_reason: abort}
+          - return: {added: false}
+      - call: engine-core.add-request
+        input: "= input.request"
+      - return: {added: true}
+
+  - component: engine-core-proc
+    name: handle-abort
+    kind: function
+    summary: "ABORT: EngineCore.abort_requests (idempotent in the scheduler)."
+    sources: ["vllm/v1/engine/core.py:1685-1686"]
+    request: {type: object, properties: {type: {type: string}, request_ids: {type: array, items: {type: string}}}}
+    behavior:
+      - call: engine-core.abort-requests
+        input: {request_ids: "= input.request_ids"}
+
+  - component: engine-core-proc
+    name: handle-executor-failed
+    kind: function
+    summary: "EXECUTOR_FAILED (put by the executor's failure callback): raise RuntimeError, which kills the busy loop."
+    sources: ["vllm/v1/engine/core.py:1701-1702"]
+    errors: [{code: runtime-error, status: 0, retryable: false}]
+    behavior:
+      - fail: {code: runtime-error, message: "Executor failed."}
+
+  - component: engine-core-proc
+    name: handle-wakeup
+    kind: function
+    summary: "WAKEUP (from the signal handler): only wakes the blocked input_queue.get()."
+    sources: ["vllm/v1/engine/core.py:1678-1679"]
+    behavior:
+      - return: {woken: true}
+
+  - component: engine-core-proc
+    name: handle-utility
+    kind: function
+    summary: "UTILITY: refuse while shutting down; look the method up lazily on the engine and run it; a failure becomes failure_message; a Future result defers the reply."
+    sources: ["vllm/v1/engine/core.py:1687-1700", "vllm/v1/engine/core.py:1719-1753"]
+    request: EngineCoreUtilityCall
+    response: EngineCoreUtilityResult
+    behavior:
+      - if: "state.shutdown_state != 'RUNNING'"
+        then:
+          - title: "Shutting down: reply with failure 'Server shutting down'"
+            source: "vllm/v1/engine/core.py:1719-1734"
+            return: {result: null, failure_message: Server shutting down}
+      - set:
+          vars.known: [get_supported_tasks, profile, reset_mm_cache, reset_prefix_cache, reset_encoder_cache, pause_scheduler, resume_scheduler, is_scheduler_paused, sleep, wake_up, release_kv_cache_memory, is_sleeping, execute_dummy_batch, compute_weight_checksums, add_lora, remove_lora, list_loras, pin_lora, save_sharded_state, collective_rpc, set_weight_version, get_weight_version]
+      - if: "!(input.method in vars.known)"
+        then:
+          - title: "getattr fails: AttributeError becomes the failure message"
+            source: "vllm/v1/engine/core.py:1692-1696"
+            return: {result: null, failure_message: "= 'Call to ' + input.method + \" method failed: 'EngineCoreProc' object has no attribute '\" + input.method + \"'\""}
+      - title: "method(*args); exceptions are logged and returned as failure_message"
+        source: "vllm/v1/engine/core.py:1736-1753"
+        call: "= (input.method == 'pause_scheduler' ? 'engine-core-proc.' : 'engine-core.') + input.method.replace('_', '-')"
+        targets: [engine-core.get-supported-tasks, engine-core.profile, engine-core.reset-mm-cache, engine-core.reset-prefix-cache, engine-core.reset-encoder-cache, engine-core-proc.pause-scheduler, engine-core.resume-scheduler, engine-core.is-scheduler-paused, engine-core.sleep, engine-core.wake-up, engine-core.release-kv-cache-memory, engine-core.is-sleeping, engine-core.execute-dummy-batch, engine-core.compute-weight-checksums, engine-core.add-lora, engine-core.remove-lora, engine-core.list-loras, engine-core.pin-lora, engine-core.save-sharded-state, engine-core.collective-rpc, engine-core.set-weight-version, engine-core.get-weight-version]
+        input: "= input.args"
+        as: r
+        on_error: continue
+      - if: "!vars.r.ok"
+        then:
+          - return: {result: null, failure_message: "= 'Call to ' + input.method + ' method failed: ' + (has(vars.r.error.message) && vars.r.error.message != null && vars.r.error.message != '' ? vars.r.error.message : vars.r.error.code)"}
+      - return: {result: "= vars.r.value", failure_message: null}
+
+  - component: engine-core-proc
+    name: executor-fail-callback
+    kind: function
+    summary: "The executor failure callback: put EXECUTOR_FAILED on the input queue."
+    sources: ["vllm/v1/engine/core.py:1149-1151"]
+    behavior:
+      - put: "= 'engine-core-input:' + self"
+        value: {type: EXECUTOR_FAILED}
+
+  - component: engine-core-proc
+    name: signal-handler
+    kind: function
+    summary: "SIGTERM/SIGINT handler: record the shutdown request and wake the busy loop."
+    sources: ["vllm/v1/engine/core.py:1451-1467", "vllm/v1/engine/core.py:1444-1449"]
+    request: {type: object, properties: {signal: {type: string, default: SIGTERM}}}
+    behavior:
+      - if: "state.shutdown_state == 'RUNNING'"
+        then:
+          - set: {state.shutdown_state: REQUESTED}
+      - title: "SignalCallback wakes the idle loop via a WAKEUP on the input queue"
+        source: "vllm/v1/engine/core.py:1444-1449"
+        put: "= 'engine-core-input:' + self"
+        value: {type: WAKEUP}
+      - return: {shutdown_state: "= state.shutdown_state"}
+
+  - component: engine-core-proc
+    name: process-aborts-queue
+    kind: function
+    summary: "EngineCore._process_aborts_queue: abort, as one batch, every id that arrived during model execution."
+    sources: ["vllm/v1/engine/core.py:814-822"]
+    behavior:
+      - if: "size(state.aborts_queue) == 0"
+        then: [{return: {aborted: 0}}]
+      - set:
+          vars.ids: "= state.aborts_queue.flatten()"
+          state.aborts_queue: []
+      - call: engine-core.abort-requests
+        input: {request_ids: "= vars.ids"}
+      - return: {aborted: "= size(vars.ids)"}
+
+  - component: engine-core-proc
+    name: pause-scheduler
+    kind: function
+    summary: "EngineCoreProc.pause_scheduler: abort (mode abort), set PAUSED_NEW or PAUSED_ALL (keep), and finish now when idle or once the engine becomes idle."
+    sources: ["vllm/v1/engine/core.py:2061-2103", "vllm/v1/engine/core.py:921-949"]
+    request: {type: object, properties: {mode: {type: string, default: abort, description: "abort, wait or keep"}, clear_cache: {type: boolean, default: true}}}
+    errors: [{code: value-error, status: 0, retryable: false}]
+    behavior:
+      - set:
+          vars.mode: "= has(input.mode) ? input.mode : 'abort'"
+          vars.clear: "= has(input.clear_cache) ? input.clear_cache : true"
+      - if: "!(vars.mode in ['abort', 'wait', 'keep'])"
+        then:
+          - fail: {code: value-error, message: "= 'Invalid pause mode: ' + vars.mode"}
+      - if: "vars.mode == 'abort'"
+        then:
+          - title: "abort: finish every request as aborted and send the abort outputs"
+            source: "vllm/v1/engine/core.py:2088-2092"
+            call: scheduler.finish-requests
+            input: {request_ids: null, finished_status: FINISHED_ABORTED}
+            as: ab
+          - call: engine-core-proc.send-abort-outputs
+            input: {requests: "= vars.ab.value.finished.map(r, {'request_id': r, 'client_index': 0})"}
+      - title: "keep -> PAUSED_ALL (nothing steps); abort and wait -> PAUSED_NEW (new adds queue)"
+        source: "vllm/v1/engine/core.py:2094-2095"
+        call: scheduler.set-pause-state
+        input: {pause_state: "= vars.mode == 'keep' ? 'PAUSED_ALL' : 'PAUSED_NEW'"}
+      - call: engine-core-proc.has-work
+        as: hw
+      - if: "!vars.hw.value"
+        then:
+          - call: engine-core.finish-pause
+            input: {clear_cache: "= vars.clear"}
+          - return: {paused: true, pending: false}
+      - title: "Not idle yet: finish the pause from an idle-state callback; the utility reply waits for it"
+        source: "vllm/v1/engine/core.py:2101-2103"
+        set: {state.idle_callbacks: "= (has(state.idle_callbacks) ? state.idle_callbacks : []) + [{'clear_cache': vars.clear}]"}
+      - return: {paused: true, pending: true}
+
+  - component: engine-core-proc
+    name: run-engine-core
+    kind: function
+    summary: "EngineCoreProc.run_engine_core: the engine-core process target: install signal handlers, build EngineCoreProc (and so EngineCore), run the busy loop; a startup failure is logged, a later fatal error sends ENGINE_CORE_DEAD."
+    sources: ["vllm/v1/engine/core.py:1391-1529"]
+    request: {type: object, properties: {iterations: {type: integer, default: 60}, client_kind: {type: string, enum: [async, sync], default: async}}}
+    errors: [{code: runtime-error, status: 0}]
+    behavior:
+      - title: "Construct the engine: EngineCore.__init__ builds the executor, profiles memory and sizes the KV cache, creates the scheduler"
+        source: "vllm/v1/engine/core.py:1471-1482"
+        call: engine-core.init
+        as: eng
+        on_error:
+          - title: "EngineCore failed to start: the exception ends the process before any handshake"
+            source: "vllm/v1/engine/core.py:1508-1510"
+            fail: "= error"
+      - set: {state.shutdown_state: RUNNING, state.dead: false, state.exited: false, state.client_kind: "= has(input.client_kind) ? input.client_kind : 'async'"}
+      - title: Start the busy loop
+        source: "vllm/v1/engine/core.py:1496"
+        emit: engine-core-proc.run-busy-loop
+        after_ms: 0
+        input: {iterations: "= has(input.iterations) ? input.iterations : 60"}
+      - return: "= vars.eng.value"
+
+  # ------------------------------------------------------------------ EngineCore
+  - component: engine-core
+    name: init
+    kind: function
+    summary: "EngineCore.__init__: load plugins, create the executor (which loads the model on the workers), initialize KV caches, create the scheduler, and size the batch queue (2 under async scheduling)."
+    sources: ["vllm/v1/engine/core.py:118-258"]
+    response: {type: object, properties: {num_gpu_blocks: {type: integer}, batch_queue_size: {type: integer}, backend: {type: string}}}
+    behavior:
+      - title: "Setup Model: executor_class(vllm_config)"
+        source: "vllm/v1/engine/core.py:143-147"
+        call: executor.init-executor
+        as: ex
+      - title: "Setup KV Caches and update CacheConfig after profiling"
+        source: "vllm/v1/engine/core.py:157"
+        call: engine-core.initialize-kv-caches
+        as: kv
+      - title: "Batch queue for async scheduling / PP: size max_concurrent_batches"
+        source: "vllm/v1/engine/core.py:216-225"
+        set:
+          state.batch_queue: {}
+          vars.bq: "= config['async-scheduling'] ? 2 : 1"
+      - return: {num_gpu_blocks: "= vars.kv.value.num_gpu_blocks", batch_queue_size: "= vars.bq", backend: "= vars.ex.value.backend"}
+
+  - component: engine-core
+    name: initialize-kv-caches
+    kind: function
+    summary: "EngineCore._initialize_kv_caches: get KV specs from the workers, profile available memory, compute the KV cache config, initialize the workers' caches and warm up/compile the model."
+    sources: ["vllm/v1/engine/core.py:261-406"]
+    response: {type: object, properties: {num_gpu_blocks: {type: integer}}}
+    behavior:
+      - call: executor.collective-rpc
+        input: {method: get_kv_cache_spec}
+        as: specs
+      - title: "Profile peak memory to find how much is left for the KV cache"
+        source: "vllm/v1/engine/core.py:310-316"
+        call: executor.collective-rpc
+        input: {method: determine_available_memory}
+        as: mem
+      - set:
+          vars.avail: "= vars.mem.value.results.map(r, r.value)"
+      - title: "get_kv_cache_configs sizes the pool (the smallest worker wins); num_gpu_blocks is written back into CacheConfig"
+        source: "vllm/v1/engine/core.py:321-339"
+        call: kv-cache-utils.get-kv-cache-configs
+        input:
+          available_memory: "= vars.avail"
+          bytes_per_block: "= vars.specs.value.results[0].value.page_size_bytes * vars.specs.value.results[0].value.num_layers"
+        as: kvc
+      - set: {vars.num_blocks: "= vars.kvc.value.num_blocks"}
+      - title: "Each worker allocates its KV cache with the agreed block count"
+        source: "vllm/v1/engine/core.py:376"
+        call: executor.collective-rpc
+        input: {method: initialize_from_config, args: {num_blocks: "= vars.num_blocks"}}
+      - title: "Compile or warm up the model (CUDA graphs) on the workers"
+        source: "vllm/v1/engine/core.py:378-379"
+        call: executor.collective-rpc
+        input: {method: compile_or_warm_up_model}
+      - return: {num_gpu_blocks: "= vars.num_blocks"}
+
+  - component: engine-core
+    name: add-request
+    kind: rpc
+    summary: "EngineCore.add_request: validate the id and any pooling task, hand the Request to the scheduler, and abort at once a request marked abort_immediately."
+    sources: ["vllm/v1/engine/core.py:508-552"]
+    request: EngineCoreClientRequest
+    errors:
+      - {code: type-error, status: 0, retryable: false}
+      - {code: value-error, status: 0, retryable: false}
+    behavior:
+      - if: "type(input.request_id) != string"
+        then:
+          - title: request_id must be a string
+            source: "vllm/v1/engine/core.py:514-517"
+            fail: {code: type-error, message: "request_id must be a string"}
+      - if: "has(input.pooling_params) && input.pooling_params != null"
+        then:
+          - call: engine-core.get-supported-tasks
+            as: tasks
+          - if: "!(input.pooling_params.task in vars.tasks.value)"
+            then:
+              - title: Unsupported pooling task
+                source: "vllm/v1/engine/core.py:519-527"
+                fail: {code: value-error, message: "= 'Unsupported task: ' + input.pooling_params.task"}
+      - title: Hand the request to the scheduler (WAITING)
+        source: "vllm/v1/engine/core.py:548"
+        call: scheduler.add-request
+        input: "= input"
+      - if: "has(input.abort_immediately) && input.abort_immediately"
+        then:
+          - title: "abort_immediately: abort now so the KV connector frees pre-admission resources"
+            source: "vllm/v1/engine/core.py:549-552"
+            call: engine-core.abort-requests
+            input: {request_ids: ["= input.request_id"]}
+      - return: {added: "= input.request_id"}
+
+  - component: engine-core
+    name: abort-requests
+    kind: function
+    summary: "EngineCore.abort_requests: finish the requests in the scheduler as FINISHED_ABORTED."
+    sources: ["vllm/v1/engine/core.py:554-559"]
+    request: {type: object, properties: {request_ids: {type: array, items: {type: string}}}}
+    behavior:
+      - call: scheduler.finish-requests
+        input: {request_ids: "= input.request_ids", finished_status: FINISHED_ABORTED}
+
+  - component: engine-core
+    name: preprocess-add-request
+    kind: function
+    latency_ms: 0
+    summary: "EngineCore.preprocess_add_request (input thread): refresh multimodal features from the receiver cache, build the Request, start grammar compilation for structured output."
+    sources: ["vllm/v1/engine/core.py:1089-1111"]
+    request: EngineCoreClientRequest
+    response: EngineCoreClientRequest
+    behavior:
+      - if: "has(input.mm_features) && input.mm_features != null && size(input.mm_features) > 0"
+        then:
+          - title: "mm_receiver_cache.get_and_update_features: store the items P0 sent, fill the ones it left out from the P1 cache (a miss raises MultiModalCacheMissError)"
+            source: "vllm/v1/engine/core.py:1095-1101"
+            call: lru-key-replicated-receiver-cache.get-and-update-features
+            input: {mm_features: "= input.mm_features"}
+            as: mm
+          - set: {vars.req_in: "= merge(input, {'mm_features': vars.mm.value.mm_features})"}
+        else:
+          - set: {vars.req_in: "= input"}
+      - if: "has(input.sampling_params) && has(input.sampling_params.structured_outputs) && input.sampling_params.structured_outputs != null"
+        then:
+          - title: "get_structured_output_key: json (dumped to text), json_object, regex, choice, grammar, then structural_tag; xgrammar validation already turned a choice into an EBNF grammar"
+            detail: "A JSON schema given as an object is passed as a generic object schema text (no json.dumps in CEL)."
+            source: "vllm/v1/structured_output/request.py:74-95"
+            set:
+              vars.so: "= input.sampling_params.structured_outputs"
+          - set:
+              vars.key: "= has(vars.so.json) && vars.so.json != null ? ['json', type(vars.so.json) == string ? vars.so.json : '{\"type\": \"object\"}'] : (has(vars.so.json_object) && vars.so.json_object == true ? ['json_object', ''] : (has(vars.so.regex) && vars.so.regex != null ? ['regex', vars.so.regex] : (has(vars.so.choice) && vars.so.choice != null ? ['grammar', 'root ::= ' + vars.so.choice.map(c, '\"' + c + '\"').join(' | ')] : (has(vars.so.grammar) && vars.so.grammar != null ? ['grammar', vars.so.grammar] : ['structural_tag', has(vars.so.structural_tag) && vars.so.structural_tag != null ? vars.so.structural_tag : '']))))"
+              vars.so_backend: "= has(vars.so._backend) && vars.so._backend != null ? vars.so._backend : (config['structured-outputs-backend'] == 'auto' ? 'xgrammar' : config['structured-outputs-backend'])"
+          - title: "Structured output: structured_output_manager.grammar_init(req) starts compiling the grammar now; the scheduler checks its status before scheduling the request"
+            source: "vllm/v1/engine/core.py:1104-1110"
+            call: structured-output-manager.grammar-init
+            input:
+              request_id: "= input.request_id"
+              backend: "= vars.so_backend"
+              request_type: "= vars.key[0]"
+              grammar_spec: "= vars.key[1]"
+              stop_token_ids: "= (has(input.sampling_params.stop_token_ids) && input.sampling_params.stop_token_ids != null ? input.sampling_params.stop_token_ids : []) + (has(input.sampling_params.eos_token_id) && input.sampling_params.eos_token_id != null ? [input.sampling_params.eos_token_id] : [])"
+            as: gi
+          - title: "Request.__init__: a structured-output request starts in WAITING_FOR_STRUCTURED_OUTPUT_GRAMMAR and carries its grammar"
+            source: "vllm/v1/request.py:116-117"
+            return: "= merge(vars.req_in, {'status': 'WAITING_FOR_STRUCTURED_OUTPUT_GRAMMAR', 'grammar_id': vars.gi.value.grammar_id})"
+      - title: "Request.from_engine_core_request"
+        source: "vllm/v1/request.py:244-270"
+        return: "= merge(vars.req_in, {'status': 'WAITING'})"
+
+  - component: engine-core
+    name: step
+    kind: function
+    summary: "EngineCore.step: schedule, execute the model on the workers, sample if needed, apply aborts that arrived meanwhile, and let the scheduler turn the model output into EngineCoreOutputs."
+    sources: ["vllm/v1/engine/core.py:657-687"]
+    response: {type: object, properties: {outputs: {type: ["object", "null"], default: null}, model_executed: {type: boolean}, batch_queue_len: {type: integer}}}
+    behavior:
+      - call: scheduler.has-requests
+        as: hr
+      - if: "!vars.hr.value"
+        then:
+          - title: "No requests in the scheduler: nothing to do"
+            source: "vllm/v1/engine/core.py:665-666"
+            return: {outputs: null, model_executed: false, batch_queue_len: 0}
+      - call: scheduler.schedule
+        input: {throttle_prefills: false}
+        as: so
+      - title: "execute_model on the workers (non_block); future.result() re-raises a worker failure"
+        source: "vllm/v1/engine/core.py:667-675"
+        call: executor.execute-model
+        input: {scheduler_output: "= vars.so.value"}
+        as: ex
+        on_error:
+          - title: "log_error_detail dumps the scheduler state, then re-raises"
+            source: "vllm/v1/engine/core.py:562-576"
+            fail: "= error"
+      - title: "While the workers run the forward, compute the grammar bitmask of the scheduled structured-output requests (None without any)"
+        source: "vllm/v1/engine/core.py:668"
+        call: scheduler.get-grammar-bitmask
+        input: {scheduler_output: "= vars.so.value"}
+        as: gb
+      - set: {vars.mo: "= vars.ex.value"}
+      - if: "vars.ex.value == null"
+        then:
+          - title: "execute_model returned None: sample with the grammar bitmask"
+            source: "vllm/v1/engine/core.py:675-676"
+            call: executor.sample-tokens
+            input: {grammar_output: "= vars.gb.value"}
+            as: smp
+          - set: {vars.mo: "= vars.smp.value"}
+      - title: Process aborts that arrived during model execution
+        source: "vllm/v1/engine/core.py:678-680"
+        call: engine-core-proc.process-aborts-queue
+      - call: scheduler.update-from-output
+        input: {scheduler_output: "= vars.so.value", model_runner_output: "= vars.mo"}
+        as: up
+      - call: engine-core.get-weight-version
+        as: wv
+      - return: {outputs: "= merge(vars.up.value, {'weight_version': vars.wv.value.weight_version})", model_executed: "= vars.so.value.total_num_scheduled_tokens > 0", batch_queue_len: 0}
+
+  - component: engine-core
+    name: post-step
+    kind: function
+    summary: "EngineCore.post_step: with speculative decoding and sync scheduling, take the workers' draft token ids after an executed step and hand them to the scheduler (under async scheduling the workers keep their drafts)."
+    sources: ["vllm/v1/engine/core.py:689-696", "vllm/v1/engine/core.py:185-187"]
+    request: {type: object, properties: {model_executed: {type: boolean}}}
+    response: {type: object, properties: {updated: {type: boolean}}}
+    behavior:
+      - if: "config['speculative-method'] == '' || config['async-scheduling'] || !input.model_executed"
+        then:
+          - title: "check_for_draft_tokens is off (no spec decode), async scheduling keeps drafts on the workers, or nothing ran"
+            source: "vllm/v1/engine/core.py:693"
+            return: {updated: false}
+      - title: "model_executor.take_draft_token_ids(): the output rank's DraftTokenIds (placeholders, or empty before any spec step)"
+        source: "vllm/v1/engine/core.py:694"
+        call: executor.collective-rpc
+        input: {method: take_draft_token_ids, unique_reply_rank: 0}
+        as: dt
+      - set: {vars.d: "= size(vars.dt.value.results) > 0 ? vars.dt.value.results[0].value : null"}
+      - if: "vars.d == null"
+        then:
+          - title: "None: nothing to update"
+            source: "vllm/v1/engine/core.py:695"
+            return: {updated: false}
+      - title: "scheduler.update_draft_token_ids(draft_token_ids)"
+        source: "vllm/v1/engine/core.py:696"
+        call: scheduler.update-draft-token-ids
+        input: {req_ids: "= vars.d.req_ids", draft_token_ids: "= vars.d.draft_token_ids"}
+      - return: {updated: true}
+
+  - component: engine-core
+    name: step-with-batch-queue
+    kind: function
+    summary: "EngineCore.step_with_batch_queue: schedule and launch a batch while the queue has room (returning no output), else block on the oldest batch and update the scheduler from it: outputs lag one step behind scheduling."
+    sources: ["vllm/v1/engine/core.py:698-812"]
+    response: {type: object, properties: {outputs: {type: ["object", "null"], default: null}, model_executed: {type: boolean}, batch_queue_len: {type: integer}}}
+    behavior:
+      - set:
+          vars.bq: "= has(state.batch_queue) ? state.batch_queue : {}"
+          vars.size: "= config['async-scheduling'] ? 2 : 1"
+          vars.executed: false
+      - call: scheduler.has-requests
+        as: hr
+      - if: "vars.hr.value"
+        then:
+          - call: scheduler.schedule
+            input: {throttle_prefills: false}
+            as: so
+          - title: "Launch execute_model without blocking"
+            source: "vllm/v1/engine/core.py:723-727"
+            call: executor.execute-model
+            input: {scheduler_output: "= vars.so.value"}
+            as: ex
+            on_error:
+              - title: "log_error_detail dumps the scheduler state, then re-raises"
+                source: "vllm/v1/engine/core.py:562-576"
+                fail: "= error"
+          - set: {vars.executed: "= vars.so.value.total_num_scheduled_tokens > 0", vars.mo: "= vars.ex.value"}
+          - if: "vars.executed && has(vars.so.value.pending_structured_output_tokens) && vars.so.value.pending_structured_output_tokens == true"
+            then:
+              - title: "Structured-output tokens of the prior step are still pending: defer sampling until its output is processed"
+                source: "vllm/v1/engine/core.py:747-750"
+                set: {vars.deferred: "= vars.so.value"}
+            else:
+              - if: "vars.executed"
+                then:
+                  - title: "No structured-output tokens pending: get the grammar bitmask and sample right away"
+                    source: "vllm/v1/engine/core.py:737-746"
+                    call: scheduler.get-grammar-bitmask
+                    input: {scheduler_output: "= vars.so.value"}
+                    as: gb
+                  - call: executor.sample-tokens
+                    input: {grammar_output: "= vars.gb.value"}
+                    as: smp
+                  - set: {vars.mo: "= vars.smp.value"}
+              - title: "appendleft this step's future (newest key); the busy loop is the deque's only user"
+                source: "vllm/v1/engine/core.py:752-753"
+                transact:
+                  - {table: batch_queue, op: put, key: "= string(1000000000 + seq('batch'))", value: {scheduler_output: "= vars.so.value", model_output: "= vars.mo"}, if_absent: true}
+              - set: {vars.more: "= vars.executed"}
+              - if: "!vars.executed"
+                then:
+                  - call: scheduler.has-requests
+                    as: hr2
+                  - set: {vars.more: "= vars.hr2.value"}
+              - if: "size(state.batch_queue) < vars.size && vars.more"
+                then:
+                  - title: "Queue not full: don't block on the worker; no outputs this call"
+                    source: "vllm/v1/engine/core.py:754-760"
+                    return: {outputs: null, model_executed: "= vars.executed", batch_queue_len: "= size(state.batch_queue)"}
+        else:
+          - if: "size(vars.bq) == 0"
+            then:
+              - title: Nothing scheduled and nothing in flight
+                source: "vllm/v1/engine/core.py:762-766"
+                return: {outputs: null, model_executed: false, batch_queue_len: 0}
+      - title: "Block until the oldest batch's result is available"
+        source: "vllm/v1/engine/core.py:768-779"
+        set:
+          vars.oldest: "= state.batch_queue.filter(k, state.batch_queue.all(j, k <= j))[0]"
+      - set: {vars.item: "= state.batch_queue[vars.oldest]"}
+      - title: "batch_queue.pop(): the oldest batch leaves the queue"
+        source: "vllm/v1/engine/core.py:768"
+        transact:
+          - {table: batch_queue, op: delete, key: "= vars.oldest"}
+      - title: Process aborts that arrived during model execution
+        source: "vllm/v1/engine/core.py:781-783"
+        call: engine-core-proc.process-aborts-queue
+      - call: scheduler.update-from-output
+        input: {scheduler_output: "= vars.item.scheduler_output", model_runner_output: "= vars.item.model_output"}
+        as: up
+      - if: "has(vars.deferred)"
+        then:
+          - title: "The deferred step: the prior step's tokens are in, so compute its grammar bitmask, sample, and queue it"
+            source: "vllm/v1/engine/core.py:790-808"
+            call: scheduler.get-grammar-bitmask
+            input: {scheduler_output: "= vars.deferred"}
+            as: dgb
+          - call: executor.sample-tokens
+            input: {grammar_output: "= vars.dgb.value"}
+            as: dsmp
+          - transact:
+              - {table: batch_queue, op: put, key: "= string(1000000000 + seq('batch'))", value: {scheduler_output: "= vars.deferred", model_output: "= vars.dsmp.value"}, if_absent: true}
+      - call: engine-core.get-weight-version
+        as: wv
+      - return: {outputs: "= merge(vars.up.value, {'weight_version': vars.wv.value.weight_version})", model_executed: "= vars.executed", batch_queue_len: "= size(state.batch_queue)"}
+
+  - component: engine-core
+    name: finish-pause
+    kind: function
+    summary: "EngineCore._finish_pause: synchronize the device on every worker, then optionally reset the prefix, multimodal and encoder caches."
+    sources: ["vllm/v1/engine/core.py:914-919"]
+    request: {type: object, properties: {clear_cache: {type: boolean}}}
+    errors: [{code: runtime-error, status: 0}]
+    behavior:
+      - call: executor.collective-rpc
+        input: {method: synchronize_device}
+      - if: "input.clear_cache"
+        then:
+          - title: "_reset_caches: the prefix cache reset must succeed"
+            source: "vllm/v1/engine/core.py:898-912"
+            call: engine-core.reset-prefix-cache
+            input: {reset_running_requests: true, reset_connector: true}
+            as: rp
+          - if: "!vars.rp.value"
+            then:
+              - fail: {code: runtime-error, message: "Failed to reset the KV connector cache."}
+          - call: engine-core.reset-mm-cache
+          - call: engine-core.reset-encoder-cache
+      - return: {done: true}
+
+  - component: engine-core
+    name: shutdown
+    kind: function
+    summary: "EngineCore.shutdown: clear the structured-output backend, shut down the executor and the scheduler, unfreeze the GC and tear down distributed state."
+    sources: ["vllm/v1/engine/core.py:824-840"]
+    behavior:
+      - call: executor.shutdown
+      - call: scheduler.shutdown
+      - return: {shutdown: true}

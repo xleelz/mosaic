@@ -1,0 +1,180 @@
+# distributed area, part 11 (fix round 4, merge leftovers): the block-table width per cache group
+# (KVCacheSpec.max_num_blocks_per_req and its overrides) and KVCacheConfig.needs_kv_cache_zeroing,
+# both read by the worker's model runner when it sizes block tables and KV-zero metadata.
+schema_version: 1
+id: vllm
+
+interfaces:
+  - component: kv-cache-interface
+    name: max-num-blocks-per-req
+    kind: function
+    summary: "KVCacheSpec.max_num_blocks_per_req: the row length of the worker's block table for one cache group. Base: cdiv(max_len, block_size); attention specs divide by the DCP world when DCP-sharded; HiSparse hot pages are a fixed count; a circular buffer needs one; Mamba covers the sequence in align mode (plus speculative blocks), else its resident states; a UniformType group requires every layer to agree."
+    sources:
+      - "vllm/v1/kv_cache_interface.py:249-259"
+      - "vllm/v1/kv_cache_interface.py:466-467"
+      - "vllm/v1/kv_cache_interface.py:569-574"
+      - "vllm/v1/kv_cache_interface.py:928-930"
+      - "vllm/v1/kv_cache_interface.py:1072-1094"
+      - "vllm/v1/kv_cache_interface.py:1267-1279"
+    request:
+      type: object
+      required: [spec, max_len]
+      properties:
+        spec: DistKvCacheSpec
+        max_len: {type: integer, examples: [8192]}
+        decode_context_parallel_size: {type: integer, default: 1}
+        mamba_cache_mode: {type: string, default: none, description: "vllm_config.cache_config.mamba_cache_mode"}
+    response: {type: integer}
+    errors:
+      - {code: assertion-error, status: 0, retryable: false}
+    behavior:
+      - set:
+          vars.s: "= input.spec"
+          vars.dcp: "= has(input.decode_context_parallel_size) ? input.decode_context_parallel_size : 1"
+          vars.mode: "= has(input.mamba_cache_mode) ? input.mamba_cache_mode : 'none'"
+      - if: "vars.s.kind == 'uniform_type'"
+        then:
+          - set: {vars.widths: []}
+          - title: "UniformTypeKVCacheSpecs: the set of its layers' widths"
+            source: "vllm/v1/kv_cache_interface.py:1271-1274"
+            foreach: "= vars.s.specs"
+            as: sub
+            steps:
+              - call: kv-cache-interface.max-num-blocks-per-req
+                input: {spec: "= vars.sub", max_len: "= input.max_len", decode_context_parallel_size: "= vars.dcp", mamba_cache_mode: "= vars.mode"}
+                as: w
+              - set: {vars.widths: "= vars.w.value in vars.widths ? vars.widths : vars.widths + [vars.w.value]"}
+          - if: "size(vars.widths) != 1"
+            then:
+              - title: Every layer of one group must need the same number of block table entries
+                source: "vllm/v1/kv_cache_interface.py:1275-1278"
+                fail: {code: assertion-error, status: 0, message: "= 'All layers in the same KV cache group must need the same number of block table entries, got ' + '[' + vars.widths.map(w, string(w)).join(', ') + '].'"}
+          - return: "= vars.widths[0]"
+      - if: "vars.s.kind == 'hisparse_hot'"
+        then:
+          - title: HiSparseHotSpec keeps a fixed number of hot pages per request
+            source: "vllm/v1/kv_cache_interface.py:466-467"
+            return: "= vars.s.blocks_per_request"
+      - if: "vars.s.kind == 'circular_buffer'"
+        then:
+          - title: A circular buffer reuses one block table entry
+            source: "vllm/v1/kv_cache_interface.py:928-930"
+            return: 1
+      - if: "vars.s.kind == 'mamba'"
+        then:
+          - set: {vars.nspec: "= has(vars.s.num_speculative_blocks) && vars.s.num_speculative_blocks != null ? vars.s.num_speculative_blocks : 0"}
+          - if: "vars.mode == 'align'"
+            then:
+              - title: "Align mode: rows are position-indexed over the whole sequence, plus the speculative blocks (never DCP-scaled)"
+                source: "vllm/v1/kv_cache_interface.py:1075-1083"
+                return: "= (input.max_len + vars.s.block_size - 1) / vars.s.block_size + vars.nspec"
+          - title: "Otherwise cdiv(max_memory_usage_bytes, page_size_bytes): one state plus the speculative ones"
+            source: "vllm/v1/kv_cache_interface.py:1072-1084"
+            detail: "max_memory_usage_bytes is page_size_bytes * (1 + num_speculative_blocks) outside align mode, so the quotient is exact."
+            return: "= 1 + vars.nspec"
+      - if: "vars.s.kind in ['full_attention', 'mla_attention', 'sliding_window']"
+        then:
+          - title: "AttentionSpec: a DCP-sharded cache splits the sequence over the decode context parallel ranks"
+            source: "vllm/v1/kv_cache_interface.py:569-574"
+            set:
+              vars.shards: "= (!has(vars.s.dcp_sharded) || vars.s.dcp_sharded == null || vars.s.dcp_sharded) ? vars.dcp : 1"
+          - return: "= (input.max_len + vars.s.block_size * vars.shards - 1) / (vars.s.block_size * vars.shards)"
+      - title: "KVCacheSpec: cdiv(max_len, block_size)"
+        source: "vllm/v1/kv_cache_interface.py:249-259"
+        return: "= (input.max_len + vars.s.block_size - 1) / vars.s.block_size"
+
+  - component: kv-cache-interface
+    name: needs-kv-cache-zeroing
+    kind: function
+    summary: "KVCacheConfig.needs_kv_cache_zeroing: newly allocated blocks must be zeroed when any group has a Mamba layer (its state is read before it is fully written) or the device attention caches mix precisions (a reused block would decode stale bytes); host-resident groups don't count."
+    sources:
+      - "vllm/v1/kv_cache_interface.py:1563-1594"
+    request:
+      type: object
+      required: [kv_cache_groups]
+      properties:
+        kv_cache_groups: {type: array, items: {type: object, properties: {layer_names: {type: array, items: {type: string}}, kv_cache_spec: DistKvCacheSpec, host_resident: {type: boolean, default: false}}}}
+    response: {type: object, properties: {needs_kv_cache_zeroing: {type: boolean}, has_mamba_layers: {type: boolean}, has_mixed_precision_kv_cache: {type: boolean}}}
+    behavior:
+      - title: "iter_layer_specs: a UniformType group yields its layers' specs, any other group its one spec"
+        source: "vllm/v1/kv_cache_interface.py:1563-1569"
+        set:
+          vars.layers: "= input.kv_cache_groups.map(g, g.kv_cache_spec.kind == 'uniform_type' ? g.kv_cache_spec.specs.map(k, g.kv_cache_spec.specs[k]) : [g.kv_cache_spec])"
+          vars.device: "= input.kv_cache_groups.filter(g, !has(g.host_resident) || !g.host_resident).map(g, g.kv_cache_spec.kind == 'uniform_type' ? g.kv_cache_spec.specs.map(k, g.kv_cache_spec.specs[k]) : [g.kv_cache_spec])"
+      - set:
+          vars.mamba: "= vars.layers.exists(l, l.exists(s, s.kind == 'mamba'))"
+      - title: "has_mixed_precision_kv_cache: the distinct (dtype, kv_quant_mode) pairs of the device groups' attention specs"
+        source: "vllm/v1/kv_cache_interface.py:1571-1583"
+        set:
+          vars.prec: "= vars.device.map(l, l.filter(s, s.kind in ['full_attention', 'mla_attention', 'sliding_window', 'circular_buffer']).map(s, s.dtype + '/' + (has(s.kv_quant_mode) && s.kv_quant_mode != null ? s.kv_quant_mode : 'NONE')))"
+      - set:
+          vars.mixed: "= vars.prec.exists(l, l.exists(p, vars.prec.exists(m, m.exists(q, q != p))))"
+      - title: "needs_kv_cache_zeroing = has_mamba_layers or has_mixed_precision_kv_cache"
+        source: "vllm/v1/kv_cache_interface.py:1585-1594"
+        return:
+          needs_kv_cache_zeroing: "= vars.mamba || vars.mixed"
+          has_mamba_layers: "= vars.mamba"
+          has_mixed_precision_kv_cache: "= vars.mixed"
+
+scenarios:
+  - id: distributed-kv-spec-block-table-width
+    name: Block table width per spec class, with DCP sharding, Mamba modes and a UniformType group
+    description: "tests/v1/worker/test_gpu_model_runner.py and tests/v1/core/test_kv_cache_utils.py size block tables through max_num_blocks_per_req."
+    fixtures: [tp1-llama-8b]
+    steps:
+      - {interface: kv-cache-interface.max-num-blocks-per-req, caller: gpu-model-runner, as: full, input: {spec: {kind: full_attention, block_size: 16, num_kv_heads: 8, head_size: 128, dtype: bfloat16}, max_len: 8192}}
+      - {interface: kv-cache-interface.max-num-blocks-per-req, caller: gpu-model-runner, as: dcp, input: {spec: {kind: full_attention, block_size: 16, num_kv_heads: 8, head_size: 128, dtype: bfloat16}, max_len: 8193, decode_context_parallel_size: 2}}
+      - {interface: kv-cache-interface.max-num-blocks-per-req, caller: gpu-model-runner, as: nodcp, input: {spec: {kind: full_attention, block_size: 16, num_kv_heads: 8, head_size: 128, dtype: bfloat16, dcp_sharded: false}, max_len: 8193, decode_context_parallel_size: 2}}
+      - {interface: kv-cache-interface.max-num-blocks-per-req, caller: gpu-model-runner, as: hot, input: {spec: {kind: hisparse_hot, block_size: 64, page_size: 4096, blocks_per_request: 12}, max_len: 8192}}
+      - {interface: kv-cache-interface.max-num-blocks-per-req, caller: gpu-model-runner, as: ring, input: {spec: {kind: circular_buffer, block_size: 8, num_kv_heads: 1, head_size: 64, dtype: float16}, max_len: 8192}}
+      - {interface: kv-cache-interface.max-num-blocks-per-req, caller: gpu-model-runner, as: malign, input: {spec: {kind: mamba, block_size: 16, shapes: [[1, 1]], dtypes: [float32], num_speculative_blocks: 2}, max_len: 100, mamba_cache_mode: align}}
+      - {interface: kv-cache-interface.max-num-blocks-per-req, caller: gpu-model-runner, as: mnone, input: {spec: {kind: mamba, block_size: 16, shapes: [[1, 1]], dtypes: [float32], num_speculative_blocks: 2}, max_len: 100}}
+      - {interface: kv-cache-interface.max-num-blocks-per-req, caller: gpu-model-runner, as: uni, input: {spec: {kind: uniform_type, block_size: 16, specs: {a: {kind: mla_attention, block_size: 16, num_kv_heads: 1, head_size: 512, dtype: bfloat16}, b: {kind: mla_attention, block_size: 16, num_kv_heads: 1, head_size: 128, dtype: bfloat16}}}, max_len: 1000}}
+      - {interface: kv-cache-interface.max-num-blocks-per-req, caller: gpu-model-runner, as: unibad, input: {spec: {kind: uniform_type, block_size: 16, specs: {a: {kind: mla_attention, block_size: 16, num_kv_heads: 1, head_size: 512, dtype: bfloat16}, b: {kind: circular_buffer, block_size: 16, num_kv_heads: 1, head_size: 128, dtype: bfloat16}}}, max_len: 1000}}
+    expect:
+      - "steps.full.result.value == 512 && steps.dcp.result.value == 257 && steps.nodcp.result.value == 513"
+      - "steps.hot.result.value == 12 && steps.ring.result.value == 1"
+      - "steps.malign.result.value == 9 && steps.mnone.result.value == 3"
+      - "steps.uni.result.value == 63 && steps.unibad.result.error.code == 'assertion-error' && steps.unibad.result.error.message.contains('same number')"
+
+  - id: distributed-kv-config-needs-zeroing
+    name: KV cache zeroing for Mamba layers and mixed-precision device caches only
+    fixtures: [tp1-llama-8b]
+    steps:
+      - {interface: kv-cache-interface.needs-kv-cache-zeroing, caller: gpu-worker-impl, as: uniform, input: {kv_cache_groups: [{layer_names: [l0], kv_cache_spec: {kind: full_attention, block_size: 16, num_kv_heads: 8, head_size: 128, dtype: bfloat16}}, {layer_names: [l1], kv_cache_spec: {kind: sliding_window, block_size: 16, num_kv_heads: 8, head_size: 128, dtype: bfloat16, sliding_window: 128}}]}}
+      - {interface: kv-cache-interface.needs-kv-cache-zeroing, caller: gpu-worker-impl, as: mamba, input: {kv_cache_groups: [{layer_names: [l0], kv_cache_spec: {kind: full_attention, block_size: 16, num_kv_heads: 8, head_size: 128, dtype: bfloat16}}, {layer_names: [m0], kv_cache_spec: {kind: mamba, block_size: 16, shapes: [[1, 1]], dtypes: [float32]}}]}}
+      - {interface: kv-cache-interface.needs-kv-cache-zeroing, caller: gpu-worker-impl, as: mixed, input: {kv_cache_groups: [{layer_names: [l0], kv_cache_spec: {kind: full_attention, block_size: 16, num_kv_heads: 8, head_size: 128, dtype: bfloat16}}, {layer_names: [l1], kv_cache_spec: {kind: full_attention, block_size: 16, num_kv_heads: 8, head_size: 128, dtype: fp8}}]}}
+      - {interface: kv-cache-interface.needs-kv-cache-zeroing, caller: gpu-worker-impl, as: host, input: {kv_cache_groups: [{layer_names: [l0], kv_cache_spec: {kind: full_attention, block_size: 16, num_kv_heads: 8, head_size: 128, dtype: bfloat16}}, {layer_names: [h0], host_resident: true, kv_cache_spec: {kind: full_attention, block_size: 16, num_kv_heads: 8, head_size: 128, dtype: fp8}}]}}
+    expect:
+      - "!steps.uniform.result.value.needs_kv_cache_zeroing"
+      - "steps.mamba.result.value.needs_kv_cache_zeroing && steps.mamba.result.value.has_mamba_layers && !steps.mamba.result.value.has_mixed_precision_kv_cache"
+      - "steps.mixed.result.value.needs_kv_cache_zeroing && steps.mixed.result.value.has_mixed_precision_kv_cache"
+      - "!steps.host.result.value.needs_kv_cache_zeroing"
+
+  - id: distributed-kv-dispatch-multi-connector
+    name: The scheduler's connector hooks reach MultiConnector, which loads from its first matching child
+    fixtures: [tp1-llama-8b]
+    config: {kv-connector: MultiConnector, kv-role: kv_both}
+    state:
+      multi-connector: {connectors: [LMCacheConnectorV1, MoRIIOConnector], extra_async_saves: {}}
+      moriio-connector-scheduler: {is_producer: false, mode: READ}
+    steps:
+      - {interface: kv-connector-base-v1.get-num-new-matched-tokens, caller: scheduler, as: m, input: {request_id: chatcmpl-m2, prompt_token_ids: [1, 2, 3], num_prompt_tokens: 33}}
+      - {interface: kv-connector-base-v1.build-connector-meta, caller: scheduler, as: meta}
+    expect:
+      - "steps.m.result.value.connector == 'MoRIIOConnector' && steps.m.result.value.num_external_tokens == 32"
+      - "size(steps.meta.result.value.metadata) == 2 && steps.meta.result.value.metadata[0] == {}"
+      - "state['multi-connector'].requests_to_connector == {'chatcmpl-m2': 1}"
+
+  - id: distributed-kv-dispatch-hisparse-connector
+    name: The scheduler's connector hooks reach HiSparseConnector, which matches nothing and records allocations
+    fixtures: [tp1-llama-8b]
+    config: {kv-connector: HiSparseConnector}
+    state:
+      hisparse-connector: {initialized: true, requests: []}
+    steps:
+      - {interface: kv-connector-base-v1.get-num-new-matched-tokens, caller: scheduler, as: m, input: {request_id: r5, num_prompt_tokens: 64}}
+      - {interface: kv-connector-base-v1.update-state-after-alloc, caller: scheduler, as: u, input: {request_id: r5}}
+    expect:
+      - "steps.m.result.value == {'num_external_tokens': 0, 'load_async': false, 'connector': 'HiSparseConnector'}"
+      - "steps.u.result.value.recorded && state['hisparse-connector'].requests == ['r5']"

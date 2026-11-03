@@ -1,0 +1,397 @@
+scenarios:
+- id: wr-determine-available-memory-h100-8b
+  name: Llama-3.1-8B on an H100 at 0.92 leaves 59.7 GB for the KV cache, 28,488 blocks of 16 tokens
+  fixtures:
+  - full-tp1-llama-8b
+  steps:
+  - flow: wr-load-model
+    as: load
+  - flow: wr-determine-available-memory
+    as: mem
+  - interface: gpu-worker-impl.get-num-gpu-blocks
+    caller: engine-core
+    as: blocks
+  - interface: gpu-memory.snapshot
+    caller: engine-core
+    as: snap
+  expect:
+  - steps.mem.result.value == 59745650279
+  - steps.blocks.result.value.num_gpu_blocks == 28488 && steps.blocks.result.value.bytes_per_block == 2097152
+  - steps.snap.result.value.free_bytes == 85899345920 - 16060522496 - 1073741824 && trace.exists(e, e.type == 'call.end' && e.interface == 'gpu-memory.snapshot')
+- id: wr-determine-available-memory-kv-cache-memory-bytes
+  name: kv_cache_memory_bytes skips memory profiling and ignores gpu_memory_utilization
+  fixtures:
+  - full-tp1-llama-8b
+  config:
+    kv-cache-memory-bytes: 34359738368
+  steps:
+  - flow: wr-load-model
+    as: load
+  - flow: wr-determine-available-memory
+    as: mem
+  - interface: gpu-worker-impl.get-num-gpu-blocks
+    caller: engine-core
+    as: blocks
+  expect:
+  - steps.mem.result.value == 34359738368 && steps.blocks.result.value.num_gpu_blocks == 16384
+  - trace.exists(e, e.type == 'call.end' && e.interface == 'gpu-worker-impl.get-num-gpu-blocks' && e.output.available_kv_cache_memory_bytes == 34359738368)
+- id: wr-determine-available-memory-cudagraph-estimate-off
+  name: With VLLM_MEMORY_PROFILER_ESTIMATE_CUDAGRAPHS=0 the graph estimate is not subtracted (256 more blocks)
+  fixtures:
+  - full-tp1-llama-8b
+  config:
+    vllm-memory-profiler-estimate-cudagraphs: false
+  steps:
+  - flow: wr-load-model
+    as: load
+  - flow: wr-determine-available-memory
+    as: mem
+  - interface: gpu-worker-impl.get-num-gpu-blocks
+    caller: engine-core
+    as: blocks
+  expect:
+  - steps.mem.result.value == 60282521191 && steps.blocks.result.value.num_gpu_blocks == 28744
+  - trace.exists(e, e.type == 'call.end' && e.interface == 'gpu-worker-impl.get-num-gpu-blocks' && e.output.bytes_per_block == 2097152)
+- id: wr-determine-available-memory-enforce-eager
+  name: enforce_eager skips the CUDA graph memory profile
+  fixtures:
+  - full-tp1-llama-8b
+  config:
+    enforce-eager: true
+  expect:
+  - steps.main.result.value == 60282521191
+  - calls['gpu-model-runner.profile-cudagraph-memory'] == 0 && state['gpu-worker-impl@rank0'].cudagraph_memory_estimate == 0
+  steps:
+  - flow: wr-load-model
+    as: load
+  - flow: wr-determine-available-memory
+    as: main
+- id: wr-determine-available-memory-small-batch
+  name: A smaller max_num_batched_tokens profiles a smaller activation peak and leaves more KV memory
+  fixtures:
+  - full-small-batch-limits
+  expect:
+  - steps.main.result.value == 59745650279 + 1610612736 - 64 * 196608
+  - steps.snap.result.value.free_bytes == 85899345920 - 16060522496 - 1073741824 && trace.exists(e, e.type == 'call.end' && e.interface == 'gpu-memory.snapshot')
+  steps:
+  - flow: wr-load-model
+    as: load
+  - flow: wr-determine-available-memory
+    as: main
+  - interface: gpu-memory.snapshot
+    caller: engine-core
+    as: snap
+- id: wr-determine-available-memory-free-memory-grew
+  name: Another process releasing memory during profiling fails the startup assertion
+  flow: wr-determine-available-memory
+  fixtures:
+  - full-tp1-llama-8b
+  state:
+    gpu-worker-impl:
+      init_free_memory: 60000000000
+  expect:
+  - '!result.ok && result.error.code == ''assertion-error'''
+  - trace.exists(e, e.type == 'call.end' && e.interface == 'gpu-worker-impl.determine-available-memory' && e.error != null)
+- id: wr-determine-available-memory-tp4-70b
+  name: Through collective_rpc all four ranks load Llama-3.1-70B shards and profile at once; each holds 35 GB of weights and 1.25 MiB blocks
+  fixtures:
+  - full-tp4-llama-70b
+  state:
+    gpu-model-runner:
+      model:
+        name: meta-llama/Llama-3.1-70B-Instruct
+        architecture: LlamaForCausalLM
+        num_hidden_layers: 80
+        num_kv_heads: 8
+        num_attention_heads: 64
+        head_size: 128
+        dtype_bytes: 2
+        torch_dtype: bfloat16
+        vocab_size: 128256
+        hidden_size: 8192
+        max_position_embeddings: 131072
+        weights_bytes: 141107412992
+        is_hybrid: false
+        uses_mrope: false
+        uses_prompt_embeds: false
+  steps:
+  - interface: executor.collective-rpc
+    caller: engine-core
+    as: load
+    input:
+      method: load_model
+      args: {}
+  - interface: executor.collective-rpc
+    caller: engine-core
+    as: mem
+    input:
+      method: determine_available_memory
+      args: {}
+  - interface: gpu-worker-impl.get-num-gpu-blocks
+    caller: engine-core
+    'on': rank2
+    as: b2
+  - interface: gpu-memory.snapshot
+    caller: engine-core
+    as: snap3
+    'on': rank3
+  expect:
+  - size(steps.mem.result.value.results) == 4 && steps.mem.result.value.results.all(r, r.value > 40000000000)
+  - steps.b2.result.value.bytes_per_block == 1310720 && steps.b2.result.value.num_gpu_blocks == steps.mem.result.value.results.filter(r, r.rank == 'rank2')[0].value / 1310720
+  - steps.snap3.result.value.weights_bytes == 35276853248 && trace.exists(e, e.type == 'call.end' && e.interface == 'gpu-memory.snapshot')
+- id: wr-get-num-gpu-blocks-before-profiling
+  name: The block count is not known before determine_available_memory runs
+  fixtures:
+  - full-tp1-llama-8b
+  steps:
+  - interface: gpu-worker-impl.get-num-gpu-blocks
+    caller: engine-core
+    as: b
+  expect:
+  - '!steps.b.result.ok && steps.b.result.error.code == ''runtime-error'''
+- id: wr-init-device-then-profile
+  name: A fresh process budgets ceil(80 GiB * 0.92) and builds the V2 runner; profiling then reads that budget back
+  fixtures:
+  - full-tp1-llama-8b
+  state:
+    gpu-memory@rank0:
+      weights_bytes: 0
+    gpu-worker-impl:
+      device_initialized: false
+      requested_memory: 0
+      init_free_memory: 0
+  steps:
+  - flow: wr-init-device
+    as: init
+  - flow: wr-determine-available-memory
+    as: mem
+  expect:
+  - steps.init.result.value.requested_memory == 79027398247 && steps.init.result.value.runner == 'v2'
+  - steps.mem.result.value == 79027398247 - 1073741824 - 1610612736 - 536870912
+  - calls['parallel-state.init-distributed-environment'] == 1 && calls['gpu-model-runner.init'] == 1
+  - trace.filter(e, e.type == 'call.start' && e.interface in ['parallel-state.init-distributed-environment', 'gpu-memory.snapshot']).map(e, e.interface)[0] == 'parallel-state.init-distributed-environment'
+- id: wr-init-device-insufficient-free-memory
+  name: Memory held by another process puts free below the 0.92 budget and startup fails
+  flow: wr-init-device
+  fixtures:
+  - full-tp1-llama-8b
+  state:
+    gpu-memory@rank0:
+      weights_bytes: 0
+      other_process_bytes: 10737418240
+    gpu-worker-impl:
+      device_initialized: false
+  expect:
+  - '!result.ok && result.error.code == ''value-error'' && result.error.message.contains(''less than desired GPU memory utilization'')'
+  - 'calls[''gpu-model-runner.init''] == 0 && !trace.exists(e, e.type == ''call.start'' && e.interface == ''parallel-state.ensure-model-parallel-initialized'' && e.output != null) '
+- id: wr-init-device-lower-utilization-fits
+  name: The same GPU fits when gpu_memory_utilization is lowered to 0.5
+  flow: wr-init-device
+  fixtures:
+  - full-tp1-llama-8b
+  config:
+    gpu-memory-utilization: 0.5
+  state:
+    gpu-memory@rank0:
+      weights_bytes: 0
+      other_process_bytes: 10737418240
+  expect:
+  - result.ok && result.value.requested_memory == 42949672960
+  - trace.exists(e, e.type == 'call.start' && e.interface == 'parallel-state.init-distributed-environment')
+- id: wr-init-device-unsupported-device
+  name: A non-CUDA device type is refused
+  flow: wr-init-device
+  fixtures:
+  - full-tp1-llama-8b
+  input:
+    device_type: cpu
+  expect:
+  - '!result.ok && result.error.code == ''runtime-error'' && result.error.message == ''Unsupported device type: cpu'''
+  - calls['parallel-state.init-distributed-environment'] == 0 && !trace.exists(e, e.type == 'call.start' && e.interface == 'parallel-state.init-distributed-environment')
+- id: wr-init-device-v1-runner
+  name: VLLM_USE_V2_MODEL_RUNNER=0 builds the V1 runner
+  flow: wr-init-device
+  fixtures:
+  - full-tp1-llama-8b
+  config:
+    use-v2-model-runner: false
+  state:
+    gpu-memory@rank0:
+      weights_bytes: 0
+  expect:
+  - result.ok && result.value.runner == 'v1' && trace.exists(e, e.type == 'call.start' && e.interface == 'parallel-state.init-distributed-environment')
+  - calls['gpu-model-runner.init'] == 0
+- id: wr-request-memory-external-weights
+  name: Externally held weights shrink the engine's budget; too much is refused
+  fixtures:
+  - full-tp1-llama-8b
+  steps:
+  - interface: worker-utils.request-memory
+    caller: gpu-worker-impl
+    as: ok
+    input:
+      total_bytes: 85899345920
+      free_bytes: 70000000000
+      external_weight_memory: 16060522496
+  - interface: worker-utils.request-memory
+    caller: gpu-worker-impl
+    as: low
+    input:
+      total_bytes: 85899345920
+      free_bytes: 50000000000
+      external_weight_memory: 16060522496
+  - interface: worker-utils.request-memory
+    caller: gpu-worker-impl
+    as: over
+    input:
+      total_bytes: 85899345920
+      free_bytes: 85899345920
+      external_weight_memory: 80000000000
+  expect:
+  - steps.ok.result.value.requested_memory == 79027398247 - 16060522496
+  - '!steps.low.result.ok && steps.low.result.error.code == ''value-error'''
+  - '!steps.over.result.ok && steps.over.result.error.message.startsWith(''Externally held weights'')'
+  - trace.filter(e, e.type == 'call.start' && e.interface == 'worker-utils.request-memory').size() == 3
+- id: wr-startup-sequence
+  name: load_model, get_kv_cache_spec, determine_available_memory, initialize_from_config(28488 blocks), compile_or_warm_up_model, then a first step
+  fixtures:
+  - full-tp1-llama-8b
+  state:
+    gpu-model-runner:
+      model_loaded: false
+      kv_cache_initialized: false
+      num_blocks: 0
+    cuda-graph-manager:
+      graphs_captured: false
+      capture_sizes: []
+  steps:
+  - flow: wr-load-model
+    as: load
+  - interface: gpu-worker-impl.get-kv-cache-spec
+    caller: engine-core
+    as: spec
+  - flow: wr-determine-available-memory
+    as: mem
+  - interface: gpu-worker-impl.get-num-gpu-blocks
+    caller: engine-core
+    as: blocks
+  - flow: wr-initialize-kv-cache
+    as: kv
+    input:
+      num_blocks: = steps.blocks.result.value.num_gpu_blocks
+  - flow: wr-compile-or-warm-up
+    as: warm
+  - flow: wr-execute-model
+    as: step
+    input:
+      scheduled_new_reqs:
+      - req_id: chatcmpl-abc123
+        prompt_token_ids:
+        - 128000
+        - 9906
+        - 1917
+        - 0
+        block_ids:
+        - 1
+        num_computed_tokens: 0
+        sampling_params:
+          temperature: 0.0
+      num_scheduled_tokens:
+        chatcmpl-abc123: 4
+      total_num_scheduled_tokens: 4
+  - flow: wr-sample-tokens
+    as: out
+  - interface: gpu-memory.snapshot
+    caller: engine-core
+    as: snap
+  expect:
+  - steps.load.result.value.model_memory_usage == 16060522496
+  - steps.spec.result.value.page_size_bytes == 65536 && steps.spec.result.value.num_layers == 32
+  - steps.mem.result.value == 59745650279 && steps.blocks.result.value.num_gpu_blocks == 28488
+  - steps.kv.result.value.kv_cache_bytes == 59743666176 && steps.snap.result.value.kv_cache_bytes == 59743666176 && trace.exists(e, e.type == 'call.end' && e.interface == 'gpu-memory.snapshot')
+  - steps.out.result.value.req_ids == ['chatcmpl-abc123']
+- id: wr-initialize-kv-cache-oom
+  name: More blocks than free memory holds fail the KV allocation with CUDA OOM
+  fixtures:
+  - full-tp1-llama-8b
+  expect:
+  - '!steps.main.result.ok && steps.main.result.error.code == ''out-of-memory-error'''
+  - steps.snap.result.value.kv_cache_bytes == 0 && trace.exists(e, e.type == 'call.end' && e.interface == 'gpu-memory.snapshot')
+  steps:
+  - flow: wr-initialize-kv-cache
+    as: main
+    input:
+      num_blocks: 41000
+  - interface: gpu-memory.snapshot
+    caller: engine-core
+    as: snap
+- id: wr-initialize-kv-cache-engine-field-and-zeroing
+  name: A KV config with 1000 blocks allocates 1000 * 2 MiB and builds the KV zeroing metadata
+  fixtures:
+  - full-tp1-llama-8b
+  steps:
+  - interface: gpu-worker-impl.initialize-from-config
+    caller: engine-core
+    as: kv
+    input:
+      num_blocks: 1000
+      needs_kv_cache_zeroing: true
+  - interface: gpu-worker-impl.get-num-gpu-blocks
+    caller: engine-core
+    as: b
+  - interface: gpu-memory.snapshot
+    caller: engine-core
+    as: snap
+  expect:
+  - steps.kv.result.ok && steps.snap.result.value.kv_cache_bytes == 1000 * 2097152 && trace.exists(e, e.type == 'call.end' && e.interface == 'gpu-memory.snapshot')
+- id: wr-compile-or-warm-up-enforce-eager
+  name: enforce_eager captures no graphs; the suggested --kv-cache-memory is still logged
+  flow: wr-compile-or-warm-up
+  fixtures:
+  - full-tp1-llama-8b
+  config:
+    enforce-eager: true
+  state:
+    gpu-worker-impl:
+      total_consumed: 17134264320
+      peak_activation_memory: 1610612736
+  expect:
+  - result.ok && result.value.cuda_graph_memory_bytes == 0
+  - result.value.suggested_kv_cache_memory_bytes == 79027398247 - 17134264320 - 1610612736 - 157286400
+  - calls['gpu-model-runner.capture-model'] == 0 && state['gpu-worker-impl@rank0'].suggested_kv_cache_memory_bytes > 0
+- id: wr-compile-or-warm-up-mode-none
+  name: cudagraph_mode NONE makes capture_model a warning and a no-op
+  fixtures:
+  - full-tp1-llama-8b
+  config:
+    cudagraph-mode: NONE
+    kv-cache-memory-bytes: 34359738368
+  steps:
+  - interface: cuda-graph-manager.init
+    caller: gpu-model-runner
+    as: init
+    input:
+      decode_query_len: 1
+  - flow: wr-compile-or-warm-up
+    as: warm
+  expect:
+  - steps.init.result.value.cudagraph_mode == 'NONE' && steps.warm.result.value.cuda_graph_memory_bytes == 0
+  - steps.warm.result.value.suggested_kv_cache_memory_bytes == 0 && trace.exists(e, e.type == 'call.end' && e.interface == 'cuda-graph-manager.init')
+- id: wr-load-model-weight-transfer-and-pooling
+  name: load_model with a weight transfer backend creates the engine; a pooling model has no sampler
+  fixtures:
+  - full-tp1-llama-8b
+  config:
+    weight-transfer-backend: nccl
+  state:
+    gpu-model-runner:
+      is_pooling_model: true
+  steps:
+  - flow: wr-load-model
+    as: load
+  - interface: gpu-worker-impl.get-supported-tasks
+    caller: engine-core
+    as: tasks
+  expect:
+  - steps.load.result.value.weight_transfer_engine && state['gpu-worker-impl@rank0'].is_pooling_model
+  - steps.tasks.result.value.tasks == ['embed', 'token_embed']

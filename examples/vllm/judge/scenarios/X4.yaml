@@ -1,0 +1,42 @@
+schema_version: 1
+id: vllm
+scenarios:
+  - id: bench-x4-cuda-graphs
+    name: "X4: decode batches within the capture sizes replay FULL graphs, mixed/prefill batches run PIECEWISE graphs, larger batches run eagerly"
+    description: >
+      Verified against the V2 runner (vllm/v1/worker/gpu/cudagraph_utils.py:255-390, 518-548): with the
+      deployed FULL_AND_PIECEWISE mode, uniform-decode batches up to max_cudagraph_capture_size get FULL
+      descriptors, every other batch up to that size (including prefill) gets a PIECEWISE descriptor
+      (attention eager, the rest graphed), and dispatch falls back to NONE (eager) beyond it.
+      max_cudagraph_capture_size is lowered to 16 (--compilation-config) so a 20-token prefill exceeds it;
+      the deployed default on H100 is min(max_num_seqs*2, 512) = 512 (vllm/config/vllm.py:2354-2363).
+    fixtures: [full-tp1-llama-8b]
+    config: {max-cudagraph-capture-size: 16}
+    state:
+      "cuda-graph-manager@rank0": {capture_sizes: [1, 2, 4, 8, 16], graphs_captured: true, mode: FULL_AND_PIECEWISE, decode_query_len: 1}
+    steps:
+      - interface: engine-core.add-request
+        caller: engine-core-proc
+        input: {request_id: x4-long, prompt_token_ids: [128000, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 17, 18, 19], sampling_params: {max_tokens: 8, n: 1}}
+        as: addlong
+      - flow: engine-core-busy-loop
+        input: {iterations: 2}
+        as: loop1
+      - interface: engine-core.add-request
+        caller: engine-core-proc
+        input: {request_id: x4-short, prompt_token_ids: [128000, 9906, 11, 856, 836, 374], sampling_params: {max_tokens: 4, n: 1}}
+        as: addshort
+      - flow: engine-core-busy-loop
+        input: {iterations: 1}
+        as: loop2
+    expect:
+      - "steps.loop2.result.ok"
+      # the dispatch decisions, in order: 20-token prefill > 16 -> eager; then a mixed batch (decode + 6-token prefill = 7) -> PIECEWISE padded to 8; uniform decode -> FULL
+      - >
+        trace.filter(e, e.type == 'call.end' && e.interface == 'cuda-graph-manager.dispatch').map(e, e.output.cg_mode + ':' + string(e.output.num_tokens)) ==
+        ['NONE:20', 'PIECEWISE:8', 'FULL:2']
+      - "trace.filter(e, e.type == 'call.start' && e.interface == 'cuda-graph-manager.dispatch').map(e, e.input.num_tokens) == [20, 7, 2]"
+      # path: one eager forward (no graph), one piecewise graph run (attention runs eagerly between pieces), one FULL replay
+      - "calls['cuda-graph-manager.run-pw-graph'] == 1 && calls['cuda-graph-manager.run-fullgraph'] == 1 && calls['llama-for-causal-lm.forward'] == 2"
+      - >
+        trace.filter(e, e.type == 'call.start' && e.interface in ['cuda-graph-manager.dispatch', 'llama-for-causal-lm.forward', 'cuda-graph-manager.run-pw-graph'])[1].interface == 'llama-for-causal-lm.forward'

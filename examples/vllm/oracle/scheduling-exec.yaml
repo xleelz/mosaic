@@ -1,0 +1,355 @@
+# Oracle scenarios for scheduler-kv, worker-runner and attention (see oracle/scheduling-exec.md).
+# Tests that only check kernel numerics (diffusion sampler stats, EAGLE slot-mapping kernel,
+# sparse-MLA top-k mask, sparse-MLA pinned context lengths) have no scenario here; the .md
+# explains each.
+schema_version: 1
+id: vllm
+scenarios:
+# ---------------------------------------------------------------- scheduler-kv
+- id: oracle-scheduler-kv-outlines-unsupported-regex
+  name: With the outlines backend, a regex using \b or a backreference is rejected at validation
+  description: >-
+    tests/v1/structured_output/test_backend_outlines.py:52,
+    TestValidateRegexIsBuildable.TestPR60359Regressions.test_unsupported_regex (cases r"a\b" and
+    r"(a)\1"). Code under test: validate_regex_is_buildable
+    (vllm/v1/structured_output/backend_outlines.py:336-368, _check_unsupported at 307-333), reached
+    from validate_structured_output_request_outlines (backend_outlines.py:195-202), which
+    SamplingParams._validate_structured_outputs calls for the outlines backend
+    (vllm/sampling_params.py:1359-1361), which InputProcessor._validate_params runs through
+    params.verify (vllm/v1/engine/input_processor.py:157). A regex with a word boundary or a
+    backreference raises VLLMValidationError, so the request never reaches the engine.
+    Round 2: the model now has the structured-outputs-backend config, so the world selects
+    outlines (the backend the test exercises); every parametrized case (test lines 26-50) is also
+    run straight at validate_regex_is_buildable, as the test does.
+  fixtures: [full-tp1-llama-8b]
+  config: {structured-outputs-backend: outlines}
+  steps:
+  - as: boundary
+    interface: input-processor.process-inputs
+    caller: api-server
+    input:
+      request_id: cmpl-regex-1
+      prompt_token_ids: [128000, 9906, 1917]
+      sampling_params: {max_tokens: 16, structured_outputs: {regex: 'a\b'}}
+  - as: backref
+    interface: input-processor.process-inputs
+    caller: api-server
+    input:
+      request_id: cmpl-regex-2
+      prompt_token_ids: [128000, 9906, 1917]
+      sampling_params: {max_tokens: 16, structured_outputs: {regex: '(a)\1'}}
+  - as: case0
+    interface: backend-outlines.validate-regex-is-buildable
+    caller: engine-core
+    input: {pattern: 'a\b'}
+  - as: case1
+    interface: backend-outlines.validate-regex-is-buildable
+    caller: engine-core
+    input: {pattern: '(a\b)'}
+  - as: case2
+    interface: backend-outlines.validate-regex-is-buildable
+    caller: engine-core
+    input: {pattern: '((a\b))'}
+  - as: case3
+    interface: backend-outlines.validate-regex-is-buildable
+    caller: engine-core
+    input: {pattern: '(a)\1'}
+  - as: case4
+    interface: backend-outlines.validate-regex-is-buildable
+    caller: engine-core
+    input: {pattern: '((a)\2)'}
+  - as: case5
+    interface: backend-outlines.validate-regex-is-buildable
+    caller: engine-core
+    input: {pattern: '(a(?=b))'}
+  - as: case6
+    interface: backend-outlines.validate-regex-is-buildable
+    caller: engine-core
+    input: {pattern: '(?i:a\b)'}
+  - as: case7
+    interface: backend-outlines.validate-regex-is-buildable
+    caller: engine-core
+    input: {pattern: '(?:(a\b)){2}'}
+  - as: case8
+    interface: backend-outlines.validate-regex-is-buildable
+    caller: engine-core
+    input: {pattern: '(?:a\b)*?'}
+  - as: case9
+    interface: backend-outlines.validate-regex-is-buildable
+    caller: engine-core
+    input: {pattern: '(?:a\b)*+'}
+  - as: case10
+    interface: backend-outlines.validate-regex-is-buildable
+    caller: engine-core
+    input: {pattern: '(?>a\b)'}
+  expect:
+  - "!steps.boundary.result.ok && steps.boundary.result.error.code == 'vllm-validation-error'"
+  - "!steps.backref.result.ok && steps.backref.result.error.code == 'vllm-validation-error'"
+  - "trace.exists(e, e.type == 'call.start' && e.interface.contains('outlines'))"
+  - "[steps.case0, steps.case1, steps.case2, steps.case3, steps.case4, steps.case5, steps.case6, steps.case7, steps.case8, steps.case9, steps.case10].all(st, !st.result.ok && st.result.error.code == 'vllm-validation-error')"
+
+- id: oracle-scheduler-kv-hybrid-prefix-cache-hit-rate
+  name: A replayed long prompt reuses every block below the last reachable boundary
+  description: >-
+    tests/v1/core/prefix_cache/test_hybrid_prefix_cache_hit_rate.py:1 (test_prefix_cache_hit_rate,
+    base case, dropped_blocks 0). The test serves the hybrid Qwen/Qwen3.5-0.8B (attention + mamba
+    groups), replays each conversation and asserts per turn: a cold first turn has cached == 0, a
+    replayed identical prompt has cached >= round_down(prompt - 1, scheduler_block_size), and the
+    prefix-cache query/hit counters equal the sums of prompt and cached tokens. Code under test:
+    KVCacheManager.get_computed_blocks (vllm/v1/core/kv_cache_manager.py) over
+    HybridKVCacheCoordinator.find_longest_cache_hit (vllm/v1/core/kv_cache_coordinator.py) with
+    FullAttentionManager and MambaManager (vllm/v1/core/single_type_kv_cache_manager.py), and the
+    prefix-cache stats in Scheduler.make_stats. Translated at the scheduler on one 2100-token
+    session prompt (block 16): cold run, finish, replay. Round 2: the model now represents a
+    hybrid model as a second (mamba) KV cache group on kv-cache-manager and runs the step through
+    the scheduler-schedule-hybrid flow (same scheduler.schedule entry), so the world is seeded with
+    the attention + mamba groups; the hybrid coordinator / mamba group are asserted on the trace.
+  fixtures: [full-tp1-llama-8b]
+  config: {max-num-batched-tokens: 8192}
+  state:
+    kv-cache-manager: {kv_cache_groups: [{kind: full_attention, block_size: 16}, {kind: mamba, block_size: 16}]}
+  steps:
+  - as: add1
+    flow: scheduler-add-request
+    input:
+      request_id: chatcmpl-s0-t0
+      prompt_segments: [{key: session-0-turn-0, num_tokens: 2100}]
+      sampling_params: {max_tokens: 32, temperature: 0}
+  - {as: s1, flow: scheduler-schedule-hybrid, input: {}}
+  - {as: st1, flow: scheduler-make-stats, input: {}}
+  - as: fin1
+    flow: scheduler-finish-requests
+    input: {request_ids: [chatcmpl-s0-t0], finished_status: FINISHED_STOPPED}
+  - as: add2
+    flow: scheduler-add-request
+    input:
+      request_id: chatcmpl-s0-t0-replay
+      prompt_segments: [{key: session-0-turn-0, num_tokens: 2100}]
+      sampling_params: {max_tokens: 32, temperature: 0}
+  - {as: s2, flow: scheduler-schedule-hybrid, input: {}}
+  - {as: st2, flow: scheduler-make-stats, input: {}}
+  expect:
+  - "steps.s1.result.ok && steps.s1.result.value.scheduled_new_reqs[0].num_computed_tokens == 0"
+  - "steps.s2.result.ok && steps.s2.result.value.scheduled_new_reqs[0].num_computed_tokens >= 2096"
+  - "steps.s2.result.value.scheduled_new_reqs[0].num_computed_tokens < 2100"
+  - "steps.st1.result.value.prefix_cache_stats.queries == 2100 && steps.st1.result.value.prefix_cache_stats.hits == 0"
+  - "steps.st2.result.value.prefix_cache_stats.queries == 2100 && steps.st2.result.value.prefix_cache_stats.hits >= 2096"
+  - "trace.exists(e, e.type == 'call.start' && (e.component.contains('mamba-manager') || e.component.contains('hybrid')))"
+
+- id: oracle-scheduler-kv-simple-cpu-offload-reload
+  name: After the GPU prefix cache is reset, a repeated prompt still completes through the CPU offload connector
+  description: >-
+    tests/v1/simple_kv_offload/test_integration.py:150, test_simple_cpu_offload_accuracy (eager
+    mode, _accuracy_test at :77-102). The test runs a ~2010-token prompt cold with max_tokens 1,
+    sleeps so pending transfers drain, resets the GPU prefix cache (a failed reset is only
+    printed, :94-95), runs the prompt again and asserts only that at least half of 10 repeats
+    produce the cold run's text (:100-102). Output-text equality is model accuracy and is not
+    translated; nothing in the test asserts how many tokens step 2 schedules or that the hit is
+    synchronous. With an async CPU load the request parks in WAITING_FOR_REMOTE_KVS
+    (vllm/v1/core/sched/scheduler.py:1320-1341) until the worker reports finished_recving.
+    Translated: cold run to completion, one idle-drain step that sends and completes the store,
+    reset, then the repeat runs until it emits its one token. Asserted: the repeat completes with
+    one token (what the test compares); the connector is consulted (the test's configuration).
+  fixtures: [full-tp1-llama-8b]
+  config: {kv-connector: SimpleCPUOffloadConnector, kv-role: kv_both, max-num-batched-tokens: 8192}
+  steps:
+  - as: add1
+    flow: scheduler-add-request
+    input:
+      request_id: offload-cold
+      prompt_segments: [{key: hi-x2000-count, num_tokens: 2010}]
+      sampling_params: {max_tokens: 1, temperature: 0}
+  - {as: s1, flow: scheduler-schedule, input: {}}
+  - as: u1
+    flow: scheduler-update-from-output
+    input:
+      scheduler_output: "= steps.s1.result.value"
+      model_runner_output: {req_ids: [offload-cold], sampled_token_ids: [[11]]}
+  - {as: drain, flow: scheduler-schedule, input: {}}
+  - as: udrain
+    flow: scheduler-update-from-output
+    input:
+      scheduler_output: "= steps.drain.result.value"
+      model_runner_output:
+        req_ids: []
+        sampled_token_ids: []
+        kv_connector_output: {finished_store_events: ["= steps.drain.result.value.kv_connector_metadata.store_event"]}
+  - {as: reset, flow: scheduler-reset-prefix-cache, input: {}}
+  - as: add2
+    flow: scheduler-add-request
+    input:
+      request_id: offload-hit
+      prompt_segments: [{key: hi-x2000-count, num_tokens: 2010}]
+      sampling_params: {max_tokens: 1, temperature: 0}
+  - {as: s2, flow: scheduler-schedule, input: {}}
+  - as: u2
+    flow: scheduler-update-from-output
+    input:
+      scheduler_output: "= steps.s2.result.value"
+      model_runner_output:
+        req_ids: []
+        sampled_token_ids: []
+        kv_connector_output: {finished_recving: [offload-hit], finished_sending: []}
+  - {as: s3, flow: scheduler-schedule, input: {}}
+  - as: u3
+    flow: scheduler-update-from-output
+    input:
+      scheduler_output: "= steps.s3.result.value"
+      model_runner_output: {req_ids: [offload-hit], sampled_token_ids: [[11]]}
+  expect:
+  - "steps.u1.result.ok && steps.u1.result.value.outputs[0].finish_reason == 'length'"
+  - "steps.reset.result.ok"
+  - "trace.exists(e, e.type == 'call.start' && e.interface.endsWith('.get-num-new-matched-tokens'))"
+  - "steps.u3.result.ok && steps.u3.result.value.outputs.exists(o, o.request_id == 'offload-hit' && o.new_token_ids == [11] && o.finish_reason == 'length')"
+
+- id: oracle-scheduler-kv-external-computed-blocks-free-pool
+  name: External computed tokens already covered by allocated blocks take no blocks from the pool
+  description: >-
+    tests/v1/core/test_single_type_kv_cache_manager.py:38,
+    test_external_computed_blocks_do_not_corrupt_free_pool. A FullAttentionManager (block 4, pool of
+    10 blocks, caching off) allocates 3 blocks for 12 tokens; then
+    allocate_external_computed_blocks(num_local_computed_tokens=0, num_external_computed_tokens=4)
+    must not request a negative number of blocks: the free count is unchanged and the request
+    still holds 3 blocks. Code under test: SingleTypeKVCacheManager.allocate_external_computed_blocks
+    (vllm/v1/core/single_type_kv_cache_manager.py:326-366, max(0, cdiv(total, block) - len(req_blocks))),
+    reached from KVCacheManager.allocate_slots with num_external_computed_tokens
+    (kv_cache_manager.py:371-618) via KVCacheCoordinator.allocate_new_computed_blocks
+    (kv_cache_coordinator.py:296-309).
+  fixtures: [full-prefix-caching-off]
+  config: {block-size: 4}
+  state:
+    block-pool: {num_gpu_blocks: 10, next_fresh: 1, free_front: [], free_tail: [], block_hash: {}, cached: {}, ref_cnt: {}}
+  steps:
+  - as: alloc
+    interface: full-attention-manager.allocate-new-blocks
+    caller: kv-cache-manager
+    input: {request_id: request, num_tokens: 12}
+  - as: before
+    interface: block-pool.get-num-free-blocks
+    caller: kv-cache-manager
+    input: {}
+  - as: ext
+    interface: kv-cache-manager.allocate-slots
+    caller: scheduler
+    input:
+      request_id: request
+      status: WAITING
+      num_new_tokens: 0
+      num_computed_tokens: 0
+      num_new_computed_tokens: 0
+      num_external_computed_tokens: 4
+  - as: after
+    interface: block-pool.get-num-free-blocks
+    caller: kv-cache-manager
+    input: {}
+  expect:
+  - "steps.alloc.result.ok && size(steps.alloc.result.value.new_block_ids) == 3"
+  - "steps.ext.result.ok"
+  - "steps.after.result.value.num_free_blocks == steps.before.result.value.num_free_blocks"
+  - "size(state['full-attention-manager'].req_to_blocks['request']) == 3"
+  - "trace.exists(e, e.type == 'call.start' && e.interface == 'full-attention-manager.allocate-external-computed-blocks')"
+
+# --------------------------------------------------------------- worker-runner
+- id: oracle-worker-runner-non-last-pp-rank-sample-feedback
+  name: A non-last pipeline rank receives the sampled tokens instead of sampling
+  description: >-
+    tests/v1/worker/test_gpu_model_runner_v2.py:28,
+    test_non_last_pp_rank_uses_global_batch_for_sample_feedback. Code under test:
+    GPUModelRunner.sample_tokens (vllm/v1/worker/gpu/model_runner.py:2088-2127): on a rank that is
+    not the last PP rank it takes the PCP global batch, calls pp_handler.receive(batch),
+    postprocess_num_computed_tokens(batch), model_state.postprocess_state(idx_mapping, 0) when not
+    all decode, kv_connector.post_forward, and returns a KV-connector-only output; it never samples
+    and never calls pcp_manager.restore_for_sampling. Translated as an execute_model step on a
+    rank seeded as non-last PP (is_last_pp_rank false) followed by sample_tokens.
+    Round 2: a trace event's component is the caller, so the receive is matched on its interface
+    (pp-handler.receive). Not reproducible: the test's point is that receive and
+    postprocess_num_computed_tokens get pcp_manager.global_batch rather than the local batch
+    (test lines 58-62, model_runner.py:2111-2112); the model has no PCPManager, so the local and
+    global batch are the same. model_state.postprocess_state is a no-op for a dense model
+    (model_states/interface.py:167-173) and is folded.
+  fixtures: [full-tp1-llama-8b]
+  config: {enforce-eager: true}
+  state:
+    gpu-model-runner:
+      is_last_pp_rank: false
+      fresh_slots_used: 1
+      slots:
+        chatcmpl-abc123: {prefill_len: 100, prompt_len: 100, slot: 1023}
+    sampler:
+      slots:
+        "1023": {logit_bias: false, logprobs: -1, min_p: 0, needs_processing: false, penalties: false, seeded: false, temperature: 0, thinking: false, top_k: 128256, top_p: 1}
+  steps:
+  - as: exec
+    flow: wr-execute-model
+    input:
+      finished_req_ids: []
+      num_scheduled_tokens: {chatcmpl-abc123: 1}
+      scheduled_cached_reqs: {new_block_ids: [[]], num_computed_tokens: [100], req_ids: [chatcmpl-abc123]}
+      scheduled_new_reqs: []
+      total_num_scheduled_tokens: 1
+  - as: sample
+    flow: wr-sample-tokens
+    input: {grammar_output: null}
+  expect:
+  - "steps.exec.result.ok && steps.sample.result.ok"
+  - "calls['gpu-model-runner.sample'] == 0"
+  - "trace.exists(e, e.type == 'call.start' && e.interface == 'pp-handler.receive' && e.instance == 'rank0')"
+  - "trace.exists(e, e.type == 'call.start' && e.interface == 'input-batch.post-update-num-computed-tokens-kernel')"
+  - "state['gpu-model-runner@rank0'].execute_model_state == null"
+
+- id: oracle-worker-runner-load-model-registers-moe-eplb
+  name: With EPLB on, load_model registers the MoE model with the EPLB state and starts its async loop
+  description: >-
+    tests/v1/worker/test_gpu_model_runner_v2_eplb.py:117, test_v2_load_model_registers_moe_with_eplb.
+    Code under test: GPUModelRunner.load_model (vllm/v1/worker/gpu/model_runner.py:378-...) calling
+    EPLBController.prepare_load / maybe_register_model / maybe_start_async_loop
+    (vllm/v1/worker/gpu/eplb_utils.py:94-165): with parallel_config.enable_eplb and a MoE model,
+    EplbState.add_model(moe_model, model_config) is called once and start_async_loop runs (real
+    weights). Translated with Mixtral-8x7B (MoE) as the loaded model on the TP=4 world (93 GB of
+    weights do not fit one H100); EPLB registration is asserted on the trace, on rank0. Round 2:
+    the model now has the enable-eplb config, so the world sets it as the test's parallel_config
+    does (enable_eplb=True, test_gpu_model_runner_v2_eplb.py:72-77).
+  fixtures: [full-tp4-llama-70b]
+  config: {model: mistralai/Mixtral-8x7B-Instruct-v0.1, enable-eplb: true}
+  state:
+    gpu-model-runner:
+      model_loaded: false
+      model: {architecture: MixtralForCausalLM, dtype_bytes: 2, head_size: 128, hidden_size: 4096, is_hybrid: false, max_position_embeddings: 32768, name: mistralai/Mixtral-8x7B-Instruct-v0.1, num_attention_heads: 32, num_hidden_layers: 32, num_kv_heads: 8, torch_dtype: bfloat16, uses_mrope: false, uses_prompt_embeds: false, vocab_size: 32000, weights_bytes: 93405585408}
+  steps:
+  - as: load
+    flow: wr-load-model
+    input: {load_dummy_weights: false}
+  expect:
+  - "steps.load.result.ok"
+  - "state['gpu-model-runner@rank0'].model_loaded"
+  - "trace.filter(e, e.type == 'call.start' && e.instance == 'rank0' && e.interface.contains('eplb') && e.interface.endsWith('add-model')).size() == 1"
+  - "trace.exists(e, e.type == 'call.start' && e.interface.contains('eplb') && e.interface.endsWith('start-async-loop'))"
+
+# ------------------------------------------------------------------- attention
+- id: oracle-attention-probe-environment-failure
+  name: A backend whose import fails is recorded as invalid with the exception text
+  description: >-
+    tests/v1/attention/test_cuda_backend_probe_errors.py:44,
+    test_get_valid_backends_records_environment_failure (ImportError case). Code under test:
+    CudaPlatform.get_valid_backends (vllm/platforms/cuda.py:374-414): every candidate of the SM90
+    priority list (_get_backend_priorities, cuda.py:83-180: FLASH_ATTN, FLASHINFER, TRITON_ATTN,
+    FLEX_ATTENTION, TURBOQUANT) is probed; an ImportError/OSError marks it invalid with the
+    reason "ImportError: flashinfer is not installed" and probing continues; no backend is valid.
+    Driven through get_attn_backend_cls with no selected backend (cuda.py:416-475), whose
+    ValueError carries every invalid reason. The patched _get_attn_backend_class becomes an
+    import-error fault on the real attention-backend.validate-configuration.
+  fixtures: [full-tp1-llama-8b]
+  faults:
+  - {target: attention-backend.validate-configuration, type: error, code: import-error, message: "ImportError: flashinfer is not installed"}
+  steps:
+  - as: pick
+    interface: cuda-platform.get-attn-backend-cls
+    caller: selector
+    input:
+      selected_backend: null
+      num_heads: 32
+      attn_selector_config: {head_size: 64, dtype: float16, kv_cache_dtype: null, block_size: 16}
+  expect:
+  - "!steps.pick.result.ok && steps.pick.result.error.code == 'value-error'"
+  - "calls['attention-backend.validate-configuration'] == 5"
+  - "steps.pick.result.error.message.contains('ImportError: flashinfer is not installed')"

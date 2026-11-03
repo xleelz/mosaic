@@ -1,0 +1,53 @@
+schema_version: 1
+id: vllm
+scenarios:
+  - id: bench-l7
+    name: "L7 (a-e) LoRA load and unload errors"
+    fixtures: [full-tp1-llama-8b]
+    config: {enable-lora: true, vllm-allow-runtime-lora-updating: true}
+    max_events: 500000
+    max_iterations: 100000
+    state:
+      local-disk:
+        files:
+          /adapters/sql/adapter_config.json: {content: '{"r": 16, "lora_alpha": 32, "target_modules": ["q_proj", "k_proj", "v_proj", "o_proj"], "base_model_name_or_path": "meta-llama/Llama-3.1-8B-Instruct"}', json: {base_model_name_or_path: meta-llama/Llama-3.1-8B-Instruct, lora_alpha: 32, r: 16, target_modules: [q_proj, k_proj, v_proj, o_proj]}, size: 160}
+          /adapters/sql/adapter_model.safetensors: {size: 54525952}
+    steps:
+      - {flow: serving-api-lora-load, input: {path: /v1/load_lora_adapter, body: {lora_name: sql, lora_path: /adapters/sql, load_inplace: false}}, as: load}
+      - {flow: serving-api-lora-load, input: {path: /v1/load_lora_adapter, body: {lora_name: sql, lora_path: /adapters/sql, load_inplace: false}}, as: again}
+      - {flow: serving-api-lora-load, input: {path: /v1/load_lora_adapter, body: {lora_name: llama-8b, lora_path: /adapters/sql, load_inplace: false}}, as: base}
+      - {flow: serving-api-lora-load, input: {path: /v1/load_lora_adapter, body: {lora_name: ghost, lora_path: /adapters/nothing-here, load_inplace: false}}, as: missing}
+      - {interface: openai-serving-models.post-v1-unload-lora-adapter, caller: api-client, input: {path: /v1/unload_lora_adapter, body: {lora_name: sql}}, as: unload}
+      - {flow: serving-api-models-list, as: models}
+      - flow: serving-api-chat-completion
+        input: {path: /v1/chat/completions, body: {model: sql, messages: [{role: user, content: "hi"}], max_tokens: 4, stream: false}}
+        as: chat
+      - {interface: openai-serving-models.post-v1-unload-lora-adapter, caller: api-client, input: {path: /v1/unload_lora_adapter, body: {lora_name: nope}}, as: unknown}
+    expect:
+      - "steps.load.result.ok"
+      # (a)
+      - "!steps.again.result.ok && steps.again.result.error.status == 400 && steps.again.result.error.message.contains('has already been loaded')"
+      # (b)
+      - "!steps.base.result.ok && steps.base.result.error.status == 400 && steps.base.result.error.message.contains('conflicts with a served base model')"
+      # (c) the worker raises LoRAAdapterNotFoundError; the server maps it to 404
+      - "!steps.missing.result.ok && steps.missing.result.error.status == 404 && steps.missing.result.error.message.contains('No adapter found for /adapters/nothing-here')"
+      - "trace.exists(e, e.type == 'call.end' && e.interface == 'lru-cache-worker-lora-manager.load-adapter' && e.error != null && e.error.code == 'lora-adapter-not-found-error')"
+      - "!('ghost' in state['openai-serving-models'].lora_requests)"
+      # (d)
+      - "steps.unload.result.ok && steps.unload.result.value.message == \"Success: LoRA adapter 'sql' removed successfully.\""
+      - "!steps.models.result.value.data.exists(m, m.id == 'sql')"
+      - "!steps.chat.result.ok && steps.chat.result.error.status == 404"
+      - "calls['async-llm.generate'] == 0"
+      # (e)
+      - "!steps.unknown.result.ok && steps.unknown.result.error.status == 404 && steps.unknown.result.error.message.contains('cannot be found')"
+  - id: bench-l7f
+    name: "L7 (f) without VLLM_ALLOW_RUNTIME_LORA_UPDATING the routes are not registered"
+    fixtures: [full-tp1-llama-8b]
+    config: {enable-lora: true, vllm-allow-runtime-lora-updating: false}
+    steps:
+      - {flow: serving-api-lora-load, input: {path: /v1/load_lora_adapter, body: {lora_name: sql, lora_path: /adapters/sql, load_inplace: false}}, as: load}
+      - {interface: openai-serving-models.post-v1-unload-lora-adapter, caller: api-client, input: {path: /v1/unload_lora_adapter, body: {lora_name: sql}}, as: unload}
+    expect:
+      - "!steps.load.result.ok && steps.load.result.error.status == 404"
+      - "!steps.unload.result.ok && steps.unload.result.error.status == 404"
+      - "calls['openai-serving-models.load-lora-adapter'] == 0 && calls['openai-serving-models.unload-lora-adapter'] == 0 && calls['async-llm.add-lora'] == 0"

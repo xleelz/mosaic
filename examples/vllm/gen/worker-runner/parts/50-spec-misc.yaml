@@ -1,0 +1,578 @@
+configs:
+  - {id: speculative-draft-architecture, type: string, value: "", default: "", summary: "speculative_config.draft_model_config.architectures[0] (selects DFlash2 vs DFlash)", sources: ["vllm/v1/worker/gpu/spec_decode/__init__.py:27-44"], attributes: {boundary: true, owner: config-platform, key: speculative_config.draft_model_config.architectures}}
+  - {id: mtp-num-nextn-predict-layers, type: integer, value: 1, default: 1, summary: "draft hf_config.num_nextn_predict_layers (multi-module MTP when min(layers, num_speculative_tokens) > 1)", sources: ["vllm/config/speculative.py:1982-1988"], attributes: {boundary: true, owner: config-platform, key: num_nextn_predict_layers}}
+  - {id: enable-adaptive-verification, type: boolean, value: false, default: false, summary: "speculative_config.enable_adaptive_verification (online acceptance estimator)", sources: ["vllm/config/speculative.py:551"], attributes: {boundary: true, owner: config-platform, key: speculative_config.enable_adaptive_verification}}
+
+components:
+  - {id: dspark-speculator, name: DSparkSpeculator, kind: module, parent: gpu-model-runner, layer: spec-decode, summary: "DSpark drafter (a DFlash variant).", sources: ["vllm/v1/worker/gpu/spec_decode/dspark/speculator.py:40-130"]}
+
+interfaces:
+  # ================= speculative decoding (V2) =================
+  - component: spec-decode
+    name: init-speculator
+    kind: function
+    summary: "init_speculator: dflash (DFlash2 by draft architecture), dspark, multi-module MTP, mtp/eagle/eagle3 (target-dependent AR), draft_model (standalone AR), ngram/ngram_gpu; anything else is NotImplementedError."
+    sources: ["vllm/v1/worker/gpu/spec_decode/__init__.py:13-86"]
+    latency_ms: 0
+    errors: [{code: not-implemented-error, status: 0, retryable: false}]
+    request: {type: object, required: [method], properties: {method: {type: string, examples: [eagle3]}}}
+    response: {type: object, properties: {speculator: {type: string}}}
+    behavior:
+      - if: "input.method == 'dflash'"
+        then:
+          - return: {speculator: "= config['speculative-draft-architecture'] == 'DFlash2DraftModel' ? 'dflash2-speculator' : 'dflash-speculator'"}
+      - if: "input.method == 'dspark'"
+        then: [{return: {speculator: dspark-speculator}}]
+      - if: "input.method == 'mtp' && (int(config['mtp-num-nextn-predict-layers']) < int(config['num-speculative-tokens']) ? int(config['mtp-num-nextn-predict-layers']) : int(config['num-speculative-tokens'])) > 1"
+        then:
+          - title: Multi-module MTP when more than one MTP layer is used
+            source: "vllm/v1/worker/gpu/spec_decode/__init__.py:57-62"
+            return: {speculator: multi-module-mtp-speculator}
+      - if: "input.method in ['eagle', 'eagle3', 'mtp']"
+        then:
+          - title: EAGLE/EAGLE3/single-layer MTP draft from the target's hidden states
+            source: "vllm/v1/worker/gpu/spec_decode/__init__.py:63-72"
+            return: {speculator: target-dependent-ar-speculator}
+      - if: "input.method == 'draft_model'"
+        then: [{return: {speculator: standalone-ar-speculator}}]
+      - if: "input.method in ['ngram', 'ngram_gpu']"
+        then: [{return: {speculator: ngram-gpu-speculator}}]
+      - title: Unsupported method
+        source: "vllm/v1/worker/gpu/spec_decode/__init__.py:85-86"
+        fail: {code: not-implemented-error, status: 0, message: "= input.method + ' is not supported yet.'"}
+  - component: rejection-sampler
+    name: sample
+    kind: function
+    summary: "RejectionSampler.__call__: target logits vs drafts, chunked over the vocabulary. The target's logits go through Sampler.apply_sampling_params first. Greedy rows accept a draft when it equals the target argmax; random rows with probability min(1, p/q); a -1 placeholder is rejected; the first rejected position is resampled from the residual, and fully accepted rows get a bonus token. Returns the accepted prefix plus one token per finished request, so a step emits 1 to k+1 tokens."
+    sources: ["vllm/v1/worker/gpu/spec_decode/rejection_sampler.py:407-470", "vllm/v1/worker/gpu/spec_decode/rejection_sampler_utils.py:1015-1328"]
+    latency_ms: 0
+    request: {type: object, properties: {rows: {type: array}, want_logprobs: {type: boolean, default: false}}}
+    response: {type: object, properties: {req_ids: {type: array}, sampled_token_ids: {type: array}, num_accepted: {type: array}}}
+    behavior:
+      - call: rejection-sampler.compute-local-logits-stats-kernel
+        input: {num_rows: "= size(input.rows)"}
+      - call: rejection-sampler.compute-cumulative-log-p-kernel
+        input: {num_rows: "= size(input.rows)"}
+      - call: rejection-sampler.compute-local-residual-mass-kernel
+        input: {num_rows: "= size(input.rows)"}
+      - title: Accept or reject each draft position
+        source: "vllm/v1/worker/gpu/spec_decode/rejection_sampler_utils.py:1226-1240"
+        call: rejection-sampler.rejection-kernel
+        input: {num_rows: "= size(input.rows)"}
+      - call: rejection-sampler.resample-kernel
+        input: {num_rows: "= size(input.rows)"}
+      - call: rejection-sampler.insert-resampled-kernel
+        input: {num_rows: "= size(input.rows)"}
+      - call: rejection-sampler.gather-draft-sampled-kernel
+        input: {num_rows: "= size(input.rows)"}
+      - if: "has(input.want_logprobs) && input.want_logprobs"
+        then:
+          - title: Logprobs of the accepted tokens
+            source: "vllm/v1/worker/gpu/spec_decode/rejection_sampler.py:177-218"
+            call: rejection-sampler.flatten-sampled-kernel
+            input: {num_rows: "= size(input.rows)"}
+      - title: "The target's processed logits at every draft position and the bonus position (Sampler.apply_sampling_params)"
+        source: "vllm/v1/worker/gpu/spec_decode/rejection_sampler.py:258-267"
+        call: sampler.apply-sampling-params
+        input:
+          rows: "= input.rows.map(r, merge(r, {'positions': lists.range(size(r.drafts) + 1).map(j, has(r.seq_len) ? r.seq_len - size(r.drafts) + j : -1)}))"
+        as: tgt
+      - title: "A -1 placeholder draft is never accepted: verification of a row stops at its first invalid draft"
+        source: "vllm/v1/worker/gpu/spec_decode/rejection_sampler_utils.py:559-569"
+        set:
+          vars.valid: "= input.rows.map(r, size(lists.range(size(r.drafts)).filter(j, r.drafts.slice(0, j + 1).all(d, d >= 0))))"
+      - title: Which drafts the target accepts depends on the logits
+        detail: "Greedy rows (temperature 0) accept a draft iff it equals the target's argmax and store that argmax at the first rejection; random rows accept with probability min(1, p/q) and resample the first rejected position from the residual. The model holds no logits, so the verdict is a choice: accept_all (the drafter agreed with the target everywhere: every valid draft plus a bonus token), reject_first (one resampled token), or target (each draft is compared with the stand-in token the target's logits yield at its position, so a greedy row accepts the longest matching prefix and emits exactly the tokens non-speculative greedy decoding would)."
+        source: "vllm/v1/worker/gpu/spec_decode/rejection_sampler_utils.py:570-599"
+        choice: acceptance
+        default: accept_all
+        options:
+          accept_all:
+            - set: {vars.accepted: "= vars.valid"}
+          reject_first:
+            - set: {vars.accepted: "= input.rows.map(r, 0)"}
+          target:
+            - set: {vars.accepted: "= lists.range(size(input.rows)).map(i, size(lists.range(vars.valid[i]).filter(j, lists.range(j + 1).all(m, input.rows[i].drafts[m] == vars.tgt.value.tokens[i][m]))))"}
+      - set: {ctx.num_accepted: "= vars.accepted"}
+      - title: "Accepted drafts, then the target's token at the first rejected position (or the bonus position when all are accepted)"
+        source: "vllm/v1/worker/gpu/spec_decode/rejection_sampler_utils.py:589-593"
+        return:
+          req_ids: "= input.rows.map(r, r.req_id)"
+          sampled_token_ids: "= lists.range(size(input.rows)).map(i, input.rows[i].is_final ? input.rows[i].drafts.slice(0, vars.accepted[i]) + [vars.tgt.value.tokens[i][vars.accepted[i]]] : [])"
+          num_accepted: "= vars.accepted"
+  - component: target-dependent-ar-speculator
+    name: propose
+    kind: function
+    summary: "TargetDependentARSpeculator.propose (EAGLE/EAGLE3/MTP): prefill step from the target's hidden states, then num_speculative_tokens - 1 autoregressive draft steps (fused or CUDA-graphed), feeding each draft back."
+    sources: ["vllm/v1/worker/gpu/spec_decode/target_dependent_ar/speculator.py:165-365"]
+    latency_ms: 1
+    request: {type: object, properties: {req_ids: {type: array}, num_speculative_tokens: {type: integer}, token_ids: {type: ["array", "null"], default: null, description: "each request's committed tokens (the runner's all_token_ids rows), passed to every speculator"}, num_sampled: {type: ["array", "null"], default: null, items: {type: integer}}, last_sampled: {type: ["array", "null"], default: null, items: {type: integer}}}}
+    response: {type: object, properties: {draft_token_ids: {type: object}}}
+    behavior:
+      - title: "DraftModelSpeculator.observe_verification: the target's verdict on the last drafts is folded into the acceptance estimator before the next propose"
+        source: "vllm/v1/worker/gpu/spec_decode/speculator.py:489-501"
+        when: "config['enable-adaptive-verification']"
+        call: online-acceptance-estimator.step
+        input: {num_rows: "= size(input.req_ids)"}
+      - call: target-dependent-ar-speculator.prepare-prefill-inputs-kernel
+        input: {num_rows: "= size(input.req_ids)"}
+      - if: "input.num_speculative_tokens > 1"
+        then:
+          - call: target-dependent-ar-speculator.prepare-decode-inputs-kernel
+            input: {num_rows: "= size(input.req_ids)"}
+          - foreach: "= lists.range(input.num_speculative_tokens - 1)"
+            as: step
+            steps:
+              - call: target-dependent-ar-speculator.update-draft-inputs-kernel
+                input: {num_rows: "= size(input.req_ids)"}
+      - when: "config['enable-adaptive-verification']"
+        call: online-acceptance-estimator.predict
+        input: {num_rows: "= size(input.req_ids)"}
+      - return: {draft_token_ids: "= input.req_ids.transformMapEntry(i, id, {id: lists.range(input.num_speculative_tokens).map(k, 200 + k)})"}
+  - component: standalone-ar-speculator
+    name: propose
+    kind: function
+    summary: "StandaloneARSpeculator.propose: an independent draft model prefills and decodes num_speculative_tokens drafts."
+    sources: ["vllm/v1/worker/gpu/spec_decode/standalone_ar/speculator.py:352-410"]
+    latency_ms: 1
+    request: {type: object, properties: {req_ids: {type: array}, num_speculative_tokens: {type: integer}, token_ids: {type: ["array", "null"], default: null, description: "each request's committed tokens (the runner's all_token_ids rows), passed to every speculator"}, num_sampled: {type: ["array", "null"], default: null, items: {type: integer}}, last_sampled: {type: ["array", "null"], default: null, items: {type: integer}}}}
+    response: {type: object, properties: {draft_token_ids: {type: object}}}
+    behavior:
+      - call: standalone-ar-speculator.prepare-prefill-inputs-kernel
+        input: {num_rows: "= size(input.req_ids)"}
+      - if: "input.num_speculative_tokens == 0"
+        then: [{return: {draft_token_ids: {}}}]
+      - return: {draft_token_ids: "= input.req_ids.transformMapEntry(i, id, {id: lists.range(input.num_speculative_tokens).map(k, 300 + k)})"}
+  - component: dflash-speculator
+    name: propose
+    kind: function
+    summary: "DFlashSpeculator.propose: builds a block of mask positions after the context and drafts all of them in one parallel forward."
+    sources: ["vllm/v1/worker/gpu/spec_decode/dflash/speculator.py:343-530"]
+    latency_ms: 1
+    request: {type: object, properties: {req_ids: {type: array}, num_speculative_tokens: {type: integer}, token_ids: {type: ["array", "null"], default: null, description: "each request's committed tokens (the runner's all_token_ids rows), passed to every speculator"}, num_sampled: {type: ["array", "null"], default: null, items: {type: integer}}, last_sampled: {type: ["array", "null"], default: null, items: {type: integer}}}}
+    response: {type: object, properties: {draft_token_ids: {type: object}}}
+    behavior:
+      - title: Parallel-draft query block and context slots
+        source: "vllm/v1/worker/gpu/spec_decode/dflash/speculator.py:733-778"
+        call: dflash-speculator.prepare-dflash-inputs-kernel
+        input: {num_rows: "= size(input.req_ids)"}
+      - if: "int(config['decode-context-parallel-size']) > 1"
+        then:
+          - call: cp-utils.dcp-local-seq-lens-kernel
+            input: {num_rows: "= size(input.req_ids)"}
+      - return: {draft_token_ids: "= input.req_ids.transformMapEntry(i, id, {id: lists.range(input.num_speculative_tokens).map(k, 400 + k)})"}
+  - component: dflash2-speculator
+    name: propose
+    kind: function
+    summary: "DFlash2Speculator: DFlash drafting plus a candidate selector walk and cached draft logits."
+    sources: ["vllm/v1/worker/gpu/spec_decode/dflash2/speculator.py:111-260"]
+    latency_ms: 1
+    request: {type: object, properties: {req_ids: {type: array}, num_speculative_tokens: {type: integer}, token_ids: {type: ["array", "null"], default: null, description: "each request's committed tokens (the runner's all_token_ids rows), passed to every speculator"}, num_sampled: {type: ["array", "null"], default: null, items: {type: integer}}, last_sampled: {type: ["array", "null"], default: null, items: {type: integer}}}}
+    response: {type: object, properties: {draft_token_ids: {type: object}}}
+    behavior:
+      - call: dflash-speculator.prepare-dflash-inputs-kernel
+        input: {num_rows: "= size(input.req_ids)"}
+      - title: Candidate selection
+        source: "vllm/v1/worker/gpu/spec_decode/dflash2/speculator.py:126-160"
+        call: dflash2-speculator.selector-walk-kernel
+        input: {num_rows: "= size(input.req_ids)"}
+      - call: dflash2-speculator.cache-draft-logits-kernel
+        input: {num_rows: "= size(input.req_ids)"}
+      - if: "size(input.req_ids) == 0"
+        then: [{return: {draft_token_ids: {}}}]
+      - return: {draft_token_ids: "= input.req_ids.transformMapEntry(i, id, {id: lists.range(input.num_speculative_tokens).map(k, 500 + k)})"}
+  - component: dspark-speculator
+    name: propose
+    kind: function
+    summary: "DSparkSpeculator: DFlash-style drafting; its acceptance estimator is disabled unless adaptive verification is on."
+    sources: ["vllm/v1/worker/gpu/spec_decode/dspark/speculator.py:40-130"]
+    latency_ms: 1
+    request: {type: object, properties: {req_ids: {type: array}, num_speculative_tokens: {type: integer}, token_ids: {type: ["array", "null"], default: null, description: "each request's committed tokens (the runner's all_token_ids rows), passed to every speculator"}, num_sampled: {type: ["array", "null"], default: null, items: {type: integer}}, last_sampled: {type: ["array", "null"], default: null, items: {type: integer}}}}
+    response: {type: object, properties: {draft_token_ids: {type: object}}}
+    behavior:
+      - call: dflash-speculator.prepare-dflash-inputs-kernel
+        input: {num_rows: "= size(input.req_ids)"}
+      - if: "config['enable-adaptive-verification']"
+        then:
+          - call: online-acceptance-estimator.step
+            input: {num_rows: "= size(input.req_ids)"}
+          - call: online-acceptance-estimator.predict
+            input: {num_rows: "= size(input.req_ids)"}
+      - return: {draft_token_ids: "= input.req_ids.transformMapEntry(i, id, {id: lists.range(input.num_speculative_tokens).map(k, 600 + k)})"}
+  - component: multi-module-mtp-speculator
+    name: propose
+    kind: function
+    summary: "MultiModuleMTPSpeculator.propose: each MTP module drafts one position; inputs and embeddings shift by one per module."
+    sources: ["vllm/v1/worker/gpu/spec_decode/multi_module_mtp/speculator.py:132-470"]
+    latency_ms: 1
+    request: {type: object, properties: {req_ids: {type: array}, num_speculative_tokens: {type: integer}, token_ids: {type: ["array", "null"], default: null, description: "each request's committed tokens (the runner's all_token_ids rows), passed to every speculator"}, num_sampled: {type: ["array", "null"], default: null, items: {type: integer}}, last_sampled: {type: ["array", "null"], default: null, items: {type: integer}}}}
+    response: {type: object, properties: {draft_token_ids: {type: object}}}
+    behavior:
+      - call: multi-module-mtp-speculator.prepare-input-buffers-kernel
+        input: {num_rows: "= size(input.req_ids)"}
+      - call: multi-module-mtp-speculator.prepare-input-hidden-states-and-embeddings-kernel
+        input: {num_rows: "= size(input.req_ids)"}
+      - foreach: "= lists.range(input.num_speculative_tokens)"
+        as: module
+        steps:
+          - call: multi-module-mtp-speculator.shift-input-ids-kernel
+            input: {num_rows: "= size(input.req_ids)"}
+          - call: multi-module-mtp-speculator.shift-input-embeds-kernel
+            input: {num_rows: "= size(input.req_ids)"}
+      - call: multi-module-mtp-speculator.pad-trailing-draft-slots-kernel
+        input: {num_rows: "= size(input.req_ids)"}
+      - call: multi-module-mtp-speculator.cache-inputs-kernel
+        input: {num_rows: "= size(input.req_ids)"}
+      - if: "size(input.req_ids) == 0"
+        then: [{return: {draft_token_ids: {}}}]
+      - return: {draft_token_ids: "= input.req_ids.transformMapEntry(i, id, {id: lists.range(input.num_speculative_tokens).map(k, 700 + k)})"}
+  - component: ngram-gpu-speculator
+    name: propose
+    kind: function
+    summary: "NgramGPUSpeculator.propose: for each request, find the longest n-gram (prompt_lookup_max down to prompt_lookup_min) whose earlier occurrence matches the context's suffix, the right-most occurrence on ties, and draft the k tokens that followed it; rows with no match, or that sampled nothing this step, repeat the last sampled token."
+    sources: ["vllm/v1/worker/gpu/spec_decode/ngram/speculator.py:216-270", "vllm/v1/worker/gpu/spec_decode/ngram/speculator.py:20-148"]
+    latency_ms: 0
+    request:
+      type: object
+      properties:
+        req_ids: {type: array, items: {type: string}}
+        num_speculative_tokens: {type: integer}
+        token_ids: {type: ["array", "null"], default: null, items: {type: array, items: {type: integer}}, description: "each request's committed tokens (the runner's all_token_ids row)"}
+        num_sampled: {type: ["array", "null"], default: null, items: {type: integer}}
+        last_sampled: {type: ["array", "null"], default: null, items: {type: integer}}
+    response: {type: object, properties: {draft_token_ids: {type: object}}}
+    behavior:
+      - call: ngram-gpu-speculator.ngram-scan-kernel
+        input: {num_rows: "= size(input.req_ids)"}
+      - call: ngram-gpu-speculator.ngram-finalize-kernel
+        input: {num_rows: "= size(input.req_ids)"}
+      - if: "has(input.token_ids) && input.token_ids != null && size(input.token_ids) == size(input.req_ids)"
+        then:
+          - set:
+              vars.minn: "= int(config['prompt-lookup-min'])"
+              vars.maxn: "= int(config['prompt-lookup-max'])"
+              vars.k: "= input.num_speculative_tokens"
+          - title: "Scan: score = n * (L + 1) + pos + 1 over every window pos <= L - n - 1 that equals the suffix of length n; the highest score wins (longest n, then right-most)"
+            source: "vllm/v1/worker/gpu/spec_decode/ngram/speculator.py:56-84"
+            set:
+              vars.best: "= lists.range(size(input.req_ids)).map(b, size(input.token_ids[b]) < vars.minn || (has(input.num_sampled) && input.num_sampled != null && input.num_sampled[b] == 0) ? [0] : (lists.range(vars.maxn - vars.minn + 1).map(i, vars.maxn - i).filter(n, size(input.token_ids[b]) > n).map(n, lists.range(size(input.token_ids[b]) - n).filter(p, input.token_ids[b].slice(p, p + n) == input.token_ids[b].slice(size(input.token_ids[b]) - n, size(input.token_ids[b]))).map(p, n * (size(input.token_ids[b]) + 1) + p + 1)).flatten().sortBy(x, -x) + [0]).slice(0, 1))"
+          - title: "Finalize: draft the k tokens after the match; slots with no token (or no match) take the last sampled token"
+            source: "vllm/v1/worker/gpu/spec_decode/ngram/speculator.py:113-148"
+            return:
+              draft_token_ids: "= input.req_ids.transformMapEntry(b, id, {id: lists.range(vars.k).map(j, vars.best[b][0] > 0 && ((vars.best[b][0] - 1) % (size(input.token_ids[b]) + 1)) + ((vars.best[b][0] - 1) / (size(input.token_ids[b]) + 1)) + j < size(input.token_ids[b]) ? input.token_ids[b][((vars.best[b][0] - 1) % (size(input.token_ids[b]) + 1)) + ((vars.best[b][0] - 1) / (size(input.token_ids[b]) + 1)) + j] : (has(input.last_sampled) && input.last_sampled != null ? input.last_sampled[b] : 0))})"
+      - title: Without the token rows in hand, whether the context repeats is data the model does not hold
+        choice: match
+        default: found
+        options:
+          found:
+            - return: {draft_token_ids: "= input.req_ids.transformMapEntry(i, id, {id: lists.range(input.num_speculative_tokens).map(k, 800 + k)})"}
+          none:
+            - title: "No match: every one of the k draft slots takes the last sampled token, so the step still verifies k drafts"
+              source: "vllm/v1/worker/gpu/spec_decode/ngram/speculator.py:141-148"
+              return: {draft_token_ids: "= input.req_ids.transformMapEntry(i, id, {id: lists.range(input.num_speculative_tokens).map(k, has(input.last_sampled) && input.last_sampled != null && size(input.last_sampled) > i ? input.last_sampled[i] : 0)})"}
+  - component: online-acceptance-estimator
+    name: step
+    kind: function
+    summary: "OnlineAcceptanceEstimator.step: folds the target's verdict on the last drafts into the model and refits it."
+    sources: ["vllm/v1/worker/gpu/spec_decode/acceptance_estimator.py:405-450"]
+    latency_ms: 0
+    behavior:
+      - call: online-acceptance-estimator.accumulate-kernel
+        input: {num_rows: "= input.num_rows"}
+      - call: online-acceptance-estimator.refit-kernel
+        input: {num_rows: "= input.num_rows"}
+  - component: online-acceptance-estimator
+    name: predict
+    kind: function
+    summary: "OnlineAcceptanceEstimator.predict: per-position acceptance probabilities from the draft logits."
+    sources: ["vllm/v1/worker/gpu/spec_decode/acceptance_estimator.py:451-490"]
+    latency_ms: 0
+    behavior:
+      - call: online-acceptance-estimator.local-max-sumexp-kernel
+        input: {num_rows: "= input.num_rows"}
+      - call: online-acceptance-estimator.predict-kernel
+        input: {num_rows: "= input.num_rows"}
+
+  # ================= model-specific state =================
+  - component: mamba-hybrid-model-state
+    name: preprocess-state
+    kind: function
+    summary: "MambaHybridModelState.preprocess_state: in align mode, advances per-request state indices and pre-copies recurrent state across block boundaries before the forward."
+    sources: ["vllm/v1/worker/gpu/model_states/mamba_hybrid.py:180-225"]
+    latency_ms: 0
+    behavior:
+      - if: "input.num_reqs == 0"
+        then: [{return: {launched: false}}]
+      - call: mamba-utils.preprocess-mamba-align-fused-kernel
+        input: {num_rows: "= input.num_reqs"}
+      - return: {launched: true}
+  - component: mamba-hybrid-model-state
+    name: postprocess-state
+    kind: function
+    summary: "MambaHybridModelState.postprocess_state: records accepted-token counts per Mamba slot (scatter for a real step's tensor, fill for a single value) and commits RecoverSSM state for KDA models."
+    sources: ["vllm/v1/worker/gpu/model_states/mamba_hybrid.py:350-385"]
+    latency_ms: 0
+    behavior:
+      - if: "has(input.num_sampled_is_int) && input.num_sampled_is_int"
+        then:
+          - call: mamba-hybrid-model-state.fill-num-accepted-kernel
+            input: {num_rows: "= input.num_reqs"}
+        else:
+          - call: mamba-hybrid-model-state.scatter-num-accepted-kernel
+            input: {num_rows: "= input.num_reqs"}
+      - if: "has(state.uses_recoverssm) && state.uses_recoverssm"
+        then:
+          - call: recover-ssm-state.commit-step
+            input: {num_rows: "= input.num_reqs"}
+  - component: recover-ssm-state
+    name: commit-step
+    kind: function
+    summary: "RecoverSSMState.commit_step: commits recovered SSM state."
+    sources: ["vllm/v1/worker/gpu/model_states/recoverssm.py:38-68"]
+    latency_ms: 0
+    behavior:
+      - call: recover-ssm-state.postprocess-recoverssm-align-kernel
+        input: {num_rows: "= input.num_rows"}
+  - component: rope-state
+    name: prepare-positions
+    kind: function
+    summary: "RopeState.prepare_positions: M-RoPE positions for the batch."
+    sources: ["vllm/v1/worker/gpu/mm/rope.py:98-140"]
+    latency_ms: 0
+    behavior:
+      - call: rope-state.prepare-rope-positions-kernel
+        input: {num_tokens: "= input.num_tokens"}
+  - component: prompt-embeds-state
+    name: apply
+    kind: function
+    summary: "PromptEmbedsState.apply: overlays request-supplied prompt embeddings."
+    sources: ["vllm/v1/worker/gpu/model_states/prompt_embeds.py:70-97"]
+    latency_ms: 0
+    behavior:
+      - call: prompt-embeds-state.apply-prompt-embeds-kernel
+        input: {num_tokens: "= input.num_tokens"}
+  - component: cp-utils
+    name: prepare-dcp-local-seq-lens
+    kind: function
+    summary: "prepare_dcp_local_seq_lens: this rank's share of each sequence under DCP interleaving."
+    sources: ["vllm/v1/worker/gpu/cp_utils.py:8-35"]
+    latency_ms: 0
+    behavior:
+      - call: cp-utils.dcp-local-seq-lens-kernel
+        input: {num_rows: "= input.num_reqs"}
+
+  # ================= pooling =================
+  - component: pooling-runner
+    name: pool
+    kind: function
+    summary: "PoolingRunner.pool: runs the model's pooler on the batch's hidden states; late-interaction scoring requests go to the LateInteractionRunner."
+    sources: ["vllm/v1/worker/gpu/pool/pooling_runner.py:139-200"]
+    latency_ms: 0
+    request: {type: object, properties: {req_ids: {type: array}, late_interaction: {type: boolean}}}
+    response: {type: object, properties: {pooler_output: {type: array}}}
+    behavior:
+      - if: "has(input.late_interaction) && input.late_interaction"
+        then:
+          - call: late-interaction-runner.score
+            input: {num_docs: "= size(input.req_ids)", shared_query: true}
+            as: sc
+          - return: {pooler_output: "= vars.sc.value.scores"}
+      - return: {pooler_output: "= input.req_ids.map(r, 'embedding')"}
+  - component: late-interaction-runner
+    name: score
+    kind: function
+    summary: "LateInteractionRunner._score: the fused flash-maxsim Triton kernel for one shared query on CUDA; a kernel failure disables it for the process and falls back to the reference MaxSim."
+    sources: ["vllm/v1/pool/late_interaction_runner.py:154-178", "vllm/v1/pool/flash_maxsim/flash_maxsim_rerank.py:113-170"]
+    latency_ms: 0
+    request: {type: object, properties: {num_docs: {type: integer, examples: [2]}, shared_query: {type: boolean}}}
+    response: {type: object, properties: {scores: {type: array}, path: {type: string}}}
+    behavior:
+      - if: "input.shared_query && (!has(state.flash_disabled) || !state.flash_disabled)"
+        then:
+          - call: late-interaction-runner.maxsim-rerank-kernel
+            input: {num_rows: "= input.num_docs"}
+            as: k
+            on_error:
+              - title: Kernel failure disables flash-maxsim for the process
+                source: "vllm/v1/pool/late_interaction_runner.py:167-177"
+                set: {state.flash_disabled: true}
+              - return: {scores: "= lists.range(input.num_docs).map(i, 0.5)", path: reference}
+          - return: {scores: "= lists.range(input.num_docs).map(i, 0.5)", path: flash}
+      - return: {scores: "= lists.range(input.num_docs).map(i, 0.5)", path: reference}
+  - component: late-interaction-runner
+    name: release-queries
+    kind: function
+    summary: "Releases cached query embeddings."
+    sources: ["vllm/v1/pool/late_interaction_runner.py:45-56"]
+    latency_ms: 0
+    request: {type: object, properties: {query_keys: {type: array, items: {type: string}}}}
+    response: {type: object, properties: {released: {type: integer}}}
+    behavior:
+      - set: {vars.n: "= has(state.queries) ? size(input.query_keys.filter(k, k in state.queries)) : 0"}
+      - if: "has(state.queries)"
+        then: [{set: {state.queries: "= state.queries.filter(k, !(k in input.query_keys))"}}]
+      - return: {released: "= vars.n"}
+  - component: late-interaction-runner
+    name: clear
+    kind: function
+    summary: "Clears all cached late-interaction state."
+    sources: ["vllm/v1/pool/late_interaction_runner.py:40-43"]
+    latency_ms: 0
+    behavior:
+      - if: "has(state.queries)"
+        then: [{set: {state.queries: []}}]
+
+  # ================= V1 model runner =================
+  - component: gpu-model-runner-v1
+    name: execute-model
+    kind: function
+    summary: "V1 GPUModelRunner.execute_model: updates the persistent InputBatch, computes slot mappings from the V1 block table, runs Mamba pre-processing for hybrid models, runs the forward and keeps the state for sample_tokens."
+    sources: ["vllm/v1/worker/gpu_model_runner.py:3940-4302"]
+    latency_ms: 0
+    request:
+      allOf:
+        - {$ref: SchedulerOutput}
+        - type: object
+          properties:
+            scheduled_spec_decode_tokens: {type: object, description: "req_id -> draft token ids (-1 placeholders under async scheduling)"}
+            new_block_ids_to_zero: {type: array, items: {type: integer}}
+            preempted_req_ids: {type: array, items: {type: string}}
+    response:
+      anyOf:
+        - {$ref: ModelRunnerOutput}
+        - {type: "null"}
+    behavior:
+      - if: "input.total_num_scheduled_tokens == 0"
+        then: [{return: {req_ids: [], sampled_token_ids: []}}]
+      - title: Slot mapping from the V1 block table
+        source: "vllm/v1/worker/gpu_model_runner.py:2144-2150"
+        call: block-table.compute-slot-mapping-kernel
+        input: {num_tokens: "= input.total_num_scheduled_tokens"}
+      - if: "has(input.new_block_ids_to_zero) && size(input.new_block_ids_to_zero) > 0"
+        then:
+          - call: kv-block-zeroer.zero-block-ids
+            input: {block_ids: "= input.new_block_ids_to_zero"}
+      - if: "state.hybrid"
+        then:
+          - title: Mamba preprocessing (align mode)
+            source: "vllm/v1/worker/gpu_model_runner.py:4084-4120"
+            call: mamba-utils.get-aligned-state-indices-multi-group-kernel
+            input: {num_rows: 1}
+          - call: mamba-utils.precopy-mamba-align-fused-kernel
+            input: {num_rows: 1}
+      - call: llama-for-causal-lm.forward
+        input: {num_tokens: "= input.total_num_scheduled_tokens", num_prefill_tokens: "= input.total_num_scheduled_tokens", num_decode_reqs: 0}
+      - set:
+          state.pending:
+            req_ids: "= input.num_scheduled_tokens.map(k, k).sort()"
+            drafts: "= has(input.scheduled_spec_decode_tokens) ? input.scheduled_spec_decode_tokens : {}"
+            hybrid: "= state.hybrid"
+      - return: null
+  - component: gpu-model-runner-v1
+    name: sample-tokens
+    kind: function
+    summary: "V1 sample_tokens: V1 Sampler (top-k/top-p through the shared Triton op) or the V1 rejection sampler when drafts are scheduled, Mamba post-processing, then the drafter's proposal (V1 EAGLE kernels)."
+    sources: ["vllm/v1/worker/gpu_model_runner.py:4304-4420"]
+    latency_ms: 0
+    request: {type: object, properties: {grammar_output: {type: ["object", "null"]}}}
+    response:
+      anyOf:
+        - {$ref: ModelRunnerOutput}
+        - {type: "null"}
+    behavior:
+      - if: "!has(state.pending) || state.pending == null"
+        then: [{return: null}]
+      - set: {vars.p: "= state.pending"}
+      - set: {state.pending: null}
+      - if: "size(vars.p.drafts) > 0"
+        then:
+          - title: V1 rejection sampling
+            source: "vllm/v1/worker/gpu_model_runner.py:3460-3470"
+            call: rejection-sampler-v1.expand-kernel
+            input: {num_rows: "= size(vars.p.req_ids)"}
+          - call: rejection-sampler-v1.rejection-greedy-sample-kernel
+            input: {num_rows: "= size(vars.p.req_ids)"}
+          - call: rejection-sampler-v1.rejection-random-sample-kernel
+            input: {num_rows: "= size(vars.p.req_ids)"}
+          - call: rejection-sampler-v1.sample-recovered-tokens-kernel
+            input: {num_rows: "= size(vars.p.req_ids)"}
+        else:
+          - title: V1 sampler with top-k/top-p
+            source: "vllm/v1/worker/gpu_model_runner.py:3448-3455"
+            call: topk-topp-triton.topk-topp-kernel
+            input: {num_rows: "= size(vars.p.req_ids)"}
+          - title: "V1 Sampler.forward: processed logits, top-k/top-p, then the sampled tokens' logprob ranks"
+            source: "vllm/v1/sample/sampler.py:73-140"
+          - title: Ranks via batched_count_greater_than
+            source: "vllm/v1/sample/ops/logprobs.py:11-20"
+      - if: "vars.p.hybrid"
+        then:
+          - title: Mamba postprocessing and state block copies
+            source: "vllm/v1/worker/gpu_model_runner.py:1569-1575"
+            call: mamba-utils.postprocess-mamba-fused-kernel
+            input: {num_rows: "= size(vars.p.req_ids)"}
+          - call: mamba-utils.batch-memcpy-kernel
+            input: {num_rows: "= size(vars.p.req_ids)"}
+      - if: "config['speculative-method'] in ['eagle', 'eagle3', 'dflash']"
+        then:
+          - title: "SpecDecodeBaseProposer.propose (EagleProposer): first draft step from the target's hidden states, then the remaining steps"
+            source: "vllm/v1/spec_decode/llm_base_proposer.py:512-560"
+          - title: EagleProposer is the base proposer configured for EAGLE
+            source: "vllm/v1/spec_decode/eagle.py:10-22"
+          - title: V1 drafter proposal (EAGLE / DFlash input kernels)
+            source: "vllm/v1/worker/gpu_model_runner.py:4771-4810"
+            call: spec-decode-utils.eagle-prepare-inputs-padded-kernel
+            input: {num_rows: "= size(vars.p.req_ids)"}
+          - call: spec-decode-utils.eagle-prepare-next-token-padded-kernel
+            input: {num_rows: "= size(vars.p.req_ids)"}
+          - call: spec-decode-utils.eagle-step-slot-mapping-metadata-kernel
+            input: {num_rows: "= size(vars.p.req_ids)"}
+          - call: spec-decode-utils.copy-and-expand-eagle-inputs-kernel
+            input: {num_rows: "= size(vars.p.req_ids)"}
+          - when: "config['speculative-method'] == 'dflash'"
+            call: spec-decode-utils.copy-and-expand-dflash-inputs-kernel
+            input: {num_rows: "= size(vars.p.req_ids)"}
+      - return: {req_ids: "= vars.p.req_ids", sampled_token_ids: "= vars.p.req_ids.map(r, [random(127900) + 100])"}
+  - component: gpu-model-runner-v1
+    name: dummy-sampler-run
+    kind: function
+    summary: "V1 _dummy_sampler_run: preallocates sampler buffers at max shape after capture."
+    sources: ["vllm/v1/worker/gpu_model_runner.py:5960-6030"]
+    latency_ms: 0
+    behavior:
+      - call: topk-topp-triton.topk-topp-kernel
+        input: {num_rows: "= input.num_tokens"}
+      - if: "config['speculative-method'] != ''"
+        then:
+          - call: rejection-sampler-v1.rejection-greedy-sample-kernel
+            input: {num_rows: "= input.num_tokens"}
+
+  # ================= PyTorch allocator config =================
+  - component: alloc-conf
+    name: alloc-conf-from-env
+    kind: function
+    summary: "alloc_conf_from_env: the allocator config string the process started with, checked in torch's precedence order PYTORCH_ALLOC_CONF, PYTORCH_CUDA_ALLOC_CONF, PYTORCH_HIP_ALLOC_CONF; the first non-empty one wins, else ''."
+    sources: ["vllm/device_allocator/alloc_conf.py:22-43"]
+    latency_ms: 0
+    request: {type: object, properties: {environ: {type: object}}}
+    response: {type: object, properties: {conf: {type: string}}}
+    behavior:
+      - set: {vars.found: "= ['PYTORCH_ALLOC_CONF', 'PYTORCH_CUDA_ALLOC_CONF', 'PYTORCH_HIP_ALLOC_CONF'].filter(n, n in input.environ && input.environ[n] != '')"}
+      - if: "size(vars.found) == 0"
+        then: [{return: {conf: ""}}]
+      - return: {conf: "= input.environ[vars.found[0]]"}
+  - component: alloc-conf
+    name: current-alloc-conf
+    kind: function
+    summary: "current_alloc_conf: the live allocator config when it can be read, else the environment's (used by CuMemAllocator.use_memory_pool before it flips expandable_segments)."
+    sources: ["vllm/device_allocator/alloc_conf.py:62-65", "vllm/device_allocator/cumem.py:391-394"]
+    latency_ms: 0
+    request: {type: object, properties: {live: {type: ["string", "null"], default: null}, environ: {type: object}}}
+    response: {type: object, properties: {conf: {type: string}}}
+    behavior:
+      - if: "has(input.live) && input.live != null"
+        then: [{return: {conf: "= input.live"}}]
+      - call: alloc-conf.alloc-conf-from-env
+        input: {environ: "= has(input.environ) ? input.environ : {}"}
+        as: env
+      - return: {conf: "= vars.env.value.conf"}

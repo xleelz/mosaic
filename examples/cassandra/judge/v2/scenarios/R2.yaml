@@ -1,0 +1,75 @@
+schema_version: 1
+id: cassandra
+scenarios:
+  - id: bench-r2-digest-mismatch-blocking-repair
+    name: "R2: QUORUM, n3 (data) has name=Bea@2000, n1 (digest) has name=Ada@1000 + city=Oslo@3000: mismatch from the data itself, full reads, newest per cell wins, both replicas repaired before the response"
+    flow: coordinator-read
+    fixtures: [three-node-rf3]
+    input:
+      consistency: QUORUM
+      read_command: {keyspace: shop, table: users, partition_key: "user:42", token: 100, columns: [name, city], digest: false, limit: 100}
+    state:
+      skip-list-memtable@n1:
+        cells:
+          "shop.users:user:42:name": {column: name, keyspace: shop, partition_key: "user:42", replica: n1, table: users, timestamp: 1000, value: Ada}
+          "shop.users:user:42:city": {column: city, keyspace: shop, partition_key: "user:42", replica: n1, table: users, timestamp: 3000, value: Oslo}
+      skip-list-memtable@n3:
+        cells:
+          "shop.users:user:42:name": {column: name, keyspace: shop, partition_key: "user:42", replica: n3, table: users, timestamp: 2000, value: Bea}
+    expect:
+      - "result.ok && ctx.digest_mismatch == true && ctx.read_repair == 'BLOCKING'"
+      # no forced choices: the digest mismatch comes from the replicas' data
+      - "trace.exists(e, e.type == 'choice' && e.key == 'digest-resolver.responses-match.digests' && e.option == 'mismatch')"
+      # repair reads are full data reads to both contacts
+      - "trace.exists(e, e.type == 'call.start' && e.interface == 'read-command-verb-handler.do-verb' && e.instance == 'n3' && e.input.read_command.digest == false && e.seq > trace.filter(x, x.type == 'call.start' && x.interface == 'abstract-read-repair.start-repair')[0].seq)"
+      - "trace.exists(e, e.type == 'call.start' && e.interface == 'storage-proxy-local-read-runnable.run' && e.instance == 'n1' && e.input.read_command.digest == false)"
+      # newest timestamp wins per cell
+      - "result.value.rows[0].cells.exists(c, c.column == 'name' && c.value == 'Bea' && c.timestamp == 2000)"
+      - "result.value.rows[0].cells.exists(c, c.column == 'city' && c.value == 'Oslo' && c.timestamp == 3000)"
+      # blocking read repair: both stale replicas get a mutation and ack before the response
+      - "size(ctx.stale_replicas) == 2 && 'n1' in ctx.stale_replicas && 'n3' in ctx.stale_replicas"
+      - "trace.exists(e, e.type == 'call.start' && e.interface == 'read-repair-verb-handler.do-verb' && e.instance == 'n1')"
+      - "trace.exists(e, e.type == 'call.start' && e.interface == 'read-repair-verb-handler.do-verb' && e.instance == 'n3')"
+      - "calls['blocking-read-repair.await-writes'] >= 1"
+      - "state['skip-list-memtable@n3'].cells.exists(k, state['skip-list-memtable@n3'].cells[k].column == 'city' && state['skip-list-memtable@n3'].cells[k].value == 'Oslo')"
+      - "state['skip-list-memtable@n1'].cells.exists(k, state['skip-list-memtable@n1'].cells[k].column == 'name' && state['skip-list-memtable@n1'].cells[k].value == 'Bea')"
+  - id: bench-r2-repair-mutation-is-a-diff
+    name: "R2 detail: each stale replica gets only its diff (RowIteratorMergeListener.java:382-398)"
+    flow: coordinator-read
+    fixtures: [three-node-rf3]
+    input:
+      consistency: QUORUM
+      read_command: {keyspace: shop, table: users, partition_key: "user:42", token: 100, columns: [name, city], digest: false, limit: 100}
+    state:
+      skip-list-memtable@n1:
+        cells:
+          "shop.users:user:42:name": {column: name, keyspace: shop, partition_key: "user:42", replica: n1, table: users, timestamp: 1000, value: Ada}
+          "shop.users:user:42:city": {column: city, keyspace: shop, partition_key: "user:42", replica: n1, table: users, timestamp: 3000, value: Oslo}
+      skip-list-memtable@n3:
+        cells:
+          "shop.users:user:42:name": {column: name, keyspace: shop, partition_key: "user:42", replica: n3, table: users, timestamp: 2000, value: Bea}
+    expect:
+      - "result.ok"
+      - "trace.exists(e, e.type == 'call.start' && e.interface == 'read-repair-verb-handler.do-verb' && e.instance == 'n1' && e.input.mutation.cells.all(c, c.column == 'name'))"
+  - id: bench-r2-newer-tombstone-wins-across-replicas
+    name: "R2: n3 (data) holds a name tombstone@2000, n1 holds name=Ada@1000: the tombstone travels unfiltered, shadows Ada, the client sees no name, and n1 is repaired with the tombstone"
+    flow: coordinator-read
+    fixtures: [three-node-rf3]
+    input:
+      consistency: QUORUM
+      read_command: {keyspace: shop, table: users, partition_key: "user:42", token: 100, columns: [name, city], digest: false, limit: 100}
+    state:
+      skip-list-memtable@n1:
+        cells:
+          "shop.users:user:42:name": {column: name, keyspace: shop, partition_key: "user:42", replica: n1, table: users, timestamp: 1000, value: Ada}
+          "shop.users:user:42:city": {column: city, keyspace: shop, partition_key: "user:42", replica: n1, table: users, timestamp: 1000, value: Oslo}
+      skip-list-memtable@n3:
+        cells:
+          "shop.users:user:42:name": {column: name, keyspace: shop, partition_key: "user:42", replica: n3, table: users, timestamp: 2000, value: null, deleted: true}
+          "shop.users:user:42:city": {column: city, keyspace: shop, partition_key: "user:42", replica: n3, table: users, timestamp: 1000, value: Oslo}
+    expect:
+      - "result.ok && ctx.digest_mismatch == true"
+      - "!result.value.rows.exists(p, p.cells.exists(c, c.column == 'name' && !(has(c.deleted) && c.deleted)))"
+      - "result.value.rows[0].cells.exists(c, c.column == 'city' && c.value == 'Oslo')"
+      - "ctx.stale_replicas == ['n1']"
+      - "trace.exists(e, e.type == 'call.start' && e.interface == 'read-repair-verb-handler.do-verb' && e.instance == 'n1' && e.input.mutation.cells.exists(c, c.column == 'name' && c.deleted))"

@@ -1,0 +1,852 @@
+# distributed area, part 5 (fix round): disaggregated prefill end to end. NIXL connector metadata
+# and the worker-side READ path, the KV output aggregator, MoRIIO's scheduler hooks with the hybrid
+# split_block_groups, and get_pp_indices.
+schema_version: 1
+id: vllm
+
+components:
+  - id: nixl-pull-connector-worker
+    name: NixlPullConnectorWorker
+    kind: module
+    layer: kv-transfer
+    parent: gpu-worker
+    summary: "Decode-side worker of the NIXL pull connector: handshakes with each remote prefill engine once, starts non-blocking RDMA READs into the request's local blocks, and reports finished/failed receives; on a prefill node it releases blocks once read (or when the lease expires)."
+    sources: ["vllm/distributed/kv_transfer/kv_connector/v1/nixl/pull_worker.py:39-46", "vllm/distributed/kv_transfer/kv_connector/v1/nixl/connector.py:345-371"]
+    state:
+      schema:
+        type: object
+        properties:
+          remote_agents: {type: array}
+          invalid_remote_engines: {type: array}
+          recving: {type: object}
+          failed_recv: {type: array}
+          invalid_block_ids: {type: array}
+          reqs_to_process: {type: array}
+          reqs_to_send: {type: object}
+          read_notifs: {type: array}
+          bidirectional_kv_xfer: {type: boolean}
+          engine_clock_offset: {type: object}
+          xfer_stats: {type: object}
+          registered_layers: {type: array}
+      initial: {remote_agents: [], invalid_remote_engines: [], recving: {}, failed_recv: [], invalid_block_ids: [], reqs_to_process: [], reqs_to_send: {}, read_notifs: [], bidirectional_kv_xfer: false, engine_clock_offset: {}, xfer_stats: {num_failed_transfers: [], num_failed_handshakes: [], num_kv_expired_reqs: [], num_notifications_after_expiry: []}, registered_layers: []}
+  - id: kv-output-aggregator
+    name: KVOutputAggregator
+    kind: module
+    layer: kv-transfer
+    parent: engine-core
+    capacity: {concurrency: 1}   # one engine-core thread runs every aggregate: FutureWrapper.result drains the step futures in order and aggregates each (multiproc_executor.py:91-103)
+    summary: "Executor-side merge of the workers' KVConnectorOutputs: a request counts as finished sending/receiving only after every worker reported it (expected_finished_count, normally the world size)."
+    sources: ["vllm/distributed/kv_transfer/kv_connector/utils.py:63-77"]
+    state:
+      schema: {type: object, properties: {expected: {type: integer}, recv_remaining: {type: object}, send_remaining: {type: object}, failed_pending: {type: array}}}
+      initial: {expected: 0, recv_remaining: {}, send_remaining: {}, failed_pending: []}
+  - id: distributed-utils
+    name: distributed.utils (module)
+    kind: module
+    layer: distributed
+    parent: parallel-state
+    summary: "Helpers of vllm/distributed/utils.py; modeled: get_pp_indices, the layer range of a pipeline stage."
+    sources: ["vllm/distributed/utils.py:126-170"]
+
+interfaces:
+  # ---------------------------------------------------------------- NIXL scheduler metadata
+  - component: nixl-pull-connector-scheduler
+    name: build-connector-meta
+    kind: function
+    summary: "NixlBaseConnectorScheduler.build_connector_meta: turn every queued pull into reqs_to_recv (local blocks plus the remote engine's blocks and address), attach reqs_to_send leases, reqs_in_batch and reqs_not_processed, then clear the per-step state."
+    sources: ["vllm/distributed/kv_transfer/kv_connector/v1/nixl/base_scheduler.py:474-520", "vllm/distributed/kv_transfer/kv_connector/v1/nixl/metadata.py:317-340"]
+    request: {type: object, properties: {scheduled_new_reqs: {type: array}}}
+    response:
+      type: object
+      properties:
+        reqs_to_recv: {type: object}
+        reqs_to_save: {type: object}
+        reqs_to_send: {type: object}
+        reqs_in_batch: {type: array}
+        reqs_not_processed: {type: array}
+    behavior:
+      - title: add_new_req_to_recv for each queued pull (RemoteMeta from kv_transfer_params)
+        source: "vllm/distributed/kv_transfer/kv_connector/v1/nixl/base_scheduler.py:481-495"
+        set:
+          vars.recv: "= state.reqs_need_recv.transformMapEntry(rid, r, {rid: {'local_block_ids': r.local_block_ids, 'awaiting_kvs': r.park, 'remote': {'block_ids': r.remote_block_ids, 'engine_id': r.remote_engine_id, 'request_id': has(r.remote_request_id) ? r.remote_request_id : '', 'host': has(r.remote_host) ? r.remote_host : '', 'port': has(r.remote_port) ? r.remote_port : 0, 'num_tokens': has(r.remote_num_tokens) ? r.remote_num_tokens : null}}})"
+      - if: "state.use_host_buffer"
+        then:
+          - title: Host-buffer platforms also save the prefilled blocks of finished-chunk requests
+            source: "vllm/distributed/kv_transfer/kv_connector/v1/nixl/base_scheduler.py:497-498"
+            set:
+              vars.save: "= state.reqs_need_save"
+              state.reqs_need_save: {}
+        else:
+          - set: {vars.save: {}}
+      - set:
+          vars.out:
+            reqs_to_recv: "= vars.recv"
+            reqs_to_save: "= vars.save"
+            reqs_to_send: "= state.reqs_need_send"
+            reqs_in_batch: "= state.reqs_in_batch"
+            reqs_not_processed: "= state.reqs_not_processed"
+      - title: Clear the per-step state once workers start the transfers
+        source: "vllm/distributed/kv_transfer/kv_connector/v1/nixl/base_scheduler.py:514-518"
+        set: {state.reqs_need_recv: {}, state.reqs_in_batch: [], state.reqs_not_processed: [], state.reqs_need_send: {}}
+      - return: "= vars.out"
+
+  # ---------------------------------------------------------------- NIXL worker
+  - component: nixl-pull-connector-worker
+    name: start-load-kv
+    kind: function
+    summary: "NixlPullConnectorWorker.start_load_kv: for each request to receive, handshake with an unknown remote engine (in the background; the READ starts on a later step) or start the READ; full local hits only notify the prefill node. Record reqs_in_batch, drop reqs_not_processed, and keep send leases."
+    sources: ["vllm/distributed/kv_transfer/kv_connector/v1/nixl/pull_worker.py:47-123", "vllm/distributed/kv_transfer/kv_connector/v1/nixl/pull_worker.py:125-175"]
+    request: {type: object, properties: {metadata: {type: object}}}
+    response: {type: object, properties: {started: {type: integer}, handshakes: {type: integer}}}
+    behavior:
+      - set:
+          vars.m: "= input.metadata"
+          vars.started: 0
+          vars.hs: 0
+      - foreach: "= has(vars.m.reqs_to_recv) ? vars.m.reqs_to_recv : {}"
+        as: meta
+        index: rid
+        steps:
+          - set:
+              vars.awaits: "= vars.meta.awaiting_kvs || vars.meta.local_block_ids.exists(g, size(g) > 0)"
+          - if: "vars.meta.remote.engine_id in state.invalid_remote_engines"
+            then:
+              - title: A known-bad remote engine fails the receive at once
+                source: "vllm/distributed/kv_transfer/kv_connector/v1/nixl/pull_worker.py:139-143"
+                set: {state.failed_recv: "= state.failed_recv + [vars.rid]"}
+              - continue: true
+          - if: "!(vars.meta.remote.engine_id in state.remote_agents)"
+            then:
+              - title: First contact with this prefill engine; handshake (GET_META_MSG to its listener)
+                source: "vllm/distributed/kv_transfer/kv_connector/v1/nixl/pull_worker.py:144-147"
+                call: nixl-agent.handshake
+                input: {engine_id: "= vars.meta.remote.engine_id", host: "= vars.meta.remote.host", port: "= vars.meta.remote.port"}
+                as: hsres
+                on_error:
+                  - title: Handshake failure marks the request failed
+                    set:
+                      state.failed_recv: "= state.failed_recv + [vars.rid]"
+                      state.invalid_remote_engines: "= state.invalid_remote_engines + [vars.meta.remote.engine_id]"
+                      state.xfer_stats: "= merge(state.xfer_stats, {'num_failed_handshakes': state.xfer_stats.num_failed_handshakes + [1]})"
+                  - continue: true
+              - title: "The handshake records the remote agents and the measured clock offset (taken as 0: same-host perf_counter epochs assumed)"
+                source: "vllm/distributed/kv_transfer/kv_connector/v1/nixl/base_worker.py:1305-1316"
+                set:
+                  state.remote_agents: "= state.remote_agents + [vars.meta.remote.engine_id]"
+                  state.engine_clock_offset: "= merge(state.engine_clock_offset, {vars.meta.remote.engine_id: 0.0})"
+                  vars.hs: "= vars.hs + 1"
+          - set:
+              vars.expiry: "= has(vars.meta.remote.blocks_expiry_time) ? vars.meta.remote.blocks_expiry_time : null"
+              vars.offset: "= vars.meta.remote.engine_id in state.engine_clock_offset ? double(state.engine_clock_offset[vars.meta.remote.engine_id]) : 0.0"
+          - if: "state.bidirectional_kv_xfer && vars.expiry != null && size(vars.meta.local_block_ids) > 0 && double(now) / 1000.0 + 5.0 >= double(vars.expiry) - vars.offset"
+            then:
+              - title: "Turn-2 deadline gate: D's blocks expire within the 5 s safety margin, so decline the READ; count it as expired, and clean up like a failed transfer without counting a transport failure"
+                source: "vllm/distributed/kv_transfer/kv_connector/v1/nixl/pull_worker.py:125-163"
+                set:
+                  state.failed_recv: "= state.failed_recv + [vars.rid]"
+                  state.xfer_stats: "= merge(state.xfer_stats, {'num_kv_expired_reqs': state.xfer_stats.num_kv_expired_reqs + [1]})"
+              - continue: true
+          - if: "vars.awaits"
+            then:
+              - title: Non-blocking NIXL READ of the remote blocks into the local blocks
+                source: "vllm/distributed/kv_transfer/kv_connector/v1/nixl/pull_worker.py:166-175"
+                call: nixl-agent.read-blocks
+                input: {request_id: "= vars.rid", num_blocks: "= size(vars.meta.remote.block_ids)"}
+                as: rd
+                on_error: continue
+              - set:
+                  state.recving: "= merge(state.recving, {vars.rid: {'state': vars.rd.ok ? 'DONE' : 'ERR', 'local_block_ids': vars.meta.local_block_ids}})"
+                  state.xfer_stats: "= vars.rd.ok ? state.xfer_stats : merge(state.xfer_stats, {'num_failed_transfers': state.xfer_stats.num_failed_transfers + [1]})"
+                  vars.started: "= vars.started + 1"
+            else:
+              - title: Full local hit or aborted cleanup; notify the prefill node only
+                source: "vllm/distributed/kv_transfer/kv_connector/v1/nixl/pull_worker.py:67-74"
+                call: nixl-agent.send-notif
+                input: {kind: READ_DONE, request_id: "= vars.meta.remote.request_id"}
+      - title: Track requests in this batch, drop aborted ones, keep send leases
+        source: "vllm/distributed/kv_transfer/kv_connector/v1/nixl/pull_worker.py:91-119"
+        set:
+          state.reqs_to_process: "= (state.reqs_to_process + (has(vars.m.reqs_in_batch) ? vars.m.reqs_in_batch : [])).filter(r, !(has(vars.m.reqs_not_processed) && r in vars.m.reqs_not_processed))"
+      - set:
+          state.reqs_to_send: "= merge(state.reqs_to_send, has(vars.m.reqs_to_send) ? vars.m.reqs_to_send.transformMapEntry(rid, exp, rid in state.reqs_to_process, {rid: exp}) : {})"
+      - return: {started: "= vars.started", handshakes: "= vars.hs"}
+
+  - component: nixl-pull-connector-worker
+    name: get-finished
+    kind: function
+    summary: "get_finished / get_transfer_results: receives whose READs completed become finished_recving; failed ones are finished too, with their local blocks reported invalid; on the prefill side, blocks the decoder has read (notifications) or whose lease expired become finished_sending."
+    sources: ["vllm/distributed/kv_transfer/kv_connector/v1/nixl/base_worker.py:2994-2997", "vllm/distributed/kv_transfer/kv_connector/v1/nixl/base_worker.py:2853-2990", "vllm/distributed/kv_transfer/kv_connector/v1/nixl/base_worker.py:3014-3040"]
+    request: {type: object, properties: {}}
+    response: {type: object, properties: {finished_sending: {type: array}, finished_recving: {type: array}, failed_recving: {type: array}, invalid_block_ids: {type: array}}}
+    behavior:
+      - set:
+          vars.done: "= state.recving.filter(r, state.recving[r].state == 'DONE')"
+          vars.err: "= state.recving.filter(r, state.recving[r].state == 'ERR') + state.failed_recv"
+      - title: Failed reads report their local blocks invalid so the scheduler recomputes them
+        source: "vllm/distributed/kv_transfer/kv_connector/v1/nixl/base_worker.py:3064-3110"
+        set:
+          vars.invalid: "= state.recving.filter(r, state.recving[r].state == 'ERR').map(r, state.recving[r].local_block_ids).flatten().flatten()"
+      - set:
+          vars.sent: "= state.reqs_to_send.filter(r, r in state.read_notifs || state.reqs_to_send[r] <= now)"
+      - set:
+          state.recving: "= omit(state.recving, vars.done + state.recving.filter(r, state.recving[r].state == 'ERR'))"
+          state.failed_recv: []
+          state.reqs_to_send: "= omit(state.reqs_to_send, vars.sent)"
+          state.read_notifs: "= state.read_notifs.filter(r, !(r in vars.sent))"
+      - return: {finished_sending: "= vars.sent", finished_recving: "= vars.done + vars.err", failed_recving: "= vars.err", invalid_block_ids: "= vars.invalid"}
+
+  - component: nixl-agent
+    name: handshake
+    kind: rpc
+    summary: "Background NIXL handshake: fetch the remote engine's agent metadata from its side-channel listener and add it as a remote agent."
+    sources: ["vllm/distributed/kv_transfer/kv_connector/v1/nixl/base_worker.py:1330-1360"]
+    request: {type: object, properties: {engine_id: {type: string}, host: {type: string}, port: {type: integer}}}
+    response: {type: object, properties: {ok: {type: boolean}}}
+    latency_ms: 2
+
+  - component: nixl-agent
+    name: read-blocks
+    kind: kernel
+    summary: "RDMA READ of the remote blocks (2 MiB per block across layers, assumed) at the configured RDMA bandwidth."
+    sources: ["vllm/distributed/kv_transfer/kv_connector/v1/nixl/pull_worker.py:393-420"]
+    request: {type: object, properties: {request_id: {type: string}, num_blocks: {type: integer}}}
+    response: {type: object, properties: {ok: {type: boolean}}}
+    latency_ms: "= double(input.num_blocks) * 2097152.0 / (double(config['dist-nixl-rdma-gbps']) * 1000000.0)"
+
+  # ---------------------------------------------------------------- KVOutputAggregator
+  - component: kv-output-aggregator
+    name: aggregate
+    kind: function
+    summary: "KVOutputAggregator.aggregate: count each finished_sending/finished_recving report down from expected_finished_count (a worker may raise or lower it); a request is finished only when every worker reported it. Invalid blocks are unioned, failed receives surface once they also finish, and the workers' connector stats and worker metadata are folded into the output rank's KVConnectorOutput."
+    sources: ["vllm/distributed/kv_transfer/kv_connector/utils.py:79-196", "vllm/distributed/kv_transfer/kv_connector/v1/base.py:160-177"]
+    attributes: {seam: true, callers: [engine-core]}
+    request:
+      type: object
+      required: [outputs]
+      properties:
+        world_size: {type: integer, default: 1}
+        output_rank: {type: integer, default: 0}
+        outputs:
+          type: array
+          items: {type: [object, "null"], properties: {finished_sending: {type: array}, finished_recving: {type: array}, failed_recving: {type: array}, invalid_block_ids: {type: array}, expected_finished_count: {type: integer}, kv_connector_stats: {type: [object, "null"]}, kv_connector_worker_meta: {type: [object, "null"]}}}
+    response: {type: [object, "null"], properties: {finished_sending: {type: array}, finished_recving: {type: array}, failed_recving: {type: array}, invalid_block_ids: {type: array}, expected_finished_count: {type: integer}, kv_connector_stats: {type: [object, "null"]}, kv_connector_worker_meta: {type: [object, "null"]}}}
+    behavior:
+      - if: "input.outputs[has(input.output_rank) ? input.output_rank : 0] == null"
+        then:
+          - title: No output from the output rank
+            source: "vllm/distributed/kv_transfer/kv_connector/utils.py:82-83"
+            return: null
+      - set:
+          vars.live: "= input.outputs.filter(o, o != null)"
+          vars.base: "= state.expected > 0 ? state.expected : (has(input.world_size) ? input.world_size : 1)"
+      - set:
+          vars.ups: "= vars.live.filter(o, has(o.expected_finished_count) && o.expected_finished_count > 0).map(o, o.expected_finished_count)"
+      - title: "A worker's positive expected_finished_count replaces the aggregator's"
+        source: "vllm/distributed/kv_transfer/kv_connector/utils.py:113-124"
+        set:
+          vars.expected: "= size(vars.ups) > 0 ? vars.ups[size(vars.ups) - 1] : vars.base"
+          vars.sends: "= vars.live.filter(o, has(o.finished_sending)).map(o, o.finished_sending).flatten()"
+          vars.recvs: "= vars.live.filter(o, has(o.finished_recving)).map(o, o.finished_recving).flatten()"
+      - title: update_finished_set counts each report down from expected_finished_count
+        source: "vllm/distributed/kv_transfer/kv_connector/utils.py:87-99"
+        set:
+          vars.send_left: "= vars.sends.distinct().transformMapEntry(i, r, {r: (r in state.send_remaining ? state.send_remaining[r] : vars.expected) - vars.sends.filter(x, x == r).size()})"
+          vars.recv_left: "= vars.recvs.distinct().transformMapEntry(i, r, {r: (r in state.recv_remaining ? state.recv_remaining[r] : vars.expected) - vars.recvs.filter(x, x == r).size()})"
+      - set:
+          vars.fin_send: "= vars.send_left.filter(r, vars.send_left[r] <= 0)"
+          vars.fin_recv: "= vars.recv_left.filter(r, vars.recv_left[r] <= 0)"
+          vars.failed_all: "= state.failed_pending + vars.live.filter(o, has(o.failed_recving)).map(o, o.failed_recving).flatten()"
+          vars.stats: null
+          vars.meta: null
+      - title: "Connector stats: the first worker's object is the accumulator; NixlKVConnectorStats.aggregate appends the others' non-empty lists"
+        source: "vllm/distributed/kv_transfer/kv_connector/utils.py:132-142"
+        foreach: "= vars.live.filter(o, has(o.kv_connector_stats) && o.kv_connector_stats != null).map(o, o.kv_connector_stats)"
+        as: st
+        steps:
+          - set:
+              vars.stats: "= vars.stats == null ? vars.st : vars.stats.transformMapEntry(k, v, {k: v + (k in vars.st ? vars.st[k] : [])})"
+      - title: "Worker metadata: the first worker's object is the accumulator, folded with each later one by its aggregate()"
+        source: "vllm/distributed/kv_transfer/kv_connector/utils.py:143-152"
+        foreach: "= vars.live.filter(o, has(o.kv_connector_worker_meta) && o.kv_connector_worker_meta != null).map(o, o.kv_connector_worker_meta)"
+        as: wm
+        steps:
+          - if: "vars.meta == null"
+            then:
+              - set: {vars.meta: "= vars.wm"}
+            else:
+              - title: "OffloadingWorkerMetadata.aggregate (the only worker metadata modeled)"
+                source: "vllm/distributed/kv_transfer/kv_connector/utils.py:148-152"
+                call: offloading-worker-metadata.aggregate
+                input: {self: "= vars.meta", other: "= vars.wm"}
+                as: ag
+              - set: {vars.meta: "= vars.ag.value"}
+      - source: "vllm/distributed/kv_transfer/kv_connector/utils.py:168-171"
+        set:
+          state.expected: "= vars.expected"
+          state.send_remaining: "= omit(merge(state.send_remaining, vars.send_left), vars.fin_send)"
+          state.recv_remaining: "= omit(merge(state.recv_remaining, vars.recv_left), vars.fin_recv)"
+          state.failed_pending: "= vars.failed_all.filter(r, !(r in vars.fin_recv))"
+      - source: "vllm/distributed/kv_transfer/kv_connector/utils.py:173-187"
+        return:
+          finished_sending: "= vars.fin_send"
+          finished_recving: "= vars.fin_recv"
+          failed_recving: "= vars.failed_all.filter(r, r in vars.fin_recv)"
+          invalid_block_ids: "= vars.live.filter(o, has(o.invalid_block_ids)).map(o, o.invalid_block_ids).flatten()"
+          expected_finished_count: "= vars.expected"
+          kv_connector_stats: "= vars.stats"
+          kv_connector_worker_meta: "= vars.meta"
+
+  # ---------------------------------------------------------------- MoRIIO scheduler hooks
+  - component: moriio-connector-scheduler
+    name: split-block-groups
+    kind: function
+    summary: "MoRIIOConnectorScheduler.split_block_groups: for a hybrid model, the transferable attention group's blocks plus, per Mamba group, only its running-state slot (speculative scratch slots dropped)."
+    sources: ["vllm/distributed/kv_transfer/kv_connector/v1/moriio/moriio_connector.py:1353-1375", "vllm/distributed/kv_transfer/kv_connector/utils.py:37-44"]
+    request: {type: object, required: [block_ids], properties: {block_ids: {type: array, items: {type: array, items: {type: integer}}}}}
+    response: {type: object, properties: {attn: {type: array, items: {type: integer}}, mamba: {type: array, items: {type: array, items: {type: integer}}}}}
+    errors:
+      - {code: moriio-error, status: 0, retryable: false}
+    behavior:
+      - if: "size(input.block_ids) == 0"
+        then:
+          - source: "vllm/distributed/kv_transfer/kv_connector/v1/moriio/moriio_connector.py:1362-1363"
+            return: {attn: [], mamba: []}
+      - if: "!state.has_mamba"
+        then:
+          - source: "vllm/distributed/kv_transfer/kv_connector/v1/moriio/moriio_connector.py:1364-1365"
+            fail: {code: moriio-error, status: 0, message: "Mamba block groups requested for a non-hybrid model"}
+      - title: Attention group first; each Mamba group clipped to its running-state slot
+        source: "vllm/distributed/kv_transfer/kv_connector/v1/moriio/moriio_connector.py:1366-1375"
+        return:
+          attn: "= input.block_ids[state.attn_group_ids[0]]"
+          mamba: "= state.mamba_group_ids.map(g, size(input.block_ids[g]) == 0 ? [] : input.block_ids[g].slice(0, size(input.block_ids[g]) - math.least(state.num_ssm_scratch_blocks, size(input.block_ids[g]) - 1)).slice(size(input.block_ids[g]) - math.least(state.num_ssm_scratch_blocks, size(input.block_ids[g]) - 1) - 1, size(input.block_ids[g]) - math.least(state.num_ssm_scratch_blocks, size(input.block_ids[g]) - 1)))"
+
+  - component: moriio-connector-scheduler
+    name: update-state-after-alloc
+    kind: function
+    summary: "MoRIIOConnectorScheduler.update_state_after_alloc: map request id to transfer id (synthesizing one for sidecar requests). A WRITE-mode prefill queues the blocks to save. A READ-mode decoder queues the pull into its blocks (split per hybrid group). A WRITE-mode decoder tells the prefill node, once, which blocks to write into."
+    sources: ["vllm/distributed/kv_transfer/kv_connector/v1/moriio/moriio_connector.py:917-1200"]
+    request: DistKvRequest
+    response: {type: object, properties: {kv_transfer_params: {type: [object, "null"]}, recorded: {type: boolean}}}
+    errors:
+      - {code: moriio-error, status: 0, retryable: false}
+      - {code: value-error, status: 0, retryable: false}
+    behavior:
+      - set:
+          vars.p: "= has(input.kv_transfer_params) && input.kv_transfer_params != null ? input.kv_transfer_params : {}"
+          vars.ext: "= has(input.num_external_tokens) ? input.num_external_tokens : 0"
+          vars.blocks: "= has(input.block_ids) ? input.block_ids : []"
+      - if: "size(vars.p) == 0"
+        then:
+          - source: "vllm/distributed/kv_transfer/kv_connector/v1/moriio/moriio_connector.py:954-956"
+            return: {kv_transfer_params: null, recorded: false}
+      - title: Synthesize transfer_id for sidecar requests and map it to the request
+        source: "vllm/distributed/kv_transfer/kv_connector/v1/moriio/moriio_connector.py:957-964"
+        set:
+          vars.tid: "= 'transfer_id' in vars.p ? vars.p.transfer_id : 'sidecar-' + input.request_id"
+      - set:
+          vars.p: "= merge(vars.p, {'transfer_id': vars.tid})"
+      - source: "vllm/distributed/kv_transfer/kv_connector/v1/moriio/moriio_connector.py:962"
+        call: moriio-connector-scheduler.map-request-id
+        input: {request_id: "= input.request_id", transfer_id: "= vars.tid"}
+      - if: "'do_remote_decode' in vars.p && vars.p.do_remote_decode && state.mode == 'WRITE'"
+        then:
+          - title: Prefill node in WRITE mode keeps the blocks to RDMA-write once the prefill finishes
+            source: "vllm/distributed/kv_transfer/kv_connector/v1/moriio/moriio_connector.py:964-970"
+            set:
+              state.reqs_need_save: "= merge(state.reqs_need_save, {input.request_id: vars.blocks})"
+              state.req_kv_params: "= merge(state.req_kv_params, {input.request_id: vars.p})"
+      - if: "!('do_remote_prefill' in vars.p) || !vars.p.do_remote_prefill"
+        then:
+          - return: {kv_transfer_params: "= vars.p", recorded: "= input.request_id in state.reqs_need_save"}
+      - if: "state.mode == 'READ'"
+        then:
+          - if: "!('remote_block_ids' in vars.p) || size(vars.p.remote_block_ids) == 0 || !('remote_engine_id' in vars.p)"
+            then:
+              - title: Invalid KVTransferParams; no transfer for this request
+                source: "vllm/distributed/kv_transfer/kv_connector/v1/moriio/moriio_connector.py:1077-1082"
+                return: {kv_transfer_params: "= vars.p", recorded: false}
+          - if: "state.has_mamba"
+            then:
+              - title: Hybrid READ pairs the attention and recurrent-state groups separately
+                source: "vllm/distributed/kv_transfer/kv_connector/v1/moriio/moriio_connector.py:981-995"
+                call: moriio-connector-scheduler.split-block-groups
+                input: {block_ids: "= vars.blocks"}
+                as: split
+              - if: "vars.ext > 0 && size(vars.split.value.mamba) != size(vars.p.remote_block_ids) - 1"
+                then:
+                  - source: "vllm/distributed/kv_transfer/kv_connector/v1/moriio/moriio_connector.py:992-998"
+                    fail: {code: moriio-error, status: 0, message: "= 'MoRIIO hybrid READ Mamba group count mismatch: local=' + string(size(vars.split.value.mamba)) + ', remote=' + string(size(vars.p.remote_block_ids) - 1)"}
+              - set:
+                  vars.local: "= vars.ext > 0 ? [vars.split.value.attn] + vars.split.value.mamba : [[]] + vars.split.value.mamba"
+            else:
+              - title: Attention-only; a full local hit keeps one empty list per group so the worker can notify P
+                source: "vllm/distributed/kv_transfer/kv_connector/v1/moriio/moriio_connector.py:1032-1066"
+                set:
+                  vars.local: "= vars.ext > 0 ? vars.blocks : vars.p.remote_block_ids.map(g, [])"
+          - source: "vllm/distributed/kv_transfer/kv_connector/v1/moriio/moriio_connector.py:1068-1076"
+            set:
+              state.reqs_need_recv: "= merge(state.reqs_need_recv, {input.request_id: vars.local})"
+              state.req_kv_params: "= merge(state.req_kv_params, {input.request_id: vars.p})"
+          - return: {kv_transfer_params: "= vars.p", recorded: true}
+      - title: "WRITE-mode decoder: only the owning rank notifies (is_request_leader, pinned rank, else the KV master)"
+        source: "vllm/distributed/kv_transfer/kv_connector/v1/moriio/moriio_connector.py:1121-1129"
+        set:
+          vars.notify: "= 'is_request_leader' in vars.p ? vars.p.is_request_leader : state.is_kv_master"
+      - if: "vars.notify"
+        then:
+          - if: "!('remote_host' in vars.p) || !('remote_notify_port' in vars.p)"
+            then:
+              - title: No peer address in the request id or the params
+                source: "vllm/distributed/kv_transfer/kv_connector/v1/moriio/moriio_connector.py:1140-1160"
+                fail: {code: value-error, status: 0, message: "= 'request ' + input.request_id + ': request_id has no embedded peer zmq_address and kv_transfer_params is missing remote_host / remote_notify_port'"}
+          - title: Notify the prefill node of the blocks to write (none on a full local hit)
+            source: "vllm/distributed/kv_transfer/kv_connector/v1/moriio/moriio_connector.py:1162-1166"
+            set:
+              state.notifies: "= state.notifies + [{'transfer_id': vars.tid, 'host': vars.p.remote_host, 'blocks': vars.ext > 0 && size(vars.blocks) > 0 ? vars.blocks[0] : []}]"
+      - return: {kv_transfer_params: "= vars.p", recorded: "= vars.notify"}
+
+  - component: moriio-connector-scheduler
+    name: build-connector-meta
+    kind: function
+    summary: "MoRIIOConnectorScheduler.build_connector_meta: carry the transfer-id map, every queued pull (with its saved params) and the blocks to save, then clear the queues."
+    sources: ["vllm/distributed/kv_transfer/kv_connector/v1/moriio/moriio_connector.py:1242-1320"]
+    request: {type: object, properties: {scheduled_new_reqs: {type: array}}}
+    response: {type: object, properties: {reqs_to_recv: {type: object}, reqs_to_save: {type: object}, transfer_id_to_request_id: {type: object}}}
+    behavior:
+      - title: add_new_req for every queued pull, using the params snapshot
+        source: "vllm/distributed/kv_transfer/kv_connector/v1/moriio/moriio_connector.py:1288-1295"
+        set:
+          vars.recv: "= state.reqs_need_recv.transformMapEntry(rid, b, {rid: {'local_block_ids': b, 'kv_transfer_params': rid in state.req_kv_params ? state.req_kv_params[rid] : {}}})"
+          vars.save: "= state.reqs_need_save.transformMapEntry(rid, b, {rid: {'local_block_ids': b, 'write_mode': true}})"
+      - set: {state.reqs_need_recv: {}, state.reqs_need_save: {}}
+      - return: {reqs_to_recv: "= vars.recv", reqs_to_save: "= vars.save", transfer_id_to_request_id: "= state.transfer_id_to_request_id"}
+
+  # ---------------------------------------------------------------- PP partition
+  - component: distributed-utils
+    name: get-pp-indices
+    kind: function
+    summary: "get_pp_indices: [start, end) layers of a pipeline stage. VLLM_PP_LAYER_PARTITION overrides (it must have pp_size entries summing to the layer count); otherwise layers split evenly and the remainder goes to the stages before the last."
+    sources: ["vllm/distributed/utils.py:126-169"]
+    request:
+      type: object
+      required: [num_hidden_layers, pp_rank, pp_size]
+      properties:
+        num_hidden_layers: {type: integer, examples: [32]}
+        pp_rank: {type: integer, examples: [0]}
+        pp_size: {type: integer, examples: [2]}
+        partition: {type: [string, "null"], default: null}
+    response: {type: object, properties: {start_layer: {type: integer}, end_layer: {type: integer}}}
+    errors:
+      - {code: value-error, status: 0, retryable: false}
+    behavior:
+      - if: "has(input.partition) && input.partition != null"
+        then:
+          - if: "!input.partition.split(',').all(x, x.matches('^[0-9]+$'))"
+            then:
+              - source: "vllm/distributed/utils.py:144-147"
+                fail: {code: value-error, status: 0, message: "= 'Invalid partition string: ' + input.partition"}
+          - set: {vars.parts: "= input.partition.split(',').map(x, int(x))"}
+          - if: "size(vars.parts) != input.pp_size"
+            then:
+              - source: "vllm/distributed/utils.py:148-149"
+                fail: {code: value-error, status: 0, message: "= 'len(partitions)=' + string(size(vars.parts)) + ' does not match pp_size=' + string(input.pp_size) + '.'"}
+          - if: "sum(vars.parts) != input.num_hidden_layers"
+            then:
+              - source: "vllm/distributed/utils.py:150-151"
+                fail: {code: value-error, status: 0, message: "= 'sum(partitions)=' + string(sum(vars.parts)) + ' does not match num_hidden_layers=' + string(input.num_hidden_layers) + '.'"}
+        else:
+          - title: Even split; the remainder goes to the stages just before the last
+            source: "vllm/distributed/utils.py:152-158"
+            set:
+              vars.parts: "= lists.range(input.pp_size).map(i, input.num_hidden_layers / input.pp_size + (i >= input.pp_size - 1 - input.num_hidden_layers % input.pp_size && i < input.pp_size - 1 ? 1 : 0))"
+      - source: "vllm/distributed/utils.py:166-169"
+        set:
+          vars.start: "= input.pp_rank == 0 ? 0 : sum(vars.parts.slice(0, input.pp_rank))"
+      - return: {start_layer: "= vars.start", end_layer: "= vars.start + vars.parts[input.pp_rank]"}
+
+  # ---------------------------------------------------------------- MoRIIO request-id <-> transfer-id tables
+  - component: moriio-connector-scheduler
+    name: map-request-id
+    kind: function
+    summary: "MoRIIOConnectorScheduler.map_request_id: record the request id and its stable transfer id in both lookup tables."
+    sources: ["vllm/distributed/kv_transfer/kv_connector/v1/moriio/moriio_connector.py:709-711"]
+    request: {type: object, required: [request_id, transfer_id], properties: {request_id: {type: string, examples: [rid-1]}, transfer_id: {type: string, examples: [tid-1]}}}
+    response: {type: object, properties: {mapped: {type: boolean}}}
+    behavior:
+      - call: moriio-connector-scheduler.transfer-id-to-request-id-put
+        input: {key: "= input.transfer_id", value: "= input.request_id"}
+      - call: moriio-connector-scheduler.request-id-to-transfer-id-put
+        input: {key: "= input.request_id", value: "= input.transfer_id"}
+      - return: {mapped: true}
+
+  - component: moriio-connector-scheduler
+    name: unmap-request-id
+    kind: function
+    summary: "MoRIIOConnectorScheduler.unmap_request_id: drop both entries by exact request id; if the request id was mutated after mapping, fall back to the stable transfer id; a miss only logs a warning."
+    sources: ["vllm/distributed/kv_transfer/kv_connector/v1/moriio/moriio_connector.py:713-742"]
+    request: {type: object, required: [request_id], properties: {request_id: {type: string, examples: [rid-1]}, transfer_id: {type: [string, "null"], default: null}}}
+    response: {type: object, properties: {unmapped: {type: string}}}
+    behavior:
+      - call: moriio-connector-scheduler.request-id-to-transfer-id-get
+        input: {key: "= input.request_id"}
+        as: tid
+        on_error: continue
+      - if: "vars.tid.ok"
+        then:
+          - title: Exact match clears both tables
+            source: "vllm/distributed/kv_transfer/kv_connector/v1/moriio/moriio_connector.py:717-722"
+            call: moriio-connector-scheduler.request-id-to-transfer-id-delete
+            input: {key: "= input.request_id"}
+          - call: moriio-connector-scheduler.transfer-id-to-request-id-delete
+            input: {key: "= vars.tid.value"}
+          - return: {unmapped: exact}
+      - if: "has(input.transfer_id) && input.transfer_id != null"
+        then:
+          - call: moriio-connector-scheduler.transfer-id-to-request-id-get
+            input: {key: "= input.transfer_id"}
+            as: rid
+            on_error: continue
+          - if: "vars.rid.ok"
+            then:
+              - title: The input processor mutated the request id; the transfer id finds the original
+                source: "vllm/distributed/kv_transfer/kv_connector/v1/moriio/moriio_connector.py:724-735"
+                call: moriio-connector-scheduler.request-id-to-transfer-id-delete
+                input: {key: "= vars.rid.value"}
+              - call: moriio-connector-scheduler.transfer-id-to-request-id-delete
+                input: {key: "= input.transfer_id"}
+              - return: {unmapped: transfer-id}
+      - title: Miss; warn and leave the tables alone
+        source: "vllm/distributed/kv_transfer/kv_connector/v1/moriio/moriio_connector.py:737-742"
+        return: {unmapped: miss}
+
+  - component: moriio-connector-scheduler
+    name: transfer-id-to-request-id-put
+    kind: io
+    summary: "transfer_id_to_request_id[transfer_id] = request_id"
+    sources: ["vllm/distributed/kv_transfer/kv_connector/v1/moriio/moriio_connector.py:710"]
+    request: {type: object, required: [key, value], properties: {key: {type: string}, value: {type: string}}}
+    store: {table: transfer_id_to_request_id, op: put, key: "= input.key", value: "= input.value"}
+  - component: moriio-connector-scheduler
+    name: request-id-to-transfer-id-put
+    kind: io
+    summary: "request_id_to_transfer_id[request_id] = transfer_id"
+    sources: ["vllm/distributed/kv_transfer/kv_connector/v1/moriio/moriio_connector.py:711"]
+    request: {type: object, required: [key, value], properties: {key: {type: string}, value: {type: string}}}
+    store: {table: request_id_to_transfer_id, op: put, key: "= input.key", value: "= input.value"}
+  - component: moriio-connector-scheduler
+    name: request-id-to-transfer-id-get
+    kind: io
+    summary: "request_id_to_transfer_id.get(request_id)"
+    sources: ["vllm/distributed/kv_transfer/kv_connector/v1/moriio/moriio_connector.py:717-718"]
+    request: {type: object, required: [key], properties: {key: {type: string}}}
+    errors:
+      - {code: not_found, status: 404, retryable: false}
+    store: {table: request_id_to_transfer_id, op: get, key: "= input.key"}
+  - component: moriio-connector-scheduler
+    name: transfer-id-to-request-id-get
+    kind: io
+    summary: "transfer_id_to_request_id.get(transfer_id)"
+    sources: ["vllm/distributed/kv_transfer/kv_connector/v1/moriio/moriio_connector.py:725-726"]
+    request: {type: object, required: [key], properties: {key: {type: string}}}
+    errors:
+      - {code: not_found, status: 404, retryable: false}
+    store: {table: transfer_id_to_request_id, op: get, key: "= input.key"}
+  - component: moriio-connector-scheduler
+    name: request-id-to-transfer-id-delete
+    kind: io
+    summary: "del request_id_to_transfer_id[request_id]"
+    sources: ["vllm/distributed/kv_transfer/kv_connector/v1/moriio/moriio_connector.py:719"]
+    request: {type: object, required: [key], properties: {key: {type: string}}}
+    store: {table: request_id_to_transfer_id, op: delete, key: "= input.key"}
+  - component: moriio-connector-scheduler
+    name: transfer-id-to-request-id-delete
+    kind: io
+    summary: "del transfer_id_to_request_id[transfer_id]"
+    sources: ["vllm/distributed/kv_transfer/kv_connector/v1/moriio/moriio_connector.py:720-721"]
+    request: {type: object, required: [key], properties: {key: {type: string}}}
+    store: {table: transfer_id_to_request_id, op: delete, key: "= input.key"}
+
+flows:
+  - id: distributed-nixl-start-load
+    name: Decode worker starts the NIXL READs for this step
+    tags: ["feature:disaggregated-prefill", writes]
+    entry: {caller: gpu-worker, interface: nixl-pull-connector-worker.start-load-kv, input: {metadata: {}}}
+    sources: ["vllm/distributed/kv_transfer/kv_connector/v1/nixl/pull_worker.py:47-123"]
+  - id: distributed-nixl-get-finished
+    name: Decode worker reports finished receives
+    tags: ["feature:disaggregated-prefill"]
+    entry: {caller: gpu-worker, interface: nixl-pull-connector-worker.get-finished}
+    sources: ["vllm/distributed/kv_transfer/kv_connector/v1/nixl/base_worker.py:2994-2997"]
+  - id: distributed-kv-output-aggregate
+    name: Executor aggregates the workers' KV connector outputs
+    tags: ["feature:disaggregated-prefill"]
+    entry: {caller: engine-core, interface: kv-output-aggregator.aggregate, input: {world_size: 1, outputs: [{}]}}
+    sources: ["vllm/distributed/kv_transfer/kv_connector/utils.py:79-196"]
+  - id: distributed-moriio-split-block-groups
+    name: MoRIIO hybrid block-group split
+    entry: {caller: engine-core, interface: moriio-connector-scheduler.split-block-groups, input: {block_ids: [[1, 2], [99]]}}
+    sources: ["vllm/distributed/kv_transfer/kv_connector/v1/moriio/moriio_connector.py:1353-1375"]
+  - id: distributed-moriio-unmap
+    name: MoRIIO request/transfer id unmap
+    tags: [writes]
+    entry: {caller: engine-core, interface: moriio-connector-scheduler.unmap-request-id, input: {request_id: rid-1}}
+    sources: ["vllm/distributed/kv_transfer/kv_connector/v1/moriio/moriio_connector.py:713-742"]
+  - id: distributed-pp-indices
+    name: Pipeline-stage layer range
+    entry: {caller: gpu-worker, interface: distributed-utils.get-pp-indices, input: {num_hidden_layers: 32, pp_rank: 0, pp_size: 2}}
+    sources: ["vllm/distributed/utils.py:126-169"]
+
+scenarios:
+  - id: distributed-pd-nixl-end-to-end
+    name: "Disaggregated prefill with NIXL: the prefill node keeps the blocks, the decoder pulls them, and the executor reports the receive finished"
+    description: >-
+      The prefill engine finishes the prompt and returns pull parameters (request_finished). The proxy
+      forwards them to the decode engine, whose scheduler asks the connector for external tokens,
+      allocates, records the pull and builds the step's NixlConnectorMetadata. The decode worker
+      handshakes with the prefill engine and READs the blocks; get_finished and the executor's
+      KVOutputAggregator then report the receive finished, which lets the scheduler resume the
+      request. One nixl-pull-connector-scheduler component plays both engines' scheduler roles here.
+    flow: distributed-kv-match
+    fixtures: [tp1-llama-8b, distributed-seed]
+    config: {kv-connector: NixlConnector, kv-role: kv_both}
+    steps:
+      - {flow: distributed-kv-finished, as: pfin, input: {request_id: chatcmpl-pd1, status: FINISHED_LENGTH_CAPPED, num_computed_tokens: 40, block_ids: [[7, 8, 9]], kv_transfer_params: {do_remote_decode: true}}}
+      - {flow: distributed-kv-match, as: match, input: {request_id: chatcmpl-pd1-d, num_prompt_tokens: 40, num_computed_tokens: 0, kv_transfer_params: "= steps.pfin.result.value.kv_transfer_params"}}
+      - {flow: distributed-kv-alloc, as: alloc, input: {request_id: chatcmpl-pd1-d, num_external_tokens: 40, block_ids: [[20, 21, 22]], kv_transfer_params: "= steps.pfin.result.value.kv_transfer_params"}}
+      - {flow: distributed-kv-meta, as: meta, input: {scheduled_new_reqs: []}}
+      - {flow: distributed-kv-load, as: load, input: {metadata: "= steps.meta.result.value"}}
+      - {flow: distributed-nixl-get-finished, as: fin}
+      - {flow: distributed-kv-output-aggregate, as: agg, input: {world_size: 1, outputs: ["= steps.fin.result.value"]}}
+    expect:
+      - "steps.pfin.result.value.delay_free_blocks && steps.pfin.result.value.kv_transfer_params.remote_block_ids == [[7, 8, 9]]"
+      - "steps.match.result.value.num_external_tokens == 40 && steps.match.result.value.load_async"
+      - "steps.meta.result.value.reqs_to_recv['chatcmpl-pd1-d'].local_block_ids == [[20, 21, 22]] && steps.meta.result.value.reqs_to_recv['chatcmpl-pd1-d'].remote.block_ids == [[7, 8, 9]] && steps.meta.result.value.reqs_to_recv['chatcmpl-pd1-d'].awaiting_kvs"
+      - "'chatcmpl-pd1' in steps.meta.result.value.reqs_to_send && size(state['nixl-pull-connector-scheduler'].reqs_need_recv) == 0"
+      - "steps.load.result.value.loaded == 1 && calls['nixl-agent.handshake'] == 1 && calls['nixl-agent.read-blocks'] == 1"
+      - "steps.agg.result.value.finished_recving == ['chatcmpl-pd1-d']"
+  - id: distributed-pd-nixl-read-fails
+    name: A failed READ finishes the receive as failed and reports its blocks invalid
+    flow: distributed-nixl-start-load
+    fixtures: [tp1-llama-8b]
+    faults:
+      - {target: nixl-agent.read-blocks, type: error, code: nixl-xfer-error}
+    steps:
+      - {flow: distributed-nixl-start-load, as: load, input: {metadata: {reqs_to_recv: {chatcmpl-f1: {local_block_ids: [[3, 4]], awaiting_kvs: true, remote: {block_ids: [[1, 2]], engine_id: engine-p0, request_id: chatcmpl-f1-p, host: "10.0.0.1", port: 5600}}}}}}
+      - {flow: distributed-nixl-get-finished, as: fin}
+    expect:
+      - "steps.fin.result.value.failed_recving == ['chatcmpl-f1'] && steps.fin.result.value.invalid_block_ids == [3, 4]"
+      - "'engine-p0' in state['nixl-pull-connector-worker@rank0'].remote_agents"
+  - id: distributed-pd-nixl-handshake-fails-then-bad-engine
+    name: A failed handshake fails the receive and marks the engine invalid; the next request to it fails at once
+    flow: distributed-nixl-start-load
+    fixtures: [tp1-llama-8b]
+    faults:
+      - {target: nixl-agent.handshake, type: error, code: handshake-error}
+    steps:
+      - {flow: distributed-nixl-start-load, as: a, input: {metadata: {reqs_to_recv: {r1: {local_block_ids: [[3]], awaiting_kvs: true, remote: {block_ids: [[1]], engine_id: engine-bad, request_id: p1, host: h, port: 1}}}}}}
+      - {flow: distributed-nixl-start-load, as: b, input: {metadata: {reqs_to_recv: {r2: {local_block_ids: [[4]], awaiting_kvs: true, remote: {block_ids: [[2]], engine_id: engine-bad, request_id: p2, host: h, port: 1}}}}}}
+      - {flow: distributed-nixl-get-finished, as: fin}
+    expect:
+      - "calls['nixl-agent.handshake'] == 1 && calls['nixl-agent.read-blocks'] == 0"
+      - "steps.fin.result.value.failed_recving == ['r1', 'r2'] && state['nixl-pull-connector-worker@rank0'].invalid_remote_engines == ['engine-bad']"
+  - id: distributed-pd-nixl-full-local-hit-notify-only
+    flow: distributed-nixl-start-load
+    fixtures: [tp1-llama-8b]
+    state:
+      nixl-pull-connector-worker: {remote_agents: [engine-p0]}
+    input: {metadata: {reqs_to_recv: {r3: {local_block_ids: [[]], awaiting_kvs: false, remote: {block_ids: [[5]], engine_id: engine-p0, request_id: p3, host: h, port: 1}}}, reqs_in_batch: [r9, r8], reqs_not_processed: [r8], reqs_to_send: {r9: 1}}}
+    expect:
+      - "result.value.started == 0 && calls['nixl-agent.send-notif'] == 1 && calls['nixl-agent.read-blocks'] == 0"
+      - "state['nixl-pull-connector-worker@rank0'].reqs_to_process == ['r9'] && 'r9' in state['nixl-pull-connector-worker@rank0'].reqs_to_send"
+  - id: distributed-pd-prefill-sends-finish
+    name: On the prefill worker, a read notification or an expired lease releases the blocks
+    flow: distributed-nixl-get-finished
+    fixtures: [tp1-llama-8b]
+    state:
+      nixl-pull-connector-worker: {reqs_to_send: {p-read: 99999999999999999, p-expired: 0, p-wait: 99999999999999999}, read_notifs: [p-read]}
+    steps:
+      - {flow: distributed-nixl-get-finished, as: f}
+      - {flow: distributed-kv-output-aggregate, as: agg, input: {world_size: 1, outputs: ["= steps.f.result.value"]}}
+    expect:
+      - "steps.f.result.value.finished_sending == ['p-expired', 'p-read'] || steps.f.result.value.finished_sending == ['p-read', 'p-expired']"
+      - "size(steps.agg.result.value.finished_sending) == 2 && state['nixl-pull-connector-worker@rank0'].reqs_to_send.size() == 1"
+  - id: distributed-kv-aggregate-waits-for-all-ranks
+    name: With 4 workers, a receive counts as finished only after all four reported it
+    flow: distributed-kv-output-aggregate
+    fixtures: [tp1-llama-8b]
+    steps:
+      - {flow: distributed-kv-output-aggregate, as: a, input: {world_size: 4, outputs: [{finished_recving: [r1]}, {finished_recving: [r1]}, {}, {finished_recving: [r1], failed_recving: [r1], invalid_block_ids: [5]}]}}
+      - {flow: distributed-kv-output-aggregate, as: b, input: {world_size: 4, outputs: [{}, {}, {finished_recving: [r1]}, {}]}}
+      - {flow: distributed-kv-output-aggregate, as: c, input: {world_size: 4, outputs: [null, {}, {}, {}]}}
+    expect:
+      - "size(steps.a.result.value.finished_recving) == 0 && steps.a.result.value.invalid_block_ids == [5]"
+      - "steps.b.result.value.finished_recving == ['r1'] && steps.b.result.value.failed_recving == ['r1']"
+      - "steps.c.result.value == null && size(state['kv-output-aggregator'].recv_remaining) == 0"
+  - id: distributed-kv-aggregate-folds-stats-and-meta
+    name: Worker stats and offloading metadata fold into the output rank's KVConnectorOutput; a worker can change the expected count
+    flow: distributed-kv-output-aggregate
+    fixtures: [tp1-llama-8b]
+    steps:
+      - flow: distributed-kv-output-aggregate
+        as: a
+        input:
+          world_size: 2
+          outputs:
+            - {kv_connector_stats: {num_failed_transfers: [1], num_kv_expired_reqs: []}, kv_connector_worker_meta: {completed_jobs: {"42": 1, "7": 1}}}
+            - {kv_connector_stats: {num_failed_transfers: [], num_kv_expired_reqs: [1]}, kv_connector_worker_meta: {completed_jobs: {"42": 1}}}
+      - {flow: distributed-kv-output-aggregate, as: b, input: {world_size: 2, outputs: [{finished_sending: [s1], expected_finished_count: 1}, {}]}}
+    expect:
+      - "steps.a.result.value.kv_connector_worker_meta.completed_jobs == {'42': 2, '7': 1}"
+      - "steps.a.result.value.kv_connector_stats == {'num_failed_transfers': [1], 'num_kv_expired_reqs': [1]} && steps.a.result.value.expected_finished_count == 2"
+      - "steps.b.result.value.finished_sending == ['s1'] && steps.b.result.value.expected_finished_count == 1 && state['kv-output-aggregator'].expected == 1"
+  - id: distributed-nixl-turn2-deadline-gate
+    name: "Bidirectional mode: a turn-2 READ whose deadline is past or within the 5 s margin (after the clock offset) is declined and counted as expired; far, missing and full-hit cases read or notify as usual"
+    flow: distributed-nixl-start-load
+    fixtures: [tp1-llama-8b]
+    state:
+      nixl-pull-connector-worker: {remote_agents: [remote-engine, remote-2], bidirectional_kv_xfer: true, engine_clock_offset: {remote-engine: 0.0, remote-2: 1.0e12}}
+    steps:
+      - flow: distributed-nixl-start-load
+        as: load
+        input:
+          metadata:
+            reqs_to_recv:
+              expired: {awaiting_kvs: true, local_block_ids: [[10, 11]], remote: {block_ids: [[20, 21]], engine_id: remote-engine, request_id: d-1, host: localhost, port: 1234, blocks_expiry_time: 0.0}}
+              far: {awaiting_kvs: true, local_block_ids: [[12]], remote: {block_ids: [[22]], engine_id: remote-engine, request_id: d-2, host: localhost, port: 1234, blocks_expiry_time: 1.0e12}}
+              offset: {awaiting_kvs: true, local_block_ids: [[13]], remote: {block_ids: [[23]], engine_id: remote-2, request_id: d-3, host: localhost, port: 1235, blocks_expiry_time: 1.0e12}}
+              nodeadline: {awaiting_kvs: true, local_block_ids: [[14]], remote: {block_ids: [[24]], engine_id: remote-engine, request_id: d-4, host: localhost, port: 1234}}
+              fullhit: {awaiting_kvs: false, local_block_ids: [], remote: {block_ids: [[25]], engine_id: remote-engine, request_id: d-5, host: localhost, port: 1234, blocks_expiry_time: 0.0}}
+      - flow: distributed-nixl-get-finished
+        as: fin
+      - {interface: nixl-pull-connector-worker.get-kv-connector-stats, caller: gpu-worker, as: st}
+    expect:
+      - "steps.load.result.value.started == 2"
+      - "['expired', 'offset', 'far', 'nodeadline'].all(r, r in steps.fin.result.value.finished_recving) && steps.fin.result.value.failed_recving.sort() == ['expired', 'offset']"
+      - "steps.st.result.value.num_kv_expired_reqs == [1, 1] && size(steps.st.result.value.num_failed_transfers) == 0"
+      - "size(state['nixl-pull-connector-worker@rank0'].recving) == 0"
+  - id: distributed-oracle-moriio-split-block-groups
+    name: "test_moriio_hma_scheduler.py::test_split_block_groups_separates_attention_and_mamba"
+    description: "A hybrid scheduler (attention group 0, Mamba group 1) splits ([1, 2], [99]) into attention [1, 2] and Mamba [[99]]."
+    flow: distributed-moriio-split-block-groups
+    fixtures: [tp1-llama-8b]
+    state:
+      moriio-connector-scheduler: {has_mamba: true, attn_group_ids: [0], mamba_group_ids: [1]}
+    expect:
+      - "result.ok && result.value.attn == [1, 2] && result.value.mamba == [[99]]"
+  - id: distributed-moriio-split-scratch-and-errors
+    flow: distributed-moriio-split-block-groups
+    fixtures: [tp1-llama-8b]
+    state:
+      moriio-connector-scheduler: {has_mamba: true, attn_group_ids: [0], mamba_group_ids: [1], num_ssm_scratch_blocks: 2}
+    steps:
+      - {flow: distributed-moriio-split-block-groups, as: scratch, input: {block_ids: [[1, 2, 3], [40, 41, 42, 43]]}}
+      - {flow: distributed-moriio-split-block-groups, as: empty, input: {block_ids: []}}
+    expect:
+      - "steps.scratch.result.value.mamba == [[41]] && steps.empty.result.value.attn == []"
+  - id: distributed-moriio-split-not-hybrid
+    flow: distributed-moriio-split-block-groups
+    fixtures: [tp1-llama-8b]
+    expect:
+      - "!result.ok && result.error.code == 'moriio-error' && !state['moriio-connector-scheduler'].has_mamba"
+  - id: distributed-moriio-read-mode-hybrid-pull
+    name: A hybrid READ-mode decoder queues the attention blocks plus each Mamba running-state slot, and the metadata carries them
+    flow: distributed-kv-alloc
+    fixtures: [tp1-llama-8b]
+    config: {kv-connector: MoRIIOConnector, kv-role: kv_consumer}
+    state:
+      moriio-connector-scheduler: {mode: READ, has_mamba: true, attn_group_ids: [0], mamba_group_ids: [1]}
+    steps:
+      - {flow: distributed-kv-alloc, as: a, input: {request_id: chatcmpl-m1, num_external_tokens: 32, block_ids: [[1, 2], [99]], kv_transfer_params: {do_remote_prefill: true, transfer_id: x1, remote_engine_id: e0, remote_block_ids: [[5, 6], [7]]}}}
+      - {flow: distributed-kv-meta, as: m}
+    expect:
+      - "steps.a.result.value.recorded && steps.m.result.value.reqs_to_recv['chatcmpl-m1'].local_block_ids == [[1, 2], [99]]"
+      - "state['moriio-connector-scheduler'].transfer_id_to_request_id.x1 == 'chatcmpl-m1' && size(state['moriio-connector-scheduler'].reqs_need_recv) == 0"
+  - id: distributed-moriio-read-mode-branches
+    flow: distributed-kv-alloc
+    fixtures: [tp1-llama-8b]
+    config: {kv-connector: MoRIIOConnector}
+    state:
+      moriio-connector-scheduler: {mode: READ}
+    steps:
+      - {flow: distributed-kv-alloc, as: full, input: {request_id: r-full, num_external_tokens: 0, block_ids: [[1]], kv_transfer_params: {do_remote_prefill: true, remote_engine_id: e0, remote_block_ids: [[5]]}}}
+      - {flow: distributed-kv-alloc, as: bad, input: {request_id: r-bad, num_external_tokens: 16, block_ids: [[1]], kv_transfer_params: {do_remote_prefill: true, remote_block_ids: [[5]]}}}
+      - {flow: distributed-kv-alloc, as: none, input: {request_id: r-none, kv_transfer_params: null}}
+    expect:
+      - "state['moriio-connector-scheduler'].reqs_need_recv['r-full'] == [[]] && state['moriio-connector-scheduler'].transfer_id_to_request_id['sidecar-r-full'] == 'r-full'"
+      - "!steps.bad.result.value.recorded && !steps.none.result.value.recorded"
+  - id: distributed-moriio-hybrid-group-mismatch
+    flow: distributed-kv-alloc
+    fixtures: [tp1-llama-8b]
+    config: {kv-connector: MoRIIOConnector}
+    state:
+      moriio-connector-scheduler: {mode: READ, has_mamba: true, attn_group_ids: [0], mamba_group_ids: [1]}
+    input: {request_id: r-mm, num_external_tokens: 16, block_ids: [[1], [9]], kv_transfer_params: {do_remote_prefill: true, remote_engine_id: e0, remote_block_ids: [[5]]}}
+    expect:
+      - "!result.ok && result.error.code == 'moriio-error' && size(state['moriio-connector-scheduler'].reqs_need_recv) == 0"
+  - id: distributed-moriio-hybrid-full-local-hit
+    flow: distributed-kv-alloc
+    fixtures: [tp1-llama-8b]
+    config: {kv-connector: MoRIIOConnector}
+    state:
+      moriio-connector-scheduler: {mode: READ, has_mamba: true, attn_group_ids: [0], mamba_group_ids: [1]}
+    input: {request_id: r-hit, num_external_tokens: 0, block_ids: [[1, 2], [99]], kv_transfer_params: {do_remote_prefill: true, remote_engine_id: e0, remote_block_ids: [[5], [7]]}}
+    expect:
+      - "result.ok && state['moriio-connector-scheduler'].reqs_need_recv['r-hit'] == [[], [99]]"
+  - id: distributed-moriio-write-mode-notify-and-save
+    name: In WRITE mode the decoder notifies the prefill node of its blocks, and the prefill node queues its blocks to save
+    flow: distributed-kv-alloc
+    fixtures: [tp1-llama-8b]
+    config: {kv-connector: MoRIIOConnector}
+    steps:
+      - {flow: distributed-kv-alloc, as: d, input: {request_id: r-d, num_external_tokens: 32, block_ids: [[11, 12]], kv_transfer_params: {do_remote_prefill: true, transfer_id: xw, remote_host: "10.0.0.1", remote_notify_port: 6002}}}
+      - {flow: distributed-kv-alloc, as: nolead, input: {request_id: r-n, num_external_tokens: 32, block_ids: [[13]], kv_transfer_params: {do_remote_prefill: true, is_request_leader: false}}}
+      - {flow: distributed-kv-alloc, as: noaddr, input: {request_id: r-x, num_external_tokens: 32, block_ids: [[14]], kv_transfer_params: {do_remote_prefill: true}}}
+      - {flow: distributed-kv-alloc, as: p, input: {request_id: r-p, block_ids: [[3, 4]], kv_transfer_params: {do_remote_decode: true, transfer_id: xp}}}
+      - {flow: distributed-kv-meta, as: m}
+    expect:
+      - "state['moriio-connector-scheduler'].notifies == [{'transfer_id': 'xw', 'host': '10.0.0.1', 'blocks': [11, 12]}]"
+      - "!steps.nolead.result.value.recorded && !steps.noaddr.result.ok && steps.noaddr.result.error.code == 'value-error'"
+      - "steps.p.result.value.recorded && steps.m.result.value.reqs_to_save['r-p'].local_block_ids == [[3, 4]]"
+  - id: distributed-nixl-meta-host-buffer
+    flow: distributed-kv-meta
+    fixtures: [tp1-llama-8b]
+    config: {kv-connector: NixlConnector}
+    state:
+      nixl-pull-connector-scheduler: {use_host_buffer: true, reqs_need_save: {r-s: true}, reqs_in_batch: [r-s]}
+    expect:
+      - "result.value.reqs_to_save == {'r-s': true} && result.value.reqs_in_batch == ['r-s']"
+      - "size(state['nixl-pull-connector-scheduler'].reqs_need_save) == 0 && size(state['nixl-pull-connector-scheduler'].reqs_in_batch) == 0"
+  - id: distributed-pp-indices-cases
+    name: "get_pp_indices: even, uneven (remainder before the last stage) and overridden partitions"
+    flow: distributed-pp-indices
+    fixtures: [tp1-llama-8b]
+    steps:
+      - {flow: distributed-pp-indices, as: even0}
+      - {flow: distributed-pp-indices, as: even1, input: {pp_rank: 1}}
+      - {flow: distributed-pp-indices, as: un2, input: {num_hidden_layers: 10, pp_size: 4, pp_rank: 2}}
+      - {flow: distributed-pp-indices, as: un3, input: {num_hidden_layers: 10, pp_size: 4, pp_rank: 3}}
+      - {flow: distributed-pp-indices, as: ovr, input: {num_hidden_layers: 32, pp_size: 2, pp_rank: 1, partition: "20,12"}}
+      - {flow: distributed-pp-indices, as: bad, input: {num_hidden_layers: 32, pp_size: 2, pp_rank: 1, partition: "a,b"}}
+      - {flow: distributed-pp-indices, as: cnt, input: {num_hidden_layers: 32, pp_size: 2, pp_rank: 1, partition: "32"}}
+      - {flow: distributed-pp-indices, as: sum, input: {num_hidden_layers: 32, pp_size: 2, pp_rank: 1, partition: "10,10"}}
+    expect:
+      - "steps.even0.result.value == {'start_layer': 0, 'end_layer': 16} && steps.even1.result.value == {'start_layer': 16, 'end_layer': 32}"
+      - "steps.un2.result.value == {'start_layer': 5, 'end_layer': 8} && steps.un3.result.value == {'start_layer': 8, 'end_layer': 10}"
+      - "steps.ovr.result.value == {'start_layer': 20, 'end_layer': 32}"
+      - "[steps.bad, steps.cnt, steps.sum].all(st, !st.result.ok && st.result.error.code == 'value-error')"
+  - id: distributed-moriio-map-unmap-paths
+    name: "Unmap clears both tables by exact id, falls back to the transfer id after the request id was mutated, and leaves other mappings alone on a miss"
+    flow: distributed-moriio-unmap
+    fixtures: [tp1-llama-8b]
+    steps:
+      - {interface: moriio-connector-scheduler.map-request-id, caller: engine-core, as: m1, input: {request_id: cmpl-abc-0, transfer_id: tid-42}}
+      - {flow: distributed-moriio-unmap, as: viatid, input: {request_id: cmpl-abc-0-956053a4, transfer_id: tid-42}}
+      - {interface: moriio-connector-scheduler.map-request-id, caller: engine-core, as: m2, input: {request_id: rid-1, transfer_id: tid-1}}
+      - {flow: distributed-moriio-unmap, as: miss1, input: {request_id: rid-unknown, transfer_id: {$null: true}}}
+      - {flow: distributed-moriio-unmap, as: miss2, input: {request_id: rid-unknown, transfer_id: tid-unknown}}
+      - {flow: distributed-moriio-unmap, as: exact, input: {request_id: rid-1, transfer_id: {$null: true}}}
+    expect:
+      - "steps.viatid.result.value.unmapped == 'transfer-id' && steps.miss1.result.value.unmapped == 'miss' && steps.miss2.result.value.unmapped == 'miss' && steps.exact.result.value.unmapped == 'exact'"
+      - "size(state['moriio-connector-scheduler'].request_id_to_transfer_id) == 0 && size(state['moriio-connector-scheduler'].transfer_id_to_request_id) == 0"
+

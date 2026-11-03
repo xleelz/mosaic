@@ -1,0 +1,213 @@
+# H2 (round 2). Verified: StorageProxy.shouldHint (StorageProxy.java:2442-2501) refuses when
+# Gossiper.getEndpointDowntime (Gossiper.java:541-548, nanoTime since silentlyMarkDead put the
+# endpoint in unreachableEndpoints, :1522-1531) exceeds max_hint_window 3h (conf/cassandra.yaml:80).
+# With hint_window_persistent_enabled (Config.java:117, true) it also refuses when
+# now - 3h > the oldest stored hint (:2473-2479; HintsStore.java:133-144, Long.MAX_VALUE if none).
+# The write outcome is unaffected.
+schema_version: 1
+id: cassandra
+scenarios:
+- id: bench-h2-convicted-then-past-window
+  name: 'H2 end to end: n2 goes silent, the gossip round at 20 s convicts it (phi 8.7), a write 3h+1s later is not hinted, a write inside the window is'
+  fixtures:
+  - three-node-rf3
+  state:
+    failure-detector@n1:
+      arrival_samples:
+        n3:
+          t_last_ms: 1793318419500
+          mean_ms: 1000
+  steps:
+  - flow: membership-gossip-round
+    at_ms: 20000
+    as: round
+  - flow: coordinator-write
+    input:
+      consistency: QUORUM
+      mutations:
+      - keyspace: shop
+        table: orders
+        partition_key: order:1
+        token: -4069959284402364209
+        counter: false
+        timestamp: 1793318400000000
+        columns:
+          total: 42
+    at_ms: 3600000
+    as: inside
+  - flow: coordinator-write
+    input:
+      consistency: QUORUM
+      mutations:
+      - keyspace: shop
+        table: orders
+        partition_key: order:1
+        token: -4069959284402364209
+        counter: false
+        timestamp: 1793318400000000
+        columns:
+          total: 42
+    at_ms: 10820001
+    as: past
+  expect:
+  - state['gossiper@n1'].endpoint_state_map.n2.alive == false && 'n2' in state['gossiper@n1'].unreachable_endpoints
+  - steps.inside.result.ok && steps.past.result.ok && steps.past.result.value.acks == 2
+  - trace.filter(e, e.type == 'call.start' && e.interface == 'storage-proxy.submit-hint' && 'n2' in e.input.targets).size() == 1
+  - trace.exists(e, e.type == 'call.start' && e.interface == 'storage-proxy.submit-hint' && e.t >= 3600000 && e.t < 3700000)
+  - '!trace.exists(e, e.type == ''call.start'' && e.interface == ''storage-proxy.submit-hint'' && e.t >= 10820001)'
+- id: bench-h2-persistent-window-recent-hint
+  name: 'Persistent window: n2 down 1 min, its oldest stored hint 1 min old -> hinted'
+  fixtures:
+  - three-node-rf3
+  state:
+    gossiper@n1:
+      endpoint_state_map:
+        n2:
+          alive: false
+          down_since_ms: 1793318340000
+      live_endpoints:
+      - n3
+      unreachable_endpoints:
+      - n2
+    hints-catalog@n1:
+      stores:
+        6d194555-f6eb-41d0-c000-000000000002:
+          host_id: 6d194555-f6eb-41d0-c000-000000000002
+    hints-store@n1:
+      hints:
+        old:
+          host_id: 6d194555-f6eb-41d0-c000-000000000002
+          size_bytes: 512
+          stage: file
+          hint:
+            gcgs: 864000
+            mutation:
+              keyspace: shop
+              table: orders
+              partition_key: order:0
+              token: -4069959284402364209
+              timestamp: 1
+              columns:
+                total: 1
+          key: old
+          creation_time: 1793318340000
+  steps:
+  - flow: coordinator-write
+    input:
+      consistency: QUORUM
+      mutations:
+      - keyspace: shop
+        table: orders
+        partition_key: order:1
+        token: -4069959284402364209
+        counter: false
+        timestamp: 1793318400000000
+        columns:
+          total: 42
+    as: w
+  expect:
+  - steps.w.result.ok
+  - trace.exists(e, e.type == 'call.start' && e.interface == 'storage-proxy.submit-hint' && 'n2' in e.input.targets)
+- id: bench-h2-persistent-window-old-hint
+  name: 'Persistent window: n2 down 1 min, but a hint for it is 3h+1s old -> not hinted'
+  fixtures:
+  - three-node-rf3
+  state:
+    gossiper@n1:
+      endpoint_state_map:
+        n2:
+          alive: false
+          down_since_ms: 1793318340000
+      live_endpoints:
+      - n3
+      unreachable_endpoints:
+      - n2
+    hints-catalog@n1:
+      stores:
+        6d194555-f6eb-41d0-c000-000000000002:
+          host_id: 6d194555-f6eb-41d0-c000-000000000002
+    hints-store@n1:
+      hints:
+        old:
+          host_id: 6d194555-f6eb-41d0-c000-000000000002
+          size_bytes: 512
+          stage: file
+          hint:
+            gcgs: 864000
+            mutation:
+              keyspace: shop
+              table: orders
+              partition_key: order:0
+              token: -4069959284402364209
+              timestamp: 1
+              columns:
+                total: 1
+          key: old
+          creation_time: 1793307599000
+  steps:
+  - flow: coordinator-write
+    input:
+      consistency: QUORUM
+      mutations:
+      - keyspace: shop
+        table: orders
+        partition_key: order:1
+        token: -4069959284402364209
+        counter: false
+        timestamp: 1793318400000000
+        columns:
+          total: 42
+    as: w
+  expect:
+  - steps.w.result.ok && steps.w.result.value.acks == 2
+  - trace.exists(e, e.type == 'call.start' && e.interface == 'hints-service.find-oldest-hint-timestamp')
+  - '!trace.exists(e, e.type == ''call.start'' && e.interface == ''storage-proxy.submit-hint'')'
+- id: bench-h2-downtime-survives-failed-echo
+  name: n2 convicted at 20 s; a newer gossip state at 1h triggers markAlive, but the echo fails; a write 3h+1s after conviction is not hinted (the unreachable clock was never reset)
+  fixtures:
+  - three-node-rf3
+  faults:
+  - target: echo-verb-handler.do-verb
+    type: error
+    code: unreachable
+    instance: n2
+  state:
+    failure-detector@n1:
+      arrival_samples:
+        n3:
+          t_last_ms: 1793318419500
+          mean_ms: 1000
+  steps:
+  - flow: membership-gossip-round
+    at_ms: 20000
+  - flow: membership-gossip-ack2
+    at_ms: 3600000
+    input:
+      from: n3
+      states:
+      - endpoint: n2
+        generation: 1793314800
+        heartbeat: 400
+        max_version: 410
+        status: NORMAL
+        tokens:
+        - 0
+    as: up
+  - flow: coordinator-write
+    input:
+      consistency: QUORUM
+      mutations:
+      - keyspace: shop
+        table: orders
+        partition_key: order:1
+        token: -4069959284402364209
+        counter: false
+        timestamp: 1793318400000000
+        columns:
+          total: 42
+    at_ms: 10820001
+    as: past
+  expect:
+  - state['gossiper@n1'].endpoint_state_map.n2.alive == false
+  - steps.past.result.ok
+  - '!trace.exists(e, e.type == ''call.start'' && e.interface == ''storage-proxy.submit-hint'')'

@@ -1,0 +1,32 @@
+schema_version: 1
+id: vllm
+scenarios:
+  - id: bench-k1
+    name: "K1 continuous batching: a new request joins the running batch next step; a finished one leaves at once"
+    fixtures: [full-tp1-llama-8b]
+    steps:
+      - {flow: scheduler-add-request, as: a1, input: {request_id: chatcmpl-r1, prompt_token_ids: [128000, 9906, 1917, 13, 3639], sampling_params: {max_tokens: 16}}}
+      - {flow: scheduler-schedule, as: s1, input: {}}
+      - {flow: scheduler-add-request, as: a2, input: {request_id: chatcmpl-r2, prompt_token_ids: [128000, 791, 6864, 315, 9822, 374, 12366], sampling_params: {max_tokens: 16}}}
+      - {flow: scheduler-schedule, as: s2, input: {}}
+      - {flow: scheduler-update-from-output, as: u1, input: {scheduler_output: "= steps.s1.result.value", model_runner_output: {req_ids: [chatcmpl-r1], sampled_token_ids: [[791]]}}}
+      - {flow: scheduler-update-from-output, as: u2, input: {scheduler_output: "= steps.s2.result.value", model_runner_output: {req_ids: [chatcmpl-r1, chatcmpl-r2], sampled_token_ids: [[128009], [40]]}}}
+      - {flow: scheduler-schedule, as: s3, input: {}}
+    expect:
+      # step 1: only r1, a full prefill
+      - "steps.s1.result.value.num_scheduled_tokens == {'chatcmpl-r1': 5}"
+      # step 2: r1 decodes (a RUNNING, cached req) and r2 joins as a new req in the same batch
+      - "steps.s2.result.value.num_scheduled_tokens == {'chatcmpl-r1': 1, 'chatcmpl-r2': 7}"
+      - "steps.s2.result.value.scheduled_cached_reqs.req_ids == ['chatcmpl-r1'] && steps.s2.result.value.scheduled_new_reqs.map(r, r.req_id) == ['chatcmpl-r2']"
+      # r1 stops on EOS: it is freed in update_from_output, before any later step
+      - "steps.u2.result.value.outputs.exists(o, o.request_id == 'chatcmpl-r1' && o.finish_reason == 'stop')"
+      - "steps.u2.result.value.outputs.exists(o, o.request_id == 'chatcmpl-r2' && o.finish_reason == null)"
+      # step 3: r2 keeps decoding alone; r1 reported finished
+      - "steps.s3.result.value.num_scheduled_tokens == {'chatcmpl-r2': 1}"
+      - "steps.s3.result.value.finished_req_ids == ['chatcmpl-r1']"
+      - "state.scheduler.running == ['chatcmpl-r2'] && !('chatcmpl-r1' in state.scheduler.requests)"
+      - "!('chatcmpl-r1' in state['full-attention-manager'].req_to_blocks)"
+      # path: the running pass is the first visit of r1 in s2, then the waiting admission of r2
+      - "trace.filter(e, e.type == 'call.start' && e.interface == 'kv-cache-manager.allocate-slots').map(e, [e.input.request_id, e.input.status, e.input.num_new_tokens]) == [['chatcmpl-r1', 'WAITING', 5], ['chatcmpl-r1', 'RUNNING', 1], ['chatcmpl-r2', 'WAITING', 7], ['chatcmpl-r2', 'RUNNING', 1]]"
+      - "trace.filter(e, e.type == 'call.start' && e.interface == 'kv-cache-manager.free').map(e, e.input.request_id) == ['chatcmpl-r1']"
+      - "calls['scheduler.preempt-request'] == 0"

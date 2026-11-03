@@ -1,0 +1,2089 @@
+  # ===================================================== round 4: encoder cache
+  - component: encoder-cache-manager
+    name: init
+    kind: function
+    latency_ms: 0
+    summary: "Create the cache with cache_size embedding slots, all free."
+    sources: ["vllm/v1/core/encoder_cache_manager.py:72-92"]
+    request: {type: object, required: [cache_size], properties: {cache_size: {type: integer, examples: [20]}}}
+    response: {type: object, properties: {cache_size: {type: integer}}}
+    behavior:
+      - title: create_manager(cache_size) - every slot free, nothing cached
+        source: "vllm/v1/core/encoder_cache_manager.py:78-92"
+        set:
+          state.cache_size: "= input.cache_size"
+          state.num_free_slots: "= input.cache_size"
+          state.num_freeable_slots: "= input.cache_size"
+          state.cached: {}
+          state.num_embeds_by_hash: {}
+          state.request_cached_ids: {}
+          state.freeable: []
+          state.freed: []
+      - return: {cache_size: "= input.cache_size"}
+
+  - component: encoder-cache-manager
+    name: check-and-update-cache
+    kind: function
+    latency_ms: 0
+    summary: "Is this input's embedding cached? If so the request takes a reference; an entry nobody referenced leaves the freeable list."
+    sources: ["vllm/v1/core/encoder_cache_manager.py:108-136"]
+    request:
+      type: object
+      required: [request_id, input_id, mm_hash]
+      properties:
+        request_id: {type: string, examples: [chatcmpl-abc123]}
+        input_id: {type: integer, examples: [0]}
+        mm_hash: {type: string, examples: [img1]}
+    response: {type: object, properties: {cached: {type: boolean}}}
+    behavior:
+      - if: "!(input.mm_hash in state.cached)"
+        then:
+          - title: Not cached
+            source: "vllm/v1/core/encoder_cache_manager.py:126-127"
+            return: {cached: false}
+      - if: "size(state.cached[input.mm_hash]) == 0"
+        then:
+          - title: Unreferenced entry - reclaim it from the freeable list
+            source: "vllm/v1/core/encoder_cache_manager.py:130-132"
+            set:
+              state.num_freeable_slots: "= state.num_freeable_slots - state.freeable.filter(f, f.mm_hash == input.mm_hash).map(f, f.num_embeds)[0]"
+              state.freeable: "= state.freeable.filter(f, f.mm_hash != input.mm_hash)"
+      - title: Add the request's reference
+        source: "vllm/v1/core/encoder_cache_manager.py:134-136"
+        set:
+          state.cached: "= merge(state.cached, {input.mm_hash: state.cached[input.mm_hash].filter(r, r != input.request_id) + [input.request_id]})"
+          state.request_cached_ids: "= merge(state.request_cached_ids, {input.request_id: (input.request_id in state.request_cached_ids ? state.request_cached_ids[input.request_id].filter(i, i != input.input_id) : []) + [input.input_id]})"
+      - return: {cached: true}
+
+  - component: encoder-cache-manager
+    name: can-allocate
+    kind: function
+    latency_ms: 0
+    summary: "Is there room for this input's embeddings (plus those already scheduled this step)? Evicts unreferenced entries oldest first when free slots alone are short."
+    sources: ["vllm/v1/core/encoder_cache_manager.py:145-206", "vllm/v1/request.py:333-335"]
+    request:
+      type: object
+      required: [request_id, input_id, num_embeds, encoder_compute_budget]
+      properties:
+        request_id: {type: string, examples: [chatcmpl-abc123]}
+        input_id: {type: integer, examples: [0]}
+        num_embeds: {type: integer, examples: [10], description: "request.get_num_encoder_embeds(input_id): the placeholder's embedding count."}
+        encoder_compute_budget: {type: integer, examples: [2048]}
+        num_embeds_to_schedule: {type: integer, default: 0}
+    response: {type: object, properties: {can_allocate: {type: boolean}, evicted: {type: array, items: {type: string}}}}
+    behavior:
+      - if: "input.num_embeds > input.encoder_compute_budget"
+        then:
+          - title: Over this step's encoder compute budget
+            source: "vllm/v1/core/encoder_cache_manager.py:184-185"
+            return: {can_allocate: false, evicted: []}
+      - set:
+          vars.need: "= input.num_embeds + (has(input.num_embeds_to_schedule) ? input.num_embeds_to_schedule : 0)"
+      - if: "vars.need <= state.num_free_slots"
+        then:
+          - title: Fits in the free slots
+            source: "vllm/v1/core/encoder_cache_manager.py:190-191"
+            return: {can_allocate: true, evicted: []}
+      - if: "vars.need > state.num_freeable_slots"
+        then:
+          - title: Not even after reclaiming every unreferenced entry
+            source: "vllm/v1/core/encoder_cache_manager.py:194-195"
+            return: {can_allocate: false, evicted: []}
+      - set: {vars.evicted: []}
+      - title: Evict unreferenced entries, oldest first, until it fits
+        source: "vllm/v1/core/encoder_cache_manager.py:200-206"
+        foreach: "= state.freeable"
+        as: f
+        steps:
+          - if: "vars.need <= state.num_free_slots"
+            then: [{break: true}]
+          - set:
+              state.freeable: "= state.freeable.filter(x, x.mm_hash != vars.f.mm_hash)"
+              state.cached: "= omit(state.cached, vars.f.mm_hash)"
+              state.num_embeds_by_hash: "= omit(state.num_embeds_by_hash, vars.f.mm_hash)"
+              state.freed: "= state.freed + [vars.f.mm_hash]"
+              state.num_free_slots: "= state.num_free_slots + vars.f.num_embeds"
+              vars.evicted: "= vars.evicted + [vars.f.mm_hash]"
+      - return: {can_allocate: true, evicted: "= vars.evicted"}
+
+  - component: encoder-cache-manager
+    name: allocate
+    kind: function
+    latency_ms: 0
+    summary: "Reserve slots for an input's embeddings and record the request's reference (can-allocate must have said yes)."
+    sources: ["vllm/v1/core/encoder_cache_manager.py:208-240"]
+    errors: [{code: assertion-error, status: 0, retryable: false}]
+    request:
+      type: object
+      required: [request_id, input_id, mm_hash, num_embeds]
+      properties:
+        request_id: {type: string, examples: [chatcmpl-abc123]}
+        input_id: {type: integer, examples: [0]}
+        mm_hash: {type: string, examples: [img1]}
+        num_embeds: {type: integer, examples: [10]}
+    response: {type: object, properties: {num_free_slots: {type: integer}}}
+    behavior:
+      - if: "input.mm_hash in state.num_embeds_by_hash && state.num_embeds_by_hash[input.mm_hash] != input.num_embeds"
+        then:
+          - title: The same item must always have the same embedding count
+            source: "vllm/v1/core/encoder_cache_manager.py:225-230"
+            fail: {code: assertion-error, status: 0, message: "cached_num_encoder_embeds == num_encoder_embeds"}
+      - if: "state.num_free_slots < input.num_embeds || state.num_freeable_slots < input.num_embeds"
+        then:
+          - title: Allocation without room
+            source: "vllm/v1/core/encoder_cache_manager.py:234-235"
+            fail: {code: assertion-error, status: 0, message: "self.num_free_slots >= num_encoder_embeds"}
+      - title: Reference the entry and take its slots
+        source: "vllm/v1/core/encoder_cache_manager.py:237-240"
+        set:
+          state.cached: "= merge(state.cached, {input.mm_hash: (input.mm_hash in state.cached ? state.cached[input.mm_hash].filter(r, r != input.request_id) : []) + [input.request_id]})"
+          state.num_embeds_by_hash: "= merge(state.num_embeds_by_hash, {input.mm_hash: input.num_embeds})"
+          state.request_cached_ids: "= merge(state.request_cached_ids, {input.request_id: (input.request_id in state.request_cached_ids ? state.request_cached_ids[input.request_id].filter(i, i != input.input_id) : []) + [input.input_id]})"
+          state.num_free_slots: "= state.num_free_slots - input.num_embeds"
+          state.num_freeable_slots: "= state.num_freeable_slots - input.num_embeds"
+      - return: {num_free_slots: "= state.num_free_slots"}
+
+  - component: encoder-cache-manager
+    name: free-encoder-input
+    kind: function
+    latency_ms: 0
+    summary: "Drop a request's reference to one input; an entry nobody references becomes freeable (reclaimed only when space is needed)."
+    sources: ["vllm/v1/core/encoder_cache_manager.py:246-282"]
+    request:
+      type: object
+      required: [request_id, input_id, mm_hashes]
+      properties:
+        request_id: {type: string, examples: [chatcmpl-abc123]}
+        input_id: {type: integer, examples: [0]}
+        mm_hashes: {type: array, items: {type: string}, examples: [[img1]], description: "The request's mm_features identifiers, by input id."}
+    response: {type: object, properties: {freeable: {type: boolean}}}
+    behavior:
+      - set: {vars.h: "= input.mm_hashes[input.input_id]"}
+      - if: "input.request_id in state.request_cached_ids"
+        then:
+          - title: Forget this input id for the request
+            source: "vllm/v1/core/encoder_cache_manager.py:260-263"
+            set:
+              state.request_cached_ids: "= size(state.request_cached_ids[input.request_id].filter(i, i != input.input_id)) == 0 ? omit(state.request_cached_ids, input.request_id) : merge(state.request_cached_ids, {input.request_id: state.request_cached_ids[input.request_id].filter(i, i != input.input_id)})"
+      - if: "!(vars.h in state.cached) || size(state.cached[vars.h]) == 0"
+        then: [{return: {freeable: false}}]
+      - if: "input.request_id in state.request_cached_ids && state.request_cached_ids[input.request_id].exists(i, input.mm_hashes[i] == vars.h)"
+        then:
+          - title: Another input of the same request still holds this item
+            source: "vllm/v1/core/encoder_cache_manager.py:273-277"
+            return: {freeable: false}
+      - set:
+          state.cached: "= merge(state.cached, {vars.h: state.cached[vars.h].filter(r, r != input.request_id)})"
+      - if: "size(state.cached[vars.h]) == 0"
+        then:
+          - title: Unreferenced - append to the freeable list
+            source: "vllm/v1/core/encoder_cache_manager.py:278-282"
+            set:
+              state.freeable: "= state.freeable + [{'mm_hash': vars.h, 'num_embeds': state.num_embeds_by_hash[vars.h]}]"
+              state.num_freeable_slots: "= state.num_freeable_slots + state.num_embeds_by_hash[vars.h]"
+          - return: {freeable: true}
+      - return: {freeable: false}
+
+  - component: encoder-cache-manager
+    name: get-freed-mm-hashes
+    kind: function
+    latency_ms: 0
+    summary: "Take the hashes evicted since the last call (ones re-cached meanwhile excluded), so the workers can drop those encoder outputs."
+    sources: ["vllm/v1/core/encoder_cache_manager.py:296-310"]
+    request: {type: object}
+    response: {type: object, properties: {freed: {type: array, items: {type: string}}}}
+    behavior:
+      - title: Return and clear the freed list
+        source: "vllm/v1/core/encoder_cache_manager.py:308-310"
+        set:
+          vars.out: "= state.freed.filter(h, !(h in state.cached))"
+          state.freed: []
+      - return: {freed: "= vars.out"}
+
+  - component: encoder-cache-manager
+    name: reset
+    kind: function
+    latency_ms: 0
+    summary: "Drop every cached embedding and restore full capacity (after a weight update)."
+    sources: ["vllm/v1/core/encoder_cache_manager.py:94-106"]
+    request: {type: object}
+    response: {type: object, properties: {num_free_slots: {type: integer}, num_freeable_slots: {type: integer}}}
+    behavior:
+      - title: Clear every map and restore the slot counts
+        source: "vllm/v1/core/encoder_cache_manager.py:100-106"
+        set:
+          state.cached: {}
+          state.num_embeds_by_hash: {}
+          state.request_cached_ids: {}
+          state.freeable: []
+          state.freed: []
+          state.num_free_slots: "= state.cache_size"
+          state.num_freeable_slots: "= state.cache_size"
+      - return: {num_free_slots: "= state.cache_size", num_freeable_slots: "= state.cache_size"}
+
+  - component: encoder-cache-manager
+    name: get-state
+    kind: function
+    latency_ms: 0
+    summary: "The cache's counters and maps (the attributes the scheduler and tests read)."
+    sources: ["vllm/v1/core/encoder_cache_manager.py:78-92"]
+    request: {type: object}
+    response: {type: object}
+    behavior:
+      - return: "= state"
+
+  - component: encoder-cache-manager
+    name: free
+    kind: function
+    latency_ms: 0
+    summary: "Release every input reference a finished, cancelled or aborted request holds."
+    sources: ["vllm/v1/core/encoder_cache_manager.py:284-294"]
+    request:
+      type: object
+      required: [request_id, mm_hashes]
+      properties:
+        request_id: {type: string, examples: [chatcmpl-abc123]}
+        mm_hashes: {type: array, items: {type: string}, examples: [[img1]]}
+    response: {type: object, properties: {released: {type: integer}}}
+    behavior:
+      - set: {vars.ids: "= input.request_id in state.request_cached_ids ? state.request_cached_ids[input.request_id] : []"}
+      - title: free_encoder_input for each cached input id
+        source: "vllm/v1/core/encoder_cache_manager.py:293-294"
+        foreach: "= vars.ids"
+        as: iid
+        steps:
+          - call: encoder-cache-manager.free-encoder-input
+            input: {request_id: "= input.request_id", input_id: "= vars.iid", mm_hashes: "= input.mm_hashes"}
+      - return: {released: "= size(vars.ids)"}
+
+  # ============================================ round 4: block pool free queue
+  - component: block-pool
+    name: free-queue-append
+    kind: function
+    latency_ms: 0
+    summary: "FreeKVCacheBlockQueue.append: put one block back at the tail of the free queue (evicted last) and count it free."
+    description: "The block pool frees through append_n / prepend_n (block_pool.py:793-803); append is the single-block form the queue exposes. The free queue is part of the pool's state here (free_tail)."
+    sources: ["vllm/v1/core/kv_cache_utils.py:402-424", "vllm/v1/core/kv_cache_utils.py:246-260"]
+    errors: [{code: runtime-error, status: 0, retryable: false}]
+    request: {type: object, required: [block_id], properties: {block_id: {type: integer, examples: [5]}}}
+    response: {type: object, properties: {num_free_blocks: {type: integer}}}
+    behavior:
+      - if: "input.block_id in state.free_tail || input.block_id in state.free_front || (input.block_id >= state.next_fresh && input.block_id < state.num_gpu_blocks) || input.block_id == 0"
+        then:
+          - title: The block is already linked in the free queue (or is the null block)
+            detail: "Linking a block that is already in the list corrupts it; the queue only ever receives blocks popped from it."
+            source: "vllm/v1/core/kv_cache_utils.py:412-415"
+            fail: {code: runtime-error, status: 0, message: "= 'block ' + string(input.block_id) + ' is already in the free queue'"}
+      - title: Link the block after the last one and before the fake tail
+        source: "vllm/v1/core/kv_cache_utils.py:416-424"
+        set:
+          state.free_tail: "= state.free_tail + [input.block_id]"
+          state.ref_cnt: "= omit(state.ref_cnt, string(input.block_id))"
+      - return: {num_free_blocks: "= size(state.free_front) + (state.num_gpu_blocks - state.next_fresh) + size(state.free_tail)"}
+
+  # ================================================ round 4: none hash seed
+  - component: kv-cache-utils
+    name: init-none-hash
+    kind: function
+    latency_ms: 0
+    summary: "Pick the prefix-cache hash function and the NONE_HASH seed that roots every block-hash chain: PYTHONHASHSEED if set, else a fixed seed for SHA-256 (shareable across processes) or a random per-process one for xxhash."
+    sources: ["vllm/v1/core/kv_cache_utils.py:102-172", "vllm/utils/hashing.py:26-41", "vllm/utils/hashing.py:84-103"]
+    errors: [{code: value-error, status: 0, retryable: false}]
+    request:
+      type: object
+      properties:
+        hash_fn_name: {type: string, default: sha256, enum: [sha256, sha256_cbor, xxhash, xxhash_cbor, md5], description: "cache_config.prefix_caching_hash_algo"}
+        pythonhashseed: {type: [string, "null"], default: null, description: "The PYTHONHASHSEED environment variable."}
+    response: {type: object, properties: {seed: {type: string}, hash_fn: {type: string}, random_seed: {type: boolean}}}
+    behavior:
+      - set:
+          vars.name: "= has(input.hash_fn_name) ? input.hash_fn_name : 'sha256'"
+          vars.env: "= has(input.pythonhashseed) ? input.pythonhashseed : dyn(null)"
+      - if: "!(vars.name in ['sha256', 'sha256_cbor', 'xxhash', 'xxhash_cbor'])"
+        then:
+          - title: Unknown hash algorithm
+            source: "vllm/utils/hashing.py:94-103"
+            fail: {code: value-error, status: 0, message: "= 'Unsupported hash function: ' + vars.name"}
+      - if: "vars.env != null"
+        then:
+          - title: PYTHONHASHSEED wins
+            source: "vllm/v1/core/kv_cache_utils.py:138-140"
+            set: {vars.seed: "= vars.env", vars.random: false}
+        else:
+          - if: "vars.name in ['xxhash', 'xxhash_cbor']"
+            then:
+              - title: Non-cryptographic hash - a random per-process seed (logged as a warning)
+                detail: "A predictable seed would let an attacker precompute colliding blocks; hashes are then not reproducible across processes."
+                source: "vllm/v1/core/kv_cache_utils.py:141-142"
+                set: {vars.seed: "= id('none-hash-seed', vars.name)", vars.random: true}
+            else:
+              - title: SHA-256 - the fixed default seed, identical in every process
+                source: "vllm/v1/core/kv_cache_utils.py:143"
+                set: {vars.seed: vllm-none-hash, vars.random: false}
+      - title: NONE_HASH = hash_fn(seed)
+        source: "vllm/v1/core/kv_cache_utils.py:160-172"
+        set:
+          state.none_hash_seed: "= vars.seed"
+          state.hash_fn: "= vars.name"
+      - return: {seed: "= vars.seed", hash_fn: "= vars.name", random_seed: "= vars.random"}
+
+  - component: kv-cache-utils
+    name: get-none-hash-seed
+    kind: function
+    latency_ms: 0
+    summary: "The seed NONE_HASH was derived from (the deterministic default before init_none_hash runs); the P2P tier advertises it in its handshake."
+    sources: ["vllm/v1/core/kv_cache_utils.py:146-157"]
+    request: {type: object}
+    response: {type: object, properties: {seed: {type: string}}}
+    behavior:
+      - if: "state.none_hash_seed == null"
+        then:
+          - title: Not initialized - the deterministic default
+            source: "vllm/v1/core/kv_cache_utils.py:155-156"
+            return: {seed: vllm-none-hash}
+      - return: {seed: "= state.none_hash_seed"}
+
+  - component: kv-cache-utils
+    name: get-kv-cache-config-from-groups
+    kind: function
+    latency_ms: 0
+    summary: "Build the KVCacheConfig: num_blocks = available memory // the largest group's bytes per block (or the override); one KVCacheTensor per distinct layer spec, laid out layer-outermost or block-outermost."
+    sources: ["vllm/v1/core/kv_cache_utils.py:1588-1687", "vllm/v1/core/kv_cache_utils.py:1520-1545", "vllm/v1/kv_cache_interface.py:1438-1494", "vllm/v1/kv_cache_interface.py:1408-1430"]
+    request:
+      type: object
+      required: [kv_cache_groups, available_memory]
+      properties:
+        kv_cache_groups:
+          type: array
+          description: "KVCacheGroupSpec: layer names and each layer's page size (a UniformTypeKVCacheSpecs group may mix page sizes)."
+          items: {type: object, properties: {layer_names: {type: array, items: {type: string}}, layer_pages: {type: object}}}
+        available_memory: {type: integer, examples: [724992]}
+        layout: {type: string, default: LBNHC, enum: [LBNHC, BLNHC], description: "LBNHC is layer-outermost; BLNHC block-outermost."}
+    response: {type: object, properties: {num_blocks: {type: integer}, kv_cache_tensors: {type: array}, bytes_per_block: {type: integer}}}
+    behavior:
+      - if: "size(input.kv_cache_groups) == 0"
+        then:
+          - title: Attention-free model - one block for the null block
+            source: "vllm/v1/core/kv_cache_utils.py:1604-1614"
+            return: {num_blocks: 1, kv_cache_tensors: [], bytes_per_block: 0}
+      - set:
+          vars.layer_outer: "= !has(input.layout) || input.layout == 'LBNHC'"
+      - title: Bytes per block - the largest group's sum of per-layer pages
+        source: "vllm/v1/core/kv_cache_utils.py:1524-1539"
+        set:
+          vars.bpb: "= math.greatest(input.kv_cache_groups.map(g, sum(g.layer_names.map(l, g.layer_pages[l]))))"
+      - set:
+          vars.n: "= input.available_memory / vars.bpb"
+      - if: "'num-gpu-blocks-override' in config && config['num-gpu-blocks-override'] != null"
+        then:
+          - title: num_gpu_blocks_override replaces the computed count
+            source: "vllm/v1/core/kv_cache_utils.py:1230-1236"
+            set: {vars.n: "= int(config['num-gpu-blocks-override'])"}
+      - title: One KVCacheTensor per distinct spec (page size) of each group
+        detail: "Layer-outermost: each layer owns num_blocks x page bytes (block stride = its page). Block-outermost: every layer shares each block (block stride = bytes per block)."
+        source: "vllm/v1/core/kv_cache_utils.py:1642-1678"
+        set:
+          vars.tensors: "= input.kv_cache_groups.map(g, lists.range(size(g.layer_names)).filter(i, !lists.range(i).exists(j, g.layer_pages[g.layer_names[j]] == g.layer_pages[g.layer_names[i]])).map(i, g.layer_pages[g.layer_names[i]]).map(p, {'layers': g.layer_names.filter(l, g.layer_pages[l] == p), 'block_stride': vars.layer_outer ? p : vars.bpb, 'layer_stride': vars.layer_outer ? vars.n * p : p, 'page_size_bytes': p}))"
+      - return: {num_blocks: "= vars.n", kv_cache_tensors: "= vars.tensors.flatten()", bytes_per_block: "= vars.bpb"}
+
+  - component: simple-cpu-offload-worker
+    name: register-kv-caches
+    kind: function
+    latency_ms: 0
+    summary: "Register the GPU KV caches for offload: each placement becomes [num_blocks, block_bytes] regions, one per layer when the layout is layer-outermost, derived from the config's strides (so mixed page sizes in one group work)."
+    sources: ["vllm/v1/simple_kv_offload/worker.py:81-160"]
+    request:
+      type: object
+      required: [num_blocks, kv_cache_tensors, layer_names]
+      properties:
+        num_blocks: {type: integer, examples: [4]}
+        kv_cache_tensors: {type: array, items: {type: object, properties: {layers: {type: array, items: {type: string}}, block_stride: {type: integer}, layer_stride: {type: integer}}}}
+        layer_names: {type: array, items: {type: string}, description: "Layers present in kv_caches."}
+    response: {type: object, properties: {regions: {type: object}, total_bytes_per_block: {type: integer}}}
+    behavior:
+      - if: "size(input.layer_names) == 0"
+        then:
+          - title: No KV caches to offload (warning)
+            source: "vllm/v1/simple_kv_offload/worker.py:95-97"
+            return: {regions: {}, total_bytes_per_block: 0}
+      - set: {vars.regions: {}}
+      - title: Each placement's regions are [num_blocks, block_stride] views
+        source: "vllm/v1/simple_kv_offload/worker.py:110-153"
+        foreach: "= input.kv_cache_tensors.filter(t, t.layers.exists(l, l in input.layer_names))"
+        as: t
+        steps:
+          - if: "vars.t.layer_stride >= input.num_blocks * vars.t.block_stride"
+            then:
+              - title: Layer-outermost - one region per layer
+                source: "vllm/v1/simple_kv_offload/worker.py:118-122"
+                set: {vars.regions: "= merge(vars.regions, vars.t.layers.transformMapEntry(i, l, {l: [input.num_blocks, vars.t.block_stride]}))"}
+            else:
+              - title: Block-outermost - one region for the placement, named after its first layer
+                source: "vllm/v1/simple_kv_offload/worker.py:123-126"
+                set: {vars.regions: "= merge(vars.regions, {vars.t.layers[0]: [input.num_blocks, vars.t.block_stride]})"}
+      - title: Bytes per block across all regions
+        source: "vllm/v1/simple_kv_offload/worker.py:155-160"
+        set:
+          state.gpu_kv_caches: "= vars.regions"
+          state.total_bytes_per_block: "= sum(vars.regions.transformList(k, v, v[1]))"
+      - return: {regions: "= vars.regions", total_bytes_per_block: "= state.total_bytes_per_block"}
+
+  # ============================================ round 4: offloading specs
+  - component: offloading-spec-factory
+    name: register-spec
+    kind: function
+    latency_ms: 0
+    summary: "Register an offloading spec under a name (lazily imported); a name already taken is refused."
+    sources: ["vllm/v1/kv_offload/factory.py:17-28"]
+    errors: [{code: value-error, status: 0, retryable: false}]
+    request: {type: object, required: [name, module_path, class_name], properties: {name: {type: string, examples: [MySpec]}, module_path: {type: string, examples: [my_pkg.spec]}, class_name: {type: string, examples: [MySpec]}}}
+    response: {type: object, properties: {registered: {type: string}}}
+    behavior:
+      - if: "input.name in state.registry"
+        then:
+          - title: Already registered
+            source: "vllm/v1/kv_offload/factory.py:20-21"
+            fail: {code: value-error, status: 0, message: "= 'Connector \\'' + input.name + '\\' is already registered.'"}
+      - title: Store a lazy loader for the class
+        source: "vllm/v1/kv_offload/factory.py:23-28"
+        set: {state.registry: "= merge(state.registry, {input.name: input.module_path})"}
+      - return: {registered: "= input.name"}
+
+  - component: offloading-spec-factory
+    name: get-spec-cls
+    kind: function
+    latency_ms: 0
+    summary: "Resolve kv_connector_extra_config.spec_name (default CPUOffloadingSpec): a registered name, or an out-of-tree class from spec_module_path."
+    sources: ["vllm/v1/kv_offload/factory.py:30-52"]
+    errors: [{code: value-error, status: 0, retryable: false}]
+    request: {type: object, required: [extra_config], properties: {extra_config: {type: object, properties: {spec_name: {type: [string, "null"], default: null}, spec_module_path: {type: [string, "null"], default: null}}}}}
+    response: {type: object, properties: {spec_cls: {type: string}, module_path: {type: string}, out_of_tree: {type: boolean}}}
+    behavior:
+      - set:
+          vars.name: "= has(input.extra_config.spec_name) && input.extra_config.spec_name != null ? input.extra_config.spec_name : 'CPUOffloadingSpec'"
+      - if: "vars.name in state.registry"
+        then:
+          - title: A registered spec
+            source: "vllm/v1/kv_offload/factory.py:32-33"
+            return: {spec_cls: "= vars.name", module_path: "= state.registry[vars.name]", out_of_tree: false}
+      - if: "!has(input.extra_config.spec_module_path) || input.extra_config.spec_module_path == null"
+        then:
+          - title: Unknown spec and no module path
+            source: "vllm/v1/kv_offload/factory.py:35-37"
+            fail: {code: value-error, status: 0, message: "= 'Unsupported spec type: ' + vars.name"}
+      - title: Out-of-tree spec, imported from spec_module_path (experimental, warned once)
+        source: "vllm/v1/kv_offload/factory.py:38-50"
+        return: {spec_cls: "= vars.name", module_path: "= input.extra_config.spec_module_path", out_of_tree: true}
+
+  - component: offloading-spec-factory
+    name: create-spec
+    kind: function
+    latency_ms: 0
+    summary: "Build the configured offloading spec; the CPU spec sizes the CPU tier at construction."
+    sources: ["vllm/v1/kv_offload/factory.py:54-58"]
+    request:
+      type: object
+      required: [extra_config]
+      properties:
+        extra_config: {type: object, properties: {spec_name: {type: [string, "null"], default: null}, spec_module_path: {type: [string, "null"], default: null}, cpu_bytes_to_use: {type: [integer, "null"], default: null}}}
+        worker_kv_bytes_per_block: {type: integer, default: 0}
+        blocks_per_chunk: {type: integer, default: 1}
+        world_size: {type: integer, default: 1}
+        replicated_layout: {type: boolean, default: false}
+    response: {type: object, properties: {spec_cls: {type: string}, num_chunks: {type: [integer, "null"]}}}
+    behavior:
+      - call: offloading-spec-factory.get-spec-cls
+        input: {extra_config: "= input.extra_config"}
+        as: cls
+      - if: "vars.cls.value.spec_cls == 'CPUOffloadingSpec'"
+        then:
+          - title: spec_cls(config)
+            source: "vllm/v1/kv_offload/factory.py:56-58"
+            call: cpu-offloading-spec.init
+            input:
+              cpu_bytes_to_use: "= has(input.extra_config.cpu_bytes_to_use) ? input.extra_config.cpu_bytes_to_use : dyn(null)"
+              worker_kv_bytes_per_block: "= has(input.worker_kv_bytes_per_block) ? input.worker_kv_bytes_per_block : 0"
+              blocks_per_chunk: "= has(input.blocks_per_chunk) ? input.blocks_per_chunk : 1"
+              world_size: "= has(input.world_size) ? input.world_size : 1"
+              replicated_layout: "= has(input.replicated_layout) && input.replicated_layout"
+            as: spec
+          - return: {spec_cls: CPUOffloadingSpec, num_chunks: "= vars.spec.value.num_chunks"}
+      - title: Other specs (tiering, out-of-tree) are constructed by their own class; their sizing is not modeled here
+        source: "vllm/v1/kv_offload/factory.py:56-58"
+        return: {spec_cls: "= vars.cls.value.spec_cls", num_chunks: null}
+
+  - component: cpu-offloading-spec
+    name: init
+    kind: function
+    latency_ms: 0
+    summary: "Size the CPU tier: per-worker page = worker bytes/block x blocks/chunk; the chunk row is that times the copies, rounded up to the mmap page; num_chunks = cpu_bytes_to_use // row."
+    sources: ["vllm/v1/kv_offload/cpu/spec.py:93-138", "vllm/v1/kv_offload/cpu/shared_offload_region.py:87", "vllm/v1/kv_offload/config.py:29-62", "vllm/v1/kv_offload/config.py:21-26", "vllm/v1/kv_offload/config.py:65-90"]
+    errors: [{code: exception, status: 0, retryable: false}]
+    request:
+      type: object
+      properties:
+        cpu_bytes_to_use: {type: [integer, "null"], default: null, examples: [12288]}
+        worker_kv_bytes_per_block: {type: integer, default: 0, examples: [16]}
+        blocks_per_chunk: {type: integer, default: 1, examples: [2]}
+        world_size: {type: integer, default: 1, examples: [6]}
+        replicated_layout: {type: boolean, default: false}
+        platform: {type: string, default: cuda, enum: [cuda, rocm, xpu, cpu]}
+        mmap_page_size: {type: integer, default: 4096, description: "mmap.PAGESIZE, the SharedOffloadRegion BLOCK_SIZE_ALIGNMENT."}
+        eviction_policy: {type: string, default: lru}
+    response: {type: object, properties: {num_chunks: {type: integer}, kv_bytes_per_chunk: {type: integer}, cpu_page_size_per_worker: {type: integer}, replicated_layout: {type: boolean}}}
+    behavior:
+      - if: "!has(input.cpu_bytes_to_use) || input.cpu_bytes_to_use == null || input.cpu_bytes_to_use == 0"
+        then:
+          - title: cpu_bytes_to_use is required
+            source: "vllm/v1/kv_offload/cpu/spec.py:96-100"
+            fail: {code: exception, status: 0, message: "cpu_bytes_to_use must be specified in kv_connector_extra_config"}
+      - set:
+          vars.wb: "= has(input.worker_kv_bytes_per_block) ? input.worker_kv_bytes_per_block : 0"
+          vars.ws: "= has(input.world_size) ? input.world_size : 1"
+          vars.bpc: "= has(input.blocks_per_chunk) ? input.blocks_per_chunk : 1"
+          vars.align: "= has(input.mmap_page_size) ? input.mmap_page_size : 4096"
+          vars.platform: "= has(input.platform) ? input.platform : 'cuda'"
+      - title: Replicated (single-copy) layout only on the shared mmap region (CUDA but not ROCm, or XPU)
+        source: "vllm/v1/kv_offload/cpu/spec.py:106"
+        set:
+          vars.repl: "= has(input.replicated_layout) && input.replicated_layout && (vars.platform == 'cuda' || vars.platform == 'xpu')"
+          vars.num_chunks: 0
+          vars.chunk: 0
+          vars.page: 0
+      - if: "vars.wb > 0 && vars.ws > 0"
+        then:
+          - title: Size the chunk row and count the chunks
+            detail: "kv_bytes_per_chunk keeps the page-aligned (possibly padded) row; cpu_page_size_per_worker is the unpadded per-worker slot."
+            source: "vllm/v1/kv_offload/cpu/spec.py:107-125"
+            set:
+              vars.copies: "= vars.repl ? 1 : vars.ws"
+          - set:
+              vars.raw: "= vars.wb * vars.copies * vars.bpc"
+          - set:
+              vars.page: "= vars.raw / vars.copies"
+              vars.chunk: "= (vars.raw + vars.align - 1) / vars.align * vars.align"
+          - set:
+              vars.num_chunks: "= input.cpu_bytes_to_use / vars.chunk"
+      - set:
+          state.num_chunks: "= vars.num_chunks"
+          state.kv_bytes_per_chunk: "= vars.chunk"
+          state.cpu_page_size_per_worker: "= vars.page"
+          state.replicated_layout: "= vars.repl"
+          state.eviction_policy: "= has(input.eviction_policy) ? input.eviction_policy : 'lru'"
+      - return: {num_chunks: "= vars.num_chunks", kv_bytes_per_chunk: "= vars.chunk", cpu_page_size_per_worker: "= vars.page", replicated_layout: "= vars.repl"}
+
+  - component: cpu-offloading-spec
+    name: get-manager
+    kind: function
+    latency_ms: 0
+    summary: "The scheduler-side CPUOffloadingManager over the sized chunk pool (built once)."
+    sources: ["vllm/v1/kv_offload/cpu/spec.py:140-159"]
+    request: {type: object, properties: {enable_kv_cache_events: {type: boolean, default: false}}}
+    response: {type: object, properties: {num_chunks: {type: integer}}}
+    behavior:
+      - title: CPUOffloadingManager(num_chunks, eviction policy, events)
+        source: "vllm/v1/kv_offload/cpu/spec.py:150-158"
+        call: cpu-offloading-manager.init
+        input: {num_chunks: "= state.num_chunks", enable_events: "= has(input.enable_kv_cache_events) && input.enable_kv_cache_events"}
+      - return: {num_chunks: "= state.num_chunks"}
+
+  - component: cpu-offloading-spec
+    name: create-worker
+    kind: function
+    latency_ms: 0
+    summary: "Worker side: map the shared CPU region (rank-indexed slot, or slot 0 for the replicated layout) with the spec's sizes; a zero-chunk spec keeps the tensor path."
+    sources: ["vllm/v1/kv_offload/cpu/spec.py:161-195"]
+    request: {type: object, properties: {rank: {type: integer, default: 0}, platform: {type: string, default: cuda, enum: [cuda, rocm, xpu, cpu]}}}
+    response: {type: object, properties: {shared_region: {type: boolean}}}
+    behavior:
+      - set: {vars.platform: "= has(input.platform) ? input.platform : 'cuda'"}
+      - if: "(vars.platform == 'cuda' || vars.platform == 'xpu') && state.num_chunks > 0"
+        then:
+          - title: SharedOffloadRegion with the spec's row size and per-worker page
+            source: "vllm/v1/kv_offload/cpu/spec.py:172-184"
+            call: shared-offload-region.init
+            input:
+              num_chunks: "= state.num_chunks"
+              rank: "= state.replicated_layout ? 0 : (has(input.rank) ? input.rank : 0)"
+              kv_bytes_per_chunk: "= state.kv_bytes_per_chunk"
+              cpu_page_size: "= state.cpu_page_size_per_worker"
+          - return: {shared_region: true}
+      - title: No shared region (zero chunks or another platform) - plain tensors
+        source: "vllm/v1/kv_offload/cpu/spec.py:169-171"
+        return: {shared_region: false}
+
+  # ============================================ round 4: CPU offloading manager
+  - component: cpu-offloading-manager
+    name: init
+    kind: function
+    latency_ms: 0
+    summary: "An empty CPU tier of num_chunks chunk slots with the LRU policy."
+    sources: ["vllm/v1/kv_offload/cpu/manager.py:58-92"]
+    request: {type: object, required: [num_chunks], properties: {num_chunks: {type: integer, examples: [5]}, enable_events: {type: boolean, default: false}}}
+    response: {type: object, properties: {num_chunks: {type: integer}}}
+    behavior:
+      - title: Empty chunk pool and policy
+        source: "vllm/v1/kv_offload/cpu/manager.py:67-80"
+        set:
+          state.num_chunks: "= input.num_chunks"
+          state.num_allocated: 0
+          state.free_list: []
+          state.chunks: {}
+          state.lru: []
+          state.num_write_pending: 0
+          state.req_access: {}
+          state.events: []
+          state.enable_events: "= has(input.enable_events) && input.enable_events"
+      - return: {num_chunks: "= input.num_chunks"}
+
+  - component: cpu-offloading-manager
+    name: on-new-request
+    kind: function
+    latency_ms: 0
+    summary: "A request the scheduler sees for the first time: start its access record (ReqContext state); the CPU tier offloads chunk by chunk."
+    sources: ["vllm/v1/kv_offload/base.py:349-360", "vllm/v1/kv_offload/base.py:89-117", "vllm/v1/kv_offload/cpu/manager.py:184-187"]
+    request: {type: object, required: [req_id], properties: {req_id: {type: string, examples: [chatcmpl-abc123]}, kv_transfer_params: {type: [object, "null"], default: null}}}
+    response: {type: object, properties: {policy: {type: string, enum: [chunk_level, request_level]}}}
+    behavior:
+      - if: "!(input.req_id in state.req_access)"
+        then:
+          - title: _get_request_cache_access creates the request's record for this cache generation
+            source: "vllm/v1/kv_offload/cpu/manager.py:144-155"
+            set: {state.req_access: "= merge(state.req_access, {input.req_id: {'seen': [], 'inserted': [], 'reused': [], 'finished': false}})"}
+      - return: {policy: chunk_level}
+
+  - component: cpu-offloading-manager
+    name: lookup
+    kind: function
+    latency_ms: 0
+    summary: "Is one chunk offloaded and readable? MISS if unknown, HIT_PENDING while its write is in flight, else HIT."
+    sources: ["vllm/v1/kv_offload/base.py:236-250", "vllm/v1/kv_offload/base.py:120-126", "vllm/v1/kv_offload/cpu/manager.py:189-196"]
+    request: {type: object, required: [key], properties: {key: {type: string, examples: [blk-0]}, req_id: {type: string, examples: [chatcmpl-abc123]}}}
+    response: {type: object, properties: {result: {type: string, enum: [MISS, HIT, HIT_PENDING, RETRY]}}}
+    behavior:
+      - if: "!(input.key in state.chunks)"
+        then:
+          - title: Not in the CPU tier
+            source: "vllm/v1/kv_offload/cpu/manager.py:191-192"
+            return: {result: MISS}
+      - if: "state.chunks[input.key].ref_cnt < 0"
+        then:
+          - title: Being written (ref_cnt -1, not ready)
+            source: "vllm/v1/kv_offload/cpu/manager.py:193-194"
+            return: {result: HIT_PENDING}
+      - return: {result: HIT}
+
+  - component: cpu-offloading-manager
+    name: prepare-store
+    kind: function
+    latency_ms: 0
+    summary: "Reserve chunks for the keys not yet stored: fresh chunks first, then freed ones; evict ready, unpinned LRU chunks (never the offered keys) when short; refuse (null) when eviction cannot free enough."
+    sources: ["vllm/v1/kv_offload/base.py:308-328", "vllm/v1/kv_offload/cpu/manager.py:251-363", "vllm/v1/kv_offload/cpu/manager.py:97-114", "vllm/v1/kv_offload/cpu/policies/lru.py:114-160"]
+    request:
+      type: object
+      required: [keys, req_id]
+      properties:
+        keys: {type: array, items: {type: string}, examples: [[blk-0, blk-1]]}
+        req_id: {type: string, examples: [chatcmpl-abc123]}
+    response: {type: [object, "null"], properties: {keys_to_store: {type: array, items: {type: string}}, chunk_ids: {type: array, items: {type: integer}}, evicted_keys: {type: array, items: {type: string}}}}
+    behavior:
+      - set:
+          vars.to_store: "= input.keys.filter(k, !(k in state.chunks))"
+          vars.ready: "= input.keys.filter(k, k in state.chunks && state.chunks[k].ref_cnt >= 0)"
+          vars.acc: "= input.req_id in state.req_access ? state.req_access[input.req_id] : {'seen': [], 'inserted': [], 'reused': [], 'finished': false}"
+      - title: Record the request's access to the offered keys before any early return
+        source: "vllm/v1/kv_offload/cpu/manager.py:298-306"
+        set:
+          state.req_access: "= merge(state.req_access, {input.req_id: {'seen': vars.acc.seen + input.keys.filter(k, (k in vars.to_store || k in vars.ready) && !(k in vars.acc.seen)), 'inserted': vars.acc.inserted, 'reused': vars.acc.reused + vars.ready.filter(k, !(k in vars.acc.inserted) && !(k in vars.acc.reused)), 'finished': vars.acc.finished}})"
+      - if: "size(vars.to_store) == 0"
+        then:
+          - title: Everything is already stored
+            source: "vllm/v1/kv_offload/cpu/manager.py:308-313"
+            return: {keys_to_store: [], chunk_ids: [], evicted_keys: []}
+      - set:
+          vars.free: "= size(state.free_list) + state.num_chunks - state.num_allocated"
+          vars.evictable: "= state.lru.filter(k, state.chunks[k].ref_cnt == 0)"
+          vars.evicted: []
+      - set:
+          vars.n_evict: "= size(vars.to_store) - vars.free"
+      - if: "vars.n_evict > 0"
+        then:
+          - if: "vars.n_evict > size(vars.evictable)"
+            then:
+              - title: Not enough idle chunks to evict; the store is refused
+                source: "vllm/v1/kv_offload/cpu/manager.py:319-322"
+                return: null
+          - set:
+              vars.candidates: "= vars.evictable.filter(k, !(k in input.keys))"
+          - if: "size(vars.candidates) < vars.n_evict"
+            then:
+              - title: The idle chunks left are the offered keys themselves (protected); refused
+                source: "vllm/v1/kv_offload/cpu/manager.py:326-331"
+                return: null
+          - title: Evict the least recently used idle chunks and free their slots
+            source: "vllm/v1/kv_offload/cpu/manager.py:333-339"
+            set:
+              vars.evicted: "= vars.candidates.slice(0, vars.n_evict)"
+          - set:
+              state.free_list: "= state.free_list + vars.evicted.map(k, state.chunks[k].chunk_id)"
+              state.chunks: "= state.chunks.transformMap(k, v, !(k in vars.evicted), v)"
+              state.lru: "= state.lru.filter(k, !(k in vars.evicted))"
+          - if: "state.enable_events"
+            then:
+              - title: Emit a removal event for the evicted keys
+                source: "vllm/v1/kv_offload/cpu/manager.py:341-348"
+                set: {state.events: "= state.events + [{'keys': vars.evicted, 'medium': 'CPU', 'removed': true}]"}
+      - title: Allocate fresh chunk ids first, then reuse freed ones (last freed first)
+        source: "vllm/v1/kv_offload/cpu/manager.py:97-111"
+        set:
+          vars.n_fresh: "= math.least(size(vars.to_store), state.num_chunks - state.num_allocated)"
+      - set:
+          vars.ids: "= lists.range(vars.n_fresh).map(i, state.num_allocated + i) + lists.range(size(vars.to_store) - vars.n_fresh).map(i, state.free_list[size(state.free_list) - 1 - i])"
+      - title: Insert the chunks as not ready (ref_cnt -1) and newest in LRU order
+        source: "vllm/v1/kv_offload/cpu/manager.py:350-356"
+        set:
+          state.free_list: "= state.free_list.slice(0, size(state.free_list) - (size(vars.to_store) - vars.n_fresh))"
+          state.num_allocated: "= state.num_allocated + vars.n_fresh"
+          state.chunks: "= merge(state.chunks, lists.range(size(vars.to_store)).transformMapEntry(i, j, {vars.to_store[j]: {'chunk_id': vars.ids[j], 'ref_cnt': -1}}))"
+          state.lru: "= state.lru + vars.to_store"
+          state.num_write_pending: "= state.num_write_pending + size(vars.to_store)"
+          state.req_access: "= merge(state.req_access, {input.req_id: {'inserted': state.req_access[input.req_id].inserted + vars.to_store}})"
+      - return: {keys_to_store: "= vars.to_store", chunk_ids: "= vars.ids", evicted_keys: "= vars.evicted"}
+
+  - component: cpu-offloading-manager
+    name: complete-store
+    kind: function
+    latency_ms: 0
+    summary: "A GPU->CPU write finished: the written chunks become ready and evictable; on failure they are dropped and their slots freed."
+    sources: ["vllm/v1/kv_offload/base.py:330-348", "vllm/v1/kv_offload/cpu/manager.py:365-398"]
+    request:
+      type: object
+      required: [keys]
+      properties:
+        keys: {type: array, items: {type: string}, examples: [[blk-0]]}
+        req_id: {type: string, examples: [chatcmpl-abc123]}
+        success: {type: boolean, default: true}
+    response: {type: object, properties: {stored: {type: array, items: {type: string}}, removed: {type: array, items: {type: string}}}}
+    behavior:
+      - set:
+          vars.pending: "= input.keys.filter(k, k in state.chunks && state.chunks[k].ref_cnt < 0)"
+      - if: "!has(input.success) || input.success"
+        then:
+          - title: Mark them ready (ref_cnt 0) and evictable
+            source: "vllm/v1/kv_offload/cpu/manager.py:373-381"
+            set:
+              state.chunks: "= merge(state.chunks, vars.pending.transformMapEntry(i, k, {k: {'ref_cnt': 0}}))"
+              state.num_write_pending: "= state.num_write_pending - size(vars.pending)"
+          - if: "state.enable_events && size(vars.pending) > 0"
+            then:
+              - title: Emit a stored event
+                source: "vllm/v1/kv_offload/cpu/manager.py:390-397"
+                set: {state.events: "= state.events + [{'keys': vars.pending, 'medium': 'CPU', 'removed': false}]"}
+          - return: {stored: "= vars.pending", removed: []}
+      - title: Failed write - drop the chunks and return their slots
+        source: "vllm/v1/kv_offload/cpu/manager.py:382-388"
+        set:
+          state.free_list: "= state.free_list + vars.pending.map(k, state.chunks[k].chunk_id)"
+          state.chunks: "= state.chunks.transformMap(k, v, !(k in vars.pending), v)"
+          state.lru: "= state.lru.filter(k, !(k in vars.pending))"
+          state.num_write_pending: "= state.num_write_pending - size(vars.pending)"
+      - return: {stored: [], removed: "= vars.pending"}
+
+  - component: cpu-offloading-manager
+    name: prepare-load
+    kind: function
+    latency_ms: 0
+    summary: "Pin ready chunks for reading (ref_cnt + 1, no longer evictable) and return their chunk ids; prepare_read does the same for a tier cascade without counting a request access."
+    sources: ["vllm/v1/kv_offload/base.py:265-284", "vllm/v1/kv_offload/cpu/manager.py:204-232", "vllm/v1/kv_offload/tiering/manager.py:119-127"]
+    errors: [{code: assertion-error, status: 0, retryable: false}]
+    request:
+      type: object
+      required: [keys]
+      properties:
+        keys: {type: array, items: {type: string}, examples: [[blk-0]]}
+        req_id: {type: string, examples: [chatcmpl-abc123]}
+        record_access: {type: boolean, default: true}
+    response: {type: object, properties: {chunk_ids: {type: array, items: {type: integer}}}}
+    behavior:
+      - if: "input.keys.exists(k, !(k in state.chunks))"
+        then:
+          - title: Loading a chunk that is not offloaded
+            source: "vllm/v1/kv_offload/cpu/manager.py:220"
+            fail: {code: assertion-error, status: 0, message: "= 'Chunk ' + input.keys.filter(k, !(k in state.chunks))[0] + ' not found in cache'"}
+      - if: "input.keys.exists(k, state.chunks[k].ref_cnt < 0)"
+        then:
+          - title: Loading a chunk whose write has not completed
+            source: "vllm/v1/kv_offload/cpu/manager.py:221"
+            fail: {code: assertion-error, status: 0, message: "= 'Chunk ' + input.keys.filter(k, state.chunks[k].ref_cnt < 0)[0] + ' is not ready for reading'"}
+      - title: Pin each chunk
+        source: "vllm/v1/kv_offload/cpu/manager.py:222-227"
+        set:
+          state.chunks: "= merge(state.chunks, input.keys.transformMapEntry(i, k, {k: {'ref_cnt': state.chunks[k].ref_cnt + 1}}))"
+      - if: "(!has(input.record_access) || input.record_access) && has(input.req_id) && input.req_id in state.req_access"
+        then:
+          - title: Count a request reuse of these chunks
+            source: "vllm/v1/kv_offload/cpu/manager.py:229-230"
+            set: {state.req_access: "= merge(state.req_access, {input.req_id: {'seen': state.req_access[input.req_id].seen + input.keys.filter(k, !(k in state.req_access[input.req_id].seen)), 'reused': state.req_access[input.req_id].reused + input.keys.filter(k, !(k in state.req_access[input.req_id].inserted) && !(k in state.req_access[input.req_id].reused))}})"}
+      - return: {chunk_ids: "= input.keys.map(k, state.chunks[k].chunk_id)"}
+
+  - component: cpu-offloading-manager
+    name: complete-load
+    kind: function
+    latency_ms: 0
+    summary: "A read finished: unpin (ref_cnt - 1); a chunk back at 0 is evictable again."
+    sources: ["vllm/v1/kv_offload/base.py:297-306", "vllm/v1/kv_offload/cpu/manager.py:238-249"]
+    errors: [{code: assertion-error, status: 0, retryable: false}]
+    request: {type: object, required: [keys], properties: {keys: {type: array, items: {type: string}, examples: [[blk-0]]}, req_id: {type: string, examples: [chatcmpl-abc123]}}}
+    response: {type: object, properties: {evictable: {type: array, items: {type: string}}}}
+    behavior:
+      - if: "input.keys.exists(k, !(k in state.chunks) || state.chunks[k].ref_cnt <= 0)"
+        then:
+          - title: Unpinning a chunk that is unknown or not pinned
+            source: "vllm/v1/kv_offload/cpu/manager.py:243-244"
+            fail: {code: assertion-error, status: 0, message: "chunk ref_cnt is already 0"}
+      - title: Unpin each chunk
+        source: "vllm/v1/kv_offload/cpu/manager.py:245-249"
+        set:
+          state.chunks: "= merge(state.chunks, input.keys.transformMapEntry(i, k, {k: {'ref_cnt': state.chunks[k].ref_cnt - 1}}))"
+      - return: {evictable: "= input.keys.filter(k, state.chunks[k].ref_cnt == 0)"}
+
+  - component: cpu-offloading-manager
+    name: touch
+    kind: function
+    latency_ms: 0
+    summary: "Mark keys recently used: the first key becomes the most recent, so the last is evicted first among them."
+    sources: ["vllm/v1/kv_offload/base.py:286-295", "vllm/v1/kv_offload/cpu/manager.py:234-236", "vllm/v1/kv_offload/cpu/policies/lru.py:60-71"]
+    request: {type: object, required: [keys], properties: {keys: {type: array, items: {type: string}, examples: [[blk-0, blk-1]]}, req_id: {type: string, examples: [chatcmpl-abc123]}}}
+    response: {type: object, properties: {lru: {type: array, items: {type: string}}}}
+    behavior:
+      - title: New ranks in reversed key order (unknown keys are ignored)
+        source: "vllm/v1/kv_offload/cpu/policies/lru.py:92-94"
+        set:
+          vars.known: "= input.keys.filter(k, k in state.chunks)"
+      - set:
+          state.lru: "= state.lru.filter(k, !(k in vars.known)) + vars.known.reverse()"
+      - return: {lru: "= state.lru"}
+
+  - component: cpu-offloading-manager
+    name: on-request-finished
+    kind: function
+    latency_ms: 0
+    summary: "A request finished: once, the policy refreshes the recency of every chunk the request saw (prefix order, so its first chunk is the most recent)."
+    sources: ["vllm/v1/kv_offload/base.py:362-380", "vllm/v1/kv_offload/cpu/manager.py:400-427", "vllm/v1/kv_offload/cpu/policies/lru.py:96-105"]
+    request: {type: object, required: [req_id], properties: {req_id: {type: string, examples: [chatcmpl-abc123]}}}
+    response: {type: object, properties: {finalized: {type: boolean}}}
+    behavior:
+      - if: "!(input.req_id in state.req_access) || state.req_access[input.req_id].finished"
+        then:
+          - title: No record for this cache generation, or already finished
+            source: "vllm/v1/kv_offload/cpu/manager.py:402-409"
+            return: {finalized: false}
+      - set:
+          vars.keys: "= state.req_access[input.req_id].seen.filter(k, k in state.chunks)"
+      - title: Mark finished and refresh the request's keys in reversed prefix order
+        source: "vllm/v1/kv_offload/cpu/manager.py:410-427"
+        set:
+          state.req_access: "= merge(state.req_access, {input.req_id: {'finished': true}})"
+          state.lru: "= state.lru.filter(k, !(k in vars.keys)) + vars.keys.reverse()"
+      - return: {finalized: true}
+
+  - component: cpu-offloading-manager
+    name: reset-cache
+    kind: function
+    latency_ms: 0
+    summary: "Forget every chunk unconditionally and start a new cache generation (stale completions are filtered by the scheduler)."
+    sources: ["vllm/v1/kv_offload/cpu/manager.py:429-442"]
+    request: {type: object}
+    response: {type: object, properties: {cache_generation: {type: integer}}}
+    behavior:
+      - title: Clear the policy and the chunk pool
+        source: "vllm/v1/kv_offload/cpu/manager.py:436-442"
+        set:
+          state.chunks: {}
+          state.lru: []
+          state.free_list: []
+          state.num_allocated: 0
+          state.num_write_pending: 0
+          state.req_access: {}
+          state.cache_generation: "= state.cache_generation + 1"
+      - return: {cache_generation: "= state.cache_generation"}
+
+  - component: cpu-offloading-manager
+    name: get-stats
+    kind: function
+    latency_ms: 0
+    summary: "Chunk pool usage: allocated, free, write-pending and evictable chunks."
+    sources: ["vllm/v1/kv_offload/cpu/manager.py:94-95", "vllm/v1/kv_offload/base.py:415-417"]
+    request: {type: object}
+    response: {type: object, properties: {num_free_chunks: {type: integer}, num_stored: {type: integer}, num_write_pending: {type: integer}, num_evictable: {type: integer}, lru: {type: array, items: {type: string}}}}
+    behavior:
+      - return:
+          num_free_chunks: "= size(state.free_list) + state.num_chunks - state.num_allocated"
+          num_stored: "= size(state.chunks)"
+          num_write_pending: "= state.num_write_pending"
+          num_evictable: "= size(state.lru.filter(k, state.chunks[k].ref_cnt == 0))"
+          lru: "= state.lru"
+
+  - component: cpu-offloading-manager
+    name: take-events
+    kind: function
+    latency_ms: 0
+    summary: "Take the offloading events (stored / removed keys on medium CPU) collected since the last call; none unless events are enabled."
+    sources: ["vllm/v1/kv_offload/base.py:382-393", "vllm/v1/kv_offload/cpu/manager.py:444-447", "vllm/v1/kv_offload/base.py:47-51", "vllm/v1/kv_offload/base.py:164-173"]
+    request: {type: object}
+    response: {type: object, properties: {events: {type: array}}}
+    behavior:
+      - title: Yield and clear the events
+        source: "vllm/v1/kv_offload/cpu/manager.py:444-447"
+        set:
+          vars.ev: "= state.events"
+          state.events: []
+      - return: {events: "= vars.ev"}
+
+  # ============================================ round 4: CPU offloading worker
+  - component: cpu-offloading-worker
+    name: submit-store
+    kind: function
+    latency_ms: 0
+    summary: "Queue an async GPU->CPU copy of the given GPU blocks into CPU chunks on a CUDA stream; completion is reported by get-finished."
+    sources: ["vllm/v1/kv_offload/base.py:574-578", "vllm/v1/kv_offload/cpu/gpu_worker.py:854-858", "vllm/v1/kv_offload/cpu/gpu_worker.py:534-704"]
+    request:
+      type: object
+      required: [job_id, src_block_ids, dst_chunk_ids]
+      properties:
+        job_id: {type: integer, examples: [1]}
+        src_block_ids: {type: array, items: {type: integer}, examples: [[3, 4]]}
+        dst_chunk_ids: {type: array, items: {type: integer}, examples: [[0]]}
+        bytes_per_block: {type: integer, default: 2097152}
+    response: {type: object, properties: {submitted: {type: boolean}}}
+    behavior:
+      - title: transfer_async appends the transfer to the in-order queue
+        source: "vllm/v1/kv_offload/cpu/gpu_worker.py:690-704"
+        set:
+          state.transfers: "= state.transfers + [{'job_id': input.job_id, 'direction': 'store', 'num_bytes': size(input.src_block_ids) * (has(input.bytes_per_block) ? input.bytes_per_block : 2097152)}]"
+      - return: {submitted: true}
+
+  - component: cpu-offloading-worker
+    name: submit-load
+    kind: function
+    latency_ms: 0
+    summary: "Queue an async CPU->GPU copy of CPU chunks into GPU blocks."
+    sources: ["vllm/v1/kv_offload/base.py:580-584", "vllm/v1/kv_offload/cpu/gpu_worker.py:860-864"]
+    request:
+      type: object
+      required: [job_id, src_chunk_ids, dst_block_ids]
+      properties:
+        job_id: {type: integer, examples: [2]}
+        src_chunk_ids: {type: array, items: {type: integer}, examples: [[0]]}
+        dst_block_ids: {type: array, items: {type: integer}, examples: [[7, 8]]}
+        bytes_per_block: {type: integer, default: 2097152}
+    response: {type: object, properties: {submitted: {type: boolean}}}
+    behavior:
+      - title: The load handler's transfer_async
+        source: "vllm/v1/kv_offload/cpu/gpu_worker.py:860-864"
+        set:
+          state.transfers: "= state.transfers + [{'job_id': input.job_id, 'direction': 'load', 'num_bytes': size(input.dst_block_ids) * (has(input.bytes_per_block) ? input.bytes_per_block : 2097152)}]"
+      - return: {submitted: true}
+
+  - component: cpu-offloading-worker
+    name: get-finished
+    kind: function
+    latency_ms: 0
+    summary: "Report the transfers whose end event has fired, in submission order (each with its size); here every queued copy has finished by the next poll."
+    sources: ["vllm/v1/kv_offload/base.py:586", "vllm/v1/kv_offload/cpu/gpu_worker.py:706-728", "vllm/v1/kv_offload/cpu/gpu_worker.py:866-867"]
+    request: {type: object}
+    response: {type: object, properties: {results: {type: array}}}
+    behavior:
+      - title: Pop finished transfers from the head of the queue
+        source: "vllm/v1/kv_offload/cpu/gpu_worker.py:708-728"
+        set:
+          vars.results: "= state.transfers.map(t, {'job_id': t.job_id, 'success': true, 'transfer_size': t.num_bytes})"
+          state.transfers: []
+      - return: {results: "= vars.results"}
+
+  # ============================================ round 4: secondary tiers
+  - component: secondary-tier-factory
+    name: register-tier
+    kind: function
+    latency_ms: 0
+    summary: "Register a secondary-tier type with a lazily imported class; a type already registered is refused."
+    sources: ["vllm/v1/kv_offload/tiering/factory.py:50-59", "vllm/v1/kv_offload/tiering/factory.py:146-174"]
+    errors: [{code: value-error, status: 0, retryable: false}]
+    request: {type: object, required: [tier_type, module_path, class_name], properties: {tier_type: {type: string, examples: [custom_tier]}, module_path: {type: string, examples: [vllm.v1.kv_offload.tiering.example.manager]}, class_name: {type: string, examples: [ExampleSecondaryTierManager]}}}
+    response: {type: object, properties: {registered: {type: string}}}
+    behavior:
+      - if: "input.tier_type in state.registry"
+        then:
+          - title: Already registered
+            source: "vllm/v1/kv_offload/tiering/factory.py:52-53"
+            fail: {code: value-error, status: 0, message: "= 'Tier \\'' + input.tier_type + '\\' is already registered.'"}
+      - title: Store the loader
+        source: "vllm/v1/kv_offload/tiering/factory.py:55-59"
+        set: {state.registry: "= merge(state.registry, {input.tier_type: {'module_path': input.module_path, 'class_name': input.class_name}})"}
+      - return: {registered: "= input.tier_type"}
+
+  - component: secondary-tier-factory
+    name: get-tier-class
+    kind: function
+    latency_ms: 0
+    summary: "Resolve tier_config.type: a registered type, else an out-of-tree class named by type in module_path."
+    sources: ["vllm/v1/kv_offload/tiering/factory.py:99-143"]
+    errors: [{code: value-error, status: 0, retryable: false}]
+    request: {type: object, required: [tier_config], properties: {tier_config: {type: object, properties: {type: {type: [string, "null"], default: null}, module_path: {type: [string, "null"], default: null}}}}}
+    response: {type: object, properties: {class_name: {type: string}, module_path: {type: string}}}
+    behavior:
+      - set: {vars.t: "= has(input.tier_config.type) && input.tier_config.type != null ? input.tier_config.type : ''"}
+      - if: "vars.t == ''"
+        then:
+          - title: type is required
+            source: "vllm/v1/kv_offload/tiering/factory.py:119-121"
+            fail: {code: value-error, status: 0, message: "Secondary tier configuration must include 'type'"}
+      - if: "vars.t in state.registry"
+        then:
+          - title: A registered tier type
+            source: "vllm/v1/kv_offload/tiering/factory.py:122-123"
+            return: {class_name: "= state.registry[vars.t].class_name", module_path: "= state.registry[vars.t].module_path"}
+      - if: "!has(input.tier_config.module_path) || input.tier_config.module_path == null"
+        then:
+          - title: Unknown type and no module_path
+            source: "vllm/v1/kv_offload/tiering/factory.py:124-130"
+            fail: {code: value-error, status: 0, message: "= 'Unknown secondary tier type: \\'' + vars.t + '\\'. Supported types: ' + state.registry.transformList(k, v, k).join(', ') + '. For an out-of-tree tier, also set \\'module_path\\'.'"}
+      - title: Out-of-tree - the class named by type, from module_path
+        source: "vllm/v1/kv_offload/tiering/factory.py:131-143"
+        return: {class_name: "= vars.t", module_path: "= input.tier_config.module_path"}
+
+  - component: secondary-tier-factory
+    name: create-secondary-tier
+    kind: function
+    latency_ms: 0
+    summary: "Instantiate a tier from its config: type and module_path are consumed, the rest become constructor arguments; tier_type is the configured type."
+    sources: ["vllm/v1/kv_offload/tiering/factory.py:61-97"]
+    errors: [{code: value-error, status: 0, retryable: false}]
+    request:
+      type: object
+      required: [tier_config, tier_id]
+      properties:
+        tier_config: {type: object, properties: {type: {type: [string, "null"], default: null}, module_path: {type: [string, "null"], default: null}, custom_param: {type: integer, default: 0}, backpressure: {type: [object, "null"], default: null}}}
+        tier_id: {type: string, examples: [tier0], description: "Which tier instance this is (the TieringOffloadingManager's index)."}
+        primary_row_stride: {type: integer, default: 16, description: "primary_kv_view.strides[0], the primary chunk size in bytes."}
+    response: {type: object, properties: {tier_id: {type: string}, tier_type: {type: string}, class_name: {type: string}}}
+    behavior:
+      - call: secondary-tier-factory.get-tier-class
+        input: {tier_config: "= input.tier_config"}
+        as: cls
+      - set: {vars.bp: "= has(input.tier_config.backpressure) && input.tier_config.backpressure != null ? input.tier_config.backpressure : {}"}
+      - if: "size(vars.bp) > 0 && !('backpressure_cls' in vars.bp)"
+        then:
+          - title: A backpressure config needs its detector class
+            source: "vllm/v1/kv_offload/tiering/factory.py:76-82"
+            fail: {code: value-error, status: 0, message: "backpressure config must include 'backpressure_cls' (e.g. 'EMABackpressureDetector')"}
+      - if: "vars.cls.value.class_name == 'ExampleSecondaryTierManager'"
+        then:
+          - title: tier_cls(offloading_spec, primary_kv_view, tier_type, **config)
+            source: "vllm/v1/kv_offload/tiering/factory.py:91-97"
+            call: example-secondary-tier-manager.init
+            input:
+              tier_id: "= input.tier_id"
+              tier_type: "= input.tier_config.type"
+              custom_param: "= has(input.tier_config.custom_param) ? input.tier_config.custom_param : 0"
+              primary_row_stride: "= has(input.primary_row_stride) ? input.primary_row_stride : 16"
+      - title: Other tier classes (fs, p2p, obj, kvcr) are resolved but their managers are not modeled
+        source: "vllm/v1/kv_offload/tiering/factory.py:68-71"
+        return: {tier_id: "= input.tier_id", tier_type: "= input.tier_config.type", class_name: "= vars.cls.value.class_name"}
+
+  - component: example-secondary-tier-manager
+    name: init
+    kind: function
+    latency_ms: 0
+    summary: "Create an in-memory tier: no chunks, no completed jobs; its block size is the primary view's row stride."
+    sources: ["vllm/v1/kv_offload/tiering/example/manager.py:47-82", "vllm/v1/kv_offload/tiering/base.py:157-189"]
+    request:
+      type: object
+      required: [tier_id, tier_type]
+      properties:
+        tier_id: {type: string, examples: [tier0]}
+        tier_type: {type: string, examples: [example]}
+        custom_param: {type: integer, default: 0}
+        primary_row_stride: {type: integer, default: 16}
+    response: {type: object, properties: {tier_type: {type: string}, block_size_bytes: {type: integer}, cache_hit_source: {type: string}}}
+    behavior:
+      - title: SecondaryTierManager.__init__ keeps tier_type and the primary row stride; the example tier starts empty
+        source: "vllm/v1/kv_offload/tiering/example/manager.py:65-82"
+        set:
+          state.tiers: "= merge(state.tiers, {input.tier_id: {'tier_type': input.tier_type, 'chunks': [], 'completed_jobs': [], 'block_size_bytes': has(input.primary_row_stride) ? input.primary_row_stride : 16, 'custom_param': has(input.custom_param) ? input.custom_param : 0}})"
+      - title: medium CPU, so hits are attributed to HOST
+        source: "vllm/v1/kv_offload/tiering/base.py:149-155"
+        return: {tier_type: "= input.tier_type", block_size_bytes: "= state.tiers[input.tier_id].block_size_bytes", cache_hit_source: HOST}
+
+  - component: example-secondary-tier-manager
+    name: lookup
+    kind: function
+    latency_ms: 0
+    summary: "HIT if the tier holds the chunk, else MISS (this tier never answers RETRY)."
+    sources: ["vllm/v1/kv_offload/tiering/base.py:191-205", "vllm/v1/kv_offload/tiering/example/manager.py:85-97"]
+    errors: [{code: key-error, status: 0, retryable: false}]
+    request: {type: object, required: [tier_id, key], properties: {tier_id: {type: string, examples: [tier0]}, key: {type: string, examples: [blk-0]}, req_id: {type: string, examples: [test]}}}
+    response: {type: object, properties: {result: {type: string, enum: [MISS, HIT, HIT_PENDING, RETRY]}}}
+    behavior:
+      - if: "!(input.tier_id in state.tiers)"
+        then: [{fail: {code: key-error, status: 0, message: "= 'unknown tier ' + input.tier_id"}}]
+      - title: Presence in the chunk dict
+        source: "vllm/v1/kv_offload/tiering/example/manager.py:97"
+        return: {result: "= input.key in state.tiers[input.tier_id].chunks ? 'HIT' : 'MISS'"}
+
+  - component: example-secondary-tier-manager
+    name: submit-store
+    kind: function
+    latency_ms: 0
+    summary: "Store a job's chunks from the primary tier: record every key and complete the job at once."
+    sources: ["vllm/v1/kv_offload/tiering/base.py:206-233", "vllm/v1/kv_offload/tiering/example/manager.py:99-123", "vllm/v1/kv_offload/tiering/base.py:67-77"]
+    errors: [{code: assertion-error, status: 0, retryable: false}]
+    request:
+      type: object
+      required: [tier_id, job_id, keys, chunk_ids]
+      properties:
+        tier_id: {type: string, examples: [tier0]}
+        job_id: {type: integer, examples: [0]}
+        keys: {type: array, items: {type: string}, examples: [[blk-0]]}
+        chunk_ids: {type: array, items: {type: integer}, examples: [[0]]}
+        req_id: {type: string, examples: [test]}
+    response: {type: object, properties: {stored: {type: integer}}}
+    behavior:
+      - if: "size(input.keys) != size(input.chunk_ids)"
+        then:
+          - title: Every key needs its primary chunk
+            source: "vllm/v1/kv_offload/tiering/example/manager.py:110-112"
+            fail: {code: assertion-error, status: 0, message: "= 'Length mismatch: ' + string(size(input.keys)) + ' keys but ' + string(size(input.chunk_ids)) + ' chunk_ids'"}
+      - title: Record the keys and a successful JobResult
+        source: "vllm/v1/kv_offload/tiering/example/manager.py:114-123"
+        set:
+          state.tiers: "= merge(state.tiers, {input.tier_id: {'chunks': state.tiers[input.tier_id].chunks + input.keys.filter(k, !(k in state.tiers[input.tier_id].chunks)), 'completed_jobs': state.tiers[input.tier_id].completed_jobs + [{'job_id': input.job_id, 'success': true, 'transfer_time': 0.0}]}})"
+      - return: {stored: "= size(input.keys)"}
+
+  - component: example-secondary-tier-manager
+    name: submit-load
+    kind: function
+    latency_ms: 0
+    summary: "Load a job's chunks into primary slots: fails the whole job if any key is missing, else completes at once."
+    sources: ["vllm/v1/kv_offload/tiering/base.py:234-258", "vllm/v1/kv_offload/tiering/example/manager.py:125-154", "vllm/v1/kv_offload/tiering/base.py:79-91"]
+    errors: [{code: assertion-error, status: 0, retryable: false}]
+    request:
+      type: object
+      required: [tier_id, job_id, keys, chunk_ids]
+      properties:
+        tier_id: {type: string, examples: [tier0]}
+        job_id: {type: integer, examples: [1]}
+        keys: {type: array, items: {type: string}, examples: [[blk-0]]}
+        chunk_ids: {type: array, items: {type: integer}, examples: [[2]]}
+    response: {type: object, properties: {success: {type: boolean}}}
+    behavior:
+      - if: "size(input.keys) != size(input.chunk_ids)"
+        then:
+          - title: Every key needs its primary slot
+            source: "vllm/v1/kv_offload/tiering/example/manager.py:136-138"
+            fail: {code: assertion-error, status: 0, message: "= 'Length mismatch: ' + string(size(input.keys)) + ' keys but ' + string(size(input.chunk_ids)) + ' chunk_ids'"}
+      - set: {vars.ok: "= input.keys.all(k, k in state.tiers[input.tier_id].chunks)"}
+      - title: A missing key fails the job; otherwise it succeeds at once
+        source: "vllm/v1/kv_offload/tiering/example/manager.py:140-154"
+        set:
+          state.tiers: "= merge(state.tiers, {input.tier_id: {'completed_jobs': state.tiers[input.tier_id].completed_jobs + [vars.ok ? {'job_id': input.job_id, 'success': true, 'transfer_time': 0.0} : {'job_id': input.job_id, 'success': false}]}})"
+      - return: {success: "= vars.ok"}
+
+  - component: example-secondary-tier-manager
+    name: get-finished-jobs
+    kind: function
+    latency_ms: 0
+    summary: "Return and clear the jobs completed since the last poll."
+    sources: ["vllm/v1/kv_offload/tiering/base.py:259-271", "vllm/v1/kv_offload/tiering/example/manager.py:156-167"]
+    request: {type: object, required: [tier_id], properties: {tier_id: {type: string, examples: [tier0]}}}
+    response: {type: object, properties: {jobs: {type: array}}}
+    behavior:
+      - title: Swap out the completed list
+        source: "vllm/v1/kv_offload/tiering/example/manager.py:165-167"
+        set:
+          vars.jobs: "= state.tiers[input.tier_id].completed_jobs"
+          state.tiers: "= merge(state.tiers, {input.tier_id: {'completed_jobs': []}})"
+      - return: {jobs: "= vars.jobs"}
+
+  - component: example-secondary-tier-manager
+    name: on-new-request
+    kind: function
+    latency_ms: 0
+    summary: "The example tier asks for chunk-level offloading (the default RequestOffloadingContext)."
+    sources: ["vllm/v1/kv_offload/tiering/base.py:295-306", "vllm/v1/kv_offload/tiering/example/manager.py:169-171", "vllm/v1/kv_offload/base.py:129-142"]
+    request: {type: object, required: [tier_id, req_id], properties: {tier_id: {type: string, examples: [tier0]}, req_id: {type: string, examples: [test]}}}
+    response: {type: object, properties: {policy: {type: string, enum: [chunk_level, request_level]}}}
+    behavior:
+      - title: RequestOffloadingContext() - chunk level
+        source: "vllm/v1/kv_offload/tiering/example/manager.py:169-171"
+        return: {policy: chunk_level}
+
+  - component: example-secondary-tier-manager
+    name: drain-jobs
+    kind: function
+    latency_ms: 0
+    summary: "Wait for every submitted job: a synchronous tier has nothing in flight, so its results are already queued."
+    sources: ["vllm/v1/kv_offload/tiering/base.py:342-357", "vllm/v1/kv_offload/tiering/example/manager.py:173-176"]
+    request: {type: object, required: [tier_id], properties: {tier_id: {type: string, examples: [tier0]}}}
+    response: {type: object, properties: {pending: {type: integer}}}
+    behavior:
+      - title: Nothing in flight; completed jobs stay for the next get_finished_jobs
+        source: "vllm/v1/kv_offload/tiering/example/manager.py:173-176"
+        return: {pending: "= size(state.tiers[input.tier_id].completed_jobs)"}
+
+  - component: example-secondary-tier-manager
+    name: get-num-chunks
+    kind: function
+    latency_ms: 0
+    summary: "How many chunks the tier holds."
+    sources: ["vllm/v1/kv_offload/tiering/example/manager.py:178-180"]
+    request: {type: object, required: [tier_id], properties: {tier_id: {type: string, examples: [tier0]}}}
+    response: {type: object, properties: {num_chunks: {type: integer}}}
+    behavior:
+      - return: {num_chunks: "= size(state.tiers[input.tier_id].chunks)"}
+
+  # ============================================ round 4: tiering manager
+  - component: tiering-offloading-manager
+    name: init
+    kind: function
+    latency_ms: 0
+    summary: "Compose the primary CPU tier with the given secondary tiers (by tier id, in order)."
+    sources: ["vllm/v1/kv_offload/tiering/manager.py:191-250"]
+    request: {type: object, required: [secondary_tiers], properties: {secondary_tiers: {type: array, items: {type: string}, examples: [[tier0, tier1]]}}}
+    response: {type: object, properties: {num_tiers: {type: integer}}}
+    behavior:
+      - title: No jobs, no request state
+        source: "vllm/v1/kv_offload/tiering/manager.py:191-250"
+        set:
+          state.secondary_tiers: "= input.secondary_tiers"
+          state.jobs: {}
+          state.next_job_id: 0
+          state.req_state: {}
+          state.pending_promotions: []
+          state.load_sources: {}
+      - return: {num_tiers: "= size(input.secondary_tiers)"}
+
+  - component: tiering-offloading-manager
+    name: on-new-request
+    kind: function
+    latency_ms: 0
+    summary: "Ask every secondary tier for its offload policy: request-level if any tier wants it, else chunk-level."
+    sources: ["vllm/v1/kv_offload/tiering/manager.py:812-841", "vllm/v1/kv_offload/tiering/base.py:114-115", "vllm/v1/kv_offload/tiering/manager.py:159-160"]
+    request: {type: object, required: [req_id], properties: {req_id: {type: string, examples: [test]}}}
+    response: {type: object, properties: {policy: {type: string}}}
+    behavior:
+      - set: {vars.levels: []}
+      - title: Each tier's preference
+        source: "vllm/v1/kv_offload/tiering/manager.py:827-834"
+        foreach: "= state.secondary_tiers"
+        as: tid
+        steps:
+          - call: example-secondary-tier-manager.on-new-request
+            input: {tier_id: "= vars.tid", req_id: "= input.req_id"}
+            as: pol
+          - set: {vars.levels: "= vars.pol.value.policy == 'request_level' ? vars.levels + [vars.tid] : vars.levels"}
+      - set:
+          state.req_state: "= merge(state.req_state, {input.req_id: {'pending_primary_stores': 0, 'is_finished': false, 'request_level_tiers': vars.levels}})"
+      - return: {policy: "= size(vars.levels) > 0 ? 'request_level' : 'chunk_level'"}
+
+  - component: tiering-offloading-manager
+    name: lookup
+    kind: function
+    latency_ms: 0
+    summary: "Primary first (HIT / HIT_PENDING short-circuit); on a primary miss ask each secondary tier, and on a hit reserve a primary slot and queue a promotion (HIT_PENDING), or MISS if the primary is full."
+    sources: ["vllm/v1/kv_offload/tiering/manager.py:396-479", "vllm/v1/kv_offload/tiering/manager.py:489-541", "vllm/v1/kv_offload/tiering/base.py:117-118", "vllm/v1/kv_offload/tiering/manager.py:162-163"]
+    request: {type: object, required: [key, req_id], properties: {key: {type: string, examples: [blk-0]}, req_id: {type: string, examples: [test]}}}
+    response: {type: object, properties: {result: {type: string, enum: [MISS, HIT, HIT_PENDING, RETRY]}}}
+    behavior:
+      - title: Primary tier lookup
+        source: "vllm/v1/kv_offload/tiering/manager.py:431-444"
+        call: cpu-offloading-manager.lookup
+        input: {key: "= input.key", req_id: "= input.req_id"}
+        as: p
+      - if: "vars.p.value.result == 'HIT' || vars.p.value.result == 'HIT_PENDING'"
+        then: [{return: {result: "= vars.p.value.result"}}]
+      - title: Ask each secondary tier in order (a busy tier's RETRY would be returned if no tier hits; the example tier never answers RETRY)
+        source: "vllm/v1/kv_offload/tiering/manager.py:446-479"
+        foreach: "= state.secondary_tiers"
+        as: tid
+        steps:
+          - call: example-secondary-tier-manager.lookup
+            input: {tier_id: "= vars.tid", key: "= input.key", req_id: "= input.req_id"}
+            as: s
+          - if: "vars.s.value.result == 'HIT'"
+            then:
+              - title: Promote - reserve the primary slot now (ref_cnt -1) so later lookups see it in flight
+                source: "vllm/v1/kv_offload/tiering/manager.py:509-541"
+                call: cpu-offloading-manager.prepare-store
+                input: {keys: ["= input.key"], req_id: "= input.req_id"}
+                as: w
+              - if: "vars.w.value == null"
+                then:
+                  - title: Primary tier full; treat the chunk as unavailable
+                    source: "vllm/v1/kv_offload/tiering/manager.py:519-523"
+                    return: {result: MISS}
+              - set:
+                  state.pending_promotions: "= state.pending_promotions + [{'tier_id': vars.tid, 'req_id': input.req_id, 'keys': vars.w.value.keys_to_store, 'chunk_ids': vars.w.value.chunk_ids}]"
+                  state.load_sources: "= merge(state.load_sources, {input.req_id: {input.key: 'HOST'}})"
+              - return: {result: HIT_PENDING}
+      - title: No tier holds the chunk
+        source: "vllm/v1/kv_offload/tiering/manager.py:477-479"
+        return: {result: MISS}
+
+  - component: tiering-offloading-manager
+    name: prepare-store
+    kind: function
+    latency_ms: 0
+    summary: "GPU->primary store: the primary tier reserves chunks; a request with new chunks has one more pending primary store (cascades follow on completion)."
+    sources: ["vllm/v1/kv_offload/tiering/manager.py:618-676"]
+    request: {type: object, required: [keys, req_id], properties: {keys: {type: array, items: {type: string}, examples: [[blk-0]]}, req_id: {type: string, examples: [test]}}}
+    response: {type: [object, "null"], properties: {keys_to_store: {type: array, items: {type: string}}, chunk_ids: {type: array, items: {type: integer}}, evicted_keys: {type: array, items: {type: string}}}}
+    behavior:
+      - call: cpu-offloading-manager.prepare-store
+        input: {keys: "= input.keys", req_id: "= input.req_id"}
+        as: pr
+      - if: "vars.pr.value == null"
+        then:
+          - title: The primary tier cannot store them
+            source: "vllm/v1/kv_offload/tiering/manager.py:653-654"
+            return: null
+      - if: "size(vars.pr.value.keys_to_store) > 0 && input.req_id in state.req_state"
+        then:
+          - title: One more GPU->primary store in flight for this request
+            source: "vllm/v1/kv_offload/tiering/manager.py:656-658"
+            set: {state.req_state: "= merge(state.req_state, {input.req_id: {'pending_primary_stores': state.req_state[input.req_id].pending_primary_stores + 1}})"}
+      - return: "= vars.pr.value"
+
+  - component: tiering-offloading-manager
+    name: create-store-job
+    kind: function
+    latency_ms: 0
+    summary: "Pin the chunks in the primary tier (a cascade read, no request access counted) and register a store job."
+    sources: ["vllm/v1/kv_offload/tiering/manager.py:783-810", "vllm/v1/kv_offload/tiering/base.py:120-126"]
+    request: {type: object, required: [keys, req_id, tier_id], properties: {keys: {type: array, items: {type: string}}, req_id: {type: string}, tier_id: {type: string}}}
+    response: {type: object, properties: {job_id: {type: integer}, chunk_ids: {type: array, items: {type: integer}}}}
+    behavior:
+      - title: primary.prepare_read pins the chunks
+        source: "vllm/v1/kv_offload/tiering/manager.py:797"
+        call: cpu-offloading-manager.prepare-load
+        input: {keys: "= input.keys", req_id: "= input.req_id", record_access: false}
+        as: rd
+      - title: Allocate a job id and track the job
+        source: "vllm/v1/kv_offload/tiering/manager.py:799-809"
+        set:
+          vars.job_id: "= state.next_job_id"
+          state.next_job_id: "= state.next_job_id + 1"
+          state.jobs: "= merge(state.jobs, {string(state.next_job_id): {'tier_id': input.tier_id, 'keys': input.keys, 'is_promotion': false, 'req_id': input.req_id}})"
+      - return: {job_id: "= vars.job_id", chunk_ids: "= vars.rd.value.chunk_ids"}
+
+  - component: tiering-offloading-manager
+    name: complete-store
+    kind: function
+    latency_ms: 0
+    summary: "A GPU->primary write finished: complete it in the primary tier, then cascade the chunks to every secondary tier."
+    sources: ["vllm/v1/kv_offload/tiering/manager.py:736-781"]
+    request:
+      type: object
+      required: [keys, req_id]
+      properties:
+        keys: {type: array, items: {type: string}, examples: [[blk-0]]}
+        req_id: {type: string, examples: [test]}
+        success: {type: boolean, default: true}
+    response: {type: object, properties: {cascaded_to: {type: array, items: {type: string}}}}
+    behavior:
+      - title: Make the chunks loadable in the primary tier
+        source: "vllm/v1/kv_offload/tiering/manager.py:760"
+        call: cpu-offloading-manager.complete-store
+        input: {keys: "= input.keys", req_id: "= input.req_id", success: "= !has(input.success) || input.success"}
+      - set: {vars.cascaded: []}
+      - if: "!has(input.success) || input.success"
+        then:
+          - title: Cascade to every secondary tier
+            source: "vllm/v1/kv_offload/tiering/manager.py:762-772"
+            foreach: "= state.secondary_tiers"
+            as: tid
+            steps:
+              - call: tiering-offloading-manager.create-store-job
+                input: {keys: "= input.keys", req_id: "= input.req_id", tier_id: "= vars.tid"}
+                as: job
+              - call: example-secondary-tier-manager.submit-store
+                input: {tier_id: "= vars.tid", job_id: "= vars.job.value.job_id", keys: "= input.keys", chunk_ids: "= vars.job.value.chunk_ids", req_id: "= input.req_id"}
+              - set: {vars.cascaded: "= vars.cascaded + [vars.tid]"}
+      - if: "input.req_id in state.req_state && state.req_state[input.req_id].pending_primary_stores > 0"
+        then:
+          - title: One fewer pending primary store
+            source: "vllm/v1/kv_offload/tiering/manager.py:776-780"
+            set: {state.req_state: "= merge(state.req_state, {input.req_id: {'pending_primary_stores': state.req_state[input.req_id].pending_primary_stores - 1}})"}
+      - return: {cascaded_to: "= vars.cascaded"}
+
+  - component: tiering-offloading-manager
+    name: on-schedule-end
+    kind: function
+    latency_ms: 0
+    summary: "End of a scheduler step: process finished tier jobs (cascades unpin primary chunks; promotions make them loadable), then submit one batched promotion load per tier and request."
+    sources: ["vllm/v1/kv_offload/tiering/manager.py:881-910", "vllm/v1/kv_offload/tiering/manager.py:322-358", "vllm/v1/kv_offload/tiering/manager.py:543-567", "vllm/v1/kv_offload/tiering/manager.py:281-320", "vllm/v1/kv_offload/base.py:143-149", "vllm/v1/kv_offload/base.py:395-401", "vllm/v1/kv_offload/tiering/base.py:333-340"]
+    errors: [{code: assertion-error, status: 0, retryable: false}]
+    request: {type: object}
+    response: {type: object, properties: {finished_jobs: {type: integer}, promotions_submitted: {type: integer}}}
+    behavior:
+      - set: {vars.n_done: 0}
+      - title: Poll every tier for finished jobs
+        source: "vllm/v1/kv_offload/tiering/manager.py:332-358"
+        foreach: "= state.secondary_tiers"
+        as: tid
+        steps:
+          - call: example-secondary-tier-manager.get-finished-jobs
+            input: {tier_id: "= vars.tid"}
+            as: fin
+          - foreach: "= vars.fin.value.jobs"
+            as: jr
+            steps:
+              - if: "!(string(vars.jr.job_id) in state.jobs)"
+                then:
+                  - title: A finished job the manager never registered
+                    source: "vllm/v1/kv_offload/tiering/manager.py:336-340"
+                    fail: {code: assertion-error, status: 0, message: "= 'Finished job_id ' + string(vars.jr.job_id) + ' not in _jobs'"}
+              - set:
+                  vars.jm: "= state.jobs[string(vars.jr.job_id)]"
+                  state.jobs: "= omit(state.jobs, string(vars.jr.job_id))"
+                  vars.n_done: "= vars.n_done + 1"
+              - if: "vars.jm.is_promotion"
+                then:
+                  - title: Promotion done - the promoted chunks become ready in the primary tier (or are dropped on failure)
+                    source: "vllm/v1/kv_offload/tiering/manager.py:281-320"
+                    call: cpu-offloading-manager.complete-store
+                    input: {keys: "= vars.jm.keys", req_id: "= vars.jm.req_id", success: "= vars.jr.success"}
+                else:
+                  - title: Cascade done - unpin the primary chunks it read
+                    source: "vllm/v1/kv_offload/tiering/manager.py:351-356"
+                    call: cpu-offloading-manager.complete-load
+                    input: {keys: "= vars.jm.keys", req_id: "= vars.jm.req_id"}
+      - set:
+          vars.pending: "= state.pending_promotions"
+          state.pending_promotions: []
+      - title: Flush promotions - one batched submit_load per (tier, request)
+        source: "vllm/v1/kv_offload/tiering/manager.py:549-567"
+        foreach: "= vars.pending"
+        as: pp
+        steps:
+          - set:
+              vars.jid: "= state.next_job_id"
+              state.next_job_id: "= state.next_job_id + 1"
+              state.jobs: "= merge(state.jobs, {string(state.next_job_id): {'tier_id': vars.pp.tier_id, 'keys': vars.pp.keys, 'is_promotion': true, 'req_id': vars.pp.req_id}})"
+          - call: example-secondary-tier-manager.submit-load
+            input: {tier_id: "= vars.pp.tier_id", job_id: "= vars.jid", keys: "= vars.pp.keys", chunk_ids: "= vars.pp.chunk_ids"}
+      - return: {finished_jobs: "= vars.n_done", promotions_submitted: "= size(vars.pending)"}
+
+  - component: tiering-offloading-manager
+    name: on-request-finished
+    kind: function
+    latency_ms: 0
+    summary: "A request finished: tell the primary tier, and drop the request's state once no GPU->primary store is pending."
+    sources: ["vllm/v1/kv_offload/tiering/manager.py:843-879", "vllm/v1/kv_offload/tiering/manager.py:170-174", "vllm/v1/kv_offload/tiering/base.py:308-322"]
+    request: {type: object, required: [req_id], properties: {req_id: {type: string, examples: [test]}}}
+    response: {type: object, properties: {finalized: {type: boolean}}}
+    behavior:
+      - call: cpu-offloading-manager.on-request-finished
+        input: {req_id: "= input.req_id"}
+      - if: "!(input.req_id in state.req_state)"
+        then: [{return: {finalized: false}}]
+      - set: {state.req_state: "= merge(state.req_state, {input.req_id: {'is_finished': true}})"}
+      - if: "state.req_state[input.req_id].pending_primary_stores != 0"
+        then:
+          - title: A GPU->primary store is still pending; finalize later
+            source: "vllm/v1/kv_offload/tiering/manager.py:866-867"
+            return: {finalized: false}
+      - title: Finalize - secondary tiers' on_request_finished, then forget the request
+        source: "vllm/v1/kv_offload/tiering/manager.py:871-879"
+        set:
+          state.req_state: "= omit(state.req_state, input.req_id)"
+          state.load_sources: "= omit(state.load_sources, input.req_id)"
+      - return: {finalized: true}
+
+  # ============================================ round 4: P2P control transport
+  - component: zmq-transport
+    name: fatal-monitor-events
+    kind: function
+    latency_ms: 0
+    summary: "The socket-monitor events treated as fatal: disconnected and closed, plus the handshake failures this pyzmq defines."
+    sources: ["vllm/v1/kv_offload/tiering/p2p/control/zmq.py:30-56"]
+    request: {type: object, properties: {pyzmq_has_handshake_events: {type: boolean, default: true}}}
+    response: {type: object, properties: {events: {type: array, items: {type: string}}, mask_covers_all: {type: boolean}}}
+    behavior:
+      - title: Disconnected and closed always; handshake failures when pyzmq has them
+        source: "vllm/v1/kv_offload/tiering/p2p/control/zmq.py:38-49"
+        set:
+          vars.events: "= ['EVENT_DISCONNECTED', 'EVENT_CLOSED'] + (!has(input.pyzmq_has_handshake_events) || input.pyzmq_has_handshake_events ? ['EVENT_HANDSHAKE_FAILED_AUTH', 'EVENT_HANDSHAKE_FAILED_PROTOCOL', 'EVENT_HANDSHAKE_FAILED_NO_DETAIL'] : [])"
+      - title: The monitor mask ORs every fatal event in
+        source: "vllm/v1/kv_offload/tiering/p2p/control/zmq.py:54-56"
+        return: {events: "= vars.events", mask_covers_all: true}
+
+  - component: zmq-transport
+    name: connect
+    kind: function
+    latency_ms: 0
+    summary: "Open an outbound DEALER to a peer with a monitor socket on the fatal-event mask; the connection starts alive."
+    sources: ["vllm/v1/kv_offload/tiering/p2p/control/zmq.py:164-187", "vllm/v1/kv_offload/tiering/p2p/control/zmq.py:248-291"]
+    request: {type: object, required: [peer_id], properties: {peer_id: {type: string, examples: ["127.0.0.1:5555"]}}}
+    response: {type: object, properties: {alive: {type: boolean}}}
+    behavior:
+      - title: New connection, monitored for fatal events
+        source: "vllm/v1/kv_offload/tiering/p2p/control/zmq.py:274-279"
+        set: {state.connections: "= merge(state.connections, {input.peer_id: {'alive': true, 'closed': false}})"}
+      - return: {alive: true}
+
+  - component: zmq-transport
+    name: check-monitors
+    kind: function
+    latency_ms: 0
+    summary: "Drain each live connection's monitor events; the first fatal event marks the connection dead (its sockets stay open until close)."
+    sources: ["vllm/v1/kv_offload/tiering/p2p/control/zmq.py:345-375", "vllm/v1/kv_offload/tiering/p2p/control/zmq.py:122-129"]
+    request:
+      type: object
+      required: [events]
+      properties:
+        events: {type: object, description: "peer id -> monitor events received since the last poll, in order", examples: [{"127.0.0.1:5555": [EVENT_CONNECTED, EVENT_DISCONNECTED]}]}
+    response: {type: object, properties: {dead: {type: array, items: {type: string}}}}
+    behavior:
+      - call: zmq-transport.fatal-monitor-events
+        as: fatal
+      - set:
+          vars.dead: "= input.events.transformList(p, evs, p).filter(p, p in state.connections && state.connections[p].alive && input.events[p].exists(e, e in vars.fatal.value.events))"
+      - title: mark_dead on a fatal event
+        source: "vllm/v1/kv_offload/tiering/p2p/control/zmq.py:366-375"
+        set: {state.connections: "= merge(state.connections, vars.dead.transformMapEntry(i, p, {p: {'alive': false}}))"}
+      - return: {dead: "= vars.dead"}
+
+  - component: zmq-transport
+    name: send
+    kind: function
+    latency_ms: 0
+    summary: "Send a msgpack message to a peer; refused on a dead or closed connection."
+    sources: ["vllm/v1/kv_offload/tiering/p2p/control/zmq.py:88-95", "vllm/v1/kv_offload/tiering/p2p/control/zmq.py:105-107"]
+    errors: [{code: runtime-error, status: 0, retryable: false}]
+    request: {type: object, required: [peer_id, msg], properties: {peer_id: {type: string, examples: ["127.0.0.1:5555"]}, msg: {type: object, examples: [{type: hello}]}}}
+    response: {type: object, properties: {sent: {type: boolean}}}
+    behavior:
+      - if: "!(input.peer_id in state.connections) || !state.connections[input.peer_id].alive"
+        then:
+          - title: Send on a dead connection
+            source: "vllm/v1/kv_offload/tiering/p2p/control/zmq.py:90-93"
+            fail: {code: runtime-error, status: 0, message: "= 'ZmqConnection: send on closed connection to ' + input.peer_id"}
+      - return: {sent: true}
+
+  # ============================================ round 4: sliding window manager
+  - component: sliding-window-manager
+    name: find-longest-cache-hit
+    kind: function
+    latency_ms: 0
+    summary: "Scan the block hashes right to left for cdiv(window - 1, block_size) contiguous cached blocks (one more with EAGLE); earlier blocks are null. Without such a run the hit is the run that starts at block 0."
+    sources: ["vllm/v1/core/single_type_kv_cache_manager.py:939-1051"]
+    request:
+      type: object
+      required: [block_hashes, max_length, sliding_window]
+      properties:
+        block_hashes: {type: array, items: {type: string}}
+        max_length: {type: integer, examples: [64]}
+        sliding_window: {type: integer, examples: [8]}
+        use_eagle: {type: boolean, default: false}
+    response: {type: object, properties: {block_ids: {type: array, items: {type: integer}}, hit_length: {type: integer}}}
+    behavior:
+      - set:
+          vars.bs: "= int(config['block-size'])"
+          vars.eagle: "= has(input.use_eagle) && input.use_eagle"
+      - title: Blocks a hit must hold contiguously
+        source: "vllm/v1/core/single_type_kv_cache_manager.py:939-946"
+        set:
+          vars.need: "= (input.sliding_window - 1 + vars.bs - 1) / vars.bs + (vars.eagle ? 1 : 0)"
+          vars.n: "= math.least(input.max_length / vars.bs, size(input.block_hashes))"
+          vars.run: 0
+          vars.ids: "= lists.range(math.least(input.max_length / vars.bs, size(input.block_hashes))).map(i, 0)"
+          vars.end: -1
+      - title: Right to left, count contiguous cached blocks
+        source: "vllm/v1/core/single_type_kv_cache_manager.py:988-1007"
+        foreach: "= lists.range(vars.n).map(k, vars.n - 1 - k)"
+        as: i
+        steps:
+          - call: block-pool.get-cached-block
+            input: {block_hash: "= input.block_hashes[vars.i]"}
+            as: c
+          - if: "vars.c.value.block == null"
+            then:
+              - set: {vars.run: 0}
+              - continue: true
+          - set:
+              vars.ids: "= lists.range(vars.n).map(j, j == vars.i ? vars.c.value.block.block_id : vars.ids[j])"
+              vars.run: "= vars.run + 1"
+          - if: "vars.run >= vars.need"
+            then:
+              - title: Enough of the window is cached; the hit ends after this run
+                source: "vllm/v1/core/single_type_kv_cache_manager.py:999-1004"
+                set: {vars.end: "= vars.i + vars.run"}
+              - break: true
+      - if: "vars.end < 0"
+        then:
+          - title: No full window - keep only a run that starts at the first block
+            source: "vllm/v1/core/single_type_kv_cache_manager.py:1008-1010"
+            set: {vars.end: "= vars.run"}
+      - set: {vars.hit: "= vars.ids.slice(0, vars.end)"}
+      - if: "vars.eagle && size(vars.hit) > 0"
+        then:
+          - title: EAGLE drops the last hit block
+            source: "vllm/v1/core/single_type_kv_cache_manager.py:1018-1021"
+            set: {vars.hit: "= vars.hit.slice(0, size(vars.hit) - 1)"}
+      - return: {block_ids: "= vars.hit", hit_length: "= size(vars.hit) * vars.bs"}
+
+  - component: sliding-window-manager
+    name: allocate
+    kind: function
+    latency_ms: 0
+    summary: "Append block ids to the request's sliding-window block table (after the hit or new allocation)."
+    sources: ["vllm/v1/core/single_type_kv_cache_manager.py:48-160"]
+    request: {type: object, required: [request_id, block_ids], properties: {request_id: {type: string}, block_ids: {type: array, items: {type: integer}}}}
+    response: {type: object, properties: {block_ids: {type: array, items: {type: integer}}}}
+    behavior:
+      - title: req_to_blocks[request_id].extend(blocks)
+        source: "vllm/v1/core/single_type_kv_cache_manager.py:48-160"
+        set: {state.req_to_blocks: "= merge(state.req_to_blocks, {input.request_id: (input.request_id in state.req_to_blocks ? state.req_to_blocks[input.request_id] : []) + input.block_ids})"}
+      - return: {block_ids: "= state.req_to_blocks[input.request_id]"}
+
+  - component: sliding-window-manager
+    name: remove-skipped-blocks
+    kind: function
+    latency_ms: 0
+    summary: "Free the blocks wholly before the window (computed - window + 1 - extra retained tokens), back to front until an already-null slot, replacing each with the null block."
+    sources: ["vllm/v1/core/single_type_kv_cache_manager.py:672-710", "vllm/v1/core/single_type_kv_cache_manager.py:645-670", "vllm/v1/core/single_type_kv_cache_manager.py:1135-1170"]
+    request:
+      type: object
+      required: [request_id, processed_computed_tokens, sliding_window]
+      properties:
+        request_id: {type: string}
+        processed_computed_tokens: {type: integer, examples: [7]}
+        sliding_window: {type: integer, examples: [4]}
+        extra_retained_tokens: {type: integer, default: 0}
+    response: {type: object, properties: {freed: {type: array, items: {type: integer}}, block_ids: {type: array, items: {type: integer}}}}
+    behavior:
+      - title: Tokens before the window (never negative)
+        source: "vllm/v1/core/single_type_kv_cache_manager.py:1135-1170"
+        set:
+          vars.skipped: "= math.greatest(0, input.processed_computed_tokens - input.sliding_window + 1 - (has(input.extra_retained_tokens) ? input.extra_retained_tokens : 0))"
+      - if: "vars.skipped <= 0 || !(input.request_id in state.req_to_blocks)"
+        then:
+          - title: Every token is inside the window
+            source: "vllm/v1/core/single_type_kv_cache_manager.py:695-700"
+            return: {freed: [], block_ids: "= input.request_id in state.req_to_blocks ? state.req_to_blocks[input.request_id] : []"}
+      - set:
+          vars.blocks: "= state.req_to_blocks[input.request_id]"
+      - set:
+          vars.last: "= math.least(vars.skipped / int(config['block-size']), size(vars.blocks))"
+      - title: Back to front, stop at the first slot already nulled
+        source: "vllm/v1/core/single_type_kv_cache_manager.py:663-668"
+        set:
+          vars.firstnull: "= lists.range(vars.last).filter(i, vars.blocks[i] == 0)"
+      - set:
+          vars.start: "= size(vars.firstnull) > 0 ? vars.firstnull[size(vars.firstnull) - 1] + 1 : 0"
+      - set:
+          vars.freed: "= lists.range(vars.last - vars.start).map(k, vars.blocks[vars.last - 1 - k])"
+      - if: "size(vars.freed) > 0"
+        then:
+          - title: Return them to the pool and null their slots
+            source: "vllm/v1/core/single_type_kv_cache_manager.py:669-670"
+            call: block-pool.free-blocks
+            input: {block_ids: "= vars.freed"}
+          - set:
+              state.req_to_blocks: "= merge(state.req_to_blocks, {input.request_id: lists.range(size(vars.blocks)).map(i, i >= vars.start && i < vars.last ? 0 : vars.blocks[i])})"
+      - return: {freed: "= vars.freed", block_ids: "= state.req_to_blocks[input.request_id]"}
+
+  # ============================================ round 4: KV cache events
+  - component: block-pool
+    name: take-events
+    kind: function
+    latency_ms: 0
+    summary: "Take and clear the queued KV cache events; always empty when KV events are off."
+    sources: ["vllm/v1/core/block_pool.py:890-901", "vllm/v1/core/kv_cache_utils.py:96-99"]
+    request: {type: object}
+    response: {type: object, properties: {events: {type: array}}}
+    behavior:
+      - if: "!config['enable-kv-cache-events']"
+        then:
+          - title: Events disabled
+            source: "vllm/v1/core/block_pool.py:897-898"
+            return: {events: []}
+      - title: Swap out the queue
+        source: "vllm/v1/core/block_pool.py:899-901"
+        set:
+          vars.ev: "= state.kv_event_queue"
+          state.kv_event_queue: []
+      - return: {events: "= vars.ev"}
+
+  - component: kv-cache-manager
+    name: take-events
+    kind: function
+    latency_ms: 0
+    summary: "Take the block pool's events and annotate each BlockStored with its group's spec kind (full attention for Llama)."
+    sources: ["vllm/v1/core/kv_cache_manager.py:696-721"]
+    request: {type: object}
+    response: {type: object, properties: {events: {type: array}}}
+    behavior:
+      - call: block-pool.take-events
+        as: ev
+      - title: Annotate BlockStored events with kv_cache_spec_kind and sliding window
+        source: "vllm/v1/core/kv_cache_manager.py:704-720"
+        return:
+          events: "= vars.ev.value.events.map(e, e.type == 'BlockStored' && e.group_idx < size(state.kv_cache_groups) ? merge(e, {'kv_cache_spec_kind': state.kv_cache_groups[e.group_idx].kind, 'kv_cache_spec_sliding_window': null}) : e)"
+
+  # ============================================ round 4: circular buffer manager
+  - component: circular-buffer-manager
+    name: get-num-blocks-to-allocate
+    kind: function
+    latency_ms: 0
+    summary: "One block for a request without its ring block yet, else none."
+    sources: ["vllm/v1/core/single_type_kv_cache_manager.py:1191-1201"]
+    request: {type: object, required: [request_id], properties: {request_id: {type: string}}}
+    response: {type: object, properties: {num_blocks: {type: integer}}}
+    behavior:
+      - return: {num_blocks: "= input.request_id in state.req_to_blocks && size(state.req_to_blocks[input.request_id]) > 0 ? 0 : 1"}
+
+  - component: circular-buffer-manager
+    name: allocate-new-blocks
+    kind: function
+    latency_ms: 0
+    summary: "Claim the request's ring block from the pool the first time; later calls allocate nothing."
+    sources: ["vllm/v1/core/single_type_kv_cache_manager.py:1203-1206"]
+    request: {type: object, required: [request_id], properties: {request_id: {type: string}}}
+    response: {type: object, properties: {new_block_ids: {type: array, items: {type: integer}}}}
+    behavior:
+      - if: "input.request_id in state.req_to_blocks && size(state.req_to_blocks[input.request_id]) > 0"
+        then:
+          - title: The ring block is already claimed
+            source: "vllm/v1/core/single_type_kv_cache_manager.py:1205-1206"
+            return: {new_block_ids: []}
+      - title: _claim_ring_block takes one block
+        source: "vllm/v1/core/single_type_kv_cache_manager.py:1205-1206"
+        call: block-pool.get-new-blocks
+        input: {num_blocks: 1}
+        as: nb
+      - set: {state.req_to_blocks: "= merge(state.req_to_blocks, {input.request_id: vars.nb.value.block_ids})"}
+      - return: {new_block_ids: "= vars.nb.value.block_ids"}
+
+  - component: circular-buffer-manager
+    name: find-longest-cache-hit
+    kind: function
+    latency_ms: 0
+    summary: "Never a prefix hit: the ring holds only the latest state."
+    sources: ["vllm/v1/core/single_type_kv_cache_manager.py:1217-1230"]
+    request: {type: object, properties: {block_hashes: {type: array, items: {type: string}}, max_length: {type: integer}}}
+    response: {type: object, properties: {block_ids: {type: array, items: {type: integer}}, hit_length: {type: integer}}}
+    behavior:
+      - title: Empty hit for every group
+        source: "vllm/v1/core/single_type_kv_cache_manager.py:1230"
+        return: {block_ids: [], hit_length: 0}
+
+  - component: circular-buffer-manager
+    name: cache-blocks
+    kind: function
+    latency_ms: 0
+    summary: "Nothing to cache (no prefix caching for the ring)."
+    sources: ["vllm/v1/core/single_type_kv_cache_manager.py:1232-1240"]
+    request: {type: object, properties: {request_id: {type: string}, num_tokens: {type: integer}}}
+    response: {type: object, properties: {cached: {type: integer}}}
+    behavior:
+      - title: No-op
+        source: "vllm/v1/core/single_type_kv_cache_manager.py:1240"
+        return: {cached: 0}
+
+  - component: circular-buffer-manager
+    name: remove-skipped-blocks
+    kind: function
+    latency_ms: 0
+    summary: "Nothing is ever skipped: the ring block is reused in place (get_num_skipped_tokens is 0)."
+    sources: ["vllm/v1/core/single_type_kv_cache_manager.py:1251-1260"]
+    request: {type: object, properties: {request_id: {type: string}, processed_computed_tokens: {type: integer}}}
+    response: {type: object, properties: {freed: {type: array, items: {type: integer}}}}
+    behavior:
+      - title: No-op
+        source: "vllm/v1/core/single_type_kv_cache_manager.py:1257"
+        return: {freed: []}
+
+  # ============================================ round 4: Mamba-aligned chunking
+  - component: scheduler
+    name: mamba-block-aligned-split
+    kind: function
+    latency_ms: 0
+    summary: "Clip a prefill chunk (Mamba 'align' cache mode) so it ends where a reusable SSM state must be materialized: block boundaries, the last cacheable block, the prompt's partial-tail hash boundary and a shared-prefix junction."
+    sources: ["vllm/v1/core/sched/scheduler.py:443-556", "vllm/v1/kv_cache_interface.py:1110-1122", "vllm/v1/core/sched/scheduler.py:723-727"]
+    request:
+      type: object
+      required: [num_computed_tokens, num_new_tokens, num_prompt_tokens, num_tokens]
+      properties:
+        num_computed_tokens: {type: integer, examples: [16]}
+        num_new_tokens: {type: integer, examples: [8]}
+        num_new_local_computed_tokens: {type: integer, default: 0}
+        num_external_computed_tokens: {type: integer, default: 0}
+        num_prompt_tokens: {type: integer, examples: [24]}
+        num_tokens: {type: integer, examples: [24]}
+        shared_prefix_boundary: {type: integer, default: 0, description: "Request.shared_prefix_boundary: where this prompt stops sharing a detected prefix (0 = none)."}
+        hash_block_size: {type: [integer, "null"], default: null}
+        mamba_partial_cache_hit: {type: boolean, default: false}
+        use_eagle_block_drop: {type: boolean, default: false}
+        mamba_shared_prefix_checkpoint: {type: boolean, default: false, description: "enable_mamba_shared_prefix_checkpoint"}
+    response: {type: object, properties: {num_new_tokens: {type: integer}, end: {type: integer}}}
+    behavior:
+      - set:
+          vars.start: "= input.num_computed_tokens + input.num_new_local_computed_tokens + input.num_external_computed_tokens"
+          vars.pend: "= math.greatest(input.num_prompt_tokens, input.num_tokens - 1)"
+          vars.bs: "= int(config['block-size'])"
+          vars.hbs: "= input.hash_block_size != null ? input.hash_block_size : int(config['block-size'])"
+          vars.e: "= input.use_eagle_block_drop"
+      - if: "vars.start >= vars.pend"
+        then:
+          - title: Past the prefill - no split
+            source: "vllm/v1/core/sched/scheduler.py:464-465"
+            return: {num_new_tokens: "= input.num_new_tokens", end: "= vars.start + input.num_new_tokens"}
+      - title: Last cacheable block position (back off one block with EAGLE; else leave one token to recompute)
+        source: "vllm/v1/kv_cache_interface.py:1118-1122"
+        set:
+          vars.last: "= math.greatest(((vars.e ? input.num_tokens : input.num_tokens - 1) / vars.bs * vars.bs) - (vars.e ? vars.bs : 0), 0)"
+          vars.end: "= vars.start + input.num_new_tokens"
+          vars.maxp: "= int(config['long-prefill-token-threshold']) > 0 ? math.least(int(config['max-num-batched-tokens']), int(config['long-prefill-token-threshold'])) : int(config['max-num-batched-tokens'])"
+      - if: "vars.end < vars.pend && ((vars.end / vars.bs * vars.bs) > vars.start || vars.bs <= vars.maxp)"
+        then:
+          - title: A mid-prefill chunk ends on a block boundary
+            source: "vllm/v1/core/sched/scheduler.py:507-514"
+            set: {vars.end: "= vars.end / vars.bs * vars.bs"}
+      - title: Mandatory stops - next block boundary, last cacheable block, the prompt's partial-tail checkpoint, the shared-prefix junction
+        source: "vllm/v1/core/sched/scheduler.py:516-553"
+        set:
+          vars.tail: "= input.mamba_partial_cache_hit ? math.greatest(((vars.e ? input.num_prompt_tokens : input.num_prompt_tokens - 1) / vars.hbs * vars.hbs) - (vars.e ? vars.hbs : 0), 0) : 0"
+          vars.j: "= input.shared_prefix_boundary"
+      - set:
+          vars.jstop: "= input.mamba_shared_prefix_checkpoint && vars.j <= input.num_prompt_tokens ? vars.j : vars.start + (vars.j - vars.start) / vars.bs * vars.bs"
+      - set:
+          vars.stops: "= [vars.start % vars.bs != 0 ? (vars.start / vars.bs + 1) * vars.bs : 0, vars.last, vars.last < vars.tail && vars.tail < input.num_prompt_tokens ? vars.tail : 0, vars.start < vars.j && vars.j < vars.end ? vars.jstop : 0].filter(x, vars.start < x && x < vars.end)"
+      - title: Stop at the earliest one strictly inside the chunk
+        source: "vllm/v1/core/sched/scheduler.py:555-556"
+        set: {vars.end: "= size(vars.stops) > 0 ? math.least(vars.stops) : vars.end"}
+      - return: {num_new_tokens: "= math.greatest(vars.end - vars.start, 0)", end: "= vars.end"}
+
+  # ============================================ round 4: block-size resolution
+  - component: kv-cache-utils
+    name: resolve-kv-cache-block-sizes
+    kind: function
+    latency_ms: 0
+    summary: "(scheduler block size, hash block size): one group uses block_size x DCP for both; several use the LCM of their block sizes, and hash at prefix_match_unit or the GCD of the cacheable groups' sizes, unless caching is off or a Mamba group is not in align mode."
+    sources: ["vllm/v1/core/kv_cache_utils.py:804-906"]
+    errors: [{code: value-error, status: 0, retryable: false}]
+    request:
+      type: object
+      required: [groups]
+      properties:
+        groups: {type: array, items: {type: object, properties: {kind: {type: string}, block_size: {type: integer}, dcp_sharded: {type: boolean}, prefix_cacheable: {type: boolean}, mamba_cache_mode: {type: string}}}}
+        prefix_match_unit: {type: [integer, "null"], default: null}
+        dcp: {type: integer, default: 1}
+    response: {type: object, properties: {scheduler_block_size: {type: integer}, hash_block_size: {type: integer}}}
+    behavior:
+      - set:
+          vars.caching: "= config['enable-prefix-caching'] || config['kv-connector'] != ''"
+      - if: "size(input.groups) <= 1"
+        then:
+          - set:
+              vars.bs: "= int(config['block-size']) * (size(input.groups) == 1 && has(input.groups[0].dcp_sharded) && !input.groups[0].dcp_sharded ? 1 : input.dcp)"
+          - if: "input.prefix_match_unit != null && input.prefix_match_unit != vars.bs && size(input.groups) == 1 && vars.caching"
+            then:
+              - title: One group hits on the block size only
+                source: "vllm/v1/core/kv_cache_utils.py:833-845"
+                fail: {code: value-error, status: 0, message: "= 'Invalid prefix_match_unit=' + string(input.prefix_match_unit) + '; with a single KV cache group, prefix-cache hits land on the block size (' + string(vars.bs) + '). Unset it or set it to ' + string(vars.bs) + '.'"}
+          - title: Single group - both sizes are the block size (times DCP)
+            source: "vllm/v1/core/kv_cache_utils.py:830-849"
+            return: {scheduler_block_size: "= vars.bs", hash_block_size: "= vars.bs"}
+      - set:
+          vars.sizes: "= input.groups.map(g, g.kind == 'mamba' || (has(g.dcp_sharded) && !g.dcp_sharded) ? g.block_size : g.block_size * input.dcp)"
+      - title: Scheduler block size = LCM of the groups' sizes
+        source: "vllm/v1/core/kv_cache_utils.py:851-854"
+        set:
+          vars.lcm: "= vars.sizes.filter(m, vars.sizes.all(x, m % x == 0)).size() > 0 ? math.least(vars.sizes.filter(m, vars.sizes.all(x, m % x == 0))) : lists.range(4096).map(k, (k + 1) * math.greatest(vars.sizes)).filter(m, vars.sizes.all(x, m % x == 0))[0]"
+      - if: "!vars.caching || input.groups.exists(g, g.kind == 'mamba' && (!has(g.mamba_cache_mode) || g.mamba_cache_mode != 'align'))"
+        then:
+          - title: No block hashing, or a Mamba group outside align mode - no finer hashing
+            source: "vllm/v1/core/kv_cache_utils.py:857-871"
+            return: {scheduler_block_size: "= vars.lcm", hash_block_size: "= vars.lcm"}
+      - set:
+          vars.hs: "= lists.range(size(input.groups)).filter(i, !has(input.groups[i].prefix_cacheable) || input.groups[i].prefix_cacheable).map(i, vars.sizes[i])"
+      - set:
+          vars.hs: "= size(vars.hs) > 0 ? vars.hs : vars.sizes"
+      - title: Hash unit = prefix_match_unit, else the GCD of the cacheable sizes
+        source: "vllm/v1/core/kv_cache_utils.py:873-879"
+        set:
+          vars.h: "= input.prefix_match_unit != null ? input.prefix_match_unit : math.greatest(lists.range(math.least(vars.hs)).map(k, k + 1).filter(d, vars.hs.all(x, x % d == 0)))"
+      - if: "vars.hs.exists(x, x % vars.h != 0)"
+        then:
+          - title: Every cacheable group's size must be a multiple of the hash unit
+            source: "vllm/v1/core/kv_cache_utils.py:880-886"
+            fail: {code: value-error, status: 0, message: "= 'Invalid prefix_match_unit=' + string(vars.h) + '; prefix-cacheable KV cache group block sizes must be divisible by prefix_match_unit.'"}
+      - return: {scheduler_block_size: "= vars.lcm", hash_block_size: "= vars.h"}
+
+  - component: kv-cache-utils
+    name: generate-scheduler-kv-cache-config
+    kind: function
+    latency_ms: 0
+    summary: "The scheduler's KV cache config: every worker's config must agree on num_blocks; take the first, and represent a uniform-type group by one of its layer specs."
+    sources: ["vllm/v1/core/kv_cache_utils.py:2276-2297"]
+    errors: [{code: assertion-error, status: 0, retryable: false}]
+    request:
+      type: object
+      required: [kv_cache_configs]
+      properties:
+        kv_cache_configs: {type: array, items: {type: object, properties: {num_blocks: {type: integer}, kv_cache_groups: {type: array}}}}
+    response: {type: object, properties: {num_blocks: {type: integer}, kv_cache_groups: {type: array}}}
+    behavior:
+      - if: "input.kv_cache_configs.exists(c, c.num_blocks != input.kv_cache_configs[0].num_blocks)"
+        then:
+          - title: Workers disagree on the block count
+            source: "vllm/v1/core/kv_cache_utils.py:2280-2282"
+            fail: {code: assertion-error, status: 0, message: "all workers must have the same num_blocks"}
+      - title: Copy the first config; a uniform-type group keeps one layer's spec
+        source: "vllm/v1/core/kv_cache_utils.py:2289-2297"
+        return:
+          num_blocks: "= input.kv_cache_configs[0].num_blocks"
+          kv_cache_groups: "= input.kv_cache_configs[0].kv_cache_groups.map(g, has(g.layer_specs) && size(g.layer_specs) > 0 ? merge(g, {'spec': g.layer_specs[0], 'layer_specs': []}) : g)"
+
+  # ============================================ round 4: RSWA, chunked local, registry
+  - component: rswa-manager
+    name: remove-skipped-blocks
+    kind: function
+    latency_ms: 0
+    summary: "Without the prompt length it frees nothing (full attention); with it, free the gap blocks between the prompt's last block and the decode window start."
+    sources: ["vllm/v1/core/single_type_kv_cache_manager.py:900-930", "vllm/v1/core/single_type_kv_cache_manager.py:645-670"]
+    request:
+      type: object
+      required: [request_id, processed_computed_tokens, rswa_window]
+      properties:
+        request_id: {type: string}
+        processed_computed_tokens: {type: integer}
+        rswa_window: {type: integer}
+        num_prompt_tokens: {type: [integer, "null"], default: null}
+        block_ids: {type: array, items: {type: integer}, default: [], description: "Seeds the request's table on first use."}
+    response: {type: object, properties: {freed: {type: array, items: {type: integer}}, block_ids: {type: array, items: {type: integer}}}}
+    behavior:
+      - if: "!(input.request_id in state.req_to_blocks)"
+        then: [{set: {state.req_to_blocks: "= merge(state.req_to_blocks, {input.request_id: input.block_ids})"}}]
+      - if: "input.num_prompt_tokens == null"
+        then:
+          - title: No prompt length - the full-attention rule (nothing outside the window)
+            source: "vllm/v1/core/single_type_kv_cache_manager.py:916-920"
+            return: {freed: [], block_ids: "= state.req_to_blocks[input.request_id]"}
+      - set:
+          vars.bs: "= int(config['block-size'])"
+          vars.blocks: "= state.req_to_blocks[input.request_id]"
+      - title: Gap = [cdiv(prompt, bs), max(prompt, processed - window) // bs)
+        source: "vllm/v1/core/single_type_kv_cache_manager.py:922-930"
+        set:
+          vars.first: "= (input.num_prompt_tokens + vars.bs - 1) / vars.bs"
+          vars.last: "= math.least(math.greatest(input.num_prompt_tokens, input.processed_computed_tokens - input.rswa_window) / vars.bs, size(vars.blocks))"
+      - set:
+          vars.nulls: "= lists.range(math.greatest(vars.first, vars.last) - vars.first).map(k, vars.first + k).filter(i, vars.blocks[i] == 0)"
+      - set:
+          vars.start: "= size(vars.nulls) > 0 ? vars.nulls[size(vars.nulls) - 1] + 1 : vars.first"
+      - set:
+          vars.freed: "= lists.range(math.greatest(vars.last - vars.start, 0)).map(k, vars.blocks[vars.last - 1 - k])"
+      - if: "size(vars.freed) > 0"
+        then:
+          - title: Free the gap back to front and null its slots
+            source: "vllm/v1/core/single_type_kv_cache_manager.py:663-670"
+            call: block-pool.free-blocks
+            input: {block_ids: "= vars.freed"}
+          - set: {state.req_to_blocks: "= merge(state.req_to_blocks, {input.request_id: lists.range(size(vars.blocks)).map(i, i >= vars.start && i < vars.last ? 0 : vars.blocks[i])})"}
+      - return: {freed: "= vars.freed", block_ids: "= state.req_to_blocks[input.request_id]"}
+
+  - component: chunked-local-attention-manager
+    name: find-longest-cache-hit
+    kind: function
+    latency_ms: 0
+    summary: "Blocks before the current attention chunk are computed for free (null); then cached blocks are adopted from the chunk start until the first miss."
+    sources: ["vllm/v1/core/single_type_kv_cache_manager.py:1268-1366"]
+    request:
+      type: object
+      required: [block_hashes, max_length, attention_chunk_size]
+      properties:
+        block_hashes: {type: array, items: {type: string}}
+        max_length: {type: integer, examples: [15]}
+        attention_chunk_size: {type: integer, examples: [8]}
+    response: {type: object, properties: {block_ids: {type: array, items: {type: integer}}, hit_length: {type: integer}}}
+    behavior:
+      - set:
+          vars.bs: "= int(config['block-size'])"
+      - title: Blocks before the local window are null (already computed)
+        source: "vllm/v1/core/single_type_kv_cache_manager.py:1340-1355"
+        set:
+          vars.maxb: "= math.least(input.max_length / vars.bs, size(input.block_hashes))"
+          vars.sidx: "= input.max_length > 0 ? input.max_length / input.attention_chunk_size * input.attention_chunk_size / vars.bs : 0"
+      - set:
+          vars.ids: "= lists.range(vars.sidx).map(i, 0)"
+      - title: Adopt cached blocks from the window start until a miss
+        source: "vllm/v1/core/single_type_kv_cache_manager.py:1356-1364"
+        foreach: "= lists.range(math.greatest(vars.sidx, vars.maxb) - vars.sidx).map(k, vars.sidx + k)"
+        as: i
+        steps:
+          - call: block-pool.get-cached-block
+            input: {block_hash: "= input.block_hashes[vars.i]"}
+            as: c
+          - if: "vars.c.value.block == null"
+            then: [{break: true}]
+          - set: {vars.ids: "= vars.ids + [vars.c.value.block.block_id]"}
+      - return: {block_ids: "= vars.ids", hit_length: "= size(vars.ids) * vars.bs"}
+
+  - component: kv-cache-spec-registry
+    name: register-all-kvcache-specs
+    kind: function
+    latency_ms: 0
+    summary: "Built-in registration: each spec class to its manager and uniform-type base (MLA, RSWA, hidden-state and sink specs group with full attention), plus the HiSparse source role."
+    sources: ["vllm/v1/core/single_type_kv_cache_manager.py:2633-2707", "vllm/v1/kv_cache_spec_registry.py:60-102"]
+    errors: [{code: assertion-error, status: 0, retryable: false}]
+    request: {type: object, properties: {extra: {type: array, default: [], items: {type: object, properties: {spec: {type: string}, manager: {type: string}, base: {type: string}}}, description: "Platform plugin registrations (register_custom_kv_cache_specs)."}}}
+    response: {type: object, properties: {num_specs: {type: integer}}}
+    behavior:
+      - set:
+          vars.builtin:
+            FullAttentionSpec: {manager: FullAttentionManager, base: FullAttentionSpec}
+            HiSparseHotSpec: {manager: HiSparseHotManager, base: HiSparseHotSpec}
+            HiSparseResidentSpec: {manager: HiSparseResidentManager, base: HiSparseResidentSpec}
+            SlidingWindowSpec: {manager: SlidingWindowManager, base: SlidingWindowSpec}
+            CircularBufferSpec: {manager: CircularBufferManager, base: CircularBufferSpec}
+            SlidingWindowMLASpec: {manager: SlidingWindowManager, base: SlidingWindowMLASpec}
+            MambaSpec: {manager: MambaManager, base: MambaSpec}
+            ChunkedLocalAttentionSpec: {manager: ChunkedLocalAttentionManager, base: ChunkedLocalAttentionSpec}
+            CrossAttentionSpec: {manager: CrossAttentionManager, base: CrossAttentionSpec}
+            MLAAttentionSpec: {manager: FullAttentionManager, base: FullAttentionSpec}
+            RSWASpec: {manager: RSWAManager, base: FullAttentionSpec}
+            HiddenStateCacheSpec: {manager: FullAttentionManager, base: FullAttentionSpec}
+            SinkFullAttentionSpec: {manager: SinkFullAttentionManager, base: FullAttentionSpec}
+      - if: "input.extra.exists(e, e.spec in vars.builtin && vars.builtin[e.spec].manager != e.manager)"
+        then:
+          - title: A conflicting re-registration of a spec class
+            source: "vllm/v1/kv_cache_spec_registry.py:86-95"
+            fail: {code: assertion-error, status: 0, message: "Conflicting registration for KVCacheSpec"}
+      - title: Register the built-ins, the HiSparse source role, then the platform's custom specs
+        source: "vllm/v1/core/single_type_kv_cache_manager.py:2635-2707"
+        set:
+          state.specs: "= merge(vars.builtin, input.extra.transformMapEntry(i, e, {e.spec: {'manager': e.manager, 'base': e.base}}))"
+          state.roles: {hisparse_source: HiSparseSourceManager}
+      - return: {num_specs: "= size(state.specs)"}
+
+  - component: kv-cache-spec-registry
+    name: get-manager-class
+    kind: function
+    latency_ms: 0
+    summary: "The manager for a spec: a role-registered manager first, else the first registered class along the spec's MRO; none if unregistered."
+    sources: ["vllm/v1/kv_cache_spec_registry.py:114-138", "vllm/v1/core/single_type_kv_cache_manager.py:2585-2630"]
+    request: {type: object, required: [mro], properties: {mro: {type: array, items: {type: string}, examples: [[MLAAttentionSpec, FullAttentionSpec, AttentionSpec, KVCacheSpec]]}, role: {type: [string, "null"], default: null}}}
+    response: {type: object, properties: {manager: {type: [string, "null"]}}}
+    behavior:
+      - if: "input.role != null && input.role in state.roles"
+        then:
+          - title: The group's role picks the manager
+            source: "vllm/v1/kv_cache_spec_registry.py:129-130"
+            return: {manager: "= state.roles[input.role]"}
+      - set: {vars.hit: "= input.mro.filter(c, c in state.specs)"}
+      - title: Walk up the MRO to the first registered base
+        source: "vllm/v1/kv_cache_spec_registry.py:131-138"
+        return: {manager: "= size(vars.hit) > 0 ? state.specs[vars.hit[0]].manager : dyn(null)"}

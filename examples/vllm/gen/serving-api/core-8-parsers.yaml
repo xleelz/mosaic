@@ -1,0 +1,553 @@
+# Round 4: the parser framework (ParserManager, the registries, DelegatingParser, the ParserEngine state machine, Inkling).
+components:
+  - {id: parser-manager, name: ParserManager, kind: module, parent: api-server, layer: parsers, summary: "Composes the --reasoning-parser and --tool-call-parser classes into one Parser class (DelegatingParser or a model-specific subclass).", sources: ["vllm/parser/parser_manager.py:22-268"]}
+  - id: tool-parser-manager
+    name: ToolParserManager
+    kind: module
+    parent: api-server
+    layer: parsers
+    summary: "Registry of tool-call parsers by name: eager registrations and lazy (module, class) mappings imported on first use."
+    sources: ["vllm/tool_parsers/abstract_tool_parser.py:235-380", "vllm/tool_parsers/__init__.py:23-244"]
+    tags: [cache]
+    state:
+      schema: {type: object, properties: {tool_parsers: {type: object}, lazy_parsers: {type: object}}}
+      initial:
+        tool_parsers: {}
+        lazy_parsers: {dots: DotsToolParser, deepseek_v31: DeepSeekV31ToolParser, deepseek_v32: DeepSeekV32EngineToolParser, deepseek_v4: DeepSeekV4EngineToolParser, deepseek_v41: DeepSeekV41EngineToolParser, cohere_command3: CohereCommand3ToolParser, cohere_command4: CohereCommand4ToolParser, ernie45: Ernie45ToolParser, glm45: Glm47MoeModelToolParser, glm47: Glm47MoeModelToolParser, ling3: Ling3ToolParser, granite-20b-fc: Granite20bFCToolParser, granite: GraniteEngineToolParser, granite4: Granite4ToolParser, hermes: Hermes2ProToolParser, hf: ResponseTemplateToolParser, poolside_v1: PoolsideV1ToolParser, hunyuan_a13b: HunyuanA13BToolParser, hy_v3: HYV3ToolParser, hy_v4: HYV4ToolParser, internlm: Internlm2ToolParser, jamba: JambaToolParser, lfm2: Lfm2ToolParser, kimi_k2: KimiK2ToolParser, kimi_k3: KimiK3ToolParser, k2_horizon: K2HorizonToolParser, llama3_json: Llama3JsonToolParser, llama4_json: Llama3JsonToolParser, llama4_pythonic: Llama4PythonicToolParser, longcat: LongcatFlashToolParser, mimo: MiMoToolParser, minimax_m2: MinimaxM2ToolParser, minimax_m3: MinimaxM3ToolParser, minicpm5: MiniCPM5XMLToolParser, mistral: MistralToolParser, olmo3: Olmo3PythonicToolParser, plamo3: Plamo3EngineToolParser, muse_glimmer: MuseGlimmerToolParser, openai: GptOssToolParser, phi4_mini_json: Phi4MiniJsonToolParser, pythonic: PythonicToolParser, qwen3_coder: Qwen3EngineToolParser, qwen3_json: Hermes2ProToolParser, qwen3_xml: Qwen3EngineToolParser, seed_oss: SeedOssEngineToolParser, step3: Step3ToolParser, step3p5: Step3p5ToolParser, inkling: InklingEngineToolParser, xlam: xLAMToolParser, gigachat3: GigaChat3ToolParser, functiongemma: FunctionGemmaToolParser, gemma4: Gemma4EngineToolParser, apertus: ApertusToolParser}
+  - {id: delegating-parser, name: DelegatingParser, kind: module, parent: api-server, layer: parsers, summary: "The Parser that runs a ReasoningParser and then a ToolParser over a model output, complete (parse) or streamed (parse_delta).", sources: ["vllm/parser/abstract_parser.py:120-1042"]}
+  - {id: parser-engine, name: ParserEngine, kind: module, parent: api-server, layer: parsers, summary: "The declarative parser engine: a lexer over the config's terminal markers and a (state, terminal) transition table that routes text to reasoning, content or tool-call arguments.", sources: ["vllm/parser/engine/streaming_parser_engine.py:112-737", "vllm/parser/engine/parser_engine.py:93-700"]}
+  - {id: inkling-parser, name: InklingParser, kind: module, parent: api-server, layer: parsers, summary: "Inkling's typed content blocks (<|message_model|>, <|content_text|>, <|content_thinking|>, <|content_invoke_tool_json|>, <|end_message|>) parsed by one ParserEngine config.", sources: ["vllm/parser/inkling.py:46-332"]}
+interfaces:
+  # ---------------------------------------------------------------- registries
+  - component: tool-parser-manager
+    name: get-tool-parser
+    kind: function
+    summary: "ToolParserManager.get_tool_parser(name): an eagerly registered class, else a lazily registered one imported and cached on first access, else KeyError."
+    sources: ["vllm/tool_parsers/abstract_tool_parser.py:246-284"]
+    attributes: {racy_in_code: "check-then-import-then-store with no lock: two first lookups of one lazy name both import the module and both cache the class in tool_parsers (vllm/tool_parsers/abstract_tool_parser.py:262-276); the class is the same, so the race is benign"}
+    request: {type: object, properties: {name: {type: string, examples: [llama3_json]}}, required: [name]}
+    errors: [{code: key-error, status: 0, retryable: false}]
+    behavior:
+      - if: "input.name in state.tool_parsers"
+        then: [{source: "vllm/tool_parsers/abstract_tool_parser.py:254-255", return: {parser_class: "= state.tool_parsers[input.name]"}}]
+      - if: "input.name in state.lazy_parsers"
+        then:
+          - title: "_load_lazy_parser: import the module, take the class and cache it in tool_parsers"
+            source: "vllm/tool_parsers/abstract_tool_parser.py:262-276"
+            set: {state.tool_parsers: "= merge(state.tool_parsers, {input.name: state.lazy_parsers[input.name]})"}
+          - return: {parser_class: "= state.lazy_parsers[input.name]"}
+      - title: Unknown parser name
+        source: "vllm/tool_parsers/abstract_tool_parser.py:260"
+        fail: {code: key-error, message: "= 'Tool parser \\'' + input.name + '\\' not found.'"}
+  - component: parser-manager
+    name: get-tool-parser
+    kind: function
+    summary: "ParserManager.get_tool_parser: no tool parser unless auto tool choice is enabled and a name is given; an unregistered name is a TypeError naming the flag."
+    sources: ["vllm/parser/parser_manager.py:25-56"]
+    request: {type: object, properties: {tool_parser_name: {type: [string, "null"], default: null}, enable_auto_tools: {type: boolean, default: false}}}
+    errors: [{code: type-error, status: 0, retryable: false}]
+    behavior:
+      - if: "!(has(input.enable_auto_tools) && input.enable_auto_tools) || !has(input.tool_parser_name) || input.tool_parser_name == null"
+        then: [{source: "vllm/parser/parser_manager.py:36-37", return: {parser_class: null}}]
+      - source: "vllm/parser/parser_manager.py:40-55"
+        call: tool-parser-manager.get-tool-parser
+        input: {name: "= input.tool_parser_name"}
+        as: tp
+        on_error:
+          - title: "Any lookup failure becomes TypeError"
+            source: "vllm/parser/parser_manager.py:50-55"
+            fail: {code: type-error, message: "= 'Error: --enable-auto-tool-choice requires tool_parser:\\'' + input.tool_parser_name + '\\' which has not been registered'"}
+      - return: {parser_class: "= vars.tp.value.parser_class"}
+  - component: parser-manager
+    name: get-reasoning-parser
+    kind: function
+    summary: "ParserManager.get_reasoning_parser: None for no name, else the registry's class; a lookup failure is a TypeError."
+    sources: ["vllm/parser/parser_manager.py:58-74"]
+    request: {type: object, properties: {reasoning_parser_name: {type: [string, "null"], default: null}}}
+    errors: [{code: type-error, status: 0, retryable: false}]
+    behavior:
+      - if: "!has(input.reasoning_parser_name) || input.reasoning_parser_name == null || input.reasoning_parser_name == ''"
+        then: [{source: "vllm/parser/parser_manager.py:67-68", return: {parser_class: null}}]
+      - source: "vllm/parser/parser_manager.py:69-73"
+        call: reasoning-parser-manager.get-reasoning-parser
+        input: {name: "= input.reasoning_parser_name"}
+        as: rp
+        on_error:
+          - source: "vllm/parser/parser_manager.py:72-73"
+            fail: {code: type-error, message: "= 'reasoning_parser_name=\\'' + input.reasoning_parser_name + '\\' has not been registered'"}
+      - return: {parser_class: "= vars.rp.value.parser_class"}
+  - component: parser-manager
+    name: get-parser
+    kind: function
+    summary: "ParserManager.get_parser / _compose_parser: resolve both parsers and pick the Parser class: Harmony, the hf response-template parser (alone only), KimiK3Parser, CohereCommandParser, MiniCPM-V, else a DelegatingParser subclass carrying both classes."
+    sources: ["vllm/parser/parser_manager.py:99-268"]
+    request:
+      type: object
+      properties:
+        tool_parser_name: {type: [string, "null"], default: null}
+        reasoning_parser_name: {type: [string, "null"], default: null}
+        enable_auto_tools: {type: boolean, default: false}
+        is_harmony: {type: boolean, default: false}
+        tool_strict_level: {type: string, default: auto}
+    errors: [{code: type-error, status: 0, retryable: false}]
+    behavior:
+      - set:
+          vars.tn: "= has(input.tool_parser_name) && input.tool_parser_name != null ? input.tool_parser_name : ''"
+          vars.rn: "= has(input.reasoning_parser_name) && input.reasoning_parser_name != null ? input.reasoning_parser_name : ''"
+      - if: "vars.tn == '' && vars.rn == ''"
+        then: [{title: Neither parser named, source: "vllm/parser/parser_manager.py:157-158", return: {parser_class: null}}]
+      - source: "vllm/parser/parser_manager.py:160"
+        call: parser-manager.get-reasoning-parser
+        input: {reasoning_parser_name: "= vars.rn == '' ? null : vars.rn"}
+        as: r
+      - source: "vllm/parser/parser_manager.py:161-163"
+        call: parser-manager.get-tool-parser
+        input: {tool_parser_name: "= vars.tn == '' ? null : vars.tn", enable_auto_tools: "= has(input.enable_auto_tools) && input.enable_auto_tools"}
+        as: t
+      - if: "vars.r.value.parser_class == null && vars.t.value.parser_class == null"
+        then: [{title: "A tool parser without --enable-auto-tool-choice and no reasoning parser: no Parser", source: "vllm/parser/parser_manager.py:165-166", return: {parser_class: null}}]
+      - set:
+          vars.classes: "= {'reasoning_parser_cls': vars.r.value.parser_class, 'tool_parser_cls': vars.t.value.parser_class, 'tool_strict_level': has(input.tool_strict_level) ? input.tool_strict_level : 'auto'}"
+      - if: "has(input.is_harmony) && input.is_harmony"
+        then: [{source: "vllm/parser/parser_manager.py:170-176", return: "= merge(vars.classes, {'parser_class': 'HarmonyParser', 'base': 'HarmonyParser'})"}]
+      - if: "vars.rn == 'hf' || vars.tn == 'hf'"
+        then:
+          - title: "The hf response-template parser cannot be combined with other parsers"
+            source: "vllm/parser/parser_manager.py:178-187"
+            when: "!(vars.rn in ['hf', '']) || !(vars.tn in ['hf', ''])"
+            fail: {code: type-error, message: "The hf parser cannot be combined with other reasoning or tool call parsers"}
+          - source: "vllm/parser/parser_manager.py:188-210"
+            return: "= merge(vars.classes, {'parser_class': '_ResponseTemplateParser', 'base': 'ResponseTemplateParser'})"
+      - if: "vars.rn == 'kimi_k3' || vars.tn == 'kimi_k3'"
+        then: [{title: "kimi_k3 composes onto KimiK3Parser", source: "vllm/parser/parser_manager.py:212-223", return: "= merge(vars.classes, {'parser_class': '_KimiK3Parser', 'base': 'KimiK3Parser'})"}]
+      - if: "vars.rn in ['cohere_command3', 'cohere_command4'] || vars.tn in ['cohere_command3', 'cohere_command4']"
+        then: [{source: "vllm/parser/parser_manager.py:225-238", return: "= merge(vars.classes, {'parser_class': '_CohereCommandParser', 'base': 'CohereCommandParser'})"}]
+      - if: "vars.rn == 'minicpmv' || vars.tn == 'minicpmv'"
+        then: [{source: "vllm/parser/parser_manager.py:240-251", return: "= merge(vars.classes, {'parser_class': '_MiniCPMVParser', 'base': 'MiniCPMVUnifiedParser'})"}]
+      - title: "Default: a DelegatingParser subclass with both classes"
+        source: "vllm/parser/parser_manager.py:253-268"
+        return: "= merge(vars.classes, {'parser_class': '_Parser', 'base': 'DelegatingParser'})"
+  # ---------------------------------------------------------------- Inkling
+  - component: inkling-parser
+    name: config
+    kind: function
+    summary: "inkling_config(): the terminal markers and the (state, terminal) transition table; generation starts in MESSAGE_HEADER (after a prefilled <|message_model|>); tool payloads are {\"name\", \"args\"} JSON whose args object is carved out by _inkling_arg_converter."
+    sources: ["vllm/parser/inkling.py:86-216", "vllm/parser/inkling.py:67-84"]
+    request: {type: object, properties: {}}
+    behavior:
+      - title: "Terminals: <|end_message|> is labelled THINK_END but ends every block kind; the transitions carry the meaning"
+        source: "vllm/parser/inkling.py:88-97"
+        set:
+          vars.t:
+            MSG_MODEL: "<|message_model|>"
+            TEXT_START: "<|content_text|>"
+            THINK_START: "<|content_thinking|>"
+            THINK_END: "<|end_message|>"
+            END_SAMPLING: "<|content_model_end_sampling|>"
+            TOOL_START: "<|content_invoke_tool_json|>"
+            TOOL_TEXT: "<|content_invoke_tool_text|>"
+            TOOL_ERROR: "<|content_tool_error|>"
+      - title: "Transitions between blocks, inside a header and inside a thinking block; THINK_END/END_SAMPLING close every block (a header closed this way is flushed as text)"
+        source: "vllm/parser/inkling.py:98-192"
+        set:
+          vars.tr:
+            "CONTENT|MSG_MODEL": {next: MESSAGE_HEADER, events: []}
+            "CONTENT|TEXT_START": {next: CONTENT, events: [REASONING_END]}
+            "CONTENT|THINK_START": {next: REASONING, events: [REASONING_START]}
+            "CONTENT|TOOL_START": {next: TOOL_ARGS, events: [REASONING_END, TOOL_CALL_START]}
+            "CONTENT|TOOL_TEXT": {next: CONTENT, events: [REASONING_END]}
+            "CONTENT|TOOL_ERROR": {next: CONTENT, events: [REASONING_END]}
+            "MESSAGE_HEADER|MSG_MODEL": {next: MESSAGE_HEADER, events: []}
+            "MESSAGE_HEADER|TEXT_START": {next: CONTENT, events: [REASONING_END]}
+            "MESSAGE_HEADER|THINK_START": {next: REASONING, events: [REASONING_START]}
+            "MESSAGE_HEADER|TOOL_START": {next: TOOL_ARGS, events: [REASONING_END, TOOL_CALL_START]}
+            "MESSAGE_HEADER|TOOL_TEXT": {next: CONTENT, events: [REASONING_END]}
+            "MESSAGE_HEADER|TOOL_ERROR": {next: CONTENT, events: [REASONING_END]}
+            "REASONING|THINK_START": {next: REASONING, events: []}
+            "REASONING|TOOL_START": {next: TOOL_ARGS, events: [REASONING_END, TOOL_CALL_START]}
+            "CONTENT|THINK_END": {next: CONTENT, events: []}
+            "REASONING|THINK_END": {next: CONTENT, events: []}
+            "TOOL_ARGS|THINK_END": {next: CONTENT, events: [TOOL_CALL_END]}
+            "MESSAGE_HEADER|THINK_END": {next: CONTENT, events: [TEXT_CHUNK]}
+            "CONTENT|END_SAMPLING": {next: CONTENT, events: []}
+            "REASONING|END_SAMPLING": {next: CONTENT, events: [REASONING_END]}
+            "TOOL_ARGS|END_SAMPLING": {next: CONTENT, events: [TOOL_CALL_END]}
+            "MESSAGE_HEADER|END_SAMPLING": {next: CONTENT, events: [TEXT_CHUNK]}
+      - source: "vllm/parser/inkling.py:194-216"
+        return: {name: inkling, initial_state: MESSAGE_HEADER, wait_for_reasoning: true, terminals: "= vars.t", transitions: "= vars.tr", tool_payload: name_args_json}
+  # ---------------------------------------------------------------- engine
+  - component: parser-engine
+    name: parse-complete
+    kind: function
+    summary: "StreamingParserEngine.parse_complete over a whole text: lex the terminal markers, route the text between them by state (CONTENT to content, REASONING to reasoning, TOOL_ARGS to the current call's arguments, MESSAGE_HEADER held back), and apply each (state, terminal) transition's events; a marker with no transition is plain text in the current state."
+    sources: ["vllm/parser/engine/streaming_parser_engine.py:351-381", "vllm/parser/engine/streaming_parser_engine.py:409-585"]
+    request:
+      type: object
+      properties:
+        config: {type: object, description: "a ParserEngineConfig: initial_state, terminals {label: marker}, transitions {'STATE|LABEL': {next, events}}, tool_payload"}
+        text: {type: string, examples: ["<|content_text|>intro<|end_message|>"]}
+        initial_state: {type: [string, "null"], default: null}
+        finish: {type: boolean, default: true, description: "run finish() after the text (a complete output); false while a stream is still open"}
+      required: [config, text]
+    behavior:
+      - set:
+          vars.state: "= has(input.initial_state) && input.initial_state != null ? input.initial_state : input.config.initial_state"
+          vars.rest: "= input.text"
+          vars.content: ""
+          vars.raw_content: ""
+          vars.reasoning: ""
+          vars.header: ""
+          vars.args: ""
+          vars.calls: []
+          vars.events: []
+          vars.done: false
+          vars.labels: "= input.config.terminals.map(l, l)"
+      - title: "Lex: find the earliest terminal marker in the remaining text (markers are atomic special tokens)"
+        source: "vllm/parser/engine/streaming_parser_engine.py:357-381"
+        foreach: "= lists.range(64)"
+        as: step
+        max: 64
+        steps:
+          - if: "vars.done"
+            then: [{break: true}]
+          - set:
+              vars.hits: "= vars.labels.filter(l, vars.rest.indexOf(input.config.terminals[l]) >= 0).map(l, {'label': l, 'at': vars.rest.indexOf(input.config.terminals[l]), 'len': size(input.config.terminals[l])})"
+          - if: "size(vars.hits) == 0"
+            then:
+              - set: {vars.chunk: "= vars.rest", vars.rest: "", vars.label: "", vars.marker: "", vars.done: true}
+            else:
+              - set: {vars.at: "= math.least(vars.hits.map(h, h.at))"}
+              - set: {vars.hit: "= vars.hits.filter(h, h.at == vars.at).sortBy(h, -h.len)[0]"}
+              - set:
+                  vars.chunk: "= vars.rest.substring(0, vars.at)"
+                  vars.marker: "= input.config.terminals[vars.hit.label]"
+                  vars.label: "= vars.hit.label"
+                  vars.rest: "= vars.rest.substring(vars.at + vars.hit.len)"
+          - title: "_emit_for_state: text goes where the current state sends it (a header is buffered, tool arguments accumulate)"
+            source: "vllm/parser/engine/streaming_parser_engine.py:483-512"
+            set:
+              vars.content: "= vars.state == 'CONTENT' ? vars.content + vars.chunk : vars.content"
+              vars.raw_content: "= vars.state != 'REASONING' && vars.state != 'MESSAGE_HEADER' ? vars.raw_content + vars.chunk : vars.raw_content"
+              vars.reasoning: "= vars.state == 'REASONING' ? vars.reasoning + vars.chunk : vars.reasoning"
+              vars.header: "= vars.state == 'MESSAGE_HEADER' ? vars.header + vars.chunk : vars.header"
+              vars.args: "= vars.state == 'TOOL_ARGS' ? vars.args + vars.chunk : vars.args"
+          - if: "vars.label != ''"
+            then:
+              - set: {vars.key: "= vars.state + '|' + vars.label"}
+              - if: "!(vars.key in input.config.transitions)"
+                then:
+                  - title: "_on_terminal: no transition for (state, terminal): the marker is text in the current state"
+                    source: "vllm/parser/engine/streaming_parser_engine.py:412-421"
+                    set:
+                      vars.content: "= vars.state == 'CONTENT' ? vars.content + vars.marker : vars.content"
+                      vars.raw_content: "= vars.state != 'REASONING' && vars.state != 'MESSAGE_HEADER' ? vars.raw_content + vars.marker : vars.raw_content"
+                      vars.reasoning: "= vars.state == 'REASONING' ? vars.reasoning + vars.marker : vars.reasoning"
+                      vars.args: "= vars.state == 'TOOL_ARGS' ? vars.args + vars.marker : vars.args"
+                  - continue: true
+              - set:
+                  vars.tr: "= input.config.transitions[vars.key]"
+                  vars.events: "= vars.events + input.config.transitions[vars.key].events"
+              - title: "TEXT_CHUNK out of a message header flushes the buffered header as content"
+                source: "vllm/parser/engine/streaming_parser_engine.py:518-560"
+                if: "'TEXT_CHUNK' in vars.tr.events && vars.state == 'MESSAGE_HEADER'"
+                then: [{set: {vars.content: "= vars.content + vars.header", vars.raw_content: "= vars.raw_content + vars.header"}}]
+              - title: "Leaving a header drops it: a function name before the content-kind marker is metadata"
+                source: "vllm/parser/inkling.py:135-137"
+                if: "vars.state == 'MESSAGE_HEADER'"
+                then: [{set: {vars.header: ""}}]
+              - if: "'TOOL_CALL_START' in vars.tr.events"
+                then: [{set: {vars.args: "", vars.raw_content: "= vars.raw_content + vars.marker"}}]
+              - if: "'TOOL_CALL_END' in vars.tr.events"
+                then:
+                  - title: "TOOL_CALL_END: the name comes from the payload (name-from-args) and the arguments are its args object (_inkling_arg_converter; {} when absent)"
+                    source: "vllm/parser/inkling.py:67-84"
+                    set:
+                      vars.payload: "= jsonParse(vars.args.trim())"
+                  - set:
+                      vars.calls: "= vars.calls + [{'name': vars.payload.name, 'arguments': 'args' in vars.payload ? json(vars.payload.args) : '{}'}]"
+                      vars.raw_content: "= vars.raw_content + vars.args + vars.marker"
+                      vars.args: ""
+              - set: {vars.state: "= vars.tr.next"}
+      - title: "finish(): a still-open message header is flushed as content; an unterminated tool call is incomplete (its markup is dropped)"
+        source: "vllm/parser/engine/streaming_parser_engine.py:294-349"
+        if: "(!has(input.finish) || input.finish) && vars.state == 'MESSAGE_HEADER' && vars.header != ''"
+        then: [{set: {vars.content: "= vars.content + vars.header", vars.raw_content: "= vars.raw_content + vars.header", vars.header: "", vars.state: CONTENT}}]
+      - title: "Results: empty strings are None; whitespace-only content before tool calls is dropped"
+        source: "vllm/parser/engine/parser_engine.py:536-541"
+        return:
+          reasoning: "= vars.reasoning == '' ? null : vars.reasoning"
+          content: "= vars.content == '' || (size(vars.calls) > 0 && vars.content.trim() == '') ? null : vars.content"
+          raw_content: "= vars.raw_content"
+          tool_calls: "= vars.calls"
+          events: "= vars.events"
+          final_state: "= vars.state"
+          reasoning_ended: "= 'REASONING_END' in vars.events || (vars.state != 'REASONING' && vars.reasoning != '')"
+  # ---------------------------------------------------------------- DelegatingParser
+  - component: delegating-parser
+    name: parse
+    kind: function
+    summary: "DelegatingParser.parse: ReasoningParser.extract_reasoning (none -> the whole output is content), then _extract_tool_calls on the content: tool_choice none keeps it, a named choice wraps the content as that function's arguments, auto (with --enable-auto-tool-choice) runs ToolParser.extract_tool_calls."
+    sources: ["vllm/parser/abstract_parser.py:833-848", "vllm/parser/abstract_parser.py:350-357", "vllm/parser/abstract_parser.py:384-484", "vllm/reasoning/abs_reasoning_parsers.py:152-170", "vllm/tool_parsers/abstract_tool_parser.py:201-212"]
+    request:
+      type: object
+      properties:
+        parser: {type: object, description: "the composed classes from parser-manager.get-parser plus the engine config the adapters share"}
+        model_output: {type: string}
+        tool_choice: {default: null}
+        enable_auto_tools: {type: boolean, default: false}
+        prompt_state: {type: [string, "null"], default: null}
+      required: [parser, model_output]
+    errors: [{code: value-error, status: 0, retryable: false}]
+    behavior:
+      - set:
+          vars.has_r: "= has(input.parser.reasoning_parser_cls) && input.parser.reasoning_parser_cls != null"
+          vars.has_t: "= has(input.parser.tool_parser_cls) && input.parser.tool_parser_cls != null"
+          vars.tc: "= has(input.tool_choice) ? input.tool_choice : null"
+      - title: "One engine pass over the output (the reasoning adapter and the tool adapter share the model's ParserEngine config)"
+        source: "vllm/parser/engine/parser_engine.py:516-604"
+        call: parser-engine.parse-complete
+        input: {config: "= input.parser.config", text: "= input.model_output", initial_state: "= has(input.prompt_state) ? input.prompt_state : null"}
+        as: p
+      - title: "extract_reasoning: without a reasoning parser there is no reasoning and the whole output is content"
+        source: "vllm/parser/abstract_parser.py:350-357"
+        set:
+          vars.reasoning: "= vars.has_r ? vars.p.value.reasoning : null"
+          vars.content: "= vars.has_r ? (vars.p.value.raw_content == '' ? null : vars.p.value.raw_content) : input.model_output"
+      - if: "!vars.has_t"
+        then: [{title: "No tool parser: no tool calls, content unchanged", source: "vllm/parser/abstract_parser.py:391-393", return: {reasoning: "= vars.reasoning", content: "= vars.content", tool_calls: []}}]
+      - if: "vars.tc == 'none'"
+        then: [{title: "tool_choice none: an engine-based parser strips tool markup from the content but calls nothing", source: "vllm/parser/abstract_parser.py:395-399", return: {reasoning: "= vars.reasoning", content: "= vars.p.value.content", tool_calls: []}}]
+      - if: "vars.tc != null && type(vars.tc) == map"
+        then:
+          - title: "Named tool choice: the content is that function's arguments"
+            source: "vllm/parser/abstract_parser.py:415-427"
+            if: "vars.content == null || vars.content.trim() == ''"
+            then: [{return: {reasoning: "= vars.reasoning", content: null, tool_calls: []}}]
+          - return: {reasoning: "= vars.reasoning", content: null, tool_calls: "= [{'name': has(vars.tc.function) ? vars.tc.function.name : vars.tc.name, 'arguments': vars.content}]"}
+      - if: "!(has(input.enable_auto_tools) && input.enable_auto_tools) && vars.tc != 'required'"
+        then: [{title: "Neither auto nor required: content unchanged", source: "vllm/parser/abstract_parser.py:404-412", return: {reasoning: "= vars.reasoning", content: "= vars.content", tool_calls: "= dyn(null)"}}]
+      - title: "Auto tool choice: ToolParser.extract_tool_calls; tools_called replaces the content with what is left (whitespace-only becomes None)"
+        source: "vllm/parser/abstract_parser.py:445-484"
+        if: "size(vars.p.value.tool_calls) > 0"
+        then: [{return: {reasoning: "= vars.reasoning", content: "= vars.p.value.content", tool_calls: "= vars.p.value.tool_calls"}}]
+      - title: "No complete tool call: an engine-based parser returns its content (incomplete markup dropped)"
+        source: "vllm/parser/abstract_parser.py:463-484"
+        return: {reasoning: "= vars.reasoning", content: "= vars.p.value.content", tool_calls: "= dyn(null)"}
+  - component: delegating-parser
+    name: parse-delta
+    kind: function
+    summary: "DelegatingParser.parse_delta / ToolParser.extract_tool_calls_streaming(previous_text, current_text, delta_text): the DeltaMessage (reasoning, content, tool calls) one streamed delta adds to what the previous text already produced."
+    sources: ["vllm/parser/abstract_parser.py:849-998", "vllm/parser/abstract_parser.py:255-267", "vllm/tool_parsers/abstract_tool_parser.py:214-232"]
+    request:
+      type: object
+      properties:
+        parser: {type: object}
+        previous_text: {type: string, default: ""}
+        delta_text: {type: string}
+        finished: {type: boolean, default: false}
+        prompt_state: {type: [string, "null"], default: null}
+      required: [parser, delta_text]
+    behavior:
+      - set:
+          vars.prev: "= has(input.previous_text) && input.previous_text != null ? input.previous_text : ''"
+      - title: "What the stream had produced before this delta (the StreamState the parser carries between deltas)"
+        source: "vllm/parser/abstract_parser.py:857-870"
+        call: parser-engine.parse-complete
+        input: {config: "= input.parser.config", text: "= vars.prev", initial_state: "= has(input.prompt_state) ? input.prompt_state : null", finish: false}
+        as: before
+      - title: "ASSUMPTION: the delta is what parsing current_text adds over previous_text; the code advances the engine incrementally and also streams partial tool arguments (the same totals once a block closes)"
+        source: "vllm/parser/abstract_parser.py:871-998"
+        call: parser-engine.parse-complete
+        input: {config: "= input.parser.config", text: "= vars.prev + input.delta_text", initial_state: "= has(input.prompt_state) ? input.prompt_state : null", finish: "= has(input.finished) && input.finished"}
+        as: now
+      - set:
+          vars.r0: "= vars.before.value.reasoning == null ? 0 : size(vars.before.value.reasoning)"
+          vars.c0: "= vars.before.value.content == null ? 0 : size(vars.before.value.content)"
+          vars.r1: "= vars.now.value.reasoning == null ? '' : vars.now.value.reasoning"
+          vars.c1: "= vars.now.value.content == null ? '' : vars.now.value.content"
+      - set:
+          vars.delta:
+            reasoning: "= size(vars.r1) > vars.r0 ? dyn(vars.r1.substring(vars.r0)) : dyn(null)"
+            content: "= size(vars.c1) > vars.c0 ? dyn(vars.c1.substring(vars.c0)) : dyn(null)"
+            tool_calls: "= lists.range(size(vars.now.value.tool_calls)).filter(i, i >= size(vars.before.value.tool_calls)).map(i, {'index': i, 'type': 'function', 'function': vars.now.value.tool_calls[i]})"
+      - title: "Nothing new: None (no DeltaMessage is sent)"
+        source: "vllm/parser/abstract_parser.py:990-998"
+        if: "vars.delta.reasoning == null && vars.delta.content == null && size(vars.delta.tool_calls) == 0"
+        then: [{return: {delta: null}}]
+      - return: {delta: "= vars.delta"}
+  - component: delegating-parser
+    name: is-reasoning-end
+    kind: function
+    summary: "Parser.is_reasoning_end / DelegatingParser.is_reasoning_end: no reasoning parser means reasoning is over; otherwise the reasoning parser decides from the output so far (the engine's last reasoning marker is an end)."
+    sources: ["vllm/parser/abstract_parser.py:220-233", "vllm/parser/abstract_parser.py:769-773", "vllm/reasoning/abs_reasoning_parsers.py:71-88", "vllm/parser/engine/parser_engine.py:658-680"]
+    request: {type: object, properties: {parser: {type: object}, text: {type: string}}, required: [parser, text]}
+    behavior:
+      - if: "!has(input.parser.reasoning_parser_cls) || input.parser.reasoning_parser_cls == null"
+        then: [{source: "vllm/parser/abstract_parser.py:769-773", return: {is_reasoning_end: true}}]
+      - title: "The last reasoning marker in the output decides: THINK_END (or a reasoning-ending transition) ends it, THINK_START reopens it"
+        source: "vllm/parser/engine/parser_engine.py:668-680"
+        set:
+          vars.end_at: "= 'THINK_END' in input.parser.config.terminals ? input.text.lastIndexOf(input.parser.config.terminals.THINK_END) : -1"
+          vars.start_at: "= 'THINK_START' in input.parser.config.terminals ? input.text.lastIndexOf(input.parser.config.terminals.THINK_START) : -1"
+      - return: {is_reasoning_end: "= vars.end_at > vars.start_at"}
+scenarios:
+  - id: serving-api-parser-manager-compose
+    name: "ParserManager.get_parser picks the Parser class from the two flags"
+    fixtures: [full-tp1-llama-8b]
+    steps:
+      - {interface: parser-manager.get-parser, caller: api-server, as: none, input: {}}
+      - {interface: parser-manager.get-parser, caller: api-server, as: kimi, input: {reasoning_parser_name: kimi_k3}}
+      - {interface: parser-manager.get-parser, caller: api-server, as: noauto, input: {tool_parser_name: llama3_json, enable_auto_tools: false}}
+      - {interface: parser-manager.get-parser, caller: api-server, as: both, input: {tool_parser_name: inkling, reasoning_parser_name: inkling, enable_auto_tools: true}}
+      - {interface: parser-manager.get-parser, caller: api-server, as: hfmix, input: {tool_parser_name: hf, reasoning_parser_name: glm45, enable_auto_tools: true}}
+      - {interface: parser-manager.get-parser, caller: api-server, as: hf, input: {reasoning_parser_name: hf}}
+      - {interface: parser-manager.get-parser, caller: api-server, as: badtool, input: {tool_parser_name: nope, enable_auto_tools: true}}
+      - {interface: parser-manager.get-parser, caller: api-server, as: badreason, input: {reasoning_parser_name: nope}}
+      - {interface: parser-manager.get-parser, caller: api-server, as: cohere, input: {reasoning_parser_name: cohere_command4}}
+      - {interface: parser-manager.get-parser, caller: api-server, as: minicpmv, input: {reasoning_parser_name: minicpmv}}
+      - {interface: parser-manager.get-parser, caller: api-server, as: harmony, input: {reasoning_parser_name: openai_gptoss, tool_parser_name: openai, enable_auto_tools: true, is_harmony: true}}
+    expect:
+      - "steps.none.result.ok && steps.none.result.value.parser_class == null"
+      - "steps.kimi.result.value.base == 'KimiK3Parser' && steps.kimi.result.value.reasoning_parser_cls == 'KimiK3ReasoningParser' && steps.kimi.result.value.tool_parser_cls == null"
+      - "steps.noauto.result.ok && steps.noauto.result.value.parser_class == null"
+      - "steps.both.result.value.base == 'DelegatingParser' && steps.both.result.value.reasoning_parser_cls == 'InklingParserReasoningAdapter' && steps.both.result.value.tool_parser_cls == 'InklingEngineToolParser'"
+      - "!steps.hfmix.result.ok && steps.hfmix.result.error.code == 'type-error'"
+      - "steps.hf.result.value.base == 'ResponseTemplateParser'"
+      - "!steps.badtool.result.ok && steps.badtool.result.error.message.contains('has not been registered')"
+      - "!steps.badreason.result.ok && steps.badreason.result.error.code == 'type-error'"
+      - "steps.cohere.result.value.base == 'CohereCommandParser' && steps.minicpmv.result.value.base == 'MiniCPMVUnifiedParser' && steps.harmony.result.value.base == 'HarmonyParser'"
+  - id: serving-api-tool-parser-registry
+    name: "ToolParserManager resolves a lazy name once, then from its cache; an unknown name is KeyError"
+    fixtures: [full-tp1-llama-8b]
+    steps:
+      - {interface: tool-parser-manager.get-tool-parser, caller: api-server, as: first, input: {name: hermes}}
+      - {interface: tool-parser-manager.get-tool-parser, caller: api-server, as: again, input: {name: hermes}}
+      - {interface: tool-parser-manager.get-tool-parser, caller: api-server, as: bad, input: {name: nope}}
+      - {interface: reasoning-parser-manager.get-reasoning-parser, caller: api-server, as: rbad, input: {name: nope}}
+    expect:
+      - "steps.first.result.value.parser_class == 'Hermes2ProToolParser' && steps.again.result.value.parser_class == 'Hermes2ProToolParser'"
+      - "!steps.bad.result.ok && steps.bad.result.error.code == 'key-error' && steps.bad.result.error.message == 'Tool parser \\'nope\\' not found.'"
+      - "!steps.rbad.result.ok && steps.rbad.result.error.message.contains('Available parsers: cohere_command3, cohere_command4, deepseek_v3')"
+  - id: serving-api-inkling-parse
+    name: "Inkling, complete outputs: thinking then text; text closed without a header then a tool block; a header function name is dropped"
+    fixtures: [full-tp1-llama-8b]
+    steps:
+      - {interface: inkling-parser.config, caller: api-server, as: cfg, input: {}}
+      - interface: delegating-parser.parse
+        caller: api-server
+        as: think
+        input:
+          parser: {reasoning_parser_cls: InklingParserReasoningAdapter, tool_parser_cls: InklingEngineToolParser, config: "= steps.cfg.result.value"}
+          model_output: "<|content_thinking|>Let me think.<|end_message|><|message_model|><|content_text|>It is sunny.<|end_message|>"
+          enable_auto_tools: true
+      - interface: delegating-parser.parse
+        caller: api-server
+        as: tool
+        input:
+          parser: {reasoning_parser_cls: InklingParserReasoningAdapter, tool_parser_cls: InklingEngineToolParser, config: "= steps.cfg.result.value"}
+          model_output: "<|content_text|>intro<|end_message|><|content_invoke_tool_json|>{\"name\":\"get_weather\",\"args\":{\"city\":\"Seattle\"}}<|end_message|>"
+          enable_auto_tools: true
+      - interface: delegating-parser.parse
+        caller: api-server
+        as: header
+        input:
+          parser: {reasoning_parser_cls: InklingParserReasoningAdapter, tool_parser_cls: InklingEngineToolParser, config: "= steps.cfg.result.value"}
+          model_output: "someFn<|content_invoke_tool_json|>{\"name\":\"get_weather\",\"args\":{\"city\":\"SF\"}}<|end_message|>"
+          enable_auto_tools: true
+      - interface: delegating-parser.parse
+        caller: api-server
+        as: none
+        input:
+          parser: {reasoning_parser_cls: InklingParserReasoningAdapter, tool_parser_cls: InklingEngineToolParser, config: "= steps.cfg.result.value"}
+          model_output: "<|content_text|>intro<|end_message|><|content_invoke_tool_json|>{\"name\":\"f\",\"args\":{}}<|end_message|>"
+          tool_choice: none
+      - interface: delegating-parser.parse
+        caller: api-server
+        as: notool
+        input:
+          parser: {reasoning_parser_cls: InklingParserReasoningAdapter, tool_parser_cls: null, config: "= steps.cfg.result.value"}
+          model_output: "<|content_text|>plain<|end_message|>"
+      - interface: delegating-parser.parse
+        caller: api-server
+        as: named
+        input:
+          parser: {reasoning_parser_cls: null, tool_parser_cls: InklingEngineToolParser, config: "= steps.cfg.result.value"}
+          model_output: "{\"city\": \"Paris\"}"
+          tool_choice: {type: function, function: {name: get_weather}}
+      - interface: delegating-parser.parse
+        caller: api-server
+        as: noauto
+        input:
+          parser: {reasoning_parser_cls: InklingParserReasoningAdapter, tool_parser_cls: InklingEngineToolParser, config: "= steps.cfg.result.value"}
+          model_output: "<|content_text|>hi<|end_message|>"
+          tool_choice: auto
+          enable_auto_tools: false
+      - interface: delegating-parser.parse
+        caller: api-server
+        as: notext
+        input:
+          parser: {reasoning_parser_cls: null, tool_parser_cls: InklingEngineToolParser, config: "= steps.cfg.result.value"}
+          model_output: "<|content_text|>no tools here<|content_model_end_sampling|>"
+          enable_auto_tools: true
+      - interface: delegating-parser.parse
+        caller: api-server
+        as: namedempty
+        input:
+          parser: {reasoning_parser_cls: null, tool_parser_cls: InklingEngineToolParser, config: "= steps.cfg.result.value"}
+          model_output: "  "
+          tool_choice: {type: function, function: {name: get_weather}}
+    expect:
+      - "steps.think.result.value.reasoning == 'Let me think.' && steps.think.result.value.content == 'It is sunny.' && steps.think.result.value.tool_calls == null"
+      - "steps.tool.result.value.content == 'intro' && size(steps.tool.result.value.tool_calls) == 1 && steps.tool.result.value.tool_calls[0].name == 'get_weather' && jsonParse(steps.tool.result.value.tool_calls[0].arguments) == {'city': 'Seattle'}"
+      - "steps.header.result.value.content == null && steps.header.result.value.tool_calls[0].name == 'get_weather'"
+      - "steps.none.result.value.tool_calls == [] && steps.none.result.value.content == 'intro'"
+      - "steps.notool.result.value.tool_calls == [] && steps.notool.result.value.content.contains('plain')"
+      - "steps.named.result.value.tool_calls[0].name == 'get_weather' && steps.named.result.value.content == null"
+      - "steps.noauto.result.value.tool_calls == null && steps.noauto.result.value.content.contains('hi')"
+      - "steps.notext.result.value.tool_calls == null && steps.notext.result.value.content == 'no tools here'"
+      - "steps.namedempty.result.value.tool_calls == [] && steps.namedempty.result.value.content == null"
+  - id: serving-api-inkling-stream-content-then-tool
+    name: "Inkling streamed (tests/parser/engine/test_inkling.py:870): a text block closed with no header, then a tool block; the text reaches content once and one call follows"
+    fixtures: [full-tp1-llama-8b]
+    steps:
+      - {interface: inkling-parser.config, caller: api-server, as: cfg, input: {}}
+      - interface: delegating-parser.parse-delta
+        caller: api-server
+        as: d1
+        input: {parser: {reasoning_parser_cls: InklingParserReasoningAdapter, tool_parser_cls: InklingEngineToolParser, config: "= steps.cfg.result.value"}, previous_text: "", delta_text: "<|content_text|>intro"}
+      - interface: delegating-parser.parse-delta
+        caller: api-server
+        as: d2
+        input: {parser: {reasoning_parser_cls: InklingParserReasoningAdapter, tool_parser_cls: InklingEngineToolParser, config: "= steps.cfg.result.value"}, previous_text: "<|content_text|>intro", delta_text: "<|end_message|><|content_invoke_tool_json|>{\"name\":\"get_weather\","}
+      - interface: delegating-parser.parse-delta
+        caller: api-server
+        as: d3
+        input: {parser: {reasoning_parser_cls: InklingParserReasoningAdapter, tool_parser_cls: InklingEngineToolParser, config: "= steps.cfg.result.value"}, previous_text: "<|content_text|>intro<|end_message|><|content_invoke_tool_json|>{\"name\":\"get_weather\",", delta_text: "\"args\":{\"city\":\"Seattle\"}}<|end_message|>", finished: true}
+      - interface: delegating-parser.is-reasoning-end
+        caller: api-server
+        as: ended
+        input: {parser: {reasoning_parser_cls: InklingParserReasoningAdapter, config: "= steps.cfg.result.value"}, text: "<|content_thinking|>x<|end_message|>"}
+      - interface: delegating-parser.is-reasoning-end
+        caller: api-server
+        as: open
+        input: {parser: {reasoning_parser_cls: InklingParserReasoningAdapter, config: "= steps.cfg.result.value"}, text: "<|content_thinking|>still thinking"}
+      - interface: delegating-parser.is-reasoning-end
+        caller: api-server
+        as: noreason
+        input: {parser: {reasoning_parser_cls: null, config: "= steps.cfg.result.value"}, text: "anything"}
+    expect:
+      - "steps.d1.result.value.delta.content == 'intro'"
+      - "steps.d2.result.value.delta == null"
+      - "steps.d3.result.value.delta.content == null && size(steps.d3.result.value.delta.tool_calls) == 1 && steps.d3.result.value.delta.tool_calls[0].function.name == 'get_weather' && jsonParse(steps.d3.result.value.delta.tool_calls[0].function.arguments) == {'city': 'Seattle'}"
+      - "steps.ended.result.value.is_reasoning_end && !steps.open.result.value.is_reasoning_end && steps.noreason.result.value.is_reasoning_end"
+  - id: serving-api-chat-inkling-parser
+    name: "Chat with --tool-call-parser inkling --reasoning-parser inkling: the composed DelegatingParser parses the full output (plain text is a header flushed as content) and every streamed delta"
+    fixtures: [full-tp1-llama-8b]
+    config: {tool-call-parser: inkling, reasoning-parser: inkling, enable-auto-tool-choice: true, worker-runner-natural-output-tokens-base: 3, worker-runner-natural-output-tokens-spread: 1}
+    steps:
+      - {flow: serving-api-chat-completion, as: full, input: {body: {max_tokens: 8, tools: [{type: function, function: {name: get_weather, parameters: {type: object}}}]}}}
+      - {flow: serving-api-chat-stream, as: s, input: {body: {max_tokens: 8, stream: true}}}
+    expect:
+      - "steps.full.result.ok && steps.full.result.value.choices[0].message.content.startsWith(' t') && steps.full.result.value.choices[0].message.tool_calls == []"
+      - "trace.exists(e, e.type == 'call.end' && e.interface == 'parser-manager.get-parser' && e.output.base == 'DelegatingParser') && trace.exists(e, e.type == 'call.start' && e.interface == 'delegating-parser.parse')"
+      - "trace.exists(e, e.type == 'call.start' && e.interface == 'delegating-parser.parse-delta') && steps.s.result.ok"

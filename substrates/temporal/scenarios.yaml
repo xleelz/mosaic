@@ -1,0 +1,459 @@
+# The Temporal substrate's own tests. Run with:
+#   go run ./internal/devtools/check -f substrates/temporal/temporal.yaml -f substrates/temporal/scenarios.yaml
+# Imports don't bring these along (MergeImports skips flows and scenarios).
+# `worker` is a sample worker process: workflow types one-activity, sleep, approval and counter,
+# and activity types greet, flaky, slow and process, each an interface subscribed to the
+# substrate's task topics that ignores the other types. Every scenario sets max_virtual_ms, which
+# makes the run concurrent so that each step starts at its at_ms while earlier steps' timers
+# (the 10 s workflow task timeouts among them) are still pending.
+schema_version: 1
+id: temporal-scenarios
+
+components:
+  - {id: client, name: Client, kind: client, summary: "A Temporal client (SDK or CLI): the scenarios' entry point."}
+  - {id: worker, name: Worker, kind: service, summary: "A worker process polling the task queue: the sample workflows and activities."}
+
+interfaces:
+  # ---- workflows ----
+  - component: worker
+    name: one-activity-workflow
+    kind: event
+    summary: "Workflow one-activity: run input.activity_type once with the given options, then complete with its result (or fail with its failure)."
+    subscribe: [temporal-workflow-task]
+    request: WorkflowTask
+    behavior:
+      - if: "input.workflow_type != 'one-activity'"
+        then: [{return: {}}]
+      - set:
+          vars.types: "= input.new_events.map(e, e.type)"
+          vars.o: "= input.input"
+      - set:
+          vars.cmds: >-
+            = 'workflow_execution_started' in vars.types ? [dyn({
+                  'type': 'schedule_activity', 'activity_id': 'a1', 'activity_type': vars.o.activity_type,
+                  'input': 'activity_input' in vars.o ? vars.o.activity_input : null,
+                  'start_to_close_timeout_ms': 'start_to_close_ms' in vars.o ? vars.o.start_to_close_ms : 0,
+                  'schedule_to_close_timeout_ms': 'schedule_to_close_ms' in vars.o ? vars.o.schedule_to_close_ms : 0,
+                  'heartbeat_timeout_ms': 'heartbeat_ms' in vars.o ? vars.o.heartbeat_ms : 0,
+                  'retry_policy': 'retry_policy' in vars.o ? vars.o.retry_policy : {}})] :
+              ('activity_task_completed' in vars.types ?
+                [dyn({'type': 'complete_workflow', 'result': input.new_events.filter(e, e.type == 'activity_task_completed')[0].attrs.result})] :
+              (vars.types.exists(t, t in ['activity_task_failed', 'activity_task_timed_out']) ?
+                [dyn({'type': 'fail_workflow', 'failure': {'type': 'ActivityError', 'message': 'activity a1 failed', 'non_retryable': true}})] : []))
+      - call: temporal-server.respond-workflow-task-completed
+        input: {task_token: "= input.task_token", commands: "= vars.cmds"}
+        as: r
+        on_error: [{set: {ctx.wft_error: "= error.code"}}]
+
+  - component: worker
+    name: sleep-workflow
+    kind: event
+    summary: "Workflow sleep: a durable timer of input.sleep_ms, then complete."
+    subscribe: [temporal-workflow-task]
+    request: WorkflowTask
+    behavior:
+      - if: "input.workflow_type != 'sleep'"
+        then: [{return: {}}]
+      - set:
+          vars.types: "= input.new_events.map(e, e.type)"
+      - call: temporal-server.respond-workflow-task-completed
+        input:
+          task_token: "= input.task_token"
+          commands: >-
+            = 'workflow_execution_started' in vars.types ? [dyn({'type': 'start_timer', 'timer_id': 't1', 'duration_ms': input.input.sleep_ms})] :
+              ('timer_fired' in vars.types ? [dyn({'type': 'complete_workflow', 'result': 'slept'})] : [])
+
+  - component: worker
+    name: approval-workflow
+    kind: event
+    summary: "Workflow approval: wait for signals; complete with the names of the signals of the task that first carries any. Takes 50 ms per task."
+    subscribe: [temporal-workflow-task]
+    latency_ms: 50
+    request: WorkflowTask
+    behavior:
+      - if: "input.workflow_type != 'approval'"
+        then: [{return: {}}]
+      - set:
+          vars.sigs: "= input.new_events.filter(e, e.type == 'workflow_execution_signaled').map(e, e.attrs.signal_name)"
+      - call: temporal-server.respond-workflow-task-completed
+        input:
+          task_token: "= input.task_token"
+          commands: "= size(vars.sigs) > 0 ? [dyn({'type': 'complete_workflow', 'result': {'signals': vars.sigs}})] : []"
+        as: r
+        on_error: continue
+      - set: {ctx.approval_answers: "= (has(ctx.approval_answers) ? ctx.approval_answers : []) + [vars.r.ok ? vars.r.value.accepted : false]"}
+
+  - component: worker
+    name: counter-workflow
+    kind: event
+    summary: "Workflow counter: continue as new with n + 1 until n reaches input.limit, then complete with n."
+    subscribe: [temporal-workflow-task]
+    request: WorkflowTask
+    behavior:
+      - if: "input.workflow_type != 'counter'"
+        then: [{return: {}}]
+      - call: temporal-server.respond-workflow-task-completed
+        input:
+          task_token: "= input.task_token"
+          commands: >-
+            = input.input.n < input.input.limit ? [dyn({'type': 'continue_as_new', 'input': {'n': input.input.n + 1, 'limit': input.input.limit}})] :
+              [dyn({'type': 'complete_workflow', 'result': {'n': input.input.n}})]
+
+  # ---- activities ----
+  - component: worker
+    name: greet-activity
+    kind: event
+    subscribe: [temporal-activity-task]
+    request: ActivityTask
+    behavior:
+      - if: "input.activity_type != 'greet'"
+        then: [{return: {}}]
+      - call: temporal-server.respond-activity-completed
+        input: {task_token: "= input.task_token", result: "= 'Hello, ' + input.input.name"}
+
+  - component: worker
+    name: flaky-activity
+    kind: event
+    summary: "Activity flaky: fails with input.error_type until attempt input.succeed_on."
+    subscribe: [temporal-activity-task]
+    request: ActivityTask
+    behavior:
+      - if: "input.activity_type != 'flaky'"
+        then: [{return: {}}]
+      - if: "input.attempt < input.input.succeed_on"
+        then:
+          - call: temporal-server.respond-activity-failed
+            input: {task_token: "= input.task_token", failure: {type: "= input.input.error_type", message: "= 'attempt ' + string(input.attempt) + ' failed'", non_retryable: false}}
+          - return: {}
+      - call: temporal-server.respond-activity-completed
+        input: {task_token: "= input.task_token", result: "= 'ok on attempt ' + string(input.attempt)"}
+
+  - component: worker
+    name: slow-activity
+    kind: event
+    summary: "Activity slow: answers input.work_ms after it starts, without heartbeats."
+    subscribe: [temporal-activity-task]
+    request: ActivityTask
+    behavior:
+      - if: "input.activity_type != 'slow'"
+        then: [{return: {}}]
+      - emit: worker.slow-finish
+        input: {task_token: "= input.task_token"}
+        after_ms: "= input.input.work_ms"
+
+  - component: worker
+    name: slow-finish
+    kind: event
+    request: {type: object, properties: {task_token: {type: string}}}
+    behavior:
+      - call: temporal-server.respond-activity-completed
+        input: {task_token: "= input.task_token", result: done}
+        on_error: [{set: {ctx.late_completion: "= error.code"}}]
+
+  - component: worker
+    name: process-activity
+    kind: event
+    summary: "Activity process: input.steps steps of 1 s, heartbeating its progress; a retry resumes after the last heartbeated step."
+    subscribe: [temporal-activity-task]
+    request: ActivityTask
+    behavior:
+      - if: "input.activity_type != 'process'"
+        then: [{return: {}}]
+      - set: {vars.first: "= input.heartbeat_details == null ? 1 : int(input.heartbeat_details) + 1"}
+      - emit: worker.process-step
+        input: {task_token: "= input.task_token", step: "= vars.first", first: "= vars.first", steps: "= input.input.steps"}
+        after_ms: 1000
+
+  - component: worker
+    name: process-step
+    kind: event
+    request: {type: object, properties: {task_token: {type: string}, step: {type: integer}, first: {type: integer}, steps: {type: integer}}}
+    behavior:
+      - call: temporal-server.record-activity-heartbeat
+        input: {task_token: "= input.task_token", details: "= input.step"}
+        as: hb
+        on_error: [{return: {}}]
+      - if: "input.step < input.steps"
+        then:
+          - emit: worker.process-step
+            input: {task_token: "= input.task_token", step: "= input.step + 1", first: "= input.first", steps: "= input.steps"}
+            after_ms: 1000
+          - return: {}
+      - call: temporal-server.respond-activity-completed
+        input: {task_token: "= input.task_token", result: {steps: "= input.steps", resumed_from: "= input.first"}}
+
+fixtures:
+  - id: clock
+    summary: "An empty cluster; the clock starts at 2026-11-01T00:00:00Z (epoch ms 1793491200000)."
+    clock: {epoch: "2026-11-01T00:00:00Z"}
+
+flows:
+  - {id: start, tags: [writes], entry: {caller: client, interface: temporal-server.start-workflow, input: {task_queue: main, id_reuse_policy: allow_duplicate, id_conflict_policy: fail}}}
+  - {id: signal, tags: [writes], entry: {caller: client, interface: temporal-server.signal-workflow, input: {run_id: ""}}}
+  - {id: terminate, tags: [writes], entry: {caller: client, interface: temporal-server.terminate-workflow, input: {run_id: "", reason: test}}}
+  - {id: describe, tags: [reads], entry: {caller: client, interface: temporal-server.describe-workflow, input: {run_id: ""}}}
+  - {id: history, tags: [reads], entry: {caller: client, interface: temporal-server.get-workflow-history, input: {run_id: ""}}}
+
+scenarios:
+  # ---- start, activities, completion ----
+  - id: workflow-runs-activity-to-completion
+    name: A started workflow schedules its activity, gets the result and completes; describe shows it closed
+    fixtures: [clock]
+    max_virtual_ms: 60000
+    steps:
+      - {flow: start, as: start, at_ms: 0, input: {workflow_id: greet-1, workflow_type: one-activity, input: {activity_type: greet, activity_input: {name: Ada}, start_to_close_ms: 5000}}}
+      - {flow: history, as: h, at_ms: 1000, input: {workflow_id: greet-1}}
+      - {flow: describe, as: d, at_ms: 1001, input: {workflow_id: greet-1}}
+    expect:
+      - "steps.start.result.ok && steps.start.result.value.started && steps.start.result.value.run_id == steps.h.result.value.run_id"
+      - "steps.h.result.value.status == 'completed'"
+      - "steps.h.result.value.events.map(e, e.type) == ['workflow_execution_started', 'activity_task_scheduled', 'activity_task_completed', 'workflow_execution_completed']"
+      - "steps.h.result.value.events[3].attrs.result == 'Hello, Ada' && steps.h.result.value.events[2].attrs.attempt == 1"
+      - "steps.d.result.value.execution_info.status == 'completed' && steps.d.result.value.execution_info.history_length == 4"
+      - "steps.d.result.value.pending_activities == [] && steps.d.result.value.pending_workflow_task == null"
+      - "steps.d.result.value.execution_info.close_time != null && steps.d.result.value.execution_info.type == 'one-activity'"
+
+  # ---- workflow id reuse and conflict policies ----
+      - "state['temporal-server'].runs[steps.start.result.value.run_id].status == 'completed' && size(state['temporal-server'].activities) == 0"
+
+
+  - id: workflow-id-conflict-while-running
+    name: A second start of a running workflow id fails by default, returns the run with use_existing, and replaces it with terminate_existing
+    fixtures: [clock]
+    max_virtual_ms: 60000
+    steps:
+      - {flow: start, as: r1, at_ms: 0, input: {workflow_id: order-1, workflow_type: approval, input: {}}}
+      - {flow: start, as: dup, at_ms: 100, input: {workflow_id: order-1, workflow_type: approval, input: {}}}
+      - {flow: start, as: existing, at_ms: 200, input: {workflow_id: order-1, workflow_type: approval, input: {}, id_conflict_policy: use_existing}}
+      - {flow: start, as: replace, at_ms: 300, input: {workflow_id: order-1, workflow_type: approval, input: {}, id_conflict_policy: terminate_existing}}
+      - {flow: describe, as: latest, at_ms: 401, input: {workflow_id: order-1}}
+    expect:
+      - "!steps.dup.result.ok && steps.dup.result.error.code == 'workflow_execution_already_started' && steps.dup.result.error.data.run_id == steps.r1.result.value.run_id"
+      - "steps.existing.result.ok && !steps.existing.result.value.started && steps.existing.result.value.run_id == steps.r1.result.value.run_id"
+      - "steps.replace.result.value.started && steps.replace.result.value.run_id != steps.r1.result.value.run_id"
+      - "state['temporal-server'].runs[steps.r1.result.value.run_id].status == 'terminated'"
+      - "state['temporal-server'].runs[steps.r1.result.value.run_id].history[1].type == 'workflow_execution_terminated'"
+      - "steps.latest.result.value.execution_info.status == 'running' && steps.latest.result.value.execution_info.run_id == steps.replace.result.value.run_id"
+
+  - id: workflow-id-reuse-after-close
+    name: After a run closes, reject_duplicate refuses, allow_duplicate_failed_only refuses after success but allows after termination, allow_duplicate starts
+    fixtures: [clock]
+    max_virtual_ms: 60000
+    steps:
+      - {flow: start, as: done, at_ms: 0, input: {workflow_id: wf-a, workflow_type: one-activity, input: {activity_type: greet, activity_input: {name: A}, start_to_close_ms: 5000}}}
+      - {flow: start, as: rejected, at_ms: 100, input: {workflow_id: wf-a, workflow_type: one-activity, input: {activity_type: greet, activity_input: {name: A}, start_to_close_ms: 5000}, id_reuse_policy: reject_duplicate}}
+      - {flow: start, as: failed_only, at_ms: 200, input: {workflow_id: wf-a, workflow_type: one-activity, input: {activity_type: greet, activity_input: {name: A}, start_to_close_ms: 5000}, id_reuse_policy: allow_duplicate_failed_only}}
+      - {flow: start, as: again, at_ms: 300, input: {workflow_id: wf-a, workflow_type: one-activity, input: {activity_type: greet, activity_input: {name: B}, start_to_close_ms: 5000}}}
+      - {flow: start, as: b1, at_ms: 400, input: {workflow_id: wf-b, workflow_type: approval, input: {}}}
+      - {flow: terminate, as: kill, at_ms: 500, input: {workflow_id: wf-b}}
+      - {flow: start, as: b2, at_ms: 600, input: {workflow_id: wf-b, workflow_type: approval, input: {}, id_reuse_policy: allow_duplicate_failed_only}}
+      - {flow: history, as: ha, at_ms: 1000, input: {workflow_id: wf-a}}
+    expect:
+      - "!steps.rejected.result.ok && steps.rejected.result.error.code == 'workflow_execution_already_started'"
+      - "!steps.failed_only.result.ok && steps.failed_only.result.error.code == 'workflow_execution_already_started'"
+      - "steps.again.result.value.started && steps.again.result.value.run_id != steps.done.result.value.run_id"
+      - "steps.ha.result.value.run_id == steps.again.result.value.run_id && steps.ha.result.value.events[3].attrs.result == 'Hello, B'"
+      - "steps.kill.result.ok && steps.b2.result.ok && steps.b2.result.value.started"
+
+  # ---- retry policies ----
+      - "state['temporal-server'].workflows['wf-a'].run_id == steps.again.result.value.run_id && size(state['temporal-server'].runs) == 4"
+
+
+  - id: activity-retries-with-backoff
+    name: A failing activity is retried after 1 s then 2 s (coefficient 2) and succeeds on attempt 3; describe shows the pending retry
+    fixtures: [clock]
+    max_virtual_ms: 60000
+    steps:
+      - {flow: start, as: start, at_ms: 0, input: {workflow_id: flaky-1, workflow_type: one-activity, input: {activity_type: flaky, activity_input: {succeed_on: 3, error_type: Flaky}, start_to_close_ms: 5000, retry_policy: {initial_interval_ms: 1000, backoff_coefficient: 2.0}}}}
+      - {flow: describe, as: d1, at_ms: 500, input: {workflow_id: flaky-1}}
+      - {flow: describe, as: d2, at_ms: 2000, input: {workflow_id: flaky-1}}
+      - {flow: history, as: h, at_ms: 8000, input: {workflow_id: flaky-1}}
+    expect:
+      - "steps.d1.result.value.execution_info.status == 'running' && size(steps.d1.result.value.pending_activities) == 1"
+      - "steps.d1.result.value.pending_activities[0].state == 'scheduled' && steps.d1.result.value.pending_activities[0].attempt == 1"
+      - "steps.d1.result.value.pending_activities[0].last_failure.type == 'Flaky' && steps.d1.result.value.pending_activities[0].maximum_attempts == 0"
+      - "steps.d1.result.value.pending_activities[0].next_attempt_schedule_time - steps.d1.result.value.execution_info.start_time > 1000"
+      - "steps.d2.result.value.pending_activities[0].attempt == 2 && steps.d2.result.value.pending_activities[0].last_failure.message == 'attempt 2 failed'"
+      - "steps.h.result.value.status == 'completed' && steps.h.result.value.events[2].attrs.attempt == 3"
+      - "steps.h.result.value.events[2].time - steps.h.result.value.events[0].time >= 3000 && steps.h.result.value.events[2].time - steps.h.result.value.events[0].time < 3100"
+      - "calls['worker.flaky-activity'] == 3"
+
+  - id: activity-maximum-attempts
+    name: With maximum_attempts 3 the activity fails for good after the third attempt and the workflow fails
+    fixtures: [clock]
+    max_virtual_ms: 60000
+    steps:
+      - {flow: start, as: start, at_ms: 0, input: {workflow_id: flaky-2, workflow_type: one-activity, input: {activity_type: flaky, activity_input: {succeed_on: 10, error_type: Flaky}, start_to_close_ms: 5000, retry_policy: {initial_interval_ms: 100, maximum_attempts: 3}}}}
+      - {flow: history, as: h, at_ms: 5000, input: {workflow_id: flaky-2}}
+    expect:
+      - "steps.h.result.value.status == 'failed'"
+      - "steps.h.result.value.events[2].type == 'activity_task_failed' && steps.h.result.value.events[2].attrs.attempt == 3"
+      - "steps.h.result.value.events[2].attrs.retry_state == 'maximum_attempts_reached' && steps.h.result.value.events[2].attrs.failure.type == 'Flaky'"
+      - "steps.h.result.value.events[3].type == 'workflow_execution_failed' && calls['worker.flaky-activity'] == 3"
+      - "size(state['temporal-server'].activities) == 0 && state['temporal-server'].runs[steps.start.result.value.run_id].status == 'failed'"
+
+  - id: activity-non-retryable-error
+    name: A failure type listed in non_retryable_error_types is not retried
+    fixtures: [clock]
+    max_virtual_ms: 60000
+    steps:
+      - {flow: start, as: start, at_ms: 0, input: {workflow_id: pay-1, workflow_type: one-activity, input: {activity_type: flaky, activity_input: {succeed_on: 2, error_type: PaymentDeclined}, start_to_close_ms: 5000, retry_policy: {non_retryable_error_types: [PaymentDeclined]}}}}
+      - {flow: history, as: h, at_ms: 5000, input: {workflow_id: pay-1}}
+    expect:
+      - "steps.h.result.value.status == 'failed' && calls['worker.flaky-activity'] == 1"
+      - "steps.h.result.value.events[2].attrs.retry_state == 'non_retryable_failure' && steps.h.result.value.events[2].attrs.attempt == 1"
+      - "size(state['temporal-server'].activities) == 0"
+
+
+  - id: schedule-to-close-caps-retries
+    name: Retries stop when the next attempt would start past the schedule-to-close timeout, and the activity times out
+    fixtures: [clock]
+    max_virtual_ms: 60000
+    steps:
+      - {flow: start, as: start, at_ms: 0, input: {workflow_id: flaky-3, workflow_type: one-activity, input: {activity_type: flaky, activity_input: {succeed_on: 10, error_type: Flaky}, start_to_close_ms: 1000, schedule_to_close_ms: 2500}}}
+      - {flow: history, as: h, at_ms: 8000, input: {workflow_id: flaky-3}}
+    expect:
+      - "calls['worker.flaky-activity'] == 2"
+      - "steps.h.result.value.events[2].type == 'activity_task_timed_out' && steps.h.result.value.events[2].attrs.retry_state == 'timeout'"
+      - "steps.h.result.value.events[2].attrs.failure.timeout_type == 'schedule_to_close' && steps.h.result.value.events[2].attrs.failure.cause.type == 'Flaky'"
+      - "steps.h.result.value.status == 'failed'"
+
+  # ---- timeouts, heartbeats, worker crashes ----
+      - "size(state['temporal-server'].activities) == 0"
+
+
+  - id: heartbeat-timeout-redelivers-after-worker-crash
+    name: A worker crashing mid-activity stops its heartbeats; after the heartbeat timeout the retry resumes from the last heartbeat's details
+    fixtures: [clock]
+    max_virtual_ms: 60000
+    faults: [{target: worker.process-step, type: crash, after_steps: 0, calls: [2]}]
+    steps:
+      - {flow: start, as: start, at_ms: 0, input: {workflow_id: proc-1, workflow_type: one-activity, input: {activity_type: process, activity_input: {steps: 3}, start_to_close_ms: 30000, heartbeat_ms: 3000}}}
+      - {flow: describe, as: alive, at_ms: 1500, input: {workflow_id: proc-1}}
+      - {flow: describe, as: retrying, at_ms: 4500, input: {workflow_id: proc-1}}
+      - {flow: history, as: h, at_ms: 20000, input: {workflow_id: proc-1}}
+    expect:
+      - "steps.alive.result.value.pending_activities[0].state == 'started' && steps.alive.result.value.pending_activities[0].heartbeat_details == 1"
+      - "steps.alive.result.value.pending_activities[0].last_heartbeat_time != null"
+      - "steps.retrying.result.value.pending_activities[0].state == 'scheduled' && steps.retrying.result.value.pending_activities[0].last_failure.timeout_type == 'heartbeat'"
+      - "steps.h.result.value.status == 'completed' && steps.h.result.value.events[2].attrs.attempt == 2"
+      - "steps.h.result.value.events[3].attrs.result == {'steps': 3, 'resumed_from': 2}"
+      - "faults == 1"
+
+  - id: start-to-close-timeout-refuses-late-completion
+    name: An activity running past its start-to-close timeout times out; the worker's late answer is refused not_found
+    fixtures: [clock]
+    max_virtual_ms: 60000
+    steps:
+      - {flow: start, as: start, at_ms: 0, input: {workflow_id: slow-1, workflow_type: one-activity, input: {activity_type: slow, activity_input: {work_ms: 5000}, start_to_close_ms: 2000, retry_policy: {maximum_attempts: 1}}}}
+      - {flow: history, as: h, at_ms: 10000, input: {workflow_id: slow-1}}
+    expect:
+      - "steps.h.result.value.events[2].type == 'activity_task_timed_out' && steps.h.result.value.events[2].attrs.failure.timeout_type == 'start_to_close'"
+      - "steps.h.result.value.events[2].time - steps.h.result.value.events[0].time >= 2000 && steps.h.result.value.events[2].time - steps.h.result.value.events[0].time < 2100"
+      - "steps.h.result.value.status == 'failed' && ctx.late_completion == 'not_found'"
+      - "size(state['temporal-server'].activities) == 0"
+
+
+  - id: workflow-task-redelivered-after-worker-crash
+    name: A workflow worker that crashes on its task never answers; after the 10 s workflow task timeout the task is redelivered and the workflow proceeds
+    fixtures: [clock]
+    max_virtual_ms: 60000
+    faults: [{target: worker.one-activity-workflow, type: crash, after_steps: 0, calls: [1]}]
+    steps:
+      - {flow: start, as: start, at_ms: 0, input: {workflow_id: wft-1, workflow_type: one-activity, input: {activity_type: greet, activity_input: {name: Lin}, start_to_close_ms: 5000}}}
+      - {flow: describe, as: stuck, at_ms: 5000, input: {workflow_id: wft-1}}
+      - {flow: describe, as: retried, at_ms: 10003, input: {workflow_id: wft-1}}
+      - {flow: history, as: h, at_ms: 20000, input: {workflow_id: wft-1}}
+    expect:
+      - "steps.stuck.result.value.execution_info.history_length == 1 && steps.stuck.result.value.pending_workflow_task.attempt == 1"
+      - "steps.h.result.value.status == 'completed' && steps.h.result.value.events[1].time - steps.h.result.value.events[0].time >= 10000"
+      - "steps.h.result.value.events[3].attrs.result == 'Hello, Lin' && faults == 1"
+
+  # ---- timers ----
+      - "!('wft' in state['temporal-server'].runs[steps.start.result.value.run_id])"
+
+
+  - id: durable-timer
+    name: A workflow sleeping on a 5 s timer is running meanwhile and completes when it fires
+    fixtures: [clock]
+    max_virtual_ms: 60000
+    steps:
+      - {flow: start, as: start, at_ms: 0, input: {workflow_id: nap-1, workflow_type: sleep, input: {sleep_ms: 5000}}}
+      - {flow: describe, as: sleeping, at_ms: 2000, input: {workflow_id: nap-1}}
+      - {flow: history, as: h, at_ms: 6000, input: {workflow_id: nap-1}}
+    expect:
+      - "steps.sleeping.result.value.execution_info.status == 'running' && steps.sleeping.result.value.pending_workflow_task == null"
+      - "steps.h.result.value.events.map(e, e.type) == ['workflow_execution_started', 'timer_started', 'timer_fired', 'workflow_execution_completed']"
+      - "steps.h.result.value.events[2].time - steps.h.result.value.events[1].time == 5000"
+      - "size(state['temporal-server'].timers) == 0"
+
+  # ---- signals ----
+  - id: signal-completes-workflow
+    name: A signal reaches the waiting workflow, which completes; signals to a closed or unknown workflow are not_found
+    fixtures: [clock]
+    max_virtual_ms: 60000
+    steps:
+      - {flow: start, as: start, at_ms: 0, input: {workflow_id: ap-1, workflow_type: approval, input: {}}}
+      - {flow: signal, as: sig, at_ms: 1000, input: {workflow_id: ap-1, signal_name: approve, input: {by: ops}}}
+      - {flow: history, as: h, at_ms: 2000, input: {workflow_id: ap-1}}
+      - {flow: signal, as: late, at_ms: 3000, input: {workflow_id: ap-1, signal_name: approve, input: {}}}
+      - {flow: signal, as: unknown, at_ms: 3001, input: {workflow_id: nope, signal_name: approve, input: {}}}
+    expect:
+      - "steps.sig.result.ok && steps.h.result.value.status == 'completed'"
+      - "steps.h.result.value.events[1].type == 'workflow_execution_signaled' && steps.h.result.value.events[1].attrs.input == {'by': 'ops'}"
+      - "steps.h.result.value.events[2].attrs.result == {'signals': ['approve']}"
+      - "!steps.late.result.ok && steps.late.result.error.code == 'not_found' && steps.late.result.error.message == 'workflow execution already completed'"
+      - "!steps.unknown.result.ok && steps.unknown.result.error.code == 'not_found'"
+      - "state['temporal-server'].runs[steps.start.result.value.run_id].status == 'completed'"
+
+
+  - id: signal-during-close-is-unhandled
+    name: A signal arriving while the worker completes the workflow refuses the close; the next task carries both signals
+    fixtures: [clock]
+    max_virtual_ms: 60000
+    steps:
+      - {flow: start, as: start, at_ms: 0, input: {workflow_id: ap-2, workflow_type: approval, input: {}}}
+      - {flow: signal, as: s1, at_ms: 1000, input: {workflow_id: ap-2, signal_name: approve, input: {}}}
+      - {flow: signal, as: s2, at_ms: 1020, input: {workflow_id: ap-2, signal_name: escalate, input: {}}}
+      - {flow: history, as: h, at_ms: 3000, input: {workflow_id: ap-2}}
+    expect:
+      - "steps.h.result.value.status == 'completed'"
+      - "steps.h.result.value.events[3].attrs.result == {'signals': ['approve', 'escalate']}"
+      - "ctx.approval_answers == [true, false, true]"
+
+  # ---- continue-as-new ----
+      - "size(state['temporal-server'].runs[steps.start.result.value.run_id].history) == 4"
+
+
+  - id: continue-as-new-chain
+    name: Continue-as-new closes each run and starts the next with the same workflow id and a fresh history
+    fixtures: [clock]
+    max_virtual_ms: 60000
+    steps:
+      - {flow: start, as: start, at_ms: 0, input: {workflow_id: count-1, workflow_type: counter, input: {n: 0, limit: 3}}}
+      - {flow: history, as: last, at_ms: 1001, input: {workflow_id: count-1}}
+    expect:
+      - "state['temporal-server'].runs[steps.start.result.value.run_id].status == 'continued_as_new'"
+      - "state['temporal-server'].runs[steps.start.result.value.run_id].new_execution_run_id != ''"
+      - "steps.last.result.value.status == 'completed' && steps.last.result.value.run_id != steps.start.result.value.run_id"
+      - "steps.last.result.value.events.map(e, e.type) == ['workflow_execution_started', 'workflow_execution_completed']"
+      - "steps.last.result.value.events[0].attrs.input == {'n': 3, 'limit': 3} && steps.last.result.value.events[1].attrs.result == {'n': 3}"
+      - "steps.last.result.value.events[0].attrs.continued_execution_run_id != ''"
+      - "size(state['temporal-server'].runs) == 4"
+
+  # ---- termination ----
+  - id: terminate-drops-pending-work
+    name: Terminating a run drops its pending activity; the worker's later answer is refused
+    fixtures: [clock]
+    max_virtual_ms: 60000
+    steps:
+      - {flow: start, as: start, at_ms: 0, input: {workflow_id: slow-2, workflow_type: one-activity, input: {activity_type: slow, activity_input: {work_ms: 5000}, start_to_close_ms: 10000}}}
+      - {flow: describe, as: busy, at_ms: 1000, input: {workflow_id: slow-2}}
+      - {flow: terminate, as: kill, at_ms: 1001, input: {workflow_id: slow-2, reason: operator}}
+      - {flow: describe, as: after, at_ms: 1100, input: {workflow_id: slow-2}}
+      - {flow: terminate, as: again, at_ms: 1200, input: {workflow_id: slow-2}}
+    expect:
+      - "size(steps.busy.result.value.pending_activities) == 1 && steps.busy.result.value.pending_activities[0].state == 'started'"
+      - "steps.after.result.value.execution_info.status == 'terminated' && steps.after.result.value.pending_activities == []"
+      - "!steps.again.result.ok && steps.again.result.error.code == 'not_found'"
+      - "ctx.late_completion == 'not_found'"

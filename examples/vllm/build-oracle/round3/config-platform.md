@@ -1,0 +1,14 @@
+# Round-3 unit tests: config-platform
+
+Scenarios: `build-oracle/round3/config-platform.yaml`, translated by hand. config-platform has no generator.
+
+| # | Test | Scenario | Verdict | Notes |
+|---|---|---|---|---|
+| 1 | tests/utils_/test_torch_utils.py:94 `test_common_broadcastable_dtype` | — | untranslatable | The code under test, `vllm/utils/torch_utils.py:common_broadcastable_dtype`, is kernels-ops' module (BRIEF ownership: `vllm/utils/**`). It is a pure torch dtype-promotion helper, below the model's level: no component, config or seam of mine computes dtypes. |
+| 2 | tests/v1/e2e/spec_decode/draft_model/test_draft_model.py:184 `test_draft_model_engine_args_tensor_parallelism` | r3-config-platform-2-draft-model-engine-args-tp | pass | Model fixed: `create-speculative-config` now verifies the draft checkpoint's quantization with the speculative config's own `quantization` (speculative.py:1308) and the draft TP via the new `speculative-config.verify-and-get-draft-tp` (speculative.py:1711-1743). `quant_config.get_name() == 'fp8'` is asserted as `model_config.quantization == 'fp8'`. The `dataclasses.replace` draft VllmConfig is test-only. |
+| 3 | tests/v1/e2e/general/test_pooling_chunked_prefill.py:124 `test_pooling_prefix_cache` | — | untranslatable (for this area) | The asserts count the chunks a pooler wrapper injected into the workers receives, after a prefix-cache hit. That path is the scheduler's (scheduler-kv) and the worker's pooler (worker-runner). My part, that a pooling decoder with explicit `enable_prefix_caching` resolves with prefix caching on, is already covered by `config-create-engine-config-pooling`. |
+| 4 | tests/plugins_tests/lora_resolvers/test_hf_hub_resolver.py:74 `test_nonlora_adapter` | r3-config-platform-4-hf-hub-nonlora-adapter | pass | Model fixed: the new `hf-hub-resolver.resolve-lora` (hf_hub_resolver.py:29-128) uses hf-hub `list-repo-files` and `snapshot-download` store stubs. |
+| 5 | tests/v1/e2e/spec_decode/speculators/test_speculators.py:28 `test_speculators_model_integration` (both params) | r3-config-platform-5-speculators-model-integration | pass | Config part only: detection, the verifier as the served model, the eagle3 method, num_speculative_tokens > 0 and the draft path. Text generation, GSM8k accuracy and the comparison with a non-speculative run need real model outputs and are below the model's level. |
+| 6 | tests/v1/ec_connector/unit/test_scheduler_nixl_consumer.py:188 `test_failed_read_falls_back_only_with_local_input` | — | untranslatable (for this area) | The code under test is `vllm/distributed/ec_transfer/**`, distributed's area. Nothing of config-platform is on the path. |
+
+**Result: 3 of 6 pass. The other 3 are untranslatable: their code under test belongs to kernels-ops, scheduler-kv/worker-runner and distributed.**

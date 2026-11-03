@@ -1,0 +1,120 @@
+# A tiny inference engine built on the CUDA substrate, to show an import works. Loading a model
+# allocates its fp16 weights on the GPU (cudaMalloc, which fails with out of memory when the
+# model doesn't fit) and copies them in over PCIe; a request copies the prompt in, runs a
+# prefill kernel (compute bound) and one decode step (memory bound: it reads every weight),
+# copies the logits back and synchronizes its stream.
+# Imported ids: components and interfaces under "cuda/", schemas under "cuda.", state at
+# state['cuda/cuda-runtime']; configs keep their ids, and the local cuda-peak-tflops (tensor
+# cores) overrides the substrate's FP32 default.
+schema_version: 1
+id: gpu-inference
+name: GPU inference engine (substrate import example)
+level: service
+imports:
+  - {ontology: ../../cuda/cuda.yaml, as: cuda}
+
+configs:
+  - id: cuda-peak-tflops
+    type: number
+    value: 312
+    default: 19.5
+    summary: "FP16 tensor-core peak of an A100 (overrides the substrate's FP32 default)."
+
+components:
+  - {id: client, kind: client, summary: The caller.}
+  - id: engine
+    kind: service
+    summary: Loads one model onto GPU 0 and serves requests on its own stream.
+    state:
+      schema:
+        type: object
+        properties:
+          weights: {type: string, description: "The weights' device pointer"}
+          params: {type: integer}
+          stream: {type: string}
+      initial: {weights: "", params: 0, stream: ""}
+
+interfaces:
+  - component: engine
+    name: load-model
+    kind: rpc
+    latency_ms: 0
+    request: {type: object, required: [params], properties: {params: {type: integer, examples: [7000000000]}}}
+    response: {type: object, properties: {weights_bytes: {type: integer}, load_ms: {type: number}}}
+    errors: [{code: model_too_large, status: 507}]
+    behavior:
+      - call: cuda/cuda-runtime.malloc
+        input: {device: 0, bytes: "= input.params * 2"}
+        as: w
+        on_error:
+          - fail: {code: model_too_large, status: 507, message: "= 'weights do not fit on the GPU: ' + error.message", data: "= error.data"}
+      - call: cuda/cuda-runtime.stream-create
+        input: {device: 0, non_blocking: true}
+        as: s
+      - call: cuda/cuda-runtime.memcpy
+        input: {device: 0, kind: h2d, dst: "= vars.w.value.ptr", src: weights-file, bytes: "= input.params * 2", pinned: true}
+        as: copy
+      - set:
+          state.weights: "= vars.w.value.ptr"
+          state.params: "= input.params"
+          state.stream: "= vars.s.value.stream"
+      - return: {weights_bytes: "= input.params * 2", load_ms: "= vars.copy.value.waited_ms"}
+
+  - component: engine
+    name: generate
+    kind: rpc
+    latency_ms: 0
+    request: {type: object, required: [prompt_tokens], properties: {prompt_tokens: {type: integer, examples: [512]}}}
+    response: {type: object, properties: {device_us: {type: integer}, prefill_bound: {type: string}, decode_bound: {type: string}}}
+    errors: [{code: model_not_loaded, status: 409}]
+    behavior:
+      - if: "state.weights == ''"
+        then: [{fail: {code: model_not_loaded, status: 409}}]
+      - set: {vars.t0: "= now_us"}
+      - call: cuda/cuda-runtime.memcpy-async
+        input: {device: 0, stream: "= state.stream", kind: h2d, dst: "= state.weights", src: prompt, bytes: "= input.prompt_tokens * 4", pinned: true}
+        as: input_copy
+      - call: cuda/cuda-runtime.launch-kernel
+        input: {device: 0, stream: "= state.stream", name: prefill, blocks: 864, threads_per_block: 256, flops: "= 2 * state.params * input.prompt_tokens", bytes: "= state.params * 2"}
+        as: prefill
+      - call: cuda/cuda-runtime.launch-kernel
+        input: {device: 0, stream: "= state.stream", name: decode, blocks: 864, threads_per_block: 256, flops: "= 2 * state.params", bytes: "= state.params * 2"}
+        as: decode
+      - call: cuda/cuda-runtime.memcpy-async
+        input: {device: 0, stream: "= state.stream", kind: d2h, dst: logits, src: "= state.weights", bytes: 64000, pinned: true}
+        as: out
+      - call: cuda/cuda-runtime.stream-synchronize
+        input: {device: 0, stream: "= state.stream"}
+        as: sync
+      - return:
+          device_us: "= vars.sync.value.done_us - vars.t0"
+          prefill_bound: "= vars.prefill.value.bound"
+          decode_bound: "= vars.decode.value.bound"
+
+flows:
+  - {id: load-model, tags: [writes], entry: {caller: client, interface: engine.load-model}}
+  - {id: generate, tags: [reads], entry: {caller: client, interface: engine.generate}}
+
+scenarios:
+  - id: load-then-generate
+    name: A 7B model loads in 560 ms over PCIe Gen4; a 512-token request is compute bound in prefill, memory bound in decode, ~30 ms in all
+    steps:
+      - {flow: load-model, as: load, input: {params: 7000000000}}
+      - {flow: generate, as: gen, input: {prompt_tokens: 512}}
+      - {interface: cuda/cuda-runtime.mem-get-info, caller: client, as: info, input: {device: 0}}
+    expect:
+      - "steps.load.result.value.load_ms == 560.01 && steps.load.duration_ms == 560"
+      - "steps.gen.result.value.prefill_bound == 'compute' && steps.gen.result.value.decode_bound == 'memory'"
+      - "steps.gen.result.value.device_us == 29876 && steps.gen.duration_ms == 29"
+      - "steps.info.result.value.free == 85899345920 - 536870912 - 14000000000"
+      - "state['cuda/cuda-runtime'].completed.map(o, state['cuda/cuda-runtime'].ops[o].op) == ['memcpy h2d', 'memcpy h2d', 'kernel prefill', 'kernel decode', 'memcpy d2h']"
+
+  - id: model-too-large
+    name: A 70B fp16 model (140 GB) doesn't fit in 80 GB; the load fails out of memory and nothing is allocated
+    steps:
+      - {flow: load-model, as: load, input: {params: 70000000000}}
+      - {flow: generate, as: gen, input: {prompt_tokens: 16}}
+    expect:
+      - "!steps.load.result.ok && steps.load.result.error.code == 'model_too_large' && steps.load.result.error.data.cuda_error == 2"
+      - "!steps.gen.result.ok && steps.gen.result.error.code == 'model_not_loaded'"
+      - "size(state['cuda/cuda-runtime'].allocs) == 0 && state.engine.weights == ''"

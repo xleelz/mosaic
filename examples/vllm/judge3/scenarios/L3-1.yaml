@@ -1,0 +1,80 @@
+schema_version: 1
+id: vllm
+# L3-1 Sleep and wake (blind judge, fix round 4).
+# Verified against vllm-0.32.0:
+#  routers.py:40-47 (dev + RL routers only with VLLM_SERVER_DEV_MODE), serve/__init__.py:43-47 (SECURITY WARNING),
+#  serve/dev/sleep/api_router.py:26-61, async_llm.py:1154-1175, core.py:959-1019 + 2061-2103 (pause, idle callback),
+#  executor/abstract.py:37,379-417 (SLEEP_TAGS), sleep_mode_backend.py:127-137, loggers.py:1335-1352,
+#  exception_handling/register.py:29 + handlers/validation.py:149-198 (RequestValidationError -> 400, not 422).
+scenarios:
+  - id: bench-l3-1a
+    name: Without VLLM_SERVER_DEV_MODE the sleep and pause routes are not registered (404)
+    fixtures: [full-tp1-llama-8b]
+    config: {enable-sleep-mode: true}
+    steps:
+      - {interface: dev-sleep-router.post-sleep, caller: api-client, input: {path: /sleep, query: {level: 1}}, as: sleep}
+      - {interface: dev-sleep-router.post-wake-up, caller: api-client, input: {path: /wake_up, query: {tags: []}}, as: wake}
+      - {interface: dev-sleep-router.get-is-sleeping, caller: api-client, input: {path: /is_sleeping}, as: iss}
+      - {interface: rl-online-router.post-pause, caller: api-client, input: {path: /pause}, as: pause}
+    expect:
+      - "[steps.sleep, steps.wake, steps.iss, steps.pause].all(s, !s.result.ok && s.result.error.status == 404)"
+      - "!trace.exists(e, e.type == 'call.start' && e.interface.startsWith('async-llm.'))"
+      # The startup SECURITY WARNING (serve/__init__.py:44-47) is not modeled: no interface registers the routers.
+
+  - id: bench-l3-1b
+    name: /sleep?level=1 with a request in flight aborts it, offloads weights, discards the KV cache, then replies
+    fixtures: [full-tp1-llama-8b]
+    config: {vllm-server-dev-mode: true, enable-sleep-mode: true}
+    max_events: 600000
+    max_iterations: 1000000
+    steps:
+      - {flow: serving-api-chat-completion, input: {body: {max_tokens: 32}}, as: chat, await: false}
+      - {interface: dev-sleep-router.post-sleep, caller: api-client, input: {path: /sleep, query: {level: 1, mode: abort}}, as: sl, at_ms: 170}
+      - {interface: dev-sleep-router.get-is-sleeping, caller: api-client, input: {path: /is_sleeping}, as: iss}
+    expect:
+      # outcome the code gives (core.py:2088-2092 abort; 974-995 sleep after the pause completes)
+      - "steps.chat.result.ok && steps.chat.result.value.choices[0].finish_reason == 'abort'"
+      - "steps.sl.result.ok && steps.sl.result.value.status == 'sleeping' && steps.sl.result.value.level == 1"
+      - "steps.iss.result.value.is_sleeping == true"
+      - "state['stat-logger-manager'].sleep_state.weights_offloaded == 1 && state['stat-logger-manager'].sleep_state.awake == 0"
+      # the path: the executor actually sleeps (weights offloaded, KV discarded) before /sleep replies
+      - "calls['executor.sleep'] == 1 && 'weights' in state.executor.sleeping_tags && 'kv_cache' in state.executor.sleeping_tags"
+      - "'weights' in state['cu-mem-allocator@rank0'].offloaded && 'kv_cache' in state['cu-mem-allocator@rank0'].discarded"
+
+  - id: bench-l3-1c
+    name: Asleep, a chat request queues; wake weights only stays sleeping; a full wake runs the queued request
+    fixtures: [full-tp1-llama-8b]
+    config: {vllm-server-dev-mode: true, enable-sleep-mode: true}
+    max_events: 600000
+    max_iterations: 1000000
+    steps:
+      - {interface: dev-sleep-router.post-sleep, caller: api-client, input: {path: /sleep, query: {level: 1, mode: abort}}, as: sl}
+      - {interface: dev-sleep-router.get-is-sleeping, caller: api-client, input: {path: /is_sleeping}, as: iss}
+      - {flow: serving-api-chat-completion, input: {body: {max_tokens: 4}}, as: chat, await: false}
+      - {interface: dev-sleep-router.post-wake-up, caller: api-client, input: {path: /wake_up, query: {tags: [weights]}}, as: w1, at_ms: 300}
+      - {interface: dev-sleep-router.post-wake-up, caller: api-client, input: {path: /wake_up, query: {tags: []}}, as: w2, at_ms: 400}
+    expect:
+      - "steps.sl.result.value == {'status': 'sleeping', 'level': 1} && steps.iss.result.value.is_sleeping"
+      - "trace.exists(e, e.type == 'call.start' && e.interface == 'cu-mem-allocator.sleep')"
+      - "steps.w1.result.value.status == 'sleeping' && steps.w1.result.value.tags == ['weights']"
+      - "steps.w2.result.value.status == 'awake' && steps.w2.result.value.tags == null"
+      # queued, not scheduled, until the full wake resumes the scheduler (scheduler.py:912-917, core.py:1016-1018)
+      - "steps.chat.result.ok && steps.chat.result.value.choices[0].finish_reason == 'length'"
+      - "trace.filter(e, e.type == 'call.start' && e.interface == 'scheduler.schedule').all(e, e.t >= 400)"
+      - "state.executor.sleeping_tags == [] && state['stat-logger-manager'].sleep_state.awake == 1"
+
+  - id: bench-l3-1d
+    name: level=3 is refused 400 by the validation handler; level=2 discards weights (discard_all gauge)
+    fixtures: [full-tp1-llama-8b]
+    config: {vllm-server-dev-mode: true, enable-sleep-mode: true}
+    max_events: 200000
+    steps:
+      - {interface: dev-sleep-router.post-sleep, caller: api-client, input: {path: /sleep, query: {level: 3}}, as: l3}
+      - {interface: dev-sleep-router.post-sleep, caller: api-client, input: {path: /sleep, query: {level: 2, mode: abort}}, as: l2}
+    expect:
+      # handlers/validation.py:149-198: RequestValidationError -> 400 Bad Request, param from loc ('query','level') = 'query.level'
+      - "!steps.l3.result.ok && steps.l3.result.error.status == 400"
+      - "!steps.l3.result.ok && steps.l3.result.error.data.param == 'query.level'"
+      - "steps.l2.result.value == {'status': 'sleeping', 'level': 2}"
+      - "'weights' in state['cu-mem-allocator@rank0'].discarded && !('weights' in state['cu-mem-allocator@rank0'].offloaded)"
+      - "state['stat-logger-manager'].sleep_state == {'awake': 0, 'weights_offloaded': 0, 'discard_all': 1}"

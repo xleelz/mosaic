@@ -1,0 +1,58 @@
+schema_version: 1
+id: vllm
+scenarios:
+  - id: bench-l3-7a
+    name: (a) fifth request over max_num_queued_reqs=4 gets 503 in the API process
+    flow: serving-api-chat-completion
+    fixtures: [full-tp1-llama-8b]
+    config: {max-num-queued-reqs: 4}
+    state:
+      output-processor: {request_states: {r1: {}, r2: {}, r3: {}, r4: {}}}
+    expect:
+      - "!result.ok && result.error.status == 503"
+      - "result.error.message == 'The engine is currently busy and cannot accept new requests. Please try again later or on a different instance.'"
+      - "calls['async-llm.check-admission'] == 1 && calls['async-llm.generate'] == 0"
+      - "!trace.exists(e, e.type == 'call.start' && e.interface.startsWith('engine-core'))"
+  - id: bench-l3-7b
+    name: (b) n=2 counts as 2 - rejected with 3 in flight, n=1 admitted
+    fixtures: [full-tp1-llama-8b]
+    config: {max-num-queued-reqs: 4}
+    state:
+      output-processor: {request_states: {r1: {}, r2: {}, r3: {}}}
+    steps:
+      - {flow: serving-api-chat-completion, input: {body: {n: 2}}, as: two}
+      - {flow: serving-api-chat-completion, input: {body: {n: 1}}, as: one}
+    expect:
+      - "!steps.two.result.ok && steps.two.result.error.status == 503"
+      - "steps.one.result.ok"
+      - "trace.exists(e, e.type == 'call.start' && e.interface == 'async-llm.check-admission' && e.input.n == 2)"
+      - "calls['async-llm.generate'] == 1"
+  - id: bench-l3-7c
+    name: (c) stream=true over the limit gets a real 503, not 200 + error chunk
+    flow: serving-api-chat-stream
+    fixtures: [full-tp1-llama-8b]
+    config: {max-num-queued-reqs: 4}
+    state:
+      output-processor: {request_states: {r1: {}, r2: {}, r3: {}, r4: {}}}
+    expect:
+      - "!result.ok && result.error.status == 503"
+      - "calls['async-llm.generate'] == 0 && !trace.exists(e, e.type == 'call.start' && e.interface.contains('stream-generator'))"
+      - "trace.exists(e, e.type == 'call.end' && e.interface == 'generate-base-serving.preflight' && e.error != null)"
+  - id: bench-l3-7d
+    name: (d) rejection counter per rejection, /health stays 200, in-flight requests finish normally
+    fixtures: [full-tp1-llama-8b]
+    config: {max-num-queued-reqs: 4}
+    steps:
+      - {flow: serving-api-chat-completion, await: false, as: f1}
+      - {flow: serving-api-chat-completion, await: false, as: f2}
+      - {flow: serving-api-chat-completion, await: false, as: f3}
+      - {flow: serving-api-chat-completion, await: false, as: f4}
+      - {flow: serving-api-chat-completion, at_ms: 30, await: false, as: rej1}
+      - {flow: serving-api-chat-completion, at_ms: 31, await: false, as: rej2}
+      - {flow: serving-api-health, at_ms: 32, await: false, as: health}
+    expect:
+      - "!steps.rej1.result.ok && steps.rej1.result.error.status == 503 && !steps.rej2.result.ok && steps.rej2.result.error.status == 503"
+      - "state['stat-logger-manager'].admission_rejections.max_num_queued_reqs == 2"
+      - "trace.filter(e, e.type == 'call.start' && e.interface == 'prometheus-registry.incr' && e.input.name == 'vllm:admission_rejections').size() == 2"
+      - "steps.health.result.ok && steps.health.result.value.status_code == 200"
+      - "[steps.f1, steps.f2, steps.f3, steps.f4].all(s, s.result.ok && s.result.value.choices[0].finish_reason in ['length', 'stop'])"

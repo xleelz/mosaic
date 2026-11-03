@@ -1,0 +1,42 @@
+schema_version: 1
+id: vllm
+scenarios:
+  - id: bench-v5
+    name: "V5: client disconnects mid-stream"
+    description: >
+      Streaming request (max_tokens 16) while the busy loop runs; the client disconnects after a
+      few tokens. Code: the cancellation reaches AsyncLLM.generate (CancelledError/GeneratorExit,
+      async_llm.py:777-783), which calls abort(internal=True): OutputProcessor.abort_requests drops
+      the request state and an ABORT goes to the engine core, where EngineCore.abort_requests ->
+      Scheduler.finish_requests(FINISHED_ABORTED) frees the request's KV blocks
+      (scheduler.py:2649-2771). For a StreamingResponse the disconnect is seen by Starlette's
+      response, not with_cancellation (api_utils.py:62-65).
+    fixtures: [full-tp1-llama-8b]
+    steps:
+      - {flow: engine-core-busy-loop, input: {iterations: 60}, as: loop, await: false}
+      - flow: serving-api-chat-completion
+        at_ms: 0
+        as: chat
+        await: false
+        input:
+          path: /v1/chat/completions
+          headers: {X-Request-Id: v5}
+          body:
+            model: llama-8b
+            messages: [{role: user, content: "What is the capital of France?"}]
+            max_tokens: 16
+            stream: true
+      - {at_ms: 260, cancel: disconnect-chatcmpl-v5}
+    expect:
+      # outcome: the request is aborted, not completed
+      - "steps.chat.result.ok && steps.chat.result.value.disconnected == true"
+      - "calls['async-llm.abort'] == 1 && calls['request-output-collector.put'] < 16"
+      # path: ABORT to the engine core, finished as aborted in the scheduler, KV blocks freed
+      - "trace.exists(e, e.type == 'call.start' && e.interface == 'engine-core-proc.process-input-sockets' && e.input.request_type == 'ABORT' && e.input.request_ids.exists(r, r.startsWith('chatcmpl-v5-')))"
+      - "trace.exists(e, e.type == 'call.start' && e.interface == 'scheduler.finish-requests' && e.input.request_ids.exists(r, r.startsWith('chatcmpl-v5-')))"
+      - "trace.filter(e, e.type == 'call.start' && e.interface == 'kv-cache-manager.free').size() == 1"
+      - "trace.filter(e, e.type == 'call.start' && e.interface == 'scheduler.finish-requests')[0].seq < trace.filter(e, e.type == 'call.start' && e.interface == 'kv-cache-manager.free')[0].seq"
+      - "size(state['output-processor'].request_states) == 0"
+      - "size(state['full-attention-manager'].req_to_blocks) == 0"
+      # ctx set by engine-core's generate when its await is cancelled
+      - "ctx.generate_canceled.startsWith('chatcmpl-v5-')"

@@ -1,0 +1,289 @@
+# models-layers: the model registry and the registry subprocess entry point.
+# build.py adds model-registry's `models`, `previously_supported` and `oot_supported`
+# state and the registry table citations, parsed from registry.py.
+components:
+  - id: model-executor
+    name: model_executor package
+    kind: module
+    parent: gpu-worker
+    layer: models
+    summary: "The model executor: registry, loaders, quantization, layers and model definitions that run inside each GPU worker."
+    sources: ["vllm/model_executor/__init__.py:1-9"]
+    attributes: {owner: models-layers}
+  - id: model-registry
+    name: _ModelRegistry (ModelRegistry)
+    kind: module
+    parent: model-executor
+    layer: models
+    summary: "The architecture registry: maps an HF architecture name to a lazily imported vLLM model class, built from the registry tables."
+    sources:
+      - "vllm/model_executor/models/registry.py:1125-1131"
+      - "vllm/model_executor/models/registry.py:1537-1546"
+    attributes:
+      racy_in_code: "_LazyRegisteredModel.inspect_model_cls reads the modelinfo cache file and later saves it with no lock (vllm/model_executor/models/registry.py:1059-1087); two processes inspecting the same class both run the subprocess and both write the same _ModelInfo"
+    state:
+      initial:
+        modelinfo_cache: {}
+  - id: model-registry-subprocess
+    name: registry.py subprocess entry (_run, _run_in_subprocess)
+    kind: function
+    parent: model-executor
+    layer: models
+    summary: "Runs model-class inspection in a child python -m vllm.model_executor.models.registry process so CUDA is not initialized in the parent."
+    sources:
+      - "vllm/model_executor/models/registry.py:1550-1577"
+      - "vllm/model_executor/models/registry.py:1580-1595"
+
+interfaces:
+  - component: model-registry
+    name: resolve-model-cls
+    kind: function
+    summary: "Resolve the first registered architecture of a model to its vLLM class, with the Transformers backend fallback and the unsupported-architecture refusals."
+    sources: ["vllm/model_executor/models/registry.py:1376-1428"]
+    request:
+      type: object
+      required: [architectures]
+      properties:
+        architectures: {type: array, items: {type: string, examples: [LlamaForCausalLM]}}
+        model_impl: {type: [string, "null"], default: null}
+    response: ModelsResolvedClass
+    errors:
+      - {code: value-error, status: 0, retryable: false, summary: "No architectures, an unsupported, removed or out-of-tree architecture"}
+    behavior:
+      - title: No architectures given
+        source: "vllm/model_executor/models/registry.py:1381-1384"
+        if: "size(input.architectures) == 0"
+        then:
+          - fail: {code: value-error, status: 0, message: "No model architectures are specified"}
+      - set:
+          vars.impl: "= has(input.model_impl) && input.model_impl != null ? input.model_impl : config['model-impl']"
+          vars.registered: "= input.architectures.filter(a, a in state.models)"
+      - title: model_impl=transformers forces the Transformers backend
+        source: "vllm/model_executor/models/registry.py:1386-1392"
+        if: "vars.impl == 'transformers'"
+        then:
+          - call: model-registry.try-resolve-transformers
+            input: {architecture: "= input.architectures[0]", model_impl: "= vars.impl"}
+            as: tf
+          - if: "vars.tf.value.arch != ''"
+            then:
+              - return: "= merge(state.models[vars.tf.value.arch], {'arch': vars.tf.value.arch, 'requested': input.architectures[0], 'component': 'auto-weights-loader', 'is_pooling': state.models[vars.tf.value.arch].is_pooling})"
+      - title: No registered architecture and model_impl=auto - try Transformers first
+        source: "vllm/model_executor/models/registry.py:1399-1409"
+        if: "size(vars.registered) == 0 && vars.impl == 'auto'"
+        then:
+          - call: model-registry.try-resolve-transformers
+            input: {architecture: "= input.architectures[0]", model_impl: "= vars.impl"}
+            as: tf2
+          - if: "vars.tf2.value.arch != ''"
+            then:
+              - return: "= merge(state.models[vars.tf2.value.arch], {'arch': vars.tf2.value.arch, 'requested': input.architectures[0], 'component': 'auto-weights-loader', 'is_pooling': state.models[vars.tf2.value.arch].is_pooling})"
+      - title: First registered architecture wins
+        detail: "_normalize_arch keeps a registered name as is; _try_load_model_cls imports the module lazily (lru-cached)."
+        source: "vllm/model_executor/models/registry.py:1411-1415"
+        if: "size(vars.registered) > 0"
+        then:
+          - call: model-registry.load-model-cls
+            input: {model_arch: "= vars.registered[0]"}
+            as: cls
+          - return: "= merge(vars.cls.value, {'arch': vars.registered[0], 'requested': vars.registered[0]})"
+      - title: Nothing resolved - raise the unsupported-architecture error
+        source: "vllm/model_executor/models/registry.py:1428"
+        call: model-registry.raise-for-unsupported
+        input: {architectures: "= input.architectures"}
+
+  - component: model-registry
+    name: load-model-cls
+    kind: function
+    summary: "_LazyRegisteredModel.load_model_cls: import the registered module and take the class; the registry row says which module and class."
+    sources: ["vllm/model_executor/models/registry.py:1092-1094"]
+    request: {type: object, required: [model_arch], properties: {model_arch: {type: string, examples: [LlamaForCausalLM]}}}
+    response: ModelsResolvedClass
+    behavior:
+      - title: importlib.import_module(module_name), getattr(class_name)
+        source: "vllm/model_executor/models/registry.py:1092-1094"
+        set:
+          vars.row: "= state.models[input.model_arch]"
+      - return: "= merge(vars.row, {'arch': input.model_arch, 'requested': input.model_arch, 'component': has(vars.row.component) ? vars.row.component : 'auto-weights-loader'})"
+
+  - component: model-registry
+    name: try-resolve-transformers
+    kind: function
+    summary: "_try_resolve_transformers: use the Transformers modeling backend when the architecture is a Transformers backend entry or a compatible transformers class."
+    sources: ["vllm/model_executor/models/registry.py:1222-1295"]
+    request: {type: object, required: [architecture, model_impl], properties: {architecture: {type: string}, model_impl: {type: string}}}
+    response: {type: object, properties: {arch: {type: string}}}
+    errors:
+      - {code: value-error, status: 0, retryable: false}
+    behavior:
+      - title: A Transformers backend registry entry is used as is
+        source: "vllm/model_executor/models/registry.py:1227-1228"
+        if: "input.architecture in state.models && state.models[input.architecture].table == 'transformers_backend'"
+        then:
+          - return: {arch: "= input.architecture"}
+      - title: Look the class up in transformers (or the model's auto_map)
+        detail: "Whether transformers ships a compatible class is outside vLLM's code; the choice stands for it."
+        source: "vllm/model_executor/models/registry.py:1250-1291"
+        choice: transformers_class
+        default: absent
+        options:
+          compatible:
+            - return: {arch: TransformersForCausalLM}
+          absent:
+            - if: "input.model_impl != 'transformers'"
+              then:
+                - return: {arch: ""}
+            - fail: {code: value-error, status: 0, message: "= 'Cannot find model module. ' + input.architecture + ' is not a registered model in the Transformers library'"}
+
+  - component: model-registry
+    name: raise-for-unsupported
+    kind: function
+    summary: "_raise_for_unsupported: name the version that dropped a removed architecture, the plugin for an out-of-tree one, or list the supported ones."
+    sources: ["vllm/model_executor/models/registry.py:1177-1208"]
+    request: {type: object, required: [architectures], properties: {architectures: {type: array, items: {type: string}}}}
+    errors:
+      - {code: value-error, status: 0, retryable: false}
+    behavior:
+      - title: A registered architecture that failed to import or inspect
+        source: "vllm/model_executor/models/registry.py:1180-1184"
+        if: "input.architectures.exists(a, a in state.models)"
+        then:
+          - fail: {code: value-error, status: 0, message: "= 'Model architectures ' + input.architectures.join(', ') + ' failed to be inspected.'"}
+      - foreach: "= input.architectures"
+        as: arch
+        steps:
+          - title: Previously supported architecture
+            source: "vllm/model_executor/models/registry.py:1187-1195"
+            if: "vars.arch in state.previously_supported"
+            then:
+              - fail: {code: value-error, status: 0, message: "= 'Model architecture ' + vars.arch + ' was supported in vLLM until v' + state.previously_supported[vars.arch] + ', and is not supported anymore.'"}
+          - title: Moved out of tree to a plugin
+            source: "vllm/model_executor/models/registry.py:1196-1203"
+            if: "vars.arch in state.oot_supported"
+            then:
+              - fail: {code: value-error, status: 0, message: "= 'Model architecture ' + vars.arch + ' is not supported in-tree anymore. Please install the plugin at ' + state.oot_supported[vars.arch]"}
+      - source: "vllm/model_executor/models/registry.py:1205-1208"
+        fail: {code: value-error, status: 0, message: "= 'Model architectures ' + input.architectures.join(', ') + ' are not supported for now.'"}
+
+  - component: model-registry
+    name: inspect-model-cls
+    kind: function
+    summary: "Return the _ModelInfo of the first registered architecture: from the per-module cache file when the module hash matches, else from a subprocess that imports the class, then cache it."
+    sources:
+      - "vllm/model_executor/models/registry.py:1323-1374"
+      - "vllm/model_executor/models/registry.py:1044-1090"
+    tags: [writes]
+    request:
+      type: object
+      required: [architectures]
+      properties:
+        architectures: {type: array, items: {type: string, examples: [LlamaForCausalLM]}}
+    response: ModelsModelInfo
+    errors:
+      - {code: value-error, status: 0, retryable: false}
+      - {code: runtime-error, status: 0, retryable: false}
+    behavior:
+      - source: "vllm/model_executor/models/registry.py:1328-1331"
+        if: "size(input.architectures) == 0"
+        then:
+          - fail: {code: value-error, status: 0, message: "No model architectures are specified"}
+      - set:
+          vars.registered: "= input.architectures.filter(a, a in state.models)"
+      - if: "size(vars.registered) == 0"
+        then:
+          - call: model-registry.raise-for-unsupported
+            input: {architectures: "= input.architectures"}
+      - set:
+          vars.arch: "= vars.registered[0]"
+      - title: Cache hit - the module file hash matches the cached _ModelInfo
+        source: "vllm/model_executor/models/registry.py:1059-1068"
+        if: "vars.arch in state.modelinfo_cache"
+        then:
+          - set: {ctx.modelinfo_source: cache}
+          - return: "= state.modelinfo_cache[vars.arch]"
+      - title: Cache miss - inspect in a subprocess to avoid initializing CUDA
+        source: "vllm/model_executor/models/registry.py:1077-1080"
+        call: model-registry-subprocess.run-in-subprocess
+        input: {model_arch: "= vars.arch"}
+        as: mi
+      - title: Save the _ModelInfo cache file
+        source: "vllm/model_executor/models/registry.py:1085-1087"
+        set:
+          ctx.modelinfo_source: subprocess
+          "= 'state.modelinfo_cache.' + vars.arch": "= vars.mi.value"
+      - return: "= vars.mi.value"
+
+  - component: model-registry
+    name: register-model
+    kind: function
+    summary: "Register an out-of-tree architecture, either a class or a lazy 'module:Class' string; an existing name is overwritten."
+    sources: ["vllm/model_executor/models/registry.py:1132-1175"]
+    tags: [writes]
+    request:
+      type: object
+      required: [model_arch, model_cls]
+      properties:
+        model_arch: {type: string, examples: [MyLlamaForCausalLM]}
+        model_cls: {type: string, examples: ["my_plugin.models:MyLlamaForCausalLM"]}
+    response: {type: object, properties: {registered: {type: string}, overwritten: {type: boolean}}}
+    errors:
+      - {code: value-error, status: 0, retryable: false}
+    behavior:
+      - title: A lazy class must be '<module>:<class>'
+        source: "vllm/model_executor/models/registry.py:1159-1164"
+        if: "size(input.model_cls.split(':')) != 2"
+        then:
+          - fail: {code: value-error, status: 0, message: "Expected a string in the format `<module>:<class>`"}
+      - title: Store a _LazyRegisteredModel (overwriting with a debug log if present)
+        source: "vllm/model_executor/models/registry.py:1149-1175"
+        set:
+          vars.overwritten: "= input.model_arch in state.models"
+          "= 'state.models.' + input.model_arch": "= {'module': input.model_cls.split(':')[0], 'class_name': input.model_cls.split(':')[1], 'table': 'plugin', 'is_pooling': false, 'is_text_generation': true}"
+      - return: {registered: "= input.model_arch", overwritten: "= vars.overwritten"}
+
+  - component: model-registry-subprocess
+    name: run-in-subprocess
+    kind: rpc
+    summary: "_run_in_subprocess: pickle the function, run `python -m vllm.model_executor.models.registry` on it, and read the pickled result back; a failing child becomes RuntimeError."
+    sources: ["vllm/model_executor/models/registry.py:1550-1577"]
+    request: {type: object, required: [model_arch], properties: {model_arch: {type: string, examples: [LlamaForCausalLM]}}}
+    response: ModelsModelInfo
+    errors:
+      - {code: runtime-error, status: 0, retryable: false}
+    behavior:
+      - title: subprocess.run(_SUBPROCESS_COMMAND, input=cloudpickle bytes)
+        source: "vllm/model_executor/models/registry.py:1561-1565"
+        call: model-registry-subprocess.run
+        input: {model_arch: "= input.model_arch"}
+        as: child
+        on_error:
+          - title: check_returncode failed - wrap stderr in RuntimeError
+            source: "vllm/model_executor/models/registry.py:1568-1574"
+            fail: {code: runtime-error, status: 0, message: "= 'Error raised in subprocess: ' + error.code"}
+      - return: "= vars.child.value"
+
+  - component: model-registry-subprocess
+    name: run
+    kind: cli
+    summary: "The registry module's __main__: load general plugins, unpickle the function from stdin, run it and pickle the result to the output file."
+    sources:
+      - "vllm/model_executor/models/registry.py:1580-1591"
+      - "vllm/model_executor/models/registry.py:1594-1595"
+    request: {type: object, required: [model_arch], properties: {model_arch: {type: string, examples: [LlamaForCausalLM]}}}
+    response: ModelsModelInfo
+    latency_ms: 1500
+    behavior:
+      - title: Load general plugins so plugin-registered architectures exist in the child
+        source: "vllm/model_executor/models/registry.py:1582-1584"
+      - title: The pickled fn is _ModelInfo.from_model_cls(self.load_model_cls())
+        source: "vllm/model_executor/models/registry.py:1078-1080"
+        call: model-registry.load-model-cls
+        input: {model_arch: "= input.model_arch"}
+        as: cls
+      - title: Build _ModelInfo from the class attributes and pickle it to the output file
+        source: "vllm/model_executor/models/registry.py:891-926"
+        return:
+          architecture: "= vars.cls.value.class_name"
+          is_text_generation_model: "= vars.cls.value.is_text_generation"
+          is_pooling_model: "= vars.cls.value.is_pooling"
+          module: "= vars.cls.value.module"

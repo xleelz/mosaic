@@ -1,0 +1,114 @@
+schema_version: 1
+id: vllm
+# No VLM world exists (no Qwen2.5-VL fixture); the closest is the default world with
+# model-is-multimodal on and the model id set, which reaches the engine end to end.
+scenarios:
+  # (a) The scheduler schedules the image's encoder input only in the step whose token window overlaps
+  # its placeholder: _try_schedule_encoder_inputs -> can_allocate / allocate
+  # (vllm/v1/core/sched/scheduler.py:1789-1812, 1780-1787).
+  - id: bench-p3-8a
+    flow: serving-api-multimodal-chat
+    fixtures: [full-tp1-llama-8b]
+    config: {model-is-multimodal: true, model: Qwen/Qwen2.5-VL-7B-Instruct}
+    input:
+      body:
+        max_tokens: 4
+        messages:
+          - role: user
+            content:
+              - {type: image_url, image_url: {url: "data:image/jpeg;base64,/9j/4AAQ"}}
+              - {type: text, text: "Describe this image."}
+    expect:
+      - "result.ok"
+      - "calls['scheduler.schedule'] >= 1"
+      - "calls['encoder-cache-manager.can-allocate'] >= 1 && calls['encoder-cache-manager.allocate'] == 1"
+  # (b) In that step the worker runs the vision encoder (execute_mm_encoder, cached by mm_hash in
+  # encoder_cache.encoder_outputs) before the decoder forward and splices the embeddings into inputs_embeds
+  # (vllm/v1/worker/gpu/model_states/default.py:110-123, model_states/interface.py:189-205).
+  - id: bench-p3-8b
+    flow: serving-api-multimodal-chat
+    fixtures: [full-tp1-llama-8b]
+    config: {model-is-multimodal: true, model: Qwen/Qwen2.5-VL-7B-Instruct}
+    input:
+      body:
+        max_tokens: 4
+        messages:
+          - role: user
+            content:
+              - {type: image_url, image_url: {url: "data:image/jpeg;base64,/9j/4AAQ"}}
+              - {type: text, text: "Describe this image."}
+    expect:
+      - "result.ok"
+      - "calls['encoder-cache.add-request'] >= 1"
+      - "size(state['encoder-cache@rank0'].encoder_outputs) == 1"
+  # (c) end to end: a concurrent second request with different text and the same image finds the mm_hash
+  # cached, takes a reference, and the encoder does not run again (encoder_cache_manager.py:108-136,
+  # encoder_runner.py:91-92).
+  - id: bench-p3-8c-e2e
+    fixtures: [full-tp1-llama-8b]
+    config: {model-is-multimodal: true, model: Qwen/Qwen2.5-VL-7B-Instruct}
+    steps:
+      - flow: serving-api-multimodal-chat
+        as: r1
+        await: false
+        input:
+          body:
+            max_tokens: 4
+            messages:
+              - role: user
+                content:
+                  - {type: image_url, image_url: {url: "data:image/jpeg;base64,/9j/4AAQ"}}
+                  - {type: text, text: "Describe this image."}
+      - flow: serving-api-multimodal-chat
+        as: r2
+        input:
+          body:
+            max_tokens: 4
+            messages:
+              - role: user
+                content:
+                  - {type: text, text: "What colour is the sky here?"}
+                  - {type: image_url, image_url: {url: "data:image/jpeg;base64,/9j/4AAQ"}}
+    expect:
+      - "steps.r1.result.ok && steps.r2.result.ok"
+      - "calls['encoder-cache-manager.allocate'] == 1"
+      - "trace.exists(e, e.type == 'call.end' && e.interface == 'encoder-cache-manager.check-and-update-cache' && e.output.cached == true)"
+  # (c) unit: the manager's reference counting, driven the way the scheduler calls it.
+  # (d) unit: once both references are dropped the entry is only freeable (slots not returned, still cached);
+  # a later can_allocate that needs the room evicts it, and only then does get_freed_mm_hashes hand it to
+  # the workers, whose free_states drops the tensor (encoder_cache_manager.py:246-309,
+  # model_runner.py:1166-1169). Code nuance: the scheduler drops a reference as soon as the request's
+  # computed tokens pass the placeholder (scheduler.py:2151-2153, 2536-2543), not only at finish.
+  - id: bench-p3-8cd-unit
+    fixtures: [full-tp1-llama-8b]
+    state:
+      "encoder-cache@rank0": {encoder_outputs: {img1: "tensor"}, mm_features: {}}
+    steps:
+      - {interface: encoder-cache-manager.init, caller: scheduler, input: {cache_size: 1000}, as: init}
+      - {interface: encoder-cache-manager.check-and-update-cache, caller: scheduler, as: miss,
+         input: {request_id: r1, input_id: 0, mm_hash: img1}}
+      - {interface: encoder-cache-manager.can-allocate, caller: scheduler, as: can1,
+         input: {request_id: r1, input_id: 0, num_embeds: 600, encoder_compute_budget: 8192, num_embeds_to_schedule: 0}}
+      - {interface: encoder-cache-manager.allocate, caller: scheduler, as: a1,
+         input: {request_id: r1, input_id: 0, mm_hash: img1, num_embeds: 600}}
+      - {interface: encoder-cache-manager.check-and-update-cache, caller: scheduler, as: hit,
+         input: {request_id: r2, input_id: 0, mm_hash: img1}}
+      - {interface: encoder-cache-manager.get-state, caller: scheduler, as: both}
+      - {interface: encoder-cache-manager.free, caller: scheduler, as: f1, input: {request_id: r1, mm_hashes: [img1]}}
+      - {interface: encoder-cache-manager.free, caller: scheduler, as: f2, input: {request_id: r2, mm_hashes: [img1]}}
+      - {interface: encoder-cache-manager.get-state, caller: scheduler, as: idle}
+      - {interface: encoder-cache-manager.get-freed-mm-hashes, caller: scheduler, as: nofreed}
+      - {interface: encoder-cache-manager.can-allocate, caller: scheduler, as: can2,
+         input: {request_id: r3, input_id: 0, num_embeds: 600, encoder_compute_budget: 8192, num_embeds_to_schedule: 0}}
+      - {interface: encoder-cache-manager.get-freed-mm-hashes, caller: scheduler, as: freed}
+      - {interface: encoder-cache.free-encoder-cache, caller: gpu-model-runner, on: rank0, as: wfree,
+         input: {mm_hash: img1}}
+    expect:
+      - "!steps.miss.result.value.cached && steps.can1.result.value.can_allocate"
+      - "steps.hit.result.value.cached"
+      - "size(steps.both.result.value.cached['img1']) == 2 && steps.both.result.value.num_free_slots == 400"
+      - "size(steps.idle.result.value.cached['img1']) == 0 && steps.idle.result.value.num_free_slots == 400 && steps.idle.result.value.num_freeable_slots == 1000"
+      - "size(steps.nofreed.result.value.freed) == 0"
+      - "steps.can2.result.value.can_allocate && steps.can2.result.value.evicted == ['img1']"
+      - "steps.freed.result.value.freed == ['img1']"
+      - "steps.wfree.result.value.num_outputs == 0"

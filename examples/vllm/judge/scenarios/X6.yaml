@@ -1,0 +1,100 @@
+schema_version: 1
+id: vllm
+scenarios:
+  - id: bench-x6-eagle3-engine-steps
+    name: "X6: EAGLE3 through the engine: decode steps schedule 1+k tokens and the runner rejection-samples the drafts"
+    description: >
+      Verified (deployed async scheduling stays on with EAGLE, vllm/config/vllm.py:1596-1604; V2 runner).
+      Once a request is decoding, Scheduler.schedule schedules 1 + num_spec_tokens tokens per request
+      (vllm/v1/core/sched/scheduler.py:1135-1141, 1372-1375) and AsyncScheduler puts -1 placeholders in
+      scheduled_spec_decode_tokens (vllm/v1/core/sched/async_scheduler.py:18, 27-50); the V2 runner verifies
+      the drafts it proposed in one target forward through the RejectionSampler
+      (vllm/v1/worker/gpu/model_runner.py:1643-1652) and proposes the next drafts (2224-2253);
+      update_from_output rolls back num_computed_tokens by the rejected count (scheduler.py:2110-2128).
+    fixtures: [full-tp1-llama-8b]
+    config: {speculative-method: eagle3, num-speculative-tokens: 3}
+    state:
+      "gpu-model-runner@rank0": {speculator: target-dependent-ar-speculator}
+      "cuda-graph-manager@rank0": {decode_query_len: 4}
+    steps:
+      - interface: async-llm.add-request
+        caller: api-server
+        input: {prompt_token_ids: [128000, 9906, 11, 856, 836, 374], request_id: chatcmpl-x6, sampling_params: {max_tokens: 16, n: 1, temperature: 0}}
+        as: add
+      - flow: engine-core-busy-loop
+        input: {iterations: 4}
+        as: loop
+    expect:
+      - "steps.loop.result.ok"
+      # the speculator drafts after the prefill step (modeled)
+      - "calls['target-dependent-ar-speculator.propose'] >= 1"
+      # code: the second scheduled step is a decode step of 1 + 3 tokens with 3 spec-token slots
+      - >
+        trace.filter(e, e.type == 'call.start' && e.interface == 'gpu-model-runner.execute-model')[1].input.total_num_scheduled_tokens == 4
+      - >
+        trace.filter(e, e.type == 'call.start' && e.interface == 'gpu-model-runner.execute-model')[1].input.scheduled_spec_decode_tokens.exists(k, size(trace.filter(e, e.type == 'call.start' && e.interface == 'gpu-model-runner.execute-model')[1].input.scheduled_spec_decode_tokens[k]) == 3)
+      # code: decode steps are verified by the rejection sampler, not the plain sampler
+      - "calls['rejection-sampler.sample'] >= 1"
+
+  - id: bench-x6-worker-verify-accept
+    name: "X6 (worker seam): 3 drafts verified in one target forward; all accepted plus a bonus token, next drafts proposed"
+    fixtures: [full-tp1-llama-8b]
+    config: {speculative-method: eagle3, num-speculative-tokens: 3}
+    state:
+      "cuda-graph-manager@rank0": {decode_query_len: 4}
+      "gpu-model-runner@rank0":
+        fresh_slots_used: 1
+        speculator: target-dependent-ar-speculator
+        slots: {chatcmpl-x6: {prefill_len: 100, prompt_len: 100, slot: 1023}}
+      "sampler@rank0":
+        slots: {"1023": {logit_bias: false, logprobs: -1, min_p: 0, needs_processing: false, penalties: false, seeded: false, temperature: 0, thinking: false, top_k: 128256, top_p: 1}}
+    steps:
+      - flow: wr-execute-model
+        input:
+          num_scheduled_tokens: {chatcmpl-x6: 4}
+          scheduled_cached_reqs: {new_block_ids: [[]], num_computed_tokens: [100], req_ids: [chatcmpl-x6]}
+          scheduled_new_reqs: []
+          scheduled_spec_decode_tokens: {chatcmpl-x6: [201, 202, 203]}
+          total_num_scheduled_tokens: 4
+        as: e
+      - flow: wr-sample-tokens
+        as: s
+    expect:
+      # one target forward over 1 + 3 tokens, replayed as a FULL uniform-decode graph (query len 4)
+      - "calls['cuda-graph-manager.run-fullgraph'] == 1 && calls['llama-for-causal-lm.forward'] == 0"
+      - "trace.exists(e, e.type == 'call.end' && e.interface == 'cuda-graph-manager.dispatch' && e.output.cg_mode == 'FULL')"
+      # verification by the rejection sampler only, then the next drafts
+      - "calls['rejection-sampler.sample'] == 1 && calls['sampler.sample'] == 0"
+      - >
+        trace.filter(e, e.type == 'call.start' && e.interface in ['rejection-sampler.sample', 'target-dependent-ar-speculator.propose']).map(e, e.interface) ==
+        ['rejection-sampler.sample', 'target-dependent-ar-speculator.propose']
+      - "steps.s.result.value.sampled_token_ids[0].slice(0, 3) == [201, 202, 203] && size(steps.s.result.value.sampled_token_ids[0]) == 4"
+      - "size(state['gpu-model-runner@rank0'].draft_tokens['chatcmpl-x6']) == 3"
+
+  - id: bench-x6-worker-verify-reject
+    name: "X6 (worker seam): the first draft rejected: one resampled token, the drafts discarded"
+    fixtures: [full-tp1-llama-8b]
+    config: {speculative-method: eagle3, num-speculative-tokens: 3}
+    choices: {rejection-sampler.sample.acceptance: reject_first}
+    state:
+      "cuda-graph-manager@rank0": {decode_query_len: 4}
+      "gpu-model-runner@rank0":
+        fresh_slots_used: 1
+        speculator: target-dependent-ar-speculator
+        slots: {chatcmpl-x6: {prefill_len: 100, prompt_len: 100, slot: 1023}}
+      "sampler@rank0":
+        slots: {"1023": {logit_bias: false, logprobs: -1, min_p: 0, needs_processing: false, penalties: false, seeded: false, temperature: 0, thinking: false, top_k: 128256, top_p: 1}}
+    steps:
+      - flow: wr-execute-model
+        input:
+          num_scheduled_tokens: {chatcmpl-x6: 4}
+          scheduled_cached_reqs: {new_block_ids: [[]], num_computed_tokens: [100], req_ids: [chatcmpl-x6]}
+          scheduled_new_reqs: []
+          scheduled_spec_decode_tokens: {chatcmpl-x6: [201, 202, 203]}
+          total_num_scheduled_tokens: 4
+        as: e
+      - flow: wr-sample-tokens
+        as: s
+    expect:
+      - "size(steps.s.result.value.sampled_token_ids[0]) == 1 && !(steps.s.result.value.sampled_token_ids[0][0] in [201, 202, 203])"
+      - "calls['rejection-sampler.resample-kernel'] == 1 && ctx.num_accepted == [0]"

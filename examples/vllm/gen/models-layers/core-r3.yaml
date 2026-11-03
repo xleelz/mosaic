@@ -1,0 +1,118 @@
+# models-layers round 3: TensorSchema input validation (Phi-3-V) and Ernie-4.5-VL M-RoPE positions.
+components:
+  - id: phi3v-image-pixel-inputs
+    name: Phi3VImagePixelInputs (TensorSchema)
+    kind: module
+    parent: model-executor
+    layer: multimodal
+    summary: "Phi-3-V pixel inputs: pixel_values is (bn, p, 3, h, w) with p dynamic, image_sizes is (bn, 2); TensorSchema validates the shapes at construction."
+    sources: ["vllm/model_executor/models/phi3v.py:121-141"]
+  - id: ernie45-vl-moe-for-conditional-generation
+    name: Ernie4_5_VLMoeForConditionalGeneration
+    kind: module
+    parent: model-executor
+    layer: models
+    summary: "Ernie-4.5-VL: computes 3-D (t, h, w) M-RoPE positions for text and image/video placeholder spans."
+    sources: ["vllm/model_executor/models/ernie45_vl.py:1346-1360"]
+
+interfaces:
+  - component: phi3v-image-pixel-inputs
+    name: validate
+    kind: function
+    summary: "TensorSchema.__init__ -> validate: a list field must be non-empty and its items must share every non-dynamic dimension; the stacked shape must then match (bn, p, 3, h, w), and bn must agree with image_sizes."
+    sources: ["vllm/utils/tensor_schema.py:48-63", "vllm/utils/tensor_schema.py:198-240"]
+    request:
+      type: object
+      required: [pixel_values, image_sizes]
+      properties:
+        pixel_values: {type: array, items: {type: array, items: {type: integer}}, examples: [[[16, 3, 32, 32], [32, 3, 32, 32]]]}
+        image_sizes: {type: array, items: {type: integer}, examples: [[2, 2]]}
+    response: {type: object, properties: {bn: {type: integer}}}
+    errors:
+      - {code: value-error, status: 0, retryable: false}
+    behavior:
+      - set:
+          vars.pv: "= input.pixel_values"
+      - title: _validate_field - an empty sequence
+        source: "vllm/utils/tensor_schema.py:120-124"
+        if: "size(vars.pv) == 0"
+        then:
+          - fail: {code: value-error, status: 0, message: "pixel_values is an empty sequence"}
+      - title: Every item must match item 0 except in dynamic dims (p)
+        source: "vllm/utils/tensor_schema.py:126-149"
+        set:
+          vars.bad: "= lists.range(size(vars.pv)).filter(i, size(vars.pv[i]) != size(vars.pv[0]) || lists.range(size(vars.pv[i])).exists(d, d > 0 && vars.pv[i][d] != vars.pv[0][d]))"
+      - source: "vllm/utils/tensor_schema.py:140-149"
+        if: "size(vars.bad) > 0"
+        then:
+          - fail: {code: value-error, status: 0, message: "= 'pixel_values contains inconsistent shapes: torch.Size([' + vars.pv[0].map(x, string(x)).join(', ') + ']) (index 0) vs torch.Size([' + vars.pv[vars.bad[0]].map(x, string(x)).join(', ') + ']) (index ' + string(vars.bad[0]) + ')'"}
+      - title: _validate_tensor_shape_expected - the channel dim is 3
+        source: "vllm/utils/tensor_schema.py:172-181"
+        if: "vars.pv[0][1] != 3"
+        then:
+          - fail: {code: value-error, status: 0, message: "= 'pixel_values dim[2] expected 3, got ' + string(vars.pv[0][1])"}
+      - title: bn binds from pixel_values and must match image_sizes
+        source: "vllm/utils/tensor_schema.py:182-192"
+        if: "input.image_sizes[0] != size(vars.pv)"
+        then:
+          - fail: {code: value-error, status: 0, message: "= 'image_sizes dim[0] expected \\'bn\\'=' + string(size(vars.pv)) + ', got ' + string(input.image_sizes[0])"}
+      - return: {bn: "= size(vars.pv)"}
+
+  - component: ernie45-vl-moe-for-conditional-generation
+    name: get-mrope-input-positions
+    kind: function
+    summary: "get_mrope_input_positions: walk the multimodal features in offset order; each text run continues from the last max position, each image/video span lays out its (t, h/conv, w/conv) grid indices; delta = max + 1 - len(tokens)."
+    sources: ["vllm/model_executor/models/ernie45_vl.py:1496-1531", "vllm/model_executor/models/ernie45_vl.py:1533-1560"]
+    request:
+      type: object
+      required: [input_tokens, mm_features]
+      properties:
+        input_tokens: {type: array, items: {type: integer}, examples: [[11, 12, 13]]}
+        mm_features: {type: array, items: {type: object}, maxItems: 4, examples: [[]]}
+        spatial_conv_size: {type: integer, default: 2}
+        temporal_conv_size: {type: integer, default: 2}
+    response: {type: object, properties: {positions: {type: array}, delta: {type: integer}}}
+    errors:
+      - {code: value-error, status: 0, retryable: false}
+    behavior:
+      - set: {vars.p0: [], vars.p1: [], vars.p2: [], vars.st: 0, vars.mx: -1}
+      - title: iter_mm_grid_thw - features sorted by mm_position.offset
+        source: "vllm/model_executor/models/ernie45_vl.py:1539"
+        foreach: "= input.mm_features.sortBy(f, f.offset)"
+        as: f
+        steps:
+          - title: Only image and video carry a grid
+            source: "vllm/model_executor/models/ernie45_vl.py:1559-1560"
+            if: "!(vars.f.modality in ['image', 'video'])"
+            then:
+              - fail: {code: value-error, status: 0, message: "= 'Unsupported modality: ' + vars.f.modality"}
+          - title: image (t, h/s, w/s); video (t/tc, h/s, w/s)
+            source: "vllm/model_executor/models/ernie45_vl.py:1544-1558"
+            set:
+              vars.t: "= vars.f.modality == 'image' ? vars.f.grid_thw[0] : vars.f.grid_thw[0] / input.temporal_conv_size"
+              vars.h: "= vars.f.grid_thw[1] / input.spatial_conv_size"
+              vars.w: "= vars.f.grid_thw[2] / input.spatial_conv_size"
+              vars.text_len: "= vars.f.offset - vars.st"
+              vars.st_idx: "= vars.mx + 1"
+          - title: Text before the span, then the span's grid indices, both offset by st_idx (+ text_len)
+            source: "vllm/model_executor/models/ernie45_vl.py:1510-1520"
+            set:
+              vars.n: "= vars.t * vars.h * vars.w"
+              vars.p0: "= vars.p0 + lists.range(vars.text_len).map(x, x + vars.st_idx) + lists.range(vars.t * vars.h * vars.w).map(k, k / (vars.h * vars.w) + vars.text_len + vars.st_idx)"
+              vars.p1: "= vars.p1 + lists.range(vars.text_len).map(x, x + vars.st_idx) + lists.range(vars.t * vars.h * vars.w).map(k, (k / vars.w) % vars.h + vars.text_len + vars.st_idx)"
+              vars.p2: "= vars.p2 + lists.range(vars.text_len).map(x, x + vars.st_idx) + lists.range(vars.t * vars.h * vars.w).map(k, k % vars.w + vars.text_len + vars.st_idx)"
+          - set:
+              vars.mx: "= math.greatest(vars.p0 + vars.p1 + vars.p2)"
+              vars.st: "= vars.f.offset + vars.n"
+      - title: Trailing text after the last span
+        source: "vllm/model_executor/models/ernie45_vl.py:1522-1527"
+        when: "vars.st < size(input.input_tokens)"
+        set:
+          vars.p0: "= vars.p0 + lists.range(size(input.input_tokens) - vars.st).map(x, x + vars.mx + 1)"
+          vars.p1: "= vars.p1 + lists.range(size(input.input_tokens) - vars.st).map(x, x + vars.mx + 1)"
+          vars.p2: "= vars.p2 + lists.range(size(input.input_tokens) - vars.st).map(x, x + vars.mx + 1)"
+      - title: mrope_position_delta = max + 1 - len(input_tokens)
+        source: "vllm/model_executor/models/ernie45_vl.py:1529-1531"
+        return:
+          positions: "= [vars.p0, vars.p1, vars.p2]"
+          delta: "= math.greatest(vars.p0 + vars.p1 + vars.p2) + 1 - size(input.input_tokens)"

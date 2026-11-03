@@ -1,0 +1,282 @@
+# models-layers: multimodal processing (vllm/multimodal).
+components:
+  - id: multi-modal-registry
+    name: MultiModalRegistry (MULTIMODAL_REGISTRY)
+    kind: module
+    parent: model-executor
+    layer: multimodal
+    summary: "The global registry that dispatches multimodal data processing to the processor a model class registered."
+    sources: ["vllm/multimodal/__init__.py:5", "vllm/multimodal/registry.py:79-113"]
+    state:
+      initial:
+        processors:
+          Qwen2VLForConditionalGeneration: {info: Qwen2VLProcessingInfo, supported_limits: {image: null, video: null}, tokens_per_item: {image: 256, video: 1024}, hf_config_type: Qwen2VLConfig, processor_cls: Qwen2VLProcessor}
+          Qwen2_5_VLForConditionalGeneration: {info: Qwen2_5_VLProcessingInfo, supported_limits: {image: null, video: null}, tokens_per_item: {image: 256, video: 1024}, hf_config_type: Qwen2_5_VLConfig, processor_cls: Qwen2_5_VLProcessor}
+          LlavaForConditionalGeneration: {info: LlavaProcessingInfo, supported_limits: {image: null}, tokens_per_item: {image: 576}, hf_config_type: LlavaConfig, processor_cls: LlavaProcessor}
+  - id: base-processing-info
+    name: BaseProcessingInfo (InputProcessingContext)
+    kind: module
+    parent: multi-modal-registry
+    layer: multimodal
+    summary: "Per-model processing info over the InputProcessingContext: modality limits, data parsing and item-count validation."
+    sources: ["vllm/multimodal/processing/context.py:214-224", "vllm/multimodal/processing/context.py:450-458"]
+  - id: multi-modal-data-parser
+    name: MultiModalDataParser
+    kind: module
+    parent: multi-modal-registry
+    layer: multimodal
+    summary: "Normalizes MultiModalDataDict into per-modality items (audio, image, video, vision_chunk), raw data or embeddings."
+    sources: ["vllm/multimodal/parse.py:537-545"]
+  - id: base-multi-modal-processor
+    name: BaseMultiModalProcessor
+    kind: module
+    parent: multi-modal-registry
+    layer: multimodal
+    summary: "Applies the HF processor to the multimodal data and expands placeholder tokens in the prompt to each item's feature size."
+    sources: ["vllm/multimodal/processing/processor.py:1032-1040"]
+
+interfaces:
+  - component: multi-modal-registry
+    name: create-processor
+    kind: function
+    summary: "create_processor: refuse a non-multimodal model, resolve the model class, require a registered processor factory, then build the processor over a fresh InputProcessingContext."
+    sources: ["vllm/multimodal/registry.py:150-166", "vllm/multimodal/registry.py:115-125"]
+    request:
+      type: object
+      required: [model, architectures]
+      properties:
+        model: {type: string, examples: [Qwen/Qwen2-VL-7B-Instruct]}
+        architectures: {type: array, items: {type: string, examples: [Qwen2VLForConditionalGeneration]}}
+    response: {type: object, properties: {architecture: {type: string}, info: {type: string}}}
+    errors:
+      - {code: value-error, status: 0, retryable: false}
+    behavior:
+      - title: _get_model_cls -> get_model_architecture (the registry resolution)
+        source: "vllm/multimodal/registry.py:115-120"
+        call: model-loader-utils.get-model-architecture
+        input: {model: "= input.model", architectures: "= input.architectures"}
+        as: arch
+      - title: model_config.is_multimodal_model must hold
+        source: "vllm/multimodal/registry.py:157-159"
+        if: "vars.arch.value.table != 'multimodal'"
+        then:
+          - fail: {code: value-error, status: 0, message: "= input.model + ' is not a multimodal model'"}
+      - title: The class must carry a _processor_factory (register_processor)
+        source: "vllm/multimodal/registry.py:121-124"
+        if: "!(vars.arch.value.arch in state.processors)"
+        then:
+          - fail: {code: value-error, status: 0, message: "= 'Model class ' + vars.arch.value.class_name + ' has no registered multimodal processor'"}
+      - title: factories.build_processor(InputProcessingContext(model_config, tokenizer)); the tokenizer is None with --skip-tokenizer-init
+        source: "vllm/multimodal/registry.py:161-166"
+        return:
+          architecture: "= vars.arch.value.arch"
+          info: "= state.processors[vars.arch.value.arch].info"
+          supported_limits: "= state.processors[vars.arch.value.arch].supported_limits"
+          tokens_per_item: "= state.processors[vars.arch.value.arch].tokens_per_item"
+          ctx:
+            model: "= input.model"
+            hf_config_type: "= state.processors[vars.arch.value.arch].hf_config_type"
+            processor_cls: "= state.processors[vars.arch.value.arch].processor_cls"
+            tokenizer: "= config['skip-tokenizer-init'] ? null : input.model"
+            tokenizer_mode: auto
+
+  - component: multi-modal-data-parser
+    name: parse-mm-data
+    kind: function
+    summary: "parse_mm_data: every key must be a supported modality; image/video/audio data become processor items, `<modality>_embeds` become embedding items, empty embeddings are dropped."
+    sources: ["vllm/multimodal/parse.py:853-873"]
+    request: {type: object, required: [mm_data], properties: {mm_data: {type: object}}}
+    response: {type: object, properties: {items: {type: object}}}
+    errors:
+      - {code: value-error, status: 0, retryable: false}
+    behavior:
+      - title: Unsupported modality key
+        source: "vllm/multimodal/parse.py:865-867"
+        if: "input.mm_data.exists(k, !(k in ['audio', 'image', 'video', 'vision_chunk']))"
+        then:
+          - fail: {code: value-error, status: 0, message: "= 'Unsupported modality: ' + input.mm_data.filter(k, !(k in ['audio', 'image', 'video', 'vision_chunk']))[0]"}
+      - title: Image items are PIL images / 3-D arrays; embeddings become ImageEmbeddingItems
+        source: "vllm/multimodal/parse.py:753-765"
+        return: {items: "= input.mm_data"}
+
+  - component: base-processing-info
+    name: parse-mm-data
+    kind: function
+    summary: "BaseProcessingInfo.parse_mm_data: parse, then for each modality require --enable-mm-embeds for embeddings and check the item count against the supported and allowed (--limit-mm-per-prompt) limits."
+    sources: ["vllm/multimodal/processing/context.py:628-660"]
+    request:
+      type: object
+      required: [mm_data, supported_limits]
+      properties:
+        mm_data: {type: object}
+        supported_limits: {type: object}
+        embeds: {type: boolean, default: false}
+    errors:
+      - {code: value-error, status: 0, retryable: false}
+      - {code: vllm-validation-error, status: 0, retryable: false}
+    behavior:
+      - source: "vllm/multimodal/processing/context.py:638"
+        call: multi-modal-data-parser.parse-mm-data
+        input: {mm_data: "= input.mm_data"}
+        as: parsed
+      - title: Embedding inputs need --enable-mm-embeds
+        source: "vllm/multimodal/processing/context.py:644-649"
+        if: "input.embeds && !config['enable-mm-embeds']"
+        then:
+          - fail: {code: value-error, status: 0, message: "= 'You must set `--enable-mm-embeds` to input `' + input.mm_data.map(k, k)[0] + '_embeds`'"}
+      - title: validate_num_items per modality
+        source: "vllm/multimodal/processing/context.py:657"
+        foreach: "= input.mm_data"
+        as: count
+        index: modality
+        steps:
+          - call: base-processing-info.validate-num-items
+            input: {modality: "= vars.modality", num_items: "= vars.count", supported_limits: "= input.supported_limits"}
+      - return: {items: "= vars.parsed.value.items"}
+
+  - component: base-processing-info
+    name: validate-num-items
+    kind: function
+    summary: "validate_num_items: the limit is min(supported, allowed); allowed is the per-prompt limit (999 when unset) capped by the supported one; an unsupported modality allows 0."
+    sources: ["vllm/multimodal/processing/context.py:590-626", "vllm/config/multimodal.py:695-708"]
+    request:
+      type: object
+      required: [modality, num_items, supported_limits]
+      properties: {modality: {type: string, examples: [image]}, num_items: {type: integer, examples: [1]}, supported_limits: {type: object}}
+    errors:
+      - {code: vllm-validation-error, status: 0, retryable: false}
+    behavior:
+      - set:
+          vars.user: "= input.modality in config['limit-mm-per-prompt'] ? int(config['limit-mm-per-prompt'][input.modality]) : 999"
+          vars.known: "= input.modality in input.supported_limits"
+      - set:
+          vars.sup: "= !vars.known ? 0 : (input.supported_limits[input.modality] == null ? -1 : int(input.supported_limits[input.modality]))"
+      - title: allowed = user limit, capped by a finite supported limit; unsupported modality -> 0
+        source: "vllm/multimodal/processing/context.py:592-606"
+        set:
+          vars.allowed: "= !vars.known ? 0 : (vars.sup < 0 ? vars.user : math.least(vars.user, vars.sup))"
+      - set:
+          vars.limit: "= vars.sup < 0 ? vars.allowed : math.least(vars.sup, vars.allowed)"
+      - title: Too many items
+        source: "vllm/multimodal/processing/context.py:619-626"
+        if: "input.num_items > vars.limit"
+        then:
+          - fail: {code: vllm-validation-error, status: 0, message: "= 'At most ' + string(vars.limit) + ' ' + input.modality + '(s) may be provided in one prompt.' + ((vars.sup < 0 || input.num_items <= vars.sup) ? ' Set `--limit-mm-per-prompt` to increase this limit.' : '')"}
+      - return: {limit: "= vars.limit"}
+
+  - component: base-multi-modal-processor
+    name: apply
+    kind: function
+    summary: "BaseMultiModalProcessor.apply: run the HF processor through the P0 processor cache (only the items whose hash is not cached are processed), replace each placeholder with the item's feature tokens, and return the multimodal input (token ids, hashes, placeholder ranges)."
+    sources: ["vllm/multimodal/processing/processor.py:1811-1847", "vllm/multimodal/processing/processor.py:1497-1567"]
+    request:
+      type: object
+      required: [model, architectures, prompt_token_ids, mm_counts]
+      properties:
+        model: {type: string, examples: [Qwen/Qwen2-VL-7B-Instruct]}
+        architectures: {type: array, items: {type: string, examples: [Qwen2VLForConditionalGeneration]}}
+        prompt_token_ids: {type: array, items: {type: integer}, maxItems: 8}
+        mm_counts: {type: object}
+        embeds: {type: boolean, default: false}
+        mm_uuids: {type: [object, "null"], default: null, description: "per-modality item identities (urls or user uuids); item i defaults to '<modality>-<i>'"}
+        item_bytes: {type: [integer, "null"], default: null, description: "processed size of one item; null = tokens_per_item * config['mm-item-bytes-per-token']"}
+        mm_processor_kwargs: {type: object, default: {}}
+    response: {type: object, properties: {num_prompt_tokens: {type: integer}, placeholders: {type: object}, mm_hashes: {type: object}}}
+    errors:
+      - {code: value-error, status: 0, retryable: false}
+      - {code: vllm-validation-error, status: 0, retryable: false}
+      - {code: type-error, status: 0, retryable: false}
+    behavior:
+      - title: MULTIMODAL_REGISTRY.create_processor(model_config)
+        source: "vllm/multimodal/registry.py:150-166"
+        call: multi-modal-registry.create-processor
+        input: {model: "= input.model", architectures: "= input.architectures"}
+        as: proc
+      - title: _cached_apply_hf_processor - parse and validate the data first
+        source: "vllm/multimodal/processing/processor.py:1829"
+        call: base-processing-info.parse-mm-data
+        input: {mm_data: "= input.mm_counts", supported_limits: "= vars.proc.value.supported_limits", embeds: "= input.embeds"}
+      - title: "_get_mm_hashes: each item's identity is hashed with the model id (MultiModalHasher); a user uuid replaces the data hash"
+        source: "vllm/multimodal/processing/processor.py:1396-1401"
+        set:
+          vars.items: "= input.mm_counts.transformList(m, n, lists.range(n).map(i, {'modality': m, 'idx': i, 'tokens': m in vars.proc.value.tokens_per_item ? vars.proc.value.tokens_per_item[m] : 1, 'mm_hash': sha256(input.model + ':' + m + ':' + (input.mm_uuids != null && m in input.mm_uuids && size(input.mm_uuids[m]) > i ? string(input.mm_uuids[m][i]) : m + '-' + string(i)))})).flatten()"
+      - title: The processor cache this process uses (processor_cache_from_config)
+        source: "vllm/multimodal/cache/factories.py:49-63"
+        call: multi-modal-cache-factories.processor-cache-from-config
+        input: {supports_multimodal_inputs: true}
+        as: cache
+      - set:
+          vars.hashes: "= input.mm_counts.transformMap(m, n, vars.items.filter(it, it.modality == m).map(it, it.mm_hash))"
+      - title: No cache - process every item with the HF processor
+        source: "vllm/multimodal/processing/processor.py:1509-1510"
+        if: "vars.cache.value.cache_type == null"
+        then:
+          - call: base-multi-modal-processor.apply-hf-processor-main
+            input: {ctx: "= vars.proc.value.ctx", num_items: "= size(vars.items)", mm_processor_kwargs: "= input.mm_processor_kwargs"}
+        else:
+          - title: "_get_cache_missing_items: cache.is_cached per modality (does not touch the LRU order)"
+            source: "vllm/multimodal/processing/processor.py:1345-1351"
+            call: "= vars.cache.value.component + '.is-cached'"
+            targets: [multi-modal-processor-only-cache.is-cached, lru-key-replicated-sender-cache.is-cached]
+            input: {mm_hashes: "= vars.items.map(it, it.mm_hash)"}
+            as: cached
+          - set:
+              vars.missing: "= lists.range(size(vars.items)).filter(i, !vars.cached.value.cached[i]).map(i, vars.items[i])"
+          - title: Only the missing items go through the HF processor
+            source: "vllm/multimodal/processing/processor.py:1524-1531"
+            call: base-multi-modal-processor.apply-hf-processor-main
+            input: {ctx: "= vars.proc.value.ctx", num_items: "= size(vars.missing)", mm_processor_kwargs: "= input.mm_processor_kwargs"}
+          - title: "_merge_mm_kwargs: touch every hash, then get_and_update each item in order (a cached item is sent as None and its prompt updates come from the cache)"
+            source: "vllm/multimodal/processing/processor.py:1411-1458"
+            foreach: "= vars.items"
+            as: it
+            index: k
+            steps:
+              - call: "= vars.cache.value.component + '.get-and-update'"
+                targets: [multi-modal-processor-only-cache.get-and-update, lru-key-replicated-sender-cache.get-and-update]
+                input:
+                  mm_hash: "= vars.it.mm_hash"
+                  item: "= vars.cached.value.cached[vars.k] ? dyn(null) : dyn({'modality': vars.it.modality, 'bytes': input.item_bytes != null ? input.item_bytes : vars.it.tokens * config['mm-item-bytes-per-token'], 'prompt_updates': {'tokens': vars.it.tokens}})"
+          - title: release_sender_touches (in finally)
+            source: "vllm/multimodal/processing/processor.py:1558-1560"
+      - title: _maybe_apply_prompt_updates - one placeholder run of feature tokens per item
+        source: "vllm/multimodal/processing/processor.py:1831-1840"
+        set:
+          vars.ph: "= input.mm_counts.transformMap(m, n, n * (m in vars.proc.value.tokens_per_item ? vars.proc.value.tokens_per_item[m] : 1))"
+      - title: mm_input(prompt_token_ids, mm_kwargs (MultiModalKwargsItems), mm_hashes, mm_placeholders)
+        source: "vllm/multimodal/processing/processor.py:1842-1847"
+        return:
+          num_prompt_tokens: "= size(input.prompt_token_ids) + sum(vars.ph.map(m, vars.ph[m]))"
+          placeholders: "= vars.ph"
+          mm_hashes: "= vars.hashes"
+
+  - component: base-multi-modal-processor
+    name: apply-hf-processor-main
+    kind: function
+    summary: "_apply_hf_processor_main -> _call_hf_processor: fetch the HF processor (info.get_hf_processor with the merged kwargs) and run it on the items; with no items only the passthrough data is finalized."
+    sources: ["vllm/multimodal/processing/processor.py:1315-1333", "vllm/multimodal/processing/processor.py:1287-1297"]
+    request:
+      type: object
+      required: [ctx, num_items]
+      properties:
+        ctx: {type: object}
+        num_items: {type: integer, examples: [1]}
+        mm_processor_kwargs: {type: object, default: {}}
+    response: {type: object, properties: {processed_items: {type: integer}}}
+    latency_ms: "= double(input.num_items) * double(config['mm-hf-processor-ms-per-item'])"
+    errors:
+      - {code: type-error, status: 0, retryable: false}
+    behavior:
+      - title: hf_data empty - nothing to run the HF processor on
+        source: "vllm/multimodal/processing/processor.py:1325-1328"
+        if: "input.num_items == 0"
+        then:
+          - return: {processed_items: 0}
+      - title: self.info.get_hf_processor(**hf_kwargs)
+        source: "vllm/multimodal/processing/processor.py:1293-1297"
+        call: base-processing-info.get-hf-processor
+        input: {ctx: "= input.ctx", kwargs: "= input.mm_processor_kwargs"}
+      - title: ctx.call_hf_processor(hf_processor, data, kwargs) on the items
+        source: "vllm/multimodal/processing/context.py:402-406"
+        return: {processed_items: "= input.num_items"}
+

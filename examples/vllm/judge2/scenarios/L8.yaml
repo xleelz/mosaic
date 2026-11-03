@@ -1,0 +1,56 @@
+schema_version: 1
+id: vllm
+scenarios:
+  - id: bench-l8b
+    name: "L8 (b) three adapters through two GPU slots, max_cpu_loras 3"
+    fixtures: [full-tp1-llama-8b]
+    config: {enable-lora: true, max-loras: 2, max-cpu-loras: 3}
+    state:
+      local-disk:
+        files:
+          /adapters/doc-lora/adapter_config.json: {json: {bias: none, lora_alpha: 16, r: 8}}
+    steps:
+      - {flow: async-llm-lora, input: {lora_request: {lora_int_id: 1, lora_name: sql-lora, lora_path: /adapters/sql-lora}}, as: a1}
+      - {flow: async-llm-lora, input: {lora_request: {lora_int_id: 2, lora_name: chat-lora, lora_path: /adapters/chat-lora}}, as: a2}
+      - {flow: async-llm-lora, input: {lora_request: {lora_int_id: 3, lora_name: doc-lora, lora_path: /adapters/doc-lora}}, as: a3}
+      - {flow: models-lora-set-active-adapters, input: {requests: [{lora_int_id: 1, lora_name: sql-lora, lora_path: /adapters/sql-lora}, {lora_int_id: 2, lora_name: chat-lora, lora_path: /adapters/chat-lora}]}, as: s1}
+      - {flow: models-lora-set-active-adapters, input: {requests: [{lora_int_id: 3, lora_name: doc-lora, lora_path: /adapters/doc-lora}]}, as: s2}
+    expect:
+      - "steps.s1.result.ok && steps.s2.result.ok"
+      # at most max_loras (2) active GPU slots at any time; the third swaps in by deactivating the LRU one
+      - "state['lru-cache-lora-model-manager@rank0'].active == [2, 3] && size(state['lru-cache-lora-model-manager@rank0'].slots) == 2"
+      # all three stay in the CPU cache (max_cpu_loras 3): the swaps reload nothing from disk and nothing restarts
+      - "state['lru-cache-lora-model-manager@rank0'].registered == [1, 2, 3]"
+      - "trace.filter(e, e.type == 'call.start' && e.interface == 'lru-cache-worker-lora-manager.load-adapter').size() == 3"
+      - "trace.exists(e, e.type == 'call.start' && e.interface == 'lru-cache-lora-model-manager.activate-adapter' && e.input.adapter_id == 3 && e.t >= 24)"
+      - "calls['engine-core.init'] == 0 && calls['core-engine-proc-manager.launch'] == 0"
+  - id: bench-l8b-default-cpu
+    name: "L8 (b) with the default max_cpu_loras (= max_loras = 2) the third adapter evicts the oldest from the CPU cache, so it reloads from disk"
+    fixtures: [full-tp1-llama-8b]
+    # the world pins max-cpu-loras to 1 (resolved from max_loras 1); the code resolves None to max_loras, so 2 here
+    config: {enable-lora: true, max-loras: 2, max-cpu-loras: 2}
+    state:
+      local-disk:
+        files:
+          /adapters/doc-lora/adapter_config.json: {json: {bias: none, lora_alpha: 16, r: 8}}
+    steps:
+      - {flow: async-llm-lora, input: {lora_request: {lora_int_id: 1, lora_name: sql-lora, lora_path: /adapters/sql-lora}}, as: a1}
+      - {flow: async-llm-lora, input: {lora_request: {lora_int_id: 2, lora_name: chat-lora, lora_path: /adapters/chat-lora}}, as: a2}
+      - {flow: async-llm-lora, input: {lora_request: {lora_int_id: 3, lora_name: doc-lora, lora_path: /adapters/doc-lora}}, as: a3}
+      - {flow: models-lora-set-active-adapters, input: {requests: [{lora_int_id: 1, lora_name: sql-lora, lora_path: /adapters/sql-lora}]}, as: s1}
+    expect:
+      - "steps.a3.result.ok && steps.s1.result.ok"
+      - "trace.filter(e, e.type == 'call.start' && e.interface == 'lru-cache-worker-lora-manager.load-adapter' && e.input.lora_int_id == 1).size() == 2"
+      - "state['lru-cache-lora-model-manager@rank0'].registered == [3, 1] && 1 in state['lru-cache-lora-model-manager@rank0'].active"
+  - id: bench-l8a
+    name: "L8 (a) three waiting requests on three adapters with max_loras 2: one is held back"
+    fixtures: [full-tp1-llama-8b]
+    config: {enable-lora: true, max-loras: 2}
+    steps:
+      - {interface: scheduler.add-request, caller: engine-core, input: {request_id: r1, prompt_token_ids: [128000, 9906, 1917], lora_request: {lora_int_id: 1, lora_name: sql-lora, lora_path: /adapters/sql-lora}}, as: add1}
+      - {interface: scheduler.add-request, caller: engine-core, input: {request_id: r2, prompt_token_ids: [128000, 9906, 1918], lora_request: {lora_int_id: 2, lora_name: chat-lora, lora_path: /adapters/chat-lora}}, as: add2}
+      - {interface: scheduler.add-request, caller: engine-core, input: {request_id: r3, prompt_token_ids: [128000, 9906, 1919], lora_request: {lora_int_id: 3, lora_name: doc-lora, lora_path: /adapters/doc-lora}}, as: add3}
+      - {flow: scheduler-schedule, input: {}, as: s1}
+    expect:
+      - "size(steps.s1.result.value.scheduled_new_reqs) == 2"
+      - "state.scheduler.waiting == ['r3']"

@@ -1,0 +1,56 @@
+schema_version: 1
+id: vllm
+scenarios:
+  - id: bench-v7
+    name: "V7: a stop string ends the chat completion"
+    description: >
+      Chat request with stop [" t"] (the model's detokenizer renders every token as " t<id>", so the
+      stop string appears in the first decoded token). Code: ChatCompletionRequest.to_sampling_params
+      forwards stop (chat_completion/protocol.py:758) with include_stop_str_in_output false;
+      IncrementalDetokenizer.update/check_stop_strings (v1/engine/detokenizer.py:95-152, 321-373)
+      matches it, truncates the text before the stop string, and the output processor finishes the
+      request with finish_reason stop / stop_reason " t" and aborts it in the engine core.
+    fixtures: [full-tp1-llama-8b]
+    steps:
+      - {flow: engine-core-busy-loop, input: {iterations: 60}, as: loop, await: false}
+      - flow: serving-api-chat-completion
+        at_ms: 0
+        as: chat
+        input:
+          path: /v1/chat/completions
+          headers: {X-Request-Id: v7}
+          body:
+            model: llama-8b
+            messages: [{role: user, content: "What is the capital of France?"}]
+            max_tokens: 16
+            stop: [" t"]
+    expect:
+      - "steps.chat.result.ok"
+      # the request's stop list reaches the engine request
+      - "trace.exists(e, e.type == 'call.start' && e.interface == 'async-llm.generate' && has(e.input.sampling_params.stop) && e.input.sampling_params.stop == [' t'])"
+      # the detokenizer matched it
+      - "trace.exists(e, e.type == 'call.end' && e.interface == 'incremental-detokenizer.update' && e.output.stop_string == ' t')"
+      # outcome: finish_reason stop, stop string not in the content, generation ended early
+      - "steps.chat.result.value.choices[0].finish_reason == 'stop'"
+      - "!steps.chat.result.value.choices[0].message.content.contains(' t')"
+      - "steps.chat.result.value.usage.completion_tokens < 16"
+  - id: bench-v7-engine
+    name: "V7 (engine level): stop string handled by the output processor"
+    description: >
+      The same stop list sent straight to AsyncLLM.generate (bypassing the chat route) to show the
+      engine-side half of the path is modeled.
+    fixtures: [full-tp1-llama-8b]
+    steps:
+      - {flow: engine-core-busy-loop, input: {iterations: 60}, as: loop, await: false}
+      - flow: async-llm-generate
+        at_ms: 0
+        as: gen
+        input:
+          prompt_token_ids: [128000, 9906, 11, 856]
+          request_id: chatcmpl-v7e
+          sampling_params: {max_tokens: 16, n: 1, stop: [" t"]}
+    expect:
+      - "steps.gen.result.ok && steps.gen.result.value.items[size(steps.gen.result.value.items)-1].finish_reason == 'stop'"
+      - "!steps.gen.result.value.items[size(steps.gen.result.value.items)-1].text.contains(' t') && size(steps.gen.result.value.items[size(steps.gen.result.value.items)-1].token_ids) < 16"
+      - "trace.exists(e, e.type == 'call.end' && e.interface == 'incremental-detokenizer.update' && e.output.stop_string == ' t')"
+      - "trace.exists(e, e.type == 'call.start' && e.interface == 'engine-core-proc.process-input-sockets' && e.input.request_type == 'ABORT')"

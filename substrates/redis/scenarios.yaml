@@ -1,0 +1,610 @@
+# The Redis substrate's own tests. Run with:
+#   go run ./internal/devtools/check -f substrates/redis/redis.yaml -f substrates/redis/scenarios.yaml
+# Imports don't bring these along (MergeImports skips flows and scenarios).
+# `app` holds the client-side patterns the scenarios need (a read-modify-write, a cache-aside
+# read with a fallback, a retried INCR); `listener` is a pub/sub subscriber named listener-1.
+schema_version: 1
+id: redis-scenarios
+
+components:
+  - {id: app, name: Application, kind: service, summary: "A Redis client: the scenarios' entry point and the client-side patterns."}
+  - id: listener
+    name: Subscriber
+    kind: service
+    summary: "A pub/sub subscriber connected as client listener-1; keeps what it receives."
+    state: {initial: {inbox: []}}
+  - {id: db, name: Database, kind: datastore, summary: "The source of truth behind the cache."}
+
+interfaces:
+  - component: app
+    name: naive-incr
+    kind: rpc
+    summary: "Read-modify-write without a script: GET, compute for 10 ms, SET. Two of these overlapping lose an update."
+    request: {type: object, required: [key], properties: {key: {type: string, examples: [counter]}}}
+    response: {type: object, properties: {value: {type: integer}}}
+    behavior:
+      - {call: redis.get, input: {key: "= input.key"}, as: g}
+      - set: {vars.n: "= (vars.g.value.value == null ? 0 : int(vars.g.value.value)) + 1"}
+      - wait: 10
+      - {call: redis.set, input: {key: "= input.key", value: "= string(vars.n)"}}
+      - return: {value: "= vars.n"}
+
+  - component: app
+    name: script-incr
+    kind: rpc
+    summary: "The same read-modify-write as one EVAL, with 10 ms of client work before it."
+    request: {type: object, required: [key], properties: {key: {type: string, examples: [counter]}}}
+    response: {type: object, properties: {value: {type: integer}}}
+    behavior:
+      - wait: 10
+      - call: redis.eval
+        input:
+          keys: ["= input.key"]
+          script: >-
+            {'reply': (data[KEYS[0]] == null ? 0 : int(data[KEYS[0]].value)) + 1,
+             'writes': {KEYS[0]: {'type': 'string', 'value': string((data[KEYS[0]] == null ? 0 : int(data[KEYS[0]].value)) + 1), 'keepttl': true}}}
+        as: e
+      - return: {value: "= vars.e.value.reply"}
+
+  - component: app
+    name: cache-read
+    kind: rpc
+    summary: >-
+      Cache-aside read: GET from Redis (50 ms timeout); on a miss or when Redis is down, load from
+      the database, then try to SET the value back with a 60 s TTL. Redis errors never fail it.
+    request: {type: object, required: [key], properties: {key: {type: string, examples: ["user:1"]}}}
+    response: {type: object, properties: {value: {type: string}, source: {type: string, enum: [cache, db]}}}
+    behavior:
+      - {call: redis.get, input: {key: "= input.key"}, timeout_ms: 50, as: g, on_error: continue}
+      - if: "vars.g.ok && vars.g.value.value != null"
+        then: [{return: {value: "= vars.g.value.value", source: cache}}]
+      - set: {ctx.redis_failed: "= !vars.g.ok"}
+      - {call: db.load, input: {key: "= input.key"}, as: row}
+      - {call: redis.set, input: {key: "= input.key", value: "= vars.row.value.value", px: 60000}, timeout_ms: 50, on_error: continue}
+      - return: {value: "= vars.row.value.value", source: db}
+
+  - component: app
+    name: retrying-incr
+    kind: rpc
+    summary: "INCR retried once on a connection reset. INCR isn't idempotent: a reset after the write counts twice."
+    request: {type: object, required: [key], properties: {key: {type: string, examples: [counter]}}}
+    response: {type: object, properties: {value: {type: integer}}}
+    behavior:
+      - call: redis.incr
+        input: {key: "= input.key"}
+        retry: {max_attempts: 2, codes: [connection_reset]}
+        as: r
+      - return: {value: "= vars.r.value.value"}
+
+  - component: db
+    name: load
+    kind: rpc
+    latency_ms: 20
+    request: {type: object, required: [key], properties: {key: {type: string}}}
+    response: {type: object, properties: {value: {type: string}}}
+    behavior:
+      - return: {value: "= 'db:' + input.key"}
+
+  - component: listener
+    name: on-message
+    kind: event
+    summary: "listener-1's push handler: keeps the messages addressed to it."
+    subscribe: [redis-message]
+    request: {type: object, properties: {channel: {type: string}, message: {type: string}, receivers: {type: array}}}
+    behavior:
+      - set: {state.inbox: "= state.inbox + [input.channel + ':' + input.message]"}
+        when: "'listener-1' in input.receivers"
+
+fixtures:
+  - id: clock
+    summary: "An empty server; the clock starts at 2026-11-01T00:00:00Z."
+    clock: {epoch: "2026-11-01T00:00:00Z"}
+  - id: seeded
+    extends: [clock]
+    summary: "A string, a hash and a sorted set, with no expiry."
+    state:
+      redis:
+        keys:
+          greeting: {type: string, value: hello}
+          "user:1": {type: hash, value: {name: Ada, visits: "3"}}
+          board: {type: zset, value: {ada: 10.0, bob: 20.0, cy: 10.0, dee: 30.0}}
+
+flows:
+  - {id: get, tags: [reads], entry: {caller: app, interface: redis.get}}
+  - {id: set, tags: [writes], entry: {caller: app, interface: redis.set}}
+  - {id: setnx, tags: [writes], entry: {caller: app, interface: redis.setnx}}
+  - {id: incr, tags: [writes], entry: {caller: app, interface: redis.incr}}
+  - {id: incrby, tags: [writes], entry: {caller: app, interface: redis.incrby}}
+  - {id: del, tags: [writes], entry: {caller: app, interface: redis.del}}
+  - {id: exists, tags: [reads], entry: {caller: app, interface: redis.exists}}
+  - {id: expire, tags: [writes], entry: {caller: app, interface: redis.expire}}
+  - {id: pexpire, tags: [writes], entry: {caller: app, interface: redis.pexpire}}
+  - {id: ttl, tags: [reads], entry: {caller: app, interface: redis.ttl}}
+  - {id: pttl, tags: [reads], entry: {caller: app, interface: redis.pttl}}
+  - {id: persist, tags: [writes], entry: {caller: app, interface: redis.persist}}
+  - {id: expire-cycle, tags: [writes], entry: {caller: app, interface: redis.expire-cycle, input: {}}}
+  - {id: hset, tags: [writes], entry: {caller: app, interface: redis.hset}}
+  - {id: hget, tags: [reads], entry: {caller: app, interface: redis.hget}}
+  - {id: hgetall, tags: [reads], entry: {caller: app, interface: redis.hgetall}}
+  - {id: hdel, tags: [writes], entry: {caller: app, interface: redis.hdel}}
+  - {id: hincrby, tags: [writes], entry: {caller: app, interface: redis.hincrby}}
+  - {id: zadd, tags: [writes], entry: {caller: app, interface: redis.zadd}}
+  - {id: zincrby, tags: [writes], entry: {caller: app, interface: redis.zincrby}}
+  - {id: zscore, tags: [reads], entry: {caller: app, interface: redis.zscore}}
+  - {id: zcard, tags: [reads], entry: {caller: app, interface: redis.zcard}}
+  - {id: zrem, tags: [writes], entry: {caller: app, interface: redis.zrem}}
+  - {id: zrange, tags: [reads], entry: {caller: app, interface: redis.zrange}}
+  - {id: zrangebyscore, tags: [reads], entry: {caller: app, interface: redis.zrangebyscore}}
+  - {id: zremrangebyscore, tags: [writes], entry: {caller: app, interface: redis.zremrangebyscore}}
+  - {id: eval, tags: [writes], entry: {caller: app, interface: redis.eval}}
+  - {id: script-load, tags: [writes], entry: {caller: app, interface: redis.script-load}}
+  - {id: evalsha, tags: [writes], entry: {caller: app, interface: redis.evalsha}}
+  - {id: subscribe, tags: [writes], entry: {caller: app, interface: redis.subscribe}}
+  - {id: unsubscribe, tags: [writes], entry: {caller: app, interface: redis.unsubscribe}}
+  - {id: publish, tags: [writes], entry: {caller: app, interface: redis.publish}}
+  - {id: naive-incr, tags: [writes], entry: {caller: app, interface: app.naive-incr}}
+  - {id: script-incr, tags: [writes], entry: {caller: app, interface: app.script-incr}}
+  - {id: cache-read, tags: [reads], entry: {caller: app, interface: app.cache-read}}
+  - {id: retrying-incr, tags: [writes], entry: {caller: app, interface: app.retrying-incr}}
+
+scenarios:
+  # ---- strings ----
+  - id: set-get-roundtrip
+    name: SET stores a string and GET reads it back; GET of a missing key is nil
+    fixtures: [clock]
+    steps:
+      - {flow: set, as: s, input: {key: k, value: "42", nx: false, xx: false, get: false, ex: 0, px: 0, keepttl: false}}
+      - {flow: get, as: g, input: {key: k}}
+      - {flow: get, as: miss, input: {key: nope}}
+    expect:
+      - "steps.s.result.ok && steps.s.result.value.ok && steps.s.result.value.old == null"
+      - "steps.g.result.value.value == '42'"
+      - "steps.miss.result.ok && steps.miss.result.value.value == null"
+      - "state.redis.keys.k == {'type': 'string', 'value': '42'}"
+
+  - id: set-nx-xx
+    name: SET NX writes only an absent key and XX only a present one; a refused SET replies nil
+    fixtures: [seeded]
+    steps:
+      - {flow: set, as: nx_new, input: {key: lock, value: a, nx: true, xx: false, get: false, ex: 0, px: 0, keepttl: false}}
+      - {flow: set, as: nx_taken, input: {key: lock, value: b, nx: true, xx: false, get: false, ex: 0, px: 0, keepttl: false}}
+      - {flow: set, as: xx_missing, input: {key: ghost, value: c, nx: false, xx: true, get: false, ex: 0, px: 0, keepttl: false}}
+      - {flow: set, as: both, input: {key: lock, value: d, nx: true, xx: true, get: false, ex: 0, px: 0, keepttl: false}}
+      - {flow: get, as: g, input: {key: lock}}
+    expect:
+      - "steps.nx_new.result.value.ok && !steps.nx_taken.result.value.ok"
+      - "!steps.xx_missing.result.value.ok && !('ghost' in state.redis.keys)"
+      - "!steps.both.result.ok && steps.both.result.error.code == 'err' && steps.both.result.error.message == 'ERR syntax error'"
+      - "steps.g.result.value.value == 'a'"
+
+  - id: set-get-option-and-wrongtype
+    name: SET GET returns the old string; GET on a hash is WRONGTYPE; a plain SET overwrites any type
+    fixtures: [seeded]
+    steps:
+      - {flow: set, as: swap, input: {key: greeting, value: hi, nx: false, xx: false, get: true, ex: 0, px: 0, keepttl: false}}
+      - {flow: get, as: wrong, input: {key: "user:1"}}
+      - {flow: set, as: getwrong, input: {key: "user:1", value: x, nx: false, xx: false, get: true, ex: 0, px: 0, keepttl: false}}
+      - {flow: set, as: over, input: {key: board, value: flat, nx: false, xx: false, get: false, ex: 0, px: 0, keepttl: false}}
+    expect:
+      - "steps.swap.result.value.ok && steps.swap.result.value.old == 'hello' && state.redis.keys.greeting.value == 'hi'"
+      - "!steps.wrong.result.ok && steps.wrong.result.error.code == 'wrongtype' && steps.wrong.result.error.message.startsWith('WRONGTYPE')"
+      - "!steps.getwrong.result.ok && steps.getwrong.result.error.code == 'wrongtype' && state.redis.keys['user:1'].type == 'hash'"
+      - "steps.over.result.value.ok && state.redis.keys.board == {'type': 'string', 'value': 'flat'}"
+
+  - id: set-px-expires-lazily
+    name: A key SET with PX is readable until its TTL passes, then gone, and the read deletes it
+    fixtures: [clock]
+    steps:
+      - {flow: set, as: s, input: {key: session, value: tok, nx: false, xx: false, get: false, ex: 0, px: 1000, keepttl: false}}
+      - {flow: get, as: early, at_ms: 500, input: {key: session}}
+      - {flow: pttl, as: left, at_ms: 600, input: {key: session}}
+      - {flow: get, as: late, at_ms: 1500, input: {key: session}}
+      - {flow: ttl, as: gone, at_ms: 1600, input: {key: session}}
+    expect:
+      - "steps.early.result.value.value == 'tok'"
+      - "steps.left.result.value.pttl > 0 && steps.left.result.value.pttl <= 400"
+      - "steps.late.result.ok && steps.late.result.value.value == null"
+      - "steps.gone.result.value.ttl == -2 && !('session' in state.redis.keys)"
+
+  - id: set-ex-drops-or-keeps-ttl
+    name: SET EX sets seconds; a later plain SET drops the TTL, and SET KEEPTTL keeps it
+    fixtures: [clock]
+    steps:
+      - {flow: set, as: a, input: {key: a, value: "1", nx: false, xx: false, get: false, ex: 10, px: 0, keepttl: false}}
+      - {flow: set, as: b, input: {key: b, value: "1", nx: false, xx: false, get: false, ex: 10, px: 0, keepttl: false}}
+      - {flow: set, as: a2, input: {key: a, value: "2", nx: false, xx: false, get: false, ex: 0, px: 0, keepttl: false}}
+      - {flow: set, as: b2, input: {key: b, value: "2", nx: false, xx: false, get: false, ex: 0, px: 0, keepttl: true}}
+      - {flow: ttl, as: ta, input: {key: a}}
+      - {flow: ttl, as: tb, input: {key: b}}
+      - {flow: set, as: bad, input: {key: c, value: "1", nx: false, xx: false, get: false, ex: -5, px: 0, keepttl: false}}
+    expect:
+      - "steps.ta.result.value.ttl == -1"
+      - "steps.tb.result.value.ttl == 10 && state.redis.keys.b.value == '2'"
+      - "!steps.bad.result.ok && steps.bad.result.error.message.contains('invalid expire time')"
+
+  - id: setnx-lock
+    name: SETNX takes a free lock (1) and refuses a held one (0) without overwriting it
+    fixtures: [clock]
+    steps:
+      - {flow: setnx, as: first, input: {key: "lock:job", value: worker-a}}
+      - {flow: setnx, as: second, input: {key: "lock:job", value: worker-b}}
+      - {flow: get, as: owner, input: {key: "lock:job"}}
+    expect:
+      - "steps.first.result.value.set == 1 && steps.second.result.value.set == 0"
+      - "steps.owner.result.value.value == 'worker-a'"
+      - "!('expires_at' in state.redis.keys['lock:job'])"
+
+  - id: incr-counts-and-keeps-ttl
+    name: INCR starts a missing key at 0, INCRBY adds any amount, and both keep the TTL
+    fixtures: [clock]
+    steps:
+      - {flow: incr, as: i1, input: {key: hits}}
+      - {flow: expire, as: e, input: {key: hits, seconds: 60, nx: false, xx: false, gt: false, lt: false}}
+      - {flow: incr, as: i2, input: {key: hits}}
+      - {flow: incrby, as: i3, input: {key: hits, increment: -5}}
+      - {flow: ttl, as: t, input: {key: hits}}
+      - {flow: get, as: g, input: {key: hits}}
+    expect:
+      - "steps.i1.result.value.value == 1 && steps.i2.result.value.value == 2 && steps.i3.result.value.value == -3"
+      - "steps.t.result.value.ttl == 60"
+      - "steps.g.result.value.value == '-3' && state.redis.keys.hits.type == 'string'"
+
+  - id: incr-refusals
+    name: INCR on a non-integer string is ERR and on a hash WRONGTYPE; neither changes the key
+    fixtures: [seeded]
+    steps:
+      - {flow: incr, as: text, input: {key: greeting}}
+      - {flow: incr, as: hash, input: {key: "user:1"}}
+    expect:
+      - "!steps.text.result.ok && steps.text.result.error.code == 'err' && steps.text.result.error.message == 'ERR value is not an integer or out of range'"
+      - "!steps.hash.result.ok && steps.hash.result.error.code == 'wrongtype'"
+      - "state.redis.keys.greeting.value == 'hello'"
+
+  # ---- expiry ----
+  - id: expire-ttl-pttl
+    name: TTL is -1 without expiry; EXPIRE sets it; TTL rounds to the nearest second; PTTL is exact
+    fixtures: [seeded]
+    steps:
+      - {flow: ttl, as: none, input: {key: greeting}}
+      - {flow: expire, as: e, input: {key: greeting, seconds: 10, nx: false, xx: false, gt: false, lt: false}}
+      - {flow: ttl, as: t1, at_ms: 4400, input: {key: greeting}}
+      - {flow: pttl, as: p1, at_ms: 4500, input: {key: greeting}}
+      - {flow: expire, as: missing, input: {key: ghost, seconds: 10, nx: false, xx: false, gt: false, lt: false}}
+    expect:
+      - "steps.none.result.value.ttl == -1"
+      - "steps.e.result.value.set == 1 && steps.missing.result.value.set == 0"
+      - "steps.t1.result.value.ttl == 6"
+      - "steps.p1.result.value.pttl == state.redis.keys.greeting.expires_at - (steps.p1.start_ms + 1 + 1793491200000)"
+
+  - id: expire-flags
+    name: EXPIRE NX, XX, GT and LT set the timeout only under their condition (a persistent key is infinite)
+    fixtures: [seeded]
+    steps:
+      - {flow: expire, as: xx_persistent, input: {key: greeting, seconds: 100, nx: false, xx: true, gt: false, lt: false}}
+      - {flow: expire, as: gt_persistent, input: {key: greeting, seconds: 100, nx: false, xx: false, gt: true, lt: false}}
+      - {flow: expire, as: lt_persistent, input: {key: greeting, seconds: 100, nx: false, xx: false, gt: false, lt: true}}
+      - {flow: expire, as: nx_volatile, input: {key: greeting, seconds: 50, nx: true, xx: false, gt: false, lt: false}}
+      - {flow: expire, as: gt_shorter, input: {key: greeting, seconds: 50, nx: false, xx: false, gt: true, lt: false}}
+      - {flow: expire, as: gt_longer, input: {key: greeting, seconds: 200, nx: false, xx: false, gt: true, lt: false}}
+      - {flow: expire, as: clash, input: {key: greeting, seconds: 1, nx: true, xx: false, gt: true, lt: false}}
+      - {flow: ttl, as: t, input: {key: greeting}}
+    expect:
+      - "steps.xx_persistent.result.value.set == 0 && steps.gt_persistent.result.value.set == 0"
+      - "steps.lt_persistent.result.value.set == 1 && steps.nx_volatile.result.value.set == 0"
+      - "steps.gt_shorter.result.value.set == 0 && steps.gt_longer.result.value.set == 1"
+      - "!steps.clash.result.ok && steps.clash.result.error.code == 'err'"
+      - "steps.t.result.value.ttl == 200"
+      - "'expires_at' in state.redis.keys.greeting"
+
+
+  - id: expire-past-deletes-and-persist
+    name: PEXPIRE with a non-positive timeout deletes the key; PERSIST removes a TTL once
+    fixtures: [seeded]
+    steps:
+      - {flow: pexpire, as: kill, input: {key: greeting, ms: 0, nx: false, xx: false, gt: false, lt: false}}
+      - {flow: exists, as: ex, input: {keys: [greeting]}}
+      - {flow: expire, as: e, input: {key: board, seconds: 5, nx: false, xx: false, gt: false, lt: false}}
+      - {flow: persist, as: p1, input: {key: board}}
+      - {flow: persist, as: p2, input: {key: board}}
+      - {flow: zcard, as: later, at_ms: 10000, input: {key: board}}
+    expect:
+      - "steps.kill.result.value.set == 1 && steps.ex.result.value.count == 0 && !('greeting' in state.redis.keys)"
+      - "steps.p1.result.value.set == 1 && steps.p2.result.value.set == 0"
+      - "steps.later.result.value.count == 4"
+
+  - id: del-exists-skip-expired
+    name: DEL and EXISTS count only live keys; EXISTS counts a repeated key twice
+    fixtures: [seeded]
+    steps:
+      - {flow: pexpire, as: e, input: {key: greeting, ms: 100, nx: false, xx: false, gt: false, lt: false}}
+      - {flow: exists, as: before, input: {keys: [greeting, greeting, board, ghost]}}
+      - {flow: exists, as: after, at_ms: 200, input: {keys: [greeting, board]}}
+      - {flow: del, as: d, at_ms: 300, input: {keys: [greeting, board, ghost]}}
+      - {flow: exists, as: left, at_ms: 400, input: {keys: [greeting, board, "user:1"]}}
+    expect:
+      - "steps.before.result.value.count == 3 && steps.after.result.value.count == 1"
+      - "steps.d.result.value.deleted == 1"
+      - "!('greeting' in state.redis.keys) && !('board' in state.redis.keys) && 'user:1' in state.redis.keys"
+      - "steps.left.result.value.count == 1"
+
+
+  - id: active-expire-cycle
+    name: An expired key stays in memory until a command touches it or the active cycle sweeps it
+    fixtures: [seeded]
+    steps:
+      - {flow: pexpire, as: e1, input: {key: greeting, ms: 100, nx: false, xx: false, gt: false, lt: false}}
+      - {flow: pexpire, as: e2, input: {key: "user:1", ms: 5000, nx: false, xx: false, gt: false, lt: false}}
+      - {flow: exists, as: x, at_ms: 1000, input: {keys: [greeting]}}
+      - {flow: expire-cycle, as: sweep, at_ms: 2000}
+      - {flow: hget, as: h, input: {key: "user:1", field: name}}
+    expect:
+      - "steps.x.result.value.count == 0"
+      - "steps.sweep.result.value.deleted == ['greeting']"
+      - "!('greeting' in state.redis.keys) && steps.h.result.value.value == 'Ada'"
+
+  # ---- hashes ----
+  - id: hash-fields
+    name: HSET counts only added fields; HGETALL reads all; HDEL of the last field deletes the key
+    fixtures: [seeded]
+    steps:
+      - {flow: hset, as: s1, input: {key: "user:1", fields: {name: Grace, city: Paris}}}
+      - {flow: hget, as: name, input: {key: "user:1", field: name}}
+      - {flow: hget, as: none, input: {key: "user:1", field: zip}}
+      - {flow: hgetall, as: all, input: {key: "user:1"}}
+      - {flow: hdel, as: d1, input: {key: "user:1", fields: [city, zip]}}
+      - {flow: hset, as: s2, input: {key: "user:2", fields: {a: 1}}}
+      - {flow: hdel, as: d2, input: {key: "user:2", fields: [a]}}
+      - {flow: hgetall, as: gone, input: {key: "user:2"}}
+    expect:
+      - "steps.s1.result.value.added == 1 && steps.name.result.value.value == 'Grace' && steps.none.result.value.value == null"
+      - "steps.all.result.value.fields == {'name': 'Grace', 'visits': '3', 'city': 'Paris'}"
+      - "steps.d1.result.value.deleted == 1 && state.redis.keys['user:1'].value == {'name': 'Grace', 'visits': '3'}"
+      - "steps.s2.result.value.added == 1 && steps.d2.result.value.deleted == 1"
+      - "steps.gone.result.value.fields == {} && !('user:2' in state.redis.keys)"
+
+  - id: hash-hincrby
+    name: HINCRBY adds to an integer field and starts a missing one at 0; a text field is ERR
+    fixtures: [seeded]
+    steps:
+      - {flow: hincrby, as: v, input: {key: "user:1", field: visits, increment: 2}}
+      - {flow: hincrby, as: n, input: {key: "user:1", field: logins, increment: 1}}
+      - {flow: hincrby, as: bad, input: {key: "user:1", field: name, increment: 1}}
+      - {flow: hget, as: read, input: {key: "user:1", field: visits}}
+    expect:
+      - "steps.v.result.value.value == 5 && steps.n.result.value.value == 1"
+      - "!steps.bad.result.ok && steps.bad.result.error.message == 'ERR hash value is not an integer'"
+      - "state.redis.keys['user:1'].value.visits == '5' && state.redis.keys['user:1'].value.logins == '1'"
+
+  # ---- sorted sets ----
+      - "steps.read.result.value.value == '5'"
+
+
+  - id: zset-rank-order
+    name: ZRANGE orders by score, ties by member; REV and negative indexes work
+    fixtures: [seeded]
+    steps:
+      - {flow: zrange, as: all, input: {key: board, start: 0, stop: -1, rev: false}}
+      - {flow: zrange, as: top2, input: {key: board, start: 0, stop: 1, rev: true}}
+      - {flow: zrange, as: last, input: {key: board, start: -1, stop: -1, rev: false}}
+      - {flow: zrange, as: out, input: {key: board, start: 10, stop: 20, rev: false}}
+      - {flow: zrange, as: none, input: {key: ghost, start: 0, stop: -1, rev: false}}
+    expect:
+      - "steps.all.result.value.members == ['ada', 'cy', 'bob', 'dee'] && steps.all.result.value.scores == [10, 10, 20, 30]"
+      - "steps.top2.result.value.members == ['dee', 'bob']"
+      - "steps.last.result.value.members == ['dee'] && steps.out.result.value.members == [] && steps.none.result.value.members == []"
+
+  - id: zset-zadd-flags
+    name: ZADD NX only adds, XX only updates, GT only raises, CH counts changes
+    fixtures: [seeded]
+    steps:
+      - {flow: zadd, as: plain, input: {key: board, members: {ada: 15, eve: 5}, nx: false, xx: false, gt: false, lt: false, ch: false}}
+      - {flow: zadd, as: nx, input: {key: board, members: {ada: 99, fay: 1}, nx: true, xx: false, gt: false, lt: false, ch: false}}
+      - {flow: zadd, as: xx, input: {key: board, members: {bob: 21, gus: 1}, nx: false, xx: true, gt: false, lt: false, ch: true}}
+      - {flow: zadd, as: gt, input: {key: board, members: {dee: 25, cy: 12}, nx: false, xx: false, gt: true, lt: false, ch: true}}
+      - {flow: zadd, as: clash, input: {key: board, members: {a: 1}, nx: true, xx: false, gt: true, lt: false, ch: false}}
+      - {flow: zscore, as: s, input: {key: board, member: ada}}
+    expect:
+      - "steps.plain.result.value.count == 1 && steps.nx.result.value.count == 1"
+      - "steps.xx.result.value.count == 1 && !('gus' in state.redis.keys.board.value)"
+      - "steps.gt.result.value.count == 1 && state.redis.keys.board.value.dee == 30 && state.redis.keys.board.value.cy == 12"
+      - "!steps.clash.result.ok && steps.clash.result.error.code == 'err'"
+      - "steps.s.result.value.score == 15 && state.redis.keys.board.value.fay == 1"
+
+  - id: zset-incr-rem-card
+    name: ZINCRBY adds to a score, ZREM removes members, and removing the last one deletes the key
+    fixtures: [seeded]
+    steps:
+      - {flow: zincrby, as: inc, input: {key: board, member: ada, increment: 2.5}}
+      - {flow: zincrby, as: new, input: {key: solo, member: x, increment: 1}}
+      - {flow: zrem, as: rem, input: {key: board, members: [bob, ghost]}}
+      - {flow: zcard, as: card, input: {key: board}}
+      - {flow: zrem, as: last, input: {key: solo, members: [x]}}
+      - {flow: zscore, as: miss, input: {key: solo, member: x}}
+    expect:
+      - "steps.inc.result.value.score == 12.5 && steps.new.result.value.score == 1"
+      - "steps.rem.result.value.count == 1 && steps.card.result.value.count == 3"
+      - "steps.last.result.value.count == 1 && steps.miss.result.value.score == null && !('solo' in state.redis.keys)"
+
+  - id: zset-by-score
+    name: ZRANGEBYSCORE honors inclusive and exclusive bounds and LIMIT; ZREMRANGEBYSCORE trims
+    fixtures: [seeded]
+    steps:
+      - {flow: zrangebyscore, as: incl, input: {key: board, min: 10, max: 20, min_exclusive: false, max_exclusive: false, offset: 0, count: 0}}
+      - {flow: zrangebyscore, as: excl, input: {key: board, min: 10, max: 30, min_exclusive: true, max_exclusive: false, offset: 0, count: 0}}
+      - {flow: zrangebyscore, as: page, input: {key: board, min: 0, max: 100, min_exclusive: false, max_exclusive: false, offset: 1, count: 2}}
+      - {flow: zremrangebyscore, as: trim, input: {key: board, min: 0, max: 15, min_exclusive: false, max_exclusive: false, offset: 0, count: 0}}
+      - {flow: zrange, as: after, input: {key: board, start: 0, stop: -1, rev: false}}
+    expect:
+      - "steps.incl.result.value.members == ['ada', 'cy', 'bob']"
+      - "steps.excl.result.value.members == ['bob', 'dee']"
+      - "steps.page.result.value.members == ['cy', 'bob']"
+      - "steps.trim.result.value.count == 2 && state.redis.keys.board.value == {'bob': 20.0, 'dee': 30.0}"
+
+  # ---- Lua scripts ----
+      - "steps.after.result.value.members == ['bob', 'dee']"
+
+
+  - id: lua-compare-and-delete
+    name: The lock-release script deletes the key only when the caller still owns it
+    fixtures: [clock]
+    steps:
+      - {flow: set, as: take, input: {key: lock, value: owner-a, nx: true, xx: false, get: false, ex: 0, px: 30000, keepttl: false}}
+      - flow: eval
+        as: wrong_owner
+        input:
+          keys: [lock]
+          args: [owner-b]
+          script: "data[KEYS[0]] != null && data[KEYS[0]].value == ARGV[0] ? {'reply': 1, 'writes': {KEYS[0]: null}} : {'reply': 0}"
+      - flow: eval
+        as: owner
+        input:
+          keys: [lock]
+          args: [owner-a]
+          script: "data[KEYS[0]] != null && data[KEYS[0]].value == ARGV[0] ? {'reply': 1, 'writes': {KEYS[0]: null}} : {'reply': 0}"
+      - {flow: exists, as: x, input: {keys: [lock]}}
+    expect:
+      - "steps.wrong_owner.result.value.reply == 0 && steps.owner.result.value.reply == 1"
+      - "steps.x.result.value.count == 0 && !('lock' in state.redis.keys)"
+
+  - id: lua-atomic-vs-read-modify-write
+    name: Two overlapping GET-then-SET increments lose one; two overlapping script increments both land
+    fixtures: [clock]
+    steps:
+      - {flow: naive-incr, as: n1, await: false, input: {key: naive}}
+      - {flow: naive-incr, as: n2, at_ms: 2, await: false, input: {key: naive}}
+      - {flow: script-incr, as: s1, at_ms: 100, await: false, input: {key: scripted}}
+      - {flow: script-incr, as: s2, at_ms: 100, await: false, input: {key: scripted}}
+      - {flow: get, as: naive, at_ms: 500, input: {key: naive}}
+      - {flow: get, as: scripted, at_ms: 501, input: {key: scripted}}
+    expect:
+      - "steps.n1.result.value.value == 1 && steps.n2.result.value.value == 1"
+      - "steps.naive.result.value.value == '1'"
+      - "[steps.s1.result.value.value, steps.s2.result.value.value].exists(v, v == 2)"
+      - "steps.scripted.result.value.value == '2'"
+      - "state.redis.keys.naive.value == '1' && state.redis.keys.scripted.value == '2'"
+
+
+  - id: lua-writes-together-with-ttl
+    name: A script's writes to several keys land together, with px setting a TTL
+    fixtures: [seeded]
+    steps:
+      - flow: eval
+        as: move
+        input:
+          keys: [greeting, copy, "user:1"]
+          script: "{'reply': 'moved', 'writes': {'copy': {'type': 'string', 'value': data['greeting'].value, 'px': 2000}, 'greeting': null, 'user:1': {'type': 'hash', 'value': merge(data['user:1'].value, {'moved': '1'})}}}"
+      - {flow: ttl, as: t, input: {key: copy}}
+      - {flow: get, as: gone, at_ms: 3000, input: {key: copy}}
+    expect:
+      - "steps.move.result.value.reply == 'moved' && !('greeting' in state.redis.keys)"
+      - "steps.t.result.value.ttl == 2"
+      - "state.redis.keys['user:1'].value.moved == '1' && steps.gone.result.value.value == null"
+
+  - id: lua-error-keeps-writes
+    name: A script that errors after writing keeps the write (no rollback) and fails script_error
+    fixtures: [clock]
+    flow: eval
+    input:
+      keys: [a]
+      script: "{'writes': {'a': {'type': 'string', 'value': 'half'}}, 'error': 'user script failed'}"
+    expect:
+      - "!result.ok && result.error.code == 'script_error' && result.error.message == 'ERR user script failed'"
+      - "state.redis.keys.a.value == 'half'"
+
+  - id: lua-undeclared-key
+    name: A script writing a key it didn't declare in KEYS is refused and writes nothing
+    fixtures: [clock]
+    flow: eval
+    input:
+      keys: [a]
+      script: "{'writes': {'a': {'type': 'string', 'value': '1'}, 'b': {'type': 'string', 'value': '2'}}}"
+    expect:
+      - "!result.ok && result.error.code == 'err'"
+      - "size(state.redis.keys) == 0"
+
+  - id: lua-evalsha
+    name: EVALSHA of an unknown digest is NOSCRIPT; after SCRIPT LOAD it runs the script
+    fixtures: [seeded]
+    steps:
+      - {flow: evalsha, as: before, input: {sha: "0000000000000000000000000000000000000000", keys: [greeting], args: []}}
+      - {flow: script-load, as: load, input: {script: "{'reply': data[KEYS[0]].value + '!'}"}}
+      - {flow: evalsha, as: after, input: {sha: "= steps.load.result.value.sha", keys: [greeting], args: []}}
+    expect:
+      - "!steps.before.result.ok && steps.before.result.error.code == 'noscript'"
+      - "size(steps.load.result.value.sha) == 40 && steps.after.result.value.reply == 'hello!'"
+
+  # ---- pub/sub ----
+      - "size(state.redis.scripts) == 1"
+
+
+  - id: pubsub-delivery
+    name: PUBLISH reaches the clients subscribed now, at most once; later subscribers and unsubscribed ones miss it
+    fixtures: [clock]
+    steps:
+      - {flow: publish, as: early, input: {channel: inval, message: m0}}
+      - {flow: subscribe, as: s1, input: {client: listener-1, channels: [inval, other]}}
+      - {flow: subscribe, as: s2, input: {client: listener-2, channels: [inval]}}
+      - {flow: publish, as: p1, input: {channel: inval, message: m1}}
+      - {flow: unsubscribe, as: u, input: {client: listener-1, channels: [inval]}}
+      - {flow: publish, as: p2, input: {channel: inval, message: m2}}
+      - {flow: publish, as: p3, input: {channel: other, message: m3}}
+      - {flow: publish, as: p4, input: {channel: nobody, message: m4}}
+    expect:
+      - "steps.early.result.value.receivers == 0 && steps.s1.result.value.subscriptions == 2"
+      - "steps.p1.result.value.receivers == 2 && steps.u.result.value.subscriptions == 1"
+      - "steps.p2.result.value.receivers == 1 && steps.p3.result.value.receivers == 1 && steps.p4.result.value.receivers == 0"
+      - "state.listener.inbox == ['inval:m1', 'other:m3']"
+      - "calls['listener.on-message'] == 3"
+
+  # ---- Redis down (faults) ----
+  - id: redis-down-command-fails
+    name: With Redis down every command fails unavailable at once, and nothing is written
+    fixtures: [clock]
+    faults: [{target: redis, type: unavailable}]
+    flow: set
+    input: {key: k, value: v, nx: false, xx: false, get: false, ex: 0, px: 0, keepttl: false}
+    expect:
+      - "!result.ok && result.error.code == 'unavailable' && result.error.retryable"
+      - "faults == 1 && size(state.redis.keys) == 0 && duration_ms == 0"
+
+  - id: redis-down-cache-falls-back
+    name: A cache-aside read survives Redis being down by reading the database
+    fixtures: [clock]
+    faults: [{target: redis, type: unavailable}]
+    flow: cache-read
+    input: {key: "user:7"}
+    expect:
+      - "result.ok && result.value.source == 'db' && result.value.value == 'db:user:7'"
+      - "ctx.redis_failed && calls['db.load'] == 1 && faults == 2"
+
+  - id: redis-hang-times-out
+    name: A hung Redis costs the cache-aside read its 50 ms client timeouts, then the database answers
+    fixtures: [clock]
+    faults: [{target: redis, type: timeout}]
+    flow: cache-read
+    input: {key: "user:7"}
+    expect:
+      - "result.ok && result.value.source == 'db'"
+      - "duration_ms >= 120 && calls['db.load'] == 1"
+
+  - id: redis-cache-hit-after-fill
+    name: Once Redis is back, the first read fills the cache and the second is a hit
+    fixtures: [clock]
+    steps:
+      - {flow: cache-read, as: miss, input: {key: "user:7"}}
+      - {flow: cache-read, as: hit, input: {key: "user:7"}}
+    expect:
+      - "steps.miss.result.value.source == 'db' && steps.hit.result.value.source == 'cache'"
+      - "calls['db.load'] == 1 && 'expires_at' in state.redis.keys['user:7']"
+
+  - id: redis-lost-reply-double-incr
+    name: A connection reset after INCR landed makes the retried INCR count twice
+    fixtures: [clock]
+    faults: [{target: redis.incr, type: lost_reply, code: connection_reset, calls: [1]}]
+    steps:
+      - {flow: retrying-incr, as: inc, input: {key: counter}}
+      - {flow: get, as: read, input: {key: counter}}
+    expect:
+      - "steps.inc.result.ok && steps.inc.result.value.value == 2 && retries == 1"
+      - "steps.read.result.value.value == '2'"
+      - "state.redis.keys.counter.value == '2'"

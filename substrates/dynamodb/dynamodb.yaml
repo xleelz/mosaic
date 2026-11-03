@@ -1,0 +1,444 @@
+# DynamoDB substrate (DESIGN §14.6, §15.6). Import it instead of modeling DynamoDB again:
+#   imports: [{ontology: <path to this file>, as: ddb}]
+# Every table lives in one component, keyed "<table>|<pk>|<sk>" in state.items, and the tables
+# themselves come from config `dynamodb-tables`, which the importer overrides with its own
+# definitions (key schema pk/sk, GSIs, TTL attribute). For per-table interface names
+# (`<table>-put-if` and so on, the shape one build's areas converged on), instantiate
+# tablegen.py. Behavior follows the DynamoDB developer guide, cited per interface.
+schema_version: 1
+id: dynamodb
+name: Amazon DynamoDB (substrate)
+level: service
+description: >-
+  A DynamoDB endpoint: tables with a pk/sk primary key, GetItem, PutItem, UpdateItem and
+  DeleteItem, conditional writes (a CEL `cond` over `row`, failing 412 condition_failed),
+  TransactWriteItems (all or nothing), Query on the base table or a global secondary index,
+  and Time to Live. Tables are generic: config `dynamodb-tables` declares them.
+source: {url: "https://docs.aws.amazon.com/amazondynamodb/latest/developerguide/"}
+
+configs:
+  - id: dynamodb-tables
+    type: object
+    value: {}
+    default: {}
+    summary: >-
+      The tables, by name: {<table>: {gsis?: {<index>: {pk: <attr>, sk?: <attr>}}, ttl_attribute?: <attr>}}.
+      Every table has the attributes pk and sk as its primary key (sk is "" for a table without a
+      sort key). A request naming a table missing here fails resource_not_found. Importers declare
+      their own value; the substrate's is empty.
+    sources: ["https://docs.aws.amazon.com/amazondynamodb/latest/developerguide/HowItWorks.CoreComponents.html"]
+  - id: dynamodb-transact-max-items
+    type: integer
+    value: 4
+    default: 100
+    summary: >-
+      Items one TransactWriteItems request may hold. DynamoDB allows 100; this model has four write
+      slots, so a larger request fails validation_error (raise it by adding slots).
+    sources: ["https://docs.aws.amazon.com/amazondynamodb/latest/developerguide/transaction-apis.html"]
+
+components:
+  - id: dynamodb
+    name: DynamoDB
+    kind: datastore
+    layer: data
+    summary: "One DynamoDB endpoint (an account and region): every table's items, keyed <table>|<pk>|<sk>."
+    attributes: {technology: dynamodb}
+    sources: ["https://docs.aws.amazon.com/amazondynamodb/latest/developerguide/HowItWorks.CoreComponents.html"]
+    state:
+      schema:
+        type: object
+        properties:
+          items: {type: object, description: "Rows keyed <table>|<pk>|<sk>; each row holds its pk and sk attributes."}
+      initial: {items: {}}
+
+schemas:
+  - id: ItemKey
+    summary: A table name and an item's primary key.
+    schema:
+      type: object
+      required: [table, pk]
+      properties:
+        table: {type: string, examples: [orders]}
+        pk: {type: string, examples: ["CUSTOMER#c1"]}
+        sk: {type: string, default: "", description: "The sort key; \"\" for a table without one."}
+  - id: Item
+    summary: An item's attributes, without pk and sk (the request's key adds them).
+    schema: {type: object, additionalProperties: true}
+  - id: TransactItem
+    summary: One write of a TransactWriteItems request.
+    schema:
+      type: object
+      required: [op, table, pk]
+      properties:
+        op: {type: string, enum: [put, update, delete, incr, check]}
+        table: {type: string, examples: [orders]}
+        pk: {type: string, examples: ["CUSTOMER#c1"]}
+        sk: {type: string, default: ""}
+        item: {type: object, description: "put: the item; update: the attributes to SET"}
+        delta: {type: object, description: "incr: numeric deltas per attribute (ADD)"}
+        cond: {type: string, description: "CEL over row (null when absent): the ConditionExpression"}
+
+interfaces:
+  # ---- Single-item reads and writes -------------------------------------------------------
+  - component: dynamodb
+    name: get
+    kind: rpc
+    summary: >-
+      GetItem. A missing item is not an error: the response has no item (item: null). Reads are
+      strongly consistent here; DynamoDB's default eventually consistent read is not modeled.
+      Expired-but-unswept TTL items are still returned.
+    sources: ["https://docs.aws.amazon.com/AWSDynamoDB/latest/APIReference/API_GetItem.html"]
+    latency_ms: 3
+    request: ItemKey
+    response: {type: object, properties: {item: {type: [object, "null"]}}}
+    errors: [{code: resource_not_found, status: 400}]
+    behavior:
+      - &table-check
+        if: "!(input.table in config['dynamodb-tables'])"
+        title: Unknown table
+        source: "https://docs.aws.amazon.com/AWSDynamoDB/latest/APIReference/CommonErrors.html"
+        then: [{fail: {code: resource_not_found, status: 400, message: "= 'Requested resource not found: Table: ' + input.table + ' not found'"}}]
+      - &key
+        set: {vars.key: "= input.table + '|' + input.pk + '|' + (has(input.sk) ? input.sk : '')"}
+      - return: {item: "= vars.key in state.items ? state.items[vars.key] : null"}
+
+  - component: dynamodb
+    name: put
+    kind: rpc
+    summary: PutItem without a condition. Replaces the whole item; returns the old one (ReturnValues ALL_OLD).
+    sources: ["https://docs.aws.amazon.com/AWSDynamoDB/latest/APIReference/API_PutItem.html"]
+    latency_ms: 5
+    request: {allOf: [{$ref: ItemKey}, {type: object, required: [item], properties: {item: {$ref: Item}}}]}
+    response: {type: object, properties: {old_item: {type: [object, "null"]}}}
+    errors: [{code: resource_not_found, status: 400}]
+    behavior:
+      - *table-check
+      - *key
+      - set: {vars.old: "= vars.key in state.items ? state.items[vars.key] : null"}
+      - transact:
+          - {table: items, op: put, key: "= vars.key", value: "= merge(input.item, {'pk': input.pk, 'sk': has(input.sk) ? input.sk : ''})"}
+      - return: {old_item: "= vars.old"}
+
+  - component: dynamodb
+    name: update
+    kind: rpc
+    summary: >-
+      UpdateItem without a condition: SET the given attributes (nested maps merge; {$absent: true}
+      REMOVEs an attribute). Like DynamoDB, it creates the item when it is missing. Returns the new
+      item (ReturnValues ALL_NEW).
+    sources: ["https://docs.aws.amazon.com/AWSDynamoDB/latest/APIReference/API_UpdateItem.html"]
+    latency_ms: 5
+    request: {allOf: [{$ref: ItemKey}, {type: object, required: [item], properties: {item: {$ref: Item}, remove: {type: array, items: {type: string}, default: [], description: "Attributes to REMOVE"}}}]}
+    response: {type: object, properties: {item: {type: object}}}
+    errors: [{code: resource_not_found, status: 400}]
+    behavior:
+      - *table-check
+      - *key
+      - transact:
+          - {table: items, op: update, key: "= vars.key", value: "= merge(input.item, (has(input.remove) ? input.remove : []).transformMapEntry(n, a, {a: {'$absent': true}}))"}
+        when: "vars.key in state.items"
+        as: w
+      - transact:
+          - {table: items, op: put, key: "= vars.key", value: "= merge(input.item, {'pk': input.pk, 'sk': has(input.sk) ? input.sk : ''})"}
+        when: "!(vars.key in state.items)"
+        as: w
+      - return: {item: "= vars.w.value[0]"}
+
+  - component: dynamodb
+    name: delete
+    kind: rpc
+    summary: DeleteItem without a condition. Deleting a missing item succeeds; returns the old item (ALL_OLD) or null.
+    sources: ["https://docs.aws.amazon.com/AWSDynamoDB/latest/APIReference/API_DeleteItem.html"]
+    latency_ms: 5
+    request: ItemKey
+    response: {type: object, properties: {old_item: {type: [object, "null"]}}}
+    errors: [{code: resource_not_found, status: 400}]
+    behavior:
+      - *table-check
+      - *key
+      - set: {vars.old: "= vars.key in state.items ? state.items[vars.key] : null"}
+      - transact:
+          - {table: items, op: delete, key: "= vars.key"}
+        when: "vars.old != null"
+      - return: {old_item: "= vars.old"}
+
+  # ---- Conditional writes: the shared <table>-*-if shape (reconcile/round4/decision-store-if.md)
+  - component: dynamodb
+    name: put-if
+    kind: rpc
+    summary: >-
+      PutItem with a ConditionExpression: `cond` is CEL over row (null when absent), default
+      "true". A failed condition changes nothing and fails condition_failed 412, as
+      ConditionalCheckFailedException.
+    sources: ["https://docs.aws.amazon.com/amazondynamodb/latest/developerguide/Expressions.ConditionExpressions.html"]
+    latency_ms: 5
+    request:
+      allOf:
+        - {$ref: ItemKey}
+        - {type: object, required: [item], properties: {item: {$ref: Item}, cond: {type: string, default: "true", description: "CEL over row (null when absent)"}}}
+    response: {type: object, properties: {item: {type: object}, old_item: {type: [object, "null"]}}}
+    errors: [{code: resource_not_found, status: 400}, {code: condition_failed, status: 412, retryable: false}]
+    behavior:
+      - *table-check
+      - *key
+      - &cond-put
+        set:
+          vars.cond: "= has(input.cond) && input.cond != '' ? input.cond : 'true'"
+          vars.old: "= vars.key in state.items ? state.items[vars.key] : null"
+      - transact:
+          - {table: items, op: put, key: "= vars.key", value: "= merge(input.item, {'pk': input.pk, 'sk': has(input.sk) ? input.sk : ''})", if: "eval(vars.cond, {'row': row})", conflict: condition_failed}
+        as: w
+        on_error: &cond-failed
+          - fail:
+              code: condition_failed
+              status: 412
+              retryable: false
+              message: "= 'The conditional request failed: ' + vars.cond"
+              data: {table: "= input.table", pk: "= input.pk", sk: "= has(input.sk) ? input.sk : ''", row: "= vars.old"}
+      - return: {item: "= vars.w.value[0]", old_item: "= vars.old"}
+
+  - component: dynamodb
+    name: update-if
+    kind: rpc
+    summary: >-
+      UpdateItem with a ConditionExpression. Without `cond` the condition is "row != null" (an
+      update of a missing row fails), the shared default; with a `cond` that passes on a missing
+      row, DynamoDB creates the item, and so does this.
+    sources: ["https://docs.aws.amazon.com/AWSDynamoDB/latest/APIReference/API_UpdateItem.html", "https://docs.aws.amazon.com/amazondynamodb/latest/developerguide/Expressions.ConditionExpressions.html"]
+    latency_ms: 5
+    request:
+      allOf:
+        - {$ref: ItemKey}
+        - {type: object, required: [item], properties: {item: {$ref: Item}, cond: {type: string, default: "row != null", description: "CEL over row (null when absent)"}}}
+    response: {type: object, properties: {item: {type: object}, old_item: {type: [object, "null"]}}}
+    errors: [{code: resource_not_found, status: 400}, {code: condition_failed, status: 412, retryable: false}]
+    behavior:
+      - *table-check
+      - *key
+      - set:
+          vars.cond: "= has(input.cond) && input.cond != '' ? input.cond : 'row != null'"
+          vars.old: "= vars.key in state.items ? state.items[vars.key] : null"
+      - transact:
+          - {table: items, op: update, key: "= vars.key", value: "= input.item", if: "eval(vars.cond, {'row': row})", conflict: condition_failed}
+        when: "vars.old != null"
+        as: w
+        on_error: *cond-failed
+      - transact:
+          - {table: items, op: put, key: "= vars.key", value: "= merge(input.item, {'pk': input.pk, 'sk': has(input.sk) ? input.sk : ''})", if: "eval(vars.cond, {'row': row})", conflict: condition_failed}
+        when: "vars.old == null"
+        as: w
+        on_error: *cond-failed
+      - return: {item: "= vars.w.value[0]", old_item: "= vars.old"}
+
+  - component: dynamodb
+    name: delete-if
+    kind: rpc
+    summary: DeleteItem with a ConditionExpression (default "true"); a failed condition is condition_failed 412.
+    sources: ["https://docs.aws.amazon.com/AWSDynamoDB/latest/APIReference/API_DeleteItem.html", "https://docs.aws.amazon.com/amazondynamodb/latest/developerguide/Expressions.ConditionExpressions.html"]
+    latency_ms: 5
+    request:
+      allOf:
+        - {$ref: ItemKey}
+        - {type: object, properties: {cond: {type: string, default: "true", description: "CEL over row (null when absent)"}}}
+    response: {type: object, properties: {old_item: {type: [object, "null"]}}}
+    errors: [{code: resource_not_found, status: 400}, {code: condition_failed, status: 412, retryable: false}]
+    behavior:
+      - *table-check
+      - *key
+      - *cond-put
+      - transact:
+          - {table: items, op: delete, key: "= vars.key", if: "eval(vars.cond, {'row': row})", conflict: condition_failed}
+        on_error: *cond-failed
+      - return: {old_item: "= vars.old"}
+
+  - component: dynamodb
+    name: incr-if
+    kind: rpc
+    summary: >-
+      UpdateItem ADD (atomic counters) with a ConditionExpression (default "true"): `delta` maps
+      attributes to numbers; absent attributes and items start at 0. Returns the new item.
+    sources: ["https://docs.aws.amazon.com/amazondynamodb/latest/developerguide/WorkingWithItems.html#WorkingWithItems.AtomicCounters", "https://docs.aws.amazon.com/amazondynamodb/latest/developerguide/Expressions.ConditionExpressions.html"]
+    latency_ms: 5
+    request:
+      allOf:
+        - {$ref: ItemKey}
+        - {type: object, required: [delta], properties: {delta: {type: object, examples: [{count: 1}]}, cond: {type: string, default: "true", description: "CEL over row (null when absent)"}}}
+    response: {type: object, properties: {item: {type: object}, old_item: {type: [object, "null"]}}}
+    errors: [{code: resource_not_found, status: 400}, {code: condition_failed, status: 412, retryable: false}]
+    behavior:
+      - *table-check
+      - *key
+      - *cond-put
+      - transact:
+          - {table: items, op: incr, key: "= vars.key", value: "= input.delta", if: "eval(vars.cond, {'row': row})", conflict: condition_failed}
+          - {table: items, op: update, key: "= vars.key", value: {pk: "= input.pk", sk: "= has(input.sk) ? input.sk : ''"}}
+        as: w
+        on_error: *cond-failed
+      - return: {item: "= vars.w.value[1]", old_item: "= vars.old"}
+
+  # ---- Transactions -------------------------------------------------------------------------
+  - component: dynamodb
+    name: transact-write
+    kind: rpc
+    summary: >-
+      TransactWriteItems: up to `dynamodb-transact-max-items` writes (put, update, delete, incr, or
+      a condition check), all or nothing. Each write may carry `cond` (CEL over its row; update
+      defaults to "row != null", the others to "true"). If any condition fails, nothing is
+      written and the call fails transaction_canceled 400 with data.index (the first failing
+      item) and data.reasons (CancellationReasons). Two writes to one item fail validation_error.
+    description: >-
+      Conditions are checked against the state before the transaction (DynamoDB forbids two
+      operations on one item, so no write sees another's effect). Each slot is a put of the
+      item's computed new value followed by a delete that removes it for delete items; unused
+      slots write and remove the reserved key "~", so the trace shows those two set events.
+    sources: ["https://docs.aws.amazon.com/AWSDynamoDB/latest/APIReference/API_TransactWriteItems.html", "https://docs.aws.amazon.com/amazondynamodb/latest/developerguide/transaction-apis.html"]
+    latency_ms: 10
+    request:
+      type: object
+      required: [items]
+      properties:
+        items: {type: array, minItems: 1, items: {$ref: TransactItem}}
+    response: {type: object, properties: {items: {type: array}}}
+    errors:
+      - {code: resource_not_found, status: 400}
+      - {code: validation_error, status: 400}
+      - {code: condition_failed, status: 412, retryable: false}
+      - {code: transaction_canceled, status: 400, retryable: false}
+    behavior:
+      - if: "size(input.items) < 1 || size(input.items) > config['dynamodb-transact-max-items']"
+        then: [{fail: {code: validation_error, status: 400, message: "= 'Member must have length between 1 and ' + string(config['dynamodb-transact-max-items'])"}}]
+      - if: "!input.items.all(i, i.table in config['dynamodb-tables'])"
+        then: [{fail: {code: resource_not_found, status: 400, message: Requested resource not found}}]
+      - if: "!input.items.all(i, i.op in ['put', 'update', 'delete', 'incr', 'check'])"
+        then: [{fail: {code: validation_error, status: 400, message: "Unknown transaction operation"}}]
+      - set:
+          vars.keys: "= input.items.map(i, i.table + '|' + i.pk + '|' + (has(i.sk) ? i.sk : ''))"
+      - if: "vars.keys.distinct().size() != vars.keys.size()"
+        title: Two operations on one item
+        then: [{fail: {code: validation_error, status: 400, message: "Transaction request cannot include multiple operations on one item"}}]
+      - set:
+          vars.rows: "= vars.keys.map(k, k in state.items ? state.items[k] : null)"
+          vars.conds: "= input.items.map(i, has(i.cond) && i.cond != '' ? i.cond : (i.op == 'update' ? 'row != null' : 'true'))"
+      - set:
+          vars.next: >-
+            = input.items.transformList(n, i,
+                i.op == 'put' ? merge(i.item, {'pk': i.pk, 'sk': has(i.sk) ? i.sk : ''}) :
+                i.op == 'update' ? merge(vars.rows[n] != null ? vars.rows[n] : {'pk': i.pk, 'sk': has(i.sk) ? i.sk : ''}, i.item) :
+                i.op == 'incr' ? merge(vars.rows[n] != null ? vars.rows[n] : {'pk': i.pk, 'sk': has(i.sk) ? i.sk : ''},
+                                       i.delta.transformMap(f, d, (vars.rows[n] != null && f in vars.rows[n] ? vars.rows[n][f] : 0) + d)) :
+                vars.rows[n])
+          vars.del: "= input.items.transformList(n, i, i.op == 'delete' || (i.op == 'check' && vars.rows[n] == null))"
+      - transact:
+          - {table: items, op: put, key: "= size(input.items) > 0 ? vars.keys[0] : '~'", value: "= size(input.items) > 0 ? vars.next[0] : null", if: "size(input.items) <= 0 || eval(vars.conds[0], {'row': row})", conflict: condition_failed}
+          - {table: items, op: delete, key: "= size(input.items) > 0 && vars.del[0] ? vars.keys[0] : '~'"}
+          - {table: items, op: put, key: "= size(input.items) > 1 ? vars.keys[1] : '~'", value: "= size(input.items) > 1 ? vars.next[1] : null", if: "size(input.items) <= 1 || eval(vars.conds[1], {'row': row})", conflict: condition_failed}
+          - {table: items, op: delete, key: "= size(input.items) > 1 && vars.del[1] ? vars.keys[1] : '~'"}
+          - {table: items, op: put, key: "= size(input.items) > 2 ? vars.keys[2] : '~'", value: "= size(input.items) > 2 ? vars.next[2] : null", if: "size(input.items) <= 2 || eval(vars.conds[2], {'row': row})", conflict: condition_failed}
+          - {table: items, op: delete, key: "= size(input.items) > 2 && vars.del[2] ? vars.keys[2] : '~'"}
+          - {table: items, op: put, key: "= size(input.items) > 3 ? vars.keys[3] : '~'", value: "= size(input.items) > 3 ? vars.next[3] : null", if: "size(input.items) <= 3 || eval(vars.conds[3], {'row': row})", conflict: condition_failed}
+          - {table: items, op: delete, key: "= size(input.items) > 3 && vars.del[3] ? vars.keys[3] : '~'"}
+        title: Apply every write, or none
+        as: tx
+        on_error:
+          - set: {vars.failed: "= error.data.index / 2"}
+          - fail:
+              code: transaction_canceled
+              status: 400
+              retryable: false
+              message: "= 'Transaction cancelled, please refer cancellation reasons for specific reasons [' + input.items.transformList(n, i, n == vars.failed ? 'ConditionalCheckFailed' : 'None').join(', ') + ']'"
+              data:
+                index: "= vars.failed"
+                reasons: "= input.items.transformList(n, i, n == vars.failed ? 'ConditionalCheckFailed' : 'None')"
+                row: "= vars.rows[vars.failed]"
+      - return: {items: "= vars.next.transformList(n, v, vars.del[n] ? null : v)"}
+
+  # ---- Query on the base table or a GSI ----------------------------------------------------
+  - component: dynamodb
+    name: query
+    kind: rpc
+    summary: >-
+      Query: the items whose partition key equals `pk`, on the base table or, with `index`, on a
+      global secondary index (whose key attributes come from the table's config). Items lacking
+      the index's key attributes are not in the index (a sparse index). Optional sort-key
+      conditions: `sk_begins_with`, `sk_between` [lo, hi]. Results are in sort-key order
+      (`forward: false` reverses them) and `limit` caps them. GSIs are modeled as immediately
+      consistent; real GSIs are eventually consistent.
+    sources: ["https://docs.aws.amazon.com/amazondynamodb/latest/developerguide/Query.html", "https://docs.aws.amazon.com/amazondynamodb/latest/developerguide/GSI.html"]
+    latency_ms: 6
+    request:
+      type: object
+      required: [table, pk]
+      properties:
+        table: {type: string, examples: [orders]}
+        index: {type: string, default: "", description: "A GSI name; \"\" queries the base table."}
+        pk: {type: string, examples: ["CUSTOMER#c1"]}
+        sk_begins_with: {type: string, default: ""}
+        sk_between: {type: array, default: [], maxItems: 2}
+        forward: {type: boolean, default: true}
+        limit: {type: integer, default: 0, minimum: 0}
+    response: {type: object, properties: {items: {type: array}, count: {type: integer}}}
+    errors: [{code: resource_not_found, status: 400}, {code: validation_error, status: 400}]
+    behavior:
+      - *table-check
+      - set:
+          vars.def: "= config['dynamodb-tables'][input.table]"
+          vars.index: "= has(input.index) ? input.index : ''"
+      - if: "vars.index != '' && !(has(vars.def.gsis) && vars.index in vars.def.gsis)"
+        then: [{fail: {code: validation_error, status: 400, message: "= 'The table does not have the specified index: ' + vars.index"}}]
+      - set:
+          vars.pka: "= vars.index == '' ? 'pk' : vars.def.gsis[vars.index].pk"
+          vars.ska: "= vars.index == '' ? 'sk' : (has(vars.def.gsis[vars.index].sk) ? vars.def.gsis[vars.index].sk : '')"
+          vars.prefix: "= has(input.sk_begins_with) ? input.sk_begins_with : ''"
+          vars.between: "= has(input.sk_between) ? input.sk_between : []"
+      - set:
+          vars.rows: >-
+            = state.items.filter(k, k.startsWith(input.table + '|')).map(k, state.items[k]).filter(r,
+                vars.pka in r && r[vars.pka] == input.pk &&
+                (vars.ska == '' || vars.ska in r) &&
+                (vars.prefix == '' || (vars.ska != '' && string(r[vars.ska]).startsWith(vars.prefix))) &&
+                (size(vars.between) != 2 || (vars.ska != '' && r[vars.ska] >= vars.between[0] && r[vars.ska] <= vars.between[1])))
+      - set:
+          vars.rows: "= vars.ska == '' ? vars.rows : vars.rows.sortBy(r, r[vars.ska])"
+      - set:
+          vars.rows: "= has(input.forward) && !input.forward ? vars.rows.reverse() : vars.rows"
+      - set:
+          vars.rows: "= has(input.limit) && input.limit > 0 && input.limit < size(vars.rows) ? vars.rows.slice(0, input.limit) : vars.rows"
+      - return: {items: "= vars.rows", count: "= size(vars.rows)"}
+
+  # ---- Time to Live -------------------------------------------------------------------------
+  - component: dynamodb
+    name: ttl-sweep
+    kind: event
+    summary: >-
+      The background TTL process: deletes the items of tables with a `ttl_attribute` whose value
+      (epoch seconds) is at or before now. DynamoDB deletes expired items asynchronously, typically
+      within a few days, and expired items stay readable until then, so callers drive this sweep
+      (a scenario step or a repeating flow) instead of expiry deleting at once. Each delete
+      re-checks expiry (a write that extended the TTL wins).
+    sources: ["https://docs.aws.amazon.com/amazondynamodb/latest/developerguide/TTL.html", "https://docs.aws.amazon.com/amazondynamodb/latest/developerguide/howitworks-ttl.html"]
+    latency_ms: 0
+    request: {type: object, properties: {}}
+    response: {type: object, properties: {deleted: {type: array, items: {type: string}}}}
+    behavior:
+      - set:
+          vars.deleted: []
+          vars.expired: >-
+            = state.items.filter(k,
+                k.split('|')[0] in config['dynamodb-tables'] &&
+                'ttl_attribute' in config['dynamodb-tables'][k.split('|')[0]] &&
+                config['dynamodb-tables'][k.split('|')[0]].ttl_attribute in state.items[k] &&
+                type(state.items[k][config['dynamodb-tables'][k.split('|')[0]].ttl_attribute]) in [int, double] &&
+                double(state.items[k][config['dynamodb-tables'][k.split('|')[0]].ttl_attribute]) * 1000.0 <= double(now))
+      - foreach: "= vars.expired"
+        as: k
+        max: 1000
+        steps:
+          - set: {vars.attr: "= config['dynamodb-tables'][vars.k.split('|')[0]].ttl_attribute"}
+          - transact:
+              - {table: items, op: delete, key: "= vars.k", if: "row != null && vars.attr in row && double(row[vars.attr]) * 1000.0 <= double(now)"}
+            title: TTL delete
+            as: d
+            on_error: continue
+          - set: {vars.deleted: "= vars.deleted + [vars.k]"}
+            when: "vars.d.ok"
+      - return: {deleted: "= vars.deleted"}

@@ -1,0 +1,52 @@
+# Oracle: exthost, builtin-extensions, terminal-debug-tasks
+
+Run: `go run ./internal/devtools/check -f examples/vscode/vscode.json -f examples/vscode/oracle/extensions.yaml --no-mocks --lint hollow -v`
+gives 1879 model scenarios passing, the 2 oracle scenarios failing, and a clean hollow lint. Tests whose code under
+test has no interface in the model have no scenario, because a step naming a missing interface fails validation
+for the whole run. Their intended ids are listed with "(not written)".
+
+| Test | Behavior | Scenario | Verdict | Entity at fault / missing feature | Evidence |
+|---|---|---|---|---|---|
+| src/vs/workbench/api/test/browser/extHostDebugVisualization.test.ts:60 `does not call a disposed visualization provider` | After its registration is disposed, `$provideDebugVisualizers` finds no provider and returns `[]` without calling it | oracle-exthost-debug-visualization-disposed (not written) | model-bug | exthost: no `vscode-api.debug-register-debug-visualization-provider`, no `ext-host-debug-service.register-debug-visualization-provider` or `provide-debug-visualizers` | Code: ExtHostDebugServiceBase.registerDebugVisualizationProvider (src/vs/workbench/api/common/extHostDebugService.ts:395-412) keeps the provider in `_debugVisualizationProviders`, and dispose deletes it. `$provideDebugVisualizers` (:361-367) returns `[]` when no provider is found. skips/exthost.json says `$provideDebugVisualizers` is "covered by the vscode-api interface that registers it", but that interface doesn't exist. The model only has the window-side `debug-visualizer-service.on-visualizers-extension-point` |
+| src/vs/workbench/api/test/browser/mainThreadEditorTabs.test.ts:33 `ignores only missing modal editor label changes` | An EDITOR_LABEL change for a tab that isn't in the model, in the active modal editor part, is ignored (0 rebuilds). An EDITOR_OPEN in that group still rebuilds (1) | oracle-exthost-editor-tabs-modal-label (not written) | model-bug | exthost: `main-thread-editor-tabs` has only `create`. Nothing handles `onDidEditorsChange` (`_updateTabsModel`, `_onDidTabLabelChange`, `_createTabsModel`), and `$acceptEditorTabModel`/`$acceptTabOperation` are only in skips | Code: MainThreadEditorTabs ctor subscribes to editorService.onDidEditorsChange (src/vs/workbench/api/browser/mainThreadEditorTabs.ts:62-69). `_onDidTabLabelChange` returns early for a group of activeModalEditorPart (:276-279). `_onDidTabOpen` rebuilds when the group isn't in the model (:291-298) |
+| src/vs/workbench/api/test/browser/extHostApiCommands.test.ts:232 `WorkspaceSymbols, invalid arguments` | `vscode.executeWorkspaceSymbolProvider` with no argument, null, undefined or `true` rejects. ApiCommandArgument.String validation fails in the extension host before any RPC | oracle-exthost-workspace-symbols-invalid-arguments | model-bug | exthost: `ext-host-commands` has no API commands (ExtHostApiCommands.register / registerApiCommand and argument validation). files-search-scm: `search-actions.cmd-executeworkspacesymbolprovider` is inverted | The model rejects, but for the wrong reason. Trace: ext-host-commands.execute-command → main-thread-commands.execute-command → command-service → `command-not-found`, so the "never reaches the window" expectation fails. Code: ExtHostApiCommands.register (src/vs/workbench/api/common/extHostApiCommands.ts:607-609, called at extHost.api.impl.ts:289) registers `vscode.executeWorkspaceSymbolProvider` (:165-170) with `ApiCommandArgument.String` (extHostCommands.ts:453). registerApiCommand throws `Invalid argument` (extHostCommands.ts:120-127) |
+| src/vs/workbench/api/test/browser/extHostApiCommands.test.ts:274 `executeWorkspaceSymbolProvider should accept empty string, #39522` (same unit) | With a workspace symbol provider registered, the query `''` resolves | oracle-exthost-workspace-symbols-empty-query | model-bug | same as above | Registration reaches `main-thread-language-features.register-navigate-type-support@w1`, but executing the command fails `command-not-found`. In code, the ext-host API command forwards to `_executeWorkspaceSymbolProvider` (search.contribution.ts:242-247), which runs getWorkspaceSymbols. The model's `search-actions.cmd-executeworkspacesymbolprovider` instead calls `vscode.executeWorkspaceSymbolProvider` (backwards) and never queries providers |
+| extensions/copilot/src/extension/completions-core/vscode-node/lib/src/test/textDocument.test.ts:13 `new lines are handled correctly` | A document's `\n`, `\r\n` or `\r` text splits into 2 lines, `hello` and `goodbye` | — | untranslatable | — | Line splitting in CopilotTextDocument (extensions/copilot/.../lib/src/textDocument.ts:194, lineAt :276) is string handling inside an extension, below the model's level |
+| extensions/github-authentication/src/test/github.test.ts:36 `does not loop when Codespaces secret storage drops hydrated account data` | readSessions hydrates an accountless stored session with getUserInfo once, and doesn't write it back to secret storage, so no change-event loop | oracle-builtin-extensions-github-sessions-no-write-loop (not written) | model-bug | builtin-extensions: the github-authentication extension isn't modeled at all (no component; it has no commands, so command-level coverage skipped it). No authentication getSessions path reaches an extension provider either | Code: GitHubSessionEngine.readSessions (extensions/github-authentication/src/github.ts:703-791) calls getUserInfo only for sessions without `account` (:735-743). It calls storeSessions only on a numeric account id or a dropped session (:786-789) |
+| extensions/copilot/src/extension/completions-core/vscode-node/prompt/src/test/suffixmatch.test.ts:9 `findEditDistanceScore computes correct score of two number[]` | Edit distance between token arrays | — | untranslatable | — | Pure algorithm (suffixMatchCriteria.ts:9) inside the copilot extension, below the model |
+| src/vs/workbench/contrib/terminalContrib/chatAgentTools/test/browser/outputMonitor.test.ts:58 `startMonitoring returns immediately when polling succeeds` | When a run-in-terminal command's output changes and the process is inactive, the monitor finishes Idle with the latest output, without sending text to the terminal | oracle-terminal-debug-tasks-output-monitor-idle (not written) | model-bug | terminal-debug-tasks: `chat-agent-tools-contribution` has only an empty `start`. There is no run-in-terminal tool invocation, OutputMonitor or polling | Code: OutputMonitor (src/vs/workbench/contrib/terminalContrib/chatAgentTools/browser/tools/monitoring/outputMonitor.ts:61), `_startMonitoring` (:198-270), `_waitForIdle` (:477ff, exponential polling and idle detection). Used by runInTerminalTool.ts:2058 and taskHelpers.ts:269 |
+| src/vs/workbench/contrib/terminal/test/browser/terminalEvents.test.ts:56 `should handle existing instances with capabilities` | A capability event from an existing terminal instance is re-fired as `{instance, data}` | — | untranslatable | — | createInstanceCapabilityEventMultiplexer (src/vs/workbench/contrib/terminal/browser/terminalEvents.ts:11) is generic Emitter/EventMultiplexer wiring. The test asserts listener plumbing and payload object identity, which is below the model's publish/subscribe level |
+| src/vs/workbench/contrib/terminalContrib/chatAgentTools/test/browser/terminalOutputCache.test.ts:17 `lookup returns recorded value for a cacheable command` | Recording `git status` in `/repo` then looking it up returns `clean` (also: keys include cwd; a mutation invalidates same-program reads) | oracle-terminal-debug-tasks-output-cache-hit (not written) | model-bug | terminal-debug-tasks: TerminalOutputCache isn't modeled. chat's `tool-result-compressor-service` has no interfaces to register or consult a cache | Code: TerminalOutputCache.record/lookup/observe (src/vs/workbench/contrib/terminalContrib/chatAgentTools/browser/tools/terminalOutputCache.ts:163-235), keyed by `cwd::command`, with TTL per command class. Registered via registerTerminalCompressors (terminalOutputCompressor.ts:670) |
+
+Counts: 6 model-bug (4 without a scenario because the interfaces are missing), 3 untranslatable, 0 pass, 0 test-mismatch, 0 sim-gap.
+
+## Fix requests
+
+### exthost
+1. **API commands in the extension host.** Model ExtHostApiCommands.register → `ext-host-commands.register-api-command`
+   (extHostCommands.ts:120-127, extHostApiCommands.ts:607-609). Seed `ext-host-commands` state with the `vscode.*` API
+   commands and their argument validators (at least `vscode.executeWorkspaceSymbolProvider`: one string). Invalid
+   arguments fail `invalid-argument` locally. Valid ones convert and call `_executeWorkspaceSymbolProvider` through
+   `$executeCommand`.
+2. **Debug visualization providers.** Add `vscode-api.debug-register-debug-visualization-provider` and
+   `-tree`, and `ext-host-debug-service.register-debug-visualization-provider` / `provide-debug-visualizers` /
+   `get-visualizer-tree-item`, with a provider map in state (extHostDebugService.ts:170-200, 361-412). Fix skips/exthost.json, which
+   claims coverage by a vscode-api interface that doesn't exist.
+3. **MainThreadEditorTabs.** Subscribe to the editor service's `onDidEditorsChange` and model `_updateTabsModel`,
+   `_onDidTabLabelChange` (with the modal-part early return), `_onDidTabOpen` and `_createTabsModel` against a
+   tab-group state (mainThreadEditorTabs.ts:62-79, 264-298, 509-610).
+
+### files-search-scm
+4. `search-actions.cmd-executeworkspacesymbolprovider` is inverted. `_executeWorkspaceSymbolProvider` asserts the query is a
+   string and runs getWorkspaceSymbols over the registered providers (search.contribution.ts:242-247). It must not
+   call `vscode.executeWorkspaceSymbolProvider`.
+
+### builtin-extensions
+5. Model the github-authentication extension's provider: getSessions/readSessions over a keychain store and
+   getUserInfo, with no write-back when only account data was hydrated (github.ts:703-791). Wire it to the core
+   authentication service's getSessions.
+
+### terminal-debug-tasks
+6. Model the run-in-terminal chat tool's execution: OutputMonitor polling to Idle/Cancelled/Timeout (outputMonitor.ts:61-270, 477ff)
+   with `config`-driven intervals, and TerminalOutputCache record/lookup/observe with per-class TTL and cwd-keyed
+   invalidation (terminalOutputCache.ts:163-235). Chat must give `tool-result-compressor-service` interfaces to consult it.

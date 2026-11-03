@@ -1,0 +1,1000 @@
+interfaces:
+  # =================================================================== block pool
+  - component: block-pool
+    name: get-num-free-blocks
+    kind: function
+    latency_ms: 0
+    summary: "Free blocks in the pool, eviction candidates (cached, ref_cnt 0) included."
+    sources: ["vllm/v1/core/block_pool.py:868-875"]
+    request: {type: object}
+    response: {type: object, properties: {num_free_blocks: {type: integer}, num_gpu_blocks: {type: integer}}}
+    behavior:
+      - return: {num_free_blocks: "= size(state.free_front) + (state.num_gpu_blocks - state.next_fresh) + size(state.free_tail)", num_gpu_blocks: "= state.num_gpu_blocks"}
+
+  - component: block-pool
+    name: get-usage
+    kind: function
+    latency_ms: 0
+    summary: "KV cache usage: 1 - free / (num_gpu_blocks - 1); the null block is not counted."
+    sources: ["vllm/v1/core/block_pool.py:877-888"]
+    request: {type: object}
+    response: {type: object, properties: {usage: {type: number}}}
+    behavior:
+      - set:
+          vars.free: "= size(state.free_front) + (state.num_gpu_blocks - state.next_fresh) + size(state.free_tail)"
+      - return: {usage: "= 1.0 - double(vars.free) / double(state.num_gpu_blocks - 1)"}
+
+  - component: block-pool
+    name: init
+    kind: function
+    latency_ms: 0
+    summary: "Build the pool: num_gpu_blocks blocks, block 0 taken as the null block, everything else free; no prefix cache."
+    sources: ["vllm/v1/core/block_pool.py:157-196"]
+    errors: [{code: assertion-error, status: 0, retryable: false}]
+    request: {type: object, required: [num_gpu_blocks], properties: {num_gpu_blocks: {type: integer, examples: [28488]}}}
+    response: {type: object, properties: {num_free_blocks: {type: integer}}}
+    behavior:
+      - if: "input.num_gpu_blocks <= 0"
+        then: [{fail: {code: assertion-error, status: 0, message: "num_gpu_blocks must be a positive int"}}]
+      - title: All blocks free; pop block 0 as the null block
+        source: "vllm/v1/core/block_pool.py:172-189"
+        set:
+          state.num_gpu_blocks: "= input.num_gpu_blocks"
+          state.next_fresh: 1
+          state.free_front: []
+          state.free_tail: []
+          state.ref_cnt: {}
+          state.block_hash: {}
+          state.cached: {}
+      - return: {num_free_blocks: "= input.num_gpu_blocks - 1"}
+
+  - component: block-pool
+    name: get-cached-block
+    kind: function
+    latency_ms: 0
+    summary: "Prefix-cache lookup of one block hash; a miss returns null."
+    sources: ["vllm/v1/core/block_pool.py:198-224", "vllm/v1/core/kv_cache_utils.py:74-83"]
+    request: {type: object, required: [block_hash], properties: {block_hash: {type: string}}}
+    response: {type: object, properties: {block: {}}}
+    behavior:
+      - if: "!(input.block_hash in state.cached)"
+        then: [{return: {block: null}}]
+      - set: {vars.bid: "= state.cached[input.block_hash]"}
+      - return:
+          block:
+            block_id: "= vars.bid"
+            ref_cnt: "= string(vars.bid) in state.ref_cnt ? state.ref_cnt[string(vars.bid)] : (vars.bid in state.free_tail || vars.bid in state.free_front ? 0 : 1)"
+
+  - component: block-pool
+    name: touch
+    kind: function
+    latency_ms: 0
+    summary: "A prefix hit takes a reference: ref_cnt += 1, and a block with ref_cnt 0 leaves the free queue (no longer evictable)."
+    sources: ["vllm/v1/core/block_pool.py:752-768"]
+    request: {type: object, required: [block_ids], properties: {block_ids: {type: array, items: {type: integer}}}}
+    response: {type: object, properties: {touched: {type: integer}}}
+    behavior:
+      - title: Touch prefix-hit blocks
+        detail: "Blocks at ref_cnt 0 are removed from the free queue; shared ones get ref_cnt + 1."
+        source: "vllm/v1/core/block_pool.py:762-768"
+        set:
+          vars.in_use: "= input.block_ids.filter(b, !(b in state.free_tail) && !(b in state.free_front))"
+      - set:
+          state.free_tail: "= state.free_tail.filter(b, !(b in input.block_ids))"
+          state.free_front: "= state.free_front.filter(b, !(b in input.block_ids))"
+          state.ref_cnt: "= merge(state.ref_cnt, vars.in_use.transformMapEntry(i, b, {string(b): (string(b) in state.ref_cnt ? state.ref_cnt[string(b)] : 1) + 1}))"
+      - return: {touched: "= size(input.block_ids)"}
+
+  - component: block-pool
+    name: get-new-blocks
+    kind: function
+    latency_ms: 0
+    summary: "Pop n blocks off the free queue head; a popped block that still has a hash is evicted from the prefix cache."
+    sources: ["vllm/v1/core/block_pool.py:666-700"]
+    errors: [{code: value-error, status: 0, retryable: false}]
+    request: {type: object, required: [num_blocks], properties: {num_blocks: {type: integer}}}
+    response: {type: object, properties: {block_ids: {type: array, items: {type: integer}}, evicted_hashes: {type: array, items: {type: string}}}}
+    behavior:
+      - set:
+          vars.free: "= size(state.free_front) + (state.num_gpu_blocks - state.next_fresh) + size(state.free_tail)"
+      - if: "input.num_blocks > vars.free"
+        then:
+          - title: Not enough free blocks
+            source: "vllm/v1/core/block_pool.py:678-679"
+            fail: {code: value-error, status: 0, message: "= 'Cannot get ' + string(input.num_blocks) + ' free blocks from the pool'"}
+      - set:
+          vars.take_front: "= state.free_front.slice(0, math.least(input.num_blocks, size(state.free_front)))"
+      - set:
+          vars.n_fresh: "= math.least(input.num_blocks - size(vars.take_front), state.num_gpu_blocks - state.next_fresh)"
+      - set:
+          vars.fresh: "= lists.range(vars.n_fresh).map(i, state.next_fresh + i)"
+          vars.take_tail: "= state.free_tail.slice(0, input.num_blocks - size(vars.take_front) - vars.n_fresh)"
+      - set:
+          vars.ids: "= vars.take_front + vars.fresh + vars.take_tail"
+          vars.evicted: "= (vars.take_front + vars.take_tail).filter(b, string(b) in state.block_hash).map(b, state.block_hash[string(b)])"
+      - title: Evict reused cached blocks from the prefix cache
+        detail: "_maybe_evict_cached_block drops the hash of every reused block that still had one."
+        source: "vllm/v1/core/block_pool.py:687-689"
+        set:
+          state.free_front: "= state.free_front.slice(size(vars.take_front), size(state.free_front))"
+          state.next_fresh: "= state.next_fresh + vars.n_fresh"
+          state.free_tail: "= state.free_tail.slice(size(vars.take_tail), size(state.free_tail))"
+          state.cached: "= state.cached.transformMap(h, b, !(h in vars.evicted) || !(b in vars.ids), b)"
+          state.block_hash: "= state.block_hash.transformMap(k, h, !(int(k) in vars.ids), h)"
+          state.hash_tokens: "= state.hash_tokens.transformMap(k, n, !(int(k) in vars.ids), n)"
+      - if: "config['enable-kv-cache-events'] && size(vars.evicted) > 0"
+        then:
+          - title: One BlockRemoved event per evicted hash (the hash bytes, or a 64-bit int with VLLM_KV_EVENTS_USE_INT_BLOCK_HASHES)
+            source: "vllm/v1/core/block_pool.py:615-625"
+            set: {state.kv_event_queue: "= state.kv_event_queue + vars.evicted.map(h, {'type': 'BlockRemoved', 'block_hashes': [h], 'group_idx': 0})"}
+      - return: {block_ids: "= vars.ids", evicted_hashes: "= vars.evicted"}
+
+  - component: block-pool
+    name: free-blocks
+    kind: function
+    latency_ms: 0
+    summary: "Drop one reference per block; blocks reaching 0 rejoin the free queue: uncached ones at the head (LIFO), cached ones at the tail (LRU)."
+    sources: ["vllm/v1/core/block_pool.py:774-805"]
+    request: {type: object, required: [block_ids], properties: {block_ids: {type: array, items: {type: integer}}}}
+    response: {type: object, properties: {released: {type: array, items: {type: integer}}}}
+    behavior:
+      - set:
+          vars.keys: "= input.block_ids.map(b, string(b))"
+          vars.released: "= input.block_ids.filter(b, b != 0 && !(string(b) in state.ref_cnt))"
+      - set:
+          vars.first: "= vars.released.filter(b, !(string(b) in state.block_hash) || !config['enable-prefix-caching'])"
+          vars.last: "= vars.released.filter(b, string(b) in state.block_hash && config['enable-prefix-caching'])"
+      - title: Return released blocks to the free queue
+        detail: "Blocks without a hash are prepended (reused first); cached blocks are appended (evicted last, LRU)."
+        source: "vllm/v1/core/block_pool.py:793-803"
+        set:
+          state.free_front: "= vars.first + state.free_front"
+          state.free_tail: "= state.free_tail + vars.last"
+          state.ref_cnt: "= state.ref_cnt.transformMap(k, v, !(k in vars.keys) || v > 2, k in vars.keys ? v - 1 : v)"
+      - return: {released: "= vars.released"}
+
+  - component: block-pool
+    name: cache-full-blocks
+    kind: function
+    latency_ms: 0
+    summary: "Register newly full blocks under their chained block hash so later requests can hit them."
+    sources: ["vllm/v1/core/block_pool.py:226-344", "vllm/v1/core/block_pool.py:85-99"]
+    request:
+      type: object
+      required: [block_ids, block_hashes]
+      properties:
+        block_ids: {type: array, items: {type: integer}}
+        block_hashes: {type: array, items: {type: string}}
+    response: {type: object, properties: {cached: {type: integer}}}
+    behavior:
+      - set:
+          vars.pairs: "= lists.range(math.least(size(input.block_ids), size(input.block_hashes))).filter(i, input.block_ids[i] != 0).map(i, {'b': input.block_ids[i], 'h': input.block_hashes[i]})"
+      - title: Insert block hashes
+        detail: "The first block cached under a hash serves later hits; a duplicate keeps its own hash but is not the one returned."
+        source: "vllm/v1/core/block_pool.py:626-646"
+        set:
+          state.block_hash: "= merge(state.block_hash, vars.pairs.transformMapEntry(i, p, {string(p.b): p.h}))"
+          state.cached: "= merge(vars.pairs.filter(p, !(p.h in state.cached)).transformMapEntry(i, p, {p.h: p.b}), state.cached)"
+      - if: "config['enable-kv-cache-events'] && size(vars.pairs) > 0"
+        then:
+          - title: Queue a BlockStored event for the newly cached blocks
+            source: "vllm/v1/core/block_pool.py:333-345"
+            set: {state.kv_event_queue: "= state.kv_event_queue + [{'type': 'BlockStored', 'block_hashes': vars.pairs.map(p, p.h), 'group_idx': 0}]"}
+      - return: {cached: "= size(vars.pairs)"}
+
+  - component: block-pool
+    name: cache-partial-block
+    kind: function
+    latency_ms: 0
+    summary: "Make an existing block reachable from a fine-grained prefix boundary inside it (hash_block_size < block_size): a longer partial entry replaces the block's shorter one."
+    sources: ["vllm/v1/core/block_pool.py:449-563"]
+    request:
+      type: object
+      required: [block_id, block_hash, num_tokens]
+      properties:
+        block_id: {type: integer}
+        block_hash: {type: string, description: "The prefix-chain hash at num_tokens."}
+        num_tokens: {type: integer}
+    response: {type: object, properties: {cached: {type: boolean}, removed: {type: array, items: {type: string}}}}
+    behavior:
+      - if: "input.block_id == 0"
+        then:
+          - title: The null block is never cached
+            source: "vllm/v1/core/block_pool.py:493-494"
+            return: {cached: false, removed: []}
+      - set:
+          vars.key: "= string(input.block_id)"
+      - set:
+          vars.old: "= vars.key in state.block_hash && state.block_hash[vars.key] != input.block_hash && (!(vars.key in state.hash_tokens) || state.hash_tokens[vars.key] < input.num_tokens) ? [state.block_hash[vars.key]] : []"
+      - title: A shorter earlier entry for this block is removed first
+        source: "vllm/v1/core/block_pool.py:506-517"
+        set:
+          state.cached: "= state.cached.transformMap(h, b, !(h in vars.old), b)"
+      - title: Insert the partial entry
+        source: "vllm/v1/core/block_pool.py:518-563"
+        set:
+          state.block_hash: "= merge(state.block_hash, {vars.key: input.block_hash})"
+          state.hash_tokens: "= merge(state.hash_tokens, {vars.key: input.num_tokens})"
+          state.cached: "= input.block_hash in state.cached ? state.cached : merge(state.cached, {input.block_hash: input.block_id})"
+      - return: {cached: true, removed: "= vars.old"}
+
+  - component: block-pool
+    name: reset-prefix-cache
+    kind: function
+    latency_ms: 0
+    summary: "Drop every block hash, only when no block but the null block is in use."
+    sources: ["vllm/v1/core/block_pool.py:827-866"]
+    request: {type: object}
+    response: {type: object, properties: {reset: {type: boolean}}}
+    behavior:
+      - set:
+          vars.used: "= state.num_gpu_blocks - (size(state.free_front) + (state.num_gpu_blocks - state.next_fresh) + size(state.free_tail))"
+      - if: "vars.used != 1"
+        then:
+          - title: Blocks still in use; reset refused
+            source: "vllm/v1/core/block_pool.py:838-845"
+            return: {reset: false}
+      - set: {state.cached: {}, state.block_hash: {}, state.hash_tokens: {}}
+      - return: {reset: true}
+
+  # ======================================================== full attention manager
+  - component: full-attention-manager
+    name: find-longest-cache-hit
+    kind: function
+    latency_ms: 0
+    summary: "Longest run of cached full blocks from the start of the prompt (chained hashes: the first miss ends the hit)."
+    sources: ["vllm/v1/core/single_type_kv_cache_manager.py:733-828"]
+    request:
+      type: object
+      required: [block_hashes, max_length]
+      properties:
+        block_hashes: {type: array, items: {type: string}}
+        max_length: {type: integer}
+    response: {type: object, properties: {blocks: {type: array, items: SchedKvBlock}, hit_length: {type: integer}}}
+    behavior:
+      - set: {vars.blocks: []}
+      - title: Probe cached blocks in order
+        source: "vllm/v1/core/single_type_kv_cache_manager.py:779-786"
+        foreach: "= input.block_hashes.slice(0, math.least([size(input.block_hashes), input.max_length / int(config['block-size']), 1000]))"
+        as: h
+        max: 1000
+        steps:
+          - call: block-pool.get-cached-block
+            input: {block_hash: "= vars.h"}
+            as: got
+          - if: "vars.got.value.block == null"
+            then: [{break: true}]
+          - set: {vars.blocks: "= vars.blocks + [vars.got.value.block]"}
+      - return: {blocks: "= vars.blocks", hit_length: "= size(vars.blocks) * int(config['block-size'])"}
+
+  - component: full-attention-manager
+    name: get-num-blocks-to-allocate
+    kind: function
+    latency_ms: 0
+    summary: "Blocks a request needs for num_tokens slots, counting prefix-hit blocks that are eviction candidates (they leave the free queue)."
+    sources: ["vllm/v1/core/single_type_kv_cache_manager.py:175-265"]
+    request:
+      type: object
+      required: [request_id, num_tokens]
+      properties:
+        request_id: {type: string}
+        num_tokens: {type: integer}
+        new_computed_blocks: {type: array, items: SchedKvBlock}
+    response: {type: object, properties: {num_blocks: {type: integer}}}
+    behavior:
+      - set:
+          vars.required: "= (input.num_tokens + int(config['block-size']) - 1) / int(config['block-size'])"
+          vars.have: "= input.request_id in state.req_to_blocks ? size(state.req_to_blocks[input.request_id]) : 0"
+          vars.hits: "= has(input.new_computed_blocks) ? input.new_computed_blocks : []"
+      - if: "input.request_id in state.num_cached_block"
+        then:
+          - title: Running request - no new prefix hits
+            source: "vllm/v1/core/single_type_kv_cache_manager.py:230-236"
+            return: {num_blocks: "= math.greatest(vars.required - vars.have, 0)"}
+      - return:
+          num_blocks: "= math.greatest(vars.required - (size(vars.hits) + vars.have), 0) + size(vars.hits.filter(b, b.ref_cnt == 0))"
+
+  - component: full-attention-manager
+    name: add-local-computed-blocks
+    kind: function
+    latency_ms: 0
+    summary: "Adopt prefix-hit blocks into a new request's block table (touching them) and mark them cached."
+    sources: ["vllm/v1/core/single_type_kv_cache_manager.py:267-324"]
+    request:
+      type: object
+      required: [request_id, new_computed_blocks]
+      properties:
+        request_id: {type: string}
+        new_computed_blocks: {type: array, items: SchedKvBlock}
+    response: {type: object, properties: {num_blocks: {type: integer}}}
+    behavior:
+      - set: {vars.ids: "= input.new_computed_blocks.map(b, b.block_id)"}
+      - if: "config['enable-prefix-caching']"
+        then:
+          - call: block-pool.touch
+            input: {block_ids: "= vars.ids"}
+      - set:
+          state.req_to_blocks: "= merge(state.req_to_blocks, {input.request_id: vars.ids})"
+          state.num_cached_block: "= merge(state.num_cached_block, {input.request_id: size(vars.ids)})"
+      - return: {num_blocks: "= size(vars.ids)"}
+
+  - component: full-attention-manager
+    name: allocate-external-computed-blocks
+    kind: function
+    latency_ms: 0
+    summary: "Allocate blocks for external (KV-connector) computed tokens: max(0, cdiv(local + external, block_size) - blocks held)."
+    sources: ["vllm/v1/core/single_type_kv_cache_manager.py:326-366"]
+    request: {type: object, required: [request_id, num_external_computed_tokens], properties: {request_id: {type: string}, num_local_computed_tokens: {type: integer, default: 0}, num_external_computed_tokens: {type: integer}}}
+    response: {type: object, properties: {new_block_ids: {type: array, items: {type: integer}}}}
+    behavior:
+      - if: "input.num_external_computed_tokens <= 0"
+        then: [{return: {new_block_ids: []}}]
+      - set:
+          vars.have: "= input.request_id in state.req_to_blocks ? state.req_to_blocks[input.request_id] : []"
+          vars.local: "= has(input.num_local_computed_tokens) ? input.num_local_computed_tokens : 0"
+      - title: Never a negative count - blocks already held cover the tokens
+        source: "vllm/v1/core/single_type_kv_cache_manager.py:359-363"
+        set:
+          vars.n: "= math.greatest(0, (vars.local + input.num_external_computed_tokens + int(config['block-size']) - 1) / int(config['block-size']) - size(vars.have))"
+      - if: "vars.n == 0"
+        then:
+          - set: {state.req_to_blocks: "= merge(state.req_to_blocks, {input.request_id: vars.have})"}
+          - return: {new_block_ids: []}
+      - call: block-pool.get-new-blocks
+        input: {num_blocks: "= vars.n"}
+        as: got
+      - set: {state.req_to_blocks: "= merge(state.req_to_blocks, {input.request_id: vars.have + vars.got.value.block_ids})"}
+      - return: {new_block_ids: "= vars.got.value.block_ids"}
+
+  - component: full-attention-manager
+    name: allocate-new-blocks
+    kind: function
+    latency_ms: 0
+    summary: "Extend a request's block table to cover num_tokens slots with fresh blocks from the pool."
+    sources: ["vllm/v1/core/single_type_kv_cache_manager.py:369-410"]
+    request: {type: object, required: [request_id, num_tokens], properties: {request_id: {type: string}, num_tokens: {type: integer}}}
+    response: {type: object, properties: {new_block_ids: {type: array, items: {type: integer}}}}
+    behavior:
+      - set:
+          vars.have: "= input.request_id in state.req_to_blocks ? state.req_to_blocks[input.request_id] : []"
+      - set:
+          vars.n: "= (input.num_tokens + int(config['block-size']) - 1) / int(config['block-size']) - size(vars.have)"
+      - if: "vars.n <= 0"
+        then:
+          - set: {state.req_to_blocks: "= merge(state.req_to_blocks, {input.request_id: vars.have})"}
+          - return: {new_block_ids: []}
+      - call: block-pool.get-new-blocks
+        input: {num_blocks: "= vars.n"}
+        as: got
+      - set: {state.req_to_blocks: "= merge(state.req_to_blocks, {input.request_id: vars.have + vars.got.value.block_ids})"}
+      - return: {new_block_ids: "= vars.got.value.block_ids"}
+
+  - component: full-attention-manager
+    name: cache-blocks
+    kind: function
+    latency_ms: 0
+    summary: "Cache the request's newly full blocks (up to num_tokens) under their block hashes."
+    sources: ["vllm/v1/core/single_type_kv_cache_manager.py:476-534"]
+    request:
+      type: object
+      required: [request_id, num_tokens, block_hashes]
+      properties:
+        request_id: {type: string}
+        num_tokens: {type: integer}
+        block_hashes: {type: array, items: {type: string}}
+    response: {type: object, properties: {num_cached_blocks: {type: integer}}}
+    behavior:
+      - set:
+          vars.num_cached: "= input.request_id in state.num_cached_block ? state.num_cached_block[input.request_id] : 0"
+          vars.num_full: "= math.least(input.num_tokens / int(config['block-size']), size(input.block_hashes))"
+          vars.blocks: "= input.request_id in state.req_to_blocks ? state.req_to_blocks[input.request_id] : []"
+      - if: "vars.num_cached >= vars.num_full"
+        then: [{return: {num_cached_blocks: "= vars.num_cached"}}]
+      - call: block-pool.cache-full-blocks
+        input:
+          block_ids: "= vars.blocks.slice(vars.num_cached, math.least(vars.num_full, size(vars.blocks)))"
+          block_hashes: "= input.block_hashes.slice(vars.num_cached, vars.num_full)"
+      - set: {state.num_cached_block: "= merge(state.num_cached_block, {input.request_id: vars.num_full})"}
+      - return: {num_cached_blocks: "= vars.num_full"}
+
+  - component: full-attention-manager
+    name: free
+    kind: function
+    latency_ms: 0
+    summary: "Pop a request's block table and free its blocks in reverse order, so tail blocks are evicted first."
+    sources: ["vllm/v1/core/single_type_kv_cache_manager.py:562-591"]
+    request: {type: object, required: [request_id], properties: {request_id: {type: string}}}
+    response: {type: object, properties: {freed: {type: integer}}}
+    behavior:
+      - set:
+          vars.blocks: "= input.request_id in state.req_to_blocks ? state.req_to_blocks[input.request_id] : []"
+      - set:
+          state.req_to_blocks: "= omit(state.req_to_blocks, input.request_id)"
+          state.num_cached_block: "= omit(state.num_cached_block, input.request_id)"
+      - if: "size(vars.blocks) > 0"
+        then:
+          - call: block-pool.free-blocks
+            input: {block_ids: "= vars.blocks.reverse()"}
+      - return: {freed: "= size(vars.blocks)"}
+
+  - component: full-attention-manager
+    name: get-block-ids
+    kind: function
+    latency_ms: 0
+    summary: "A request's block table (block ids in order)."
+    sources: ["vllm/v1/core/kv_cache_manager.py:723-729"]
+    request: {type: object, required: [request_id], properties: {request_id: {type: string}}}
+    response: {type: object, properties: {block_ids: {type: array, items: {type: integer}}}}
+    behavior:
+      - return: {block_ids: "= input.request_id in state.req_to_blocks ? state.req_to_blocks[input.request_id] : []"}
+
+  # ============================================================ KV cache manager
+  - component: kv-cache-manager
+    name: get-computed-blocks
+    kind: function
+    latency_ms: 0
+    summary: "Prefix-cache hit for a new request; capped at num_tokens - 1 so the last token is recomputed for logits."
+    sources: ["vllm/v1/core/kv_cache_manager.py:264-321"]
+    request:
+      type: object
+      required: [request_id, block_hashes, num_tokens]
+      properties:
+        request_id: {type: string}
+        block_hashes: {type: array, items: {type: string}}
+        num_tokens: {type: integer}
+        skip_reading_prefix_cache: {type: boolean, default: false}
+    response: {type: object, properties: {blocks: {type: array, items: SchedKvBlock}, num_computed_tokens: {type: integer}, mamba_block: {}}}
+    behavior:
+      - if: "!config['enable-prefix-caching'] || (has(input.skip_reading_prefix_cache) && input.skip_reading_prefix_cache)"
+        then:
+          - title: Prefix caching off (or skipped for this request)
+            detail: "No lookup: zero computed tokens."
+            source: "vllm/v1/core/kv_cache_manager.py:286-287"
+            return: {blocks: [], num_computed_tokens: 0, mamba_block: null}
+      - if: "size(state.kv_cache_groups) > 1"
+        then:
+          - title: Hybrid model - the hybrid coordinator reconciles the groups' hits
+            source: "vllm/v1/core/kv_cache_coordinator.py:796-935"
+            call: hybrid-kv-cache-coordinator.find-longest-cache-hit
+            input: {block_hashes: "= input.block_hashes", max_length: "= input.num_tokens - 1"}
+            as: hh
+          - return: {blocks: "= vars.hh.value.blocks", num_computed_tokens: "= vars.hh.value.hit_length", mamba_block: "= vars.hh.value.mamba_block"}
+      - title: Find the longest cache hit, at most num_tokens - 1
+        detail: "When every token hits, the last one must be recomputed to get logits; with block-aligned hits that recomputes the whole last block."
+        source: "vllm/v1/core/kv_cache_manager.py:289-300"
+        call: full-attention-manager.find-longest-cache-hit
+        input: {block_hashes: "= input.block_hashes", max_length: "= input.num_tokens - 1"}
+        as: hit
+      - return: {blocks: "= vars.hit.value.blocks", num_computed_tokens: "= vars.hit.value.hit_length", mamba_block: null}
+
+  - component: kv-cache-manager
+    name: allocate-slots
+    kind: function
+    latency_ms: 0
+    summary: "Allocate KV slots for a request's new tokens, adopting local prefix-hit blocks and allocating blocks for external (KV-connector) computed tokens; null (allocated false) when the pool can't fit them."
+    sources: ["vllm/v1/core/kv_cache_manager.py:371-618"]
+    errors: [{code: value-error, status: 0, retryable: false}]
+    request:
+      type: object
+      required: [request_id, num_new_tokens]
+      properties:
+        request_id: {type: string}
+        status: {type: string, examples: [WAITING]}
+        num_computed_tokens: {type: integer, default: 0}
+        num_tokens: {type: integer}
+        num_new_tokens: {type: integer}
+        num_new_computed_tokens: {type: integer, default: 0}
+        new_computed_blocks: {type: array, default: [], items: SchedKvBlock}
+        mamba_hit_block: {type: [object, "null"], default: null, description: "Hybrid models: the Mamba checkpoint block of the prefix hit."}
+        num_external_computed_tokens: {type: integer, default: 0}
+        num_lookahead_tokens: {type: integer, default: 0}
+        delay_cache_blocks: {type: boolean, default: false}
+        block_hashes: {type: array, default: [], items: {type: string}}
+        full_sequence_must_fit: {type: boolean, default: false}
+        has_scheduled_reqs: {type: boolean, default: true}
+    response:
+      type: object
+      properties:
+        allocated: {type: boolean}
+        new_block_ids: {type: array, items: {type: integer}}
+        block_ids: {type: array, items: {type: integer}}
+    behavior:
+      - set:
+          vars.new_comp: "= has(input.num_new_computed_tokens) ? input.num_new_computed_tokens : 0"
+          vars.ext: "= has(input.num_external_computed_tokens) ? input.num_external_computed_tokens : 0"
+          vars.hits: "= has(input.new_computed_blocks) ? input.new_computed_blocks : []"
+          vars.mamba_hit: "= has(input.mamba_hit_block) ? input.mamba_hit_block : dyn(null)"
+          vars.lookahead: "= has(input.num_lookahead_tokens) ? input.num_lookahead_tokens : 0"
+          vars.computed: "= has(input.num_computed_tokens) ? input.num_computed_tokens : 0"
+          vars.hashes: "= has(input.block_hashes) ? input.block_hashes : []"
+          vars.hybrid: "= size(state.kv_cache_groups) > 1"
+      - if: "input.num_new_tokens == 0 && vars.ext == 0 && vars.new_comp == 0"
+        then:
+          - title: Nothing to allocate or adopt
+            source: "vllm/v1/core/kv_cache_manager.py:474-482"
+            fail: {code: value-error, status: 0, message: "num_new_tokens must be greater than 0 when there are no computed tokens to adopt"}
+      - set:
+          vars.local: "= vars.computed + vars.new_comp"
+      - title: Computed tokens are local (cached) plus external (connector)
+        source: "vllm/v1/core/kv_cache_manager.py:499-507"
+        set:
+          vars.total: "= math.least(vars.local + vars.ext, int(config['max-model-len']))"
+      - call: block-pool.get-num-free-blocks
+        as: free
+      - title: Watermark for waiting and preempted admissions
+        detail: "Applied only when some request is already scheduled; 0 with the default watermark 0.0."
+        source: "vllm/v1/core/kv_cache_manager.py:509-516"
+        set:
+          vars.watermark_blocks: "= (has(input.has_scheduled_reqs) ? input.has_scheduled_reqs : true) && has(input.status) && input.status in ['WAITING', 'PREEMPTED'] ? int(double(config['watermark']) * double(vars.free.value.num_gpu_blocks)) : 0"
+      - set:
+          vars.mamba_need: 0
+      - if: "vars.hybrid"
+        then:
+          - title: The Mamba group needs a state block for a new request
+            source: "vllm/v1/core/single_type_kv_cache_manager.py:1676-1700"
+            call: mamba-manager.get-num-blocks-to-allocate
+            input: {request_id: "= input.request_id"}
+            as: mneed
+          - set: {vars.mamba_need: "= vars.mneed.value.num_blocks"}
+      - if: "has(input.full_sequence_must_fit) && input.full_sequence_must_fit"
+        then:
+          - call: full-attention-manager.get-num-blocks-to-allocate
+            input: {request_id: "= input.request_id", num_tokens: "= math.least(input.num_tokens, int(config['max-model-len']))", new_computed_blocks: "= vars.hits"}
+            as: full
+          - if: "vars.full.value.num_blocks + vars.mamba_need + vars.watermark_blocks > vars.free.value.num_free_blocks"
+            then:
+              - title: The whole prompt would not fit; refuse admission
+                detail: "scheduler_reserve_full_isl checks the full input sequence, not just the first chunk, to avoid over-admission and KV thrashing."
+                source: "vllm/v1/core/kv_cache_manager.py:522-540"
+                return: {allocated: false, new_block_ids: [], block_ids: []}
+      - set:
+          vars.need_slots: "= math.least(vars.total + input.num_new_tokens + vars.lookahead, int(config['max-model-len']))"
+      - call: full-attention-manager.get-num-blocks-to-allocate
+        input: {request_id: "= input.request_id", num_tokens: "= vars.need_slots", new_computed_blocks: "= vars.hits"}
+        as: needed
+      - if: "vars.needed.value.num_blocks + vars.mamba_need + vars.watermark_blocks > vars.free.value.num_free_blocks"
+        then:
+          - title: Not enough free blocks
+            detail: "The caller preempts (running) or stops admitting (waiting)."
+            source: "vllm/v1/core/kv_cache_manager.py:573-579"
+            return: {allocated: false, new_block_ids: [], block_ids: []}
+      - if: "size(vars.hits) > 0"
+        then:
+          - title: Adopt the prefix-hit blocks (touched first)
+            source: "vllm/v1/core/kv_cache_coordinator.py:296-302"
+            call: full-attention-manager.add-local-computed-blocks
+            input: {request_id: "= input.request_id", new_computed_blocks: "= vars.hits"}
+      - if: "vars.ext > 0"
+        then:
+          - title: Then allocate blocks for the external computed tokens
+            detail: "Two-phase: every group's local hits are touched before any external block is taken, so the allocation can't evict a hit."
+            source: "vllm/v1/core/kv_cache_coordinator.py:303-309"
+            call: full-attention-manager.allocate-external-computed-blocks
+            input: {request_id: "= input.request_id", num_local_computed_tokens: "= vars.local", num_external_computed_tokens: "= vars.ext"}
+      - call: full-attention-manager.allocate-new-blocks
+        input: {request_id: "= input.request_id", num_tokens: "= vars.need_slots"}
+        as: alloc
+      - if: "vars.hybrid"
+        then:
+          - call: mamba-manager.allocate-state
+            input: {request_id: "= input.request_id", hit_block: "= vars.mamba_hit", num_hit_tokens: "= vars.local"}
+      - if: "has(input.delay_cache_blocks) && input.delay_cache_blocks"
+        then:
+          - title: P/D - the blocks are cached once the async load finishes
+            source: "vllm/v1/core/kv_cache_manager.py:602-605"
+            call: full-attention-manager.get-block-ids
+            input: {request_id: "= input.request_id"}
+            as: dtable
+          - return: {allocated: true, new_block_ids: "= vars.alloc.value.new_block_ids", block_ids: "= vars.dtable.value.block_ids"}
+      - title: Cache the blocks that this step makes full
+        detail: "Only finalized tokens: capped at request.num_tokens, so unverified draft tokens are never cached."
+        source: "vllm/v1/core/kv_cache_manager.py:607-616"
+        call: kv-cache-manager.cache-blocks
+        input:
+          request_id: "= input.request_id"
+          num_tokens: "= math.least(vars.total + input.num_new_tokens, has(input.num_tokens) ? input.num_tokens : vars.total + input.num_new_tokens)"
+          block_hashes: "= vars.hashes"
+      - call: full-attention-manager.get-block-ids
+        input: {request_id: "= input.request_id"}
+        as: table
+      - return: {allocated: true, new_block_ids: "= vars.alloc.value.new_block_ids", block_ids: "= vars.table.value.block_ids"}
+
+  - component: kv-cache-manager
+    name: cache-blocks
+    kind: function
+    latency_ms: 0
+    summary: "Cache a request's full blocks, if prefix caching is enabled (a no-op otherwise)."
+    sources: ["vllm/v1/core/kv_cache_manager.py:782-792"]
+    request: {type: object, required: [request_id, num_tokens], properties: {request_id: {type: string}, num_tokens: {type: integer}, block_hashes: {type: array, default: [], items: {type: string}}}}
+    response: {type: object, properties: {cached: {type: boolean}}}
+    behavior:
+      - if: "!config['enable-prefix-caching'] || !has(input.block_hashes) || size(input.block_hashes) == 0"
+        then:
+          - title: Caching disabled (or nothing hashed); no-op
+            source: "vllm/v1/core/kv_cache_manager.py:791-792"
+            return: {cached: false}
+      - call: full-attention-manager.cache-blocks
+        input: {request_id: "= input.request_id", num_tokens: "= input.num_tokens", block_hashes: "= input.block_hashes"}
+      - if: "size(state.kv_cache_groups) > 1"
+        then:
+          - title: Hybrid - the Mamba group checkpoints its state at the newest full block
+            source: "vllm/v1/core/kv_cache_coordinator.py:369-377"
+            call: mamba-manager.cache-blocks
+            input: {request_id: "= input.request_id", num_tokens: "= input.num_tokens", block_hashes: "= input.block_hashes"}
+      - return: {cached: true}
+
+  - component: kv-cache-manager
+    name: free
+    kind: function
+    latency_ms: 0
+    summary: "Free all KV blocks of a request (coordinator -> FullAttentionManager.free)."
+    sources: ["vllm/v1/core/kv_cache_manager.py:620-629"]
+    request: {type: object, required: [request_id], properties: {request_id: {type: string}}}
+    response: {type: object, properties: {freed: {type: integer}}}
+    behavior:
+      - call: full-attention-manager.free
+        input: {request_id: "= input.request_id"}
+        as: f
+      - if: "size(state.kv_cache_groups) > 1"
+        then:
+          - title: Hybrid - free the Mamba group's blocks too
+            source: "vllm/v1/core/kv_cache_coordinator.py:400-408"
+            call: mamba-manager.free
+            input: {request_id: "= input.request_id"}
+      - return: {freed: "= vars.f.value.freed"}
+
+  - component: kv-cache-manager
+    name: get-block-ids
+    kind: function
+    latency_ms: 0
+    summary: "Read a request's block table (the block ids the worker's block table holds)."
+    sources: ["vllm/v1/core/kv_cache_manager.py:727-729", "vllm/v1/core/kv_cache_manager.py:34-107"]
+    request: {type: object, required: [request_id], properties: {request_id: {type: string}}}
+    response: {type: object, properties: {block_ids: {type: array, items: {type: integer}}}}
+    behavior:
+      - call: full-attention-manager.get-block-ids
+        input: {request_id: "= input.request_id"}
+        as: t
+      - return: {block_ids: "= vars.t.value.block_ids"}
+
+  - component: kv-cache-manager
+    name: usage
+    kind: function
+    latency_ms: 0
+    summary: "KV cache usage fraction, from the block pool."
+    sources: ["vllm/v1/core/kv_cache_manager.py:226-234"]
+    request: {type: object}
+    response: {type: object, properties: {usage: {type: number}}}
+    behavior:
+      - call: block-pool.get-usage
+        as: u
+      - return: {usage: "= vars.u.value.usage"}
+
+  - component: kv-cache-manager
+    name: record-prefix-cache-stats
+    kind: function
+    latency_ms: 0
+    summary: "Count one admitted request's prefix-cache queries (its tokens) and hits; preempted re-admissions count separately."
+    sources: ["vllm/v1/core/kv_cache_manager.py:253-262", "vllm/v1/metrics/stats.py:138-155"]
+    request: {type: object, required: [num_tokens, num_hits], properties: {num_tokens: {type: integer}, num_hits: {type: integer}, preempted: {type: boolean}}}
+    response: {type: object}
+    behavior:
+      - if: "!config['enable-prefix-caching']"
+        then: [{return: {recorded: false}}]
+      - if: "has(input.preempted) && input.preempted"
+        then:
+          - set:
+              state.prefix_cache_stats: "= merge(state.prefix_cache_stats, {'preempted_requests': state.prefix_cache_stats.preempted_requests + 1, 'preempted_queries': state.prefix_cache_stats.preempted_queries + input.num_tokens, 'preempted_hits': state.prefix_cache_stats.preempted_hits + input.num_hits})"
+          - return: {recorded: true}
+      - set:
+          state.prefix_cache_stats: "= merge(state.prefix_cache_stats, {'requests': state.prefix_cache_stats.requests + 1, 'queries': state.prefix_cache_stats.queries + input.num_tokens, 'hits': state.prefix_cache_stats.hits + input.num_hits})"
+      - return: {recorded: true}
+
+  - component: kv-cache-manager
+    name: make-prefix-cache-stats
+    kind: function
+    latency_ms: 0
+    summary: "Take (and reset) the prefix-cache stats accumulated since the last call."
+    sources: ["vllm/v1/core/kv_cache_manager.py:236-247"]
+    request: {type: object}
+    response: {type: object}
+    behavior:
+      - set:
+          vars.stats: "= state.prefix_cache_stats"
+          state.prefix_cache_stats: {requests: 0, queries: 0, hits: 0, preempted_requests: 0, preempted_queries: 0, preempted_hits: 0, reset: false}
+      - return: "= vars.stats"
+
+  - component: kv-cache-manager
+    name: reset-prefix-cache
+    kind: function
+    latency_ms: 0
+    summary: "Invalidate the prefix cache (e.g. after a weight update); refused while any block is in use."
+    sources: ["vllm/v1/core/kv_cache_manager.py:674-689"]
+    request: {type: object}
+    response: {type: object, properties: {reset: {type: boolean}}}
+    behavior:
+      - call: block-pool.reset-prefix-cache
+        as: r
+      - if: "vars.r.value.reset"
+        then:
+          - set: {state.prefix_cache_stats: "= merge(state.prefix_cache_stats, {'reset': true})"}
+      - return: {reset: "= vars.r.value.reset"}
+
+  # ============================================================ kv cache utils
+  - component: kv-cache-utils
+    name: request-block-hasher
+    kind: function
+    latency_ms: 0
+    summary: "Hashes of a request's new full blocks, each chained over the whole prefix before it."
+    description: >-
+      Stand-in for sha256 over (parent hash, block tokens, extra keys): the hash of the block
+      ending at token E is the content keys of the prompt up to min(E, P) plus the output
+      tokens past the prompt. Equal hashes mean equal prefixes, as with the real chained hash.
+    sources: ["vllm/v1/core/kv_cache_utils.py:954-998", "vllm/v1/core/kv_cache_utils.py:695-725"]
+    request:
+      type: object
+      required: [prompt_segments]
+      properties:
+        prompt_segments: {type: array, items: {type: object, properties: {key: {type: string}, num_tokens: {type: integer}}}}
+        output_token_ids: {type: array, items: {type: integer}}
+        num_existing_hashes: {type: integer, default: 0}
+        lora_request: {type: [object, "null"], default: null, properties: {lora_name: {type: string}, lora_int_id: {type: integer}, lora_path: {type: string}}}
+        cache_salt: {type: [string, "null"], default: null}
+    response: {type: object, properties: {new_block_hashes: {type: array, items: {type: string}}}}
+    behavior:
+      - title: Extra keys of the block hash - LoRA name and path, then the cache salt
+        detail: "generate_block_hash_extra_keys adds ('lora', name, path) to every block and ('cache_salt', salt) to the first block only; because each hash chains its parent, the salt still separates every later block. The stand-in carries both as a prefix of every hash."
+        source: "vllm/v1/core/kv_cache_utils.py:622-657"
+        set:
+          vars.lora_key: "= has(input.lora_request) && input.lora_request != null ? 'lora(' + input.lora_request.lora_name + ',' + (has(input.lora_request.lora_path) ? input.lora_request.lora_path : '') + ')/' : ''"
+          vars.salt_key: "= has(input.cache_salt) && input.cache_salt != null && input.cache_salt != '' ? 'salt(' + input.cache_salt + ')/' : ''"
+      - if: "vars.lora_key != ''"
+        then:
+          - title: A LoRA request hashes its adapter name and path into every block
+            source: "vllm/v1/core/kv_cache_utils.py:578-595"
+            set: {vars.extra: "= vars.lora_key + vars.salt_key"}
+        else:
+          - set: {vars.extra: "= vars.salt_key"}
+      - set:
+          vars.segs: "= input.prompt_segments"
+          vars.out: "= has(input.output_token_ids) ? input.output_token_ids : []"
+          vars.start: "= has(input.num_existing_hashes) ? input.num_existing_hashes : 0"
+          vars.bs: "= int(config['block-size'])"
+      - set:
+          vars.p: "= sum(vars.segs.map(s, s.num_tokens))"
+          vars.starts: "= lists.range(size(vars.segs)).map(j, sum(vars.segs.slice(0, j).map(s, s.num_tokens)))"
+      - set:
+          vars.n_full: "= (vars.p + size(vars.out)) / vars.bs"
+      - if: "vars.start >= vars.n_full"
+        then:
+          - title: No new full block
+            source: "vllm/v1/core/kv_cache_utils.py:958-960"
+            return: {new_block_hashes: []}
+      - title: Hash each new full block over its whole prefix
+        source: "vllm/v1/core/kv_cache_utils.py:976-995"
+        return:
+          new_block_hashes: "= lists.range(vars.n_full - vars.start).map(k, vars.extra + lists.range(size(vars.segs)).filter(j, vars.starts[j] < math.least((vars.start + k + 1) * vars.bs, vars.p)).map(j, vars.segs[j].key).join('|') + '@' + string(math.least((vars.start + k + 1) * vars.bs, vars.p)) + ((vars.start + k + 1) * vars.bs > vars.p ? '+' + vars.out.slice(0, (vars.start + k + 1) * vars.bs - vars.p).map(t, string(t)).join(',') : ''))"
+
+  - component: kv-cache-utils
+    name: get-kv-cache-configs
+    kind: function
+    latency_ms: 0
+    summary: "Size the KV cache pool: num_blocks = the smallest worker's available memory // bytes per block (page size x layers), unless num_gpu_blocks_override is set; the scheduler's block pool is built with it."
+    sources: ["vllm/v1/core/kv_cache_utils.py:2531-2680", "vllm/v1/core/kv_cache_utils.py:1588-1630", "vllm/v1/core/kv_cache_utils.py:2369-2400"]
+    errors: [{code: value-error, status: 0, retryable: false}]
+    request:
+      type: object
+      required: [available_memory]
+      properties:
+        available_memory: {type: array, items: {type: integer}, examples: [[59745650279]]}
+        bytes_per_block: {type: integer, default: 2097152, description: "page_size_bytes * num_layers of the KV cache spec; 2 MiB for Llama-3.1-8B (16 tokens x 2 x 8 KV heads x 128 x 2 bytes x 32 layers)."}
+    response: {type: object, properties: {num_blocks: {type: integer, examples: [28488]}}}
+    behavior:
+      - set:
+          vars.bpb: "= has(input.bytes_per_block) && input.bytes_per_block > 0 ? input.bytes_per_block : 2097152"
+      - title: Check each worker can hold one max_model_len request (the null block excluded)
+        detail: "_check_enough_kv_cache_memory runs before the pool is sized; no free memory, or less than cdiv(max_model_len, block_size) blocks, is a ValueError and startup fails."
+        source: "vllm/v1/core/kv_cache_utils.py:2638-2647"
+        foreach: "= input.available_memory"
+        as: avail
+        steps:
+          - if: "vars.avail - vars.bpb <= 0"
+            then:
+              - title: No memory left for the KV cache
+                source: "vllm/v1/core/kv_cache_utils.py:1009-1017"
+                fail: {code: value-error, status: 0, message: "No available memory for the cache blocks. Try increasing `gpu_memory_utilization` when initializing the engine."}
+          - set:
+              vars.needed: "= (int(config['max-model-len']) + int(config['block-size']) - 1) / int(config['block-size']) * vars.bpb"
+          - if: "vars.needed > vars.avail - vars.bpb"
+            then:
+              - title: One max_model_len request does not fit
+                source: "vllm/v1/core/kv_cache_utils.py:1019-1040"
+                fail: {code: value-error, status: 0, message: "= 'To serve at least one request with the model\\'s max seq len (' + string(int(config['max-model-len'])) + '), (' + string(vars.needed / 1073741824) + ' GiB KV cache is needed, which is larger than the available KV cache memory. Based on the available memory, the estimated maximum model length is ' + string((vars.avail - vars.bpb) / vars.bpb * int(config['block-size'])) + '. Try increasing `gpu_memory_utilization` or decreasing `max_model_len` when initializing the engine.'"}
+      - set:
+          vars.n: "= math.least(input.available_memory.map(m, m / vars.bpb))"
+      - if: "'num-gpu-blocks-override' in config && config['num-gpu-blocks-override'] != null"
+        then:
+          - title: num_gpu_blocks_override replaces the profiled count
+            source: "vllm/v1/core/kv_cache_utils.py:1230-1236"
+            set: {vars.n: "= int(config['num-gpu-blocks-override'])"}
+      - title: The scheduler builds its KVCacheManager and BlockPool with kv_cache_config.num_blocks
+        source: "vllm/v1/core/kv_cache_coordinator.py:119-125"
+        call: block-pool.init
+        input: {num_gpu_blocks: "= vars.n"}
+      - return: {num_blocks: "= vars.n"}
+
+  # ============================================================ hybrid KV cache
+  - component: hybrid-kv-cache-coordinator
+    name: find-longest-cache-hit
+    kind: function
+    latency_ms: 0
+    summary: "Fixed-point hit over the groups: full attention gives the longest contiguous hit; the Mamba group then cuts it back to its last checkpoint at or below it; attention blocks are trimmed to that length."
+    sources: ["vllm/v1/core/kv_cache_coordinator.py:796-935"]
+    request:
+      type: object
+      required: [block_hashes, max_length]
+      properties:
+        block_hashes: {type: array, items: {type: string}}
+        max_length: {type: integer}
+        hash_block_size: {type: [integer, "null"], default: null, description: "KVCacheConfig.hash_block_size when finer than the block size (Mamba partial hits); block_hashes are then per hash unit."}
+    response: {type: object, properties: {blocks: {type: array}, hit_length: {type: integer}, mamba_block: {}}}
+    behavior:
+      - set:
+          vars.bs: "= int(config['block-size'])"
+          vars.hbs: "= has(input.hash_block_size) && input.hash_block_size != null ? input.hash_block_size : int(config['block-size'])"
+      - set:
+          vars.scale: "= vars.hbs < vars.bs && vars.bs % vars.hbs == 0 ? vars.bs / vars.hbs : 1"
+      - title: Coarser groups read every scale-th fine hash (BlockHashListWithBlockSize)
+        source: "vllm/v1/core/kv_cache_utils.py:695-727"
+        set:
+          vars.block_hashes: "= vars.scale == 1 ? input.block_hashes : lists.range(size(input.block_hashes) / vars.scale).map(i, input.block_hashes[(i + 1) * vars.scale - 1])"
+      - title: Full attention first - the longest run of cached blocks
+        source: "vllm/v1/core/kv_cache_coordinator.py:836-874"
+        call: full-attention-manager.find-longest-cache-hit
+        input: {block_hashes: "= vars.block_hashes", max_length: "= input.max_length"}
+        as: attn
+      - title: The Mamba group accepts only a checkpointed boundary at or below that length (per hash unit when finer)
+        source: "vllm/v1/core/kv_cache_coordinator.py:851-880"
+        call: mamba-manager.find-longest-cache-hit
+        input: {block_hashes: "= input.block_hashes", max_length: "= vars.attn.value.hit_length", hash_block_size: "= vars.hbs"}
+        as: mamba
+      - title: Simple hybrid (one attention + one Mamba group) stops after one pass; keep the attention blocks covering the hit
+        source: "vllm/v1/core/kv_cache_coordinator.py:885-905"
+        return:
+          blocks: "= vars.attn.value.blocks.slice(0, (vars.mamba.value.hit_length + vars.bs - 1) / vars.bs)"
+          hit_length: "= vars.mamba.value.hit_length"
+          mamba_block: "= vars.mamba.value.block"
+
+  - component: mamba-manager
+    name: find-longest-cache-hit
+    kind: function
+    latency_ms: 0
+    summary: "Scan backwards for the last block whose Mamba state was checkpointed; a hit there covers the whole prefix (earlier states aren't needed)."
+    sources: ["vllm/v1/core/single_type_kv_cache_manager.py:1454-1531"]
+    request: {type: object, required: [block_hashes, max_length], properties: {block_hashes: {type: array, items: {type: string}}, max_length: {type: integer}, hash_block_size: {type: [integer, "null"], default: null}}}
+    response: {type: object, properties: {block: {}, hit_length: {type: integer}}}
+    behavior:
+      - set:
+          vars.hbs: "= has(input.hash_block_size) && input.hash_block_size != null ? input.hash_block_size : int(config['block-size'])"
+      - if: "vars.hbs < int(config['block-size']) && int(config['block-size']) % vars.hbs == 0"
+        then:
+          - title: Partial hits - scan hash units backwards; the last checkpointed unit wins, below the block grid if need be
+            source: "vllm/v1/core/single_type_kv_cache_manager.py:1478-1497"
+            set:
+              vars.n: "= math.least([size(input.block_hashes), input.max_length / vars.hbs, 1000])"
+              vars.found: null
+              vars.hit: 0
+          - foreach: "= lists.range(vars.n).map(i, vars.n - 1 - i)"
+            as: j
+            max: 1000
+            steps:
+              - call: block-pool.get-cached-block
+                input: {block_hash: "= input.block_hashes[vars.j] + '#mamba'"}
+                as: fine
+              - if: "vars.fine.value.block != null"
+                then:
+                  - set: {vars.found: "= vars.fine.value.block", vars.hit: "= (vars.j + 1) * vars.hbs"}
+                  - break: true
+          - return: {block: "= vars.found", hit_length: "= vars.hit"}
+      - set:
+          vars.n: "= math.least([size(input.block_hashes), input.max_length / int(config['block-size']), 1000])"
+          vars.found: null
+          vars.hit: 0
+      - title: Last match wins (early stop)
+        source: "vllm/v1/core/single_type_kv_cache_manager.py:1515-1529"
+        foreach: "= lists.range(vars.n).map(i, vars.n - 1 - i)"
+        as: i
+        max: 1000
+        steps:
+          - call: block-pool.get-cached-block
+            input: {block_hash: "= input.block_hashes[vars.i] + '#mamba'"}
+            as: got
+          - if: "vars.got.value.block != null"
+            then:
+              - set: {vars.found: "= vars.got.value.block", vars.hit: "= (vars.i + 1) * int(config['block-size'])"}
+              - break: true
+      - return: {block: "= vars.found", hit_length: "= vars.hit"}
+
+  - component: mamba-manager
+    name: get-num-blocks-to-allocate
+    kind: function
+    latency_ms: 0
+    summary: "A new request needs one state block (two when it starts from a checkpoint copy); a running one needs none."
+    sources: ["vllm/v1/core/single_type_kv_cache_manager.py:1676-1778"]
+    request: {type: object, required: [request_id], properties: {request_id: {type: string}}}
+    response: {type: object, properties: {num_blocks: {type: integer}}}
+    behavior:
+      - return: {num_blocks: "= input.request_id in state.req_to_blocks ? 0 : 1"}
+
+  - component: mamba-manager
+    name: allocate-state
+    kind: function
+    latency_ms: 0
+    summary: "Give a new request its state block; on a prefix hit the checkpoint is touched and its state copied into the new block."
+    sources: ["vllm/v1/core/single_type_kv_cache_manager.py:1780-1906"]
+    request: {type: object, required: [request_id], properties: {request_id: {type: string}, hit_block: {}, num_hit_tokens: {type: integer, default: 0}}}
+    response: {type: object, properties: {state_block: {type: integer}}}
+    behavior:
+      - if: "input.request_id in state.req_to_blocks"
+        then: [{return: {state_block: "= state.req_to_blocks[input.request_id][size(state.req_to_blocks[input.request_id]) - 1]"}}]
+      - set: {vars.held: []}
+      - if: "has(input.hit_block) && input.hit_block != null"
+        then:
+          - title: Adopt the checkpoint (touch it)
+            source: "vllm/v1/core/single_type_kv_cache_manager.py:267-317"
+            call: block-pool.touch
+            input: {block_ids: ["= input.hit_block.block_id"]}
+          - set: {vars.held: ["= input.hit_block.block_id"]}
+      - call: block-pool.get-new-blocks
+        input: {num_blocks: 1}
+        as: nb
+      - set:
+          state.req_to_blocks: "= merge(state.req_to_blocks, {input.request_id: vars.held + vars.nb.value.block_ids})"
+          state.num_cached_block: "= merge(state.num_cached_block, {input.request_id: size(vars.held) > 0 && has(input.num_hit_tokens) ? input.num_hit_tokens / int(config['block-size']) : 0})"
+      - return: {state_block: "= vars.nb.value.block_ids[0]"}
+
+  - component: mamba-manager
+    name: cache-blocks
+    kind: function
+    latency_ms: 0
+    summary: "Checkpoint the request's state at its newest full block: register the state block under that block's hash and continue in a fresh state block."
+    sources: ["vllm/v1/core/single_type_kv_cache_manager.py:1961-2006"]
+    request: {type: object, required: [request_id, num_tokens, block_hashes], properties: {request_id: {type: string}, num_tokens: {type: integer}, block_hashes: {type: array, items: {type: string}}}}
+    response: {type: object, properties: {checkpointed: {type: boolean}}}
+    behavior:
+      - set:
+          vars.full: "= math.least(input.num_tokens / int(config['block-size']), size(input.block_hashes))"
+          vars.done: "= input.request_id in state.num_cached_block ? state.num_cached_block[input.request_id] : 0"
+          vars.blocks: "= input.request_id in state.req_to_blocks ? state.req_to_blocks[input.request_id] : []"
+      - if: "vars.full <= vars.done || vars.full == 0 || size(vars.blocks) == 0"
+        then: [{return: {checkpointed: false}}]
+      - title: Register the current state block as the checkpoint of block full-1
+        source: "vllm/v1/core/single_type_kv_cache_manager.py:1961-1975"
+        call: block-pool.cache-full-blocks
+        input: {block_ids: ["= vars.blocks[size(vars.blocks) - 1]"], block_hashes: ["= input.block_hashes[vars.full - 1] + '#mamba'"]}
+      - call: block-pool.get-new-blocks
+        input: {num_blocks: 1}
+        as: nb
+      - set:
+          state.req_to_blocks: "= merge(state.req_to_blocks, {input.request_id: vars.blocks + vars.nb.value.block_ids})"
+          state.num_cached_block: "= merge(state.num_cached_block, {input.request_id: vars.full})"
+      - return: {checkpointed: true}
+
+  - component: mamba-manager
+    name: free
+    kind: function
+    latency_ms: 0
+    summary: "Free the request's state and checkpoint blocks, newest first (checkpoints stay cached and evictable)."
+    sources: ["vllm/v1/core/single_type_kv_cache_manager.py:1935-1952"]
+    request: {type: object, required: [request_id], properties: {request_id: {type: string}}}
+    response: {type: object, properties: {freed: {type: integer}}}
+    behavior:
+      - set: {vars.blocks: "= input.request_id in state.req_to_blocks ? state.req_to_blocks[input.request_id] : []"}
+      - set:
+          state.req_to_blocks: "= omit(state.req_to_blocks, input.request_id)"
+          state.num_cached_block: "= omit(state.num_cached_block, input.request_id)"
+      - if: "size(vars.blocks) > 0"
+        then:
+          - call: block-pool.free-blocks
+            input: {block_ids: "= vars.blocks.reverse()"}
+      - return: {freed: "= size(vars.blocks)"}

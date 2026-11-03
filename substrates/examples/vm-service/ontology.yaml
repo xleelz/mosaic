@@ -1,0 +1,109 @@
+# A tiny service built on both substrates, to show an import works. It provisions a VM:
+# it records the request in DynamoDB (put-if, so a retry can't double-provision), registers
+# a VM-like Nomad job, and a later status call reads the job's allocations and marks the
+# record ready (update-if on the record's state) once the allocation is healthy.
+# Imported ids: components and interfaces under "nomad/" and "ddb/", schemas under "nomad."
+# and "ddb.", state at state['nomad/nomad-server'] and state['ddb/dynamodb']; configs keep
+# their ids, and the local dynamodb-tables declares this service's table.
+schema_version: 1
+id: vm-service
+name: VM service (substrate import example)
+level: system
+imports:
+  - {ontology: ../../nomad/nomad.yaml, as: nomad}
+  - {ontology: ../../dynamodb/dynamodb.yaml, as: ddb}
+
+configs:
+  - id: dynamodb-tables
+    type: object
+    value: {vms: {gsis: {by-state: {pk: state, sk: created_at}}}}
+    default: {}
+    summary: "This service's DynamoDB tables (overrides the substrate's empty default)."
+  - id: nomad-boot-delay-ms
+    type: integer
+    value: 40000
+    default: 5000
+    summary: "A qemu VM boots in about 40 s (overrides the substrate's container-sized default)."
+
+components:
+  - {id: user, kind: client, summary: The API caller.}
+  - {id: vm-api, kind: service, summary: Provisions VMs as Nomad jobs and tracks them in DynamoDB.}
+
+interfaces:
+  - component: vm-api
+    name: provision
+    kind: http
+    attributes: {method: POST, path: /v1/vms}
+    request: {type: object, required: [vm_id], properties: {vm_id: {type: string, examples: [vm-1]}, memory_mb: {type: integer, default: 2048}}}
+    response: {type: object, properties: {vm_id: {type: string}, state: {type: string}}}
+    errors: [{code: already_exists, status: 409}]
+    behavior:
+      - call: ddb/dynamodb.put-if
+        input: {table: vms, pk: "= 'VM#' + input.vm_id", sk: "", item: {vm_id: "= input.vm_id", state: provisioning, created_at: "= now"}, cond: "row == null"}
+        on_error:
+          - fail: {code: already_exists, status: 409, message: "= 'vm exists: ' + input.vm_id"}
+      - call: nomad/nomad-server.job-register
+        input:
+          job:
+            id: "= input.vm_id"
+            type: service
+            groups: [{name: vm, count: 1, cpu: 2000, memory_mb: "= input.memory_mb", check: passing}]
+        as: reg
+      - return: {vm_id: "= input.vm_id", state: provisioning}
+
+  - component: vm-api
+    name: status
+    kind: http
+    attributes: {method: GET, path: "/v1/vms/:vm_id"}
+    request: {type: object, required: [vm_id], properties: {vm_id: {type: string, examples: [vm-1]}}}
+    response: {type: object, properties: {vm_id: {type: string}, state: {type: string}}}
+    behavior:
+      - call: nomad/nomad-server.allocations-by-job
+        input: {job_id: "= input.vm_id"}
+        as: allocs
+      - if: "vars.allocs.value.exists(a, a.desired_status == 'run' && a.status == 'healthy')"
+        then:
+          - call: ddb/dynamodb.update-if
+            input: {table: vms, pk: "= 'VM#' + input.vm_id", sk: "", item: {state: ready}, cond: "row != null && row.state == 'provisioning'"}
+            on_error: continue
+      - call: ddb/dynamodb.get
+        input: {table: vms, pk: "= 'VM#' + input.vm_id", sk: ""}
+        as: rec
+      - return: {vm_id: "= input.vm_id", state: "= vars.rec.value.item.state"}
+
+flows:
+  - {id: provision, tags: [writes], entry: {caller: user, interface: vm-api.provision}}
+  - {id: status, tags: [reads], entry: {caller: user, interface: vm-api.status}}
+
+fixtures:
+  - id: one-node
+    clock: {epoch: "2026-11-01T00:00:00Z"}
+    state:
+      nomad/nomad-server:
+        nodes:
+          node-1: {id: node-1, datacenter: dc1, node_class: "", cpu: 8000, memory_mb: 16384, status: ready, eligibility: eligible}
+
+scenarios:
+  - id: vm-ready-after-boot
+    name: The VM is provisioning through its boot and ready once its allocation is healthy
+    fixtures: [one-node]
+    steps:
+      - {flow: provision, as: p, await: false, input: {vm_id: vm-1}}
+      - {flow: status, as: booting, at_ms: 20000, input: {vm_id: vm-1}}
+      - {flow: status, as: ready, at_ms: 60000, input: {vm_id: vm-1}}
+    expect:
+      - "steps.p.result.ok && steps.booting.result.value.state == 'provisioning'"
+      - "steps.ready.result.value.state == 'ready'"
+      - "state['ddb/dynamodb'].items['vms|VM#vm-1|'].state == 'ready'"
+      - "state['nomad/nomad-server'].jobs['vm-1'].status == 'running'"
+
+  - id: provision-twice-refused
+    name: A second provision of the same VM is refused by the conditional put, and registers nothing
+    fixtures: [one-node]
+    steps:
+      - {flow: provision, as: first, input: {vm_id: vm-2}}
+      - {flow: provision, as: second, input: {vm_id: vm-2}}
+    expect:
+      - "steps.first.result.ok && !steps.second.result.ok && steps.second.result.error.code == 'already_exists'"
+      - "calls['nomad/nomad-server.job-register'] == 1"
+      - "state['nomad/nomad-server'].jobs['vm-2'].version == 0"

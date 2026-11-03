@@ -1,0 +1,70 @@
+schema_version: 1
+id: cassandra
+scenarios:
+  # Verified expectation (5.0.9): GossipTask runs every 1000 ms (Gossiper.java:142, 2028): bump the local heartbeat
+  # (:348), build digests for every known endpoint (:353), SYN to one random live member (:362, sendGossip
+  # :984-1003), maybe SYN to an unreachable member with probability unreachable/(live+1) (:1015-1030), maybe SYN to
+  # a seed when the live target was not a seed or live < seeds (:384-385), never when this node is the only seed
+  # (:1038-1041); then doStatusCheck (:389) runs the failure detector over every endpoint. SYN -> ACK (digests the
+  # receiver wants + states it has newer, GossipDigestSynVerbHandler.java:42-120) -> ACK2 (states requested,
+  # GossipDigestAckVerbHandler.java:41-110) -> applyStateLocally (GossipDigestAck2VerbHandler.java:34-55).
+  - id: bench-g1-round-default
+    flow: membership-gossip-round
+    name: Default 3-node cluster, this node the only seed - one SYN to a live member, no seed gossip, status check
+    expect:
+      - "result.ok && result.value.gossiped && state.gossiper.endpoint_state_map['10.0.0.1'].heartbeat == 401"
+      - "calls['gossiper.make-gossip-digest'] == 1 && ctx.syn_sent_to == ['10.0.0.2']"
+      - "calls['gossip-digest-syn-verb-handler.do-verb'] == 1 && !has(ctx.gossiped_to_seed)"
+      - "calls['gossiper.do-status-check'] == 1 && calls['failure-detector.interpret'] == 2 && !has(ctx.convicted)"
+  - id: bench-g1-round-unreachable-and-seed
+    flow: membership-gossip-round
+    name: 10.0.0.3 unreachable, seeds [10.0.0.1, 10.0.0.3]; random draws hit - SYN to the live member, the unreachable one and a seed
+    choices:
+      gossiper.maybe-gossip-to-unreachable-member.roll: send
+      gossiper.maybe-gossip-to-seed.roll: send
+    state:
+      gossiper:
+        seeds: ["10.0.0.1", "10.0.0.3"]
+        endpoint_state_map: {"10.0.0.3": {alive: false, down_since_ms: -5000}}
+        live_endpoints: ["10.0.0.2"]
+        unreachable_endpoints: ["10.0.0.3"]
+      failure-detector:
+        arrival_samples: {"10.0.0.3": {mean_ms: 1000, t_last_ms: -5000}}
+    expect:
+      - "ctx.syn_sent_to == ['10.0.0.2', '10.0.0.3', '10.0.0.3'] && ctx.gossiped_to_seed == '10.0.0.3'"
+      - "calls['gossip-digest-syn-verb-handler.do-verb'] == 3"
+  - id: bench-g1-round-draws-miss
+    flow: membership-gossip-round
+    name: Same cluster, both random draws miss (p = 0.5 and 2/2 -> the seed draw is certain, so only the unreachable is skipped)
+    choices:
+      gossiper.maybe-gossip-to-unreachable-member.roll: skip
+    state:
+      gossiper:
+        seeds: ["10.0.0.1", "10.0.0.3"]
+        endpoint_state_map: {"10.0.0.3": {alive: false, down_since_ms: -5000}}
+        live_endpoints: ["10.0.0.2"]
+        unreachable_endpoints: ["10.0.0.3"]
+    expect:
+      - "ctx.syn_sent_to == ['10.0.0.2', '10.0.0.3'] && ctx.gossiped_to_seed == '10.0.0.3'"
+  - id: bench-g1-syn-to-ack
+    flow: membership-gossip-syn
+    name: SYN from 10.0.0.2 - peer is behind on 10.0.0.1 and ahead on 10.0.0.3 - ACK requests 10.0.0.3 and carries 10.0.0.1's state
+    input:
+      digests:
+        - {endpoint: 10.0.0.1, generation: 1761800000, max_version: 300}
+        - {endpoint: 10.0.0.2, generation: 1761800000, max_version: 360}
+        - {endpoint: 10.0.0.3, generation: 1761800000, max_version: 400}
+    expect:
+      - "ctx.ack_digests == ['10.0.0.3'] && ctx.ack_states == 1"
+      - "calls['gossip-digest-ack-verb-handler.do-verb'] == 1"
+  - id: bench-g1-ack-to-ack2
+    flow: membership-gossip-ack
+    name: ACK from 10.0.0.2 with a newer state for 10.0.0.3 and a request for 10.0.0.1 - apply it, answer with ACK2
+    input:
+      digests:
+        - {endpoint: 10.0.0.1, generation: 1761800000, max_version: 300}
+      states:
+        - {endpoint: 10.0.0.3, generation: 1761800000, heartbeat: 390, max_version: 400, status: NORMAL, tokens: [6148914691236517205]}
+    expect:
+      - "state.gossiper.endpoint_state_map['10.0.0.3'].max_version == 400 && state.gossiper.endpoint_state_map['10.0.0.3'].heartbeat == 390"
+      - "ctx.ack_outcome == 'ack2' && ctx.ack2_states == 1 && calls['gossip-digest-ack2-verb-handler.do-verb'] == 1"

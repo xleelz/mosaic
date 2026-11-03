@@ -1,0 +1,1281 @@
+# TCP and TLS substrate (DESIGN §14.6, §16.5). Import it instead of modeling sockets again:
+#   imports: [{ontology: <path to this file>, as: tcp}]
+# There is no code snapshot: every behavior cites the RFCs, the Linux man pages (man7.org) or the
+# TLS libraries' sources by URL. The socket API is Linux's: errors are errno names (ECONNREFUSED,
+# ETIMEDOUT, ECONNRESET, EPIPE, EAGAIN, ...), so a caller written against Go's net, Java's NIO or
+# libc maps them one to one.
+# Scope: listen, connect and accept with the three-way handshake (one RTT), SYN retransmission
+# with exponential backoff (connect timeout, backlog overflow), connection refused, data transfer
+# with a send buffer and the peer's receive window (partial writes, EAGAIN, blocking writes that
+# wait for a window update), half-close, close with FIN or RST (unread data, SO_LINGER 0, a write
+# to a closed peer), read timeouts (SO_RCVTIMEO), a server idle timeout, keepalive and the
+# retransmission timeout against a crashed peer, and the TLS 1.2/1.3 handshake with certificate
+# validation (expired, unknown CA, hostname mismatch) and close_notify.
+# Not modeled: TIME_WAIT, Nagle and delayed ACKs, congestion control (cwnd, slow start), packet
+# loss and retransmission of data (except against a crashed host), MSS segmentation, urgent data,
+# TLS record overhead, session resumption, 0-RTT and client certificates.
+schema_version: 1
+id: tcp-tls
+name: TCP and TLS (substrate)
+level: runtime
+description: >-
+  The kernel TCP stack of a set of hosts, seen through the socket API (listen, connect, accept,
+  send, recv, shutdown, close), and a TLS library on top of it (handshake with certificate
+  validation, read, write, close_notify). Time is the network's: a handshake costs one RTT, data
+  arrives half an RTT plus its serialization time after it is sent, a window update half an RTT
+  after the reader frees buffer space. A blocking call waits in virtual time for the event that
+  wakes it (data, a FIN, an RST, a window update, a connection to accept) or its timeout.
+source: {url: "https://www.rfc-editor.org/rfc/rfc9293"}
+
+configs:
+  - id: tcp-rtt-ms
+    type: integer
+    value: 10
+    default: 10
+    summary: >-
+      Round-trip time between any two hosts. The SYN and the SYN-ACK take one RTT, so connect
+      returns one RTT after it starts; a segment arrives RTT/2 after it is sent. Not a kernel
+      setting; a property of the network.
+    sources: ["https://www.rfc-editor.org/rfc/rfc9293#section-3.5", "https://www.rfc-editor.org/rfc/rfc6298"]
+  - id: tcp-bandwidth-bytes-per-ms
+    type: integer
+    value: 125000
+    default: 125000
+    summary: "Link bandwidth for serialization delay: bytes per ms (125000 is 1 Gbit/s). A segment of k bytes arrives RTT/2 + k / bandwidth after it is sent."
+    sources: ["https://www.rfc-editor.org/rfc/rfc9293#section-3.8.6"]
+  - id: tcp-rcvbuf-bytes
+    type: integer
+    value: 131072
+    default: 131072
+    summary: >-
+      Default receive buffer (net.ipv4.tcp_rmem's default, 131072): the receive window a socket
+      advertises. Bytes in flight to a socket plus the bytes it has not read yet never exceed it.
+      A socket may set its own (SO_RCVBUF) with rcvbuf on connect or listen.
+    sources: ["https://man7.org/linux/man-pages/man7/tcp.7.html", "https://man7.org/linux/man-pages/man7/socket.7.html", "https://www.rfc-editor.org/rfc/rfc9293#section-3.8.6.2"]
+  - id: tcp-sndbuf-bytes
+    type: integer
+    value: 16384
+    default: 16384
+    summary: >-
+      Default send buffer (net.ipv4.tcp_wmem's default, 16384): bytes a writer may queue that the
+      peer's window does not admit yet. When it is full a non-blocking send fails EAGAIN and a
+      blocking one waits. SO_SNDBUF with sndbuf on connect or listen.
+    sources: ["https://man7.org/linux/man-pages/man7/tcp.7.html", "https://man7.org/linux/man-pages/man7/socket.7.html"]
+  - id: tcp-syn-rto-ms
+    type: integer
+    value: 1000
+    default: 1000
+    summary: "Initial retransmission timeout for a SYN (RFC 6298 §2.1: 1 s). Each retransmission doubles it."
+    sources: ["https://www.rfc-editor.org/rfc/rfc6298#section-2"]
+  - id: tcp-syn-retries
+    type: integer
+    value: 6
+    default: 6
+    summary: >-
+      net.ipv4.tcp_syn_retries (default 6): SYN retransmissions before connect gives up with
+      ETIMEDOUT. With a 1 s initial RTO that is 1+2+4+8+16+32+64 = 127 s.
+    sources: ["https://man7.org/linux/man-pages/man7/tcp.7.html", "https://docs.kernel.org/networking/ip-sysctl.html"]
+  - id: tcp-somaxconn
+    type: integer
+    value: 4096
+    default: 4096
+    summary: "net.core.somaxconn (4096 since Linux 5.4): the cap on listen()'s backlog, the accept queue's length."
+    sources: ["https://man7.org/linux/man-pages/man2/listen.2.html"]
+  - id: tcp-retries2-timeout-ms
+    type: integer
+    value: 924600
+    default: 924600
+    summary: >-
+      How long unacknowledged data is retransmitted before the connection is dropped with
+      ETIMEDOUT: net.ipv4.tcp_retries2 = 15 gives about 924.6 s with the 200 ms minimum RTO.
+    sources: ["https://man7.org/linux/man-pages/man7/tcp.7.html", "https://docs.kernel.org/networking/ip-sysctl.html"]
+  - id: tcp-keepalive-time-ms
+    type: integer
+    value: 7200000
+    default: 7200000
+    summary: "net.ipv4.tcp_keepalive_time (2 h): idle time before the first keepalive probe, on sockets with SO_KEEPALIVE (keepalive on connect or accept)."
+    sources: ["https://man7.org/linux/man-pages/man7/tcp.7.html"]
+  - id: tcp-keepalive-intvl-ms
+    type: integer
+    value: 75000
+    default: 75000
+    summary: "net.ipv4.tcp_keepalive_intvl (75 s): the interval between unanswered probes."
+    sources: ["https://man7.org/linux/man-pages/man7/tcp.7.html"]
+  - id: tcp-keepalive-probes
+    type: integer
+    value: 9
+    default: 9
+    summary: "net.ipv4.tcp_keepalive_probes (9): unanswered probes before the connection fails ETIMEDOUT."
+    sources: ["https://man7.org/linux/man-pages/man7/tcp.7.html"]
+  - id: tcp-tls-version
+    type: string
+    value: "1.3"
+    default: "1.3"
+    summary: "TLS version a handshake negotiates when it doesn't say: 1.3 (one RTT before application data) or 1.2 (two)."
+    sources: ["https://www.rfc-editor.org/rfc/rfc8446#section-2", "https://www.rfc-editor.org/rfc/rfc5246#section-7.3"]
+  - id: tcp-tls-crypto-ms
+    type: integer
+    value: 1
+    default: 1
+    summary: "CPU time of a handshake's key exchange and signature verification, added once per handshake."
+    sources: ["https://www.rfc-editor.org/rfc/rfc8446#section-4"]
+  - id: tcp-tls-trusted-cas
+    type: array
+    value: ["Example Root CA"]
+    default: []
+    summary: "The client's trust store: names of trusted root CAs. A certificate whose issuer isn't here fails unknown_ca."
+    sources: ["https://www.rfc-editor.org/rfc/rfc5280#section-6.1"]
+
+components:
+  - id: tcp-tls
+    name: TCP and TLS
+    kind: library
+    layer: platform
+    summary: "Sockets: the hosts' kernel TCP stacks, and the TLS library applications run over them."
+    attributes: {technology: tcp}
+    sources: ["https://www.rfc-editor.org/rfc/rfc9293", "https://www.rfc-editor.org/rfc/rfc8446"]
+  - id: tcp-stack
+    name: Kernel TCP stack
+    kind: service
+    parent: tcp-tls
+    layer: platform
+    summary: >-
+      Every host's TCP stack in one place: listeners with their accept queues, and sockets (each
+      connection is two, one per end, each naming its peer). The socket API's calls are this
+      component's interfaces; a host's network status (up, blackhole, unreachable) is state.
+    sources: ["https://man7.org/linux/man-pages/man7/tcp.7.html", "https://man7.org/linux/man-pages/man7/socket.7.html"]
+    state:
+      schema:
+        type: object
+        properties:
+          listeners: {type: object, description: "addr (host:port) -> {addr, backlog, queue: [server sock ids not accepted yet], cert, idle_timeout_ms, rcvbuf, sndbuf, waiting}"}
+          socks: {type: object, description: "sock id -> one end of a connection: {id, role, host, local, remote, peer, tcp_state, rx: [{bytes, data, at}], snd_bytes, snd_data, fin_pending, fin_at, rst_at, pending_err, rd_shut, wr_shut, closed, vanished, ...}"}
+          hosts: {type: object, description: "host -> {status: up|blackhole|unreachable}; a host not listed is up"}
+      initial: {listeners: {}, socks: {}, hosts: {}}
+  - id: tls
+    name: TLS library
+    kind: library
+    parent: tcp-tls
+    layer: platform
+    summary: >-
+      A TLS client and server library (the shape of Go's crypto/tls or OpenSSL) over the TCP
+      sockets: the handshake with X.509 validation, application data, alerts and close_notify.
+    sources: ["https://www.rfc-editor.org/rfc/rfc8446", "https://pkg.go.dev/crypto/tls"]
+    state:
+      schema:
+        type: object
+        properties:
+          sessions: {type: object, description: "sock id -> {state: established|failed|closed, version, alert, alert_code, alert_sent, close_notify_sent, close_notify_received}"}
+          waiting: {type: object, description: "server sock id -> true while accept-handshake waits for the client"}
+      initial: {sessions: {}, waiting: {}}
+
+schemas:
+  - id: Certificate
+    summary: "An X.509 server certificate, flattened to what validation reads: subject, SANs, issuer and the validity period (RFC 3339)."
+    schema:
+      type: object
+      required: [subject, issuer, not_before, not_after]
+      properties:
+        subject: {type: string, examples: [api.example.test]}
+        sans: {type: array, items: {type: string}, description: "DNS subjectAltNames; \"*.example.test\" matches one label", examples: [[api.example.test]]}
+        issuer: {type: string, examples: ["Example Root CA"]}
+        not_before: {type: string, examples: ["2026-01-01T00:00:00Z"]}
+        not_after: {type: string, examples: ["2027-01-01T00:00:00Z"]}
+  - id: Sock
+    summary: "One end of a TCP connection, as the kernel holds it (what ss -t would show, and more)."
+    schema:
+      type: object
+      properties:
+        id: {type: string}
+        role: {type: string, enum: [client, server]}
+        host: {type: string}
+        local: {type: string}
+        remote: {type: string}
+        peer: {type: string, description: "The sock id of the other end"}
+        tcp_state: {type: string, enum: [ESTABLISHED, FIN_WAIT_1, CLOSED]}
+        rx: {type: array, description: "Segments in flight to or waiting in the receive buffer: {bytes, data, at}"}
+        snd_bytes: {type: integer, description: "Bytes in the send buffer that the peer's window doesn't admit yet"}
+        fin_at: {type: [integer, "null"], description: "When the peer's FIN arrives (or arrived)"}
+        rst_at: {type: [integer, "null"], description: "When an RST arrives (or arrived)"}
+        pending_err: {type: string, description: "The socket error (SO_ERROR) the next call reports, then clears"}
+        closed: {type: boolean}
+        vanished: {type: boolean, description: "Its host crashed: it answers nothing"}
+  - id: RecvResult
+    schema:
+      type: object
+      properties:
+        bytes: {type: integer}
+        data: {type: string}
+        eof: {type: boolean, description: "true: the peer's FIN (or a SHUT_RD) was reached; read returned 0"}
+
+interfaces:
+  # ---- Listening ---------------------------------------------------------------------------
+  - component: tcp-stack
+    name: listen
+    kind: function
+    summary: >-
+      socket + bind + listen on host:port. The backlog is capped at somaxconn. A listener may
+      carry a TLS certificate (the server's) and an idle timeout its server applies to accepted
+      connections (Go's http.Server IdleTimeout, nginx keepalive_timeout).
+    sources: ["https://man7.org/linux/man-pages/man2/listen.2.html", "https://man7.org/linux/man-pages/man2/bind.2.html"]
+    latency_ms: 0
+    request:
+      type: object
+      required: [addr]
+      properties:
+        addr: {type: string, examples: ["10.0.0.2:443"]}
+        backlog: {type: integer, default: 128}
+        cert: {anyOf: [{$ref: Certificate}, {type: "null"}], default: null, description: "The server certificate, for TLS; null: plain TCP"}
+        idle_timeout_ms: {type: integer, default: 0, description: "0: none"}
+        rcvbuf: {type: integer, default: 0, description: "SO_RCVBUF for accepted sockets; 0: config tcp-rcvbuf-bytes"}
+        sndbuf: {type: integer, default: 0, description: "SO_SNDBUF for accepted sockets; 0: config tcp-sndbuf-bytes"}
+    response: {type: object, properties: {addr: {type: string}, backlog: {type: integer}}}
+    errors: [{code: EADDRINUSE}]
+    behavior:
+      - if: "input.addr in state.listeners"
+        source: "https://man7.org/linux/man-pages/man2/bind.2.html"
+        then: [{fail: {code: EADDRINUSE, message: "= 'bind: address already in use: ' + input.addr"}}]
+      - set:
+          vars.backlog: "= math.least([has(input.backlog) ? input.backlog : 128, config['tcp-somaxconn']])"
+      - transact:
+          - table: listeners
+            op: put
+            key: "= input.addr"
+            value:
+              addr: "= input.addr"
+              backlog: "= vars.backlog"
+              queue: []
+              cert: "= has(input.cert) ? input.cert : null"
+              idle_timeout_ms: "= has(input.idle_timeout_ms) ? input.idle_timeout_ms : 0"
+              rcvbuf: "= has(input.rcvbuf) && input.rcvbuf > 0 ? input.rcvbuf : config['tcp-rcvbuf-bytes']"
+              sndbuf: "= has(input.sndbuf) && input.sndbuf > 0 ? input.sndbuf : config['tcp-sndbuf-bytes']"
+              waiting: false
+      - return: {addr: "= input.addr", backlog: "= vars.backlog"}
+
+  - component: tcp-stack
+    name: close-listener
+    kind: function
+    summary: >-
+      close() on a listening socket. Connections still in its accept queue are reset (their
+      clients see ECONNRESET), new SYNs to the port are refused, and an accept blocked on it fails
+      EBADF.
+    sources: ["https://man7.org/linux/man-pages/man2/close.2.html", "https://www.rfc-editor.org/rfc/rfc9293#section-3.10.4"]
+    latency_ms: 0
+    request: {type: object, required: [addr], properties: {addr: {type: string, examples: ["10.0.0.2:443"]}}}
+    response: {type: object, properties: {reset: {type: array, items: {type: string}}}}
+    errors: [{code: EBADF}]
+    behavior:
+      - if: "!(input.addr in state.listeners)"
+        then: [{fail: {code: EBADF, message: "= 'not listening: ' + input.addr"}}]
+      - set: {vars.queue: "= state.listeners[input.addr].queue"}
+      - foreach: "= vars.queue"
+        as: sid
+        max: 1000
+        steps:
+          - call: tcp-stack.close
+            input: {sock: "= vars.sid", linger_zero: true}
+      - set: {vars.waiting: "= state.listeners[input.addr].waiting"}
+      - transact:
+          - {table: listeners, op: delete, key: "= input.addr"}
+        title: The port is closed; later SYNs are answered with RST
+      - put: "= 'acc:' + input.addr"
+        value: {closed: true}
+        when: "vars.waiting"
+      - return: {reset: "= vars.queue.map(s, state.socks[s].peer)"}
+
+  # ---- Connection establishment -----------------------------------------------------------
+  - component: tcp-stack
+    name: connect
+    kind: function
+    summary: >-
+      connect() from a host to addr: the three-way handshake. The SYN reaches the listener RTT/2
+      later and the SYN-ACK comes back after another RTT/2, so connect returns ESTABLISHED one RTT
+      after it starts; the client's ACK reaches the server RTT/2 after that, which is when the
+      connection becomes acceptable. No listener: the peer answers RST and connect fails
+      ECONNREFUSED after one RTT. A full accept queue (backlog) drops the SYN, and so does a
+      blackholed host: the SYN is retransmitted after the RTO, doubling each time, and after
+      tcp_syn_retries connect fails ETIMEDOUT (127 s by default) unless the caller's own connect
+      timeout (Go's Dialer.Timeout) ends it first. An unreachable host (ICMP host unreachable)
+      fails EHOSTUNREACH.
+    sources: ["https://www.rfc-editor.org/rfc/rfc9293#section-3.5", "https://man7.org/linux/man-pages/man2/connect.2.html", "https://man7.org/linux/man-pages/man7/tcp.7.html", "https://www.rfc-editor.org/rfc/rfc6298#section-5", "https://man7.org/linux/man-pages/man2/listen.2.html"]
+    latency_ms: 0
+    request:
+      type: object
+      required: [addr]
+      properties:
+        host: {type: string, default: client, description: "The connecting host"}
+        addr: {type: string, examples: ["10.0.0.2:443"]}
+        timeout_ms: {type: integer, default: 0, description: "The caller's connect timeout; 0: the kernel's SYN retries decide"}
+        keepalive: {type: boolean, default: false, description: "SO_KEEPALIVE"}
+        rcvbuf: {type: integer, default: 0}
+        sndbuf: {type: integer, default: 0}
+    response:
+      type: object
+      properties:
+        sock: {type: string}
+        local: {type: string}
+        remote: {type: string}
+        syn_sent: {type: integer, description: "SYNs sent, retransmissions included"}
+    errors: [{code: ECONNREFUSED}, {code: ETIMEDOUT}, {code: EHOSTUNREACH}]
+    behavior:
+      - set:
+          vars.start: "= now"
+          vars.rhost: "= input.addr.split(':')[0]"
+          vars.rtt: "= config['tcp-rtt-ms']"
+          vars.rto: "= config['tcp-syn-rto-ms']"
+          vars.timeout: "= has(input.timeout_ms) ? input.timeout_ms : 0"
+      - set:
+          vars.hs: "= vars.rhost in state.hosts ? state.hosts[vars.rhost].status : 'up'"
+      - if: "vars.hs == 'unreachable'"
+        title: ICMP host unreachable
+        source: "https://man7.org/linux/man-pages/man2/connect.2.html"
+        then:
+          - {wait: "= vars.rtt"}
+          - fail: {code: EHOSTUNREACH, message: "= 'connect: no route to host ' + input.addr"}
+      - foreach: "= lists.range(config['tcp-syn-retries'] + 1)"
+        as: attempt_i
+        max: 30
+        steps:
+          - set:
+              vars.hs: "= vars.rhost in state.hosts ? state.hosts[vars.rhost].status : 'up'"
+              vars.listening: "= input.addr in state.listeners"
+          - if: "vars.hs == 'up' && !vars.listening"
+            title: No listener; the peer answers the SYN with RST
+            source: "https://www.rfc-editor.org/rfc/rfc9293#section-3.10.7.1"
+            then:
+              - {wait: "= vars.rtt"}
+              - fail: {code: ECONNREFUSED, message: "= 'connect: connection refused ' + input.addr", data: {syn_sent: "= vars.attempt_i + 1"}}
+          - if: "vars.hs == 'up' && size(state.listeners[input.addr].queue) < state.listeners[input.addr].backlog"
+            title: SYN, SYN-ACK, ACK
+            then:
+              - {wait: "= vars.rtt"}
+              - set: {vars.cn: "= seq('sock')"}
+              - set: {vars.sn: "= seq('sock')"}
+              - set:
+                  vars.cid: "= 'sock-' + string(vars.cn)"
+                  vars.sid: "= 'sock-' + string(vars.sn)"
+                  vars.l: "= state.listeners[input.addr]"
+                  vars.chost: "= has(input.host) ? input.host : 'client'"
+              - transact:
+                  - table: socks
+                    op: put
+                    key: "= vars.cid"
+                    value:
+                      id: "= vars.cid"
+                      role: client
+                      host: "= vars.chost"
+                      local: "= vars.chost + ':' + string(32768 + vars.cn)"
+                      remote: "= input.addr"
+                      peer: "= vars.sid"
+                      listener: ""
+                      tcp_state: ESTABLISHED
+                      established_at: "= now"
+                      rx: []
+                      snd_bytes: 0
+                      snd_data: ""
+                      fin_pending: false
+                      fin_sent: false
+                      fin_at: null
+                      rst_at: null
+                      pending_err: ""
+                      rd_shut: false
+                      wr_shut: false
+                      closed: false
+                      vanished: false
+                      rcvbuf: "= has(input.rcvbuf) && input.rcvbuf > 0 ? input.rcvbuf : config['tcp-rcvbuf-bytes']"
+                      sndbuf: "= has(input.sndbuf) && input.sndbuf > 0 ? input.sndbuf : config['tcp-sndbuf-bytes']"
+                      keepalive: "= has(input.keepalive) && input.keepalive"
+                      last_activity: "= now"
+                      unacked_since: null
+                      rx_waiting: false
+                      tx_waiting: false
+                      cert: null
+                      idle_timeout_ms: 0
+                      accepted: false
+                      bytes_sent: 0
+                      bytes_received: 0
+                  - table: socks
+                    op: put
+                    key: "= vars.sid"
+                    value:
+                      id: "= vars.sid"
+                      role: server
+                      host: "= vars.rhost"
+                      local: "= input.addr"
+                      remote: "= vars.chost + ':' + string(32768 + vars.cn)"
+                      peer: "= vars.cid"
+                      listener: "= input.addr"
+                      tcp_state: ESTABLISHED
+                      established_at: "= now + vars.rtt / 2"
+                      rx: []
+                      snd_bytes: 0
+                      snd_data: ""
+                      fin_pending: false
+                      fin_sent: false
+                      fin_at: null
+                      rst_at: null
+                      pending_err: ""
+                      rd_shut: false
+                      wr_shut: false
+                      closed: false
+                      vanished: false
+                      rcvbuf: "= vars.l.rcvbuf"
+                      sndbuf: "= vars.l.sndbuf"
+                      keepalive: false
+                      last_activity: "= now + vars.rtt / 2"
+                      unacked_since: null
+                      rx_waiting: false
+                      tx_waiting: false
+                      cert: "= vars.l.cert"
+                      idle_timeout_ms: "= vars.l.idle_timeout_ms"
+                      accepted: false
+                      bytes_sent: 0
+                      bytes_received: 0
+                  - {table: listeners, op: update, key: "= input.addr", value: {queue: "= vars.l.queue + [vars.sid]", waiting: false}}
+                title: The server end joins the accept queue
+              - put: "= 'acc:' + input.addr"
+                value: {sock: "= vars.sid"}
+                when: "vars.l.waiting"
+              - emit: tcp-stack.idle-check
+                input: {sock: "= vars.sid"}
+                after_ms: "= vars.rtt / 2 + vars.l.idle_timeout_ms"
+                when: "vars.l.idle_timeout_ms > 0"
+              - return: {sock: "= vars.cid", local: "= vars.chost + ':' + string(32768 + vars.cn)", remote: "= input.addr", syn_sent: "= vars.attempt_i + 1"}
+          - if: "vars.timeout > 0 && now + vars.rto - vars.start >= vars.timeout"
+            title: The caller's connect timeout ends the handshake
+            then:
+              - {wait: "= vars.start + vars.timeout - now"}
+              - fail: {code: ETIMEDOUT, message: "= 'connect: i/o timeout ' + input.addr", data: {syn_sent: "= vars.attempt_i + 1"}}
+          - title: SYN dropped (blackhole or full accept queue); retransmit after the RTO, which doubles
+            source: "https://www.rfc-editor.org/rfc/rfc6298#section-5"
+            wait: "= vars.rto"
+          - set: {vars.rto: "= vars.rto * 2"}
+      - fail: {code: ETIMEDOUT, message: "= 'connect: connection timed out ' + input.addr", data: {syn_sent: "= config['tcp-syn-retries'] + 1"}}
+
+  - component: tcp-stack
+    name: accept
+    kind: function
+    summary: >-
+      accept() on a listener: takes the oldest established connection from the accept queue. With
+      an empty queue a non-blocking accept fails EAGAIN; a blocking one waits for the next
+      handshake to complete (or its SO_RCVTIMEO, then EAGAIN). A connection whose ACK is still in
+      flight is returned when the ACK arrives.
+    sources: ["https://man7.org/linux/man-pages/man2/accept.2.html", "https://man7.org/linux/man-pages/man7/socket.7.html"]
+    latency_ms: 0
+    request:
+      type: object
+      required: [addr]
+      properties:
+        addr: {type: string, examples: ["10.0.0.2:443"]}
+        nonblocking: {type: boolean, default: false}
+        timeout_ms: {type: integer, default: 0, description: "SO_RCVTIMEO; 0: wait forever"}
+    response: {type: object, properties: {sock: {type: string}, remote: {type: string}, local: {type: string}}}
+    errors: [{code: EINVAL}, {code: EAGAIN}, {code: EBADF}]
+    behavior:
+      - if: "!(input.addr in state.listeners)"
+        then: [{fail: {code: EINVAL, message: "= 'accept: socket is not listening: ' + input.addr"}}]
+      - if: "size(state.listeners[input.addr].queue) == 0"
+        then:
+          - if: "has(input.nonblocking) && input.nonblocking"
+            then: [{fail: {code: EAGAIN, message: "accept: resource temporarily unavailable"}}]
+          - transact:
+              - {table: listeners, op: update, key: "= input.addr", value: {waiting: true}}
+          - receive: "= 'acc:' + input.addr"
+            title: Blocked in accept until a handshake completes
+            as: bell
+            timeout_ms: "= has(input.timeout_ms) ? input.timeout_ms : 0"
+            on_error:
+              - transact:
+                  - {table: listeners, op: update, key: "= input.addr", value: {waiting: false}}
+              - fail: {code: EAGAIN, message: "accept: resource temporarily unavailable (timeout)"}
+          - if: "!(input.addr in state.listeners)"
+            then: [{fail: {code: EBADF, message: "accept: the listening socket was closed"}}]
+      - set: {vars.sid: "= state.listeners[input.addr].queue[0]"}
+      - transact:
+          - {table: listeners, op: update, key: "= input.addr", value: {queue: "= state.listeners[input.addr].queue.slice(1, size(state.listeners[input.addr].queue))"}}
+          - {table: socks, op: update, key: "= vars.sid", value: {accepted: true}}
+      - wait: "= math.greatest([0, state.socks[vars.sid].established_at - now])"
+        title: The client's ACK is still in flight
+        when: "state.socks[vars.sid].established_at > now"
+      - return: {sock: "= vars.sid", remote: "= state.socks[vars.sid].remote", local: "= input.addr"}
+
+  # ---- Data transfer ------------------------------------------------------------------------
+  - component: tcp-stack
+    name: send
+    kind: function
+    summary: >-
+      send()/write() on a connected socket. Bytes the peer's receive window admits go on the wire
+      at once (arriving RTT/2 plus serialization later); the rest is queued in the send buffer.
+      What fits in neither is not written: a non-blocking send returns the partial count, or
+      EAGAIN when nothing fits; a blocking send waits for the reader to open the window, up to its
+      SO_SNDTIMEO (then the partial count, or EAGAIN). Writing after shutdown(SHUT_WR) is EPIPE.
+      Data sent to a peer that has closed its socket is answered with RST: the write succeeds,
+      the next one fails ECONNRESET, and later ones EPIPE. Against a crashed peer the data is
+      never acknowledged and the connection fails ETIMEDOUT after tcp_retries2.
+    sources: ["https://man7.org/linux/man-pages/man2/send.2.html", "https://man7.org/linux/man-pages/man7/tcp.7.html", "https://man7.org/linux/man-pages/man7/socket.7.html", "https://www.rfc-editor.org/rfc/rfc9293#section-3.8.6", "https://www.rfc-editor.org/rfc/rfc9293#section-3.10.7.4"]
+    latency_ms: 0
+    request:
+      type: object
+      required: [sock]
+      properties:
+        sock: {type: string, examples: [sock-1]}
+        data: {type: string, default: "", description: "The payload; its UTF-8 length is the byte count"}
+        size: {type: integer, default: 0, description: "A payload of this many bytes, without content, when data is empty"}
+        nonblocking: {type: boolean, default: false}
+        timeout_ms: {type: integer, default: 0, description: "SO_SNDTIMEO; 0: wait forever"}
+    response: {type: object, properties: {written: {type: integer}}}
+    errors: [{code: EBADF}, {code: EPIPE}, {code: ECONNRESET}, {code: EAGAIN}, {code: ETIMEDOUT}]
+    behavior:
+      - if: "!(input.sock in state.socks) || state.socks[input.sock].closed"
+        then: [{fail: {code: EBADF, message: "= 'send: bad file descriptor ' + input.sock"}}]
+      - set:
+          vars.s: "= state.socks[input.sock]"
+          vars.data: "= has(input.data) ? input.data : ''"
+          vars.start: "= now"
+          vars.written: 0
+          vars.timeout: "= has(input.timeout_ms) ? input.timeout_ms : 0"
+          vars.nb: "= has(input.nonblocking) && input.nonblocking"
+      - set:
+          vars.n: "= vars.data != '' ? byteLen(vars.data) : (has(input.size) ? input.size : 0)"
+          vars.rst: "= vars.s.rst_at != null && vars.s.rst_at <= now"
+      - if: "vars.s.wr_shut"
+        source: "https://man7.org/linux/man-pages/man2/shutdown.2.html"
+        then: [{fail: {code: EPIPE, message: "send: broken pipe (shut down for writing)"}}]
+      - if: "vars.rst && vars.s.pending_err != ''"
+        title: The RST's error is reported once
+        source: "https://man7.org/linux/man-pages/man7/socket.7.html"
+        then:
+          - transact:
+              - {table: socks, op: update, key: "= input.sock", value: {pending_err: "", tcp_state: CLOSED}}
+          - fail: {code: ECONNRESET, message: "send: connection reset by peer"}
+      - if: "vars.rst"
+        then: [{fail: {code: EPIPE, message: "send: broken pipe"}}]
+      - if: "vars.s.unacked_since != null && now >= vars.s.unacked_since + config['tcp-retries2-timeout-ms']"
+        then:
+          - transact:
+              - {table: socks, op: update, key: "= input.sock", value: {tcp_state: CLOSED}}
+          - fail: {code: ETIMEDOUT, message: "send: connection timed out"}
+      - if: "vars.n == 0"
+        then: [{return: {written: 0}}]
+      - set: {vars.p: "= state.socks[vars.s.peer]"}
+      - if: "vars.p.closed && !vars.p.vanished"
+        title: The peer has closed its socket; it answers this data with RST
+        source: "https://www.rfc-editor.org/rfc/rfc9293#section-3.10.7.4"
+        then:
+          - transact:
+              - table: socks
+                op: update
+                key: "= input.sock"
+                value:
+                  rst_at: "= vars.s.rst_at == null ? now + config['tcp-rtt-ms'] : vars.s.rst_at"
+                  pending_err: "= vars.s.rst_at == null ? 'ECONNRESET' : vars.s.pending_err"
+                  bytes_sent: "= vars.s.bytes_sent + vars.n"
+                  last_activity: "= now"
+          - return: {written: "= vars.n"}
+      - foreach: "= lists.range(200)"
+        as: loop_i
+        max: 200
+        steps:
+          - set: {vars.s: "= state.socks[input.sock]"}
+          - if: "(vars.s.rst_at != null && vars.s.rst_at <= now) || vars.s.closed"
+            then: [{break: true}]
+          - set: {vars.k: "= math.least([vars.n - vars.written, vars.s.sndbuf - vars.s.snd_bytes])"}
+          - if: "vars.k > 0"
+            then:
+              - transact:
+                  - table: socks
+                    op: update
+                    key: "= input.sock"
+                    value:
+                      snd_bytes: "= vars.s.snd_bytes + vars.k"
+                      snd_data: "= vars.s.snd_data + (vars.data == '' ? '' : substrBytes(vars.data, vars.written, vars.written + vars.k))"
+                      last_activity: "= now"
+              - set: {vars.written: "= vars.written + vars.k"}
+              - call: tcp-stack.flush
+                input: {sock: "= input.sock"}
+          - if: "vars.written >= vars.n"
+            then: [{break: true}]
+          - if: "vars.k > 0"
+            then: [{continue: true}]
+          - if: "vars.nb"
+            then: [{break: true}]
+          - set: {vars.s: "= state.socks[input.sock]"}
+          - set:
+              vars.limits: >-
+                = (vars.timeout > 0 ? [vars.start + vars.timeout] : []) +
+                  (vars.s.unacked_since != null ? [vars.s.unacked_since + config['tcp-retries2-timeout-ms']] : [])
+          - if: "size(vars.limits) > 0 && math.least(vars.limits) <= now"
+            then: [{break: true}]
+          - transact:
+              - {table: socks, op: update, key: "= input.sock", value: {tx_waiting: true}}
+          - receive: "= 'tx:' + input.sock"
+            title: Send buffer full; blocked until the peer's window opens
+            as: bell
+            timeout_ms: "= size(vars.limits) > 0 ? math.least(vars.limits) - now : 0"
+            on_error: [{set: {vars.bell: timeout}}]
+      - set: {vars.s: "= state.socks[input.sock]"}
+      - transact:
+          - {table: socks, op: update, key: "= input.sock", value: {tx_waiting: false}}
+        when: "vars.s.tx_waiting"
+      - if: "vars.written == 0 && vars.s.rst_at != null && vars.s.rst_at <= now && vars.s.pending_err != ''"
+        then:
+          - transact:
+              - {table: socks, op: update, key: "= input.sock", value: {pending_err: "", tcp_state: CLOSED}}
+          - fail: {code: ECONNRESET, message: "send: connection reset by peer"}
+      - if: "vars.written == 0 && vars.s.unacked_since != null && now >= vars.s.unacked_since + config['tcp-retries2-timeout-ms']"
+        then: [{fail: {code: ETIMEDOUT, message: "send: connection timed out"}}]
+      - if: "vars.written == 0"
+        then: [{fail: {code: EAGAIN, message: "send: resource temporarily unavailable"}}]
+      - return: {written: "= vars.written"}
+
+  - component: tcp-stack
+    name: flush
+    kind: function
+    summary: >-
+      Move send-buffer bytes onto the wire as far as the peer's receive window allows, and the FIN
+      after them once the buffer is empty (a FIN is queued behind data). Runs after each send,
+      and after each read of the peer (the window update reaches the sender RTT/2 after the read,
+      so the data arrives one RTT after it). Wakes a reader waiting on the peer and a writer
+      waiting for room.
+    sources: ["https://www.rfc-editor.org/rfc/rfc9293#section-3.8.6.2", "https://www.rfc-editor.org/rfc/rfc9293#section-3.6"]
+    latency_ms: 0
+    request:
+      type: object
+      required: [sock]
+      properties:
+        sock: {type: string, description: "The sending end"}
+        extra_ms: {type: integer, default: 0, description: "Delay before transmission (a window update's trip)"}
+    response: {type: object, properties: {moved: {type: integer}, fin: {type: boolean}}}
+    behavior:
+      - if: "!(input.sock in state.socks) || !(state.socks[input.sock].peer in state.socks)"
+        then: [{return: {moved: 0, fin: false}}]
+      - set:
+          vars.s: "= state.socks[input.sock]"
+          vars.p: "= state.socks[state.socks[input.sock].peer]"
+      - if: "vars.p.vanished"
+        title: The peer's host is gone; nothing is acknowledged
+        then:
+          - transact:
+              - {table: socks, op: update, key: "= input.sock", value: {unacked_since: "= now"}}
+            when: "vars.s.unacked_since == null && (vars.s.snd_bytes > 0 || vars.s.fin_pending)"
+          - return: {moved: 0, fin: false}
+      - set:
+          vars.free: "= math.greatest([0, vars.p.rcvbuf - sum(vars.p.rx.map(x, x.bytes))])"
+          vars.dl: "= byteLen(vars.s.snd_data)"
+      - set: {vars.k: "= math.least([vars.s.snd_bytes, vars.free])"}
+      - set:
+          vars.cut: "= math.least([vars.k, vars.dl])"
+          vars.at: "= now + int(config['tcp-rtt-ms']) / 2 + (has(input.extra_ms) ? int(input.extra_ms) : 0) + int(vars.k) / int(config['tcp-bandwidth-bytes-per-ms'])"
+          vars.fin: "= vars.s.fin_pending && vars.s.snd_bytes - vars.k == 0"
+      - transact:
+          - table: socks
+            op: update
+            key: "= input.sock"
+            value:
+              snd_bytes: "= vars.s.snd_bytes - vars.k"
+              snd_data: "= substrBytes(vars.s.snd_data, vars.cut, vars.dl)"
+              fin_pending: "= vars.fin ? false : vars.s.fin_pending"
+              fin_sent: "= vars.fin || vars.s.fin_sent"
+              bytes_sent: "= vars.s.bytes_sent + vars.k"
+          - table: socks
+            op: update
+            key: "= vars.s.peer"
+            value:
+              rx: "= vars.k > 0 ? vars.p.rx + [{'bytes': vars.k, 'data': substrBytes(vars.s.snd_data, 0, vars.cut), 'at': vars.at}] : vars.p.rx"
+              fin_at: "= vars.fin ? vars.at : vars.p.fin_at"
+        when: "vars.k > 0 || vars.fin"
+        title: Segments (and the FIN) on the wire
+      - call: tcp-stack.ring
+        input: {sock: "= vars.s.peer", dir: rx}
+        when: "vars.k > 0 || vars.fin"
+      - call: tcp-stack.ring
+        input: {sock: "= input.sock", dir: tx}
+        when: "vars.k > 0"
+      - return: {moved: "= vars.k", fin: "= vars.fin"}
+
+  - component: tcp-stack
+    name: recv
+    kind: function
+    summary: >-
+      recv()/read(): returns up to max bytes that have arrived, and opens the window for the
+      sender (its queued bytes follow one RTT later). With nothing arrived: 0 (EOF) once the
+      peer's FIN is reached or after shutdown(SHUT_RD); ECONNRESET once if an RST arrived (EOF
+      after that); otherwise a non-blocking read fails EAGAIN and a blocking one waits for data,
+      a FIN or an RST, up to its SO_RCVTIMEO (EAGAIN). Against a crashed peer a keepalive socket
+      fails ETIMEDOUT after keepalive_time + probes x intvl of silence, and a socket with
+      unacknowledged data after tcp_retries2.
+    sources: ["https://man7.org/linux/man-pages/man2/recv.2.html", "https://man7.org/linux/man-pages/man7/socket.7.html", "https://man7.org/linux/man-pages/man7/tcp.7.html", "https://www.rfc-editor.org/rfc/rfc9293#section-3.8.4"]
+    latency_ms: 0
+    request:
+      type: object
+      required: [sock]
+      properties:
+        sock: {type: string, examples: [sock-2]}
+        max: {type: integer, default: 65536}
+        nonblocking: {type: boolean, default: false}
+        timeout_ms: {type: integer, default: 0, description: "SO_RCVTIMEO; 0: wait forever"}
+    response: RecvResult
+    errors: [{code: EBADF}, {code: ECONNRESET}, {code: EAGAIN}, {code: ETIMEDOUT}]
+    behavior:
+      - if: "!(input.sock in state.socks) || state.socks[input.sock].closed"
+        then: [{fail: {code: EBADF, message: "= 'recv: bad file descriptor ' + input.sock"}}]
+      - set:
+          vars.start: "= now"
+          vars.max: "= has(input.max) ? input.max : 65536"
+          vars.timeout: "= has(input.timeout_ms) ? input.timeout_ms : 0"
+          vars.nb: "= has(input.nonblocking) && input.nonblocking"
+          vars.ka_ms: "= config['tcp-keepalive-time-ms'] + config['tcp-keepalive-probes'] * config['tcp-keepalive-intvl-ms']"
+      - foreach: "= lists.range(200)"
+        as: loop_i
+        max: 200
+        steps:
+          - set: {vars.s: "= state.socks[input.sock]"}
+          - if: "vars.s.unacked_since != null && now >= vars.s.unacked_since + config['tcp-retries2-timeout-ms']"
+            title: Retransmissions exhausted (tcp_retries2)
+            then:
+              - transact:
+                  - {table: socks, op: update, key: "= input.sock", value: {tcp_state: CLOSED, rx_waiting: false}}
+              - fail: {code: ETIMEDOUT, message: "recv: connection timed out"}
+          - set:
+              vars.ready: "= vars.s.rx.filter(x, x.at <= now)"
+              vars.later: "= vars.s.rx.filter(x, x.at > now)"
+              vars.pv: "= vars.s.peer in state.socks && state.socks[vars.s.peer].vanished"
+          - if: "size(vars.ready) > 0 && !vars.s.rd_shut"
+            then:
+              - set:
+                  vars.rb: "= sum(vars.ready.map(x, x.bytes))"
+                  vars.rd: "= vars.ready.map(x, x.data).join('')"
+              - set:
+                  vars.k: "= math.least([vars.rb, vars.max])"
+                  vars.dl: "= byteLen(vars.rd)"
+              - set: {vars.cut: "= math.least([vars.k, vars.dl])"}
+              - transact:
+                  - table: socks
+                    op: update
+                    key: "= input.sock"
+                    value:
+                      rx: "= (vars.rb > vars.k ? [{'bytes': vars.rb - vars.k, 'data': substrBytes(vars.rd, vars.cut, vars.dl), 'at': now}] : []) + vars.later"
+                      last_activity: "= now"
+                      bytes_received: "= vars.s.bytes_received + vars.k"
+                      rx_waiting: false
+              - call: tcp-stack.flush
+                title: Window update to the sender
+                input: {sock: "= vars.s.peer", extra_ms: "= config['tcp-rtt-ms'] / 2"}
+              - return: {bytes: "= vars.k", data: "= substrBytes(vars.rd, 0, vars.cut)", eof: false}
+          - if: "vars.s.rd_shut || (vars.s.fin_at != null && vars.s.fin_at <= now && size(vars.later) == 0)"
+            title: End of stream (FIN reached, or shut down for reading)
+            then:
+              - transact:
+                  - {table: socks, op: update, key: "= input.sock", value: {rx_waiting: false, last_activity: "= now"}}
+              - return: {bytes: 0, data: "", eof: true}
+          - if: "vars.s.rst_at != null && vars.s.rst_at <= now"
+            then:
+              - if: "vars.s.pending_err != ''"
+                title: The RST's error is reported once
+                then:
+                  - transact:
+                      - {table: socks, op: update, key: "= input.sock", value: {pending_err: "", tcp_state: CLOSED, rx_waiting: false}}
+                  - fail: {code: ECONNRESET, message: "recv: connection reset by peer"}
+              - return: {bytes: 0, data: "", eof: true}
+          - if: "vars.nb"
+            then: [{fail: {code: EAGAIN, message: "recv: resource temporarily unavailable"}}]
+          - set:
+              vars.future: >-
+                = vars.later.map(x, x.at) +
+                  (vars.s.fin_at != null && vars.s.fin_at > now ? [vars.s.fin_at] : []) +
+                  (vars.s.rst_at != null && vars.s.rst_at > now ? [vars.s.rst_at] : [])
+              vars.ka_at: "= vars.pv && vars.s.keepalive ? vars.s.last_activity + vars.ka_ms : -1"
+              vars.retx_at: "= vars.s.unacked_since != null ? int(vars.s.unacked_since) + int(config['tcp-retries2-timeout-ms']) : -1"
+          - set:
+              vars.limits: "= (vars.timeout > 0 ? [vars.start + vars.timeout] : []) + (vars.ka_at >= 0 ? [vars.ka_at] : []) + (vars.retx_at >= 0 ? [vars.retx_at] : [])"
+          - set:
+              vars.next: "= size(vars.future) > 0 ? math.least(vars.future) : -1"
+              vars.limit: "= size(vars.limits) > 0 ? math.least(vars.limits) : -1"
+          - if: "vars.next >= 0 && (vars.limit < 0 || vars.next <= vars.limit)"
+            title: Something is in flight; wait for it to arrive
+            then:
+              - {wait: "= vars.next - now"}
+              - {continue: true}
+          - if: "vars.limit >= 0 && vars.limit <= now"
+            then:
+              - transact:
+                  - {table: socks, op: update, key: "= input.sock", value: {rx_waiting: false}}
+              - if: "vars.ka_at >= 0 && vars.ka_at <= now"
+                title: Keepalive probes unanswered
+                source: "https://man7.org/linux/man-pages/man7/tcp.7.html"
+                then:
+                  - transact:
+                      - {table: socks, op: update, key: "= input.sock", value: {tcp_state: CLOSED}}
+                  - fail: {code: ETIMEDOUT, message: "recv: connection timed out (keepalive)"}
+              - fail: {code: EAGAIN, message: "recv: resource temporarily unavailable (SO_RCVTIMEO)"}
+          - transact:
+              - {table: socks, op: update, key: "= input.sock", value: {rx_waiting: true}}
+          - receive: "= 'rx:' + input.sock"
+            title: Blocked in recv until data, a FIN or an RST arrives
+            as: bell
+            timeout_ms: "= vars.limit >= 0 ? vars.limit - now : 0"
+            on_error: [{set: {vars.bell: timeout}}]
+      - fail: {code: EAGAIN, message: "recv: gave up after 200 wake-ups"}
+
+  - component: tcp-stack
+    name: bulk-send
+    kind: function
+    summary: >-
+      A bulk transfer as a stream of segments, for callers that read a whole response with a
+      streaming call: the sender yields one segment per serialization time. The reader declares
+      the receive window in segments (window: rcvbuf / segment_bytes) and the sender's
+      SO_SNDTIMEO (stall_ms) on its call; a reader slower than the link closes the window, the
+      sender blocks, and past stall_ms the transfer fails stream_stalled, the stream form of a
+      zero-window send timeout. Bytes are counted, not carried.
+    sources: ["https://www.rfc-editor.org/rfc/rfc9293#section-3.8.6.2", "https://man7.org/linux/man-pages/man7/socket.7.html"]
+    latency_ms: 0
+    request:
+      type: object
+      required: [segments]
+      properties:
+        segments: {type: integer, minimum: 1, maximum: 1000, examples: [8]}
+        segment_bytes: {type: integer, default: 1448, description: "MSS on Ethernet with timestamps"}
+    response: {type: object, properties: {segments: {type: integer}, bytes: {type: integer}}}
+    behavior:
+      - set:
+          vars.sb: "= has(input.segment_bytes) ? input.segment_bytes : 1448"
+      - foreach: "= lists.range(input.segments)"
+        as: seg
+        max: 1000
+        steps:
+          - wait: "= math.greatest([1, int(vars.sb) / int(config['tcp-bandwidth-bytes-per-ms'])])"
+          - yield: {index: "= vars.seg", bytes: "= vars.sb"}
+      - return: {segments: "= input.segments", bytes: "= input.segments * vars.sb"}
+
+  # ---- Teardown -----------------------------------------------------------------------------
+  - component: tcp-stack
+    name: shutdown
+    kind: function
+    summary: >-
+      shutdown(): SHUT_WR sends a FIN after the queued data (a half-close: the peer reads the data,
+      then EOF, and may keep sending; this end may keep reading); later writes fail EPIPE. SHUT_RD
+      makes reads return 0. SHUT_RDWR does both.
+    sources: ["https://man7.org/linux/man-pages/man2/shutdown.2.html", "https://www.rfc-editor.org/rfc/rfc9293#section-3.6"]
+    latency_ms: 0
+    request:
+      type: object
+      required: [sock, how]
+      properties:
+        sock: {type: string, examples: [sock-1]}
+        how: {type: string, enum: [SHUT_RD, SHUT_WR, SHUT_RDWR], default: SHUT_WR}
+    response: {type: object, properties: {fin: {type: boolean}}}
+    errors: [{code: EBADF}, {code: ENOTCONN}]
+    behavior:
+      - if: "!(input.sock in state.socks) || state.socks[input.sock].closed"
+        then: [{fail: {code: EBADF, message: "= 'shutdown: bad file descriptor ' + input.sock"}}]
+      - if: "state.socks[input.sock].tcp_state == 'CLOSED'"
+        then: [{fail: {code: ENOTCONN, message: "shutdown: transport endpoint is not connected"}}]
+      - set:
+          vars.wr: "= input.how in ['SHUT_WR', 'SHUT_RDWR'] && !state.socks[input.sock].wr_shut"
+          vars.rd: "= input.how in ['SHUT_RD', 'SHUT_RDWR']"
+      - transact:
+          - table: socks
+            op: update
+            key: "= input.sock"
+            value:
+              wr_shut: "= vars.wr || state.socks[input.sock].wr_shut"
+              fin_pending: "= vars.wr || state.socks[input.sock].fin_pending"
+              rd_shut: "= vars.rd || state.socks[input.sock].rd_shut"
+              tcp_state: "= vars.wr ? 'FIN_WAIT_1' : state.socks[input.sock].tcp_state"
+      - call: tcp-stack.flush
+        input: {sock: "= input.sock"}
+        when: "vars.wr"
+      - call: tcp-stack.ring
+        input: {sock: "= input.sock", dir: rx}
+        when: "vars.rd"
+      - return: {fin: "= vars.wr"}
+
+  - component: tcp-stack
+    name: close
+    kind: function
+    summary: >-
+      close() on a connected socket. Normally a FIN follows the queued data (the kernel keeps
+      sending after the descriptor is gone). Unread received data, or SO_LINGER with a zero
+      timeout (linger_zero), makes it an abortive close instead: an RST, which discards the queues
+      and makes the peer's next call fail ECONNRESET. Either way the descriptor is gone (EBADF).
+    sources: ["https://man7.org/linux/man-pages/man2/close.2.html", "https://man7.org/linux/man-pages/man7/socket.7.html", "https://www.rfc-editor.org/rfc/rfc2525#section-2.17", "https://www.rfc-editor.org/rfc/rfc9293#section-3.10.4"]
+    latency_ms: 0
+    request:
+      type: object
+      required: [sock]
+      properties:
+        sock: {type: string, examples: [sock-1]}
+        linger_zero: {type: boolean, default: false, description: "SO_LINGER {on, 0}: abort with RST"}
+    response: {type: object, properties: {rst: {type: boolean}}}
+    errors: [{code: EBADF}]
+    behavior:
+      - if: "!(input.sock in state.socks) || state.socks[input.sock].closed"
+        then: [{fail: {code: EBADF, message: "= 'close: bad file descriptor ' + input.sock"}}]
+      - set:
+          vars.s: "= state.socks[input.sock]"
+          vars.unread: "= state.socks[input.sock].rx.exists(x, x.at <= now)"
+      - set:
+          vars.abort: "= (has(input.linger_zero) && input.linger_zero) || vars.unread"
+          vars.p: "= vars.s.peer in state.socks ? state.socks[vars.s.peer] : null"
+      - if: "vars.abort"
+        title: Abortive close; the peer gets an RST
+        detail: Unread data or SO_LINGER 0 turns close into a reset (RFC 2525 §2.17).
+        source: "https://www.rfc-editor.org/rfc/rfc2525#section-2.17"
+        then:
+          - transact:
+              - {table: socks, op: update, key: "= input.sock", value: {closed: true, tcp_state: CLOSED, rx: [], snd_bytes: 0, snd_data: "", fin_pending: false}}
+          - transact:
+              - table: socks
+                op: update
+                key: "= vars.s.peer"
+                value:
+                  rst_at: "= vars.p.rst_at == null ? now + config['tcp-rtt-ms'] / 2 : vars.p.rst_at"
+                  pending_err: "= vars.p.rst_at == null ? 'ECONNRESET' : vars.p.pending_err"
+            when: "vars.p != null && !vars.p.closed && !vars.p.vanished"
+          - call: tcp-stack.ring
+            input: {sock: "= vars.s.peer", dir: rx}
+          - call: tcp-stack.ring
+            input: {sock: "= vars.s.peer", dir: tx}
+          - return: {rst: true}
+      - transact:
+          - table: socks
+            op: update
+            key: "= input.sock"
+            value:
+              closed: true
+              wr_shut: true
+              fin_pending: "= !vars.s.wr_shut || vars.s.fin_pending"
+              tcp_state: FIN_WAIT_1
+      - call: tcp-stack.flush
+        input: {sock: "= input.sock"}
+      - return: {rst: false}
+
+  # ---- Helpers, timers and failures ---------------------------------------------------------
+  - component: tcp-stack
+    name: ring
+    kind: function
+    summary: "Wake the task blocked in recv (dir rx) or send (dir tx) on a socket, if one is waiting."
+    sources: ["https://man7.org/linux/man-pages/man7/epoll.7.html"]
+    latency_ms: 0
+    request: {type: object, required: [sock, dir], properties: {sock: {type: string}, dir: {type: string, enum: [rx, tx]}}}
+    response: {type: object, properties: {rung: {type: boolean}}}
+    behavior:
+      - if: "!(input.sock in state.socks) || !state.socks[input.sock][input.dir + '_waiting']"
+        then: [{return: {rung: false}}]
+      - transact:
+          - {table: socks, op: update, key: "= input.sock", value: "= {input.dir + '_waiting': false}"}
+      - put: "= input.dir + ':' + input.sock"
+        value: 1
+      - return: {rung: true}
+
+  - component: tcp-stack
+    name: idle-check
+    kind: event
+    summary: >-
+      The server's idle timer for an accepted connection (Go's http.Server IdleTimeout, nginx
+      keepalive_timeout): when the server end has had no reads or writes for the listener's
+      idle_timeout_ms, the server closes it (a FIN); otherwise the timer is re-armed for the rest.
+    sources: ["https://pkg.go.dev/net/http#Server", "https://nginx.org/en/docs/http/ngx_http_core_module.html#keepalive_timeout"]
+    latency_ms: 0
+    request: {type: object, required: [sock], properties: {sock: {type: string}}}
+    response: {type: object, properties: {closed: {type: boolean}}}
+    behavior:
+      - if: "!(input.sock in state.socks) || state.socks[input.sock].closed"
+        then: [{return: {closed: false}}]
+      - set: {vars.s: "= state.socks[input.sock]"}
+      - if: "now - vars.s.last_activity >= vars.s.idle_timeout_ms"
+        title: Idle timeout; the server closes the connection
+        then:
+          - call: tcp-stack.close
+            input: {sock: "= input.sock"}
+          - return: {closed: true}
+      - emit: tcp-stack.idle-check
+        input: {sock: "= input.sock"}
+        after_ms: "= vars.s.last_activity + vars.s.idle_timeout_ms - now"
+      - return: {closed: false}
+
+  - component: tcp-stack
+    name: host-crash
+    kind: event
+    summary: >-
+      A host loses power or is partitioned away. Its sockets vanish without a FIN or RST and its
+      listeners go with it; SYNs to it are dropped (connect times out). Its peers notice only by
+      keepalive or when their data is never acknowledged (ETIMEDOUT).
+    sources: ["https://man7.org/linux/man-pages/man7/tcp.7.html", "https://www.rfc-editor.org/rfc/rfc9293#section-3.8.4"]
+    latency_ms: 0
+    request: {type: object, required: [host], properties: {host: {type: string, examples: [10.0.0.2]}}}
+    response: {type: object, properties: {vanished: {type: array, items: {type: string}}}}
+    behavior:
+      - set:
+          vars.socks: "= state.socks.filter(k, state.socks[k].host == input.host && !state.socks[k].closed)"
+          vars.listeners: "= state.listeners.filter(a, a.split(':')[0] == input.host)"
+      - foreach: "= vars.socks"
+        as: k
+        max: 1000
+        steps:
+          - transact:
+              - {table: socks, op: update, key: "= vars.k", value: {vanished: true, closed: true, tcp_state: CLOSED}}
+      - foreach: "= vars.listeners"
+        as: a
+        max: 1000
+        steps:
+          - transact:
+              - {table: listeners, op: delete, key: "= vars.a"}
+      - transact:
+          - {table: hosts, op: put, key: "= input.host", value: {status: blackhole}}
+      - return: {vanished: "= vars.socks"}
+
+  - component: tcp-stack
+    name: get-sock
+    kind: function
+    summary: "Read one end's kernel state (getsockopt, ss -ti): its buffers, flags and times."
+    sources: ["https://man7.org/linux/man-pages/man8/ss.8.html", "https://man7.org/linux/man-pages/man2/getsockopt.2.html"]
+    latency_ms: 0
+    request: {type: object, required: [sock], properties: {sock: {type: string, examples: [sock-1]}}}
+    response: Sock
+    errors: [{code: EBADF}]
+    behavior:
+      - if: "!(input.sock in state.socks)"
+        then: [{fail: {code: EBADF, message: "= 'bad file descriptor ' + input.sock"}}]
+      - return: "= state.socks[input.sock]"
+
+  # ---- TLS ----------------------------------------------------------------------------------
+  - component: tls
+    name: handshake
+    kind: function
+    summary: >-
+      The client's TLS handshake on a connected socket. ClientHello goes out; ServerHello,
+      Certificate and Finished come back one RTT later, when the client validates the server's
+      certificate the way crypto/x509 does: the validity period (certificate_expired, alert 45),
+      then the chain to a trusted root (unknown_ca, alert 48), then the hostname against the SANs
+      (bad_certificate, alert 42). On failure the client sends the alert and closes the
+      connection; the server's next TLS read fails with the alert it received. TLS 1.3 is then
+      done (application data may follow the client's Finished); TLS 1.2 needs a second RTT. A
+      peer without a certificate isn't speaking TLS (handshake_failure, alert 40).
+    sources: ["https://www.rfc-editor.org/rfc/rfc8446#section-2", "https://www.rfc-editor.org/rfc/rfc8446#section-6.2", "https://www.rfc-editor.org/rfc/rfc5280#section-6.1", "https://www.rfc-editor.org/rfc/rfc6125#section-6.4.3", "https://go.dev/src/crypto/x509/verify.go", "https://github.com/openssl/openssl/blob/master/ssl/statem/statem_lib.c", "https://www.rfc-editor.org/rfc/rfc5246#section-7.3"]
+    latency_ms: 0
+    request:
+      type: object
+      required: [sock, server_name]
+      properties:
+        sock: {type: string, examples: [sock-1]}
+        server_name: {type: string, examples: [api.example.test], description: "SNI, and the name the certificate must match"}
+        version: {type: string, enum: ["1.2", "1.3", ""], default: "", description: "\"\": config tcp-tls-version"}
+        trusted_cas: {type: array, items: {type: string}, default: [], description: "Overrides config tcp-tls-trusted-cas when not empty"}
+        insecure_skip_verify: {type: boolean, default: false}
+    response:
+      type: object
+      properties:
+        version: {type: string}
+        cipher_suite: {type: string}
+        peer_subject: {type: string}
+        handshake_ms: {type: integer}
+    errors:
+      - {code: certificate_expired}
+      - {code: unknown_ca}
+      - {code: bad_certificate}
+      - {code: handshake_failure}
+      - {code: EBADF}
+    behavior:
+      - call: tcp-stack.get-sock
+        input: {sock: "= input.sock"}
+        as: s
+      - call: tcp-stack.get-sock
+        input: {sock: "= vars.s.value.peer"}
+        as: p
+      - set:
+          vars.start: "= now"
+          vars.version: "= has(input.version) && input.version != '' ? input.version : config['tcp-tls-version']"
+          vars.cas: "= has(input.trusted_cas) && size(input.trusted_cas) > 0 ? input.trusted_cas : config['tcp-tls-trusted-cas']"
+          vars.cert: "= vars.p.value.cert"
+          vars.skip: "= has(input.insecure_skip_verify) && input.insecure_skip_verify"
+      - title: ClientHello out; ServerHello, Certificate, CertificateVerify and Finished back
+        wait: "= config['tcp-rtt-ms'] + config['tcp-tls-crypto-ms']"
+      - set:
+          vars.alert: >-
+            = vars.cert == null ? 'handshake_failure' :
+              vars.skip ? '' :
+              (int(timestamp(vars.cert.not_after)) * 1000 < now || int(timestamp(vars.cert.not_before)) * 1000 > now) ? 'certificate_expired' :
+              !(vars.cert.issuer in vars.cas) ? 'unknown_ca' :
+              !((has(vars.cert.sans) ? vars.cert.sans : [vars.cert.subject]).exists(n, n == input.server_name ||
+                  (n.startsWith('*.') && input.server_name.endsWith(n.substring(1)) && size(input.server_name.split('.')) == size(n.split('.'))))) ? 'bad_certificate' :
+              ''
+      - if: "vars.alert != ''"
+        title: Certificate validation failed; the client sends a fatal alert and closes
+        source: "https://www.rfc-editor.org/rfc/rfc8446#section-6.2"
+        then:
+          - set:
+              vars.code: "= {'handshake_failure': 40, 'bad_certificate': 42, 'certificate_expired': 45, 'unknown_ca': 48}[vars.alert]"
+          - transact:
+              - {table: sessions, op: put, key: "= input.sock", value: {state: failed, version: "= vars.version", alert: "= vars.alert", alert_code: "= vars.code", alert_sent: true, close_notify_sent: false, close_notify_received: false}}
+              - {table: sessions, op: put, key: "= vars.s.value.peer", value: {state: failed, version: "= vars.version", alert: "= vars.alert", alert_code: "= vars.code", alert_sent: false, close_notify_sent: false, close_notify_received: false}}
+          - call: tls.wake-server
+            input: {sock: "= vars.s.value.peer"}
+          - call: tcp-stack.close
+            input: {sock: "= input.sock"}
+          - fail:
+              code: "= vars.alert"
+              message: "= 'tls: failed to verify certificate: ' + vars.alert"
+              data: {alert: "= vars.alert", alert_code: "= vars.code", server_name: "= input.server_name"}
+      - title: "TLS 1.2: ChangeCipherSpec and Finished take a second round trip"
+        wait: "= config['tcp-rtt-ms']"
+        when: "vars.version == '1.2'"
+      - transact:
+          - {table: sessions, op: put, key: "= input.sock", value: {state: established, version: "= vars.version", alert: "", alert_code: 0, alert_sent: false, close_notify_sent: false, close_notify_received: false}}
+          - {table: sessions, op: put, key: "= vars.s.value.peer", value: {state: established, version: "= vars.version", alert: "", alert_code: 0, alert_sent: false, close_notify_sent: false, close_notify_received: false}}
+      - call: tls.wake-server
+        input: {sock: "= vars.s.value.peer"}
+      - return:
+          version: "= vars.version"
+          cipher_suite: "= vars.version == '1.3' ? 'TLS_AES_128_GCM_SHA256' : 'TLS_ECDHE_RSA_WITH_AES_128_GCM_SHA256'"
+          peer_subject: "= vars.cert.subject"
+          handshake_ms: "= now - vars.start"
+
+  - component: tls
+    name: accept-handshake
+    kind: function
+    summary: >-
+      The server's side of the handshake on an accepted socket (Go's Conn.Handshake on a server
+      conn, SSL_accept): it waits until the client's handshake is decided, then returns the
+      session, or fails with the alert the client sent (the server's view of a certificate the
+      client rejected). Without a client handshake within timeout_ms it fails handshake_timeout.
+    sources: ["https://www.rfc-editor.org/rfc/rfc8446#section-2", "https://pkg.go.dev/crypto/tls#Conn.Handshake", "https://docs.openssl.org/master/man3/SSL_accept/"]
+    latency_ms: 0
+    request:
+      type: object
+      required: [sock]
+      properties:
+        sock: {type: string}
+        timeout_ms: {type: integer, default: 0, description: "0: wait forever"}
+    response: {type: object, properties: {version: {type: string}}}
+    errors: [{code: tls_alert}, {code: handshake_timeout}]
+    behavior:
+      - if: "!(input.sock in state.sessions)"
+        then:
+          - transact:
+              - {table: waiting, op: put, key: "= input.sock", value: true}
+          - receive: "= 'tls:' + input.sock"
+            title: Waiting for the client's handshake
+            as: bell
+            timeout_ms: "= has(input.timeout_ms) ? input.timeout_ms : 0"
+            on_error:
+              - transact:
+                  - {table: waiting, op: delete, key: "= input.sock"}
+              - fail: {code: handshake_timeout, message: "tls: handshake timed out"}
+      - if: "state.sessions[input.sock].state == 'failed'"
+        then:
+          - fail:
+              code: tls_alert
+              message: "= 'remote error: tls: ' + state.sessions[input.sock].alert"
+              data: {alert: "= state.sessions[input.sock].alert", alert_code: "= state.sessions[input.sock].alert_code"}
+      - return: {version: "= state.sessions[input.sock].version"}
+
+  - component: tls
+    name: wake-server
+    kind: function
+    summary: "Wake the server's accept-handshake on a socket once the client's handshake is decided."
+    sources: ["https://www.rfc-editor.org/rfc/rfc8446#section-2"]
+    latency_ms: 0
+    request: {type: object, required: [sock], properties: {sock: {type: string}}}
+    response: {type: object, properties: {woken: {type: boolean}}}
+    behavior:
+      - if: "!(input.sock in state.waiting)"
+        then: [{return: {woken: false}}]
+      - transact:
+          - {table: waiting, op: delete, key: "= input.sock"}
+      - put: "= 'tls:' + input.sock"
+        value: 1
+      - return: {woken: true}
+
+  - component: tls
+    name: write
+    kind: function
+    summary: "Write application data on an established TLS session (the record layer's overhead isn't counted). Before the handshake, or after an alert, it fails."
+    sources: ["https://www.rfc-editor.org/rfc/rfc8446#section-5", "https://pkg.go.dev/crypto/tls#Conn.Write"]
+    latency_ms: 0
+    request:
+      type: object
+      required: [sock]
+      properties:
+        sock: {type: string}
+        data: {type: string, default: ""}
+        size: {type: integer, default: 0}
+        nonblocking: {type: boolean, default: false}
+        timeout_ms: {type: integer, default: 0}
+    response: {type: object, properties: {written: {type: integer}}}
+    errors: [{code: handshake_not_done}, {code: tls_alert}]
+    behavior:
+      - if: "!(input.sock in state.sessions)"
+        then: [{fail: {code: handshake_not_done, message: "tls: handshake has not completed"}}]
+      - if: "state.sessions[input.sock].state == 'failed'"
+        then: [{fail: {code: tls_alert, message: "= 'tls: ' + state.sessions[input.sock].alert", data: {alert: "= state.sessions[input.sock].alert"}}}]
+      - call: tcp-stack.send
+        input: "= input"
+        as: w
+      - return: "= vars.w.value"
+
+  - component: tls
+    name: read
+    kind: function
+    summary: >-
+      Read application data from a TLS session. A session whose handshake failed reports the
+      alert (the server sees "remote error: tls: unknown certificate authority"). At the end of
+      the stream, a close_notify first makes it a clean EOF; a TCP FIN without one is a
+      truncation, unexpected_eof (Go's io.ErrUnexpectedEOF, OpenSSL's unexpected eof while
+      reading).
+    sources: ["https://www.rfc-editor.org/rfc/rfc8446#section-6.1", "https://pkg.go.dev/crypto/tls#Conn.Read", "https://docs.openssl.org/master/man3/SSL_get_error/"]
+    latency_ms: 0
+    request:
+      type: object
+      required: [sock]
+      properties:
+        sock: {type: string}
+        max: {type: integer, default: 65536}
+        nonblocking: {type: boolean, default: false}
+        timeout_ms: {type: integer, default: 0}
+    response: RecvResult
+    errors: [{code: handshake_not_done}, {code: tls_alert}, {code: unexpected_eof}]
+    behavior:
+      - if: "!(input.sock in state.sessions)"
+        then: [{fail: {code: handshake_not_done, message: "tls: handshake has not completed"}}]
+      - if: "state.sessions[input.sock].state == 'failed'"
+        title: The peer's fatal alert
+        then:
+          - fail:
+              code: tls_alert
+              message: "= 'remote error: tls: ' + state.sessions[input.sock].alert"
+              data: {alert: "= state.sessions[input.sock].alert", alert_code: "= state.sessions[input.sock].alert_code"}
+      - call: tcp-stack.recv
+        input: "= input"
+        as: r
+      - if: "vars.r.value.eof && !state.sessions[input.sock].close_notify_received"
+        title: FIN without close_notify; a truncation attack looks like this
+        then: [{fail: {code: unexpected_eof, message: "tls: unexpected EOF (no close_notify)"}}]
+      - return: "= vars.r.value"
+
+  - component: tls
+    name: close
+    kind: function
+    summary: "Send close_notify on an established session, then close the socket. The peer's next read at the end of the stream is a clean EOF."
+    sources: ["https://www.rfc-editor.org/rfc/rfc8446#section-6.1", "https://pkg.go.dev/crypto/tls#Conn.Close"]
+    latency_ms: 0
+    request:
+      type: object
+      required: [sock]
+      properties:
+        sock: {type: string}
+        close_notify: {type: boolean, default: true, description: "false: close the TCP socket without close_notify"}
+    response: {type: object, properties: {rst: {type: boolean}}}
+    behavior:
+      - call: tcp-stack.get-sock
+        input: {sock: "= input.sock"}
+        as: s
+      - transact:
+          - {table: sessions, op: update, key: "= input.sock", value: {state: closed, close_notify_sent: true}}
+          - {table: sessions, op: update, key: "= vars.s.value.peer", value: {close_notify_received: true}}
+        when: "(!has(input.close_notify) || input.close_notify) && input.sock in state.sessions && state.sessions[input.sock].state == 'established' && vars.s.value.peer in state.sessions"
+        title: close_notify alert
+      - call: tcp-stack.close
+        input: {sock: "= input.sock"}
+        as: c
+      - return: "= vars.c.value"

@@ -1,0 +1,856 @@
+# Redis substrate (DESIGN §15.6, §16.5). Import it instead of modeling Redis again:
+#   imports: [{ontology: <path to this file or its directory>, as: redis}]
+# There is no code snapshot: every interface cites the Redis command reference by URL.
+# Scope: one standalone Redis server (a single logical database) with strings, hashes and
+# sorted sets; TTLs with lazy and active expiry; INCR/INCRBY, SET NX/XX/GET/EX/PX/KEEPTTL,
+# SETNX, EXPIRE/PEXPIRE with NX/XX/GT/LT; Lua scripts (EVAL, SCRIPT LOAD, EVALSHA) as one
+# atomic step; and pub/sub. Redis down, slow or losing replies is a fault on the `redis`
+# component (unavailable, timeout, lost_reply), not a mode of the model.
+# Not modeled: lists, sets, streams, MULTI/EXEC/WATCH, replication and failover, cluster
+# slots, persistence (RDB/AOF), eviction under maxmemory, pattern subscriptions.
+schema_version: 1
+id: redis
+name: Redis (substrate)
+level: service
+description: >-
+  A standalone Redis server. Every key lives in state.keys as {type: string|hash|zset, value,
+  expires_at?} (expires_at in epoch ms); string values are stored as strings, as Redis stores
+  them, hash fields as strings, and sorted-set scores as doubles. Expired keys are invisible to
+  every command and deleted lazily when a command touches them, or by the active expire-cycle.
+  A Lua script is a CEL expression run against the declared KEYS in one step, so no other
+  command interleaves; its writes apply all at once. PUBLISH delivers to the clients subscribed
+  at that moment through the topic redis-message (at most once, nothing is stored).
+source: {url: "https://redis.io/docs/latest/commands/"}
+
+configs:
+  - id: redis-script-max-keys
+    type: integer
+    value: 4
+    default: 4
+    summary: >-
+      The KEYS one EVAL may declare and write in this model (four write slots). Redis itself has
+      no such limit; raise it by adding slots to eval's transaction.
+    sources: ["https://redis.io/docs/latest/develop/interact/programmability/eval-intro/"]
+
+components:
+  - id: redis
+    name: Redis
+    kind: datastore
+    layer: data
+    summary: "One Redis server, database 0: its keyspace, loaded scripts and pub/sub subscriptions."
+    attributes: {technology: redis}
+    sources: ["https://redis.io/docs/latest/develop/data-types/", "https://redis.io/docs/latest/develop/reference/eviction/"]
+    state:
+      schema:
+        type: object
+        properties:
+          keys: {type: object, description: "key -> {type: string|hash|zset, value, expires_at?} (expires_at: epoch ms)"}
+          scripts: {type: object, description: "sha -> script, from SCRIPT LOAD"}
+          channels: {type: object, description: "channel -> {client: true}: the clients subscribed to it"}
+      initial: {keys: {}, scripts: {}, channels: {}}
+
+schemas:
+  - id: Key
+    summary: One key.
+    schema: {type: object, required: [key], properties: {key: {type: string, examples: ["session:42"]}}}
+  - id: Keys
+    summary: Several keys.
+    schema: {type: object, required: [keys], properties: {keys: {type: array, items: {type: string}, examples: [["a", "b"]]}}}
+  - id: ExpireFlags
+    summary: The EXPIRE options of Redis 7.0.
+    schema:
+      type: object
+      properties:
+        nx: {type: boolean, default: false, description: "Set only when the key has no expiry"}
+        xx: {type: boolean, default: false, description: "Set only when the key has an expiry"}
+        gt: {type: boolean, default: false, description: "Set only when the new expiry is later (a persistent key counts as infinite)"}
+        lt: {type: boolean, default: false, description: "Set only when the new expiry is earlier (a persistent key counts as infinite)"}
+
+interfaces:
+  # ---- Strings -------------------------------------------------------------------------------
+  - component: redis
+    name: get
+    kind: rpc
+    summary: "GET: the string value, or null when the key is missing or expired. WRONGTYPE on a hash or sorted set."
+    sources: ["https://redis.io/docs/latest/commands/get/"]
+    latency_ms: 1
+    request: Key
+    response: {type: object, properties: {value: {type: [string, "null"]}}}
+    errors: &wt [{code: wrongtype, retryable: false}]
+    behavior:
+      - &lazy-expire
+        transact:
+          - {table: keys, op: delete, key: "= input.key"}
+        when: "input.key in state.keys && 'expires_at' in state.keys[input.key] && state.keys[input.key].expires_at <= now"
+        title: Lazy expiry
+        detail: The key's TTL has passed; the command that touches it deletes it first and then sees no key.
+        source: "https://redis.io/docs/latest/commands/expire/#how-redis-expires-keys"
+      - &cur
+        set: {vars.cur: "= input.key in state.keys ? state.keys[input.key] : null"}
+      - &wrongtype-string
+        if: "vars.cur != null && vars.cur.type != 'string'"
+        then: [&wrongtype {fail: {code: wrongtype, retryable: false, message: "WRONGTYPE Operation against a key holding the wrong kind of value"}}]
+      - return: {value: "= vars.cur == null ? null : vars.cur.value"}
+
+  - component: redis
+    name: set
+    kind: rpc
+    summary: >-
+      SET key value [NX | XX] [GET] [EX s | PX ms | KEEPTTL]. Replaces the key whatever its type
+      (with GET, a non-string is WRONGTYPE) and drops its TTL unless KEEPTTL or a new EX/PX. With
+      NX (only if absent) or XX (only if present) a SET that doesn't apply writes nothing and
+      replies nil (ok: false). `old` is the previous string with GET, else null.
+    sources: ["https://redis.io/docs/latest/commands/set/"]
+    latency_ms: 1
+    request:
+      type: object
+      required: [key, value]
+      properties:
+        key: {type: string, examples: ["lock:order-1"]}
+        value: {type: string, examples: [owner-a]}
+        nx: {type: boolean, default: false}
+        xx: {type: boolean, default: false}
+        get: {type: boolean, default: false}
+        ex: {type: integer, default: 0, description: "Seconds; 0: none"}
+        px: {type: integer, default: 0, description: "Milliseconds; 0: none"}
+        keepttl: {type: boolean, default: false}
+    response: {type: object, properties: {ok: {type: boolean}, old: {type: [string, "null"]}}}
+    errors: &wt-err [{code: wrongtype, retryable: false}, {code: err, retryable: false}]
+    behavior:
+      - *lazy-expire
+      - *cur
+      - set:
+          vars.nx: "= has(input.nx) && input.nx"
+          vars.xx: "= has(input.xx) && input.xx"
+          vars.get: "= has(input.get) && input.get"
+          vars.keepttl: "= has(input.keepttl) && input.keepttl"
+          vars.ex: "= has(input.ex) ? input.ex : 0"
+          vars.px: "= has(input.px) ? input.px : 0"
+      - if: "(vars.nx && vars.xx) || (vars.ex != 0 && vars.px != 0) || (vars.keepttl && (vars.ex != 0 || vars.px != 0))"
+        then: [{fail: {code: err, retryable: false, message: "ERR syntax error"}}]
+      - if: "vars.ex < 0 || vars.px < 0"
+        then: [{fail: {code: err, retryable: false, message: "ERR invalid expire time in 'set' command"}}]
+      - if: "vars.get && vars.cur != null && vars.cur.type != 'string'"
+        then: [*wrongtype]
+      - set: {vars.old: "= vars.get && vars.cur != null ? vars.cur.value : null"}
+      - if: "(vars.nx && vars.cur != null) || (vars.xx && vars.cur == null)"
+        then: [{title: "NX or XX not met"}, {return: {ok: false, old: "= vars.old"}}]
+      - set:
+          vars.ms: "= vars.ex > 0 ? vars.ex * 1000 : vars.px"
+          vars.row: "= {'type': 'string', 'value': string(input.value)}"
+      - transact:
+          - table: keys
+            op: put
+            key: "= input.key"
+            value: >-
+              = vars.ms > 0 ? merge(vars.row, {'expires_at': now + vars.ms}) :
+                (vars.keepttl && vars.cur != null && 'expires_at' in vars.cur ? merge(vars.row, {'expires_at': vars.cur.expires_at}) : vars.row)
+      - return: {ok: true, old: "= vars.old"}
+
+  - component: redis
+    name: setnx
+    kind: rpc
+    summary: "SETNX: set the key only when it doesn't exist; 1 when set, 0 when it already existed. Sets no TTL (pair it with EXPIRE, or use SET NX PX)."
+    sources: ["https://redis.io/docs/latest/commands/setnx/"]
+    latency_ms: 1
+    request: {type: object, required: [key, value], properties: {key: {type: string, examples: ["lock:order-1"]}, value: {type: string, examples: [owner-a]}}}
+    response: {type: object, properties: {set: {type: integer, enum: [0, 1]}}}
+    behavior:
+      - *lazy-expire
+      - *cur
+      - if: "vars.cur != null"
+        then: [{return: {set: 0}}]
+      - transact:
+          - {table: keys, op: put, key: "= input.key", value: {type: string, value: "= string(input.value)"}}
+      - return: {set: 1}
+
+  - component: redis
+    name: incr
+    kind: rpc
+    summary: "INCR: add 1 to the integer in a string key (a missing key counts as 0); the TTL is kept. A non-integer value is ERR."
+    sources: ["https://redis.io/docs/latest/commands/incr/"]
+    latency_ms: 1
+    request: Key
+    response: &int-value {type: object, properties: {value: {type: integer}}}
+    errors: *wt-err
+    behavior:
+      - *lazy-expire
+      - *cur
+      - *wrongtype-string
+      - &not-integer
+        if: "vars.cur != null && !vars.cur.value.matches('^-?[0-9]+$')"
+        then: [{fail: {code: err, retryable: false, message: "ERR value is not an integer or out of range"}}]
+      - &incr-write
+        set: {vars.n: "= (vars.cur == null ? 0 : int(vars.cur.value)) + (has(input.increment) ? input.increment : 1)"}
+      - &incr-put
+        transact:
+          - {table: keys, op: put, key: "= input.key", value: "= vars.cur == null ? {'type': 'string', 'value': string(vars.n)} : merge(vars.cur, {'value': string(vars.n)})"}
+      - return: {value: "= vars.n"}
+
+  - component: redis
+    name: incrby
+    kind: rpc
+    summary: "INCRBY: INCR by `increment` (may be negative)."
+    sources: ["https://redis.io/docs/latest/commands/incrby/"]
+    latency_ms: 1
+    request: {type: object, required: [key, increment], properties: {key: {type: string, examples: ["hits:a"]}, increment: {type: integer, examples: [5]}}}
+    response: *int-value
+    errors: *wt-err
+    behavior:
+      - *lazy-expire
+      - *cur
+      - *wrongtype-string
+      - *not-integer
+      - *incr-write
+      - *incr-put
+      - return: {value: "= vars.n"}
+
+  # ---- Keys and expiry -----------------------------------------------------------------------
+  - component: redis
+    name: del
+    kind: rpc
+    summary: "DEL: delete the keys, of any type; the reply counts the keys that existed (expired ones don't)."
+    sources: ["https://redis.io/docs/latest/commands/del/"]
+    latency_ms: 1
+    request: Keys
+    response: {type: object, properties: {deleted: {type: integer}}}
+    behavior:
+      - set:
+          vars.live: "= input.keys.distinct().filter(k, k in state.keys && (!('expires_at' in state.keys[k]) || state.keys[k].expires_at > now))"
+          vars.all: "= input.keys.distinct().filter(k, k in state.keys)"
+      - foreach: "= vars.all"
+        as: k
+        max: 1000
+        steps:
+          - transact:
+              - {table: keys, op: delete, key: "= vars.k"}
+      - return: {deleted: "= size(vars.live)"}
+
+  - component: redis
+    name: exists
+    kind: rpc
+    summary: "EXISTS: how many of the keys exist (a key named twice counts twice); expired keys don't."
+    sources: ["https://redis.io/docs/latest/commands/exists/"]
+    latency_ms: 1
+    request: Keys
+    response: {type: object, properties: {count: {type: integer}}}
+    behavior:
+      - return: {count: "= size(input.keys.filter(k, k in state.keys && (!('expires_at' in state.keys[k]) || state.keys[k].expires_at > now)))"}
+
+  - component: redis
+    name: expire
+    kind: rpc
+    summary: >-
+      EXPIRE key seconds [NX | XX | GT | LT]: 1 when the timeout was set, 0 when the key is
+      missing or a flag refused it. A zero or negative timeout deletes the key (and replies 1).
+      Overwriting the key (SET, DEL) drops the TTL; INCR, HSET and ZADD keep it.
+    sources: ["https://redis.io/docs/latest/commands/expire/"]
+    latency_ms: 1
+    request: {allOf: [{$ref: Key}, {$ref: ExpireFlags}, {type: object, required: [seconds], properties: {seconds: {type: integer, examples: [60]}}}]}
+    response: &set-flag {type: object, properties: {set: {type: integer, enum: [0, 1]}}}
+    errors: [{code: err, retryable: false}]
+    behavior:
+      - set: {vars.ms: "= input.seconds * 1000"}
+      - &expire-body
+        if: "true"
+        then:
+          - *lazy-expire
+          - *cur
+          - set:
+              vars.nx: "= has(input.nx) && input.nx"
+              vars.xx: "= has(input.xx) && input.xx"
+              vars.gt: "= has(input.gt) && input.gt"
+              vars.lt: "= has(input.lt) && input.lt"
+          - if: "(vars.nx && (vars.xx || vars.gt || vars.lt)) || (vars.gt && vars.lt)"
+            then: [{fail: {code: err, retryable: false, message: "ERR NX and XX, GT or LT options at the same time are not compatible"}}]
+          - if: "vars.cur == null"
+            then: [{return: {set: 0}}]
+          - set:
+              vars.has_ttl: "= 'expires_at' in vars.cur"
+              vars.at: "= now + vars.ms"
+          - if: >-
+              (vars.nx && vars.has_ttl) || (vars.xx && !vars.has_ttl) ||
+              (vars.gt && (!vars.has_ttl || vars.at <= vars.cur.expires_at)) ||
+              (vars.lt && vars.has_ttl && vars.at >= vars.cur.expires_at)
+            then: [{title: "Flag refused the new expiry"}, {return: {set: 0}}]
+          - if: "vars.ms <= 0"
+            then:
+              - {title: "A timeout in the past deletes the key"}
+              - transact: [{table: keys, op: delete, key: "= input.key"}]
+              - return: {set: 1}
+          - transact:
+              - {table: keys, op: put, key: "= input.key", value: "= merge(vars.cur, {'expires_at': vars.at})"}
+          - return: {set: 1}
+
+  - component: redis
+    name: pexpire
+    kind: rpc
+    summary: "PEXPIRE: EXPIRE in milliseconds."
+    sources: ["https://redis.io/docs/latest/commands/pexpire/"]
+    latency_ms: 1
+    request: {allOf: [{$ref: Key}, {$ref: ExpireFlags}, {type: object, required: [ms], properties: {ms: {type: integer, examples: [1500]}}}]}
+    response: *set-flag
+    errors: [{code: err, retryable: false}]
+    behavior:
+      - set: {vars.ms: "= input.ms"}
+      - *expire-body
+
+  - component: redis
+    name: ttl
+    kind: rpc
+    summary: "TTL: seconds left (rounded, as Redis does: (ms + 500) / 1000), -1 for a key without expiry, -2 for a missing or expired key."
+    sources: ["https://redis.io/docs/latest/commands/ttl/"]
+    latency_ms: 1
+    request: Key
+    response: {type: object, properties: {ttl: {type: integer}}}
+    behavior:
+      - *lazy-expire
+      - *cur
+      - return: {ttl: "= vars.cur == null ? -2 : ('expires_at' in vars.cur ? (vars.cur.expires_at - now + 500) / 1000 : -1)"}
+
+  - component: redis
+    name: pttl
+    kind: rpc
+    summary: "PTTL: milliseconds left, -1 without expiry, -2 when missing or expired."
+    sources: ["https://redis.io/docs/latest/commands/pttl/"]
+    latency_ms: 1
+    request: Key
+    response: {type: object, properties: {pttl: {type: integer}}}
+    behavior:
+      - *lazy-expire
+      - *cur
+      - return: {pttl: "= vars.cur == null ? -2 : ('expires_at' in vars.cur ? vars.cur.expires_at - now : -1)"}
+
+  - component: redis
+    name: persist
+    kind: rpc
+    summary: "PERSIST: remove the key's expiry; 1 when one was removed, 0 when the key is missing or had none."
+    sources: ["https://redis.io/docs/latest/commands/persist/"]
+    latency_ms: 1
+    request: Key
+    response: *set-flag
+    behavior:
+      - *lazy-expire
+      - *cur
+      - if: "vars.cur == null || !('expires_at' in vars.cur)"
+        then: [{return: {set: 0}}]
+      - transact:
+          - {table: keys, op: put, key: "= input.key", value: "= omit(vars.cur, 'expires_at')"}
+      - return: {set: 1}
+
+  - component: redis
+    name: expire-cycle
+    kind: event
+    summary: >-
+      The active expire cycle: deletes every key whose TTL has passed. Redis samples volatile keys
+      about ten times a second; callers drive this sweep (a scenario step or a repeating flow)
+      when the state should show the deletion. Commands never see expired keys either way.
+    sources: ["https://redis.io/docs/latest/commands/expire/#how-redis-expires-keys"]
+    latency_ms: 0
+    request: {type: object, properties: {}}
+    response: {type: object, properties: {deleted: {type: array, items: {type: string}}}}
+    behavior:
+      - set: {vars.expired: "= state.keys.filter(k, 'expires_at' in state.keys[k] && state.keys[k].expires_at <= now)"}
+      - foreach: "= vars.expired"
+        as: k
+        max: 1000
+        steps:
+          - transact: [{table: keys, op: delete, key: "= vars.k"}]
+      - return: {deleted: "= vars.expired"}
+
+  # ---- Hashes --------------------------------------------------------------------------------
+  - component: redis
+    name: hset
+    kind: rpc
+    summary: "HSET: set the given fields (values stored as strings), creating the hash; replies with the number of fields added (not updated). The TTL is kept."
+    sources: ["https://redis.io/docs/latest/commands/hset/"]
+    latency_ms: 1
+    request: {type: object, required: [key, fields], properties: {key: {type: string, examples: ["user:1"]}, fields: {type: object, minProperties: 1, description: "field -> value"}}}
+    response: {type: object, properties: {added: {type: integer}}}
+    errors: *wt
+    behavior:
+      - *lazy-expire
+      - *cur
+      - &wrongtype-hash
+        if: "vars.cur != null && vars.cur.type != 'hash'"
+        then: [*wrongtype]
+      - set:
+          vars.fields: "= input.fields.transformMap(f, v, string(v))"
+          vars.added: "= size(input.fields.filter(f, vars.cur == null || !(f in vars.cur.value)))"
+      - transact:
+          - {table: keys, op: put, key: "= input.key", value: "= vars.cur == null ? {'type': 'hash', 'value': vars.fields} : merge(vars.cur, {'value': vars.fields})"}
+      - return: {added: "= vars.added"}
+
+  - component: redis
+    name: hget
+    kind: rpc
+    summary: "HGET: one field's value, or null."
+    sources: ["https://redis.io/docs/latest/commands/hget/"]
+    latency_ms: 1
+    request: {type: object, required: [key, field], properties: {key: {type: string, examples: ["user:1"]}, field: {type: string, examples: [name]}}}
+    response: {type: object, properties: {value: {type: [string, "null"]}}}
+    errors: *wt
+    behavior:
+      - *lazy-expire
+      - *cur
+      - *wrongtype-hash
+      - return: {value: "= vars.cur != null && input.field in vars.cur.value ? vars.cur.value[input.field] : null"}
+
+  - component: redis
+    name: hgetall
+    kind: rpc
+    summary: "HGETALL: every field; {} for a missing key."
+    sources: ["https://redis.io/docs/latest/commands/hgetall/"]
+    latency_ms: 1
+    request: Key
+    response: {type: object, properties: {fields: {type: object}}}
+    errors: *wt
+    behavior:
+      - *lazy-expire
+      - *cur
+      - *wrongtype-hash
+      - return: {fields: "= vars.cur == null ? {} : vars.cur.value"}
+
+  - component: redis
+    name: hdel
+    kind: rpc
+    summary: "HDEL: remove fields; replies with how many existed. Removing the last field deletes the key."
+    sources: ["https://redis.io/docs/latest/commands/hdel/"]
+    latency_ms: 1
+    request: {type: object, required: [key, fields], properties: {key: {type: string, examples: ["user:1"]}, fields: {type: array, items: {type: string}, minItems: 1, examples: [[name]]}}}
+    response: {type: object, properties: {deleted: {type: integer}}}
+    errors: *wt
+    behavior:
+      - *lazy-expire
+      - *cur
+      - *wrongtype-hash
+      - if: "vars.cur == null"
+        then: [{return: {deleted: 0}}]
+      - set:
+          vars.removed: "= size(input.fields.distinct().filter(f, f in vars.cur.value))"
+          vars.left: "= vars.cur.value.filter(f, !(f in input.fields))"
+      - transact: [{table: keys, op: delete, key: "= input.key"}]
+        when: "size(vars.left) == 0"
+        title: Last field removed; the key goes too
+      - transact:
+          - {table: keys, op: put, key: "= input.key", value: "= merge(omit(vars.cur, 'value'), {'value': vars.left.transformMapEntry(i, f, {f: vars.cur.value[f]})})"}
+        when: "size(vars.left) > 0"
+      - return: {deleted: "= vars.removed"}
+
+  - component: redis
+    name: hincrby
+    kind: rpc
+    summary: "HINCRBY: add `increment` to an integer field (missing fields and keys start at 0). A non-integer field is ERR."
+    sources: ["https://redis.io/docs/latest/commands/hincrby/"]
+    latency_ms: 1
+    request: {type: object, required: [key, field, increment], properties: {key: {type: string, examples: ["user:1"]}, field: {type: string, examples: [visits]}, increment: {type: integer, examples: [1]}}}
+    response: *int-value
+    errors: *wt-err
+    behavior:
+      - *lazy-expire
+      - *cur
+      - *wrongtype-hash
+      - set: {vars.old: "= vars.cur != null && input.field in vars.cur.value ? vars.cur.value[input.field] : '0'"}
+      - if: "!vars.old.matches('^-?[0-9]+$')"
+        then: [{fail: {code: err, retryable: false, message: "ERR hash value is not an integer"}}]
+      - set: {vars.n: "= int(vars.old) + input.increment"}
+      - transact:
+          - {table: keys, op: put, key: "= input.key", value: "= vars.cur == null ? {'type': 'hash', 'value': {input.field: string(vars.n)}} : merge(vars.cur, {'value': {input.field: string(vars.n)}})"}
+      - return: {value: "= vars.n"}
+
+  # ---- Sorted sets ---------------------------------------------------------------------------
+  - component: redis
+    name: zadd
+    kind: rpc
+    summary: >-
+      ZADD key [NX | XX] [GT | LT] [CH] {member: score}: add members or update their scores.
+      NX only adds, XX only updates, GT/LT update only to a higher/lower score (and still add new
+      members). Replies with the members added, or with CH the members added or changed.
+    sources: ["https://redis.io/docs/latest/commands/zadd/"]
+    latency_ms: 1
+    request:
+      type: object
+      required: [key, members]
+      properties:
+        key: {type: string, examples: [leaderboard]}
+        members: {type: object, minProperties: 1, description: "member -> score"}
+        nx: {type: boolean, default: false}
+        xx: {type: boolean, default: false}
+        gt: {type: boolean, default: false}
+        lt: {type: boolean, default: false}
+        ch: {type: boolean, default: false}
+    response: {type: object, properties: {count: {type: integer}}}
+    errors: *wt-err
+    behavior:
+      - *lazy-expire
+      - *cur
+      - &wrongtype-zset
+        if: "vars.cur != null && vars.cur.type != 'zset'"
+        then: [*wrongtype]
+      - set:
+          vars.nx: "= has(input.nx) && input.nx"
+          vars.xx: "= has(input.xx) && input.xx"
+          vars.gt: "= has(input.gt) && input.gt"
+          vars.lt: "= has(input.lt) && input.lt"
+          vars.old: "= vars.cur == null ? {} : vars.cur.value"
+      - if: "(vars.nx && vars.xx) || (vars.gt && vars.lt) || (vars.nx && (vars.gt || vars.lt))"
+        then: [{fail: {code: err, retryable: false, message: "ERR GT, LT, and/or NX options at the same time are not compatible"}}]
+      - set:
+          vars.apply: >-
+            = input.members.transformMap(m, s,
+                (m in vars.old) ? (!vars.nx && (!vars.gt || double(s) > vars.old[m]) && (!vars.lt || double(s) < vars.old[m])) : !vars.xx,
+                double(s))
+      - set:
+          vars.added: "= size(vars.apply.filter(m, !(m in vars.old)))"
+          vars.changed: "= size(vars.apply.filter(m, !(m in vars.old) || vars.old[m] != vars.apply[m]))"
+      - transact:
+          - {table: keys, op: put, key: "= input.key", value: "= vars.cur == null ? {'type': 'zset', 'value': vars.apply} : merge(vars.cur, {'value': vars.apply})"}
+        when: "size(vars.apply) > 0"
+      - return: {count: "= has(input.ch) && input.ch ? vars.changed : vars.added"}
+
+  - component: redis
+    name: zincrby
+    kind: rpc
+    summary: "ZINCRBY: add `increment` to a member's score (a new member starts at 0); replies with the new score."
+    sources: ["https://redis.io/docs/latest/commands/zincrby/"]
+    latency_ms: 1
+    request: {type: object, required: [key, member, increment], properties: {key: {type: string, examples: [leaderboard]}, member: {type: string, examples: [ada]}, increment: {type: number, examples: [5]}}}
+    response: {type: object, properties: {score: {type: number}}}
+    errors: *wt
+    behavior:
+      - *lazy-expire
+      - *cur
+      - *wrongtype-zset
+      - set: {vars.score: "= (vars.cur != null && input.member in vars.cur.value ? double(vars.cur.value[input.member]) : 0.0) + double(input.increment)"}
+      - transact:
+          - {table: keys, op: put, key: "= input.key", value: "= vars.cur == null ? {'type': 'zset', 'value': {input.member: vars.score}} : merge(vars.cur, {'value': {input.member: vars.score}})"}
+      - return: {score: "= vars.score"}
+
+  - component: redis
+    name: zscore
+    kind: rpc
+    summary: "ZSCORE: a member's score, or null."
+    sources: ["https://redis.io/docs/latest/commands/zscore/"]
+    latency_ms: 1
+    request: {type: object, required: [key, member], properties: {key: {type: string, examples: [leaderboard]}, member: {type: string, examples: [ada]}}}
+    response: {type: object, properties: {score: {type: [number, "null"]}}}
+    errors: *wt
+    behavior:
+      - *lazy-expire
+      - *cur
+      - *wrongtype-zset
+      - return: {score: "= vars.cur != null && input.member in vars.cur.value ? vars.cur.value[input.member] : null"}
+
+  - component: redis
+    name: zcard
+    kind: rpc
+    summary: "ZCARD: the number of members; 0 for a missing key."
+    sources: ["https://redis.io/docs/latest/commands/zcard/"]
+    latency_ms: 1
+    request: Key
+    response: {type: object, properties: {count: {type: integer}}}
+    errors: *wt
+    behavior:
+      - *lazy-expire
+      - *cur
+      - *wrongtype-zset
+      - return: {count: "= vars.cur == null ? 0 : size(vars.cur.value)"}
+
+  - component: redis
+    name: zrem
+    kind: rpc
+    summary: "ZREM: remove members; replies with how many existed. Removing the last member deletes the key."
+    sources: ["https://redis.io/docs/latest/commands/zrem/"]
+    latency_ms: 1
+    request: {type: object, required: [key, members], properties: {key: {type: string, examples: [leaderboard]}, members: {type: array, items: {type: string}, minItems: 1, examples: [[ada]]}}}
+    response: {type: object, properties: {count: {type: integer}}}
+    errors: *wt
+    behavior:
+      - *lazy-expire
+      - *cur
+      - *wrongtype-zset
+      - if: "vars.cur == null"
+        then: [{return: {count: 0}}]
+      - set:
+          vars.removed: "= size(input.members.distinct().filter(m, m in vars.cur.value))"
+          vars.left: "= vars.cur.value.filter(m, !(m in input.members))"
+      - &zset-rewrite
+        if: "size(vars.left) == 0"
+        then:
+          - transact: [{table: keys, op: delete, key: "= input.key"}]
+        else:
+          - transact:
+              - {table: keys, op: put, key: "= input.key", value: "= merge(omit(vars.cur, 'value'), {'value': vars.left.transformMapEntry(i, m, {m: vars.cur.value[m]})})"}
+      - return: {count: "= vars.removed"}
+
+  - component: redis
+    name: zrange
+    kind: rpc
+    summary: >-
+      ZRANGE key start stop [REV]: members by rank, lowest score first (ties by member, in byte
+      order), with their scores. Negative indexes count from the end; out-of-range ends clamp.
+    sources: ["https://redis.io/docs/latest/commands/zrange/"]
+    latency_ms: 1
+    request:
+      type: object
+      required: [key]
+      properties:
+        key: {type: string, examples: [leaderboard]}
+        start: {type: integer, default: 0}
+        stop: {type: integer, default: -1}
+        rev: {type: boolean, default: false}
+    response: &zrange-out {type: object, properties: {members: {type: array, items: {type: string}}, scores: {type: array, items: {type: number}}}}
+    errors: *wt
+    behavior:
+      - *lazy-expire
+      - *cur
+      - *wrongtype-zset
+      - &zsorted
+        set:
+          vars.z: "= vars.cur == null ? {} : vars.cur.value"
+      - &zsorted2
+        set:
+          vars.sorted: "= vars.z.map(m, m).sortBy(m, size(vars.z.filter(o, vars.z[o] < vars.z[m] || (vars.z[o] == vars.z[m] && o < m))))"
+      - set:
+          vars.list: "= has(input.rev) && input.rev ? vars.sorted.reverse() : vars.sorted"
+          vars.n: "= size(vars.sorted)"
+      - set:
+          vars.a: "= has(input.start) ? (input.start < 0 ? math.greatest(0, vars.n + input.start) : input.start) : 0"
+          vars.b: "= has(input.stop) ? (input.stop < 0 ? vars.n + input.stop : math.least(input.stop, vars.n - 1)) : vars.n - 1"
+      - set:
+          vars.out: "= vars.a > vars.b || vars.a >= vars.n ? [] : vars.list.slice(vars.a, vars.b + 1)"
+      - return: {members: "= vars.out", scores: "= vars.out.map(m, vars.z[m])"}
+
+  - component: redis
+    name: zrangebyscore
+    kind: rpc
+    summary: >-
+      ZRANGE key min max BYSCORE [LIMIT offset count] (ZRANGEBYSCORE): members whose score is in
+      [min, max], lowest first; min_exclusive / max_exclusive are Redis's "(" prefix. count 0
+      means no limit.
+    sources: ["https://redis.io/docs/latest/commands/zrangebyscore/", "https://redis.io/docs/latest/commands/zrange/"]
+    latency_ms: 1
+    request: &score-range
+      type: object
+      required: [key, min, max]
+      properties:
+        key: {type: string, examples: [leaderboard]}
+        min: {type: number, examples: [0]}
+        max: {type: number, examples: [100]}
+        min_exclusive: {type: boolean, default: false}
+        max_exclusive: {type: boolean, default: false}
+        offset: {type: integer, default: 0}
+        count: {type: integer, default: 0}
+    response: *zrange-out
+    errors: *wt
+    behavior:
+      - *lazy-expire
+      - *cur
+      - *wrongtype-zset
+      - *zsorted
+      - *zsorted2
+      - &in-range
+        set:
+          vars.hit: >-
+            = vars.sorted.filter(m,
+                (has(input.min_exclusive) && input.min_exclusive ? vars.z[m] > input.min : vars.z[m] >= input.min) &&
+                (has(input.max_exclusive) && input.max_exclusive ? vars.z[m] < input.max : vars.z[m] <= input.max))
+      - set:
+          vars.off: "= has(input.offset) ? input.offset : 0"
+          vars.cnt: "= has(input.count) ? input.count : 0"
+      - set:
+          vars.out: "= vars.off >= size(vars.hit) ? [] : vars.hit.slice(vars.off, vars.cnt > 0 ? math.least(size(vars.hit), vars.off + vars.cnt) : size(vars.hit))"
+      - return: {members: "= vars.out", scores: "= vars.out.map(m, vars.z[m])"}
+
+  - component: redis
+    name: zremrangebyscore
+    kind: rpc
+    summary: "ZREMRANGEBYSCORE: remove the members whose score is in [min, max]; replies with how many. The sliding-window rate limiter's trim."
+    sources: ["https://redis.io/docs/latest/commands/zremrangebyscore/"]
+    latency_ms: 1
+    request: *score-range
+    response: {type: object, properties: {count: {type: integer}}}
+    errors: *wt
+    behavior:
+      - *lazy-expire
+      - *cur
+      - *wrongtype-zset
+      - if: "vars.cur == null"
+        then: [{return: {count: 0}}]
+      - *zsorted
+      - *zsorted2
+      - *in-range
+      - set: {vars.left: "= vars.z.filter(m, !(m in vars.hit))"}
+      - *zset-rewrite
+      - return: {count: "= size(vars.hit)"}
+
+  # ---- Lua scripts ---------------------------------------------------------------------------
+  - component: redis
+    name: eval
+    kind: rpc
+    summary: >-
+      EVAL script numkeys KEYS ARGV. The script is a CEL expression standing in for the Lua
+      source. It sees KEYS, ARGV, now (epoch ms) and data (KEYS[i] -> the key's row
+      {type, value, expires_at?}, or null when missing or expired) and returns
+      {reply, writes?, error?}: writes maps a declared key to its new row ({type, value} plus
+      px (a TTL in ms) or keepttl: true) or to null (delete). The script runs as one atomic step,
+      so no other client's command interleaves, and its writes land together. Like Redis, there
+      is no rollback: a script that returns `error` still applies its writes, then the call
+      fails script_error. Writing a key not in KEYS is ERR, as keys must be declared.
+    description: >-
+      Redis runs a script atomically ("no other script or Redis command will be executed while a
+      script is being executed") but doesn't roll back the writes a script made before a runtime
+      error. The transaction below has redis-script-max-keys put/delete slot pairs; unused slots
+      write and remove the reserved key "~", as the DynamoDB substrate's transactions do.
+    sources: ["https://redis.io/docs/latest/commands/eval/", "https://redis.io/docs/latest/develop/interact/programmability/eval-intro/", "https://redis.io/docs/latest/develop/interact/programmability/lua-api/"]
+    latency_ms: 1
+    request:
+      type: object
+      required: [script]
+      properties:
+        script: {type: string, examples: ["{'reply': data[KEYS[0]] == null ? null : data[KEYS[0]].value}"]}
+        keys: {type: array, items: {type: string}, default: []}
+        args: {type: array, default: []}
+    response: {type: object, properties: {reply: {}}}
+    errors: [{code: err, retryable: false}, {code: script_error, retryable: false}]
+    behavior:
+      - set:
+          vars.keys: "= has(input.keys) ? input.keys.distinct() : []"
+          vars.args: "= has(input.args) ? input.args : []"
+      - if: "size(vars.keys) > config['redis-script-max-keys']"
+        then: [{fail: {code: err, retryable: false, message: "= 'ERR this model allows at most ' + string(config['redis-script-max-keys']) + ' KEYS per script'"}}]
+      - foreach: "= vars.keys"
+        as: k
+        steps:
+          - transact: [{table: keys, op: delete, key: "= vars.k"}]
+            when: "vars.k in state.keys && 'expires_at' in state.keys[vars.k] && state.keys[vars.k].expires_at <= now"
+            title: Lazy expiry of a declared key
+      - set:
+          vars.data: "= vars.keys.transformMapEntry(i, k, {k: k in state.keys ? state.keys[k] : null})"
+      - set:
+          vars.out: "= eval(input.script, {'KEYS': has(input.keys) ? input.keys : [], 'ARGV': vars.args, 'data': vars.data, 'now': now})"
+      - set:
+          vars.writes: "= 'writes' in vars.out ? vars.out.writes : {}"
+      - if: "!vars.writes.all(k, k in vars.keys)"
+        then: [{fail: {code: err, retryable: false, message: "ERR Script attempted to access a non local key in a cluster node script"}}]
+      - set:
+          vars.wk: "= vars.keys.filter(k, k in vars.writes)"
+      - set:
+          vars.rows: >-
+            = vars.wk.map(k, vars.writes[k] == null ? null :
+                ('px' in vars.writes[k] && vars.writes[k].px > 0 ? merge(omit(vars.writes[k], 'px', 'keepttl'), {'expires_at': now + vars.writes[k].px}) :
+                ('keepttl' in vars.writes[k] && vars.writes[k].keepttl && vars.data[k] != null && 'expires_at' in vars.data[k] ? merge(omit(vars.writes[k], 'px', 'keepttl'), {'expires_at': vars.data[k].expires_at}) :
+                 omit(vars.writes[k], 'px', 'keepttl', 'expires_at'))))
+      - transact:
+          - {table: keys, op: put, key: "= size(vars.wk) > 0 ? vars.wk[0] : '~'", value: "= size(vars.wk) > 0 ? vars.rows[0] : null"}
+          - {table: keys, op: delete, key: "= size(vars.wk) > 0 && vars.rows[0] == null ? vars.wk[0] : '~'"}
+          - {table: keys, op: put, key: "= size(vars.wk) > 1 ? vars.wk[1] : '~'", value: "= size(vars.wk) > 1 ? vars.rows[1] : null"}
+          - {table: keys, op: delete, key: "= size(vars.wk) > 1 && vars.rows[1] == null ? vars.wk[1] : '~'"}
+          - {table: keys, op: put, key: "= size(vars.wk) > 2 ? vars.wk[2] : '~'", value: "= size(vars.wk) > 2 ? vars.rows[2] : null"}
+          - {table: keys, op: delete, key: "= size(vars.wk) > 2 && vars.rows[2] == null ? vars.wk[2] : '~'"}
+          - {table: keys, op: put, key: "= size(vars.wk) > 3 ? vars.wk[3] : '~'", value: "= size(vars.wk) > 3 ? vars.rows[3] : null"}
+          - {table: keys, op: delete, key: "= size(vars.wk) > 3 && vars.rows[3] == null ? vars.wk[3] : '~'"}
+        title: The script's writes land together
+        when: "size(vars.wk) > 0"
+      - if: "'error' in vars.out && vars.out.error != null"
+        then: [{title: "Script error after its writes (no rollback)"}, {fail: {code: script_error, retryable: false, message: "= 'ERR ' + string(vars.out.error)"}}]
+      - return: {reply: "= 'reply' in vars.out ? vars.out.reply : null"}
+
+  - component: redis
+    name: script-load
+    kind: rpc
+    summary: >-
+      SCRIPT LOAD: cache a script and reply with its digest. Redis uses SHA1; this model uses the
+      first 40 hex digits of SHA-256 (the same length), which callers only pass back to EVALSHA.
+    sources: ["https://redis.io/docs/latest/commands/script-load/"]
+    latency_ms: 1
+    request: {type: object, required: [script], properties: {script: {type: string}}}
+    response: {type: object, properties: {sha: {type: string}}}
+    behavior:
+      - set: {vars.sha: "= sha256(input.script).substring(0, 40)"}
+      - transact: [{table: scripts, op: put, key: "= vars.sha", value: "= input.script"}]
+      - return: {sha: "= vars.sha"}
+
+  - component: redis
+    name: evalsha
+    kind: rpc
+    summary: "EVALSHA: EVAL a cached script by digest; NOSCRIPT when the server doesn't have it (never loaded, or lost on a restart)."
+    sources: ["https://redis.io/docs/latest/commands/evalsha/"]
+    latency_ms: 0
+    request:
+      type: object
+      required: [sha]
+      properties:
+        sha: {type: string}
+        keys: {type: array, items: {type: string}, default: []}
+        args: {type: array, default: []}
+    response: {type: object, properties: {reply: {}}}
+    errors: [{code: noscript, retryable: false}, {code: err, retryable: false}, {code: script_error, retryable: false}]
+    behavior:
+      - if: "!(input.sha in state.scripts)"
+        then: [{fail: {code: noscript, retryable: false, message: "NOSCRIPT No matching script. Please use EVAL."}}]
+      - call: redis.eval
+        input: {script: "= state.scripts[input.sha]", keys: "= has(input.keys) ? input.keys : []", args: "= has(input.args) ? input.args : []"}
+        as: r
+      - return: "= vars.r.value"
+
+  # ---- Pub/sub -------------------------------------------------------------------------------
+  - component: redis
+    name: subscribe
+    kind: rpc
+    summary: "SUBSCRIBE: the client (a connection name) listens on the channels; replies with how many channels it is subscribed to."
+    sources: ["https://redis.io/docs/latest/commands/subscribe/", "https://redis.io/docs/latest/develop/interact/pubsub/"]
+    latency_ms: 1
+    request: &sub-req {type: object, required: [client, channels], properties: {client: {type: string, examples: [worker-1]}, channels: {type: array, items: {type: string}, minItems: 1, examples: [[invalidations]]}}}
+    response: &sub-out {type: object, properties: {subscriptions: {type: integer}}}
+    behavior:
+      - foreach: "= input.channels.distinct()"
+        as: ch
+        steps:
+          - transact:
+              - {table: channels, op: put, key: "= vars.ch", value: "= merge(vars.ch in state.channels ? state.channels[vars.ch] : {}, {input.client: true})"}
+      - return: {subscriptions: "= size(state.channels.filter(c, input.client in state.channels[c]))"}
+
+  - component: redis
+    name: unsubscribe
+    kind: rpc
+    summary: "UNSUBSCRIBE: stop listening on the channels (a dropped connection unsubscribes from all of them)."
+    sources: ["https://redis.io/docs/latest/commands/unsubscribe/"]
+    latency_ms: 1
+    request: *sub-req
+    response: *sub-out
+    behavior:
+      - foreach: "= input.channels.distinct().filter(c, c in state.channels && input.client in state.channels[c])"
+        as: ch
+        steps:
+          - transact:
+              - {table: channels, op: delete, key: "= vars.ch"}
+            when: "size(state.channels[vars.ch]) == 1"
+          - transact:
+              - {table: channels, op: put, key: "= vars.ch", value: "= omit(state.channels[vars.ch], input.client)"}
+            when: "size(state.channels[vars.ch]) > 1"
+      - return: {subscriptions: "= size(state.channels.filter(c, input.client in state.channels[c]))"}
+
+  - component: redis
+    name: publish
+    kind: rpc
+    summary: >-
+      PUBLISH: deliver the message to the clients subscribed to the channel now; replies with
+      their number. Delivery is at most once: a client that subscribes later, or is
+      disconnected, never sees the message, and nothing is stored.
+    description: >-
+      The push goes out asynchronously, once per PUBLISH that reaches a client, on the topic
+      `redis-message` with input {channel, message, receivers}. An importer's subscriber
+      declares `subscribe: [<as>/redis-message]` (imported topics take the import's prefix,
+      §17 item 8) and keeps the messages whose `receivers` hold its client name; each Redis
+      import has its own topic.
+    sources: ["https://redis.io/docs/latest/commands/publish/", "https://redis.io/docs/latest/develop/interact/pubsub/#delivery-semantics", "https://redis.io/docs/latest/develop/interact/pubsub/#format-of-pushed-messages"]
+    latency_ms: 1
+    request: {type: object, required: [channel, message], properties: {channel: {type: string, examples: [invalidations]}, message: {type: string, examples: ["user:1"]}}}
+    response: {type: object, properties: {receivers: {type: integer}}}
+    behavior:
+      - set: {vars.to: "= input.channel in state.channels ? state.channels[input.channel].map(c, c) : []"}
+      - publish: redis-message
+        input: {channel: "= input.channel", message: "= input.message", receivers: "= vars.to"}
+        when: "size(vars.to) > 0"
+      - return: {receivers: "= size(vars.to)"}

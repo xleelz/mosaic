@@ -1,0 +1,91 @@
+# G4 (round 2). Verified (corrected in round 1, re-checked): StorageService.decommission
+# (StorageService.java:5300-5397): without force, refuses when N <= RF for a distributed keyspace
+# ("Not enough live nodes...", :5354-5367); the check is inside the try, so the mode becomes
+# DECOMMISSION_FAILED (:5416-5421). With 4 nodes: startLeaving gossips LEAVING (:5289-5296), sleeps
+# max(RING_DELAY 30 s, batchlog timeout) (:5376-5378), unbootstrap (:5454-5486): batchlog replay and
+# the range stream start together, hints transfer after the batchlog replay (transfer_hints_on_decommission
+# true, Config.java:452) concurrently with the stream; then leaveRing gossips LEFT and sleeps
+# max(RING_DELAY, 2 gossip intervals) (:5424-5435); the node ends DECOMMISSIONED (:5382-5397).
+# Peers: handleStateLeaving adds a leaving endpoint and pending ranges; handleStateLeft removes it.
+schema_version: 1
+id: cassandra
+scenarios:
+- id: bench-g4-three-nodes-refused
+  name: 'G4: decommission of n3 in the 3-node RF 3 cluster is refused (N <= RF) and the mode becomes DECOMMISSION_FAILED; nothing is gossiped or streamed'
+  fixtures:
+  - three-node-rf3
+  steps:
+  - flow: membership-decommission
+    'on': n3
+    as: d
+  expect:
+  - '!steps.d.result.ok && steps.d.result.error.code == ''unsupported-operation-exception'' && steps.d.result.error.message.startsWith(''Not enough live nodes to maintain replication
+    factor in keyspace'')'
+  - state['storage-service@n3'].operation_mode == 'DECOMMISSION_FAILED' && state['storage-service@n3'].is_decommissioning == false
+  - '!trace.exists(e, e.type == ''call.start'' && (e.interface == ''gossiper.add-local-application-state'' || e.interface == ''stream-plan.execute''))'
+- id: bench-g4-four-nodes-end-to-end
+  name: 'G4: n4 decommissions: LEAVING, 30 s, streams each range to its new owner while the batchlog replays, hints to a peer after the replay, LEFT, 30 s, DECOMMISSIONED; n1 sees LEAVING
+    (pending ranges) then LEFT (removed)'
+  fixtures:
+  - four-node-rf3
+  steps:
+  - flow: membership-decommission
+    'on': n4
+    as: d
+  - flow: membership-gossip-ack2
+    'on': n1
+    input:
+      from: n4
+      states:
+      - endpoint: n4
+        generation: 1793314800
+        host_id: 6d194555-f6eb-41d0-c000-000000000004
+        dc: datacenter1
+        rack: rack1
+        tokens:
+        - 3000000000000000000
+        heartbeat: 500
+        max_version: 510
+        status: LEAVING
+    as: leaving
+  - flow: membership-gossip-ack2
+    'on': n1
+    input:
+      from: n4
+      states:
+      - endpoint: n4
+        generation: 1793314800
+        host_id: 6d194555-f6eb-41d0-c000-000000000004
+        dc: datacenter1
+        rack: rack1
+        tokens:
+        - 3000000000000000000
+        heartbeat: 600
+        max_version: 610
+        status: LEFT
+    as: left
+  expect:
+  - steps.d.result.ok && steps.d.result.value.operation_mode == 'DECOMMISSIONED' && state['storage-service@n4'].bootstrap_state == 'DECOMMISSIONED'
+  - steps.d.duration_ms >= 60000
+  - trace.exists(e, e.type == 'call.start' && e.interface == 'gossiper.add-local-application-state' && e.instance == 'n4' && e.input.value == 'LEAVING' && e.t < 1000)
+  - trace.exists(e, e.type == 'call.start' && e.interface == 'stream-plan.execute' && e.instance == 'n4' && e.input.transfer_ranges && e.t >= 30000)
+  - trace.exists(e, e.type == 'call.start' && e.interface == 'stream-plan.execute' && e.input.peer == 'n3' && '(6148914691236517205,-6148914691236517206]' in e.input.ranges)
+  - trace.exists(e, e.type == 'call.start' && e.interface == 'stream-plan.execute' && e.input.peer == 'n1' && '(-6148914691236517206,0]' in e.input.ranges)
+  - trace.exists(e, e.type == 'call.start' && e.interface == 'stream-plan.execute' && e.input.peer == 'n2' && '(0,3000000000000000000]' in e.input.ranges)
+  - trace.exists(b, b.type == 'call.start' && b.interface == 'batchlog-manager.start-batchlog-replay' && b.instance == 'n4' && trace.exists(h, h.type == 'call.start' && h.interface ==
+    'hints-service.transfer-hints' && h.seq > b.seq))
+  - trace.exists(e, e.type == 'call.start' && e.interface == 'gossiper.add-local-application-state' && e.instance == 'n4' && e.input.value == 'LEFT' && e.t >= 30000)
+  - '!state[''token-metadata@n4''].ring.exists(r, r.endpoint == ''n4'')'
+  - '!state[''token-metadata@n1''].ring.exists(r, r.endpoint == ''n4'') && !(''n4'' in state[''token-metadata@n1''].leaving_endpoints)'
+  - trace.exists(e, e.type == 'call.start' && e.interface == 'token-metadata.add-leaving-endpoint' && e.instance == 'n1' && e.input.endpoint == 'n4')
+- id: bench-g4-stream-and-batchlog-concurrent
+  name: 'G4: the range stream starts at the same virtual time as the batchlog replay (not after it)'
+  fixtures:
+  - four-node-rf3
+  steps:
+  - flow: membership-decommission
+    'on': n4
+    as: d
+  expect:
+  - trace.exists(b, b.type == 'call.start' && b.interface == 'batchlog-manager.start-batchlog-replay' && trace.exists(s, s.type == 'call.start' && s.interface == 'stream-plan.execute'
+    && s.t <= b.t + 5))

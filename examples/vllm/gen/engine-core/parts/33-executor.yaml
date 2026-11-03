@@ -1,0 +1,452 @@
+interfaces:
+  # ------------------------------------------------------------------ Executor (base)
+  - component: executor
+    name: get-class
+    kind: function
+    summary: "Executor.get_class: map distributed_executor_backend to the executor class (ray, mp, uni, external_launcher, or a qualname)."
+    sources: ["vllm/v1/executor/abstract.py:64-109"]
+    response: {type: object, properties: {backend: {type: string}, executor_class: {type: string}}}
+    errors: [{code: value-error, status: 0}, {code: type-error, status: 0, reachable_by: "a distributed_executor_backend given as a class or qualname that isn't an Executor subclass (abstract.py:70-75, 96-102); the shared fixtures never deploy one"}]
+    behavior:
+      - title: "distributed_executor_backend is resolved in ParallelConfig.__post_init__: uni for world size 1, else mp on one node"
+        source: "vllm/config/parallel.py:1034-1080"
+        set:
+          vars.backend: "= (('distributed-executor-backend' in config) && config['distributed-executor-backend'] != null) ? config['distributed-executor-backend'] : (config['tensor-parallel-size'] > 1 ? 'mp' : 'uni')"
+      - if: "vars.backend == 'mp'"
+        then: [{return: {backend: mp, executor_class: MultiprocExecutor}}]
+      - if: "vars.backend == 'uni'"
+        then: [{return: {backend: uni, executor_class: UniProcExecutor}}]
+      - if: "vars.backend == 'ray'"
+        then: [{return: {backend: ray, executor_class: RayDistributedExecutor}}]
+      - if: "vars.backend == 'external_launcher'"
+        then: [{return: {backend: external_launcher, executor_class: ExecutorWithExternalLauncher}}]
+      - title: Unknown backend
+        source: "vllm/v1/executor/abstract.py:106-108"
+        fail: {code: value-error, message: "= 'Unknown distributed executor backend: ' + vars.backend"}
+
+  - component: executor
+    name: init-executor
+    kind: function
+    summary: "Executor.__init__ -> _init_executor of the chosen class: the uni executor initializes and loads its one worker in process; the mp executor spawns a WorkerProc per rank."
+    sources: ["vllm/v1/executor/abstract.py:111-131"]
+    response: {type: object, properties: {backend: {type: string}}}
+    behavior:
+      - call: executor.get-class
+        as: cls
+      - set: {state.backend: "= vars.cls.value.backend", state.sleeping_tags: []}
+      - call: "= vars.cls.value.backend == 'mp' ? 'multiproc-executor.init-executor' : 'uni-proc-executor.init-executor'"
+        targets: [multiproc-executor.init-executor, uni-proc-executor.init-executor]
+      - return: {backend: "= vars.cls.value.backend"}
+
+  - component: executor
+    name: collective-rpc
+    kind: function
+    summary: "Executor.collective_rpc (abstract): run a worker method on every rank; dispatched to the uni or mp implementation. A multiproc RPC timeout surfaces as TimeoutError."
+    sources: ["vllm/v1/executor/abstract.py:199-231", "vllm/v1/executor/abstract.py:176-185", "vllm/v1/executor/abstract.py:187-196"]
+    request: {type: object, required: [method], properties: {method: {type: string, examples: [determine_available_memory]}, args: {type: object}, timeout_s: {type: ["integer", "null"], default: null}, unique_reply_rank: {type: ["integer", "null"], default: null}}}
+    response: {type: object, properties: {results: {type: array}}}
+    errors: [{code: timeout-error, status: 0}, {code: runtime-error, status: 0}]
+    behavior:
+      - set: {vars.backend: "= (('distributed-executor-backend' in config) && config['distributed-executor-backend'] != null) ? config['distributed-executor-backend'] : (config['tensor-parallel-size'] > 1 ? 'mp' : 'uni')"}
+      - call: "= vars.backend == 'mp' ? 'multiproc-executor.collective-rpc' : 'uni-proc-executor.collective-rpc'"
+        targets: [multiproc-executor.collective-rpc, uni-proc-executor.collective-rpc]
+        input: "= input"
+        as: r
+        on_error:
+          - title: "get_response: a dequeue timeout raises TimeoutError('RPC call to <method> timed out.')"
+            source: "vllm/v1/executor/multiproc_executor.py:438-441"
+            when: "error.code == 'timeout'"
+            fail: {code: timeout-error, message: "= 'RPC call to ' + input.method + ' timed out.'"}
+          - fail: "= error"
+      - return: "= vars.r.value"
+
+  - component: executor
+    name: execute-model
+    kind: function
+    summary: "Executor.execute_model: collective_rpc('execute_model') on the workers; the uni and mp executors override it."
+    sources: ["vllm/v1/executor/abstract.py:250-257"]
+    request: {type: object, properties: {scheduler_output: {$ref: SchedulerOutput}}}
+    response: {anyOf: [{$ref: ModelRunnerOutput}, {type: "null"}]}
+    behavior:
+      - set: {vars.backend: "= (('distributed-executor-backend' in config) && config['distributed-executor-backend'] != null) ? config['distributed-executor-backend'] : (config['tensor-parallel-size'] > 1 ? 'mp' : 'uni')"}
+      - call: "= vars.backend == 'mp' ? 'multiproc-executor.execute-model' : 'uni-proc-executor.execute-model'"
+        targets: [multiproc-executor.execute-model, uni-proc-executor.execute-model]
+        input: "= input"
+        as: r
+      - return: "= vars.r.value"
+
+  - component: executor
+    name: sample-tokens
+    kind: function
+    summary: "Executor.sample_tokens: collective_rpc('sample_tokens', grammar_output) from the output rank."
+    sources: ["vllm/v1/executor/abstract.py:270-276"]
+    request: {type: object, properties: {grammar_output: {type: ["object", "null"], default: null}}}
+    response: {anyOf: [{$ref: ModelRunnerOutput}, {type: "null"}]}
+    behavior:
+      - set: {vars.backend: "= (('distributed-executor-backend' in config) && config['distributed-executor-backend'] != null) ? config['distributed-executor-backend'] : (config['tensor-parallel-size'] > 1 ? 'mp' : 'uni')"}
+      - call: "= vars.backend == 'mp' ? 'multiproc-executor.sample-tokens' : 'uni-proc-executor.sample-tokens'"
+        targets: [multiproc-executor.sample-tokens, uni-proc-executor.sample-tokens]
+        input: "= input"
+        as: r
+      - return: "= vars.r.value"
+
+  - component: executor
+    name: sleep
+    kind: function
+    summary: "Executor.sleep: no-op when the weights already sleep; else collective_rpc('sleep', level) and mark weights and kv_cache as sleeping."
+    sources: ["vllm/v1/executor/abstract.py:382-392"]
+    request: {type: object, properties: {level: {type: integer, default: 1}}}
+    behavior:
+      - if: "'weights' in state.sleeping_tags"
+        then:
+          - title: Executor is already sleeping
+            source: "vllm/v1/executor/abstract.py:383-385"
+            return: {slept: false}
+      - call: executor.collective-rpc
+        input: {method: sleep, args: {level: "= input.level"}}
+      - title: "sleeping_tags |= SLEEP_TAGS: a union with the current set"
+        source: "vllm/v1/executor/abstract.py:389"
+        set: {state.sleeping_tags: "= state.sleeping_tags + ['weights', 'kv_cache'].filter(t, !(t in state.sleeping_tags))"}
+      - return: {slept: true}
+
+  - component: executor
+    name: wake-up
+    kind: function
+    summary: "Executor.wake_up: no-op when awake or a tag isn't sleeping; else collective_rpc('wake_up', tags) and clear those tags (all when tags is None)."
+    sources: ["vllm/v1/executor/abstract.py:394-417"]
+    request: {type: object, properties: {tags: {type: ["array", "null"], items: {type: string}, default: null}}}
+    behavior:
+      - if: "size(state.sleeping_tags) == 0"
+        then:
+          - title: Executor is not sleeping
+            source: "vllm/v1/executor/abstract.py:395-397"
+            return: {woke: false}
+      - set: {vars.tags: "= has(input.tags) && input.tags != null ? input.tags : null"}
+      - if: "vars.tags != null && vars.tags.exists(t, !(t in state.sleeping_tags))"
+        then:
+          - title: "A tag that isn't sleeping: warn and return"
+            source: "vllm/v1/executor/abstract.py:398-405"
+            return: {woke: false}
+      - call: executor.collective-rpc
+        input: {method: wake_up, args: "= vars.tags == null ? {} : {'tags': vars.tags}"}
+      - set: {state.sleeping_tags: "= vars.tags == null ? [] : state.sleeping_tags.filter(t, !(t in vars.tags))"}
+      - return: {woke: true}
+
+  - component: executor
+    name: discard
+    kind: function
+    summary: "Executor.discard: discard the not-yet-sleeping tags' memory on the workers and count them as sleeping."
+    sources: ["vllm/v1/executor/abstract.py:419-434"]
+    request: {type: object, properties: {tags: {type: array, items: {type: string}}}}
+    behavior:
+      - set: {vars.todo: "= input.tags.filter(t, !(t in state.sleeping_tags))"}
+      - if: "size(vars.todo) == 0"
+        then: [{return: {discarded: []}}]
+      - call: executor.collective-rpc
+        input: {method: discard, args: {tags: "= vars.todo"}}
+      - title: "sleeping_tags |= tags_to_discard, in a finally: a union with the current set"
+        source: "vllm/v1/executor/abstract.py:425-428"
+        set: {state.sleeping_tags: "= state.sleeping_tags + input.tags.filter(t, !(t in state.sleeping_tags))"}
+      - return: {discarded: "= vars.todo"}
+
+  - component: executor
+    name: is-sleeping
+    kind: function
+    sources: ["vllm/v1/executor/abstract.py:378-380"]
+    response: {type: boolean}
+    behavior:
+      - return: "= size(state.sleeping_tags) > 0"
+
+  - component: executor
+    name: shutdown
+    kind: function
+    summary: "Shut down the executor: the uni executor shuts its worker down; the mp executor terminates the worker processes."
+    sources: ["vllm/v1/executor/abstract.py:327-329"]
+    behavior:
+      - set: {vars.backend: "= (('distributed-executor-backend' in config) && config['distributed-executor-backend'] != null) ? config['distributed-executor-backend'] : (config['tensor-parallel-size'] > 1 ? 'mp' : 'uni')"}
+      - if: "vars.backend == 'mp'"
+        then:
+          - call: multiproc-executor.shutdown
+          - return: {backend: mp}
+      - call: gpu-worker-impl.shutdown
+        on: rank0
+      - return: {backend: uni}
+
+  # ------------------------------------------------------------------ UniProcExecutor
+  - component: uni-proc-executor
+    name: init-executor
+    kind: function
+    summary: "UniProcExecutor._init_executor: create the driver worker (rank 0), init its device and load the model."
+    sources: ["vllm/v1/executor/uniproc_executor.py:52-75"]
+    behavior:
+      - call: gpu-worker-impl.init-device
+        on: rank0
+      - call: gpu-worker-impl.load-model
+        on: rank0
+
+  - component: uni-proc-executor
+    name: collective-rpc
+    kind: function
+    summary: "UniProcExecutor.collective_rpc: run the method directly on the driver worker; non_block wraps the result (or the exception) in a Future."
+    sources: ["vllm/v1/executor/uniproc_executor.py:90-117"]
+    request: {type: object, properties: {method: {type: string}, args: {type: object}}}
+    response: {type: object, properties: {results: {type: array}}}
+    behavior:
+      - call: "= 'gpu-worker-impl.' + input.method.replace('_', '-')"
+        targets: __WORKER_TARGETS__
+        on: rank0
+        input: "= has(input.args) && input.args != null ? input.args : {}"
+        as: out
+      - return: {results: [{rank: rank0, value: "= vars.out.value"}]}
+
+  - component: uni-proc-executor
+    name: execute-model
+    kind: function
+    summary: "UniProcExecutor.execute_model: single-value collective_rpc; in non-blocking mode an already-failed future raises at once."
+    sources: ["vllm/v1/executor/uniproc_executor.py:119-132"]
+    request: {type: object, properties: {scheduler_output: {$ref: SchedulerOutput}}}
+    response: {anyOf: [{$ref: ModelRunnerOutput}, {type: "null"}]}
+    behavior:
+      - call: gpu-worker-impl.execute-model
+        on: rank0
+        input: "= input.scheduler_output"
+        as: out
+      - return: "= vars.out.value"
+
+  - component: uni-proc-executor
+    name: sample-tokens
+    kind: function
+    sources: ["vllm/v1/executor/uniproc_executor.py:134-142"]
+    request: {type: object, properties: {grammar_output: {type: ["object", "null"], default: null}}}
+    response: {anyOf: [{$ref: ModelRunnerOutput}, {type: "null"}]}
+    behavior:
+      - call: gpu-worker-impl.sample-tokens
+        on: rank0
+        input: "= input"
+        as: out
+      - return: "= vars.out.value"
+
+  # ------------------------------------------------------------------ MultiprocExecutor
+  - component: multiproc-executor
+    name: init-executor
+    kind: function
+    summary: "MultiprocExecutor._init_executor: spawn one WorkerProc per rank (each inits its device and loads the model), wait for all to be ready, start the worker monitor."
+    sources: ["vllm/v1/executor/multiproc_executor.py:118-268"]
+    behavior:
+      - set:
+          state.is_failed: false
+          state.shutting_down: false
+          vars.ranks: "= lists.range(config['tensor-parallel-size']).map(i, 'rank' + string(i))"
+      - title: "make_worker_process per rank, then wait_for_ready on all of them"
+        source: "vllm/v1/executor/multiproc_executor.py:186-240"
+        parallel: "= vars.ranks"
+        as: rank
+        steps:
+          - call: gpu-worker-impl.init-device
+            on: "= vars.rank"
+          - call: gpu-worker-impl.load-model
+            on: "= vars.rank"
+        join: {need: all}
+        on_insufficient: {code: runtime-error, summary: "WorkerProc initialization failed"}
+        as_result: ready
+      - title: "start_worker_monitor: a daemon MultiprocWorkerMonitor thread blocks on the worker process sentinels"
+        source: "vllm/v1/executor/multiproc_executor.py:291-330"
+        emit: multiproc-executor.monitor-workers
+        input: {}
+      - return: {workers: "= size(vars.ranks)"}
+
+  - component: multiproc-executor
+    name: collective-rpc
+    kind: function
+    summary: "MultiprocExecutor.collective_rpc: refuse once failed; enqueue (method, args, kwargs, output_rank) on the broadcast queue and dequeue each rank's (or only the output rank's) reply before the deadline; a FAILURE reply raises RuntimeError."
+    sources: ["vllm/v1/executor/multiproc_executor.py:382-456"]
+    request: {type: object, properties: {method: {type: string}, args: {type: object}, timeout_s: {type: ["integer", "null"], default: null}, unique_reply_rank: {type: ["integer", "null"], default: null}}}
+    response: {type: object, properties: {results: {type: array}}}
+    errors: [{code: runtime-error, status: 0, retryable: false}, {code: timeout, status: 0, retryable: true}]
+    behavior:
+      - if: "state.is_failed"
+        then:
+          - title: "The worker monitor marked the executor failed"
+            source: "vllm/v1/executor/multiproc_executor.py:398-399"
+            fail: {code: runtime-error, message: "Executor failed."}
+      - set: {vars.ranks: "= lists.range(config['tensor-parallel-size']).map(i, 'rank' + string(i))"}
+      - set: {vars.reply_rank: "= has(input.unique_reply_rank) && input.unique_reply_rank != null ? 'rank' + string(input.unique_reply_rank) : ''"}
+      - title: "Broadcast (method, args, kwargs, output_rank) on the shared MessageQueue: every rank runs it; dequeue only response_mqs[output_rank] when one is given, else every rank's reply, before the deadline"
+        source: "vllm/v1/executor/multiproc_executor.py:425-454"
+        parallel: "= vars.ranks"
+        as: rank
+        steps:
+          - set: {state.inflight: "= merge(has(state.inflight) ? state.inflight : {}, {vars.rank: ((has(state.inflight) && vars.rank in state.inflight) ? state.inflight[vars.rank] : 0) + 1})"}
+          - call: worker-proc.execute-worker-rpc
+            input: {rank: "= vars.rank", method: "= input.method", args: "= has(input.args) && input.args != null ? input.args : {}", output_rank: "= vars.reply_rank"}
+            as: reply
+            on_error: continue
+          - set: {state.inflight: "= merge(state.inflight, {vars.rank: state.inflight[vars.rank] - 1})"}
+          - if: "!vars.reply.ok && vars.reply.error.code in ['killed', 'peer-killed']"
+            then: [{fail: "= vars.reply.error"}]
+          - if: "!vars.reply.ok"
+            then:
+              - title: "status != SUCCESS: get_response raises RuntimeError naming the worker's message"
+                source: "vllm/v1/executor/multiproc_executor.py:444-449"
+                return: {rpc_failure: "= \"Worker failed with error '\" + (has(vars.reply.error.message) ? string(vars.reply.error.message) : vars.reply.error.code) + \"', please check the stack trace above for the root cause\""}
+          - return: "= vars.reply.value"
+        join: {need: all}
+        timeout_ms: "= has(input.timeout_s) && input.timeout_s != null ? input.timeout_s * 1000 : 3600000"
+        on_insufficient: {code: runtime-error, summary: "Worker failed with error, please check the stack trace above for the root cause"}
+        as_result: replies
+      - if: "vars.replies.results.exists(r, type(r.value) == map && 'rpc_failure' in r.value)"
+        then:
+          - title: "The FAILURE reply surfaces as RuntimeError('Worker failed with error ...')"
+            source: "vllm/v1/executor/multiproc_executor.py:444-449"
+            fail: {code: runtime-error, message: "= vars.replies.results.filter(r, type(r.value) == map && 'rpc_failure' in r.value)[0].value.rpc_failure"}
+      - title: "responses[0] if output_rank is not None else responses"
+        source: "vllm/v1/executor/multiproc_executor.py:425-427"
+        return: {results: "= vars.replies.results.filter(r, vars.reply_rank == '' || r.item == vars.reply_rank).map(r, {'rank': r.item, 'value': r.value})"}
+
+  - component: multiproc-executor
+    name: execute-model
+    kind: function
+    summary: "MultiprocExecutor.execute_model: collective_rpc to all ranks with the reply from the output rank only, bounded by VLLM_EXECUTE_MODEL_TIMEOUT_SECONDS."
+    sources: ["vllm/v1/executor/multiproc_executor.py:341-352"]
+    request: {type: object, properties: {scheduler_output: {$ref: SchedulerOutput}}}
+    response: {anyOf: [{$ref: ModelRunnerOutput}, {type: "null"}]}
+    behavior:
+      - call: executor.collective-rpc
+        input: {method: execute_model, args: "= input.scheduler_output", unique_reply_rank: 0, timeout_s: "= config['vllm-execute-model-timeout-seconds']"}
+        as: r
+      - return: "= vars.r.value.results[0].value"
+
+  - component: multiproc-executor
+    name: sample-tokens
+    kind: function
+    sources: ["vllm/v1/executor/multiproc_executor.py:354-365"]
+    request: {type: object, properties: {grammar_output: {type: ["object", "null"], default: null}}}
+    response: {anyOf: [{$ref: ModelRunnerOutput}, {type: "null"}]}
+    behavior:
+      - call: executor.collective-rpc
+        input: {method: sample_tokens, args: "= input", unique_reply_rank: 0, timeout_s: "= config['vllm-execute-model-timeout-seconds']"}
+        as: r
+      - return: "= vars.r.value.results[0].value"
+
+  - component: multiproc-executor
+    name: monitor-workers
+    kind: function
+    summary: "The MultiprocWorkerMonitor thread: when a worker process dies (and no shutdown is under way) mark the executor failed, shut it down and fire the failure callback (EXECUTOR_FAILED to the engine)."
+    sources: ["vllm/v1/executor/multiproc_executor.py:299-333"]
+    request: {type: object, properties: {died_rank: {type: ["string", "null"], default: null, description: "unset: block on the sentinels until a worker process exits (the thread init_executor starts)"}, exitcode: {type: integer, examples: [-9]}}}
+    behavior:
+      - if: "!has(input.died_rank) || input.died_rank == null"
+        then:
+          - title: "died = multiprocessing.connection.wait(sentinels): block until any worker process exits"
+            source: "vllm/v1/executor/multiproc_executor.py:301-302"
+            wait: {signals: ["exit:gpu-worker@rank0", "exit:gpu-worker@rank1", "exit:gpu-worker@rank2", "exit:gpu-worker@rank3", "exit:gpu-worker@rank4", "exit:gpu-worker@rank5", "exit:gpu-worker@rank6", "exit:gpu-worker@rank7"], as: died}
+          - set: {vars.died_rank: "= vars.died.data.instance"}
+        else:
+          - set: {vars.died_rank: "= input.died_rank"}
+      - if: "state.shutting_down"
+        then:
+          - title: Shutdown already initiated
+            source: "vllm/v1/executor/multiproc_executor.py:309-311"
+            return: {handled: false}
+      - title: "Worker proc died unexpectedly: shutting down executor"
+        source: "vllm/v1/executor/multiproc_executor.py:312-320"
+        set: {state.is_failed: true}
+      - call: multiproc-executor.shutdown
+      - title: "failure_callback(): EngineCoreProc puts EXECUTOR_FAILED on its input queue"
+        source: "vllm/v1/executor/multiproc_executor.py:321-325"
+        call: engine-core-proc.executor-fail-callback
+      - return: {handled: true, died_rank: "= vars.died_rank"}
+
+  - component: multiproc-executor
+    name: shutdown
+    kind: function
+    summary: "MultiprocExecutor.shutdown: mark shutting down, close every worker's death pipe so each WorkerProc shuts its worker down, then wait for (and kill) the worker processes."
+    sources: ["vllm/v1/executor/multiproc_executor.py:509-542"]
+    behavior:
+      - if: "state.shutting_down"
+        then: [{return: {shutdown: false}}]
+      - set: {state.shutting_down: true}
+      - set: {vars.stuck: "= lists.range(config['tensor-parallel-size']).map(i, 'rank' + string(i)).filter(r, has(state.inflight) && r in state.inflight && state.inflight[r] > 0)"}
+      - title: "Close each death pipe: the WorkerProc's death-pipe monitor and its finally call worker.shutdown()"
+        source: "vllm/v1/executor/multiproc_executor.py:834-858"
+        parallel: "= lists.range(config['tensor-parallel-size']).map(i, 'rank' + string(i)).filter(r, !(r in vars.stuck))"
+        as: rank
+        steps:
+          - call: gpu-worker-impl.shutdown
+            on: "= vars.rank"
+            on_error: continue
+        join: {need: all}
+        as_result: stopped
+      - if: "size(vars.stuck) > 0"
+        then:
+          - title: "_ensure_worker_termination: wait for busy workers to exit (VLLM_WORKER_SHUTDOWN_TIMEOUT_SECONDS, then SIGTERM and 4 s more), polling"
+            source: "vllm/v1/executor/multiproc_executor.py:459-496"
+            foreach: "= lists.range(config['vllm-worker-shutdown-timeout-seconds'] + 4)"
+            as: sec
+            steps:
+              - set: {vars.stuck: "= vars.stuck.filter(r, state.inflight[r] > 0)"}
+              - if: "size(vars.stuck) == 0"
+                then: [{break: true}]
+              - wait: "= vars.sec == 0 ? 1 : 1000"
+          - set: {vars.stuck: "= vars.stuck.filter(r, state.inflight[r] > 0)"}
+          - foreach: "= vars.stuck"
+            as: r
+            steps:
+              - title: "p.kill(): the stuck worker process is killed"
+                source: "vllm/v1/executor/multiproc_executor.py:498-507"
+                kill: {component: gpu-worker, instance: "= vars.r"}
+      - return: {shutdown: true, killed: "= vars.stuck"}
+
+  # ------------------------------------------------------------------ WorkerProc
+  - component: worker-proc
+    name: execute-worker-rpc
+    kind: rpc
+    summary: "WorkerProc.worker_busy_loop -> _execute_worker_rpc on one rank: dequeue the broadcast RPC, run it on the worker, and reply (SUCCESS, or FAILURE carrying the exception text) if this rank is the reply rank."
+    sources: ["vllm/v1/executor/multiproc_executor.py:1037-1068"]
+    request: {type: object, properties: {rank: {type: string}, method: {type: string}, args: {type: object}, output_rank: {type: string, default: "", description: "the reply rank ('' = every rank replies)"}}}
+    errors: [{code: runtime-error, status: 0, retryable: false}]
+    behavior:
+      - set: {vars.replies: "= !has(input.output_rank) || input.output_rank == '' || input.output_rank == input.rank"}
+      - call: "= 'gpu-worker-impl.' + input.method.replace('_', '-')"
+        targets: __WORKER_TARGETS__
+        on: "= input.rank"
+        input: "= input.args"
+        as: out
+        on_error:
+          - title: "The worker process was killed mid-RPC: it never replies"
+            source: "vllm/v1/executor/multiproc_executor.py:498-507"
+            when: "error.code in ['killed', 'peer-killed']"
+            return: {replied: false, killed: true}
+          - title: "A rank that is not the reply rank logs the exception and sends nothing"
+            source: "vllm/v1/executor/multiproc_executor.py:1062-1068"
+            when: "!vars.replies"
+            return: {replied: false, logged: "= error.code"}
+          - title: "WorkerProc hit an exception: handle_output gets the exception itself, and enqueue_output sends (FAILURE, str(e)), the worker's own message"
+            source: "vllm/v1/executor/multiproc_executor.py:1059-1068"
+            detail: "enqueue_output: an Exception becomes (FAILURE, str(output)) (vllm/v1/executor/multiproc_executor.py:991-1006)."
+            fail: {code: "= error.code", message: "= has(error.message) && error.message != null ? error.message : error.code", data: {status: FAILURE}}
+      - if: "!vars.replies"
+        then:
+          - title: "if output_rank is None or self.rank == output_rank: only the reply rank enqueues its output"
+            source: "vllm/v1/executor/multiproc_executor.py:1053-1054"
+            return: {replied: false}
+      - if: "config['async-scheduling']"
+        then:
+          - title: "Async scheduling: the output goes through the async_output_queue thread"
+            source: "vllm/v1/executor/multiproc_executor.py:1010-1018"
+            call: worker-proc.async-output-busy-loop
+            input: {rank: "= input.rank", output: "= vars.out.value"}
+            as: reply
+          - return: "= vars.reply.value"
+      - return: "= vars.out.value"
+
+  - component: worker-proc
+    name: async-output-busy-loop
+    kind: function
+    summary: "WorkerProc.async_output_busy_loop (one item): take the output from async_output_queue and enqueue it as a SUCCESS reply (resolving an AsyncModelRunnerOutput first)."
+    sources: ["vllm/v1/executor/multiproc_executor.py:1020-1035", "vllm/v1/executor/multiproc_executor.py:991-1008"]
+    request: {type: object, properties: {rank: {type: string}, output: {}}}
+    behavior:
+      - if: "input.output == null"
+        then: [{return: null}]
+      - return: "= input.output"

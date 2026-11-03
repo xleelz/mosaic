@@ -1,0 +1,63 @@
+schema_version: 1
+id: cassandra
+scenarios:
+  # Verified expectation (5.0.9): hinted_handoff_enabled (conf/cassandra.yaml:68 true; set false here) makes
+  # StorageProxy.shouldHint return false first (StorageProxy.java:2444-2447). Down replicas are skipped
+  # (StorageProxy.java:1549-1560) and timed-out/failed replicas are not hinted (AbstractWriteResponseHandler.java:309).
+  # Outcome unchanged. Refinement for CL ANY with no live replica (ReplicaPlans.java:102-104 accepts it): no hint
+  # acks the handler, so get() waits write_request_timeout (2000 ms, AbstractWriteResponseHandler.java:112-127);
+  # StorageProxy.mutate catches the WriteTimeout for ANY and calls hintMutations (StorageProxy.java:907-912,
+  # 968-988), which hints nobody (shouldHint false) and returns normally: the client sees success after ~2 s and
+  # the write is stored nowhere.
+  - id: bench-h3-quorum-one-down-no-hint
+    flow: coordinator-write
+    name: Hints disabled, QUORUM write, 10.0.0.2 down - succeeds with 2 acks, no hint
+    state:
+      gossiper:
+        endpoint_state_map: {"10.0.0.2": {alive: false}}
+        live_endpoints: ["10.0.0.3"]
+        unreachable_endpoints: ["10.0.0.2"]
+      storage-proxy: {hinted_handoff_enabled: false}
+    expect:
+      - "result.ok && result.value.acks == 2 && result.value.block_for == 2"
+      - "calls['storage-proxy.should-hint'] >= 1 && calls['gossiper.get-endpoint-downtime'] == 0"
+      - "calls['storage-proxy.submit-hint'] == 0 && size(state['hints-buffer'].hints) == 0"
+      - "calls['mutation-verb-handler.do-verb'] == 1"
+  - id: bench-h3-one-timeout-no-hint
+    flow: coordinator-write
+    name: Hints disabled, ONE write, a live replica times out - still succeeds, nothing hinted
+    input: {consistency: ONE}
+    state:
+      storage-proxy: {hinted_handoff_enabled: false}
+    faults:
+      - {target: mutation-verb-handler.do-verb, type: timeout, calls: [1]}
+    expect:
+      - "result.ok && result.value.block_for == 1"
+      - "calls['storage-proxy.submit-hint'] == 0 && size(state['hints-buffer'].hints) == 0"
+  - id: bench-h3-any-all-down-silent-success
+    flow: coordinator-write
+    name: Hints disabled, CL ANY, every replica down, coordinator not a replica - success after the 2 s write timeout, nothing stored
+    input:
+      consistency: ANY
+      mutations:
+        - {columns: {name: Grace}, counter: false, keyspace: shop, partition_key: "user:7", table: users, timestamp: 1730000000000000, token: -100}
+    state:
+      storage-proxy: {hinted_handoff_enabled: false}
+      gossiper:
+        endpoint_state_map:
+          "10.0.0.2": {alive: false}
+          "10.0.0.3": {alive: false}
+          "10.0.0.4": {alive: false, dc: datacenter1, endpoint: 10.0.0.4, generation: 1761800000, heartbeat: 300, host_id: 6d194555-f6eb-41d0-c000-000000000004, load: 1048576, max_version: 300, rack: rack1, rpc_ready: true, status: NORMAL, tokens: [3000000000000000000], update_ms: 0}
+        live_endpoints: []
+        unreachable_endpoints: ["10.0.0.2", "10.0.0.3", "10.0.0.4"]
+      token-metadata:
+        host_ids: {"10.0.0.1": 6d194555-f6eb-41d0-c000-000000000001, "10.0.0.2": 6d194555-f6eb-41d0-c000-000000000002, "10.0.0.3": 6d194555-f6eb-41d0-c000-000000000003, "10.0.0.4": 6d194555-f6eb-41d0-c000-000000000004}
+        ring:
+          - {endpoint: 10.0.0.1, token: -6148914691236517206}
+          - {endpoint: 10.0.0.2, token: 0}
+          - {endpoint: 10.0.0.4, token: 3000000000000000000}
+          - {endpoint: 10.0.0.3, token: 6148914691236517205}
+    expect:
+      - "result.ok && result.value.path == 'hinted-for-any' && result.value.hinted == []"
+      - "calls['mutation-verb-handler.do-verb'] == 0 && calls['storage-proxy.submit-hint'] == 0 && size(state['hints-buffer'].hints) == 0"
+      - "duration_ms >= 2000"

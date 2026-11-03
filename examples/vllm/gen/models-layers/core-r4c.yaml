@@ -1,0 +1,182 @@
+# models-layers fix round 4: rows of the owner coverage report (vllm/multimodal/inputs.py data classes,
+# FusedMoEConfig, GroupShape, encode_image_url).
+components:
+  - id: multi-modal-feature-spec
+    name: MultiModalFeatureSpec / MultiModalKwargsItem / MultiModalFieldElem
+    kind: module
+    parent: multi-modal-registry
+    layer: multimodal
+    summary: "Per-item multimodal records sent to the engine: the processed kwargs item (None when cached on P1), modality, identifier, mm_hash and placeholder position; kwargs items map field names to elems."
+    sources: ["vllm/multimodal/inputs.py:343-386", "vllm/multimodal/inputs.py:870-886"]
+  - id: quant-utils
+    name: vllm/model_executor/layers/quantization/utils/quant_utils.py (GroupShape)
+    kind: module
+    parent: quantization
+    layer: quantization
+    summary: "Quantization helpers; GroupShape(row, col) names a scale's grouping: per-tensor (-1, -1), per-token (1, -1), per-channel (-1, 1) or per-group (1, k)."
+    sources: ["vllm/model_executor/layers/quantization/utils/quant_utils.py:116-136"]
+  - id: multimodal-utils
+    name: vllm/multimodal/utils.py
+    kind: module
+    parent: multi-modal-registry
+    layer: multimodal
+    summary: "Multimodal helpers, including encoding a PIL image as a data URL."
+    sources: ["vllm/multimodal/utils.py:79-92"]
+
+interfaces:
+  - component: multi-modal-feature-spec
+    name: gather-kwargs
+    kind: function
+    summary: "MultiModalFeatureSpec.gather_kwargs: for the requested keys, collect each feature's field data in order, skipping features whose data is None (cached items) and keys an item lacks."
+    sources: ["vllm/multimodal/inputs.py:376-386"]
+    request:
+      type: object
+      required: [features, keys]
+      properties:
+        features: {type: array, items: {type: object, description: "{modality, identifier, mm_hash, mm_position, data: {field: value} | null}"}}
+        keys: {type: array, items: {type: string}}
+    response: {type: object}
+    behavior:
+      - set: {vars.out: {}}
+      - foreach: "= input.features"
+        as: f
+        steps:
+          - title: A cached item (data None) contributes nothing
+            source: "vllm/multimodal/inputs.py:380-381"
+            if: "!has(vars.f.data) || vars.f.data == null"
+            then: [{continue: true}]
+          - source: "vllm/multimodal/inputs.py:382-384"
+            set:
+              vars.out: "= merge(vars.out, input.keys.filter(k, k in vars.f.data).transformMapEntry(i, k, {k: (k in vars.out ? vars.out[k] : []) + [vars.f.data[k]]}))"
+      - return: "= vars.out"
+
+  - component: multi-modal-feature-spec
+    name: kwargs-item-dummy
+    kind: function
+    summary: "MultiModalKwargsItem.dummy(nbytes) and get_data: a one-field item {'dummy': elem} whose data is nbytes of uint8 under a shared batch-size-1 field (used to size caches in tests)."
+    sources: ["vllm/multimodal/inputs.py:876-886"]
+    request: {type: object, properties: {nbytes: {type: integer, default: 1}}}
+    response: {type: object}
+    behavior:
+      - source: "vllm/multimodal/inputs.py:879-883"
+        return:
+          fields: [dummy]
+          data: {dummy: {nbytes: "= input.nbytes", dtype: uint8}}
+          field: {dummy: MultiModalSharedField}
+          bytes: "= input.nbytes"
+
+  - component: multi-modal-feature-spec
+    name: field-elem-equals
+    kind: function
+    summary: "MultiModalFieldElem.__eq__: two elems are equal when both data are None, or both are equal nested tensors, and the field types match."
+    sources: ["vllm/multimodal/inputs.py:389-422"]
+    request: {type: object, required: [a, b], properties: {a: {type: object}, b: {type: object}}}
+    response: {type: object, properties: {equal: {type: boolean}}}
+    behavior:
+      - title: data None only equals None
+        source: "vllm/multimodal/inputs.py:413-418"
+        set:
+          vars.da: "= has(input.a.data) ? input.a.data : null"
+          vars.db: "= has(input.b.data) ? input.b.data : null"
+      - if: "input.a.field != input.b.field"
+        then:
+          - return: {equal: false}
+      - source: "vllm/multimodal/inputs.py:420-422"
+        return: {equal: "= vars.da == vars.db"}
+
+  - component: fused-moe-config
+    name: init
+    kind: function
+    summary: "FusedMoEConfig.__post_init__ and accessors: intermediate_size must divide by TP (per-partition size = I / tp); max_num_tokens > 0; router logits default to the input dtype; gated activations fuse 2 shards into w13; Mori requires AITER fused MoE; tp/dp/ep sizes and use_ep come from the parallel config."
+    sources: ["vllm/model_executor/layers/fused_moe/config.py:1264-1574"]
+    request:
+      type: object
+      required: [num_experts, experts_per_token, hidden_dim, intermediate_size, activation, moe_parallel_config]
+      properties:
+        num_experts: {type: integer, examples: [8]}
+        experts_per_token: {type: integer, examples: [2]}
+        hidden_dim: {type: integer, examples: [4096]}
+        intermediate_size: {type: integer, examples: [14336]}
+        activation: {type: string, examples: [silu]}
+        moe_parallel_config: {type: object}
+        in_dtype: {type: string, default: bfloat16}
+        router_logits_dtype: {type: [string, "null"], default: null}
+        max_num_tokens: {type: integer, default: 256}
+        rocm_aiter_fmoe_enabled: {type: boolean, default: false}
+    response: {type: object}
+    errors:
+      - {code: assertion-error, status: 0, retryable: false}
+      - {code: value-error, status: 0, retryable: false}
+    behavior:
+      - set:
+          vars.p: "= input.moe_parallel_config"
+          vars.tp: "= has(input.moe_parallel_config.tp_size) ? input.moe_parallel_config.tp_size : 1"
+      - title: assert intermediate_size % tp_size == 0
+        source: "vllm/model_executor/layers/fused_moe/config.py:1340-1342"
+        if: "input.intermediate_size % vars.tp != 0"
+        then:
+          - fail: {code: assertion-error, status: 0, message: "= 'intermediate_size ' + string(input.intermediate_size) + ' is not divisible by tp_size ' + string(vars.tp)"}
+      - source: "vllm/model_executor/layers/fused_moe/config.py:1349"
+        if: "input.max_num_tokens <= 0"
+        then:
+          - fail: {code: assertion-error, status: 0, message: "max_num_tokens must be > 0"}
+      - title: is_act_and_mul is the activation's is_gated
+        source: "vllm/model_executor/layers/fused_moe/config.py:1406-1413"
+        call: moe-activation.from-str
+        input: {s: "= input.activation"}
+        as: act
+      - title: Mori all-to-all needs AITER fused MoE
+        source: "vllm/model_executor/layers/fused_moe/config.py:1390-1393"
+        if: "has(vars.p.use_ep) && vars.p.use_ep && has(vars.p.all2all_backend) && vars.p.all2all_backend in ['mori_high_throughput', 'mori_low_latency'] && ((has(vars.p.dp_size) ? vars.p.dp_size : 1) > 1) && !input.rocm_aiter_fmoe_enabled"
+        then:
+          - fail: {code: assertion-error, status: 0, message: "Mori needs to be used with aiter fused_moe for now."}
+      - title: Accessors delegate to moe_parallel_config
+        source: "vllm/model_executor/layers/fused_moe/config.py:1415-1457"
+        return:
+          intermediate_size_per_partition: "= input.intermediate_size / vars.tp"
+          router_logits_dtype: "= input.router_logits_dtype != null ? input.router_logits_dtype : input.in_dtype"
+          hidden_dim_unpadded: "= input.hidden_dim"
+          is_act_and_mul: "= vars.act.value.is_gated"
+          w13_num_shards: "= vars.act.value.is_gated ? 2 : 1"
+          tp_size: "= vars.tp"
+          dp_size: "= has(vars.p.dp_size) ? vars.p.dp_size : 1"
+          ep_size: "= has(vars.p.ep_size) ? vars.p.ep_size : 1"
+          use_ep: "= has(vars.p.use_ep) ? vars.p.use_ep : false"
+
+  - component: quant-utils
+    name: group-shape-kind
+    kind: function
+    summary: "GroupShape.is_per_tensor / is_per_token / is_per_channel / is_per_group for a (row, col) shape."
+    sources: ["vllm/model_executor/layers/quantization/utils/quant_utils.py:116-136"]
+    request: {type: object, required: [row, col], properties: {row: {type: integer, examples: [1]}, col: {type: integer, examples: [-1]}}}
+    response: {type: object}
+    behavior:
+      - source: "vllm/model_executor/layers/quantization/utils/quant_utils.py:126-136"
+        return:
+          is_per_tensor: "= input.row == -1 && input.col == -1"
+          is_per_token: "= input.row == 1 && input.col == -1"
+          is_per_channel: "= input.row == -1 && input.col == 1"
+          is_per_group: "= input.row == 1 && input.col >= 1"
+
+  - component: multimodal-utils
+    name: encode-image-url
+    kind: function
+    summary: "encode_image_url: base64 of the image (converted to RGB unless image_mode is None) in a data URL whose MIME type comes from mimetypes (image/<format> otherwise)."
+    sources: ["vllm/multimodal/utils.py:79-92"]
+    request:
+      type: object
+      required: [image]
+      properties:
+        image: {type: string, description: "stand-in for the encoded image bytes"}
+        format: {type: string, default: PNG}
+        image_mode: {type: [string, "null"], default: RGB}
+    response: {type: object, properties: {url: {type: string}}}
+    behavior:
+      - title: mimetypes.types_map lookup, else image/<format>
+        source: "vllm/multimodal/utils.py:90-91"
+        set:
+          vars.ext: "= input.format.lowerAscii()"
+      - set:
+          vars.mime: "= vars.ext in ['jpg', 'jpeg'] ? 'image/jpeg' : (vars.ext == 'png' ? 'image/png' : (vars.ext == 'gif' ? 'image/gif' : (vars.ext == 'bmp' ? 'image/bmp' : 'image/' + vars.ext)))"
+      - source: "vllm/multimodal/utils.py:92"
+        return: {url: "= 'data:' + vars.mime + ';base64,' + base64Encode(input.image)"}

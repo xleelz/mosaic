@@ -1,0 +1,64 @@
+schema_version: 1
+id: vllm
+scenarios:
+  - id: bench-k8-admission
+    name: "K8 priority policy: of two waiting requests, the lower priority value is admitted first even though it arrived later"
+    fixtures: [full-tp1-llama-8b]
+    config: {scheduling-policy: priority}
+    steps:
+      - {flow: scheduler-add-request, as: lo, input: {request_id: chatcmpl-lo, prompt_token_ids: [128000, 1, 2], priority: 5, sampling_params: {max_tokens: 8}}}
+      - {flow: scheduler-add-request, as: hi, at_ms: 2, input: {request_id: chatcmpl-hi, prompt_token_ids: [128000, 3, 4], priority: 0, sampling_params: {max_tokens: 8}}}
+      - {flow: scheduler-schedule, as: s1, input: {}}
+    expect:
+      - "steps.s1.result.value.scheduled_new_reqs.map(r, r.req_id) == ['chatcmpl-hi', 'chatcmpl-lo']"
+      - "state.scheduler.running == ['chatcmpl-hi', 'chatcmpl-lo']"
+      - "calls['priority-request-queue.peek-request'] >= 2 && calls['fcfs-request-queue.peek-request'] == 0"
+
+  - id: bench-k8-preempt
+    name: "K8 priority policy under memory pressure: the lowest-priority running request (not the last one) is preempted"
+    description: "--num-gpu-blocks-override 13 (12 usable). Running order is mid (prio 1), lo (prio 5), hi (prio 0); all three cross into a 5th block at s5. FCFS would preempt hi (the last); priority preempts lo."
+    fixtures: [full-tp1-llama-8b]
+    config: {scheduling-policy: priority, num-gpu-blocks-override: 13}
+    state:
+      block-pool: {num_gpu_blocks: 13}
+    steps:
+      - {flow: scheduler-add-request, as: am, input: {request_id: chatcmpl-mid, prompt_segments: [{key: pm, num_tokens: 61}], priority: 1, sampling_params: {max_tokens: 50}}}
+      - {flow: scheduler-schedule, as: s1, input: {}}
+      - {flow: scheduler-update-from-output, as: u1, input: {scheduler_output: "= steps.s1.result.value", model_runner_output: {req_ids: [chatcmpl-mid], sampled_token_ids: [[11]]}}}
+      - {flow: scheduler-add-request, as: al, at_ms: 1, input: {request_id: chatcmpl-lo, prompt_segments: [{key: pl, num_tokens: 62}], priority: 5, sampling_params: {max_tokens: 50}}}
+      - {flow: scheduler-schedule, as: s2, input: {}}
+      - {flow: scheduler-update-from-output, as: u2, input: {scheduler_output: "= steps.s2.result.value", model_runner_output: {req_ids: [chatcmpl-mid, chatcmpl-lo], sampled_token_ids: [[12], [21]]}}}
+      - {flow: scheduler-add-request, as: ah, at_ms: 2, input: {request_id: chatcmpl-hi, prompt_segments: [{key: ph, num_tokens: 63}], priority: 0, sampling_params: {max_tokens: 50}}}
+      - {flow: scheduler-schedule, as: s3, input: {}}
+      - {flow: scheduler-update-from-output, as: u3, input: {scheduler_output: "= steps.s3.result.value", model_runner_output: {req_ids: [chatcmpl-mid, chatcmpl-lo, chatcmpl-hi], sampled_token_ids: [[13], [22], [31]]}}}
+      - {flow: scheduler-schedule, as: s4, input: {}}
+      - {flow: scheduler-update-from-output, as: u4, input: {scheduler_output: "= steps.s4.result.value", model_runner_output: {req_ids: [chatcmpl-mid, chatcmpl-lo, chatcmpl-hi], sampled_token_ids: [[14], [23], [32]]}}}
+      - {flow: scheduler-schedule, as: s5, input: {}}
+    expect:
+      - "steps.s4.result.value.num_scheduled_tokens == {'chatcmpl-mid': 1, 'chatcmpl-lo': 1, 'chatcmpl-hi': 1}"
+      - "steps.s5.result.value.preempted_req_ids == ['chatcmpl-lo']"
+      - "steps.s5.result.value.num_scheduled_tokens == {'chatcmpl-mid': 1, 'chatcmpl-hi': 1}"
+      - "state.scheduler.running == ['chatcmpl-mid', 'chatcmpl-hi'] && state.scheduler.waiting == ['chatcmpl-lo']"
+      - "state.scheduler.requests['chatcmpl-lo'].status == 'PREEMPTED' && state.scheduler.requests['chatcmpl-lo'].num_computed_tokens == 0"
+      - "trace.filter(e, e.type == 'call.start' && e.interface == 'scheduler.preempt-request').map(e, e.input.request_id) == ['chatcmpl-lo']"
+
+  - id: bench-k8-self-preempt
+    name: "K8 edge: the lowest-priority request preempts itself, which ends the running pass, so a later running request waits a step"
+    description: "--num-gpu-blocks-override 9. Running order lo (prio 5), hi (prio 0). lo needs a 5th block first; the victim max(priority, arrival) is lo itself; scheduler.py:842-848 then breaks out of the running loop."
+    fixtures: [full-tp1-llama-8b]
+    config: {scheduling-policy: priority, num-gpu-blocks-override: 9}
+    state:
+      block-pool: {num_gpu_blocks: 9}
+    steps:
+      - {flow: scheduler-add-request, as: al, input: {request_id: chatcmpl-lo, prompt_segments: [{key: pl, num_tokens: 63}], priority: 5, sampling_params: {max_tokens: 50}}}
+      - {flow: scheduler-schedule, as: s1, input: {}}
+      - {flow: scheduler-update-from-output, as: u1, input: {scheduler_output: "= steps.s1.result.value", model_runner_output: {req_ids: [chatcmpl-lo], sampled_token_ids: [[21]]}}}
+      - {flow: scheduler-add-request, as: ah, at_ms: 1, input: {request_id: chatcmpl-hi, prompt_segments: [{key: ph, num_tokens: 64}], priority: 0, sampling_params: {max_tokens: 50}}}
+      - {flow: scheduler-schedule, as: s2, input: {}}
+      - {flow: scheduler-update-from-output, as: u2, input: {scheduler_output: "= steps.s2.result.value", model_runner_output: {req_ids: [chatcmpl-lo, chatcmpl-hi], sampled_token_ids: [[22], [31]]}}}
+      - {flow: scheduler-schedule, as: s3, input: {}}
+    expect:
+      - "steps.s2.result.value.num_scheduled_tokens == {'chatcmpl-lo': 1, 'chatcmpl-hi': 64}"
+      - "steps.s3.result.value.preempted_req_ids == ['chatcmpl-lo']"
+      - "steps.s3.result.value.total_num_scheduled_tokens == 0"
+      - "trace.exists(e, e.type == 'note' && e.title == 'Preempted itself; it cannot be scheduled')"

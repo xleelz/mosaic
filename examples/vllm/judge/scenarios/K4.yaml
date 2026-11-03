@@ -1,0 +1,48 @@
+schema_version: 1
+id: vllm
+scenarios:
+  - id: bench-k4
+    name: "K4 prefix caching hit: a second request sharing a 512-token prefix adopts the 32 cached blocks and computes only its own tokens"
+    fixtures: [full-tp1-llama-8b]
+    steps:
+      - {flow: scheduler-add-request, as: a1, input: {request_id: chatcmpl-r1, prompt_segments: [{key: sys-512, num_tokens: 512}, {key: user-a, num_tokens: 100}], sampling_params: {max_tokens: 16}}}
+      - {flow: scheduler-schedule, as: s1, input: {}}
+      - {flow: scheduler-update-from-output, as: u1, input: {scheduler_output: "= steps.s1.result.value", model_runner_output: {req_ids: [chatcmpl-r1], sampled_token_ids: [[791]]}}}
+      - {flow: scheduler-add-request, as: a2, input: {request_id: chatcmpl-r2, prompt_segments: [{key: sys-512, num_tokens: 512}, {key: user-b, num_tokens: 60}], sampling_params: {max_tokens: 16}}}
+      - {flow: scheduler-schedule, as: s2, input: {}}
+      - {flow: scheduler-make-stats, as: st, input: {}}
+    expect:
+      - "steps.s1.result.value.num_scheduled_tokens == {'chatcmpl-r1': 612}"
+      - "steps.s2.result.value.num_scheduled_tokens == {'chatcmpl-r1': 1, 'chatcmpl-r2': 60}"
+      - "steps.s2.result.value.scheduled_new_reqs[0].num_computed_tokens == 512"
+      - "size(steps.s2.result.value.scheduled_new_reqs[0].block_ids) == 36"
+      - "steps.s2.result.value.scheduled_new_reqs[0].block_ids.slice(0, 32) == steps.s1.result.value.scheduled_new_reqs[0].block_ids.slice(0, 32)"
+      - "!steps.s2.result.value.scheduled_new_reqs[0].block_ids.slice(32, 36).exists(b, b in steps.s1.result.value.scheduled_new_reqs[0].block_ids)"
+      - "state.scheduler.requests['chatcmpl-r2'].num_cached_tokens == 512"
+      - "steps.st.result.value.prefix_cache_stats.hits == 512"
+      # path: the lookup returns 32 blocks, which allocate-slots adopts as new_computed_blocks
+      - "trace.filter(e, e.type == 'call.end' && e.interface == 'kv-cache-manager.get-computed-blocks').map(e, e.output.num_computed_tokens) == [0, 512]"
+      - "trace.filter(e, e.type == 'call.start' && e.interface == 'kv-cache-manager.allocate-slots' && e.input.request_id == 'chatcmpl-r2').map(e, [e.input.num_new_computed_tokens, size(e.input.new_computed_blocks), e.input.num_new_tokens]) == [[512, 32, 60]]"
+
+  - id: bench-k4-same-step
+    name: "K4 variant: blocks are cached at allocation, so a request admitted later in the same step already hits r1's prefix"
+    fixtures: [full-tp1-llama-8b]
+    steps:
+      - {flow: scheduler-add-request, as: a1, input: {request_id: chatcmpl-r1, prompt_segments: [{key: sys-512, num_tokens: 512}, {key: user-a, num_tokens: 100}], sampling_params: {max_tokens: 16}}}
+      - {flow: scheduler-add-request, as: a2, input: {request_id: chatcmpl-r2, prompt_segments: [{key: sys-512, num_tokens: 512}, {key: user-b, num_tokens: 60}], sampling_params: {max_tokens: 16}}}
+      - {flow: scheduler-schedule, as: s1, input: {}}
+    expect:
+      - "steps.s1.result.value.num_scheduled_tokens == {'chatcmpl-r1': 612, 'chatcmpl-r2': 60}"
+      - "steps.s1.result.value.scheduled_new_reqs[1].num_computed_tokens == 512"
+
+  - id: bench-k4-prompt-equals-prefix
+    name: "K4 edge: a prompt that is exactly the cached 512 tokens hits only 496 (capped at num_tokens - 1, block aligned)"
+    fixtures: [full-tp1-llama-8b]
+    steps:
+      - {flow: scheduler-add-request, as: a1, input: {request_id: chatcmpl-r1, prompt_segments: [{key: sys-512, num_tokens: 512}, {key: user-a, num_tokens: 100}], sampling_params: {max_tokens: 16}}}
+      - {flow: scheduler-schedule, as: s1, input: {}}
+      - {flow: scheduler-add-request, as: a2, input: {request_id: chatcmpl-r2, prompt_segments: [{key: sys-512, num_tokens: 512}], sampling_params: {max_tokens: 16}}}
+      - {flow: scheduler-schedule, as: s2, input: {}}
+    expect:
+      - "steps.s2.result.value.scheduled_new_reqs[0].num_computed_tokens == 496"
+      - "steps.s2.result.value.num_scheduled_tokens['chatcmpl-r2'] == 16"

@@ -1,0 +1,41 @@
+schema_version: 1
+id: vllm
+scenarios:
+  - id: bench-v1
+    name: "V1: non-streaming chat completion, max_tokens 16"
+    description: >
+      The engine-core busy loop runs (await false) while POST /v1/chat/completions renders the chat
+      template, tokenizes, calls AsyncLLM.generate (EngineCoreRequest ADD to the engine core), the
+      scheduler/worker loop produces 16 tokens, the output processor detokenizes them and the full
+      generator returns one chat.completion with finish_reason length and usage.
+    fixtures: [full-tp1-llama-8b]
+    steps:
+      - {flow: engine-core-busy-loop, input: {iterations: 60}, as: loop, await: false}
+      - flow: serving-api-chat-completion
+        at_ms: 0
+        as: chat
+        input:
+          path: /v1/chat/completions
+          headers: {X-Request-Id: v1}
+          body:
+            model: llama-8b
+            messages: [{role: user, content: "What is the capital of France?"}]
+            max_tokens: 16
+    expect:
+      # outcome
+      - "steps.chat.result.ok && steps.chat.result.value.object == 'chat.completion' && steps.chat.result.value.id == 'chatcmpl-v1'"
+      - "steps.chat.result.value.choices[0].finish_reason == 'length' && steps.chat.result.value.choices[0].message.role == 'assistant'"
+      - "steps.chat.result.value.usage.completion_tokens == 16 && steps.chat.result.value.usage.prompt_tokens == 14 && steps.chat.result.value.usage.total_tokens == 30"
+      # path: chat template applied and tokenized before generate
+      - "trace.exists(e, e.type == 'call.start' && e.interface == 'hf-renderer.render-messages')"
+      - "trace.filter(e, e.type == 'call.start' && e.interface == 'hf-renderer.render-messages')[0].seq < trace.filter(e, e.type == 'call.start' && e.interface == 'async-llm.generate')[0].seq"
+      - "trace.exists(e, e.type == 'call.start' && e.interface == 'async-llm.generate' && e.input.request_id == 'chatcmpl-v1' && e.input.sampling_params.max_tokens == 16)"
+      # EngineCoreRequest ADD crosses to the engine core and reaches the scheduler
+      - "trace.exists(e, e.type == 'call.start' && e.interface == 'input-processor.process-inputs')"
+      - "trace.exists(e, e.type == 'call.start' && e.interface == 'engine-core-proc.process-input-sockets')"
+      - "trace.exists(e, e.type == 'call.start' && e.interface == 'scheduler.add-request' && e.input.request_id.startsWith('chatcmpl-v1-'))"
+      - "trace.exists(e, e.type == 'call.start' && e.interface == 'gpu-worker-impl.execute-model' && e.instance == 'rank0')"
+      # length cap decided by check_stop; detokenized incrementally in the frontend
+      - "trace.exists(e, e.type == 'call.end' && e.interface == 'sched-utils.check-stop' && e.output.status == 'FINISHED_LENGTH_CAPPED')"
+      - "calls['incremental-detokenizer.update'] == 16 && calls['async-llm.generate'] == 1"
+      - "size(state['output-processor'].request_states) == 0"

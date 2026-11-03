@@ -1,0 +1,18 @@
+# Oracle: worker-runner (fix round 4, blind)
+
+| Test | Behavior | Scenario | Verdict | At fault / missing | Evidence |
+|---|---|---|---|---|---|
+| tests/v1/worker/test_gpu_model_runner_v2_cudagraph_profiling.py:117 `test_profile_cudagraph_memory_disabled_returns_zero` | `profile_cudagraph_memory` returns 0 and does no KV bootstrap/teardown when cudagraph_mode is NONE | `oracle-worker-runner-profile-cg-memory-disabled-returns-zero` | model-bug | worker-runner: `gpu-model-runner.profile-cudagraph-memory` | Code `vllm/v1/worker/gpu/cudagraph_utils.py:889-890` returns 0 on mode NONE. The model's behavior unconditionally returns `config['worker-runner-cudagraph-memory-bytes']` (536870912); the NONE guard lives only in its caller `gpu-worker-impl.determine-available-memory` (gpu_worker.py:700-704). |
+| tests/v1/cudagraph/test_cudagraph_manager.py:59 `test_full_capture_sets_graph_pool_id_before_cuda_graph` | FULL capture sets NCCL's `pynccl_allocator._graph_pool_id` to the pool before entering `torch.cuda.graph` | `oracle-worker-runner-full-capture-sets-graph-pool-id` | model-bug (missing) | worker-runner: `cuda-graph-manager.capture` | Code `cudagraph_utils.py:491-494` enters `capture_pool` (`vllm/compilation/cudagraph_pool.py:33-45`, calls `set_graph_pool_id`) then `torch.cuda.graph`. The model's `capture` is one `gpu-memory.allocate` of a constant; no per-descriptor capture, no capture_pool / graph-pool-id step, so the ordering can't be observed. |
+| tests/v1/cudagraph/test_cudagraph_mode.py:42 `test_backend_and_cudagraph_mode_combo` (case FA2, FULL) | FA2 (UNIFORM_BATCH) with cudagraph_mode FULL is downgraded to FULL_AND_PIECEWISE and generation succeeds | `oracle-worker-runner-backend-and-cudagraph-mode-combo` | model-bug | worker-runner: `gpu-model-runner.initialize-kv-cache` / `cuda-graph-manager.init` (orphan `attn-utils.get-attn-cg-support`) | Code `vllm/v1/worker/gpu/model_runner.py:735-744` calls `resolve_cudagraph_mode_and_sizes` (`vllm/config/compilation.py:1386-1411`): FULL mixed mode needs ALWAYS; FA2 reports UNIFORM_BATCH (`flash_attn.py:614-617`) so it becomes FULL_AND_PIECEWISE. Model: `cuda-graph-manager.init` reads `config['cudagraph-mode']` verbatim and returns FULL; `get-attn-cg-support` is never called. Generation itself succeeds. |
+
+Other cases of the parametrized test (FA3, FlashInfer, FULL_AND_PIECEWISE) were not translated separately; the FA2/FULL case is the one with a decision.
+
+Side note (attention, not scored): with `flash-attn-version: 2` the trace still runs `flash-attn-interface.vllm-fa3-get-scheduler-metadata` ("FA3 heuristics").
+
+## Fix requests
+
+### worker-runner
+1. `gpu-model-runner.profile-cudagraph-memory`: return 0 first when `cudagraph-mode` is NONE (cudagraph_utils.py:889-890), and model the bootstrap (`_init_minimal_kv_cache_for_profiling`), the `needs_capture` early return (0 after teardown) and teardown in a finally.
+2. `cuda-graph-manager.capture`: capture per descriptor (PIECEWISE then FULL, FULL capped at `_max_full_descs_to_capture` when profiling); for each FULL graph enter `capture_pool` (sets the NCCL graph pool id, cudagraph_pool.py:33-45) before the `torch.cuda.graph` capture (cudagraph_utils.py:491-494).
+3. `gpu-model-runner.initialize-kv-cache`: call `attn-utils.get-attn-cg-support` over the attention groups and resolve the mode as `resolve_cudagraph_mode_and_sizes` does (compilation.py:1369-1460: FULL mixed without ALWAYS -> FULL_AND_PIECEWISE or FULL_DECODE_ONLY; NEVER -> error / PIECEWISE / NONE; spec-decode downgrade), and pass the resolved mode to `cuda-graph-manager.init` instead of reading the config verbatim.

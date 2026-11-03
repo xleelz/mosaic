@@ -1,0 +1,166 @@
+# A process supervisor at the runtime level, built on the Linux substrate, to show an import
+# works. It runs a job as a child process (fork, execve and a blocking waitpid in one call) and
+# stops it the way systemd and container runtimes do: SIGTERM, a grace period, then SIGKILL if
+# the child is still there. Imported ids: components and interfaces under "linux/", state at
+# state['linux/kernel']; configs keep their ids.
+schema_version: 1
+id: linux-worker
+name: Process supervisor (substrate import example)
+level: runtime
+imports:
+  - {ontology: ../../linux/linux.yaml, as: linux}
+
+configs:
+  - id: supervisor-stop-grace-ms
+    type: integer
+    value: 2000
+    default: 10000
+    summary: "How long stop waits after SIGTERM before SIGKILL (systemd's TimeoutStopSec, default 90 s; 2 s here)."
+    sources: ["https://www.freedesktop.org/software/systemd/man/latest/systemd.kill.html"]
+
+components:
+  - {id: operator, kind: client, summary: Whoever asks the supervisor to run or stop jobs.}
+  - id: supervisor
+    kind: service
+    summary: "The supervisor process (pid 100): it forks one child per job and reaps it."
+
+interfaces:
+  - component: supervisor
+    name: run
+    kind: function
+    summary: >-
+      Run a program as a child and wait for it, in one call: fork, execve in the child, then a
+      blocking waitpid that wakes when the program exits. An exec failure makes the child exit
+      127, as posix_spawn and shells do. Reports the status as a shell would ($?).
+    request:
+      type: object
+      required: [path]
+      properties:
+        path: {type: string, examples: [/usr/bin/worker]}
+        run_ms: {type: integer, default: 1000}
+        exit_code: {type: integer, default: 0}
+    response: {type: object, properties: {pid: {type: integer}, status: {type: integer}}}
+    behavior:
+      - call: linux/kernel.fork
+        input: {pid: 100}
+        as: f
+      - call: linux/kernel.execve
+        input: {pid: "= vars.f.value.child", path: "= input.path", run_ms: "= input.run_ms", exit_code: "= input.exit_code"}
+        on_error:
+          - title: exec failed; the child exits 127
+            call: linux/kernel.exit
+            input: {pid: "= vars.f.value.child", code: 127}
+      - call: linux/kernel.waitpid
+        input: {pid: 100, child: "= vars.f.value.child"}
+        as: w
+      - return: {pid: "= vars.w.value.pid", status: "= vars.w.value.shell_status"}
+
+  - component: supervisor
+    name: start
+    kind: function
+    summary: Start a long-running child and return its pid without waiting.
+    request: {type: object, required: [path], properties: {path: {type: string, examples: [/usr/bin/worker]}, term: {type: string, enum: [default, handle], default: default, description: "sim: whether the program installs a SIGTERM handler (and so ignores the request to stop)"}}}
+    response: {type: object, properties: {pid: {type: integer}}}
+    behavior:
+      - call: linux/kernel.fork
+        input: {pid: 100}
+        as: f
+      - call: linux/kernel.execve
+        input: {pid: "= vars.f.value.child", path: "= input.path"}
+      - call: linux/kernel.sigaction
+        input: {pid: "= vars.f.value.child", sig: 15, action: handle}
+        when: "has(input.term) && input.term == 'handle'"
+      - return: {pid: "= vars.f.value.child"}
+
+  - component: supervisor
+    name: stop
+    kind: function
+    summary: >-
+      Stop a child: SIGTERM, then poll with WNOHANG; if it hasn't exited after the grace period,
+      SIGKILL and reap. Returns the shell status (143 for SIGTERM, 137 for SIGKILL) and whether
+      it had to escalate.
+    request: {type: object, required: [pid], properties: {pid: {type: integer, examples: [101]}}}
+    response: {type: object, properties: {status: {type: integer}, escalated: {type: boolean}}}
+    behavior:
+      - call: linux/kernel.kill
+        input: {pid: 100, target: "= input.pid", sig: 15}
+      - call: linux/kernel.waitpid
+        input: {pid: 100, child: "= input.pid", wnohang: true}
+        as: w
+      - if: "vars.w.value.pid != 0"
+        then: [{return: {status: "= vars.w.value.shell_status", escalated: false}}]
+      - call: linux/kernel.nanosleep
+        input: {pid: 100, ms: "= config['supervisor-stop-grace-ms']"}
+      - call: linux/kernel.waitpid
+        input: {pid: 100, child: "= input.pid", wnohang: true}
+        as: w2
+      - if: "vars.w2.value.pid != 0"
+        then: [{return: {status: "= vars.w2.value.shell_status", escalated: false}}]
+      - title: Grace period over; SIGKILL can't be caught
+        call: linux/kernel.kill
+        input: {pid: 100, target: "= input.pid", sig: 9}
+      - call: linux/kernel.waitpid
+        input: {pid: 100, child: "= input.pid"}
+        as: w3
+      - return: {status: "= vars.w3.value.shell_status", escalated: true}
+
+flows:
+  - {id: run, tags: [writes], entry: {caller: operator, interface: supervisor.run}}
+  - {id: start, tags: [writes], entry: {caller: operator, interface: supervisor.start}}
+  - {id: stop, tags: [writes], entry: {caller: operator, interface: supervisor.stop}}
+
+fixtures:
+  - id: supervisor-host
+    clock: {epoch: "2026-11-01T00:00:00Z"}
+    state:
+      linux/kernel:
+        next_pid: 101
+        procs:
+          "1": {pid: 1, ppid: 0, state: running, exe: /sbin/init, handlers: {}, caught: [], blocked: {on: '', obj: '', addr: '', seq: 0}, nofile: 1024, rss_mb: 10, oom_score_adj: 0, status: null}
+          "100": {pid: 100, ppid: 1, state: running, exe: /usr/bin/supervisor, handlers: {}, caught: [], blocked: {on: '', obj: '', addr: '', seq: 0}, nofile: 1024, rss_mb: 20, oom_score_adj: 0, status: null}
+        files:
+          /usr/bin/worker: {path: /usr/bin/worker, data: "", exec: true}
+
+scenarios:
+  - id: run-to-completion
+    name: A job that exits 3 after 500 ms; run forks, execs and blocks in waitpid until then, and reports status 3
+    fixtures: [supervisor-host]
+    steps:
+      - {flow: run, as: r, input: {path: /usr/bin/worker, run_ms: 500, exit_code: 3}}
+      - {interface: linux/kernel.proc-status, caller: operator, as: gone, input: {pid: 101}}
+    expect:
+      - "steps.r.result.ok && steps.r.result.value.pid == 101 && steps.r.result.value.status == 3"
+      - "steps.r.duration_ms >= 500 && steps.r.duration_ms <= 502"
+      - "steps.gone.result.error.code == 'ESRCH'"
+      - "!('101' in state['linux/kernel'].procs)"
+
+  - id: run-missing-program
+    name: An exec failure exits the child with 127, which run reports
+    fixtures: [supervisor-host]
+    steps:
+      - {flow: run, as: r, input: {path: /usr/bin/missing}}
+    expect:
+      - "steps.r.result.ok && steps.r.result.value.status == 127 && steps.r.duration_ms <= 2"
+      - "!('101' in state['linux/kernel'].procs)"
+
+  - id: stop-graceful
+    name: A worker with the default SIGTERM action exits on the first signal (status 143), no escalation
+    fixtures: [supervisor-host]
+    steps:
+      - {flow: start, as: s, input: {path: /usr/bin/worker}}
+      - {flow: stop, as: t, at_ms: 1000, input: {pid: 101}}
+    expect:
+      - "steps.t.result.value.status == 143 && !steps.t.result.value.escalated"
+      - "steps.t.duration_ms < 10"
+      - "!('101' in state['linux/kernel'].procs)"
+
+  - id: stop-escalates-to-sigkill
+    name: A worker that handles SIGTERM survives it; after the 2 s grace the supervisor sends SIGKILL (status 137)
+    fixtures: [supervisor-host]
+    steps:
+      - {flow: start, as: s, input: {path: /usr/bin/worker, term: handle}}
+      - {flow: stop, as: t, at_ms: 1000, input: {pid: 101}}
+    expect:
+      - "steps.t.result.value.status == 137 && steps.t.result.value.escalated"
+      - "steps.t.duration_ms >= 2000"
+      - "!('101' in state['linux/kernel'].procs)"

@@ -1,0 +1,84 @@
+schema_version: 1
+id: cassandra
+scenarios:
+  # Verified expectation (5.0.9), StorageService.decommission (StorageService.java:5298-5422): in the benchmark
+  # cluster (3 nodes, ks1 RF 3) a non-forced decommission is REFUSED - "Not enough live nodes to maintain
+  # replication factor" (:5354-5368) - and because the check is inside the try, the mode becomes
+  # DECOMMISSION_FAILED (:5416-5421). With 4 nodes: startLeaving gossips LEAVING and adds the leaving endpoint
+  # (:5289-5296, 5375); sleep max(RING_DELAY 30 s, batchlog timeout) (:5376-5378); unbootstrap (:5454-5490):
+  # batchlog replay and range streaming start together, hints are transferred after the batchlog replay
+  # (transfer_hints_on_decommission default true, Config.java:452), both awaited; leaveRing removes the
+  # local endpoint, gossips LEFT and sleeps RING_DELAY (:5424-5435); then gossip/messaging stop and the mode is
+  # DECOMMISSIONED (:5382-5397). Correction: hints are streamed concurrently with the data stream (after the
+  # batchlog), not strictly after it; and the 3-node case refuses.
+  - id: bench-g4-three-nodes-refused
+    flow: membership-decommission
+    name: Default 3-node cluster with RF 3 - decommission refused, mode DECOMMISSION_FAILED, nothing streamed
+    expect:
+      - "!result.ok && result.error.message.contains('Not enough live nodes')"
+      - "state['storage-service'].operation_mode == 'DECOMMISSION_FAILED'"
+      - "calls['stream-plan.execute'] == 0 && calls['hints-service.transfer-hints'] == 0 && !has(ctx.status_changes)"
+  - id: bench-g4-four-nodes
+    flow: membership-decommission
+    name: 4-node cluster - LEAVING, wait 30 s, batchlog replay, stream ranges, transfer hints, LEFT, wait 30 s, DECOMMISSIONED
+    state:
+      gossiper:
+        endpoint_state_map:
+          "10.0.0.4": {alive: true, dc: datacenter1, endpoint: 10.0.0.4, generation: 1761800000, heartbeat: 300, host_id: 6d194555-f6eb-41d0-c000-000000000004, load: 1048576, max_version: 310, rack: rack1, rpc_ready: true, status: NORMAL, tokens: [3074457345618258602], update_ms: 0}
+        live_endpoints: ["10.0.0.2", "10.0.0.3", "10.0.0.4"]
+      token-metadata:
+        host_ids: {"10.0.0.1": 6d194555-f6eb-41d0-c000-000000000001, "10.0.0.2": 6d194555-f6eb-41d0-c000-000000000002, "10.0.0.3": 6d194555-f6eb-41d0-c000-000000000003, "10.0.0.4": 6d194555-f6eb-41d0-c000-000000000004}
+        ring:
+          - {endpoint: 10.0.0.1, token: -6148914691236517206}
+          - {endpoint: 10.0.0.2, token: 0}
+          - {endpoint: 10.0.0.4, token: 3074457345618258602}
+          - {endpoint: 10.0.0.3, token: 6148914691236517205}
+    expect:
+      - "result.value.operation_mode == 'DECOMMISSIONED' && state['storage-service'].bootstrap_state == 'DECOMMISSIONED'"
+      - "'10.0.0.1:LEAVING' in ctx.status_changes && '10.0.0.1:LEFT' in ctx.status_changes"
+      - "calls['batchlog-manager.start-batchlog-replay'] == 1 && calls['stream-plan.execute'] == 1 && calls['hints-service.transfer-hints'] == 1"
+      - "!state['token-metadata'].ring.exists(e, e.endpoint == '10.0.0.1') && state.gossiper.enabled == false"
+      - "duration_ms >= 60000"
+  - id: bench-g4-peer-sees-leaving
+    flow: membership-gossip-ack2
+    name: Coordinator 10.0.0.1 in a 4-node ring learns 10.0.0.4 is LEAVING - its ranges become pending on the nodes taking them over
+    input:
+      states:
+        - {endpoint: 10.0.0.4, generation: 1761800000, heartbeat: 320, max_version: 330, status: LEAVING, tokens: [3074457345618258602]}
+    state:
+      gossiper:
+        endpoint_state_map:
+          "10.0.0.4": {alive: true, dc: datacenter1, endpoint: 10.0.0.4, generation: 1761800000, heartbeat: 300, host_id: 6d194555-f6eb-41d0-c000-000000000004, load: 1048576, max_version: 310, rack: rack1, rpc_ready: true, status: NORMAL, tokens: [3074457345618258602], update_ms: 0}
+        live_endpoints: ["10.0.0.2", "10.0.0.3", "10.0.0.4"]
+      token-metadata:
+        host_ids: {"10.0.0.1": 6d194555-f6eb-41d0-c000-000000000001, "10.0.0.2": 6d194555-f6eb-41d0-c000-000000000002, "10.0.0.3": 6d194555-f6eb-41d0-c000-000000000003, "10.0.0.4": 6d194555-f6eb-41d0-c000-000000000004}
+        ring:
+          - {endpoint: 10.0.0.1, token: -6148914691236517206}
+          - {endpoint: 10.0.0.2, token: 0}
+          - {endpoint: 10.0.0.4, token: 3074457345618258602}
+          - {endpoint: 10.0.0.3, token: 6148914691236517205}
+    expect:
+      - "state['token-metadata'].leaving_endpoints == ['10.0.0.4']"
+      - "size(state['token-metadata'].pending_ranges) > 0 && !state['token-metadata'].pending_ranges.exists(r, r.endpoint == '10.0.0.4')"
+  - id: bench-g4-peer-sees-left
+    flow: membership-gossip-ack2
+    name: 10.0.0.4 gossips LEFT - removed from the ring, its hints excised, clients told REMOVED_NODE
+    input:
+      states:
+        - {endpoint: 10.0.0.4, generation: 1761800000, heartbeat: 400, max_version: 420, status: LEFT, tokens: [3074457345618258602]}
+    state:
+      gossiper:
+        endpoint_state_map:
+          "10.0.0.4": {alive: true, dc: datacenter1, endpoint: 10.0.0.4, generation: 1761800000, heartbeat: 320, host_id: 6d194555-f6eb-41d0-c000-000000000004, load: 1048576, max_version: 330, rack: rack1, rpc_ready: true, status: LEAVING, tokens: [3074457345618258602], update_ms: 0}
+        live_endpoints: ["10.0.0.2", "10.0.0.3", "10.0.0.4"]
+      token-metadata:
+        host_ids: {"10.0.0.1": 6d194555-f6eb-41d0-c000-000000000001, "10.0.0.2": 6d194555-f6eb-41d0-c000-000000000002, "10.0.0.3": 6d194555-f6eb-41d0-c000-000000000003, "10.0.0.4": 6d194555-f6eb-41d0-c000-000000000004}
+        leaving_endpoints: ["10.0.0.4"]
+        ring:
+          - {endpoint: 10.0.0.1, token: -6148914691236517206}
+          - {endpoint: 10.0.0.2, token: 0}
+          - {endpoint: 10.0.0.4, token: 3074457345618258602}
+          - {endpoint: 10.0.0.3, token: 6148914691236517205}
+    expect:
+      - "!state['token-metadata'].ring.exists(e, e.endpoint == '10.0.0.4') && state['token-metadata'].leaving_endpoints == []"
+      - "calls['server-event-notifier.on-leave-cluster'] == 1"

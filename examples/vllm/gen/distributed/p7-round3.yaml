@@ -1,0 +1,216 @@
+# distributed area, part 7 (fix round 3): code under the round-3 unit tests. The offloading
+# connector's opaque page mapping, the EC CPU connector's embedding cache, and nccl_m2n's
+# transferability check.
+schema_version: 1
+id: vllm
+
+components:
+  - id: canonical-mapping
+    name: offloading canonical_mapping (module)
+    kind: module
+    layer: kv-transfer
+    parent: gpu-worker
+    summary: "Maps each worker's physical KV page onto a parallelism-agnostic canonical page for the offloading connector; when no structured mapping applies, the page is placed whole at a worker-exclusive offset."
+    sources: ["vllm/distributed/kv_transfer/kv_connector/v1/offloading/canonical_mapping.py:334-348"]
+  - id: ec-embedding-cache
+    name: EmbeddingCache (EC CPU connector)
+    kind: datastore
+    layer: ec-transfer
+    parent: engine-core
+    summary: "Fixed-size block cache of encoder outputs keyed by content (mm_hash), FIFO eviction of ready, unpinned entries; guarded by a threading.Lock."
+    sources: ["vllm/distributed/ec_transfer/ec_connector/cpu/scheduler/embedding_cache.py:48-71"]
+    state:
+      schema: {type: object, properties: {entries: {type: object}, num_blocks: {type: integer}, free_blocks: {type: array}}}
+      initial: {entries: {}, num_blocks: 8, free_blocks: [0, 1, 2, 3, 4, 5, 6, 7]}
+  - id: m2n-common
+    name: weight_transfer m2n_common (module)
+    kind: module
+    layer: weight-transfer
+    parent: gpu-worker
+    summary: "Shared helpers of the nccl_m2n weight transfer: dtype and rank checks, mesh and placement conversion."
+    sources: ["vllm/distributed/weight_transfer/m2n_common.py:29", "vllm/distributed/weight_transfer/m2n_common.py:47-66"]
+
+interfaces:
+  - component: canonical-mapping
+    name: opaque-fallback-mapping
+    kind: function
+    summary: "_opaque_fallback_mapping: one run copies this worker's whole page to canonical offset rank * page_size; the canonical page is num_ranks pages; one writer; not parallelism-agnostic."
+    sources: ["vllm/distributed/kv_transfer/kv_connector/v1/offloading/canonical_mapping.py:334-348"]
+    request:
+      type: object
+      required: [page_size_bytes, num_ranks, rank]
+      properties:
+        page_size_bytes: {type: integer, examples: [1024]}
+        num_ranks: {type: integer, examples: [4]}
+        rank: {type: integer, examples: [2]}
+    response:
+      type: object
+      properties:
+        canonical_page_size_bytes: {type: integer}
+        local_page_size_bytes: {type: integer}
+        runs: {type: array}
+        num_writers: {type: integer}
+        writer_index: {type: integer}
+        parallelism_agnostic: {type: boolean}
+    behavior:
+      - title: "CopyRun(0, rank * page, page, 1, page, page)"
+        source: "vllm/distributed/kv_transfer/kv_connector/v1/offloading/canonical_mapping.py:338-340"
+        return:
+          canonical_page_size_bytes: "= input.num_ranks * input.page_size_bytes"
+          local_page_size_bytes: "= input.page_size_bytes"
+          runs: "= [{'local_offset': 0, 'canonical_offset': input.rank * input.page_size_bytes, 'fragment_size': input.page_size_bytes, 'num_fragments': 1, 'local_stride': input.page_size_bytes, 'canonical_stride': input.page_size_bytes}]"
+          num_writers: 1
+          writer_index: 0
+          parallelism_agnostic: false
+
+  - component: ec-embedding-cache
+    name: get
+    kind: function
+    summary: "EmbeddingCache.get: the entry for a key, or None (under the cache lock)."
+    sources: ["vllm/distributed/ec_transfer/ec_connector/cpu/scheduler/embedding_cache.py:72-75"]
+    request: {type: object, required: [key], properties: {key: {type: string, examples: [a]}}}
+    response: {type: [object, "null"], properties: {block_ids: {type: array, items: {type: integer}}, ready: {type: boolean}}}
+    behavior:
+      - call: ec-embedding-cache.entry-lookup
+        input: {key: "= input.key"}
+        as: e
+        on_error: continue
+      - title: "self._entries.get(key): None when absent"
+        source: "vllm/distributed/ec_transfer/ec_connector/cpu/scheduler/embedding_cache.py:74-75"
+        return: "= vars.e.ok ? vars.e.value : null"
+
+  - component: ec-embedding-cache
+    name: entry-lookup
+    kind: io
+    summary: "self._entries[key]"
+    sources: ["vllm/distributed/ec_transfer/ec_connector/cpu/scheduler/embedding_cache.py:75"]
+    request: {type: object, required: [key], properties: {key: {type: string}}}
+    errors:
+      - {code: not_found, status: 404, retryable: false}
+    store: {table: entries, op: get, key: "= input.key"}
+
+  - component: ec-embedding-cache
+    name: alloc
+    kind: function
+    summary: "EmbeddingCache.alloc: refuse a duplicate key or more blocks than the cache holds; None when even evicting every evictable entry can't make room; otherwise a not-ready entry on the lowest free blocks."
+    sources: ["vllm/distributed/ec_transfer/ec_connector/cpu/scheduler/embedding_cache.py:86-111"]
+    attributes: {single_writer: "vllm/distributed/ec_transfer/ec_connector/cpu/scheduler/embedding_cache.py:94 holds self._lock for the whole allocation"}
+    request: {type: object, required: [key, n_blocks], properties: {key: {type: string, examples: [a]}, n_blocks: {type: integer, examples: [2]}}}
+    response: {type: [object, "null"], properties: {block_ids: {type: array, items: {type: integer}}, ready: {type: boolean}}}
+    errors:
+      - {code: assertion-error, status: 0, retryable: false}
+    behavior:
+      - call: ec-embedding-cache.get
+        input: {key: "= input.key"}
+        as: cur
+      - if: "vars.cur.value != null"
+        then:
+          - source: "vllm/distributed/ec_transfer/ec_connector/cpu/scheduler/embedding_cache.py:95-97"
+            fail: {code: assertion-error, status: 0, message: "= 'EmbeddingCache: duplicate alloc for ' + input.key"}
+      - if: "input.n_blocks > state.num_blocks"
+        then:
+          - source: "vllm/distributed/ec_transfer/ec_connector/cpu/scheduler/embedding_cache.py:98-101"
+            fail: {code: assertion-error, status: 0, message: "= 'EmbeddingCache: ' + string(input.n_blocks) + ' blocks requested but capacity is ' + string(state.num_blocks)"}
+      - if: "size(state.free_blocks) < input.n_blocks"
+        then:
+          - title: Not enough space even after eviction (no evictable entries modeled)
+            source: "vllm/distributed/ec_transfer/ec_connector/cpu/scheduler/embedding_cache.py:102-103"
+            return: null
+      - title: Take blocks from the free stack, in ascending order
+        source: "vllm/distributed/ec_transfer/ec_connector/cpu/scheduler/embedding_cache.py:104-111"
+        call: ec-embedding-cache.put-entry
+        input: {key: "= input.key", entry: "= {'block_ids': state.free_blocks.slice(size(state.free_blocks) - input.n_blocks, size(state.free_blocks)).sort(), 'ready': false}"}
+        as: put
+      - set: {state.free_blocks: "= state.free_blocks.slice(0, size(state.free_blocks) - input.n_blocks)"}
+      - return: "= vars.put.value"
+
+  - component: ec-embedding-cache
+    name: put-entry
+    kind: io
+    summary: "self._entries[key] = CacheEntry(block_ids, shape)"
+    sources: ["vllm/distributed/ec_transfer/ec_connector/cpu/scheduler/embedding_cache.py:109-110"]
+    request: {type: object, required: [key, entry], properties: {key: {type: string}, entry: {type: object}}}
+    errors:
+      - {code: assertion-error, status: 0, retryable: false}
+    store: {table: entries, op: put, key: "= input.key", value: "= input.entry", where: "row == null", conflict: assertion-error}
+
+  - component: m2n-common
+    name: check-transferable
+    kind: function
+    summary: "check_transferable: reject a parameter whose dtype nccl_m2n can't move, or whose rank is outside 1..MAX_TENSOR_DIMS (3), naming the parameter."
+    sources: ["vllm/distributed/weight_transfer/m2n_common.py:257-268"]
+    request:
+      type: object
+      required: [name, dtype, shape]
+      properties:
+        name: {type: string, examples: [w]}
+        dtype: {type: string, examples: [bfloat16]}
+        shape: {type: array, items: {type: integer}, examples: [[16, 16]]}
+    response: {type: object, properties: {ok: {type: boolean}}}
+    errors:
+      - {code: value-error, status: 0, retryable: false}
+    behavior:
+      - if: "!(input.dtype in ['int8', 'uint8', 'float8_e4m3fn', 'float8_e5m2', 'float16', 'bfloat16', 'int32', 'uint32', 'float32', 'int64', 'uint64', 'float64'])"
+        then:
+          - source: "vllm/distributed/weight_transfer/m2n_common.py:259-263"
+            fail: {code: value-error, status: 0, message: "= 'parameter \\'' + input.name + '\\' has dtype torch.' + input.dtype + ', which nccl_m2n does not support.'"}
+      - if: "size(input.shape) < 1 || size(input.shape) > 3"
+        then:
+          - source: "vllm/distributed/weight_transfer/m2n_common.py:264-268"
+            fail: {code: value-error, status: 0, message: "= 'parameter \\'' + input.name + '\\' has rank ' + string(size(input.shape)) + '; nccl_m2n supports rank 1..3'"}
+      - return: {ok: true}
+
+flows:
+  - id: distributed-offload-opaque-mapping
+    name: Opaque canonical page mapping
+    entry: {caller: gpu-worker, interface: canonical-mapping.opaque-fallback-mapping, input: {page_size_bytes: 1024, num_ranks: 4, rank: 2}}
+    sources: ["vllm/distributed/kv_transfer/kv_connector/v1/offloading/canonical_mapping.py:334-348"]
+  - id: distributed-ec-embedding-cache-alloc
+    name: Allocate in the EC embedding cache
+    tags: [writes]
+    entry: {caller: engine-core, interface: ec-embedding-cache.alloc, input: {key: a, n_blocks: 2}}
+    sources: ["vllm/distributed/ec_transfer/ec_connector/cpu/scheduler/embedding_cache.py:86-111"]
+  - id: distributed-ec-embedding-cache-get
+    name: Look up the EC embedding cache
+    entry: {caller: engine-core, interface: ec-embedding-cache.get, input: {key: a}}
+    sources: ["vllm/distributed/ec_transfer/ec_connector/cpu/scheduler/embedding_cache.py:72-75"]
+  - id: distributed-m2n-check-transferable
+    name: nccl_m2n transferability check
+    entry: {caller: python-user, interface: m2n-common.check-transferable, input: {name: w, dtype: bfloat16, shape: [16, 16]}}
+    sources: ["vllm/distributed/weight_transfer/m2n_common.py:257-268"]
+
+scenarios:
+  - id: distributed-ec-embedding-cache-alloc-then-get
+    flow: distributed-ec-embedding-cache-alloc
+    fixtures: [tp1-llama-8b]
+    steps:
+      - {flow: distributed-ec-embedding-cache-alloc, as: a}
+      - {flow: distributed-ec-embedding-cache-get, as: g}
+      - {flow: distributed-ec-embedding-cache-alloc, as: dup}
+      - {flow: distributed-ec-embedding-cache-alloc, as: big, input: {key: b, n_blocks: 9}}
+      - {flow: distributed-ec-embedding-cache-alloc, as: full, input: {key: c, n_blocks: 7}}
+    expect:
+      - "steps.a.result.value.block_ids == [6, 7] && !steps.a.result.value.ready && steps.g.result.value == steps.a.result.value"
+      - "steps.dup.result.error.code == 'assertion-error' && steps.big.result.error.code == 'assertion-error' && steps.full.result.value == null"
+      - "size(state['ec-embedding-cache'].entries) == 1"
+  - id: distributed-m2n-check-transferable-cases
+    flow: distributed-m2n-check-transferable
+    fixtures: [tp1-llama-8b]
+    steps:
+      - {flow: distributed-m2n-check-transferable, as: ok}
+      - {flow: distributed-m2n-check-transferable, as: cplx, input: {dtype: complex64, shape: [4]}}
+      - {flow: distributed-m2n-check-transferable, as: scalar, input: {shape: []}}
+    expect:
+      - "steps.ok.result.value.ok && steps.cplx.result.error.message.contains(\"'w'\") && steps.scalar.result.error.message.contains('rank 0')"
+  - id: distributed-offload-opaque-mapping-tiles
+    name: The opaque fallback pages of all ranks tile the canonical page exactly once
+    flow: distributed-offload-opaque-mapping
+    fixtures: [tp1-llama-8b]
+    steps:
+      - {flow: distributed-offload-opaque-mapping, as: r0, input: {rank: 0}}
+      - {flow: distributed-offload-opaque-mapping, as: r1, input: {rank: 1}}
+      - {flow: distributed-offload-opaque-mapping, as: r2, input: {rank: 2}}
+      - {flow: distributed-offload-opaque-mapping, as: r3, input: {rank: 3}}
+    expect:
+      - "[steps.r0, steps.r1, steps.r2, steps.r3].map(s, s.result.value.runs[0].canonical_offset) == [0, 1024, 2048, 3072]"
+      - "[steps.r0, steps.r3].all(s, s.result.value.canonical_page_size_bytes == 4096 && s.result.value.num_writers == 1)"

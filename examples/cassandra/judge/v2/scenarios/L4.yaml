@@ -1,0 +1,85 @@
+schema_version: 1
+id: cassandra
+scenarios:
+  - id: bench-l4-retry
+    flow: cql-conditional-write
+    fixtures: [three-node-rf3]
+    name: "L4 (path): n2 has promised a higher ballot; prepare rejected, random 0-99ms back-off, re-prepare with ballot = rejected promise + 1, then apply"
+    input:
+      statement:
+        keyspace: shop
+        table: users
+        type: INSERT
+        if_not_exists: true
+        columns: {name: Ada}
+        partition_keys:
+          - {partition_key: "user:42", token: -7509452495886106294}
+    state:
+      paxos-state@n2:
+        rows:
+          shop.users:user:42:
+            accepted_ballot: 0
+            accepted_columns: {}
+            accepted_empty: true
+            committed_ballot: 0
+            committed_columns: {}
+            promised: 1793318400500000
+            promised_write: 1793318400500000
+    expect:
+      - "result.ok && result.value.applied == true && ctx.casContentions == 1 && ctx.prepareRejected == true"
+      - "calls['ballot-generator.next-ballot'] == 2 && calls['storage-proxy.prepare-paxos'] == 2"
+      # second ballot is the rejecting replica's promise + 1 (#5667)
+      - "trace.filter(e, e.type == 'call.start' && e.interface == 'storage-proxy.prepare-paxos')[1].input.commit.ballot == 1793318400500001"
+      - "state['paxos-state@n2'].rows['shop.users:user:42'].committed_columns.name == 'Ada'"
+      - "calls['storage-proxy.propose-paxos'] == 1 && calls['storage-proxy.commit-paxos'] == 1"
+  - id: bench-l4-timeout
+    flow: cql-conditional-write
+    fixtures: [three-node-rf3]
+    name: "L4: contended prepare (n2, n3 promised higher) that answers slowly; the next attempt starts past cas_contention_timeout (1000ms) -> CasWriteTimeout(CAS, SERIAL, 0, 2)"
+    input:
+      statement:
+        keyspace: shop
+        table: users
+        type: INSERT
+        if_not_exists: true
+        columns: {name: Ada}
+        partition_keys:
+          - {partition_key: "user:42", token: -7509452495886106294}
+    state:
+      paxos-state@n2:
+        rows:
+          shop.users:user:42: {accepted_ballot: 0, accepted_columns: {}, accepted_empty: true, committed_ballot: 0, committed_columns: {}, promised: 1793318400500000, promised_write: 1793318400500000}
+      paxos-state@n3:
+        rows:
+          shop.users:user:42: {accepted_ballot: 0, accepted_columns: {}, accepted_empty: true, committed_ballot: 0, committed_columns: {}, promised: 1793318400500000, promised_write: 1793318400500000}
+    faults:
+      - {target: prepare-verb-handler.do-verb, instance: n2, type: latency, latency_ms: 990, calls: [1]}
+      - {target: prepare-verb-handler.do-verb, instance: n3, type: latency, latency_ms: 990, calls: [1]}
+    expect:
+      - "!result.ok && result.error.code == 'write-timeout' && result.error.status == 4352"
+      - "result.error.data.write_type == 'CAS' && result.error.data.consistency == 'SERIAL' && result.error.data.received == 0 && result.error.data.block_for == 2"
+      - "result.error.data.contentions >= 1 && ctx.prepareRejected == true"
+      - "calls['storage-proxy.read-one'] == 0 && calls['storage-proxy.propose-paxos'] == 0 && calls['storage-proxy.commit-paxos'] == 0"
+      - "duration_ms >= 1000 && duration_ms < 2000"
+  # Round 3: real contention between two concurrent proposers (overlapping steps), no latency stand-in
+  - id: bench-l4-concurrent-proposers
+    fixtures: [three-node-rf3]
+    name: "L4 (round 3): two coordinators run INSERT IF NOT EXISTS on the same partition at once; real contention, no latency stand-in"
+    max_virtual_ms: 60000
+    steps:
+      - flow: cql-conditional-write
+        'on': n1
+        as: a
+        await: false
+        input:
+          statement: {keyspace: shop, table: users, type: INSERT, if_not_exists: true, columns: {name: Ada}, partition_keys: [{partition_key: "user:42", token: -7509452495886106294}]}
+      - flow: cql-conditional-write
+        'on': n2
+        as: b
+        at_ms: 0
+        input:
+          statement: {keyspace: shop, table: users, type: INSERT, if_not_exists: true, columns: {name: Bob}, partition_keys: [{partition_key: "user:42", token: -7509452495886106294}]}
+    expect:
+      - "steps.a.result.ok && steps.b.result.ok"
+      - "[steps.a.result.value.applied, steps.b.result.value.applied].filter(x, x).size() == 1"
+      - "calls['ballot-generator.next-ballot'] >= 3"

@@ -1,0 +1,445 @@
+# Round 4: request validators and protocol shapes (tools, generate, batch chat), PoolingParams, MistralTokenizer.
+components:
+  - {id: pooling-params, name: PoolingParams, kind: module, parent: api-server, layer: api, summary: "vllm.PoolingParams: per-task pooling options (dimensions, use_activation), checked against the model config by verify().", sources: ["vllm/pooling_params.py:39-240"]}
+  - {id: serving-structured-decisions, name: ServingStructuredDecisions, kind: module, parent: api-server, layer: api, summary: "POST /v1/systemone: structured decisions read from label log-probabilities; enabled only for architectures with a read strategy.", sources: ["vllm/entrypoints/generate/structured_decisions/api_router.py:31-91", "vllm/entrypoints/generate/structured_decisions/serving.py:82-121"]}
+  - {id: download-kernels-subcommand, name: DownloadKernelsSubcommand, kind: module, parent: cli-main, layer: cli, summary: "`vllm download-kernels`: install FlashInfer's precompiled kernels (jit-cache wheels, else the cubin wheel).", sources: ["vllm/entrypoints/cli/download_kernels.py:27-80"]}
+  - {id: cli-args, name: cli_args, kind: module, parent: api-server, layer: cli, summary: "`vllm serve` argument parser and the checks that run on the parsed args before anything loads.", sources: ["vllm/entrypoints/launchers/cli_args.py:421-560"]}
+  - {id: mistral-tokenizer, name: MistralTokenizer, kind: module, parent: api-server, layer: api, summary: "The mistral-common tokenizer (Tekken or SentencePiece) behind --tokenizer-mode mistral.", sources: ["vllm/tokenizers/mistral.py:206-564"]}
+interfaces:
+  - component: openai-serving-chat
+    name: check-tool-usage
+    kind: function
+    summary: "ChatCompletionRequest.check_tool_usage: tools must not be empty; tools without tool_choice mean auto; tool_choice none skips the checks; any other tool_choice needs tools and is auto, required or a named ChatCompletionNamedToolChoiceParam whose function name matches one ChatCompletionToolsParam's FunctionDefinition."
+    sources: ["vllm/entrypoints/openai/chat_completion/protocol.py:935-1020", "vllm/entrypoints/openai/chat_completion/protocol.py:191-217", "vllm/entrypoints/generate/base/protocol.py:298-313"]
+    request: {type: object, properties: {body: {$ref: ServingChatCompletionRequest}}, required: [body]}
+    errors: [{code: vllm-validation-error, status: 0, retryable: false}]
+    behavior:
+      - set:
+          vars.tools: "= has(input.body.tools) ? input.body.tools : null"
+          vars.tc: "= has(input.body.tool_choice) ? input.body.tool_choice : null"
+      - if: "vars.tools != null && size(vars.tools) == 0"
+        then: [{source: "vllm/entrypoints/openai/chat_completion/protocol.py:945-950", fail: {code: vllm-validation-error, message: "`tools` must not be an empty array. Either provide at least one tool or omit the field entirely.", data: {param: tools}}}]
+      - title: "tools without tool_choice default to auto"
+        source: "vllm/entrypoints/openai/chat_completion/protocol.py:952-955"
+        if: "vars.tc == null && vars.tools != null"
+        then: [{return: {tool_choice: auto}}]
+      - if: "vars.tc == null || vars.tc == 'none'"
+        then: [{source: "vllm/entrypoints/openai/chat_completion/protocol.py:957-959", return: {tool_choice: "= vars.tc"}}]
+      - if: "vars.tools == null"
+        then: [{source: "vllm/entrypoints/openai/chat_completion/protocol.py:963-967", fail: {code: vllm-validation-error, message: "When using `tool_choice`, `tools` must be set.", data: {param: tool_choice}}}]
+      - if: "type(vars.tc) != map"
+        then:
+          - if: "!(vars.tc in ['auto', 'required'])"
+            then: [{source: "vllm/entrypoints/openai/chat_completion/protocol.py:971-979", fail: {code: vllm-validation-error, message: "= 'Invalid value for `tool_choice`: ' + string(vars.tc) + '! Only named tools, \"none\", \"auto\" or \"required\" are supported.'", data: {param: tool_choice}}}]
+          - return: {tool_choice: "= vars.tc"}
+      - title: "A named tool choice ({type: function, function: {name}}) must name one of the tools' FunctionDefinitions"
+        source: "vllm/entrypoints/openai/chat_completion/protocol.py:986-1019"
+        if: "!('function' in vars.tc) || type(vars.tc.function) != map || !('name' in vars.tc.function)"
+        then: [{fail: {code: vllm-validation-error, message: "= 'Expected field `name` in `function` in `tool_choice`! Correct usage: `{\"type\": \"function\", \"function\": {\"name\": \"my_function\"}}`'", data: {param: tool_choice.function.name}}}]
+      - if: "!vars.tools.exists(t, has(t.function) && t.function.name == vars.tc.function.name)"
+        then: [{source: "vllm/entrypoints/openai/chat_completion/protocol.py:1009-1019", fail: {code: vllm-validation-error, message: The tool specified in `tool_choice` does not match any of the specified `tools`, data: {param: tool_choice}}}]
+      - return: {tool_choice: "= vars.tc"}
+  - component: openai-serving-chat-batch
+    name: check-batch-mode
+    kind: function
+    summary: "BatchChatCompletionRequest.check_batch_mode: no beam search, no logprob_token_ids without logprobs, no pre-tokenized kv_transfer prompt, and n must be 1."
+    sources: ["vllm/entrypoints/openai/chat_completion/protocol.py:1103-1232"]
+    request: {type: object, properties: {body: {type: object}}, required: [body]}
+    errors: [{code: vllm-validation-error, status: 0, retryable: false}]
+    behavior:
+      - if: "has(input.body.use_beam_search) && input.body.use_beam_search == true"
+        then: [{source: "vllm/entrypoints/openai/chat_completion/protocol.py:1184-1189", fail: {code: vllm-validation-error, message: Batch chat completions do not support beam search. Please set `use_beam_search` to False., data: {param: use_beam_search}}}]
+      - if: "has(input.body.logprob_token_ids) && input.body.logprob_token_ids != null && size(input.body.logprob_token_ids) > 0 && !(has(input.body.logprobs) && input.body.logprobs == true)"
+        then: [{source: "vllm/entrypoints/openai/chat_completion/protocol.py:1190-1194", fail: {code: vllm-validation-error, message: "when using `logprob_token_ids`, `logprobs` must be set to true.", data: {param: logprob_token_ids}}}]
+      - if: "has(input.body.kv_transfer_params) && input.body.kv_transfer_params != null && has(input.body.kv_transfer_params.prompt_token_ids) && input.body.kv_transfer_params.prompt_token_ids != null"
+        then: [{source: "vllm/entrypoints/openai/chat_completion/protocol.py:1195-1206", fail: {code: vllm-validation-error, message: "Batch chat completions do not support `kv_transfer_params['prompt_token_ids']`: one pre-tokenized prompt cannot serve several conversations.", data: {param: kv_transfer_params.prompt_token_ids}}}]
+      - if: "has(input.body.n) && input.body.n != null && input.body.n != 1"
+        then: [{source: "vllm/entrypoints/openai/chat_completion/protocol.py:1217-1223", fail: {code: vllm-validation-error, message: Batch chat completions do not support `n > 1`. Please set `n` to 1., data: {param: n, value: "= input.body.n"}}}]
+      - return: {ok: true}
+  - component: serving-tokens
+    name: validate-generate-request
+    kind: function
+    summary: "GenerateRequest validators (token-in/token-out): token_ids non-empty and non-negative, content_parts and features exclusive, and a text output mode needs detokenize; FastAPI turns the ValueError into a 400."
+    sources: ["vllm/entrypoints/scale_out/token_in_token_out/protocol.py:162-361"]
+    request: {type: object, properties: {body: {type: object}}, required: [body]}
+    errors: [{code: Bad Request, status: 400, retryable: false}]
+    behavior:
+      - if: "!has(input.body.token_ids) || input.body.token_ids == null || size(input.body.token_ids) == 0"
+        then: [{source: "vllm/entrypoints/scale_out/token_in_token_out/protocol.py:171", fail: {code: Bad Request, status: 400, message: "body.token_ids: List should have at least 1 item after validation, not 0", data: {param: body.token_ids}}}]
+      - if: "input.body.token_ids.exists(t, t < 0)"
+        then: [{source: "vllm/entrypoints/scale_out/token_in_token_out/protocol.py:174-179", fail: {code: Bad Request, status: 400, message: "body.token_ids: Value error, token_ids must not contain negative values", data: {param: body.token_ids}}}]
+      - if: "has(input.body.content_parts) && input.body.content_parts != null && size(input.body.content_parts) > 0 && has(input.body.features) && input.body.features != null"
+        then: [{source: "vllm/entrypoints/scale_out/token_in_token_out/protocol.py:195-199", fail: {code: Bad Request, status: 400, message: "Value error, content_parts and features are mutually exclusive"}}]
+      - if: "has(input.body.output_mode) && input.body.output_mode != null && input.body.output_mode != 'tokens' && has(input.body.sampling_params) && has(input.body.sampling_params.detokenize) && input.body.sampling_params.detokenize == false"
+        then: [{source: "vllm/entrypoints/scale_out/token_in_token_out/protocol.py:322-329", fail: {code: Bad Request, status: 400, message: "= 'Value error, output_mode=\\'' + input.body.output_mode + '\\' requires sampling_params.detokenize to be true'"}}]
+      - return: {ok: true}
+  - component: pooling-params
+    name: verify
+    kind: function
+    summary: "PoolingParams.verify: plugin and unknown tasks skip; embed tasks default use_activation and check dimensions (Matryoshka models only, within [1, embedding_size] and the listed sizes); classify tasks default use_activation; a parameter the task doesn't take is refused."
+    sources: ["vllm/pooling_params.py:89-108", "vllm/pooling_params.py:161-218"]
+    request:
+      type: object
+      properties:
+        task: {type: [string, "null"], examples: [embed]}
+        dimensions: {type: [integer, "null"], default: null}
+        use_activation: {type: [boolean, "null"], default: null}
+        is_matryoshka: {type: boolean, default: false}
+        embedding_size: {type: integer, default: 4096}
+        matryoshka_dimensions: {type: [array, "null"], items: {type: integer}, default: null}
+    errors: [{code: vllm-validation-error, status: 0, retryable: false}, {code: value-error, status: 0, retryable: false}]
+    behavior:
+      - set:
+          vars.valid: "= {'embed': ['dimensions', 'use_activation'], 'classify': ['use_activation'], 'token_embed': ['dimensions', 'use_activation'], 'token_classify': ['use_activation']}"
+          vars.model: "= config['served-model-name'] != null ? config['served-model-name'][0] : config['model']"
+      - if: "input.task == 'plugin' || !(input.task in vars.valid)"
+        then: [{title: "plugin tasks validate through the IO processor; unknown tasks are left to plugins", source: "vllm/pooling_params.py:89-99", return: {task: "= input.task", verified: false}}]
+      - set:
+          vars.act: "= has(input.use_activation) && input.use_activation != null ? input.use_activation : true"
+      - if: "input.task in ['embed', 'token_embed'] && has(input.dimensions) && input.dimensions != null"
+        then:
+          - if: "!(has(input.is_matryoshka) && input.is_matryoshka)"
+            then: [{source: "vllm/pooling_params.py:172-177", fail: {code: vllm-validation-error, message: "= 'Model \\'' + vars.model + '\\' does not support Matryoshka embeddings; dimensions must be unset (received dimensions=' + string(input.dimensions) + ').'"}}]
+          - if: "input.dimensions < 1 || input.dimensions > input.embedding_size"
+            then: [{source: "vllm/pooling_params.py:179-183", fail: {code: vllm-validation-error, message: "= 'Model \\'' + vars.model + '\\' only supports dimensions in range [1, ' + string(input.embedding_size) + '], got ' + string(input.dimensions) + '.'"}}]
+          - if: "has(input.matryoshka_dimensions) && input.matryoshka_dimensions != null && !(input.dimensions in input.matryoshka_dimensions)"
+            then: [{source: "vllm/pooling_params.py:185-190", fail: {code: vllm-validation-error, message: "= 'Model \\'' + vars.model + '\\' only supports Matryoshka dimensions [' + input.matryoshka_dimensions.map(d, string(d)).join(', ') + '], got ' + string(input.dimensions) + '.'"}}]
+      - title: "_verify_valid_parameters: a set parameter the task does not take"
+        source: "vllm/pooling_params.py:198-217"
+        if: "!('dimensions' in vars.valid[input.task]) && has(input.dimensions) && input.dimensions != null"
+        then: [{fail: {code: vllm-validation-error, message: "= 'Task \\'' + input.task + '\\' only supports [' + vars.valid[input.task].map(p, '\\'' + p + '\\'').join(', ') + '] parameters, does not support [\\'dimensions\\'] parameters'"}}]
+      - return: {task: "= input.task", verified: true, use_activation: "= vars.act", dimensions: "= has(input.dimensions) ? input.dimensions : null"}
+  - component: mistral-tokenizer
+    name: from-pretrained
+    kind: function
+    summary: "MistralTokenizer.from_pretrained: mistral-common's backend from the repo (revision main when unset), Tekken when the repo ships tekken.json, else SentencePiece (tokenizer.model.v*); anything else is refused."
+    sources: ["vllm/tokenizers/mistral.py:209-256"]
+    request: {type: object, properties: {path_or_repo_id: {type: string, examples: [mistralai/Mistral-7B-Instruct-v0.3]}, revision: {type: [string, "null"], default: null}}, required: [path_or_repo_id]}
+    errors: [{code: value-error, status: 0, retryable: false}]
+    behavior:
+      - source: "vllm/tokenizers/mistral.py:218-225"
+        call: hf-hub.list-repo-files
+        input: {repo_id: "= input.path_or_repo_id"}
+        as: files
+      - set:
+          vars.tekken: "= vars.files.value.files.exists(f, f == 'tekken.json')"
+          vars.spm: "= vars.files.value.files.exists(f, f.startsWith('tokenizer.model'))"
+      - if: "!vars.tekken && !vars.spm"
+        then: [{source: "vllm/tokenizers/mistral.py:249-253", fail: {code: value-error, message: "= 'Unsupported tokenizer: ' + input.path_or_repo_id"}}]
+      - return: {tokenizer_class: MistralTokenizer, is_tekken: "= vars.tekken", revision: "= has(input.revision) && input.revision != null ? input.revision : 'main'"}
+  - component: mistral-tokenizer
+    name: encode
+    kind: function
+    summary: "MistralTokenizer.encode: BOS when special tokens are added, never EOS; truncation keeps the first max_length ids (max_length 0 gives an empty prompt)."
+    sources: ["vllm/tokenizers/mistral.py:368-384"]
+    request: {type: object, properties: {text: {type: string, examples: [hello world]}, add_special_tokens: {type: boolean, default: true}, truncation: {type: [boolean, "null"], default: null}, max_length: {type: [integer, "null"], default: null}}, required: [text]}
+    behavior:
+      - title: "tokenizer.encode(text, bos=add_special_tokens, eos=False) (ASSUMPTION: one id per word, BOS id 1)"
+        source: "vllm/tokenizers/mistral.py:379"
+        set:
+          vars.ids: "= (has(input.add_special_tokens) && !input.add_special_tokens ? [] : [1]) + (input.text.trim() == '' ? [] : input.text.trim().split(' ').filter(w, w != '').map(w, 1000 + size(w)))"
+      - if: "!(has(input.truncation) && input.truncation == false) && has(input.max_length) && input.max_length != null"
+        then: [{source: "vllm/tokenizers/mistral.py:381-382", return: {ids: "= vars.ids.slice(0, math.least([input.max_length, size(vars.ids)]))"}}]
+      - return: {ids: "= vars.ids"}
+  - component: serving-structured-decisions
+    name: select-read-strategy
+    kind: function
+    summary: "init_structured_decisions_state / select_read_strategy: the model's architecture must have a read strategy whose task the model supports (and, for generate strategies, a logprobs mode); otherwise the API stays disabled."
+    sources: ["vllm/entrypoints/generate/structured_decisions/api_router.py:65-91", "vllm/entrypoints/generate/structured_decisions/strategies.py:812-848"]
+    request: {type: object, properties: {}}
+    behavior:
+      - call: hf-hub.download-config
+        input: {model: "= config['model']"}
+        as: cfg
+      - set:
+          vars.arch: "= size(vars.cfg.value.architectures) > 0 ? vars.cfg.value.architectures[0] : ''"
+          vars.strategies: "= {'ClefOmniForJointSchema': 'JointSchemaStrategy', 'Lfm2VlForConditionalGeneration': 'LiquidStrategy', 'Qwen3ForCausalLM': 'NextTokenStrategy', 'Qwen3_5ForConditionalGeneration': 'NextTokenStrategy', 'Qwen3_5MoeForConditionalGeneration': 'NextTokenStrategy', 'DiffusionGemmaForBlockDiffusion': 'DiffusionGemmaCanvasStrategy'}"
+      - if: "!(vars.arch in vars.strategies)"
+        then: [{title: "Unsupported architecture: ValueError, logged, /v1/systemone disabled", source: "vllm/entrypoints/generate/structured_decisions/strategies.py:831-837", return: {enabled: false, reason: "= 'The structured decisions API does not support ' + vars.arch + '.'"}}]
+      - return: {enabled: true, strategy: "= vars.strategies[vars.arch]"}
+  - component: serving-structured-decisions
+    name: post-v1-systemone
+    kind: http
+    summary: "POST /v1/systemone: 501 when the model has no structured-decision strategy; otherwise create_decision checks the model, the engine and admission, then the strategy reads the answers."
+    sources: ["vllm/entrypoints/generate/structured_decisions/api_router.py:36-60"]
+    attributes: {method: POST, path: /v1/systemone}
+    request: {type: object, properties: {path: {type: string, examples: [/v1/systemone]}, body: {type: object, properties: {model: {type: string, examples: [llama-8b]}, questions: {type: array, items: {type: object}, default: []}}}}, required: [path]}
+    errors: [{code: NotImplementedError, status: 501}, {code: NotFoundError, status: 404}, {code: ConnectionRefusedError, status: 0, retryable: true}]
+    behavior:
+      - call: launcher.accept-connection
+      - source: "vllm/entrypoints/generate/structured_decisions/api_router.py:52"
+        call: serving-structured-decisions.select-read-strategy
+        as: st
+      - if: "!vars.st.value.enabled"
+        then:
+          - title: "No handler: NotImplementedError, which the app maps to 501"
+            source: "vllm/entrypoints/generate/structured_decisions/api_router.py:53-56"
+            call: exception-handling.create-error-response
+            input: {code: not-implemented-error, status: 0, message: The model does not support the structured decision API}
+      - source: "vllm/entrypoints/generate/structured_decisions/serving.py:87-88"
+        call: base-serving.check-model
+        input: {model: "= has(input.body) && has(input.body.model) ? input.body.model : ''"}
+      - source: "vllm/entrypoints/generate/structured_decisions/serving.py:89-99"
+        call: generate-base-serving.preflight
+        input: {n: "= has(input.body) && has(input.body.questions) ? size(input.body.questions) : 1"}
+      - title: "strategy.read: each question's label log-probabilities (ASSUMPTION: numeric scoring the simulation does not run; the answers are left empty)"
+        source: "vllm/entrypoints/generate/structured_decisions/serving.py:105-116"
+        return: {strategy: "= vars.st.value.strategy", answers: {}}
+  - component: download-kernels-subcommand
+    name: cmd
+    kind: cli
+    summary: "`vllm download-kernels [--dry-run]`: nothing to do without FlashInfer; else `python -m flashinfer download-kernels` when jit-cache wheels exist for this CUDA version, otherwise `install-cubin-wheel`; exits with the subprocess's code."
+    sources: ["vllm/entrypoints/cli/download_kernels.py:27-66"]
+    request: {type: object, properties: {dry_run: {type: boolean, default: false}, flashinfer_installed: {type: boolean, default: true, description: "find_spec('flashinfer') found it"}, jit_cache_wheels: {type: boolean, default: true, description: "has_flashinfer_jit_cache_wheels() for this CUDA version"}}}
+    behavior:
+      - if: "has(input.flashinfer_installed) && !input.flashinfer_installed"
+        then: [{title: "FlashInfer is not installed; skipping its kernels", source: "vllm/entrypoints/cli/download_kernels.py:28-30", return: {exit_code: 0, command: null}}]
+      - title: "jit-cache wheels when published for this CUDA version, else the cubin wheel only; --dry-run passes through"
+        source: "vllm/entrypoints/cli/download_kernels.py:31-43"
+        set:
+          vars.cmd: "= ['python', '-m', 'flashinfer', (!has(input.jit_cache_wheels) || input.jit_cache_wheels) ? 'download-kernels' : 'install-cubin-wheel'] + (has(input.dry_run) && input.dry_run ? ['--dry-run'] : [])"
+      - title: "subprocess.run with FLASHINFER_DISABLE_VERSION_CHECK=1; sys.exit(returncode)"
+        source: "vllm/entrypoints/cli/download_kernels.py:44-45"
+        return: {exit_code: 0, command: "= vars.cmd"}
+  - component: cohere-serving-chat-v2
+    name: error-response
+    kind: function
+    summary: "_error_response: an exception becomes vLLM's ErrorResponse first (create_error_response), then Cohere's envelope: the same HTTP status (400 when it has none) and a body of just {message} (plus the request id when known)."
+    sources: ["vllm/entrypoints/cohere/api_router.py:102-117", "vllm/entrypoints/cohere/api_router.py:190-198"]
+    request: {type: object, properties: {code: {type: string}, status: {type: integer}, message: {type: string}, param: {type: [string, "null"], default: null}, value: {default: null}}, required: [code]}
+    errors: [{code: CohereError, status: 400}]
+    behavior:
+      - source: "vllm/entrypoints/cohere/api_router.py:192-194"
+        call: exception-handling.create-error-response
+        input: {code: "= input.code", status: "= has(input.status) ? input.status : 0", message: "= has(input.message) ? input.message : ''", param: "= has(input.param) ? input.param : null", value: "= has(input.value) ? input.value : null"}
+        as: er
+        on_error:
+          - title: "Cohere's envelope: status = info.code (or 400), body {message}"
+            source: "vllm/entrypoints/cohere/api_router.py:109-117"
+            fail: {code: CohereError, status: "= error.status != null && error.status > 0 ? error.status : 400", message: "= error.message", data: {body: "= {'message': error.message}"}}
+      - return: {ok: true}
+  - component: cohere-serving-chat-v2
+    name: build-position-to-source
+    kind: function
+    summary: "_build_position_to_source / _walk_citable_positions: number the citable slots as melody does (bucket 0 for top-level documents, then one bucket per tool_call_id in first-seen order; one slot per tool content block, a string being one text block) and give each its source: documents keep their id and data, text blocks become an id-less tool_output (a JSON-object text is spread, anything else is {content})."
+    sources: ["vllm/entrypoints/cohere/serving.py:1254-1277", "vllm/entrypoints/cohere/serving.py:773-900", "vllm/entrypoints/cohere/serving.py:1279-1296"]
+    request: {type: object, properties: {messages: {type: array, items: {type: object}}, documents: {type: [array, "null"], default: null}}, required: [messages]}
+    behavior:
+      - set:
+          vars.docs: "= has(input.documents) && input.documents != null ? input.documents : []"
+          vars.out: []
+      - title: "Bucket 0: the top-level documents, with the doc_<idx> fallback id"
+        source: "vllm/entrypoints/cohere/serving.py:842-870"
+        set:
+          vars.out: "= lists.range(size(vars.docs)).map(i, {'bucket': 0, 'idx': i, 'type': 'document', 'id': type(vars.docs[i]) == string ? 'doc_' + string(i) : (has(vars.docs[i].id) && vars.docs[i].id != null && vars.docs[i].id != '' ? vars.docs[i].id : 'doc_' + string(i)), 'document': type(vars.docs[i]) == string ? {'text': vars.docs[i]} : (type(vars.docs[i].data) == map ? vars.docs[i].data : {'text': vars.docs[i].data})})"
+          vars.first: "= size(vars.docs) > 0 ? 1 : 0"
+      - title: "Each unique tool_call_id claims the next bucket, first seen in an assistant's tool_calls or a tool message"
+        source: "vllm/entrypoints/cohere/serving.py:873-880"
+        set:
+          vars.ids: "= input.messages.map(m, m.role == 'assistant' && has(m.tool_calls) && m.tool_calls != null ? m.tool_calls.map(tc, tc.id) : (m.role == 'tool' && has(m.tool_call_id) ? [m.tool_call_id] : [])).flatten()"
+      - set:
+          vars.order: "= lists.range(size(vars.ids)).filter(i, vars.ids.indexOf(vars.ids[i]) == i).map(i, vars.ids[i])"
+      - title: "One slot per tool-content block (a string or empty content is one text block); slots of messages sharing a tool_call_id accumulate"
+        source: "vllm/entrypoints/cohere/serving.py:880-900"
+        foreach: "= input.messages.filter(m, m.role == 'tool')"
+        as: tm
+        max: 32
+        steps:
+          - set:
+              vars.bucket: "= vars.first + vars.order.indexOf(vars.tm.tool_call_id)"
+              vars.blocks: "= !has(vars.tm.content) || vars.tm.content == null || type(vars.tm.content) == string ? [{'type': 'text', 'text': has(vars.tm.content) && vars.tm.content != null ? vars.tm.content : ''}] : vars.tm.content"
+          - set:
+              vars.base: "= size(vars.out.filter(o, o.bucket == vars.bucket))"
+          - title: "_text_to_tool_output_payload: a text that parses as a JSON object is the payload; other text is {content: text} (ASSUMPTION: JSON-object text is recognized by its braces)"
+            source: "vllm/entrypoints/cohere/serving.py:1288-1296"
+            set:
+              vars.out: "= vars.out + lists.range(size(vars.blocks)).map(j, vars.blocks[j].type == 'document' ? {'bucket': vars.bucket, 'idx': vars.base + j, 'type': 'tool', 'id': has(vars.blocks[j].document.id) && vars.blocks[j].document.id != '' ? vars.blocks[j].document.id : null, 'tool_output': type(vars.blocks[j].document.data) == map ? merge(vars.blocks[j].document.data, has(vars.blocks[j].document.id) && vars.blocks[j].document.id != '' ? {'id': vars.blocks[j].document.id} : {}) : {'text': vars.blocks[j].document.data}} : {'bucket': vars.bucket, 'idx': vars.base + j, 'type': 'tool', 'id': null, 'tool_output': vars.blocks[j].text == '' ? {} : (vars.blocks[j].text.trim().startsWith('{') && vars.blocks[j].text.trim().endsWith('}') && size(vars.blocks[j].text.split('{')) == size(vars.blocks[j].text.split('}')) ? jsonParse(vars.blocks[j].text) : {'content': vars.blocks[j].text})})"
+      - return: {positions: "= vars.out"}
+  - component: cli-args
+    name: validate-parsed-serve-args
+    kind: function
+    summary: "validate_parsed_serve_args: the chat template must look valid (an existing file, a jinja string, or a built-in template name), auto tool choice needs a tool parser, log outputs need log requests, the SSE keep-alive interval is non-negative, per-request metrics need stats logging."
+    sources: ["vllm/entrypoints/launchers/cli_args.py:502-546", "vllm/renderers/chat_utils.py:1457-1490"]
+    request:
+      type: object
+      properties:
+        chat_template: {type: [string, "null"], default: null}
+        tool_call_parser: {type: [string, "null"], default: null}
+        enable_auto_tool_choice: {type: boolean, default: false}
+        enable_log_outputs: {type: boolean, default: false}
+        enable_log_requests: {type: boolean, default: false}
+        sse_keep_alive_interval: {type: integer, default: 0}
+        enable_per_request_metrics: {type: boolean, default: false}
+        disable_log_stats: {type: boolean, default: false}
+    errors: [{code: vllm-validation-error, status: 0}, {code: type-error, status: 0}, {code: value-error, status: 0}]
+    behavior:
+      - if: "has(input.chat_template) && input.chat_template != null && !input.chat_template.contains('{') && !input.chat_template.contains('}') && !input.chat_template.contains('\\n')"
+        then:
+          - title: "validate_chat_template: a path-like string must exist, as given or in the built-in chat_templates directory"
+            source: "vllm/renderers/chat_utils.py:1465-1477"
+            call: local-disk.stat
+            input: {path: "= input.chat_template"}
+            as: p
+          - if: "!vars.p.value.exists"
+            then:
+              - call: local-disk.stat
+                input: {path: "= 'vllm/transformers_utils/chat_templates/' + input.chat_template"}
+                as: b
+              - if: "!vars.b.value.exists"
+                then: [{source: "vllm/renderers/chat_utils.py:1478-1486", fail: {code: vllm-validation-error, message: "= 'The supplied chat template string (' + input.chat_template + ') appears path-like, but doesn\\'t exist! Tried: ' + input.chat_template + ' and vllm/transformers_utils/chat_templates/' + input.chat_template", data: {param: chat_template}}}]
+      - if: "has(input.enable_auto_tool_choice) && input.enable_auto_tool_choice && (!has(input.tool_call_parser) || input.tool_call_parser == null || input.tool_call_parser == '')"
+        then: [{source: "vllm/entrypoints/launchers/cli_args.py:522-524", fail: {code: type-error, message: "Error: --enable-auto-tool-choice requires --tool-call-parser"}}]
+      - if: "has(input.enable_log_outputs) && input.enable_log_outputs && !(has(input.enable_log_requests) && input.enable_log_requests)"
+        then: [{source: "vllm/entrypoints/launchers/cli_args.py:525-526", fail: {code: type-error, message: "Error: --enable-log-outputs requires --enable-log-requests"}}]
+      - if: "has(input.sse_keep_alive_interval) && input.sse_keep_alive_interval < 0"
+        then: [{source: "vllm/entrypoints/launchers/cli_args.py:528-533", fail: {code: value-error, message: "Error: --sse-keep-alive-interval must be a non-negative integer (0 disables keep-alive comments)."}}]
+      - if: "has(input.enable_per_request_metrics) && input.enable_per_request_metrics && has(input.disable_log_stats) && input.disable_log_stats"
+        then: [{source: "vllm/entrypoints/launchers/cli_args.py:535-542", fail: {code: value-error, message: "Error: --enable-per-request-metrics requires engine statistics logging; remove --disable-log-stats to enable per-request metrics."}}]
+      - return: {ok: true}
+scenarios:
+  - id: serving-api-chat-tool-usage-validation
+    name: "check_tool_usage: empty tools, tool_choice without tools, an unknown string choice, a named choice that matches no tool (all 400); a matching named choice is accepted"
+    fixtures: [full-tp1-llama-8b]
+    steps:
+      - {flow: serving-api-chat-completion, as: empty, input: {body: {max_tokens: 4, tools: []}}}
+      - {flow: serving-api-chat-completion, as: notools, input: {body: {max_tokens: 4, tool_choice: required}}}
+      - {flow: serving-api-chat-completion, as: weird, input: {body: {max_tokens: 4, tool_choice: sometimes, tools: [{type: function, function: {name: get_weather}}]}}}
+      - {flow: serving-api-chat-completion, as: noname, input: {body: {max_tokens: 4, tool_choice: {type: function, function: {}}, tools: [{type: function, function: {name: get_weather}}]}}}
+      - {flow: serving-api-chat-completion, as: nomatch, input: {body: {max_tokens: 4, tool_choice: {type: function, function: {name: get_time}}, tools: [{type: function, function: {name: get_weather}}]}}}
+      - {interface: openai-serving-chat.check-tool-usage, caller: api-server, as: named, input: {body: {messages: [{role: user, content: hi}], tool_choice: {type: function, function: {name: get_weather}}, tools: [{type: function, function: {name: get_weather}}]}}}
+      - {interface: openai-serving-chat.check-tool-usage, caller: api-server, as: dflt, input: {body: {messages: [{role: user, content: hi}], tools: [{type: function, function: {name: get_weather}}]}}}
+      - {interface: openai-serving-chat.check-tool-usage, caller: api-server, as: none, input: {body: {messages: [{role: user, content: hi}], tool_choice: none}}}
+      - {interface: openai-serving-chat.check-tool-usage, caller: api-server, as: auto, input: {body: {messages: [{role: user, content: hi}], tool_choice: auto, tools: [{type: function, function: {name: f}}]}}}
+    expect:
+      - "steps.empty.result.error.status == 400 && steps.empty.result.error.data.param == 'tools'"
+      - "steps.notools.result.error.message.startsWith('When using `tool_choice`, `tools` must be set.') && steps.weird.result.error.data.param == 'tool_choice'"
+      - "steps.noname.result.error.data.param == 'tool_choice.function.name' && steps.nomatch.result.error.message.startsWith('The tool specified in `tool_choice` does not match')"
+      - "steps.named.result.ok && steps.dflt.result.value.tool_choice == 'auto' && steps.none.result.value.tool_choice == 'none' && steps.auto.result.value.tool_choice == 'auto'"
+      - "calls['async-llm.generate'] == 0"
+  - id: serving-api-protocol-validators
+    name: "Batch chat refuses n>1, beam search, logprob_token_ids without logprobs and a pre-tokenized kv_transfer prompt; /inference/v1/generate refuses empty or negative token ids, content_parts with features, and text output without detokenize"
+    fixtures: [full-tp1-llama-8b]
+    config: {enable-scale-out: true}
+    steps:
+      - {interface: openai-serving-chat-batch.check-batch-mode, caller: api-server, as: bn, input: {body: {n: 2}}}
+      - {interface: openai-serving-chat-batch.check-batch-mode, caller: api-server, as: bb, input: {body: {use_beam_search: true}}}
+      - {interface: openai-serving-chat-batch.check-batch-mode, caller: api-server, as: bl, input: {body: {logprob_token_ids: [5]}}}
+      - {interface: openai-serving-chat-batch.check-batch-mode, caller: api-server, as: bk, input: {body: {kv_transfer_params: {prompt_token_ids: [1, 2]}}}}
+      - {interface: openai-serving-chat-batch.check-batch-mode, caller: api-server, as: bok, input: {body: {n: 1}}}
+      - {interface: serving-tokens.validate-generate-request, caller: api-server, as: gneg, input: {body: {token_ids: [1, -2]}}}
+      - {interface: serving-tokens.validate-generate-request, caller: api-server, as: gempty, input: {body: {token_ids: []}}}
+      - {interface: serving-tokens.validate-generate-request, caller: api-server, as: gboth, input: {body: {token_ids: [1], content_parts: [{type: text}], features: {}}}}
+      - {interface: serving-tokens.validate-generate-request, caller: api-server, as: gtext, input: {body: {token_ids: [1], output_mode: text, sampling_params: {detokenize: false}}}}
+      - {interface: serving-tokens.validate-generate-request, caller: api-server, as: gok, input: {body: {token_ids: [128000, 9906]}}}
+    expect:
+      - "steps.bn.result.error.data.param == 'n' && steps.bb.result.error.data.param == 'use_beam_search' && steps.bl.result.error.data.param == 'logprob_token_ids' && steps.bk.result.error.data.param == 'kv_transfer_params.prompt_token_ids' && steps.bok.result.ok"
+      - "steps.gneg.result.error.status == 400 && steps.gneg.result.error.message.contains('negative') && steps.gempty.result.error.status == 400"
+      - "steps.gboth.result.error.message.contains('mutually exclusive') && steps.gtext.result.error.message.contains('requires sampling_params.detokenize') && steps.gok.result.ok"
+  - id: serving-api-pooling-params-verify
+    name: "PoolingParams.verify: dimensions need a Matryoshka model and a valid size; classify takes no dimensions; plugin tasks skip"
+    fixtures: [full-tp1-llama-8b]
+    steps:
+      - {interface: pooling-params.verify, caller: api-server, as: plain, input: {task: embed}}
+      - {interface: pooling-params.verify, caller: api-server, as: nomat, input: {task: embed, dimensions: 256}}
+      - {interface: pooling-params.verify, caller: api-server, as: range, input: {task: embed, dimensions: 9999, is_matryoshka: true}}
+      - {interface: pooling-params.verify, caller: api-server, as: listed, input: {task: embed, dimensions: 300, is_matryoshka: true, matryoshka_dimensions: [256, 512]}}
+      - {interface: pooling-params.verify, caller: api-server, as: okdim, input: {task: embed, dimensions: 256, is_matryoshka: true, matryoshka_dimensions: [256, 512]}}
+      - {interface: pooling-params.verify, caller: api-server, as: cls, input: {task: classify, dimensions: 8}}
+      - {interface: pooling-params.verify, caller: api-server, as: plugin, input: {task: plugin}}
+    expect:
+      - "steps.plain.result.value.use_activation && steps.okdim.result.value.dimensions == 256 && !steps.plugin.result.value.verified"
+      - "steps.nomat.result.error.message.contains('does not support Matryoshka') && steps.range.result.error.message.contains('only supports dimensions in range [1, 4096]') && steps.listed.result.error.message.contains('only supports Matryoshka dimensions')"
+      - "steps.cls.result.error.message.contains('does not support')"
+  - id: serving-api-mistral-tokenizer
+    name: "A Mistral-format repo resolves to MistralTokenizer (Tekken); encode adds BOS but no EOS and truncates to max_length"
+    fixtures: [full-tp1-llama-8b]
+    state:
+      hf-hub:
+        repos: {"mistralai/Mistral-7B-Instruct-v0.3": {files: [tekken.json, params.json]}, "mistralai/odd": {files: [config.json]}}
+        models: {"mistralai/Mistral-7B-Instruct-v0.3": {architectures: [MistralForCausalLM], vocab_size: 32768, max_position_embeddings: 32768, num_attention_heads: 32, num_key_value_heads: 8}}
+    steps:
+      - {interface: tokenizer-registry.get-tokenizer, caller: api-server, as: tok, input: {tokenizer_name: mistralai/Mistral-7B-Instruct-v0.3}}
+      - {interface: mistral-tokenizer.from-pretrained, caller: api-server, as: odd, input: {path_or_repo_id: mistralai/odd}}
+      - {interface: mistral-tokenizer.encode, caller: api-server, as: enc, input: {text: "hello big world"}}
+      - {interface: mistral-tokenizer.encode, caller: api-server, as: cut, input: {text: "hello big world", max_length: 2}}
+    expect:
+      - "steps.tok.result.value.tokenizer_class == 'MistralTokenizer' && trace.exists(e, e.type == 'call.end' && e.interface == 'mistral-tokenizer.from-pretrained' && e.output.is_tekken && e.output.revision == 'main')"
+      - "!steps.odd.result.ok && steps.enc.result.value.ids == [1, 1005, 1003, 1005] && steps.cut.result.value.ids == [1, 1005]"
+  - id: serving-api-systemone-and-download-kernels
+    name: "/v1/systemone is 501 for Llama (no read strategy) and served for a Qwen3 model; vllm download-kernels picks the FlashInfer command"
+    fixtures: [full-tp1-llama-8b]
+    steps:
+      - {interface: serving-structured-decisions.post-v1-systemone, caller: api-client, as: llama, input: {path: /v1/systemone, body: {model: llama-8b, questions: [{id: q1}]}}}
+      - {interface: download-kernels-subcommand.cmd, caller: operator, as: dl, input: {dry_run: true}}
+      - {interface: download-kernels-subcommand.cmd, caller: operator, as: cubin, input: {jit_cache_wheels: false}}
+      - {interface: download-kernels-subcommand.cmd, caller: operator, as: none, input: {flashinfer_installed: false}}
+    expect:
+      - "!steps.llama.result.ok && steps.llama.result.error.status == 501"
+      - "steps.dl.result.value.command == ['python', '-m', 'flashinfer', 'download-kernels', '--dry-run'] && steps.cubin.result.value.command[3] == 'install-cubin-wheel' && steps.none.result.value.command == null"
+  - id: serving-api-systemone-qwen3
+    name: "/v1/systemone on a Qwen3 model: the NextToken strategy serves it"
+    fixtures: [full-tp1-llama-8b]
+    config: {model: Qwen/Qwen3-0.6B}
+    state:
+      hf-hub:
+        models: {"Qwen/Qwen3-0.6B": {architectures: [Qwen3ForCausalLM], vocab_size: 151936, max_position_embeddings: 40960, num_attention_heads: 16, num_key_value_heads: 8}}
+    steps:
+      - {interface: serving-structured-decisions.post-v1-systemone, caller: api-client, as: q, input: {path: /v1/systemone, body: {model: llama-8b, questions: [{id: q1}]}}}
+    expect:
+      - "steps.q.result.ok && steps.q.result.value.strategy == 'NextTokenStrategy'"
+  - id: serving-api-cohere-sources-and-errors
+    name: "Cohere: citable positions number documents then tool buckets (JSON-object tool text spread into tool_output); render errors use Cohere's {message} envelope"
+    fixtures: [full-tp1-llama-8b]
+    config: {vllm-enable-cohere-api: true}
+    steps:
+      - interface: cohere-serving-chat-v2.build-position-to-source
+        caller: api-server
+        as: pos
+        input:
+          documents: [plain doc]
+          messages:
+            - {role: user, content: q}
+            - {role: assistant, tool_plan: plan, tool_calls: [{id: call_a, type: function, function: {name: f, arguments: "{}"}}]}
+            - {role: tool, tool_call_id: call_a, content: [{type: text, text: "{\"title\": \"hi\"}"}, {type: text, text: plain words}, {type: document, document: {id: res_x, data: {text: x}}}]}
+      - {interface: cohere-serving-chat-v2.post-cohere-v2-chat-render, caller: api-client, as: r404, input: {path: /cohere/v2/chat/render, body: {model: unknown, messages: [{role: user, content: hi}]}}}
+    expect:
+      - "steps.pos.result.value.positions[0].bucket == 0 && steps.pos.result.value.positions[0].id == 'doc_0' && steps.pos.result.value.positions[0].document == {'text': 'plain doc'}"
+      - "steps.pos.result.value.positions[1].bucket == 1 && steps.pos.result.value.positions[1].tool_output == {'title': 'hi'} && steps.pos.result.value.positions[1].id == null"
+      - "steps.pos.result.value.positions[2].tool_output == {'content': 'plain words'} && steps.pos.result.value.positions[3].id == 'res_x' && steps.pos.result.value.positions[3].idx == 2"
+      - "steps.r404.result.error.status == 404 && steps.r404.result.error.data.body == {'message': steps.r404.result.error.message}"
+  - id: serving-api-serve-args-validation
+    name: "validate_parsed_serve_args: an existing --chat-template file passes; a path-like missing one, auto tool choice without a parser and per-request metrics without stats are refused"
+    fixtures: [full-tp1-llama-8b]
+    state:
+      local-disk:
+        paths: {"examples/template_chatml.jinja": {exists: true, is_dir: false}}
+    steps:
+      - {interface: cli-args.validate-parsed-serve-args, caller: operator, as: ok, input: {chat_template: examples/template_chatml.jinja}}
+      - {interface: cli-args.validate-parsed-serve-args, caller: operator, as: missing, input: {chat_template: does/not/exist}}
+      - {interface: cli-args.validate-parsed-serve-args, caller: operator, as: jinja, input: {chat_template: "{{ messages }}"}}
+      - {interface: cli-args.validate-parsed-serve-args, caller: operator, as: auto, input: {enable_auto_tool_choice: true}}
+      - {interface: cli-args.validate-parsed-serve-args, caller: operator, as: logs, input: {enable_log_outputs: true}}
+      - {interface: cli-args.validate-parsed-serve-args, caller: operator, as: sse, input: {sse_keep_alive_interval: -1}}
+      - {interface: cli-args.validate-parsed-serve-args, caller: operator, as: prm, input: {enable_per_request_metrics: true, disable_log_stats: true}}
+    expect:
+      - "steps.ok.result.ok && steps.jinja.result.ok"
+      - "steps.missing.result.error.code == 'vllm-validation-error' && steps.missing.result.error.data.param == 'chat_template'"
+      - "steps.auto.result.error.code == 'type-error' && steps.logs.result.error.code == 'type-error' && steps.sse.result.error.code == 'value-error' && steps.prm.result.error.code == 'value-error'"
+  - id: serving-api-offline-tokens-prompt
+    name: "LLM.generate with a TokensPrompt: the given ids reach the engine untokenized"
+    fixtures: [full-tp1-llama-8b]
+    state:
+      engine-core-proc: {client_kind: sync}
+    steps:
+      - {interface: llm.generate, caller: python-user, as: g, input: {prompts: [{prompt_token_ids: [128000, 9906, 1917]}]}}
+    expect:
+      - "trace.exists(e, e.type == 'call.start' && e.interface == 'llm-engine.add-request' && e.input.prompt_token_ids == [128000, 9906, 1917])"
+  - id: serving-api-rerank-and-score-responses
+    name: "/rerank sorts results by relevance and applies top_n; /score keeps pair order with usage totals"
+    fixtures: [full-tp1-llama-8b]
+    steps:
+      - {interface: serving-scores.build-response, caller: api-server, as: rr, input: {prefix: rerank, request_id: rerank-1, model_name: llama-8b, scores: [0.1, 0.9, 0.5], documents: [a, b, c], top_n: 2, num_prompt_tokens: 7}}
+      - {interface: serving-scores.build-response, caller: api-server, as: sc, input: {prefix: score, request_id: score-1, model_name: llama-8b, scores: [0.1, 0.9], documents: [a, b], num_prompt_tokens: 5}}
+    expect:
+      - "size(steps.rr.result.value.results) == 2 && steps.rr.result.value.results[0].index == 1 && steps.rr.result.value.results[1].index == 2 && steps.rr.result.value.usage.total_tokens == 7"
+      - "steps.sc.result.value.data[1].score == 0.9 && steps.sc.result.value.usage.total_tokens == 5 && steps.sc.result.value.object == 'list'"

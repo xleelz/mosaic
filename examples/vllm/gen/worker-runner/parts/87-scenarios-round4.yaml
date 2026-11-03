@@ -1,0 +1,438 @@
+# Fix round 4 scenarios: blind findings (oracle2, judge2 P1/P3/P5) and the coverage rows.
+scenarios:
+  # ---------------- batch-sharded sampling (oracle2 fix request) ----------------
+  - id: wr-batch-shard-partition
+    name: Batch-sharded sampling gives request i to rank slot % tp_size and keeps batch order; an empty batch launches nothing
+    description: "BatchSharder.shard_sampler_inputs (batch_shard.py:162-288). Six requests in slots 0..5 with 1 or 2 logits rows, TP 4, seen from rank 1 (its own instance): rank 1 owns slots 1 and 5 (4 rows); per owner rank the rows are [2, 4, 1, 2]. The empty batch has max_num_reqs_per_rank 1 and max_num_logits_per_req 1."
+    fixtures: [full-tp4-llama-70b]
+    config: {enable-batch-sharded-sampling: true, tensor-parallel-size: 4}
+    steps:
+      - interface: batch-sharder.shard-sampler-inputs
+        caller: gpu-model-runner
+        on: rank1
+        input: {req_ids: [a, b, c, d, e, f], idx_mapping: [0, 1, 2, 3, 4, 5], cu_num_logits: [0, 1, 3, 4, 6, 7, 9]}
+        as: s
+      - interface: batch-sharder.shard-sampler-inputs
+        caller: gpu-model-runner
+        on: rank2
+        input: {req_ids: [], idx_mapping: [], cu_num_logits: [0]}
+        as: empty
+    expect:
+      - "steps.s.result.value.local_batch.req_ids == ['b', 'f'] && steps.s.result.value.local_batch.idx_mapping == [1, 5] && steps.s.result.value.local_batch.cu_num_logits == [0, 2, 4]"
+      - "steps.s.result.value.metadata.num_logits_per_rank == [2, 4, 1, 2] && steps.s.result.value.metadata.num_local_logits == 4 && steps.s.result.value.metadata.num_local_reqs == 2"
+      - "steps.s.result.value.metadata.max_num_reqs_per_rank == 2 && steps.s.result.value.metadata.max_num_logits_per_req == 2"
+      - "steps.s.result.value.metadata.gathered_src_indices == [0, 2, 4, 6, 1, 3]"
+      - "steps.empty.result.value.metadata.num_local_reqs == 0 && steps.empty.result.value.metadata.max_num_reqs_per_rank == 1 && steps.empty.result.value.metadata.num_logits_per_rank == [0, 0, 0, 0]"
+
+  # ---------------- greedy rejection sampling (judge2 P1c, P3a) ----------------
+  - id: wr-spec-greedy-verification-matches-greedy-decoding
+    name: "At temperature 0 the target accepts the longest prefix of drafts equal to its argmax, so speculative output equals plain greedy output; a -1 placeholder is never accepted"
+    description: "With the choice `target`, rejection-sampler.sample compares each draft with the stand-in token the target's logits yield at its position (rejection_sampler_utils.py:570-599). Positions 101..104 of a 100-token prompt give 32519, 40438, 48357, 56276. Row a has drafts [32519, 40438, 999]: 2 accepted, then the target's 48357. Row b's drafts all match: 3 plus the bonus 56276. Row c's first draft is a -1 placeholder: no draft is verified and the target's token at 101 is emitted. A plain greedy sample at seq_len 101 gives the same 32519."
+    fixtures: [full-tp1-llama-8b]
+    choices: {rejection-sampler.sample.acceptance: target}
+    state:
+      sampler:
+        slots:
+          '1021': {temperature: 0.0, top_p: 1.0, top_k: 128256, min_p: 0.0, seeded: false, logprobs: -1, penalties: false, logit_bias: false, thinking: false, needs_processing: false}
+          '1022': {temperature: 0.0, top_p: 1.0, top_k: 128256, min_p: 0.0, seeded: false, logprobs: -1, penalties: false, logit_bias: false, thinking: false, needs_processing: false}
+          '1023': {temperature: 0.0, top_p: 1.0, top_k: 128256, min_p: 0.0, seeded: false, logprobs: -1, penalties: false, logit_bias: false, thinking: false, needs_processing: false}
+    steps:
+      - interface: rejection-sampler.sample
+        caller: gpu-model-runner
+        input:
+          rows:
+            - {req_id: a, slot: 1021, is_final: true, drafts: [32519, 40438, 999], seq_len: 104, prompt_len: 100}
+            - {req_id: b, slot: 1022, is_final: true, drafts: [32519, 40438, 48357], seq_len: 104, prompt_len: 100}
+            - {req_id: c, slot: 1023, is_final: true, drafts: [-1, 40438, 48357], seq_len: 104, prompt_len: 100}
+        as: v
+      - interface: sampler.sample
+        caller: gpu-model-runner
+        input:
+          rows: [{req_id: a, slot: 1021, is_final: true, drafts: [], seq_len: 101, prompt_len: 100}]
+        as: plain
+    expect:
+      - "steps.v.result.value.sampled_token_ids == [[32519, 40438, 48357], [32519, 40438, 48357, 56276], [32519]]"
+      - "steps.v.result.value.num_accepted == [2, 3, 0]"
+      - "steps.plain.result.value.sampled_token_ids == [[32519]] && steps.plain.result.value.sampled_token_ids[0][0] == steps.v.result.value.sampled_token_ids[1][0]"
+
+  # ---------------- n-gram drafts computed from the runner's token history (judge2 P1a, P1d) ----------------
+  - id: wr-spec-ngram-step-uses-token-history
+    name: "An n-gram step proposes from the request's own tokens: no match gives k copies of the last sampled token, which the scheduler gets back only because the batch has a structured-output request"
+    description: "sample_tokens passes each request's all_token_ids, num_sampled and the last sampled tokens to the speculator (model_runner.py:2238-2253). The greedy token sampled after the 6-token prompt does not occur earlier, so the n-gram scan finds nothing and all 3 draft slots take that token (speculator.py:141-148). The grammar output names the request, so DraftTokensHandler copies the real drafts back (spec_decode/utils.py:84-86)."
+    fixtures: [full-tp1-llama-8b]
+    config: {speculative-method: ngram, num-speculative-tokens: 3, prompt-lookup-min: 2, prompt-lookup-max: 3}
+    state:
+      gpu-model-runner: {speculator: ngram-gpu-speculator}
+    steps:
+      - flow: wr-execute-model
+        as: e
+        input:
+          scheduled_new_reqs:
+            - {req_id: chatcmpl-ng, prompt_token_ids: [128000, 11, 12, 13, 11, 12], block_ids: [1], num_computed_tokens: 0, sampling_params: {temperature: 0.0}}
+          scheduled_cached_reqs: {req_ids: [], num_computed_tokens: [], new_block_ids: []}
+          num_scheduled_tokens: {chatcmpl-ng: 6}
+          total_num_scheduled_tokens: 6
+          finished_req_ids: []
+      - flow: wr-sample-tokens
+        as: s
+        input: {grammar_output: {structured_output_request_ids: [chatcmpl-ng]}}
+      - interface: gpu-worker-impl.take-draft-token-ids
+        caller: engine-core
+        as: d
+    expect:
+      - "size(steps.s.result.value.sampled_token_ids[0]) == 1"
+      - "steps.d.result.value.req_ids == ['chatcmpl-ng'] && steps.d.result.value.draft_token_ids == [lists.range(3).map(i, steps.s.result.value.sampled_token_ids[0][0])]"
+      - "trace.exists(e, e.type == 'call.start' && e.interface == 'ngram-gpu-speculator.propose' && e.input.token_ids == [[128000, 11, 12, 13, 11, 12, steps.s.result.value.sampled_token_ids[0][0]]])"
+
+  # ---------------- spec-decode stats and metrics (judge2 P3c, worker side) ----------------
+  - id: wr-spec-decoding-stats-and-metrics
+    name: "Spec-decode stats accumulate per draft (per-position counts included), log the mean acceptance length with the bonus token, and feed the vllm:spec_decode_* counters"
+    description: "Two drafts of k=3 in one step: 3 drafted / 1 accepted and 3 / 3 (metrics.py:33-50). Logging: mean acceptance length 1 + 4/2 = 3, acceptance rate 4/6 = 66.7%, per-position rates [1, 0.5, 0.5] (metrics.py:82-137). Prometheus counters grow by the step's totals (metrics.py:266-281). Accepting more than k is an assertion."
+    fixtures: [full-tp1-llama-8b]
+    config: {speculative-method: eagle3, num-speculative-tokens: 3}
+    steps:
+      - interface: spec-decoding-stats.observe-draft
+        caller: engine-core
+        input: {stats: null, num_spec_tokens: 3, num_draft_tokens: 3, num_accepted_tokens: 1}
+        as: o1
+      - interface: spec-decoding-stats.observe-draft
+        caller: engine-core
+        input: {stats: "= steps.o1.result.value", num_spec_tokens: 3, num_draft_tokens: 3, num_accepted_tokens: 3}
+        as: o2
+      - interface: spec-decoding-stats.log
+        caller: engine-core
+        input: {observed: ["= steps.o2.result.value"]}
+        as: log
+      - interface: spec-decoding-stats.log
+        caller: engine-core
+        input: {observed: []}
+        as: nolog
+      - interface: spec-decoding-prom.observe
+        caller: engine-core
+        input: {stats: "= steps.o2.result.value"}
+        as: prom
+      - interface: spec-decoding-stats.observe-draft
+        caller: engine-core
+        input: {stats: null, num_spec_tokens: 3, num_draft_tokens: 3, num_accepted_tokens: 4}
+        as: bad
+    expect:
+      - "steps.o2.result.value.num_drafts == 2 && steps.o2.result.value.num_draft_tokens == 6 && steps.o2.result.value.num_accepted_tokens == 4"
+      - "steps.o2.result.value.num_accepted_tokens_per_pos == [2, 1, 1] && steps.o2.result.value.num_draft_tokens_per_pos == [2, 2, 2]"
+      - "steps.log.result.value.mean_acceptance_length == 3.0 && steps.log.result.value.acceptance_rates == [1.0, 0.5, 0.5] && steps.log.result.value.draft_acceptance_rate > 66.6 && steps.log.result.value.draft_acceptance_rate < 66.7"
+      - "steps.nolog.result.value == null"
+      - "steps.prom.result.value.num_accepted_tokens == 4 && steps.prom.result.value.num_accepted_tokens_per_pos == [2, 1, 1]"
+      - "!steps.bad.result.ok && steps.bad.result.error.code == 'assertion-error'"
+  - id: wr-spec-decoding-prom-disabled
+    name: Without speculative decoding the spec-decode counters do not move
+    fixtures: [full-tp1-llama-8b]
+    steps:
+      - interface: spec-decoding-prom.observe
+        caller: engine-core
+        input: {stats: {num_drafts: 1, num_draft_tokens: 3, num_accepted_tokens: 2, num_accepted_tokens_per_pos: [1, 1, 0]}}
+        as: p
+    expect:
+      - "steps.p.result.value.num_drafts == 0 && steps.p.result.value.num_accepted_tokens == 0"
+
+  # ---------------- V1 persistent batch and sampler ----------------
+  - id: wr-v1-input-batch-add-remove-condense
+    name: "V1 InputBatch: removed rows are refilled lowest first, condense moves the last live row into a hole, and SamplingMetadata follows the live requests"
+    description: "add_request takes the lowest freed row or appends (gpu_input_batch.py:320-343); remove_request leaves a hole (523-578); condense slides the last live row into the lowest hole (698-760); _make_sampling_metadata derives all_greedy/all_random, top-p/top-k and max_num_logprobs from the live sets (851-955, 1103-1144)."
+    fixtures: [full-tp1-llama-8b]
+    steps:
+      - {interface: input-batch-v1.add-request, caller: gpu-model-runner-v1, input: {req_id: a, prompt_token_ids: [1, 2, 3], output_token_ids: [], num_computed_tokens: 0, sampling_params: {temperature: 0.0}}, as: a}
+      - {interface: input-batch-v1.add-request, caller: gpu-model-runner-v1, input: {req_id: b, prompt_token_ids: [1, 2], output_token_ids: [7], num_computed_tokens: 0, sampling_params: {temperature: 0.8, top_p: 0.9, logprobs: 5}}, as: b}
+      - {interface: input-batch-v1.add-request, caller: gpu-model-runner-v1, input: {req_id: c, prompt_token_ids: [4], output_token_ids: [], num_computed_tokens: 0, sampling_params: {temperature: 0.0}}, as: c}
+      - {interface: input-batch-v1.remove-request, caller: gpu-model-runner-v1, input: {req_id: a}, as: ra}
+      - {interface: input-batch-v1.remove-request, caller: gpu-model-runner-v1, input: {req_id: zz}, as: rz}
+      - {interface: input-batch-v1.make-sampling-metadata, caller: gpu-model-runner-v1, input: {}, as: m1}
+      - {interface: input-batch-v1.condense, caller: gpu-model-runner-v1, input: {}, as: cd}
+      - {interface: input-batch-v1.condense, caller: gpu-model-runner-v1, input: {}, as: cd2}
+      - {interface: input-batch-v1.add-request, caller: gpu-model-runner-v1, input: {req_id: d, prompt_token_ids: [5, 6], output_token_ids: [], num_computed_tokens: 0, sampling_params: {temperature: 0.0}}, as: d}
+      - {interface: input-batch-v1.remove-request, caller: gpu-model-runner-v1, input: {req_id: b}, as: rb}
+      - {interface: input-batch-v1.make-sampling-metadata, caller: gpu-model-runner-v1, input: {}, as: m2}
+    expect:
+      - "steps.a.result.value.req_index == 0 && steps.b.result.value.req_index == 1 && steps.c.result.value.req_index == 2 && steps.b.result.value.num_tokens == 3"
+      - "steps.ra.result.value.req_index == 0 && steps.rz.result.value.req_index == null"
+      - "steps.m1.result.value.num_reqs == 2 && !steps.m1.result.value.all_greedy && !steps.m1.result.value.all_random && steps.m1.result.value.has_top_p && steps.m1.result.value.max_num_logprobs == 5"
+      - "steps.cd.result.value.req_ids == ['c', 'b'] && steps.cd.result.value.moved == [{'req_id': 'c', 'from': 2, 'to': 0}] && steps.cd2.result.value.moved == []"
+      - "steps.d.result.value.req_index == 2 && steps.m2.result.value.all_greedy && steps.m2.result.value.max_num_logprobs == null && steps.m2.result.value.num_reqs == 2"
+      - "state['input-batch-v1@rank0'].req_id_to_index == {'c': 0, 'd': 2} && state['input-batch-v1@rank0'].removed == [1]"
+  - id: wr-v1-input-batch-full
+    name: V1 InputBatch refuses a request past max_num_reqs
+    fixtures: [full-small-batch-limits]
+    state:
+      input-batch-v1: {req_ids: [x, y], req_id_to_index: {x: 0, y: 1}, removed: []}
+    steps:
+      - {interface: input-batch-v1.add-request, caller: gpu-model-runner-v1, input: {req_id: z, prompt_token_ids: [1], output_token_ids: [], num_computed_tokens: 0}, as: z}
+    expect:
+      - "!steps.z.result.ok && steps.z.result.error.code == 'assertion-error'"
+  - id: wr-v1-sampler-greedy-random-mixed
+    name: "V1 Sampler: an all-greedy batch takes the argmax and skips argmax-invariant processors; a mixed batch picks greedy or random per row by temperature"
+    fixtures: [full-tp1-llama-8b]
+    steps:
+      - interface: sampler-v1.forward
+        caller: gpu-model-runner-v1
+        input: {sampling_metadata: {all_greedy: true, all_random: false, max_num_logprobs: null, temperatures: [0.0, 0.0]}, logitsprocs: [{name: min_p, argmax_invariant: true}, {name: logit_bias, argmax_invariant: false}], greedy_tokens: [11, 12], random_tokens: [21, 22]}
+        as: g
+      - interface: sampler-v1.forward
+        caller: gpu-model-runner-v1
+        input: {sampling_metadata: {all_greedy: false, all_random: true, max_num_logprobs: 2, temperatures: [0.7, 1.0]}, logitsprocs: [{name: min_p, argmax_invariant: true}], greedy_tokens: [11, 12], random_tokens: [21, 22]}
+        as: r
+      - interface: sampler-v1.forward
+        caller: gpu-model-runner-v1
+        input: {sampling_metadata: {all_greedy: false, all_random: false, max_num_logprobs: null, temperatures: [0.0, 0.9]}, logitsprocs: [], greedy_tokens: [11, 12], random_tokens: [21, 22]}
+        as: m
+      - interface: sampler-v1.forward
+        caller: gpu-model-runner-v1
+        input: {sampling_metadata: {all_greedy: true, all_random: true, max_num_logprobs: null, temperatures: []}, greedy_tokens: [], random_tokens: []}
+        as: bad
+    expect:
+      - "steps.g.result.value.path == 'greedy' && steps.g.result.value.sampled_token_ids == [11, 12] && steps.g.result.value.processors_applied == ['logit_bias']"
+      - "steps.r.result.value.path == 'random' && steps.r.result.value.sampled_token_ids == [21, 22] && steps.r.result.value.has_logprobs"
+      - "steps.m.result.value.path == 'mixed' && steps.m.result.value.sampled_token_ids == [11, 22]"
+      - "!steps.bad.result.ok && steps.bad.result.error.code == 'assertion-error'"
+
+  # ---------------- KV cache specs and config ----------------
+  # ---------------- V2 custom logits processors and their params validator ----------------
+  - id: wr-custom-logits-processor-lifecycle
+    name: "A custom V2 logits processor initializes each slot it is told about, can decline a request, flushes its staged writes every step and runs after the built-in stages"
+    fixtures: [full-tp1-llama-8b]
+    state:
+      sampler: {custom_processors: [DryLogitsProcessor]}
+    steps:
+      - interface: sampler.add-request
+        caller: gpu-model-runner
+        input: {slot: 5, sampling_params: {temperature: 0.0}}
+        as: accepted_req
+      - interface: sampler.add-request
+        caller: gpu-model-runner
+        input: {slot: 6, sampling_params: {temperature: 0.0, extra_args: {DryLogitsProcessor: false}}}
+        as: declined_req
+      - interface: sampler.apply-staged-writes
+        caller: gpu-model-runner
+        as: flush
+      - interface: sampler.apply-sampling-params
+        caller: rejection-sampler
+        input: {rows: [{req_id: r5, slot: 5, is_final: true, drafts: [], seq_len: 3, prompt_len: 2}]}
+        as: asp
+      - interface: custom-logits-processor.apply
+        caller: sampler
+        input: {processor: LogitsProcessor, ctx: {idx_mapping: [5], expanded_idx_mapping: [5]}}
+        as: abstract
+    expect:
+      - "steps.accepted_req.result.value.needs_processing && !steps.declined_req.result.value.needs_processing"
+      - "steps.flush.result.value.flushed == ['sampling_states', 'DryLogitsProcessor'] && size(steps.asp.result.value.tokens[0]) == 1"
+      - "!steps.abstract.result.ok && steps.abstract.result.error.code == 'not-implemented-error'"
+      - "trace.exists(e, e.type == 'call.start' && e.interface == 'custom-logits-processor.apply' && e.input.ctx.idx_mapping == [5])"
+  - id: wr-custom-logits-processor-params-validator
+    name: "At admission a custom processor's ValueError becomes VLLMValidationError; with no custom classes every request passes"
+    fixtures: [full-tp1-llama-8b]
+    steps:
+      - interface: logits-processor-loader.build-custom-logits-processors-params-validator
+        caller: input-processor
+        input: {custom: [{name: DryLogitsProcessor, rejects: [dry_multiplier]}], sampling_params: {dry_multiplier: -1}}
+        as: bad
+      - interface: logits-processor-loader.build-custom-logits-processors-params-validator
+        caller: input-processor
+        input: {custom: [{name: DryLogitsProcessor, rejects: [dry_multiplier]}], sampling_params: {temperature: 0.5}}
+        as: good
+      - interface: logits-processor-loader.build-custom-logits-processors-params-validator
+        caller: input-processor
+        input: {custom: [], sampling_params: {dry_multiplier: -1}}
+        as: none
+    expect:
+      - "!steps.bad.result.ok && steps.bad.result.error.code == 'vllm-validation-error'"
+      - "steps.good.result.value.validated_by == ['DryLogitsProcessor'] && steps.none.result.value.validated_by == []"
+
+  # ---------------- PP hand-off keyed by TP rank (judge2 item 7) ----------------
+  - id: wr-pp-handoff-keyed-by-tp-rank
+    name: "With TP 2 x PP 2, each first-stage TP rank sends its intermediate tensors to the same TP rank of the next stage, not to a shared stage key"
+    tags: [concurrency]
+    fixtures: [full-tp4-llama-70b]
+    config: {tensor-parallel-size: 2, pipeline-parallel-size: 2}
+    state:
+      gpu-worker-impl@rank0: {pp_rank: 0, is_first_pp_rank: true, is_last_pp_rank: false}
+      gpu-worker-impl@rank1: {pp_rank: 0, is_first_pp_rank: true, is_last_pp_rank: false}
+      gpu-model-runner@rank0: {fresh_slots_used: 1, slots: {r0: {prefill_len: 4, prompt_len: 4, slot: 1023}}, pp_rank: 0, is_first_pp_rank: true, is_last_pp_rank: false}
+      gpu-model-runner@rank1: {fresh_slots_used: 1, slots: {r0: {prefill_len: 4, prompt_len: 4, slot: 1023}}, pp_rank: 0, is_first_pp_rank: true, is_last_pp_rank: false}
+    steps:
+      - interface: gpu-worker-impl.execute-model
+        caller: multiproc-executor
+        on: rank0
+        await: false
+        input: &ppstep
+          total_num_scheduled_tokens: 4
+          num_scheduled_tokens: {r0: 4}
+          scheduled_new_reqs: []
+          scheduled_cached_reqs: {req_ids: [r0], num_computed_tokens: [0], new_block_ids: [null]}
+          finished_req_ids: []
+        as: x0
+      - interface: gpu-worker-impl.execute-model
+        caller: multiproc-executor
+        on: rank1
+        input: *ppstep
+        as: x1
+    expect:
+      - "steps.x1.result.ok && steps.x1.result.value == null"
+      - "trace.exists(e, e.type == 'put' && e.key == 'pp-hidden:1:tp1' && e.instance == 'rank1') && trace.exists(e, e.type == 'put' && e.key == 'pp-hidden:1' && e.instance == 'rank0')"
+
+  # ---------------- the code's model_runner.add_requests assertion ----------------
+  - id: wr-add-request-prefill-shorter-than-prompt
+    name: A refill shorter than the prompt is an assertion error
+    fixtures: [full-tp1-llama-8b]
+    steps:
+      - flow: wr-execute-model
+        as: e
+        input:
+          scheduled_new_reqs:
+            - {req_id: chatcmpl-short, prompt_token_ids: [1, 2], prompt_len: 5, block_ids: [1], num_computed_tokens: 0, sampling_params: {temperature: 0.0}}
+          scheduled_cached_reqs: {req_ids: [], num_computed_tokens: [], new_block_ids: []}
+          num_scheduled_tokens: {chatcmpl-short: 2}
+          total_num_scheduled_tokens: 2
+          finished_req_ids: []
+    expect:
+      - "!steps.e.result.ok && steps.e.result.error.code == 'assertion-error'"
+      - "state['gpu-model-runner@rank0'].fresh_slots_used == 1"
+
+  # ---------------- workspace manager and KV allocation helpers ----------------
+  - id: wr-workspace-manager-lifecycle
+    name: "The workspace manager grows a slot's scratch until it is locked; afterwards a larger request is an assertion; reset leaves it uninitialized"
+    fixtures: [full-tp1-llama-8b]
+    steps:
+      - {interface: workspace-manager.reset, caller: gpu-model-runner, as: reset}
+      - {interface: workspace-manager.current, caller: gpu-model-runner, as: none}
+      - {interface: workspace-manager.init, caller: gpu-model-runner, input: {num_lanes: 2}, as: init}
+      - {interface: workspace-manager.get-simultaneous, caller: gpu-model-runner, input: {nbytes: [100, 300]}, as: g1}
+      - {interface: workspace-manager.get-simultaneous, caller: gpu-model-runner, input: {nbytes: [256]}, as: g2}
+      - {interface: workspace-manager.get-simultaneous, caller: gpu-model-runner, input: {nbytes: [10], lane: 2}, as: badlane}
+      - {interface: workspace-manager.lock, caller: gpu-model-runner, as: lock}
+      - {interface: workspace-manager.get-simultaneous, caller: gpu-model-runner, input: {nbytes: [4096]}, as: grow}
+      - {interface: workspace-manager.init, caller: gpu-model-runner, input: {num_lanes: 0}, as: zero}
+    expect:
+      - "!steps.none.result.ok && steps.none.result.error.code == 'assertion-error' && steps.init.result.value.num_slots == 2"
+      - "steps.g1.result.value.offsets == [0, 256] && steps.g1.result.value.workspace_bytes == 768 && steps.g1.result.value.grew && !steps.g2.result.value.grew"
+      - "!steps.badlane.result.ok && steps.badlane.result.error.code == 'runtime-error'"
+      - "!steps.grow.result.ok && steps.grow.result.error.code == 'assertion-error' && !steps.zero.result.ok && steps.zero.result.error.code == 'value-error'"
+      - "state['workspace-manager@rank0'].sizes == [768, 0] && state['workspace-manager@rank0'].locked"
+  - id: wr-kv-allocation-helpers
+    name: "KV allocation helpers: one shared backing buffer per KV config, a block size every backend supports, and block-table rows padded to 128-token multiples"
+    fixtures: [full-tp1-llama-8b]
+    steps:
+      - {interface: worker-utils.allocate-kv-cache, caller: attn-utils, input: {kv_cache_tensors: [{size: 4096, layers: [l0, l1]}, {size: 4096, layers: [l2]}]}, as: alloc}
+      - {interface: worker-utils.allocate-kv-cache, caller: attn-utils, input: {kv_cache_tensors: [{size: 4096, layers: [l0]}, {size: 2048, layers: [l1]}]}, as: mismatch}
+      - {interface: worker-utils.allocate-kv-cache, caller: attn-utils, input: {kv_cache_tensors: []}, as: empty}
+      - {interface: worker-utils.select-common-block-size, caller: gpu-model-runner, input: {kv_manager_block_size: 16, backends: [{name: FLASH_ATTN, multiple_of: [16]}, {name: TRITON_ATTN, multiple_of: [16]}]}, as: same}
+      - {interface: worker-utils.select-common-block-size, caller: gpu-model-runner, input: {kv_manager_block_size: 256, backends: [{name: FLASHMLA, sizes: [64]}, {name: TRITON_MLA, multiple_of: [16]}]}, as: down}
+      - {interface: worker-utils.select-common-block-size, caller: gpu-model-runner, input: {kv_manager_block_size: 64, backends: [{name: A, sizes: [64]}, {name: B, sizes: [32]}]}, as: none}
+      - {interface: block-table.get-block-table-width, caller: gpu-model-runner-v1, input: {max_num_blocks: 100, block_size: 16}, as: w16}
+      - {interface: block-table.get-block-table-width, caller: gpu-model-runner-v1, input: {max_num_blocks: 100, block_size: 256}, as: w256}
+      - {interface: block-table.get-block-table-width, caller: gpu-model-runner-v1, input: {max_num_blocks: 100, block_size: 16, token_alignment: 0}, as: wbad}
+    expect:
+      - "steps.alloc.result.value.bytes == 4096 && steps.alloc.result.value.kv_caches == ['l0', 'l1', 'l2'] && steps.empty.result.value.bytes == 0"
+      - "!steps.mismatch.result.ok && steps.mismatch.result.error.code == 'assertion-error'"
+      - "steps.same.result.value.block_size == 16 && steps.down.result.value.block_size == 64"
+      - "!steps.none.result.ok && steps.none.result.error.code == 'value-error'"
+      - "steps.w16.result.value.width == 104 && steps.w256.result.value.width == 100 && !steps.wbad.result.ok"
+      - "trace.exists(e, e.type == 'call.start' && e.interface == 'gpu-memory.allocate' && e.input.bytes == 4096)"
+
+  # ---------------- forward context and the runner's KV connector ----------------
+  - id: wr-forward-context-lifecycle
+    name: "set_forward_context fills in a BatchDescriptor for a CUDA graph run, builds DP metadata for a MoE model under DP, and is gone after the forward"
+    fixtures: [full-tp1-llama-8b]
+    config: {data-parallel-size: 2}
+    steps:
+      - {interface: forward-context.get-forward-context, caller: llama-for-causal-lm, as: outside}
+      - {interface: forward-context.set-forward-context, caller: gpu-model-runner, input: {num_tokens: 8, cudagraph_runtime_mode: PIECEWISE}, as: pw}
+      - {interface: forward-context.get-forward-context, caller: llama-for-causal-lm, as: inside}
+      - {interface: forward-context.exit-forward-context, caller: gpu-model-runner, as: done}
+      - {interface: forward-context.set-forward-context, caller: gpu-model-runner, input: {num_tokens: 8, is_moe_model: true, num_tokens_across_dp: [8, 4]}, as: dp}
+      - {interface: forward-context.set-forward-context, caller: gpu-model-runner, input: {num_tokens: 8, is_moe_model: true, num_tokens_across_dp: [6, 4]}, as: bad}
+    expect:
+      - "!steps.outside.result.ok && steps.outside.result.error.code == 'assertion-error'"
+      - "steps.pw.result.value.batch_descriptor.num_tokens == 8 && steps.inside.result.value.in_piecewise_cudagraph && steps.done.result.value.restored == null"
+      - "steps.dp.result.value.dp_metadata.num_tokens_across_dp_cpu == [8, 4] && steps.dp.result.value.batch_descriptor == null"
+      - "!steps.bad.result.ok && steps.bad.result.error.code == 'assertion-error'"
+  - id: wr-runner-kv-connector-step
+    name: "With a KV connector the runner binds the step's connector metadata before the forward and collects transfer results after sampling; an empty step still drives the connector"
+    fixtures: [full-tp1-llama-8b]
+    config: {kv-connector: ExampleConnector}
+    state:
+      gpu-model-runner:
+        fresh_slots_used: 1
+        slots: {chatcmpl-kv: {prefill_len: 4, prompt_len: 4, slot: 1023}}
+      sampler:
+        slots:
+          '1023': {temperature: 0.0, top_p: 1.0, top_k: 128256, min_p: 0.0, seeded: false, logprobs: -1, penalties: false, logit_bias: false, thinking: false, needs_processing: false}
+    steps:
+      - flow: wr-execute-model
+        as: e
+        input:
+          scheduled_new_reqs: []
+          scheduled_cached_reqs: {req_ids: [chatcmpl-kv], num_computed_tokens: [0], new_block_ids: [[]]}
+          num_scheduled_tokens: {chatcmpl-kv: 4}
+          total_num_scheduled_tokens: 4
+          finished_req_ids: []
+          kv_connector_metadata: {reqs_to_save: []}
+      - flow: wr-sample-tokens
+        as: s
+      - flow: wr-execute-model
+        as: idle
+        input:
+          scheduled_new_reqs: []
+          scheduled_cached_reqs: {req_ids: [], num_computed_tokens: [], new_block_ids: []}
+          num_scheduled_tokens: {}
+          total_num_scheduled_tokens: 0
+          finished_req_ids: [chatcmpl-old]
+          kv_connector_metadata: {reqs_to_save: []}
+      - flow: wr-execute-model
+        as: nometa
+        input:
+          scheduled_new_reqs: []
+          scheduled_cached_reqs: {req_ids: [], num_computed_tokens: [], new_block_ids: []}
+          num_scheduled_tokens: {}
+          total_num_scheduled_tokens: 0
+          finished_req_ids: []
+    expect:
+      - "size(steps.s.result.value.sampled_token_ids[0]) == 1"
+      - "steps.idle.result.value.sampled_token_ids == [] && has(steps.idle.result.value.kv_connector_output)"
+      - "!steps.nometa.result.ok && steps.nometa.result.error.code == 'assertion-error'"
+      - "trace.filter(e, e.type == 'call.start' && e.interface in ['kv-connector-base-v1-worker.bind-connector-metadata', 'kv-connector-base-v1-worker.clear-connector-metadata']).map(e, e.interface) == ['kv-connector-base-v1-worker.bind-connector-metadata', 'kv-connector-base-v1-worker.clear-connector-metadata', 'kv-connector-base-v1-worker.bind-connector-metadata', 'kv-connector-base-v1-worker.clear-connector-metadata']"
+
+  # ---------------- pooling metadata, V1 spec metadata and dispatcher, encoder cache, EC connector, watermark routing ----------------
+  - id: wr-runner-metadata-helpers
+    name: "Pooling metadata needs a task per request; V1 dummy spec metadata counts drafts and sampled tokens; the V1 dispatcher's keys follow the graph mode"
+    fixtures: [full-tp1-llama-8b]
+    steps:
+      - {interface: pooling-metadata.build, caller: pooling-runner, input: {pooling_params: [{task: embed}, {task: classify}]}, as: pool}
+      - {interface: pooling-metadata.build, caller: pooling-runner, input: {pooling_params: [{task: embed}, {task: null}]}, as: notask}
+      - {interface: spec-decode-metadata-v1.make-dummy, caller: gpu-model-runner-v1, input: {draft_token_ids: [[1, 2], [], [3, 4, 5]]}, as: sd}
+      - {interface: cudagraph-dispatcher-v1.initialize-cudagraph-keys, caller: gpu-model-runner-v1, input: {cudagraph_mode: FULL_AND_PIECEWISE, uniform_decode_query_len: 1, capture_sizes: [1, 2, 4, 8]}, as: keys}
+      - {interface: cudagraph-dispatcher-v1.initialize-cudagraph-keys, caller: gpu-model-runner-v1, input: {cudagraph_mode: NONE, capture_sizes: {$null: true}}, as: none}
+      - {interface: cudagraph-dispatcher-v1.initialize-cudagraph-keys, caller: gpu-model-runner-v1, input: {cudagraph_mode: PIECEWISE, capture_sizes: {$null: true}}, as: nosizes}
+      - {interface: gpu-model-runner-v1.get-model, caller: gpu-worker-impl, input: {model_loaded: false}, as: nomodel}
+    expect:
+      - "steps.pool.result.value.tasks == ['embed', 'classify'] && !steps.notask.result.ok && steps.notask.result.error.code == 'value-error'"
+      - "steps.sd.result.value.cu_num_draft_tokens == [2, 2, 5] && steps.sd.result.value.cu_num_sampled_tokens == [3, 4, 8] && steps.sd.result.value.num_logits == 8 && steps.sd.result.value.max_spec_len == 3"
+      - "size(steps.keys.result.value.mixed_keys) == 4 && steps.keys.result.value.mixed_keys.all(k, k.mode == 'PIECEWISE' && k.num_reqs == null) && size(steps.keys.result.value.decode_keys) == 4"
+      - "steps.none.result.value.mixed_keys == [] && !steps.nosizes.result.ok && !steps.nomodel.result.ok && steps.nomodel.result.error.code == 'value-error'"
+  - id: wr-encoder-cache-and-ec-connector
+    name: "The encoder cache tracks requests' multimodal features and drops outputs by hash or wholesale; an EC producer saves only the encoder outputs computed this step"
+    fixtures: [full-tp1-llama-8b]
+    state:
+      encoder-cache: {mm_features: {}, encoder_outputs: {h1: e1, h2: e2}}
+    steps:
+      - {interface: encoder-cache.add-request, caller: gpu-model-runner, input: {req_id: r1, mm_features: [{mm_hash: h1}]}, as: add}
+      - {interface: encoder-cache.add-request, caller: gpu-model-runner, input: {req_id: r1, mm_features: {$null: true}}, as: rm}
+      - {interface: encoder-cache.free-encoder-cache, caller: gpu-model-runner, input: {mm_hash: h1}, as: free}
+      - {interface: encoder-cache.free-encoder-cache, caller: gpu-model-runner, input: {mm_hash: {$null: true}}, as: reset}
+      - {interface: runner-ec-connector.maybe-get-output, caller: gpu-model-runner, input: {ec_connector_metadata: {}, is_producer: true, cached_before: [h1], cached_after: [h1, h3]}, as: prod}
+      - {interface: runner-ec-connector.maybe-get-output, caller: gpu-model-runner, input: {ec_connector_metadata: {$null: true}}, as: nometa}
+      - {interface: dual-key-gumbel-watermarker.sample, caller: gpu-watermark-sampler, input: {alpha: 0.0}, as: a0}
+      - {interface: dual-key-gumbel-watermarker.sample, caller: gpu-watermark-sampler, input: {alpha: 0.5}, as: mix}
+      - {interface: dual-key-gumbel-watermarker.sample, caller: gpu-watermark-sampler, input: {alpha: 1.0}, as: a1}
+      - {interface: dual-key-gumbel-watermarker.sample, caller: gpu-watermark-sampler, input: {alpha: 0.5, has_random_sampler: false}, as: norng}
+    expect:
+      - "steps.add.result.value.num_requests == 1 && steps.rm.result.value.num_requests == 0 && steps.free.result.value.num_outputs == 1 && steps.reset.result.value.num_outputs == 0"
+      - "steps.prod.result.value.saved == ['h3'] && steps.prod.result.value.started == ['save'] && steps.nometa.result.value == null"
+      - "steps.a0.result.value.keys == ['draft'] && steps.a1.result.value.keys == ['target'] && steps.mix.result.value.keys == ['draft', 'target'] && !steps.norng.result.ok"
+      - "state['encoder-cache@rank0'].encoder_outputs == {}"

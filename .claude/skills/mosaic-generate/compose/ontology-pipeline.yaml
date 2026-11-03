@@ -1,0 +1,922 @@
+# The mosaic generation pipeline (docs/PIPELINE.md) as one recursive compose
+# workflow (docs/DESIGN.md §14.9, §14.11). The same template runs at every
+# scope: the whole repo at level system, or one component of a parent model,
+# with the parent's contract, at a deeper level. See README.md beside it.
+#
+# Briefs are Go text/template over .inputs, .artifacts, .tree, .item,
+# .out_dir (this run's workspace), .output_path and .task. They point at the
+# templates in .claude/skills/mosaic-generate/templates/ instead of copying
+# them, so the rules keep one wording.
+#
+# The stage graph (a stage starts as soon as its bindings exist):
+#
+#   inventory -> skeleton -+-> areas -> reconcile -> refix -> merge -> merge_gate -+
+#                          '-> benchmark (in parallel with the builds)             |
+#   +------------------------------------------------------------------------------+
+#   +-> conformance -> contract   +-> judges (one per benchmark group)
+#   +-> refinement                +-> measure_judges (one per blind group) -+
+#   +-> oracle_sample -> oracle   '-> measure_sample -> measure_oracle -----+-> measure
+#   all of them -> results -> check + explore -> check_gate -> zoom_known -> children
+#
+# Every agent_turn has a budget (DESIGN §14.13). A turn that runs out, or fails
+# otherwise, is routed once by on_fail: builds, fixes and coordinator turns to a
+# retry that resumes from the files the first attempt left; judges and oracle
+# agents to a short gap turn that finishes what it can and records the rest as
+# a gap. Shared briefs open with a retry note that renders only in the handler
+# (`with index . "failure"`, so the primary stage does not bind `failure`).
+#
+# For one or two files, or a single small component, ontology-pipeline-light.yaml
+# runs the same inputs and outputs with fewer, cheaper turns (README.md).
+id: mosaic-ontology-pipeline
+version: 1
+description: >
+  Build a mosaic ontology of a scope (a repo, or one component of a parent model)
+  through inventory, skeleton and contracts, parallel area agents, reconciliation,
+  the test oracle, judges and a blind measure, ending in the full check gate.
+  Zoomed-in components run the same template as children.
+produces: artifacts
+
+recursion:
+  max_depth: 6               # system -> service -> logic -> runtime -> machine, with room for zoom.yaml wrappers
+  max_descendants: 32
+  max_children_per_visit: 8
+
+roles:
+  coordinator: {cap: 2, cap_scope: task}   # per scope; refinement and the contract review run side by side
+  benchmark: {cap: 1, cap_scope: tree}     # writes cases while the areas build; builds nothing, reads no model
+  area: {cap: 8, cap_scope: tree}          # the area agents of every scope in one tree share 8 slots
+  oracle: {cap: 4, cap_scope: tree}
+  judge: {cap: 6, cap_scope: tree}
+  measure: {cap: 8, cap_scope: tree}       # the blind re-measurement: fresh agents that never built or judged
+
+inputs:
+  scope:
+    description: >
+      What to model. The whole repo is {repo, paths: ["."]}; a zoomed component is
+      {repo, component, paths: [its code paths]}. profile names an existing profile to start from.
+    type: object
+    required: [repo, paths]
+    properties:
+      repo: {type: string, description: absolute path of the read-only checkout}
+      paths: {type: array, minItems: 1, items: {type: string}}
+      component: {type: string, description: the parent component this run refines}
+      name: {type: string, description: the ontology's name (default from the repo or component)}
+      profile: {type: string, description: an existing profile.yaml to start from}
+  contract:
+    description: >
+      For a child, the parent component's contract (DESIGN §14.3): the parent run and
+      document, the component, its interfaces and the parent scenarios that cross its
+      boundary. null at the root.
+    type: [object, "null"]
+    default: null
+    required: [parent, component, interfaces]
+    properties:
+      parent:
+        type: object
+        required: [task, ontology, document]
+        properties:
+          task: {type: string}
+          ontology: {type: string}
+          document: {type: string, description: path of the parent's merged ontology document}
+          revision: {type: string}
+      component: {type: string}
+      interfaces: {type: array, items: {type: string}}
+      scenarios: {type: array, items: {type: string}}
+      latency_ms: {}
+  level:
+    description: The level label of the document this run builds (DESIGN §14.2).
+    type: string
+    enum: [system, service, logic, runtime, machine]
+    default: system
+  zoom:
+    description: Component ids of this run's model to refine as child runs once it passes its gate.
+    type: array
+    items: {type: string}
+    default: []
+
+outputs:
+  ontology:
+    type: object
+    required: [path, name, level, components]
+    properties:
+      path: {type: string}
+      name: {type: string}
+      level: {type: string}
+      revision: {type: string}
+      results: {type: string}
+      scores: {type: object}
+      components:
+        type: array
+        items: &component
+          type: object
+          required: [id, code_paths, interfaces]
+          properties:
+            id: {type: string}
+            code_paths: {type: array, items: {type: string}}
+            interfaces: {type: array, items: {type: string}}
+            scenarios: {type: array, items: {type: string}}
+            next_level: {enum: [service, logic, runtime, machine]}
+  refines:
+    type: object
+    required: [refines, implements, candidates]
+    properties:
+      refines: {type: [object, "null"]}
+      implements: {type: array}
+      candidates: {type: array}
+  timing:
+    description: The conformance check's result (check --refinement); the latencies to apply are in <out>/timing.json. A note at the root.
+    type: object
+    required: [exit, stdout]
+  change_requests:
+    type: object
+    required: [requests]
+    properties:
+      requests: {type: array}
+
+stages:
+  # ---------------------------------------------------------------- 1. Inventory
+  - id: inventory
+    kind: agent_turn
+    role: coordinator
+    budget: {max_turns: 120, timeout_min: 30}
+    on_fail: inventory_retry
+    output: &inventory_out
+      name: inventory
+      schema:
+        type: object
+        required: [path, audit, counts]
+        properties:
+          path: {type: string}
+          audit: {type: string}
+          counts: {type: object}
+          below_target: {type: array, items: {type: string}}
+    brief: &inventory_brief |
+      {{with .artifacts}}{{with index . "failure"}}**Retry.** The first attempt at this stage failed ({{.reason}}:
+      {{.error}}). Its files are still in the workspace: keep what is sound and finish the rest
+      within this budget; don't start over.
+      {{end}}{{end -}}
+      You are the coordinator of a mosaic generation run (task {{.task}}, level `{{.inputs.level}}`).
+      Read `docs/PIPELINE.md` ("Layout and shell setup", "The check tool", "Stage 1: Inventory")
+      and `.claude/skills/mosaic-generate/SKILL.md` first. Your workspace is `{{.out_dir}}`
+      (WS in the runbook); write only there. The code is read-only.
+
+      Scope:
+      ```json
+      {{json .inputs.scope}}
+      ```
+      {{if .inputs.contract}}
+      This run refines component `{{.inputs.contract.component}}` of the parent ontology
+      `{{.inputs.contract.parent.ontology}}` (`{{.inputs.contract.parent.document}}`). Its contract:
+      ```json
+      {{json .inputs.contract}}
+      ```
+      Inventory only the scope's paths. Entry points at this level are the component's parts
+      (DESIGN §14.2: at `{{.inputs.level}}`), not the parent's routes.
+      {{end}}
+      Do stage 1: write `{{.out_dir}}/profile.yaml` (from {{with index .inputs.scope "profile"}}`{{.}}`{{else}}`examples/_profile-template/profile.yaml`{{end}}{{if .inputs.contract}}, inheriting the parent's naming, error convention and shared shapes{{end}}),
+      run the inventory scanner over the scope's paths into `{{.out_dir}}/inventory.json`, audit
+      precision and recall into `{{.out_dir}}/inventory-audit.md`, and turn false-positive classes
+      into skip rules. Report the per-kind counts and every kind below the audit targets.
+  - id: inventory_retry
+    kind: agent_turn
+    role: coordinator
+    budget: {max_turns: 60, timeout_min: 15}
+    output: *inventory_out
+    brief: *inventory_brief
+
+  # ------------------------------------------------------ 2. Skeleton and contracts
+  - id: skeleton
+    kind: agent_turn
+    role: coordinator
+    budget: {max_turns: 250, timeout_min: 45}
+    on_fail: skeleton_retry
+    output: &skeleton_out
+      name: skeleton
+      schema:
+        type: object
+        required: [profile, skeleton, fixtures, brief, areas]
+        properties:
+          profile: {type: string}
+          skeleton: {type: string}
+          fixtures: {type: string}
+          brief: {type: string}
+          acceptance: {type: string}
+          areas:
+            type: array
+            minItems: 1
+            items:
+              type: object
+              required: [id, owns]
+              properties:
+                id: {type: string}
+                owns: {type: array, items: {type: string}}
+                summary: {type: string}
+    brief: &skeleton_brief |
+      {{with .artifacts}}{{with index . "failure"}}**Retry.** The first attempt at this stage failed ({{.reason}}:
+      {{.error}}). Its files are still in the workspace: keep what is sound and finish the rest
+      within this budget; don't start over.
+      {{end}}{{end -}}
+      You are the coordinator (task {{.task}}, level `{{.inputs.level}}`), workspace `{{.out_dir}}`.
+      The inventory is `{{.artifacts.inventory.path}}` (audit `{{.artifacts.inventory.audit}}`).
+
+      Do stages 2 and 3 of `docs/PIPELINE.md` ("Stage 2: Skeleton and contracts", "Stage 3:
+      Fixtures"), every exit criterion included:
+      - the profile's areas, overrides, naming, errors, shared shapes, `features`, `failures`,
+        `shared_data`; `skeleton.yaml` with predeclared seams; `contracts/*.yaml`;
+        `test-targets.json` (`scripts/test_targets.py`); `fixtures.yaml` with a smoke scenario per
+        fixture; `assign_inventory.py` run;
+      - each area's in-build oracle sample (stage 4b: `scripts/sample_tests.py --area <id>`);
+      - `BRIEF.md`, rendered with `scripts/render_template.py {{.out_dir}} BRIEF` from
+        `.claude/skills/mosaic-generate/templates/BRIEF.md`. Fill its marks from this run; don't
+        reword its rules.
+      Set the document `level: {{.inputs.level}}` in the skeleton.
+      {{if .inputs.contract}}
+      This is a refinement (DESIGN §14.3, §14.11). In the skeleton, declare
+      `refines: {ontology: {{.inputs.contract.parent.ontology}}, component: {{.inputs.contract.component}}}`
+      and one boundary interface per contract interface, each with
+      `implements: "{{.inputs.contract.component}}.<interface>"` and the parent's request,
+      response and error schemas, read from `{{.inputs.contract.parent.document}}`. These are
+      predeclared seams that the owning area must keep. Project the parent's scenarios that cross
+      the component ({{json (index .inputs.contract "scenarios")}}) onto it as acceptance scenarios in
+      `{{.out_dir}}/acceptance.yaml`: calls into the component become entry steps, and the
+      parent's observed boundary outputs become expectations. Never change the contract to fit
+      the code here; disagreements are recorded and become change requests later.
+      {{end}}
+      Return the paths you wrote and the area list (id, owned path globs, one-line summary). The
+      area list drives the fan-out, one agent per area.
+  - id: skeleton_retry
+    kind: agent_turn
+    role: coordinator
+    budget: {max_turns: 120, timeout_min: 25}
+    output: *skeleton_out
+    brief: *skeleton_brief
+
+  # --------------------------------- before the fan-out: the benchmarks, kept from builders
+  - id: benchmark
+    kind: agent_turn
+    role: benchmark
+    budget: {max_turns: 80, timeout_min: 30}
+    on_fail: benchmark_retry
+    tools: [Read, Grep, Glob, Write]
+    output: &benchmark_out
+      name: benchmark
+      schema:
+        type: object
+        required: [path, blind_path, groups, blind_groups]
+        properties:
+          path: {type: string}
+          blind_path: {type: string}
+          groups: &case_groups
+            type: array
+            minItems: 1
+            items:
+              type: object
+              required: [id]
+              properties:
+                id: {type: string}
+                cases: {type: integer}
+          blind_groups: *case_groups
+    brief: &benchmark_brief |
+      {{with .artifacts}}{{with index . "failure"}}**Retry.** The first attempt at this stage failed ({{.reason}}:
+      {{.error}}). Its files are still in the workspace: keep what is sound and finish the rest
+      within this budget; don't start over.
+      {{end}}{{end -}}
+      You write benchmarks and build nothing. Read `.claude/skills/mosaic-generate/templates/BENCHMARK.md`
+      and the profile `{{.artifacts.skeleton.profile}}`. From the system's docs and well-known
+      behavior{{if .inputs.contract}} of component `{{.inputs.contract.component}}` at level `{{.inputs.level}}`{{end}},
+      write two disjoint case sets: `{{.out_dir}}/BENCHMARK.md` (judged in the judging stage) and
+      `{{.out_dir}}/BENCHMARK1.md` (held back for the blind measure at the end of this round). No
+      case may appear in both. Never read fragments, notes or any model file: the area agents are
+      building them while you write. Group each file's cases by theme, at most 5 cases per group:
+      one fresh agent judges each group in parallel, with a 15-minute budget. Return both paths,
+      the groups of BENCHMARK.md and the groups of BENCHMARK1.md, each with its case count.
+  - id: benchmark_retry
+    kind: agent_turn
+    role: benchmark
+    budget: {max_turns: 40, timeout_min: 15}
+    tools: [Read, Grep, Glob, Write]
+    output: *benchmark_out
+    brief: *benchmark_brief
+
+  # ------------------------------------------------ 3. Fan-out: one agent per area
+  # In parallel with the benchmark: builders never read it, and it reads no model.
+  - id: areas
+    kind: fanout
+    branches_from: skeleton.areas
+    max_branches: 32
+    parallel: true
+    join: all
+    output: fragments
+    branch:
+      stages:
+        - id: build
+          kind: agent_turn
+          role: area
+          budget: {max_turns: 300, timeout_min: 45}
+          on_fail: build_retry
+          output: &build_out
+            name: area
+            schema: &area_report {type: object, required: [area, fragment, notes, gate_passed], properties: {area: {type: string}, fragment: {type: string}, notes: {type: string}, skips: {type: string}, gate_passed: {type: boolean}, breaking_changes: {type: array}, contract_findings: {type: array}}}
+          brief: &build_brief |
+            {{with .artifacts}}{{with index . "failure"}}**Retry.** The first attempt at this stage failed ({{.reason}}:
+            {{.error}}). Its files are still in the workspace: keep what is sound and finish the rest
+            within this budget; don't start over.
+            {{end}}{{end -}}
+            You are the area agent for area `{{.item.id}}` (owns {{json .item.owns}}).
+            Read `{{.artifacts.skeleton.brief}}` (rendered from
+            `.claude/skills/mosaic-generate/templates/BRIEF.md`) and follow it exactly, with the
+            workspace `{{.out_dir}}`. You own only `fragments/{{.item.id}}.yaml`, `notes/{{.item.id}}.md`,
+            `skips/{{.item.id}}.json` and `skips/{{.item.id}}.features.json`. Translate your in-build
+            oracle sample `build-oracle/{{.item.id}}.json` (stage 4b). Never read any `BENCHMARK*.md`,
+            `oracle*/` or `judge*/`.
+            {{if .inputs.contract}}
+            This model refines `{{.inputs.contract.component}}`. The skeleton's boundary interfaces
+            carry `implements:`; keep their shapes, and run the acceptance scenarios `{{index .artifacts.skeleton "acceptance"}}`
+            with your gate. Where the code disagrees with the parent's contract, model the code and
+            list each disagreement under `contract_findings` (interface, what the contract says,
+            what the code does, citation). Never edit the contract to match.
+            {{end}}
+            Staging (DESIGN §15.2): before you report done,
+            `.claude/skills/mosaic-generate/scripts/mcheck --stage {{.out_dir}}/fragments/{{.item.id}}.yaml --accept`
+            must pass. It runs your fragment against the other fragments as they last passed, and
+            `--accept` records yours as last-good. A failure that needs another area's fix is
+            reported in your notes, not worked around. Set `gate_passed` only when staging passed.
+            Hand off only when the stage 4 exit criteria in `docs/PIPELINE.md` hold. Report the
+            "Breaking changes" from your notes as `breaking_changes`.
+        - id: build_retry
+          kind: agent_turn
+          role: area
+          budget: {max_turns: 150, timeout_min: 30}
+          output: *build_out
+          brief: *build_brief
+
+  # ------------------------------------------------------------ 4. Reconciliation
+  - id: reconcile
+    kind: agent_turn
+    role: coordinator
+    budget: {max_turns: 150, timeout_min: 30}
+    on_fail: reconcile_retry
+    output: &reconcile_out
+      name: reconcile
+      schema:
+        type: object
+        required: [decisions, merged_check, relaunch]
+        properties:
+          decisions: {type: string}
+          merged_check: {type: string}
+          relaunch:
+            type: array
+            items:
+              type: object
+              required: [id]
+              properties:
+                id: {type: string}
+                decisions: {type: array}
+    brief: &reconcile_brief |
+      {{with .artifacts}}{{with index . "failure"}}**Retry.** The first attempt at this stage failed ({{.reason}}:
+      {{.error}}). Its files are still in the workspace: keep what is sound and finish the rest
+      within this budget; don't start over.
+      {{end}}{{end -}}
+      You are the coordinator, workspace `{{.out_dir}}`. Every area handed off:
+      ```json
+      {{json .artifacts.fragments}}
+      ```
+      Do stage 5 of `docs/PIPELINE.md` up to the relaunch: merge, run the full gate into
+      `reconcile/merged-check.txt`, split the failures per area into `reconcile/<area>.txt`, group
+      them by root cause, and write `RECONCILE.md` from
+      `.claude/skills/mosaic-generate/templates/RECONCILE.md`, one numbered decision per cause,
+      naming the owner and the exact shape. Route every reported breaking change to its owner.
+      Return the areas to relaunch, each with the decision numbers it must apply (an empty list
+      when the merge already passes).
+  - id: reconcile_retry
+    kind: agent_turn
+    role: coordinator
+    budget: {max_turns: 80, timeout_min: 20}
+    output: *reconcile_out
+    brief: *reconcile_brief
+
+  - id: refix
+    kind: fanout
+    branches_from: reconcile.relaunch
+    max_branches: 32
+    parallel: true
+    join: all
+    output: refixes
+    branch:
+      stages:
+        - id: fix
+          kind: agent_turn
+          role: area
+          budget: {max_turns: 150, timeout_min: 30}
+          on_fail: fix_retry
+          output: &fix_out
+            name: fix
+            schema: *area_report
+          brief: &fix_brief |
+            {{with .artifacts}}{{with index . "failure"}}**Retry.** The first attempt at this stage failed ({{.reason}}:
+            {{.error}}). Its files are still in the workspace: keep what is sound and finish the rest
+            within this budget; don't start over.
+            {{end}}{{end -}}
+            You are the area agent for area `{{.item.id}}`, in the reconciliation round. Read
+            `{{.artifacts.skeleton.brief}}` and `{{.out_dir}}/RECONCILE.md`, then apply decisions
+            {{json .item.decisions}} to your own files only (`fragments/{{.item.id}}.yaml`,
+            `notes/{{.item.id}}.md`, `skips/{{.item.id}}*.json`) in `{{.out_dir}}`. Your failures are in
+            `reconcile/{{.item.id}}.txt`. A failure that needs another area's fix is reported, not
+            worked around. Hand off when your standalone gate passes again and staging passes:
+            `.claude/skills/mosaic-generate/scripts/mcheck --stage {{.out_dir}}/fragments/{{.item.id}}.yaml --accept`
+            (DESIGN §15.2). Set `gate_passed` only when it passed.
+        - id: fix_retry
+          kind: agent_turn
+          role: area
+          budget: {max_turns: 80, timeout_min: 20}
+          output: *fix_out
+          brief: *fix_brief
+
+  # merge, regenerate the worlds, require full coverage: stage 5's exit criterion
+  - id: merge
+    kind: command
+    after: [refix]
+    argv:
+      - sh
+      - -c
+      - |
+        WS='{{.out_dir}}'; CODE='{{.inputs.scope.repo}}'; SCRIPTS=.claude/skills/mosaic-generate/scripts
+        F=""; for f in "$WS"/fragments/*.yaml; do F="$F -f $f"; done
+        C=""; for f in "$WS"/contracts/*.yaml; do [ -e "$f" ] && C="$C --contract $f"; done
+        [ -n "$C" ] && C="$C --max-contract-issues 0"
+        python3 $SCRIPTS/assign_inventory.py "$WS" --worlds || exit $?
+        exec go run ./internal/devtools/check -f "$WS/skeleton.yaml" -f "$WS/fixtures.yaml" -f "$WS/worlds.yaml" $F \
+          --code "$CODE" --strict-citations --inventory "$WS/inventory.json" --strict-coverage \
+          --min-modeled 0.5 --min-substantive 0.5 --max-trivial 0.35 \
+          --tests "$WS/test-targets.json" --min-test-reach 0.5 --features "$WS/profile.yaml" --strict-features \
+          --behavior-coverage --no-mocks --lint hollow,trivial,racy,seam-names --max-racy 0 --max-seam-names 0 $C \
+          --coverage-md "$WS/coverage-tables.md" -o "$WS/ontology.json"
+  - id: merge_gate
+    kind: gate
+    expr: artifacts.merge.exit == 0
+
+  # ------------------------------------------- the refinement link and its timing
+  - id: refinement
+    kind: agent_turn
+    role: coordinator
+    budget: {max_turns: 60, timeout_min: 15}
+    on_fail: refinement_retry
+    after: [merge_gate]
+    output: &refinement_out
+      name: refines
+      schema:
+        type: object
+        required: [refines, implements, candidates]
+        properties:
+          refines: {type: [object, "null"]}
+          implements:
+            type: array
+            items: {type: object, required: [interface, implements], properties: {interface: {type: string}, implements: {type: string}, conforms: {type: boolean}}}
+          candidates:
+            type: array
+            items: {type: object, required: [component, reason], properties: {component: {type: string}, reason: {type: string}, tests: {type: array}}}
+    brief: &refinement_brief |
+      {{with .artifacts}}{{with index . "failure"}}**Retry.** The first attempt at this stage failed ({{.reason}}:
+      {{.error}}). Its files are still in the workspace: keep what is sound and finish the rest
+      within this budget; don't start over.
+      {{end}}{{end -}}
+      You are the coordinator, workspace `{{.out_dir}}`; the merged model is `{{.out_dir}}/ontology.json`.
+      The oracle, judges and blind measure read it while you work: don't edit it or the fragments.
+      {{if .inputs.contract}}
+      Verify the refinement link that the skeleton predeclared (DESIGN §14.3, §14.11): the document's
+      `refines: {ontology: {{.inputs.contract.parent.ontology}}, component: {{.inputs.contract.component}}{{with index .inputs.contract.parent "revision"}}, revision: {{.}}{{end}}}`,
+      and `implements` on every boundary interface, each resolving against
+      `{{.inputs.contract.parent.document}}` (`mosaic validate -f <parent> -f <child>`). List each
+      implements pair and whether its schemas conform both ways; a missing or broken link is a
+      finding for the results, not an edit. Return `refines` as the document carries it. The
+      parent's `refined_by` entry is the parent owners' to apply; don't edit the parent document.
+      {{else}}
+      This is a root run: `refines` is null and `implements` is empty.
+      {{end}}
+      Also list this model's refinement candidates (DESIGN §14.7): components whose tests don't fit
+      level `{{.inputs.level}}` (untranslatable tests about byte layout, codecs or OS behavior;
+      repeated findings below the level), each with the reason and the tests that would become the
+      child's oracle sample. Read the area notes' untranslatable and sim-gap rows.
+  - id: refinement_retry
+    kind: agent_turn
+    role: coordinator
+    budget: {max_turns: 30, timeout_min: 10}
+    output: *refinement_out
+    brief: *refinement_brief
+
+  - id: conformance
+    kind: command
+    after: [merge_gate]
+    argv:
+      - sh
+      - -c
+      - |
+        {{if .inputs.contract}}exec go run ./internal/devtools/check -f '{{.inputs.contract.parent.document}}' \
+          --refinement '{{.out_dir}}/ontology.json' --apply-timing '{{.out_dir}}/timing.json'{{else}}echo "root run: no parent contract; latencies are this model's own"{{end}}
+    output: timing
+
+  # ------------------------------------------------------------- 5. Test oracle
+  - id: oracle_sample
+    kind: command
+    after: [merge_gate]
+    argv:
+      - sh
+      - -c
+      - exec python3 .claude/skills/mosaic-generate/scripts/sample_tests.py '{{.out_dir}}' --exclude-sample '{{.out_dir}}/build-oracle/*.json'
+  - id: oracle
+    kind: fanout
+    after: [oracle_sample]
+    branches_from: skeleton.areas
+    max_branches: 32
+    parallel: true
+    join: all
+    output: oracle
+    branch:
+      stages:
+        - id: translate
+          kind: agent_turn
+          role: oracle
+          budget: {max_turns: 120, timeout_min: 20}
+          on_fail: translate_gap
+          tools: &mcheck_tools [Read, Grep, Glob, Write, "Bash(.claude/skills/mosaic-generate/scripts/mcheck *)"]
+          output:
+            name: verdicts
+            schema: &verdicts {type: object, required: [area, report, pass, model_bug, sim_gap, untranslatable], properties: {area: {type: string}, report: {type: string}, pass: {type: integer}, model_bug: {type: integer}, sim_gap: {type: integer}, untranslatable: {type: integer}, unscored: {type: integer, description: tests left unscored when the agent ran out of budget}}}
+          brief: |
+            Run the checker only as `.claude/skills/mosaic-generate/scripts/mcheck <check args>`, from the
+            repo root, with no `cd`, env prefix or pipe: only that exact command form is allowed.
+            You are an oracle agent for area `{{.item.id}}`. Follow
+            `.claude/skills/mosaic-generate/templates/ORACLE.md` and "Stage 6: Test oracle" in
+            `docs/PIPELINE.md`, with the workspace `{{.out_dir}}` and the merged model
+            `{{.out_dir}}/ontology.json`. Translate this area's tests from `oracle/sample.json` into
+            `oracle/{{.item.id}}.yaml` and write one verdict row per test to `oracle/{{.item.id}}.md`.
+            Read the repo's tests; never run them, and never edit the model. If the sample has no
+            tests for this area, write nothing and return zeros.
+        - id: translate_gap
+          kind: agent_turn
+          role: oracle
+          budget: {max_turns: 40, timeout_min: 10}
+          tools: *mcheck_tools
+          output: {name: verdicts, schema: *verdicts}
+          brief: |
+            The oracle agent for area `{{.item.id}}` stopped ({{.artifacts.failure.reason}}:
+            {{.artifacts.failure.error}}). Close its gap in the workspace `{{.out_dir}}`, following
+            `.claude/skills/mosaic-generate/templates/ORACLE.md`: keep every verdict row its report
+            already holds, finish at most the tests whose translation is nearly done, and record
+            each remaining sampled test as a row with verdict `unscored` and cause `budget`. Count
+            them in `unscored`; they are a recorded gap, not a model verdict. Run the checker only
+            as `.claude/skills/mosaic-generate/scripts/mcheck <check args>`. Never edit the model.
+
+  # ----------------------------------------------------------------- 6. Judges
+  - id: judges
+    kind: fanout
+    after: [merge_gate]
+    branches_from: benchmark.groups
+    max_branches: 32
+    parallel: true
+    join: all
+    output: judges
+    branch:
+      stages:
+        - id: judge
+          kind: agent_turn
+          role: judge
+          budget: {max_turns: 100, timeout_min: 15}
+          on_fail: judge_gap
+          tools: *mcheck_tools
+          output:
+            name: score
+            schema: &score {type: object, required: [group, scorecard, cases], properties: {group: {type: string}, scorecard: {type: string}, cases: {type: array, items: {type: object, required: [case, score], properties: {case: {type: string}, score: {enum: [pass, partial, fail, missing, sim-gap]}, cause: {type: string}, expectation_corrected: {type: boolean}}}}}}
+          brief: |
+            Run the checker only as `.claude/skills/mosaic-generate/scripts/mcheck <check args>`, from the
+            repo root, with no `cd`, env prefix or pipe: only that exact command form is allowed.
+            You are the judge for benchmark group `{{.item.id}}` of `{{.artifacts.benchmark.path}}`.
+            Follow `.claude/skills/mosaic-generate/templates/JUDGE.md` and "Stage 7: Judging" in
+            `docs/PIPELINE.md`: verify each expectation against the code under
+            `{{.inputs.scope.repo}}` first, then run each case against `{{.out_dir}}/ontology.json`.
+            Write only under `{{.out_dir}}/judge/`. Never edit the model.
+        - id: judge_gap
+          kind: agent_turn
+          role: judge
+          budget: {max_turns: 40, timeout_min: 10}
+          tools: *mcheck_tools
+          output: {name: score, schema: *score}
+          brief: |
+            The judge for group `{{.item.id}}` stopped ({{.artifacts.failure.reason}}:
+            {{.artifacts.failure.error}}). Close its gap, following
+            `.claude/skills/mosaic-generate/templates/JUDGE.md`: keep every case its scorecard under
+            `{{.out_dir}}/judge/` already scored, finish at most the case in
+            progress, and score each remaining case `missing` with cause `budget`: a recorded gap,
+            not a model failure. Run the checker only as
+            `.claude/skills/mosaic-generate/scripts/mcheck <check args>`. Never edit the model.
+
+  # -------------------------------------------- 7. The blind measure of this round
+  - id: measure_sample
+    kind: command
+    after: [oracle_sample]
+    argv:
+      - sh
+      - -c
+      - exec python3 .claude/skills/mosaic-generate/scripts/sample_tests.py '{{.out_dir}}' --out '{{.out_dir}}/oracle1/sample.json' --min-size 10 --exclude-sample '{{.out_dir}}/build-oracle/*.json' --exclude-sample '{{.out_dir}}/oracle*/sample.json'
+  # Fresh agents, one per blind benchmark group and one per area of the fresh
+  # oracle sample, all in parallel; then a short turn sums them into `measure`.
+  - id: measure_judges
+    kind: fanout
+    after: [merge_gate]
+    branches_from: benchmark.blind_groups
+    max_branches: 32
+    parallel: true
+    join: all
+    branch:
+      stages:
+        - id: blind_judge
+          kind: agent_turn
+          role: measure
+          budget: {max_turns: 100, timeout_min: 15}
+          on_fail: blind_judge_gap
+          tools: *mcheck_tools
+          output: {name: blind_score, schema: *score}
+          brief: |
+            Run the checker only as `.claude/skills/mosaic-generate/scripts/mcheck <check args>`, from the
+            repo root, with no `cd`, env prefix or pipe: only that exact command form is allowed.
+            You are a blind judge of this round ("Blind re-measurement" in `docs/PIPELINE.md`): you
+            built, fixed and judged nothing else. Score group `{{.item.id}}` of
+            `{{.artifacts.benchmark.blind_path}}`, and only that group, against
+            `{{.out_dir}}/ontology.json`, following `.claude/skills/mosaic-generate/templates/JUDGE.md`:
+            verify each expectation against the code under `{{.inputs.scope.repo}}` first. Write only
+            `{{.out_dir}}/judge1/{{.item.id}}.md` and the scenarios it needs under `{{.out_dir}}/judge1/`.
+            Never read `{{.out_dir}}/judge/` or `BENCHMARK.md`, and never edit the model.
+        - id: blind_judge_gap
+          kind: agent_turn
+          role: measure
+          budget: {max_turns: 40, timeout_min: 10}
+          tools: *mcheck_tools
+          output: {name: blind_score, schema: *score}
+          brief: |
+            The blind judge for group `{{.item.id}}` of `{{.artifacts.benchmark.blind_path}}` stopped
+            ({{.artifacts.failure.reason}}: {{.artifacts.failure.error}}). Close its gap, following
+            `.claude/skills/mosaic-generate/templates/JUDGE.md`: keep every case
+            `{{.out_dir}}/judge1/{{.item.id}}.md` already scored, finish at most the case in progress,
+            and score each remaining case `missing` with cause `budget`: a recorded gap, not a model
+            failure. Run the checker only as `.claude/skills/mosaic-generate/scripts/mcheck <check args>`.
+            Never edit the model.
+  - id: measure_oracle
+    kind: fanout
+    after: [measure_sample]
+    branches_from: skeleton.areas
+    max_branches: 32
+    parallel: true
+    join: all
+    branch:
+      stages:
+        - id: blind_translate
+          kind: agent_turn
+          role: measure
+          budget: {max_turns: 120, timeout_min: 20}
+          on_fail: blind_translate_gap
+          tools: *mcheck_tools
+          output: {name: blind_verdicts, schema: *verdicts}
+          brief: |
+            Run the checker only as `.claude/skills/mosaic-generate/scripts/mcheck <check args>`, from the
+            repo root, with no `cd`, env prefix or pipe: only that exact command form is allowed.
+            You are a blind oracle agent of this round ("Blind re-measurement" in `docs/PIPELINE.md`):
+            you built, fixed and judged nothing. Follow `.claude/skills/mosaic-generate/templates/ORACLE.md`
+            with the merged model `{{.out_dir}}/ontology.json`: translate area `{{.item.id}}`'s tests
+            from the fresh sample `{{.out_dir}}/oracle1/sample.json` into `oracle1/{{.item.id}}.yaml`
+            and write one verdict row per test to `oracle1/{{.item.id}}.md`, in `{{.out_dir}}`. Read
+            the repo's tests; never run them, never read `oracle/`, and never edit the model. If the
+            sample has no tests for this area, write nothing and return zeros.
+        - id: blind_translate_gap
+          kind: agent_turn
+          role: measure
+          budget: {max_turns: 40, timeout_min: 10}
+          tools: *mcheck_tools
+          output: {name: blind_verdicts, schema: *verdicts}
+          brief: |
+            The blind oracle agent for area `{{.item.id}}` stopped ({{.artifacts.failure.reason}}:
+            {{.artifacts.failure.error}}). Close its gap in `{{.out_dir}}/oracle1/`, following
+            `.claude/skills/mosaic-generate/templates/ORACLE.md`: keep every verdict row
+            `oracle1/{{.item.id}}.md` already holds, finish at most the tests nearly done, and record
+            each remaining sampled test as a row with verdict `unscored` and cause `budget`. Count
+            them in `unscored`. Run the checker only as
+            `.claude/skills/mosaic-generate/scripts/mcheck <check args>`. Never edit the model.
+  - id: measure
+    kind: agent_turn
+    role: measure
+    budget: {max_turns: 15, timeout_min: 5}
+    model: sonnet
+    on_fail: measure_retry
+    tools: [Read, Write]
+    output: &measure_out
+      name: measure
+      schema: &measure_schema
+        type: object
+        required: [benchmark, oracle]
+        properties:
+          benchmark: {type: object, required: [pass, total], properties: {pass: {type: integer}, total: {type: integer}}}
+          oracle: *verdicts
+          gaps: {type: array, items: {type: string}, description: blind cases and tests left unscored for budget}
+    brief: &measure_brief |
+      You sum the blind measure of this round; you score nothing yourself. The blind judges'
+      scores, one per group of `{{.artifacts.benchmark.blind_path}}`:
+      ```json
+      {{json .artifacts.measure_judges}}
+      ```
+      The blind oracle verdicts, one per area of `{{.out_dir}}/oracle1/sample.json`:
+      ```json
+      {{json .artifacts.measure_oracle}}
+      ```
+      Return `benchmark: {pass, total}` (cases scored `pass`, and all cases), and `oracle` as the
+      sums of the verdict counts with area `all` and report `{{.out_dir}}/oracle1/SUMMARY.md`. List
+      in `gaps` each case scored `missing` with cause `budget` and each area with `unscored`
+      tests. Write `{{.out_dir}}/oracle1/SUMMARY.md` and `{{.out_dir}}/judge1/SUMMARY.md`: the
+      totals and one line per group or area, each linking its report.
+  - id: measure_retry
+    kind: agent_turn
+    role: measure
+    budget: {max_turns: 15, timeout_min: 5}
+    model: sonnet
+    tools: [Read, Write]
+    output: *measure_out
+    brief: *measure_brief
+
+  # ---------------------------- contract review: change requests against the parent
+  - id: contract
+    kind: agent_turn
+    role: coordinator
+    budget: {max_turns: 60, timeout_min: 15}
+    on_fail: contract_retry
+    inputs: [refixes, timing]
+    output: &contract_out
+      name: change_requests
+      schema:
+        type: object
+        required: [requests]
+        properties:
+          requests:
+            type: array
+            items:
+              type: object
+              required: [target, finding, evidence]
+              properties:
+                target: {type: string, description: "parent, or the owning area for a breaking change inside this model"}
+                interface: {type: string}
+                kind: {enum: [schema, error, timing, scenario, missing, extra, other]}
+                finding: {type: string}
+                evidence: {type: array, items: {type: string}}
+                proposed: {type: string}
+    brief: &contract_brief |
+      {{with .artifacts}}{{with index . "failure"}}**Retry.** The first attempt at this stage failed ({{.reason}}:
+      {{.error}}). Its files are still in the workspace: keep what is sound and finish the rest
+      within this budget; don't start over.
+      {{end}}{{end -}}
+      You are the coordinator, workspace `{{.out_dir}}`. Collect the contract findings and breaking
+      changes the areas reported:
+      ```json
+      {{json .artifacts.fragments}}
+      {{json .artifacts.refixes}}
+      ```
+      {{if .inputs.contract}}
+      Compare them, the conformance report below and the acceptance scenarios' results with the
+      parent's contract for `{{.inputs.contract.component}}`. Each place the code shows the
+      contract wrong (a schema, an error code, a missing or extra interface, a scenario outcome)
+      is one request with `target: parent`, citing the code: DESIGN §14.3, "Rectifying up". Timing
+      differences are not requests; they replace the parent's latency by §14.3's rule.
+      ```
+      {{.artifacts.timing.stdout}}
+      ```
+      {{else}}
+      This is a root run: there is no parent; list only breaking changes routed to areas, with the
+      area as `target`.
+      {{end}}
+      Return an empty list when everything agrees. A child never silently disagrees with its parent.
+  - id: contract_retry
+    kind: agent_turn
+    role: coordinator
+    budget: {max_turns: 30, timeout_min: 10}
+    output: *contract_out
+    brief: *contract_brief
+  - id: contract_agrees
+    kind: gate
+    expr: 'tree.parent == "" || !artifacts.change_requests.requests.exists(r, r.target == "parent")'
+    on_fail: file_change_requests
+  - id: file_change_requests
+    kind: change_request
+    target: parent
+    from: change_requests
+    artifact: ontology
+
+  # --------------------------------------------------------- results (stage 8)
+  - id: results
+    kind: agent_turn
+    role: coordinator
+    budget: {max_turns: 100, timeout_min: 30}
+    on_fail: results_retry
+    inputs: [measure, judges, oracle, refines, change_requests]
+    output: &results_out
+      name: ontology
+      schema:
+        type: object
+        required: [path, name, level, components]
+        properties:
+          path: {type: string}
+          name: {type: string}
+          level: {type: string}
+          revision: {type: string}
+          results: {type: string}
+          scores: {type: object}
+          components: {type: array, items: *component}
+    brief: &results_brief |
+      {{with .artifacts}}{{with index . "failure"}}**Retry.** The first attempt at this stage failed ({{.reason}}:
+      {{.error}}). Its files are still in the workspace: keep what is sound and finish the rest
+      within this budget; don't start over.
+      {{end}}{{end -}}
+      You are the coordinator, workspace `{{.out_dir}}`. Do "Stage 8: Results" of `docs/PIPELINE.md`:
+      write `{{.out_dir}}/RESULTS.md` with the build counts and gate lines, the oracle verdicts, the
+      judges' scorecards and corrected expectations, the blind measure (the round's reported score;
+      seen re-scores apart), wrong claims with owners, ranked simulator gaps, the refinement
+      candidates and the change requests. List every budget gap (cases scored `missing` with cause
+      `budget`, `unscored` oracle tests, and turns that needed a retry, from `mosaic compose tree
+      {{.task}} --stats`) apart from the scores: a gap is unmeasured, not failed. The blind scores:
+      ```json
+      {{json .artifacts.measure}}
+      ```
+      Return the ontology document `{{.out_dir}}/ontology.json` with its name, level
+      `{{.inputs.level}}` and the scores, and list its components for zooming in: each one's id,
+      code paths, interface ids, the ids of the scenarios that cross its boundary, and the level a
+      refinement would sit at.
+  - id: results_retry
+    kind: agent_turn
+    role: coordinator
+    budget: {max_turns: 50, timeout_min: 15}
+    output: *results_out
+    brief: *results_brief
+
+  # ------------------------------------------------------- 8. The check gate
+  # thresholds: the profile's gates (--profile), never flags here
+  - id: check
+    kind: command
+    after: [results]
+    argv:
+      - sh
+      - -c
+      - |
+        WS='{{.out_dir}}'; CODE='{{.inputs.scope.repo}}'
+        F=""; for f in "$WS"/fragments/*.yaml; do F="$F -f $f"; done
+        C=""; for f in "$WS"/contracts/*.yaml; do [ -e "$f" ] && C="$C --contract $f"; done
+        exec go run ./internal/devtools/check -f "$WS/skeleton.yaml" -f "$WS/fixtures.yaml" -f "$WS/worlds.yaml" $F \
+          --code "$CODE" --strict-citations --inventory "$WS/inventory.json" --strict-coverage \
+          --min-modeled 0.5 --min-substantive 0.5 --max-trivial 0.35 \
+          --tests "$WS/test-targets.json" --features "$WS/profile.yaml" --strict-features \
+          --behavior-coverage --no-mocks $C \
+          --lint hollow,trivial,racy,seam-names,unknown-inputs,exemptions,internal-assertions,clock-ids \
+          --profile "$WS/profile.yaml" --strict-stubs -q
+  # schedule exploration of the race and concurrency scenarios (DESIGN §15.5, §16.1). Failures are
+  # recorded (this stage's output and the replay files under replay/) and fail the stage only when
+  # the profile's gates set max_explore_failures. --profile also applies its other gates here.
+  - id: explore
+    kind: command
+    after: [results]
+    argv:
+      - sh
+      - -c
+      - |
+        WS='{{.out_dir}}'; CODE='{{.inputs.scope.repo}}'
+        F=""; for f in "$WS"/fragments/*.yaml; do F="$F -f $f"; done
+        exec go run ./internal/devtools/check -f "$WS/skeleton.yaml" -f "$WS/fixtures.yaml" -f "$WS/worlds.yaml" $F \
+          --code "$CODE" --profile "$WS/profile.yaml" --scenario '^$' \
+          --explore 'race|concurr' --schedules 20 --replay-dir "$WS/replay" -q
+  - id: check_gate
+    kind: gate
+    expr: artifacts.check.exit == 0 && artifacts.explore.exit == 0
+
+  # ----------------------------- zooming in during the run: the same template, recursively
+  - id: zoom_known
+    kind: gate
+    after: [check_gate]
+    expr: inputs.zoom.all(z, artifacts.ontology.components.exists(c, c.id == z))
+  - id: children
+    kind: fanout
+    after: [zoom_known]
+    branches_from: "=artifacts.ontology.components.filter(c, c.id in inputs.zoom)"
+    max_branches: 8
+    parallel: true
+    join: all
+    branch:
+      output: child
+      stages:
+        - id: refine
+          kind: subworkflow
+          workflow: self
+          inputs:
+            scope: '={"repo": inputs.scope.repo, "component": item.id, "paths": item.code_paths}'
+            contract: >-
+              ={"parent": {"task": tree.task, "ontology": artifacts.ontology.name,
+              "document": artifacts.ontology.path},
+              "component": item.id, "interfaces": item.interfaces,
+              "scenarios": has(item.scenarios) ? item.scenarios : []}
+            level: '=has(item.next_level) ? item.next_level : {"system": "service", "service": "logic", "logic": "runtime", "runtime": "machine", "machine": "machine"}[inputs.level]'
+          outputs:
+            child: ontology
+            child_refines: refines
+            child_timing: timing

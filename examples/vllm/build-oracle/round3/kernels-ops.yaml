@@ -1,0 +1,48 @@
+# Round-3 in-build oracle for kernels-ops (build-oracle/round3/kernels-ops.json). See kernels-ops.md.
+schema_version: 1
+id: vllm
+
+scenarios:
+  - id: oracle-r3-kernels-ops-rope-static-qquant-kvcache-fusion
+    name: RopeKVCacheFusionPass fuses rope + static Q FP8 quant + KV cache update once; the generic pattern alone cannot
+    description: >-
+      tests/compile/passes/test_rope_kvcache_fusion.py::test_rope_static_qquant_kvcache_fusion (line 462).
+      With fuse_rope_kvcache on and an attention layer supporting the fused kernel, the pass matches the
+      rope -> static Q quant -> KV update graph once, and static_scaled_fp8_quant remains after fusion.
+      Negative control: with _supports_static_q_fp8_quant_fusion false only the generic
+      RopeReshapeKVCachePattern is registered, and it cannot match through the quant
+      (vllm/compilation/passes/fusion/rope_kvcache_fusion.py:42, 99, 409-455).
+    fixtures: [full-tp1-llama-8b]
+    config: {fuse-rope-kvcache: true}
+    steps:
+      - interface: rope-kv-cache-fusion-pass.call
+        caller: gpu-worker
+        as: fused
+        input: {graph_patterns: ["rope+static_fp8_quant+kv_cache_update"], layer_supports_fused_rope_kvcache: true, static_q_fp8_quant_supported: true}
+      - interface: rope-kv-cache-fusion-pass.call
+        caller: gpu-worker
+        as: generic
+        input: {graph_patterns: ["rope+static_fp8_quant+kv_cache_update"], layer_supports_fused_rope_kvcache: true, static_q_fp8_quant_supported: false}
+    expect:
+      - "steps.fused.result.ok && steps.fused.result.value.matched_count == 1"
+      - "steps.fused.result.value.replaced_with == 'vllm::fused_rope_and_unified_kv_cache_update'"
+      - "steps.fused.result.value.static_quant_remains"
+      - "steps.generic.result.ok && steps.generic.result.value.matched_count == 0"
+
+  - id: oracle-r3-kernels-ops-cpu-act-and-mul
+    name: CPU silu_and_mul, gelu_and_mul and gelu_tanh_and_mul write [num_tokens, d] from [num_tokens, 2d]
+    description: >-
+      tests/kernels/core/test_cpu_activation.py::test_cpu_act_and_mul (line 44), the opcheck half:
+      torch.ops._C.{silu_and_mul, gelu_and_mul, gelu_tanh_and_mul} on the CPU build take out [T, d] and
+      x [T, 2d] for T in (7, 83), d in (512, 2048), bf16 and fp32 (csrc/cpu/activation.cpp:87-125,
+      csrc/cpu/torch_bindings.cpp:484-495). The numeric comparison with forward_native is untranslatable.
+    fixtures: [full-tp1-llama-8b]
+    config: {vllm-target-device: cpu}
+    steps:
+      - {interface: cpu-torch-bindings.silu-and-mul, caller: gpu-worker, as: silu, input: {num_tokens: 7, hidden_size: 1024, dtype_bytes: 2}}
+      - {interface: cpu-torch-bindings.gelu-and-mul, caller: gpu-worker, as: gelu, input: {num_tokens: 83, hidden_size: 4096, dtype_bytes: 4}}
+      - {interface: cpu-torch-bindings.gelu-tanh-and-mul, caller: gpu-worker, as: tanh, input: {num_tokens: 83, hidden_size: 1024, dtype_bytes: 2}}
+    expect:
+      - "steps.silu.result.ok && steps.silu.result.value.num_tokens == 7 && steps.silu.result.value.d == 512 && steps.silu.result.value.act == 'silu_and_mul'"
+      - "steps.gelu.result.ok && steps.gelu.result.value.num_tokens == 83 && steps.gelu.result.value.d == 2048"
+      - "steps.tanh.result.ok && steps.tanh.result.value.d == 512 && steps.tanh.result.value.act == 'gelu_tanh_and_mul'"

@@ -1,0 +1,483 @@
+interfaces:
+  # ------------------------------------------------------------------ EngineCore utility methods (engine-rpc)
+  - component: engine-core
+    name: get-supported-tasks
+    kind: rpc
+    summary: "EngineCore.get_supported_tasks: the executor's cached collective_rpc('get_supported_tasks') from rank 0."
+    sources: ["vllm/v1/engine/core.py:423-426", "vllm/v1/executor/abstract.py:340-344"]
+    response: {type: array, items: {type: string}}
+    behavior:
+      - call: executor.collective-rpc
+        input: {method: get_supported_tasks}
+        as: r
+      - return: "= vars.r.value.results[0].value.tasks"
+
+  - component: engine-core
+    name: profile
+    kind: rpc
+    summary: "EngineCore.profile -> Executor.profile: start or stop the torch profiler on every worker."
+    sources: ["vllm/v1/engine/core.py:842-854", "vllm/v1/executor/abstract.py:285-308"]
+    request: {type: object, properties: {is_start: {type: boolean, default: true}, profile_prefix: {type: ["string", "null"], default: null}}}
+    behavior:
+      - call: executor.collective-rpc
+        input: {method: profile, args: "= has(input.profile_prefix) && input.profile_prefix != null ? {'is_start': has(input.is_start) ? input.is_start : true, 'profile_prefix': input.profile_prefix} : {'is_start': has(input.is_start) ? input.is_start : true}"}
+      - return: {profiling: "= has(input.is_start) ? input.is_start : true"}
+
+  - component: engine-core
+    name: reset-mm-cache
+    kind: rpc
+    summary: "EngineCore.reset_mm_cache: clear the P1 receiver cache and every worker's multimodal cache (warns when requests are in flight)."
+    sources: ["vllm/v1/engine/core.py:856-869"]
+    behavior:
+      - title: "The P1 receiver cache lives in EngineCore (mm_processor_cache_type lru): clear it"
+        source: "vllm/v1/engine/core.py:865-867"
+        call: lru-key-replicated-receiver-cache.clear-cache
+      - call: executor.collective-rpc
+        input: {method: reset_mm_cache}
+      - return: {reset: true}
+
+  - component: engine-core
+    name: reset-prefix-cache
+    kind: rpc
+    summary: "EngineCore.reset_prefix_cache: delegated to the scheduler (owner of the prefix cache); returns whether it succeeded."
+    sources: ["vllm/v1/engine/core.py:871-876"]
+    request: {type: object, properties: {reset_running_requests: {type: boolean, default: false}, reset_connector: {type: boolean, default: false}}}
+    response: {type: boolean}
+    behavior:
+      - call: scheduler.reset-prefix-cache
+        input: {reset_running_requests: "= has(input.reset_running_requests) ? input.reset_running_requests : false"}
+        as: r
+      - return: "= vars.r.value.reset"
+
+  - component: engine-core
+    name: reset-encoder-cache
+    kind: rpc
+    summary: "EngineCore.reset_encoder_cache: reset the scheduler's encoder cache manager (logical) and the workers' encoder caches (physical)."
+    sources: ["vllm/v1/engine/core.py:878-896"]
+    behavior:
+      - call: scheduler.reset-encoder-cache
+      - call: executor.collective-rpc
+        input: {method: reset_encoder_cache}
+      - return: {reset: true}
+
+  - component: engine-core
+    name: resume-scheduler
+    kind: rpc
+    summary: "EngineCore.resume_scheduler: set UNPAUSED so requests queued while paused are scheduled again."
+    sources: ["vllm/v1/engine/core.py:951-953"]
+    behavior:
+      - call: scheduler.set-pause-state
+        input: {pause_state: UNPAUSED}
+      - return: {paused: false}
+
+  - component: engine-core
+    name: is-scheduler-paused
+    kind: rpc
+    sources: ["vllm/v1/engine/core.py:955-957"]
+    response: {type: boolean}
+    behavior:
+      - call: scheduler.pause-state
+        as: ps
+      - return: "= vars.ps.value != 'UNPAUSED'"
+
+  - component: engine-core
+    name: sleep
+    kind: rpc
+    summary: "EngineCore.sleep: pause the scheduler (clearing caches from level 1), then level 0 stops there; level 1 offloads weights and discards the KV cache, level 2 discards all GPU memory."
+    sources: ["vllm/v1/engine/core.py:959-995"]
+    request: {type: object, properties: {level: {type: integer, default: 1}, mode: {type: string, default: abort}}}
+    behavior:
+      - set:
+          vars.level: "= has(input.level) ? input.level : 1"
+          vars.mode: "= has(input.mode) ? input.mode : 'abort'"
+      - title: "Pause the scheduler first; caches are cleared from level 1"
+        source: "vllm/v1/engine/core.py:972-974"
+        call: engine-core-proc.pause-scheduler
+        input: {mode: "= vars.mode", clear_cache: "= vars.level >= 1"}
+        as: pause
+      - if: "vars.level < 1"
+        then:
+          - title: "Level 0: scheduling paused only, no GPU memory change"
+            source: "vllm/v1/engine/core.py:975-976"
+            return: {level: 0, pending: "= vars.pause.value.pending"}
+      - if: "vars.pause.value.pending"
+        then:
+          - title: "In-flight requests still running: the executor sleeps when the pause completes"
+            source: "vllm/v1/engine/core.py:986-995"
+            set: {ctx.sleep_deferred: true}
+          - return: {level: "= vars.level", pending: true}
+      - call: executor.sleep
+        input: {level: "= vars.level"}
+      - return: {level: "= vars.level", pending: false}
+
+  - component: engine-core
+    name: wake-up
+    kind: rpc
+    summary: "EngineCore.wake_up: wake the given tags ('scheduling' alone wakes nothing on the executor); resume scheduling only when all executor memory is resident again."
+    sources: ["vllm/v1/engine/core.py:997-1019"]
+    request: {type: object, properties: {tags: {type: ["array", "null"], items: {type: string}, default: null}}}
+    response: {type: boolean}
+    behavior:
+      - set:
+          vars.tags: "= has(input.tags) && input.tags != null ? dyn(input.tags.filter(t, t != 'scheduling')) : dyn(null)"
+      - if: "vars.tags == null || size(vars.tags) > 0"
+        then:
+          - call: executor.wake-up
+            input: {tags: "= vars.tags"}
+      - call: executor.is-sleeping
+        as: sl
+      - if: "!vars.sl.value"
+        then:
+          - title: "Fully awake: resume the scheduler"
+            source: "vllm/v1/engine/core.py:1016-1018"
+            call: engine-core.resume-scheduler
+      - return: "= !vars.sl.value"
+
+  - component: engine-core
+    name: release-kv-cache-memory
+    kind: rpc
+    summary: "EngineCore.release_kv_cache_memory: only after a completed pause with nothing in flight and all memory resident; resets caches and discards the KV cache memory."
+    sources: ["vllm/v1/engine/core.py:1021-1039"]
+    errors: [{code: runtime-error, status: 0, retryable: false}]
+    behavior:
+      - call: engine-core.is-scheduler-paused
+        as: paused
+      - call: scheduler.has-requests
+        as: hr
+      - if: "!vars.paused.value || vars.hr.value || (has(state.batch_queue) && size(state.batch_queue) > 0)"
+        then:
+          - title: "Not idle and paused"
+            source: "vllm/v1/engine/core.py:1026-1033"
+            fail: {code: runtime-error, message: "release_kv_cache_memory() requires a completed pause first"}
+      - call: executor.is-sleeping
+        as: sl
+      - if: "vars.sl.value"
+        then:
+          - fail: {code: runtime-error, message: "release_kv_cache_memory() requires all executor memory to be resident"}
+      - call: engine-core.reset-prefix-cache
+        input: {reset_running_requests: true, reset_connector: true}
+      - call: executor.discard
+        input: {tags: [kv_cache]}
+      - return: {released: true}
+
+  - component: engine-core
+    name: is-sleeping
+    kind: rpc
+    sources: ["vllm/v1/engine/core.py:1041-1043"]
+    response: {type: boolean}
+    behavior:
+      - call: engine-core.is-scheduler-paused
+        as: p
+      - call: executor.is-sleeping
+        as: s
+      - return: "= vars.p.value || vars.s.value"
+
+  - component: engine-core
+    name: execute-dummy-batch
+    kind: rpc
+    sources: ["vllm/v1/engine/core.py:1045-1046", "vllm/v1/executor/abstract.py:278-279"]
+    behavior:
+      - call: executor.collective-rpc
+        input: {method: execute_dummy_batch}
+      - return: {ran: true}
+
+  - component: engine-core
+    name: compute-weight-checksums
+    kind: rpc
+    sources: ["vllm/v1/engine/core.py:1048-1049"]
+    behavior:
+      - call: executor.collective-rpc
+        input: {method: compute_weight_checksums}
+        as: r
+      - return: "= vars.r.value.results.map(x, x.value)"
+
+  - component: engine-core
+    name: add-lora
+    kind: rpc
+    summary: "EngineCore.add_lora -> Executor.add_lora: assert lora_int_id > 0, load on every worker, true only if all did."
+    sources: ["vllm/v1/engine/core.py:1051-1052", "vllm/v1/executor/abstract.py:352-354"]
+    request: {type: object, properties: {lora_request: {type: object, properties: {lora_name: {type: string, examples: [sql-adapter]}, lora_int_id: {type: integer, examples: [1]}, lora_path: {type: string, examples: [/models/lora/sql-adapter]}}}}}
+    response: {type: boolean}
+    errors: [{code: assertion-error, status: 0}]
+    behavior:
+      - if: "input.lora_request.lora_int_id <= 0"
+        then:
+          - fail: {code: assertion-error, message: "lora_id must be greater than 0."}
+      - call: executor.collective-rpc
+        input: {method: add_lora, args: "= input.lora_request"}
+        as: r
+      - return: "= vars.r.value.results.all(x, x.value.added)"
+
+  - component: engine-core
+    name: remove-lora
+    kind: rpc
+    sources: ["vllm/v1/engine/core.py:1054-1055", "vllm/v1/executor/abstract.py:356-358"]
+    request: {type: object, properties: {lora_id: {type: integer, examples: [1]}}}
+    response: {type: boolean}
+    errors: [{code: assertion-error, status: 0}]
+    behavior:
+      - if: "input.lora_id <= 0"
+        then:
+          - fail: {code: assertion-error, message: "lora_id must be greater than 0."}
+      - call: executor.collective-rpc
+        input: {method: remove_lora, args: {lora_int_id: "= input.lora_id"}}
+        as: r
+      - return: "= vars.r.value.results.all(x, x.value.removed)"
+
+  - component: engine-core
+    name: pin-lora
+    kind: rpc
+    sources: ["vllm/v1/engine/core.py:1060-1061", "vllm/v1/executor/abstract.py:360-362"]
+    request: {type: object, properties: {lora_id: {type: integer, examples: [1]}}}
+    response: {type: boolean}
+    errors: [{code: assertion-error, status: 0}]
+    behavior:
+      - if: "input.lora_id <= 0"
+        then:
+          - fail: {code: assertion-error, message: "lora_id must be greater than 0."}
+      - call: executor.collective-rpc
+        input: {method: pin_lora, args: {lora_int_id: "= input.lora_id"}}
+        as: r
+      - return: "= vars.r.value.results.all(x, x.value.pinned)"
+
+  - component: engine-core
+    name: list-loras
+    kind: rpc
+    summary: "EngineCore.list_loras -> Executor.list_loras: every worker must report the same set."
+    sources: ["vllm/v1/engine/core.py:1057-1058", "vllm/v1/executor/abstract.py:364-368"]
+    response: {type: array, items: {type: integer}}
+    errors: [{code: assertion-error, status: 0}]
+    behavior:
+      - call: executor.collective-rpc
+        input: {method: list_loras}
+        as: r
+      - if: "vars.r.value.results.exists(x, x.value.lora_ids != vars.r.value.results[0].value.lora_ids)"
+        then:
+          - fail: {code: assertion-error, message: "All workers should have the same LORAs."}
+      - return: "= vars.r.value.results[0].value.lora_ids"
+
+  - component: engine-core
+    name: save-sharded-state
+    kind: rpc
+    sources: ["vllm/v1/engine/core.py:1063-1071", "vllm/v1/executor/abstract.py:310-320"]
+    request: {type: object, properties: {path: {type: string, examples: [/tmp/sharded]}, pattern: {type: ["string", "null"], default: null}, max_size: {type: ["integer", "null"], default: null}}}
+    behavior:
+      - call: executor.collective-rpc
+        input: {method: save_sharded_state, args: {path: "= input.path"}}
+      - return: {saved: "= input.path"}
+
+  - component: engine-core
+    name: collective-rpc
+    kind: rpc
+    sources: ["vllm/v1/engine/core.py:1073-1080"]
+    request: {type: object, properties: {method: {type: string, examples: [compute_weight_checksums]}, args: {type: object}}}
+    behavior:
+      - call: executor.collective-rpc
+        input: {method: "= input.method", args: "= has(input.args) ? input.args : {}"}
+        as: r
+      - return: "= vars.r.value.results.map(x, x.value)"
+
+  - component: engine-core
+    name: set-weight-version
+    kind: rpc
+    summary: "EngineCore.set_weight_version: remember the caller's opaque weight version (attached to every later EngineCoreOutputs)."
+    sources: ["vllm/v1/engine/core.py:1082-1083"]
+    request: {type: object, properties: {weight_version: {type: string, examples: [step-100]}}}
+    store: {table: weights, op: put, key: current, value: {weight_version: "= input.weight_version"}}
+
+  - component: engine-core
+    name: get-weight-version
+    kind: rpc
+    summary: "EngineCore.get_weight_version: the latest committed weight version ('default' until set)."
+    sources: ["vllm/v1/engine/core.py:1085-1087", "vllm/v1/engine/core.py:140-141"]
+    response: {type: object, properties: {weight_version: {type: string}}}
+    store: {table: weights, op: get, key: current, default: {weight_version: default}}
+
+  # ------------------------------------------------------------------ EngineCoreSentinel (fault tolerance)
+  - component: engine-core-sentinel
+    name: on-fault
+    kind: function
+    summary: "EngineCoreSentinel.on_fault: clear resumed, abort every request (abort outputs to clients), drop in-flight batches, become DEAD if the executor failed else UNHEALTHY, and push the status to the client."
+    sources: ["vllm/v1/fault_tolerance/engine_core_sentinel.py:79-105"]
+    request: {type: object, properties: {error: {type: object}}}
+    behavior:
+      - set: {state.resumed: false, state.fault_at: "= now", state.fault_info: "= input.error.code"}
+      - call: scheduler.finish-requests
+        input: {request_ids: null, finished_status: FINISHED_ABORTED}
+        as: ab
+      - call: engine-core-proc.send-abort-outputs
+        input: {requests: "= vars.ab.value.finished.map(r, {'request_id': r, 'client_index': 0})"}
+      - call: multiproc-executor.is-failed
+        as: failed
+      - set: {state.status_type: "= vars.failed.value ? 'DEAD' : 'UNHEALTHY'"}
+      - title: "_push_status: an FT status UtilityOutput to client 0"
+        source: "vllm/v1/fault_tolerance/engine_core_sentinel.py:107-119"
+        call: engine-core-proc.process-output-sockets
+        input: {client_index: 0, outputs: {utility_output: {id: 0, status: "= state.status_type.lowerAscii()", fault_info: "= state.fault_info"}}}
+      - return: {status: "= state.status_type"}
+
+  - component: engine-core-sentinel
+    name: wait-resumed
+    kind: function
+    summary: "The wrapper's sentinel.resumed.wait(engine_recovery_timeout_sec): recovered, still waiting, or timed out."
+    sources: ["vllm/v1/fault_tolerance/engine_core_sentinel.py:185-194"]
+    response: {type: object, properties: {recovered: {type: boolean}, timed_out: {type: boolean}}}
+    behavior:
+      - if: "state.resumed"
+        then: [{return: {recovered: true, timed_out: false}}]
+      - if: "now - state.fault_at >= config['engine-recovery-timeout-sec'] * 1000"
+        then:
+          - title: "No recovery within the timeout"
+            source: "vllm/v1/fault_tolerance/engine_core_sentinel.py:190-194"
+            return: {recovered: false, timed_out: true}
+      - return: {recovered: false, timed_out: false}
+
+  - component: engine-core-sentinel
+    name: handle-command
+    kind: function
+    summary: "EngineCoreSentinel.handle_command: reject unless the engine is UNHEALTHY; otherwise run the instruction (retry) and reply with a FaultToleranceResult."
+    sources: ["vllm/v1/fault_tolerance/engine_core_sentinel.py:50-81"]
+    request: {type: object, properties: {request_id: {type: string, examples: [ft-1]}, instruction: {type: string, examples: [retry]}, params: {type: object, default: {}}}}
+    response: {type: object, properties: {request_id: {type: string}, success: {type: boolean}, reason: {type: ["string", "null"], default: null}}}
+    behavior:
+      - if: "state.status_type != 'UNHEALTHY'"
+        then:
+          - title: "Not UNHEALTHY: reject the instruction"
+            source: "vllm/v1/fault_tolerance/engine_core_sentinel.py:53-63"
+            return: {request_id: "= input.request_id", success: false, reason: "= '[FT] Rejecting ' + input.instruction + ' on engine 0: status is ' + state.status_type"}
+      - if: "input.instruction != 'retry'"
+        then:
+          - title: "run_method fails for an unknown instruction"
+            source: "vllm/v1/fault_tolerance/engine_core_sentinel.py:64-71"
+            return: {request_id: "= input.request_id", success: false, reason: "= \"'EngineCoreSentinel' object has no attribute '\" + input.instruction + \"'\""}
+      - call: engine-core-sentinel.retry
+        input: "= input"
+        as: res
+      - return: "= vars.res.value"
+
+  - component: engine-core-sentinel
+    name: retry
+    kind: function
+    summary: "EngineCoreSentinel.retry: send handle_ft_command to every worker, become HEALTHY, set resumed (the busy loop continues) and push the status."
+    sources: ["vllm/v1/fault_tolerance/engine_core_sentinel.py:121-134"]
+    request: {type: object, properties: {request_id: {type: string}}}
+    behavior:
+      - call: executor.collective-rpc
+        input: {method: handle_ft_command, args: "= input"}
+      - set: {state.status_type: HEALTHY, state.resumed: true}
+      - call: engine-core-proc.process-output-sockets
+        input: {client_index: 0, outputs: {utility_output: {id: 0, status: healthy}}}
+      - return: {request_id: "= input.request_id", success: true, reason: null}
+
+  - component: multiproc-executor
+    name: is-failed
+    kind: function
+    summary: "hasattr(executor, 'is_failed') and executor.is_failed: only the mp executor can be failed."
+    sources: ["vllm/v1/fault_tolerance/engine_core_sentinel.py:91-96"]
+    response: {type: boolean}
+    behavior:
+      - return: "= state.is_failed"
+
+  # ------------------------------------------------------------------ msgpack codec (serial_utils)
+  - component: msgpack-serializer
+    name: encode
+    kind: function
+    summary: "MsgpackEncoder.encode: native values encode as themselves; enc_hook maps tensors, arrays, slices, multimodal items and utility results; any other object raises TypeError unless insecure serialization is allowed, then it becomes a pickle extension (cloudpickle for functions)."
+    sources: ["vllm/v1/serial_utils.py:165-178", "vllm/v1/serial_utils.py:190-235"]
+    request:
+      type: object
+      required: [obj]
+      properties:
+        obj:
+          type: object
+          description: "The value to encode: kind native (msgpack-encodable as is), tensor, ndarray, slice, utility_result, function or object (a custom class instance); type is the Python class name"
+          properties:
+            kind: {type: string, enum: [native, tensor, ndarray, slice, utility_result, function, object], default: native}
+            type: {type: string, examples: [CustomClass]}
+            value: {}
+    response: {type: object, properties: {bufs: {type: array}}}
+    errors:
+      - {code: type-error, status: 0, retryable: false, summary: "Object of type ... is not serializable"}
+    behavior:
+      - if: "input.obj.kind in ['function', 'object'] && !config['vllm-allow-insecure-serialization']"
+        then:
+          - title: "enc_hook: no hook for this type and pickle isn't allowed"
+            source: "vllm/v1/serial_utils.py:220-225"
+            fail: {code: type-error, message: "= 'Object of type ' + (has(input.obj.type) ? input.obj.type : 'object') + ' is not serializableSet VLLM_ALLOW_INSECURE_SERIALIZATION=1 to allow fallback to pickle-based serialization.'"}
+      - if: "input.obj.kind == 'function'"
+        then:
+          - title: "Functions go through cloudpickle (pickle can't serialize methods)"
+            source: "vllm/v1/serial_utils.py:227-230"
+            return: {bufs: ["= {'ext': 2, 'type': has(input.obj.type) ? input.obj.type : 'function', 'data': has(input.obj.value) ? input.obj.value : null}"]}
+      - if: "input.obj.kind == 'object'"
+        then:
+          - title: "Any other object: a pickle extension (CUSTOM_TYPE_PICKLE)"
+            source: "vllm/v1/serial_utils.py:232-234"
+            return: {bufs: ["= {'ext': 1, 'type': has(input.obj.type) ? input.obj.type : 'object', 'data': has(input.obj.value) ? input.obj.value : null}"]}
+      - title: "Native values and the hooked types (tensor, ndarray, slice, multimodal, utility result) encode without pickle"
+        source: "vllm/v1/serial_utils.py:190-218"
+        return: {bufs: ["= {'kind': input.obj.kind, 'value': has(input.obj.value) ? input.obj.value : null}"]}
+
+  - component: msgpack-serializer
+    name: decode
+    kind: function
+    summary: "MsgpackDecoder.decode: ext_hook unpickles pickle and cloudpickle extensions only when insecure serialization is allowed; any other extension code is NotImplementedError. Native payloads decode as themselves."
+    sources: ["vllm/v1/serial_utils.py:339-347", "vllm/v1/serial_utils.py:472-482"]
+    request: {type: object, required: [bufs], properties: {bufs: {type: array}, type: {type: ["string", "null"], default: null, description: "the decoder's target type (MsgpackDecoder(t))"}}}
+    response: {type: object, properties: {obj: {type: object}}}
+    errors:
+      - {code: not-implemented-error, status: 0, retryable: false, summary: "Extension type code ... is not supported"}
+    behavior:
+      - set: {vars.b: "= input.bufs[0]"}
+      - if: "has(vars.b.ext)"
+        then:
+          - if: "config['vllm-allow-insecure-serialization'] && vars.b.ext in [1, 2]"
+            then:
+              - title: "pickle.loads / cloudpickle.loads rebuild the object"
+                source: "vllm/v1/serial_utils.py:476-480"
+                return: {obj: "= {'kind': vars.b.ext == 2 ? 'function' : 'object', 'type': vars.b.type, 'value': vars.b.data}"}
+          - title: "Pickle not allowed (or an unknown code): the extension isn't supported"
+            source: "vllm/v1/serial_utils.py:482"
+            fail: {code: not-implemented-error, message: "= 'Extension type code ' + string(vars.b.ext) + ' is not supported'"}
+      - return: {obj: "= {'kind': vars.b.kind, 'value': vars.b.value}"}
+
+  # ------------------------------------------------------------------ Ray helpers
+  - component: ray-prometheus-metric
+    name: get-sanitized-opentelemetry-name
+    kind: function
+    summary: "RayPrometheusMetric._get_sanitized_opentelemetry_name: every character outside a-z, A-Z, 0-9 and _ becomes _ (Ray and OpenTelemetry reject them)."
+    sources: ["vllm/v1/metrics/ray_wrappers.py:69-80"]
+    request: {type: object, required: [name], properties: {name: {type: string, examples: ["vllm:num_requests_running"]}}}
+    response: {type: string}
+    behavior:
+      - title: "re.sub(r'[^a-zA-Z0-9_]', '_', name)"
+        source: "vllm/v1/metrics/ray_wrappers.py:80"
+        return: "= replace(input.name, '[^a-zA-Z0-9_]', '_')"
+
+  - component: ray-env
+    name: get-env-vars-to-copy
+    kind: function
+    summary: "get_env_vars_to_copy: the registered vLLM env vars, the environment's vars matching a copy prefix (built-in plus VLLM_RAY_EXTRA_ENV_VAR_PREFIXES_TO_COPY), PYTHONHASHSEED plus VLLM_RAY_EXTRA_ENV_VARS_TO_COPY, and additional_vars; minus exclude_vars and the non-carry-over file's names."
+    description: "The environment is the request's environ (the names set in os.environ). The registered set stands for vllm.envs.environment_variables; the model lists the Ray-relevant ones it uses."
+    sources: ["vllm/ray/ray_env.py:56-116"]
+    request:
+      type: object
+      properties:
+        environ: {type: array, items: {type: string}, default: [], description: "names present in os.environ"}
+        exclude_vars: {type: ["array", "null"], items: {type: string}, default: null}
+        additional_vars: {type: ["array", "null"], items: {type: string}, default: null}
+        destination: {type: ["string", "null"], default: null}
+    response: {type: array, items: {type: string}}
+    behavior:
+      - title: "Prefixes: the built-in ones plus the user's CSV (stripped, empties dropped)"
+        source: "vllm/ray/ray_env.py:30-53"
+        set:
+          vars.prefixes: "= ['VLLM_', 'FLASH_ATTENTION_', 'LMCACHE_', 'NCCL_', 'UCX_', 'HF_', 'HUGGING_FACE_'] + config['vllm-ray-extra-env-var-prefixes-to-copy'].split(',').map(t, t.trim()).filter(t, t != '')"
+          vars.extra: "= ['PYTHONHASHSEED'] + config['vllm-ray-extra-env-vars-to-copy'].split(',').map(t, t.trim()).filter(t, t != '')"
+          vars.registered: "= ['VLLM_HOST_IP', 'VLLM_PORT', 'VLLM_ALLOW_INSECURE_SERIALIZATION', 'VLLM_RAY_EXTRA_ENV_VAR_PREFIXES_TO_COPY', 'VLLM_RAY_EXTRA_ENV_VARS_TO_COPY', 'VLLM_WORKER_SHUTDOWN_TIMEOUT_SECONDS', 'VLLM_EXECUTE_MODEL_TIMEOUT_SECONDS']"
+      - title: "Union of the four sources (prefix matches use startswith), minus exclude_vars and RAY_NON_CARRY_OVER_ENV_VARS"
+        source: "vllm/ray/ray_env.py:81-98"
+        set:
+          vars.exclude: "= (input.exclude_vars == null ? [] : input.exclude_vars) + state.non_carry_over"
+          vars.all: "= vars.registered + input.environ.filter(n, vars.prefixes.exists(p, n.startsWith(p))) + vars.extra + (input.additional_vars == null ? [] : input.additional_vars)"
+      - return: "= vars.all.filter(n, !(n in vars.exclude)).distinct()"

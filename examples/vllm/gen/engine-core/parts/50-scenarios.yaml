@@ -1,0 +1,1257 @@
+x-gen-input: &gen_input {request_id: chatcmpl-abc123, prompt_token_ids: [128000, 9906, 11, 856, 836, 374], sampling_params: {max_tokens: 4, n: 1, temperature: 0.0, stop: []}, priority: 0}
+x-idle: &idle {engine-core-proc.has-work.scheduler_has_requests: idle}
+x-busy: &busy {engine-core-proc.has-work.scheduler_has_requests: busy}
+x-add: &add {interface: async-llm.add-request, caller: api-server, as: add, input: {request_id: chatcmpl-abc123, prompt_token_ids: [128000, 9906, 11, 856, 836, 374], sampling_params: {max_tokens: 4, n: 1}}}
+
+scenarios:
+  # ------------------------------------------------------------------ generate
+  - id: engine-core-generate-happy
+    name: A request streams to completion while the busy loop runs
+    description: "The busy loop starts first (await: false); generate adds the request at t=0. The input thread queues the ADD, the next iteration hands it to the scheduler, and under async scheduling the step's outputs come back one iteration later through the output thread, the client's socket task and the output handler into the request's collector."
+    fixtures: [full-tp1-llama-8b]
+    steps:
+      - {flow: engine-core-busy-loop, as: loop, await: false, input: {iterations: 30}}
+      - {flow: async-llm-generate, as: gen, at_ms: 0, input: *gen_input}
+    expect:
+      - "steps.gen.result.ok && steps.gen.result.value.value.finished"
+      - "steps.gen.result.value.value.request_id == 'chatcmpl-abc123'"
+      - "steps.gen.result.value.value.finish_reason in ['stop', 'length'] && size(steps.gen.result.value.value.token_ids) > 0"
+      - "trace.exists(e, e.type == 'call.start' && e.interface == 'scheduler.add-request' && e.input.request_id == 'chatcmpl-abc123-00000001')"
+      - "trace.exists(e, e.type == 'call.start' && e.interface == 'gpu-worker-impl.execute-model' && e.instance == 'rank0')"
+
+  - id: engine-core-generate-batch-queue-lag
+    name: Under async scheduling the first step returns no outputs
+    description: "step_with_batch_queue launches the first batch and returns None (queue of 2 not full); the second call launches another batch and only then blocks on the first one and updates the scheduler."
+    fixtures: [full-tp1-llama-8b]
+    steps:
+      - *add
+      - {flow: engine-core-busy-loop, as: loop, input: {iterations: 2}}
+    expect:
+      - "trace.filter(e, e.type == 'call.start' && e.interface == 'scheduler.schedule').size() == 2"
+      - "trace.filter(e, e.type == 'call.start' && e.interface == 'scheduler.update-from-output').size() == 1"
+      - "trace.filter(e, e.type == 'call.start' && e.interface == 'scheduler.update-from-output')[0].seq > trace.filter(e, e.type == 'call.start' && e.interface == 'scheduler.schedule')[1].seq"
+
+  - id: engine-core-generate-sync-step
+    name: Without async scheduling every step returns its own outputs
+    description: "async_scheduling off: step_fn is EngineCore.step; schedule, execute_model, sample (execute_model returned None only on the V1 runner path), update_from_output in one call."
+    fixtures: [full-tp1-llama-8b]
+    config: {async-scheduling: false}
+    steps:
+      - *add
+      - {flow: engine-core-busy-loop, as: loop, input: {iterations: 2}}
+    expect:
+      - "trace.filter(e, e.type == 'call.start' && e.interface == 'scheduler.update-from-output').size() == 2"
+
+  - id: engine-core-generate-empty-prompt
+    name: An empty prompt is refused before anything is sent
+    fixtures: [full-tp1-llama-8b]
+    flow: async-llm-generate
+    input: {prompt_token_ids: []}
+    expect:
+      - "!result.ok && result.error.code == 'vllm-validation-error' && result.error.message == 'The decoder prompt cannot be empty'"
+
+  - id: engine-core-generate-prompt-too-long
+    name: A prompt longer than max_model_len is refused
+    fixtures: [full-tp1-llama-8b]
+    config: {max-model-len: 4}
+    flow: async-llm-generate
+    expect:
+      - "!result.ok && result.error.code == 'vllm-validation-error' && result.error.message.contains('is longer than the maximum model length of 4')"
+
+  - id: engine-core-generate-prompt-fills-context
+    name: A prompt exactly max_model_len long leaves no room for output
+    fixtures: [full-tp1-llama-8b]
+    config: {max-model-len: 6}
+    flow: async-llm-generate
+    expect:
+      - "!result.ok && result.error.code == 'vllm-validation-error' && result.error.message.contains('plus the number of requested output tokens')"
+
+  - id: engine-core-generate-queue-overflow
+    name: max_num_queued_reqs rejects with QueueOverflowError (503)
+    description: "One request is already in flight; with max_num_queued_reqs 1 the next is rejected before registration, and the admission rejection is counted."
+    fixtures: [full-tp1-llama-8b]
+    config: {max-num-queued-reqs: 1}
+    state:
+      output-processor: {request_states: {chatcmpl-old-00000009: {external_req_id: chatcmpl-old, prompt_len: 10, is_prefilling: false, output_text: "", num_output_tokens: 3, stop: [], parent: null, has_queue: true}}}
+    steps:
+      - {flow: async-llm-generate, as: gen}
+      - {interface: async-llm.get-num-unfinished-requests, caller: api-server, as: n}
+    expect:
+      - "!steps.gen.result.ok && steps.gen.result.error.code == 'queue-overflow-error' && steps.gen.result.error.data.http_status == 503"
+      - "steps.n.result.value == 1"
+      - "state['prometheus-registry'].metrics['vllm:admission_rejections'] == 1"
+
+  - id: engine-core-generate-queued-tokens-full
+    name: max_num_queued_tokens rejects while prompts are still prefilling
+    fixtures: [full-tp1-llama-8b]
+    config: {max-num-queued-tokens: 8}
+    state:
+      output-processor: {request_states: {chatcmpl-old-00000009: {external_req_id: chatcmpl-old, prompt_len: 10, is_prefilling: true, output_text: "", num_output_tokens: 0, stop: [], parent: null, has_queue: true}}}
+    flow: async-llm-generate
+    expect:
+      - "!result.ok && result.error.code == 'max-queued-tokens-error'"
+      - "state['prometheus-registry'].metrics['vllm:admission_rejections'] == 1"
+
+  - id: engine-core-generate-engine-dead
+    name: generate on a dead engine raises EngineDeadError without an abort
+    fixtures: [full-tp1-llama-8b]
+    state:
+      async-mp-client: {engine_dead: true}
+    flow: async-llm-generate
+    expect:
+      - "!result.ok && result.error.code == 'engine-dead-error' && result.error.status == 500"
+
+  - id: engine-core-generate-stop-string
+    name: A stop string ends the request in the detokenizer
+    description: "The detokenized text contains the stop string, so the output processor finishes the request with finish_reason stop and the matched string as stop_reason; the engine had already finished it, so no abort is sent."
+    fixtures: [full-tp1-llama-8b]
+    steps:
+      - {flow: engine-core-busy-loop, as: loop, await: false, input: {iterations: 30}}
+      - {flow: async-llm-generate, as: gen, at_ms: 0, input: {request_id: chatcmpl-abc123, prompt_token_ids: [128000, 9906], sampling_params: {max_tokens: 4, n: 1, stop: [' t']}}}
+    expect:
+      - "steps.gen.result.ok && steps.gen.result.value.value.finish_reason == 'stop'"
+      - "trace.exists(e, e.type == 'call.start' && e.interface == 'scheduler.finish-requests')"
+
+  - id: engine-core-output-stop-string-aborts-engine
+    name: A stop string the engine didn't see makes the frontend abort it
+    description: "process_outputs gets a still-running output (finish_reason null) whose text hits a stop string: the frontend finishes it and returns it in reqs_to_abort for an ABORT to the engine core."
+    fixtures: [full-tp1-llama-8b]
+    state:
+      output-processor: {request_states: {chatcmpl-abc123-00000001: {external_req_id: chatcmpl-abc123, prompt_len: 6, is_prefilling: true, output_text: "", num_output_tokens: 0, stop: [t42], parent: null, has_queue: true}}, external_req_ids: {chatcmpl-abc123: [chatcmpl-abc123-00000001]}}
+      request-output-collector: {queues: {chatcmpl-abc123-00000001: {output: null, error: null}}}
+    steps:
+      - interface: async-llm.output-handler
+        caller: api-server
+        as: oh
+        input: {outputs: {outputs: [{request_id: chatcmpl-abc123-00000001, new_token_ids: [42, 7], finish_reason: null, stop_reason: null}, {request_id: chatcmpl-gone-00000003, new_token_ids: [5], finish_reason: null, stop_reason: null}]}}
+      - {interface: request-output-collector.get, caller: api-server, as: got, input: {request_id: chatcmpl-abc123-00000001}}
+    expect:
+      - "steps.oh.result.value.reqs_to_abort == ['chatcmpl-abc123-00000001']"
+      - "trace.exists(e, e.type == 'call.start' && e.interface == 'engine-core-proc.process-input-sockets' && e.input.request_type == 'ABORT')"
+      - "steps.got.result.value.output.finish_reason == 'stop' && steps.got.result.value.output.stop_reason == 't42'"
+
+  - id: engine-core-generate-n2-fanout
+    name: n=2 fans out two child requests
+    description: "ParentRequest names the children 0_<id> and 1_<id>; admission counts 2 slots; each child is registered and sent as its own ADD."
+    fixtures: [full-tp1-llama-8b]
+    steps:
+      - {interface: async-llm.add-request, caller: api-server, as: add, input: {request_id: chatcmpl-abc123, prompt_token_ids: [128000, 9906], sampling_params: {max_tokens: 4, n: 2}}}
+    expect:
+      - "steps.add.result.value.children == ['0_chatcmpl-abc123-00000001', '1_chatcmpl-abc123-00000001']"
+      - "channel_len('engine-core-input:') == 2"
+      - "trace.filter(e, e.type == 'call.start' && e.interface == 'engine-core-proc.process-input-sockets' && e.input.request_type == 'ADD').size() == 2"
+
+  - id: engine-core-generate-client-disconnect
+    name: A client disconnect aborts the request in both processes
+    description: "The client goes away while generate awaits its collector: CancelledError makes generate abort the request internally (final ABORT output, ABORT to the engine core), and the next iteration finishes it in the scheduler."
+    fixtures: [full-tp1-llama-8b]
+    steps:
+      - {flow: engine-core-busy-loop, as: loop, await: false, input: {iterations: 30}}
+      - {flow: async-llm-generate, as: gen, at_ms: 0, await: false, input: *gen_input}
+      - {cancel: disconnect-chatcmpl-abc123, at_ms: 16}
+    expect:
+      - "!steps.gen.result.ok && steps.gen.result.error.code == 'canceled'"
+      - "ctx.generate_canceled == 'chatcmpl-abc123-00000001'"
+      - "trace.exists(e, e.type == 'call.start' && e.interface == 'scheduler.finish-requests' && e.input.request_ids == ['chatcmpl-abc123-00000001'])"
+
+  - id: engine-core-generate-engine-dies-mid-step
+    name: A worker failure mid-step kills the engine and fails the stream
+    description: "execute_model raises on the second step: with fault tolerance off the busy loop dies, run_engine_core sends ENGINE_CORE_DEAD, the client marks the engine dead and the output handler propagates EngineDeadError into every stream."
+    fixtures: [full-tp1-llama-8b]
+    faults:
+      - {target: gpu-worker-impl.execute-model, type: error, code: cuda-error, message: "CUDA error: an illegal memory access was encountered", calls: [2]}
+    steps:
+      - {flow: engine-core-busy-loop, as: loop, await: false, input: {iterations: 30}}
+      - {flow: async-llm-generate, as: gen, at_ms: 0, input: *gen_input}
+    expect:
+      - "!steps.gen.result.ok && steps.gen.result.error.code == 'engine-dead-error'"
+      - "trace.exists(e, e.type == 'call.start' && e.interface == 'scheduler.shutdown')"
+
+  - id: engine-core-generate-fault-tolerant
+    name: With fault tolerance the engine parks instead of dying
+    description: "enable_fault_tolerance: the same failure goes to EngineCoreSentinel.on_fault, which aborts every request (the stream ends with finish_reason abort), marks the engine UNHEALTHY and pushes the status to the client; the engine stays alive."
+    fixtures: [full-tp1-llama-8b]
+    config: {enable-fault-tolerance: true}
+    faults:
+      - {target: gpu-worker-impl.execute-model, type: error, code: cuda-error, calls: [2]}
+    steps:
+      - {flow: engine-core-busy-loop, as: loop, await: false, input: {iterations: 30}}
+      - {flow: async-llm-generate, as: gen, at_ms: 0, input: *gen_input}
+    expect:
+      - "steps.gen.result.ok && steps.gen.result.value.value.finish_reason == 'abort'"
+      - "trace.exists(e, e.type == 'call.start' && e.interface == 'scheduler.finish-requests') && !trace.exists(e, e.type == 'call.start' && e.interface == 'scheduler.shutdown')"
+
+  - id: engine-core-ft-recovery-timeout
+    name: A parked engine dies when no recovery comes in time
+    fixtures: [full-tp1-llama-8b]
+    config: {enable-fault-tolerance: true, engine-recovery-timeout-sec: 0}
+    state:
+      engine-core-sentinel: {status_type: UNHEALTHY, resumed: false, fault_info: cuda-error, fault_at: 1793318400000}
+    steps:
+      - {flow: engine-core-busy-loop, as: loop, input: {iterations: 3}}
+    expect:
+      - "!steps.loop.result.ok && steps.loop.result.error.code == 'runtime-error' && steps.loop.result.error.message.contains('No recovery within 0s')"
+      - "state['engine-core-proc'].dead && state['async-mp-client'].engine_dead"
+
+  - id: engine-core-ft-parked-loop-waits
+    name: A parked engine polls for recovery without stepping
+    fixtures: [full-tp1-llama-8b]
+    config: {enable-fault-tolerance: true}
+    state:
+      engine-core-sentinel: {status_type: UNHEALTHY, resumed: false, fault_info: cuda-error, fault_at: 1793318400000}
+    steps:
+      - {flow: engine-core-busy-loop, as: loop, input: {iterations: 3}}
+    expect:
+      - "steps.loop.result.ok && steps.loop.result.value.parked"
+      - "trace.filter(e, e.type == 'call.start' && e.interface == 'scheduler.schedule').size() == 0"
+
+  - id: engine-core-ft-retry-resumes
+    name: A retry instruction resumes a parked engine, a second one is rejected
+    description: "handle_fault(retry) reaches the sentinel through the input thread even while the loop is parked: workers get handle_ft_command, the engine becomes HEALTHY and resumed; repeating it is rejected because the engine is no longer UNHEALTHY."
+    fixtures: [full-tp1-llama-8b]
+    config: {enable-fault-tolerance: true}
+    state:
+      engine-core-sentinel: {status_type: UNHEALTHY, resumed: false, fault_info: cuda-error, fault_at: 1793318400000}
+    steps:
+      - {flow: engine-fault-tolerance, as: retry}
+      - {flow: engine-fault-tolerance, as: again}
+      - {interface: async-llm.get-status, caller: operator, as: status}
+    expect:
+      - "steps.retry.result.ok && steps.retry.result.value.success"
+      - "!steps.again.result.value.success && steps.again.result.value.reason.contains('status is HEALTHY')"
+      - "trace.filter(e, e.type == 'call.start' && e.interface == 'gpu-worker-impl.handle-ft-command').size() == 1"
+      - "steps.status.result.value.engines['0'].ft_error.contains('status is HEALTHY')"
+
+  # ------------------------------------------------------------------ tensor parallel / multiproc executor
+  - id: engine-core-tp4-step-on-every-rank
+    name: With TP 4 every step runs on all four ranks
+    description: "world_size 4 resolves the mp backend: collective_rpc broadcasts execute_model and sample_tokens to rank0..rank3 through each WorkerProc and waits for all of them (the reply comes from the output rank)."
+    fixtures: [full-tp4-llama-70b]
+    steps:
+      - {flow: engine-core-busy-loop, as: loop, await: false, input: {iterations: 30}}
+      - {flow: async-llm-generate, as: gen, at_ms: 0, input: *gen_input}
+    expect:
+      - "steps.gen.result.ok && steps.gen.result.value.value.finished"
+      - "trace.filter(e, e.type == 'call.start' && e.interface == 'gpu-worker-impl.execute-model' && e.instance == 'rank0').size() > 0 && trace.filter(e, e.type == 'call.start' && e.interface == 'gpu-worker-impl.execute-model' && e.instance == 'rank0').size() == trace.filter(e, e.type == 'call.start' && e.interface == 'gpu-worker-impl.execute-model' && e.instance == 'rank3').size()"
+
+  - id: engine-core-tp4-rank-timeout
+    name: A rank that never answers times execute_model out after 300 s
+    description: "One rank's execute_model hangs: the collective RPC's dequeue deadline (VLLM_EXECUTE_MODEL_TIMEOUT_SECONDS) expires, TimeoutError('RPC call to execute_model timed out.') kills the busy loop and the engine."
+    fixtures: [full-tp4-llama-70b]
+    faults:
+      - {target: gpu-worker-impl.execute-model, type: latency, latency_ms: 400000, instance: rank3}
+    steps:
+      - *add
+      - {flow: engine-core-busy-loop, as: loop, input: {iterations: 3}}
+    expect:
+      - "!steps.loop.result.ok && steps.loop.result.error.code == 'timeout-error' && steps.loop.result.error.message == 'RPC call to execute_model timed out.'"
+      - "steps.loop.result.error.code == 'timeout-error'"
+      - "duration_ms >= 300000"
+      - "trace.exists(e, e.type == 'call.start' && e.interface == 'scheduler.shutdown')"
+
+  - id: engine-core-tp4-worker-dies
+    name: A dead worker process fails the executor and the engine
+    description: "The worker monitor sees rank2's process exit: it marks the executor failed, shuts it down and puts EXECUTOR_FAILED on the engine's input queue; the busy loop raises RuntimeError('Executor failed.') and the engine dies."
+    fixtures: [full-tp4-llama-70b]
+    steps:
+      - {interface: multiproc-executor.monitor-workers, caller: engine-core, as: died, input: {died_rank: rank2, exitcode: -9}}
+      - {flow: engine-core-busy-loop, as: loop, input: {iterations: 3}}
+      - {interface: async-llm.check-health, caller: api-server, as: health}
+    expect:
+      - "steps.died.result.value.handled"
+      - "!steps.loop.result.ok && steps.loop.result.error.message == 'Executor failed.'"
+      - "!steps.health.result.ok && steps.health.result.error.code == 'engine-dead-error'"
+      - "trace.exists(e, e.type == 'call.start' && e.interface == 'scheduler.shutdown')"
+
+  - id: engine-core-tp4-monitor-ignores-shutdown
+    name: Worker exits during shutdown are not failures
+    fixtures: [full-tp4-llama-70b]
+    state:
+      multiproc-executor: {is_failed: false, shutting_down: true}
+    steps:
+      - {interface: multiproc-executor.monitor-workers, caller: engine-core, as: died, input: {died_rank: rank1, exitcode: 0}}
+    expect:
+      - "!steps.died.result.value.handled"
+
+  - id: engine-core-failed-executor-refuses-rpc
+    name: A failed multiproc executor refuses every collective RPC
+    fixtures: [full-tp4-llama-70b]
+    state:
+      multiproc-executor: {is_failed: true, shutting_down: true}
+    steps:
+      - {interface: async-llm.list-loras, caller: api-server, as: l}
+    expect:
+      - "!steps.l.result.ok && steps.l.result.error.code == 'exception' && steps.l.result.error.message == 'Call to list_loras method failed: Executor failed.'"
+
+  - id: engine-core-worker-rpc-failure
+    name: A worker exception becomes a FAILURE reply and a RuntimeError
+    fixtures: [full-tp4-llama-70b]
+    faults:
+      - {target: gpu-worker-impl.list-loras, type: error, code: value-error, instance: rank1}
+    steps:
+      - {interface: async-llm.list-loras, caller: api-server, as: l}
+    expect:
+      - "!steps.l.result.ok && steps.l.result.error.message.startsWith('Call to list_loras method failed: ')"
+      - "trace.filter(e, e.type == 'call.start' && e.interface == 'gpu-worker-impl.list-loras' && e.instance == 'rank1').size() == 1"
+
+  # ------------------------------------------------------------------ abort, shutdown
+  - id: engine-core-abort-then-step
+    name: An abort is acknowledged to the stream and applied by the next iteration
+    description: "AsyncLLM.abort with the external id: the output processor maps it to the internal id, drops it and queues a final ABORT output; the ABORT goes on the engine's aborts queue and input queue; the next busy-loop iteration finishes it in the scheduler."
+    fixtures: [full-tp1-llama-8b]
+    state:
+      output-processor: {request_states: {chatcmpl-abc123-00000001: {external_req_id: chatcmpl-abc123, prompt_len: 6, is_prefilling: false, output_text: " t9906", num_output_tokens: 1, stop: [], parent: null, has_queue: true}}, external_req_ids: {chatcmpl-abc123: [chatcmpl-abc123-00000001]}}
+      request-output-collector: {queues: {chatcmpl-abc123-00000001: {output: null, error: null}}}
+    steps:
+      - {flow: async-llm-abort, as: ab}
+      - {interface: request-output-collector.get, caller: api-server, as: got, input: {request_id: chatcmpl-abc123-00000001}}
+      - {flow: engine-core-busy-loop, as: loop, input: {iterations: 1}}
+    expect:
+      - "steps.ab.result.value.aborted == ['chatcmpl-abc123-00000001']"
+      - "steps.got.result.value.output.finish_reason == 'abort' && steps.got.result.value.output.finished"
+      - "channel_len('engine-core-input:') == 0"
+      - "trace.exists(e, e.type == 'call.start' && e.interface == 'scheduler.finish-requests' && e.input.request_ids == ['chatcmpl-abc123-00000001'])"
+
+  - id: engine-core-abort-unknown-id
+    name: Aborting an unknown id sends nothing to the engine
+    fixtures: [full-tp1-llama-8b]
+    flow: async-llm-abort
+    input: {request_ids: [chatcmpl-nope], internal: false}
+    expect:
+      - "result.ok && result.value.aborted == []"
+      - "trace.filter(e, e.type == 'call.start' && e.interface == 'engine-core-proc.process-input-sockets').size() == 0"
+
+  - id: engine-core-abort-during-step
+    name: An abort arriving mid-step is applied before update_from_output
+    description: "The ABORT lands while the step runs: the input thread puts it on the aborts queue, and the step drains that queue (one batched abort) before update_from_output."
+    fixtures: [full-tp1-llama-8b]
+    config: {async-scheduling: false}
+    steps:
+      - *add
+      - {flow: engine-core-busy-loop, as: loop, await: false, input: {iterations: 2}}
+      - {interface: async-mp-client.abort-requests-async, caller: api-server, as: ab, at_ms: 27, input: {request_ids: [chatcmpl-abc123-00000001]}}
+    expect:
+      - "trace.filter(e, e.type == 'call.start' && e.interface == 'engine-core.abort-requests')[0].seq < trace.filter(e, e.type == 'call.start' && e.interface == 'scheduler.update-from-output')[0].seq"
+      - "size(state['engine-core-proc'].aborts_queue) == 0"
+
+  - id: engine-core-shutdown-then-health
+    name: After shutdown the engine reports dead
+    description: "AsyncLLM.shutdown sends SIGTERM (shutdown requested) and runs the client's cleanup (engine_dead); check_health then raises EngineDeadError."
+    fixtures: [full-tp1-llama-8b]
+    steps:
+      - {flow: engine-shutdown, as: sd}
+      - {interface: async-llm.check-health, caller: api-server, as: health}
+    expect:
+      - "steps.sd.result.ok"
+      - "steps.sd.result.value.killed && steps.sd.duration_ms >= 5000"
+      - "!steps.health.result.ok && steps.health.result.error.code == 'engine-dead-error'"
+      - "trace.exists(e, e.type == 'kill')"
+
+  - id: engine-core-shutdown-aborts-in-flight
+    name: SIGTERM with shutdown_timeout 0 aborts everything, then the loop exits when idle
+    description: "The next iteration sees REQUESTED: it finishes every request as aborted, sends the ABORT outputs, moves to SHUTTING_DOWN; with no work left the loop exits and the engine shuts down."
+    fixtures: [full-tp1-llama-8b]
+    state:
+      engine-core-proc: {shutdown_state: RUNNING}
+    steps:
+      - {interface: engine-core-proc.signal-handler, caller: operator, as: sig, input: {signal: SIGTERM}}
+      - {flow: engine-core-busy-loop, as: loop, input: {iterations: 2}, choices: *idle}
+    expect:
+      - "steps.sig.result.value.shutdown_state == 'REQUESTED'"
+      - "steps.loop.result.ok && steps.loop.result.value.exited"
+      - "trace.exists(e, e.type == 'call.start' && e.interface == 'scheduler.finish-requests' && e.input.request_ids == null)"
+
+  - id: engine-core-shutdown-drain
+    name: With a shutdown timeout the engine drains instead of aborting
+    fixtures: [full-tp1-llama-8b]
+    config: {shutdown-timeout: 30}
+    state:
+      engine-core-proc: {shutdown_state: REQUESTED}
+    steps:
+      - {flow: engine-core-busy-loop, as: loop, input: {iterations: 1}, choices: *busy}
+    expect:
+      - "ctx.shutdown_mode == 'drain' && trace.filter(e, e.type == 'call.start' && e.interface == 'scheduler.finish-requests').size() == 0"
+
+  - id: engine-core-add-rejected-in-shutdown
+    name: New requests are rejected with ABORT once shutdown started
+    fixtures: [full-tp1-llama-8b]
+    state:
+      engine-core-proc: {shutdown_state: SHUTTING_DOWN}
+    steps:
+      - {interface: engine-core-proc.process-input-sockets, caller: async-mp-client, as: in, input: {request_type: ADD, request: {request_id: chatcmpl-late-00000004, prompt_token_ids: [1, 2], sampling_params: {max_tokens: 4}}}}
+      - {flow: engine-core-busy-loop, as: loop, input: {iterations: 1}, choices: *busy}
+    expect:
+      - "trace.filter(e, e.type == 'call.start' && e.interface == 'scheduler.add-request').size() == 0"
+
+  - id: engine-core-utility-rejected-in-shutdown
+    name: Utility calls fail with 'Server shutting down' during shutdown
+    fixtures: [full-tp1-llama-8b]
+    state:
+      engine-core-proc: {shutdown_state: SHUTTING_DOWN}
+    steps:
+      - {interface: async-llm.is-sleeping, caller: api-server, as: s}
+    expect:
+      - "!steps.s.result.ok && steps.s.result.error.code == 'exception' && steps.s.result.error.message == 'Server shutting down'"
+
+  - id: engine-core-utility-unknown-method
+    name: An unknown utility method fails with its AttributeError text
+    fixtures: [full-tp1-llama-8b]
+    steps:
+      - {interface: async-mp-client.call-utility-async, caller: api-server, as: u, input: {method: no_such_method}}
+    expect:
+      - "!steps.u.result.ok && steps.u.result.error.message.contains(\"has no attribute 'no_such_method'\")"
+
+  # ------------------------------------------------------------------ pause, sleep, wake
+  - id: engine-core-pause-abort-idle
+    name: pause_generation(abort) aborts in-flight requests and completes at once when idle
+    fixtures: [full-tp1-llama-8b]
+    steps:
+      - {flow: async-llm-pause-generation, as: p, choices: *idle}
+      - {interface: async-llm.is-paused, caller: api-server, as: paused}
+    expect:
+      - "steps.p.result.ok && steps.p.result.value.pending == false"
+      - "trace.exists(e, e.type == 'call.start' && e.interface == 'scheduler.set-pause-state' && e.input.pause_state == 'PAUSED_NEW')"
+      - "calls['gpu-worker-impl.synchronize-device'] == 1 && calls['scheduler.reset-prefix-cache'] == 1"
+      - "calls['scheduler.pause-state'] == 1"
+
+  - id: engine-core-pause-keep-completes-when-idle
+    name: pause_generation(keep) completes from the idle callback
+    description: "keep sets PAUSED_ALL without aborting; the engine still has work, so the pause registers an idle callback; the next idle iteration runs it (device sync, cache clear)."
+    fixtures: [full-tp1-llama-8b]
+    steps:
+      - {flow: async-llm-pause-generation, as: p, input: {mode: keep, clear_cache: false}, choices: *busy}
+      - {flow: engine-core-busy-loop, as: loop, input: {iterations: 1}, choices: *idle}
+    expect:
+      - "steps.p.result.value.pending && calls['scheduler.finish-requests'] == 0"
+      - "trace.exists(e, e.type == 'call.start' && e.interface == 'scheduler.set-pause-state' && e.input.pause_state == 'PAUSED_ALL')"
+      - "calls['scheduler.reset-prefix-cache'] == 0"
+
+  - id: engine-core-pause-invalid-mode
+    name: An invalid pause mode is a ValueError
+    fixtures: [full-tp1-llama-8b]
+    steps:
+      - {interface: engine-core-proc.pause-scheduler, caller: engine-core, as: p, input: {mode: freeze}}
+    expect:
+      - "!steps.p.result.ok && steps.p.result.error.code == 'value-error' && steps.p.result.error.message == 'Invalid pause mode: freeze'"
+
+  - id: engine-core-resume-generation
+    name: resume_generation unpauses the scheduler
+    fixtures: [full-tp1-llama-8b]
+    steps:
+      - {interface: async-llm.resume-generation, caller: api-server, as: r}
+    expect:
+      - "trace.exists(e, e.type == 'call.start' && e.interface == 'scheduler.set-pause-state' && e.input.pause_state == 'UNPAUSED')"
+
+  - id: engine-core-sleep-level1-then-wake
+    name: Sleep level 1 offloads weights; wake_up restores and resumes scheduling
+    fixtures: [full-tp1-llama-8b]
+    steps:
+      - {flow: async-llm-sleep, as: sl, choices: *idle}
+      - {interface: executor.is-sleeping, caller: engine-core, as: asleep}
+      - {interface: async-llm.wake-up, caller: api-server, as: wake}
+    expect:
+      - "steps.sl.result.ok && steps.sl.result.value.level == 1 && !steps.sl.result.value.pending"
+      - "steps.asleep.result.value == true"
+      - "trace.filter(e, e.type == 'call.start' && e.interface == 'gpu-worker-impl.sleep').size() == 1 && trace.filter(e, e.type == 'call.start' && e.interface == 'gpu-worker-impl.wake-up').size() == 1"
+      - "steps.wake.result.value == true"
+
+  - id: engine-core-sleep-level0
+    name: Sleep level 0 pauses scheduling only
+    fixtures: [full-tp1-llama-8b]
+    flow: async-llm-sleep
+    input: {level: 0}
+    choices: *idle
+    expect:
+      - "result.ok && result.value.level == 0"
+      - "trace.filter(e, e.type == 'call.start' && e.interface == 'gpu-worker-impl.sleep').size() == 0 && trace.filter(e, e.type == 'call.start' && e.interface == 'scheduler.reset-prefix-cache').size() == 0"
+
+  - id: engine-core-sleep-deferred-while-busy
+    name: Sleep waits for in-flight requests when the pause can't finish yet
+    fixtures: [full-tp1-llama-8b]
+    flow: async-llm-sleep
+    input: {level: 1}
+    choices: *busy
+    expect:
+      - "result.ok && result.value.pending"
+      - "ctx.sleep_deferred && trace.filter(e, e.type == 'call.start' && e.interface == 'gpu-worker-impl.sleep').size() == 0"
+
+  - id: engine-core-sleep-twice-is-noop
+    name: Sleeping executors don't sleep again
+    fixtures: [full-tp1-llama-8b]
+    state:
+      executor: {sleeping_tags: [weights, kv_cache]}
+    flow: async-llm-sleep
+    choices: *idle
+    expect:
+      - "result.ok && trace.filter(e, e.type == 'call.start' && e.interface == 'gpu-worker-impl.sleep').size() == 0"
+
+  - id: engine-core-wake-up-partial
+    name: Waking only the weights keeps scheduling paused
+    description: "With weights and kv_cache asleep, wake_up(['weights']) restores the weights but the executor is still partly asleep, so the scheduler stays paused; an unknown tag is ignored with a warning."
+    fixtures: [full-tp1-llama-8b]
+    state:
+      executor: {sleeping_tags: [weights, kv_cache]}
+    steps:
+      - {interface: async-llm.wake-up, caller: api-server, as: w1, input: {tags: [weights]}}
+      - {interface: async-llm.wake-up, caller: api-server, as: w2, input: {tags: [cuda_graphs]}}
+      - {interface: async-llm.wake-up, caller: api-server, as: w3, input: {tags: [scheduling]}}
+    expect:
+      - "steps.w1.result.value == false"
+      - "calls['scheduler.set-pause-state'] == 0 && calls['gpu-worker-impl.wake-up'] == 1"
+      - "steps.w3.result.value == false"
+
+  - id: engine-core-wake-up-when-awake
+    name: wake_up on an awake engine resumes scheduling only
+    fixtures: [full-tp1-llama-8b]
+    steps:
+      - {interface: async-llm.wake-up, caller: api-server, as: w}
+    expect:
+      - "steps.w.result.value == true && calls['gpu-worker-impl.wake-up'] == 0"
+      - "calls['scheduler.set-pause-state'] == 1"
+
+  - id: engine-core-release-kv-requires-pause
+    name: release_kv_cache_memory refuses unless paused and idle
+    fixtures: [full-tp1-llama-8b]
+    steps:
+      - {interface: async-llm.release-kv-cache-memory, caller: api-server, as: r}
+    expect:
+      - "!steps.r.result.ok && steps.r.result.error.message.contains('requires a completed pause first')"
+      - "calls['gpu-worker-impl.discard'] == 0"
+
+  # ------------------------------------------------------------------ LoRA, profile, weights, misc utilities
+  - id: engine-core-lora-add-pin-list-remove
+    name: LoRA adapters are loaded on every worker
+    fixtures: [full-tp1-llama-8b, lora-adapter-on-disk]
+    config: {enable-lora: true}
+    steps:
+      - {flow: async-llm-lora, as: add}
+      - {interface: async-llm.pin-lora, caller: api-server, as: pin, input: {lora_id: 1}}
+      - {interface: async-llm.list-loras, caller: api-server, as: list}
+      - {interface: async-llm.remove-lora, caller: api-server, as: rm, input: {lora_id: 1}}
+    expect:
+      - "steps.add.result.value == true && steps.pin.result.value == true && steps.rm.result.value == true"
+      - "steps.list.result.value == [1]"
+      - "trace.filter(e, e.type == 'call.start' && e.interface == 'gpu-worker-impl.add-lora').size() == 1 && trace.filter(e, e.type == 'call.start' && e.interface == 'gpu-worker-impl.pin-lora').size() == 1 && trace.filter(e, e.type == 'call.start' && e.interface == 'gpu-worker-impl.remove-lora').size() == 1"
+
+  - id: engine-core-lora-invalid-id
+    name: A non-positive LoRA id fails the assertion in the engine
+    fixtures: [full-tp1-llama-8b, lora-adapter-on-disk]
+    config: {enable-lora: true}
+    flow: async-llm-lora
+    input: {lora_request: {lora_name: bad, lora_int_id: 0, lora_path: /adapters/bad}}
+    expect:
+      - "!result.ok && result.error.code == 'exception' && result.error.message == 'Call to add_lora method failed: lora_id must be greater than 0.'"
+      - "calls['gpu-worker-impl.add-lora'] == 0"
+
+  - id: engine-core-lora-invalid-remove-pin
+    name: Removing or pinning LoRA id 0 fails the assertion
+    fixtures: [full-tp1-llama-8b]
+    steps:
+      - {interface: async-llm.remove-lora, caller: api-server, as: rm, input: {lora_id: 0}}
+      - {interface: async-llm.pin-lora, caller: api-server, as: pin, input: {lora_id: 0}}
+    expect:
+      - "!steps.rm.result.ok && !steps.pin.result.ok"
+
+  - id: engine-core-lora-list-tp4
+    name: list_loras asks every rank and returns the common set
+    fixtures: [full-tp4-llama-70b]
+    config: {enable-lora: true}
+    steps:
+      - {interface: engine-core.list-loras, caller: engine-core, as: l}
+    expect:
+      - "steps.l.result.ok && type(steps.l.result.value) == list"
+      - "trace.filter(e, e.type == 'call.start' && e.interface == 'gpu-worker-impl.list-loras').size() == 4"
+
+  - id: engine-core-profile-start-twice
+    name: A second start_profile is rejected while a session is active
+    fixtures: [full-tp1-llama-8b]
+    config: {profiler: torch}
+    steps:
+      - {interface: async-llm.start-profile, caller: api-server, as: p1}
+      - {interface: async-llm.start-profile, caller: api-server, as: p2}
+      - {interface: async-llm.stop-profile, caller: api-server, as: stop}
+      - {interface: async-llm.start-profile, caller: api-server, as: p3}
+    expect:
+      - "steps.p1.result.ok && !steps.p2.result.ok && steps.p2.result.error.code == 'profiler-already-active-error'"
+      - "steps.p3.result.ok && trace.filter(e, e.type == 'call.start' && e.interface == 'gpu-worker-impl.profile').size() == 3"
+
+  - id: engine-core-profile-engine-failure-clears-session
+    name: A failed profiler start clears the session
+    fixtures: [full-tp1-llama-8b]
+    config: {profiler: torch}
+    faults:
+      - {target: gpu-worker-impl.profile, type: error, code: runtime-error, calls: [1]}
+    steps:
+      - {interface: async-llm.start-profile, caller: api-server, as: p1}
+      - {interface: async-llm.start-profile, caller: api-server, as: p2}
+    expect:
+      - "!steps.p1.result.ok && steps.p2.result.ok"
+      - "trace.filter(e, e.type == 'call.start' && e.interface == 'gpu-worker-impl.profile').size() == 2"
+
+  - id: engine-core-weight-version-write-read
+    name: The weight version set by the trainer is read back and attached to outputs
+    fixtures: [full-tp1-llama-8b]
+    steps:
+      - {interface: async-llm.get-weight-version, caller: api-server, as: before}
+      - {flow: weight-version, as: set}
+      - {interface: async-llm.get-weight-version, caller: api-server, as: after}
+    expect:
+      - "steps.before.result.value == 'default' && steps.after.result.value == 'step-200'"
+      - "state['engine-core'].weights.current.weight_version == 'step-200'"
+
+  - id: engine-core-weight-update-cycle
+    name: An RL weight update runs start/update/finish on every worker and bumps the version
+    fixtures: [full-tp4-llama-70b]
+    config: {weight-transfer-backend: nccl}
+    steps:
+      - {flow: engine-startup, as: up}
+      - {interface: async-llm.init-weight-transfer-engine, caller: api-server, as: init, input: {init_info: {backend: nccl}}}
+      - {interface: async-llm.start-weight-update, caller: api-server, as: start}
+      - {interface: async-llm.update-weights, caller: api-server, as: upd, input: {update_info: {names: [model.embed_tokens.weight]}}}
+      - {interface: async-llm.finish-weight-update, caller: api-server, as: fin, input: {weight_version: step-300}}
+      - {interface: async-llm.get-weight-version, caller: api-server, as: v}
+    expect:
+      - "state['engine-core'].weights.current.weight_version == 'step-300'"
+      - "calls['gpu-worker-impl.update-weights'] == 4 && calls['gpu-worker-impl.finish-weight-update'] == 4"
+      - "steps.v.result.value == 'step-300'"
+
+  - id: engine-core-misc-utilities
+    name: Cache resets, checksums and checkpoints are utility round trips
+    fixtures: [full-tp1-llama-8b]
+    steps:
+      - {interface: async-llm.reset-prefix-cache, caller: api-server, as: rp}
+      - {interface: async-llm.reset-mm-cache, caller: api-server, as: rm}
+      - {interface: async-llm.reset-encoder-cache, caller: api-server, as: re}
+      - {interface: async-llm.compute-weight-checksums, caller: api-server, as: ck}
+      - {interface: async-llm.checkpoint-prepare, caller: api-server, as: cp}
+      - {interface: async-llm.checkpoint-restore, caller: api-server, as: cr}
+      - {interface: async-llm.collective-rpc, caller: api-server, as: rpc, input: {method: execute_dummy_batch}}
+      - {interface: async-llm.is-sleeping, caller: api-server, as: sl}
+      - {interface: async-llm.shutdown-weight-transfer-engine, caller: api-server, as: swt}
+      - {interface: async-llm.start-draft-weight-update, caller: api-server, as: sdw}
+    expect:
+      - "steps.rp.result.value == true && steps.sl.result.value == false"
+      - "trace.filter(e, e.type == 'call.start' && e.interface == 'scheduler.reset-encoder-cache').size() == 1 && trace.filter(e, e.type == 'call.start' && e.interface == 'gpu-worker-impl.reset-encoder-cache').size() == 1"
+      - "trace.filter(e, e.type == 'call.start' && e.interface == 'gpu-worker-impl.compute-weight-checksums').size() == 1 && trace.filter(e, e.type == 'call.start' && e.interface == 'gpu-worker-impl.checkpoint-prepare').size() == 1 && trace.filter(e, e.type == 'call.start' && e.interface == 'gpu-worker-impl.checkpoint-restore').size() == 1"
+      - "trace.filter(e, e.type == 'call.start' && e.interface == 'gpu-worker-impl.execute-dummy-batch').size() == 1"
+
+  - id: engine-core-supported-tasks-cached
+    name: Supported tasks are fetched once and cached
+    fixtures: [full-tp1-llama-8b]
+    steps:
+      - {interface: async-llm.get-supported-tasks, caller: api-server, as: t1}
+      - {interface: async-llm.get-supported-tasks, caller: api-server, as: t2}
+    expect:
+      - "steps.t1.result.value == ['generate'] && steps.t2.result.value == ['generate']"
+      - "trace.filter(e, e.type == 'call.start' && e.interface == 'gpu-worker-impl.get-supported-tasks').size() == 1"
+
+  - id: engine-core-encode-unsupported-task
+    name: encode on a generate-only model fails validation
+    fixtures: [full-tp1-llama-8b]
+    steps:
+      - {interface: async-llm.encode, caller: api-server, as: e}
+    expect:
+      - "!steps.e.result.ok && steps.e.result.error.code == 'vllm-validation-error'"
+      - "!trace.exists(e, e.type == 'call.start' && e.interface == 'engine-core-proc.process-input-sockets' && e.input.request_type == 'ADD')"
+
+  - id: engine-core-encode-supported-task
+    name: encode adds the pooling request when the model supports the task
+    fixtures: [full-tp1-llama-8b]
+    state:
+      async-llm: {supported_tasks: [generate, embed]}
+    steps:
+      - {interface: async-llm.encode, caller: api-server, as: e}
+    expect:
+      - "channel_len('engine-core-input:') == 1"
+      - "steps.e.result.ok && steps.e.result.value.request_id == 'embd-abc123-00000001'"
+      - "trace.exists(e, e.type == 'call.start' && e.interface == 'engine-core-proc.process-input-sockets' && e.input.request_type == 'ADD')"
+
+  - id: engine-core-kv-transfer-rejected
+    name: A rejected KV transfer is submitted pre-aborted
+    fixtures: [full-tp1-llama-8b]
+    steps:
+      - {interface: async-llm.notify-kv-transfer-request-rejected, caller: api-server, as: n}
+      - {flow: engine-core-busy-loop, as: loop, input: {iterations: 1}}
+    expect:
+      - "trace.exists(e, e.type == 'call.start' && e.interface == 'scheduler.add-request' && e.input.abort_immediately && e.input.sampling_params.watermarking == false && e.input.prompt_token_ids == [0])"
+      - "trace.exists(e, e.type == 'call.start' && e.interface == 'scheduler.finish-requests' && e.input.request_ids == ['chatcmpl-abc123'])"
+
+  - id: engine-core-drain-wait
+    name: wait_for_requests_to_drain returns at once when idle and times out when busy
+    fixtures: [full-tp1-llama-8b]
+    steps:
+      - {interface: async-llm.wait-for-requests-to-drain, caller: api-server, as: idle, choices: *idle}
+      - {interface: async-llm.wait-for-requests-to-drain, caller: api-server, as: busy, input: {drain_timeout: 2}, choices: *busy}
+    expect:
+      - "steps.idle.result.value.drained"
+      - "!steps.busy.result.ok && steps.busy.result.error.code == 'timeout-error' && steps.busy.duration_ms >= 2000"
+
+  - id: engine-core-assign-id-external-set
+    name: An EngineCoreRequest with external_req_id already set is a ValueError
+    fixtures: [full-tp1-llama-8b]
+    steps:
+      - {interface: input-processor.assign-request-id, caller: api-server, as: a, input: {request_id: chatcmpl-abc123, prompt_token_ids: [1], sampling_params: {max_tokens: 1}, external_req_id: chatcmpl-abc123}}
+    expect:
+      - "!steps.a.result.ok && steps.a.result.error.code == 'value-error'"
+
+  # ------------------------------------------------------------------ startup
+  - id: engine-core-startup-tp1
+    name: Startup on one GPU uses the in-process executor
+    description: "world_size 1 resolves the uni backend: the engine core inits and loads the model on rank0 in-process, profiles free memory, sizes the KV cache (2000 blocks), warms up, and the READY handshake returns; the busy loop then starts."
+    fixtures: [full-tp1-llama-8b]
+    steps:
+      - {flow: engine-startup, as: up}
+      - {interface: async-llm.get-supported-tasks, caller: api-server, as: tasks}
+    expect:
+      - "steps.up.result.ok && steps.up.result.value.executor_class == 'UniProcExecutor'"
+      - "trace.exists(e, e.type == 'call.start' && e.interface == 'gpu-worker-impl.initialize-from-config' && e.input.num_blocks == steps.up.result.value.num_gpu_blocks)"
+      - "calls_by_instance['gpu-worker-impl.load-model@rank0'] == 1 && calls['gpu-worker-impl.compile-or-warm-up-model'] == 1"
+      - "steps.tasks.result.value == ['generate']"
+
+  - id: engine-core-startup-tp4
+    name: Startup with TP 4 spawns a worker process per rank
+    fixtures: [full-tp4-llama-70b]
+    steps:
+      - {flow: engine-startup, as: up}
+    expect:
+      - "steps.up.result.value.executor_class == 'MultiprocExecutor'"
+      - "trace.filter(e, e.type == 'call.start' && e.interface == 'gpu-worker-impl.load-model' && e.instance == 'rank3').size() == 1 && trace.filter(e, e.type == 'call.start' && e.interface == 'gpu-worker-impl.determine-available-memory' && e.instance == 'rank2').size() == 1"
+
+  - id: engine-core-startup-load-failure
+    name: A worker that can't load the model fails engine startup
+    fixtures: [full-tp1-llama-8b]
+    faults:
+      - {target: gpu-worker-impl.load-model, type: error, code: out-of-memory-error, message: "CUDA out of memory"}
+    flow: engine-startup
+    expect:
+      - "!result.ok && result.error.code == 'runtime-error' && result.error.message.contains('Engine core initialization failed')"
+      - "!trace.exists(e, e.type == 'call.start' && e.interface == 'kv-cache-utils.get-kv-cache-configs')"
+
+  - id: engine-core-startup-bad-stat-plugin
+    name: A stat-logger plugin that isn't a StatLoggerBase stops startup
+    fixtures: [full-tp1-llama-8b]
+    state:
+      stat-logger-manager: {entry_points: {my_logger: {subclass_of_stat_logger_base: false}}}
+    flow: engine-startup
+    expect:
+      - "!result.ok && result.error.code == 'type-error' && result.error.message.contains('my_logger')"
+
+  - id: engine-core-startup-custom-prometheus-plugin
+    name: A custom Prometheus logger plugin replaces the default one
+    fixtures: [full-tp1-llama-8b]
+    state:
+      stat-logger-manager: {entry_points: {PrometheusStatLogger: {subclass_of_stat_logger_base: true}}}
+    flow: engine-startup
+    expect:
+      - "result.ok"
+      - "result.ok && state['stat-logger-manager'].loggers == ['PrometheusStatLogger', 'LoggingStatLogger']"
+
+  - id: engine-core-unknown-executor-backend
+    name: An unknown executor backend is a ValueError
+    fixtures: [full-tp1-llama-8b]
+    config: {distributed-executor-backend: bogus}
+    flow: engine-startup
+    expect:
+      - "!result.ok && result.error.code == 'value-error' && result.error.message == 'Unknown distributed executor backend: bogus'"
+
+  - id: engine-core-engine-process-dies
+    name: The client monitor marks the engine dead when its process exits
+    fixtures: [full-tp1-llama-8b]
+    state:
+      core-engine-proc-manager: {started: true, failed_proc_name: null}
+      output-processor: {request_states: {chatcmpl-abc123-00000001: {external_req_id: chatcmpl-abc123, prompt_len: 6, is_prefilling: true, output_text: "", num_output_tokens: 0, stop: [], parent: null, has_queue: true}}}
+      request-output-collector: {queues: {chatcmpl-abc123-00000001: {output: null, error: null}}}
+    steps:
+      - {interface: core-engine-proc-manager.monitor-engine-liveness, caller: api-server, as: mon, input: {exitcode: -9}}
+      - {interface: request-output-collector.get, caller: api-server, as: got, input: {request_id: chatcmpl-abc123-00000001}}
+    expect:
+      - "steps.mon.result.value.handled"
+      - "!steps.got.result.ok && steps.got.result.error.code == 'engine-dead-error'"
+      - "state['core-engine-proc-manager'].failed_proc_name == 'EngineCore'"
+
+  # ------------------------------------------------------------------ LLMEngine (offline)
+  - id: engine-core-llm-engine-add-then-step
+    name: The offline engine returns RequestOutputs from step()
+    fixtures: [full-tp1-llama-8b]
+    state:
+      engine-core-proc: {client_kind: sync}
+    steps:
+      - {flow: llm-engine-add-request, as: add, input: {request_id: chatcmpl-abc123, sampling_params: {max_tokens: 1, n: 1, output_kind: final_only}}}
+      - {flow: llm-engine-step, as: s1}
+      - {interface: llm-engine.has-unfinished-requests, caller: python-user, as: more}
+    expect:
+      - "steps.add.result.value == 'chatcmpl-abc123-00000001'"
+      - "steps.s1.result.value.request_outputs.exists(o, o.request_id == 'chatcmpl-abc123' && o.finished && o.finish_reason == 'length' && size(o.token_ids) == 1)"
+      - "steps.more.result.value == false"
+      - "trace.filter(e, e.type == 'call.start' && e.interface == 'scheduler.update-from-output').size() == 1"
+
+  - id: engine-core-llm-engine-step-engine-dead
+    name: step() on a dead engine raises EngineDeadError
+    fixtures: [full-tp1-llama-8b]
+    state:
+      sync-mp-client: {engine_dead: true, outputs_queue: [{error: {code: engine-dead-error, status: 500, message: "EngineCore encountered an issue. See stack trace (above) for the root cause."}}]}
+    steps:
+      - {flow: llm-engine-step, as: s}
+    expect:
+      - "!steps.s.result.ok && steps.s.result.error.code == 'engine-dead-error'"
+      - "!trace.exists(e, e.type == 'call.start' && e.interface == 'scheduler.schedule')"
+
+  - id: engine-core-llm-engine-dummy-batch
+    name: A DP rank with nothing to do runs a dummy batch
+    fixtures: [full-tp1-llama-8b]
+    state:
+      llm-engine: {should_execute_dummy_batch: true}
+    steps:
+      - {flow: llm-engine-step, as: s}
+    expect:
+      - "steps.s.result.value.request_outputs == [] && trace.filter(e, e.type == 'call.start' && e.interface == 'gpu-worker-impl.execute-dummy-batch').size() == 1"
+
+  - id: engine-core-llm-engine-n2-and-abort
+    name: Offline n=2 fans out; abort_request drops both children
+    fixtures: [full-tp1-llama-8b]
+    steps:
+      - {flow: llm-engine-add-request, as: add, input: {request_id: chatcmpl-abc123, sampling_params: {max_tokens: 4, n: 2}}}
+      - {interface: llm-engine.get-num-unfinished-requests, caller: python-user, as: n}
+      - {interface: llm-engine.abort-request, caller: python-user, as: ab, input: {request_ids: [chatcmpl-abc123]}}
+    expect:
+      - "steps.n.result.value == 2"
+      - "steps.ab.result.value.aborted == ['0_chatcmpl-abc123-00000001', '1_chatcmpl-abc123-00000001']"
+      - "trace.filter(e, e.type == 'call.start' && e.interface == 'engine-core-proc.process-input-sockets' && e.input.request_type == 'ABORT').size() == 1"
+
+  - id: engine-core-llm-engine-utilities
+    name: Offline utilities go through the SyncMPClient
+    fixtures: [full-tp1-llama-8b, lora-adapter-on-disk]
+    config: {enable-lora: true, profiler: torch}
+    steps:
+      - {interface: llm-engine.get-supported-tasks, caller: python-user, as: t}
+      - {interface: llm-engine.set-weight-version, caller: python-user, as: sv}
+      - {interface: llm-engine.get-weight-version, caller: python-user, as: gv}
+      - {interface: llm-engine.add-lora, caller: python-user, as: al}
+      - {interface: llm-engine.pin-lora, caller: python-user, as: pl, input: {lora_id: 1}}
+      - {interface: llm-engine.list-loras, caller: python-user, as: ll}
+      - {interface: llm-engine.remove-lora, caller: python-user, as: rl, input: {lora_id: 1}}
+      - {interface: llm-engine.reset-prefix-cache, caller: python-user, as: rp}
+      - {interface: llm-engine.reset-mm-cache, caller: python-user, as: rm}
+      - {interface: llm-engine.reset-encoder-cache, caller: python-user, as: re}
+      - {interface: llm-engine.is-sleeping, caller: python-user, as: sl}
+      - {interface: llm-engine.collective-rpc, caller: python-user, as: rpc, input: {method: compute_weight_checksums}}
+      - {interface: llm-engine.apply-model, caller: python-user, as: am}
+      - {interface: llm-engine.start-profile, caller: python-user, as: p1}
+      - {interface: llm-engine.start-profile, caller: python-user, as: p2}
+      - {interface: llm-engine.stop-profile, caller: python-user, as: p3}
+    expect:
+      - "steps.t.result.value == ['generate'] && steps.gv.result.value == 'step-100'"
+      - "steps.al.result.value && steps.ll.result.value == [1] && steps.rp.result.value && !steps.sl.result.value"
+      - "!steps.p2.result.ok && steps.p2.result.error.code == 'profiler-already-active-error'"
+      - "trace.filter(e, e.type == 'call.start' && e.interface == 'gpu-worker-impl.apply-model').size() == 1"
+
+  - id: engine-core-llm-engine-sleep-wake
+    name: Offline sleep, release and wake record the sleep state
+    fixtures: [full-tp1-llama-8b]
+    steps:
+      - {interface: llm-engine.sleep, caller: python-user, as: s, choices: *idle}
+      - {interface: llm-engine.wake-up, caller: python-user, as: w}
+      - {interface: llm-engine.release-kv-cache-memory, caller: python-user, as: r}
+    expect:
+      - "steps.s.result.ok && steps.w.result.value == true"
+      - "!steps.r.result.ok && steps.r.result.error.message.contains('requires a completed pause first')"
+      - "trace.exists(e, e.type == 'call.start' && e.interface == 'scheduler.reset-prefix-cache')"
+
+  - id: engine-core-llm-engine-metrics
+    name: get_metrics needs stat logging; with it the vllm:* metrics are read back
+    description: "The offline LLM class disables stat logging by default, so get_metrics fails its assertion; with logging on, a step's counters are visible in the snapshot."
+    fixtures: [full-tp1-llama-8b]
+    state:
+      engine-core-proc: {client_kind: sync}
+      sync-mp-client: {engine_dead: false, outputs_queue: [{outputs: {outputs: [], scheduler_stats: {num_running_reqs: 0}}}]}
+    steps:
+      - {flow: llm-engine-step, as: st}
+      - {interface: llm-engine.get-metrics, caller: python-user, as: m}
+      - {interface: llm-engine.do-log-stats-with-interval, caller: python-user, as: l1}
+      - {interface: llm-engine.do-log-stats, caller: python-user, as: l2}
+    expect:
+      - "steps.m.result.ok && steps.m.result.value.count == 1"
+      - "state['prometheus-registry'].metrics['vllm:generation_tokens'] == 0"
+      - "steps.l1.result.value.logged == false && steps.l2.result.value.logged"
+
+  - id: engine-core-llm-engine-metrics-disabled
+    name: get_metrics fails when stat logging is disabled
+    fixtures: [full-tp1-llama-8b]
+    state:
+      llm-engine: {log_stats: false}
+    steps:
+      - {interface: llm-engine.get-metrics, caller: python-user, as: m}
+    expect:
+      - "!steps.m.result.ok && steps.m.result.error.code == 'assertion-error'"
+
+  - id: engine-core-llm-engine-startup
+    name: LLMEngine.from_engine_args launches the engine core
+    fixtures: [full-tp1-llama-8b]
+    steps:
+      - {interface: llm-engine.from-engine-args, caller: python-user, as: e}
+      - {interface: llm-engine.from-vllm-config, caller: python-user, as: v}
+      - {interface: async-llm.from-vllm-config, caller: api-server, as: a}
+    expect:
+      - "steps.e.result.value.executor_class == 'UniProcExecutor'"
+      - "steps.v.result.ok && steps.a.result.ok"
+      - "trace.filter(e, e.type == 'call.start' && e.interface == 'block-pool.init').size() == 3"
+
+  - id: engine-core-api-counters-and-logging
+    name: Request counters, health and stats logging on AsyncLLM
+    fixtures: [full-tp1-llama-8b]
+    state:
+      output-processor: {request_states: {chatcmpl-old-00000009: {external_req_id: chatcmpl-old, prompt_len: 10, is_prefilling: true, output_text: "", num_output_tokens: 0, stop: [], parent: null, has_queue: true}}}
+    steps:
+      - {interface: async-llm.get-num-unfinished-requests, caller: api-server, as: n}
+      - {interface: async-llm.get-num-queued-tokens, caller: api-server, as: q}
+      - {interface: async-llm.check-health, caller: api-server, as: h}
+      - {interface: async-llm.do-log-stats, caller: api-server, as: l}
+      - {interface: async-llm.get-status, caller: api-server, as: st}
+    expect:
+      - "steps.n.result.value == 1 && steps.q.result.value == 10 && steps.h.result.value.healthy"
+      - "steps.l.result.value.logged && steps.st.result.value.total_engines == 1"
+      - "has(state['stat-logger-manager'].last_log_ms)"
+
+  # ------------------------------------------------------------------ metrics: histogram buckets
+  - id: engine-core-buckets-request-tokens
+    name: request_tokens is a 1-2-5 series capped at max_model_len, and needs it
+    fixtures: [full-tp1-llama-8b]
+    steps:
+      - {flow: metrics-histogram-buckets, as: tok, input: {family: request_tokens, max_model_len: 32768}}
+      - {flow: metrics-histogram-buckets, as: missing, input: {family: request_tokens, max_model_len: null}}
+      - {flow: metrics-histogram-buckets, as: over, input: {family: request_latency, overrides: {request_latency: [1.0, 2.0]}}}
+    expect:
+      - "steps.tok.result.value == [1, 2, 5, 10, 20, 50, 100, 200, 500, 1000, 2000, 5000, 10000, 20000]"
+      - "!steps.missing.result.ok && steps.missing.result.error.message == \"max_model_len is required for the 'request_tokens' bucket family\""
+      - "steps.over.result.value == [1.0, 2.0]"
+
+  # ------------------------------------------------------------------ in-build oracle
+  - id: oracle-build-engine-core-2
+    name: "test_default_bucket_snapshots: every static family exposes today's default boundaries"
+    description: "tests/v1/metrics/test_histogram_buckets.py:175, parametrized over the seven static families."
+    fixtures: [full-tp1-llama-8b]
+    steps:
+      - {flow: metrics-histogram-buckets, as: request_latency, input: {family: request_latency}}
+      - {flow: metrics-histogram-buckets, as: time_to_first_token, input: {family: time_to_first_token}}
+      - {flow: metrics-histogram-buckets, as: inter_token_latency, input: {family: inter_token_latency}}
+      - {flow: metrics-histogram-buckets, as: iteration_tokens, input: {family: iteration_tokens}}
+      - {flow: metrics-histogram-buckets, as: request_params_n, input: {family: request_params_n}}
+      - {flow: metrics-histogram-buckets, as: request_num_preemptions, input: {family: request_num_preemptions}}
+      - {flow: metrics-histogram-buckets, as: kv_cache_residency, input: {family: kv_cache_residency}}
+    expect:
+      - "steps.request_latency.result.value == [0.3, 0.5, 0.8, 1.0, 1.5, 2.0, 2.5, 5.0, 10.0, 15.0, 20.0, 30.0, 40.0, 50.0, 60.0, 120.0, 240.0, 480.0, 960.0, 1920.0, 7680.0]"
+      - "steps.time_to_first_token.result.value == [0.001, 0.005, 0.01, 0.02, 0.04, 0.06, 0.08, 0.1, 0.25, 0.5, 0.75, 1.0, 2.5, 5.0, 7.5, 10.0, 20.0, 40.0, 80.0, 160.0, 640.0, 2560.0]"
+      - "steps.inter_token_latency.result.value == [0.01, 0.025, 0.05, 0.075, 0.1, 0.15, 0.2, 0.3, 0.4, 0.5, 0.75, 1.0, 2.5, 5.0, 7.5, 10.0, 20.0, 40.0, 80.0]"
+      - "steps.iteration_tokens.result.value == [1, 8, 16, 32, 64, 128, 256, 512, 1024, 2048, 4096, 8192, 16384]"
+      - "steps.request_params_n.result.value == [1, 2, 5, 10, 20]"
+      - "steps.request_num_preemptions.result.value == [1, 2, 3, 4, 5, 10, 20]"
+      - "steps.kv_cache_residency.result.value == [0.001, 0.002, 0.005, 0.01, 0.02, 0.05, 0.1, 0.2, 0.5, 1, 2, 5, 10, 20, 30, 60, 120, 300, 600, 1200, 1800]"
+
+  - id: oracle-build-engine-core-3
+    name: "test_preprocess_error_handling: a preprocessing error fails one request, the engine keeps serving"
+    description: "tests/v1/engine/test_preprocess_error_handling.py:13. EngineCore.preprocess_add_request raises ValueError for the first request (prompt [333]); the input thread answers it with an empty ERROR output, and a following normal request generates tokens and finishes with stop or length."
+    fixtures: [full-tp1-llama-8b]
+    state:
+      engine-core-proc: {client_kind: sync}
+    faults:
+      - {target: engine-core.preprocess-add-request, type: error, code: value-error, message: "Simulated preprocessing error!", calls: [1]}
+    steps:
+      - {flow: llm-engine-add-request, as: bad, input: {request_id: fail-req, prompt_token_ids: [333], sampling_params: {max_tokens: 10, n: 1}}}
+      - {flow: llm-engine-step, as: s1}
+      - {flow: llm-engine-add-request, as: good, input: {request_id: chatcmpl-abc123, prompt_token_ids: [128000, 9906, 11, 856, 836, 374], sampling_params: {max_tokens: 10, n: 1}}}
+      - {flow: llm-engine-step, as: s2}
+      - {flow: llm-engine-step, as: s3}
+      - {flow: llm-engine-step, as: s4}
+      - {flow: llm-engine-step, as: s5}
+      - {flow: llm-engine-step, as: s6}
+      - {flow: llm-engine-step, as: s7}
+      - {flow: llm-engine-step, as: s8}
+      - {flow: llm-engine-step, as: s9}
+      - {flow: llm-engine-step, as: s10}
+      - {flow: llm-engine-step, as: s11}
+      - {flow: llm-engine-step, as: s12}
+      - {flow: llm-engine-step, as: s13}
+    expect:
+      - "size(steps.s1.result.value.request_outputs) == 1"
+      - "steps.s1.result.value.request_outputs[0].request_id == 'fail-req' && size(steps.s1.result.value.request_outputs[0].token_ids) == 0"
+      - "steps.s1.result.value.request_outputs[0].finished && steps.s1.result.value.request_outputs[0].finish_reason == 'error'"
+      - "[steps.s2, steps.s3, steps.s4, steps.s5, steps.s6, steps.s7, steps.s8, steps.s9, steps.s10, steps.s11, steps.s12, steps.s13].exists(st, st.result.value.request_outputs.exists(o, o.request_id == 'chatcmpl-abc123' && o.finished && o.finish_reason in ['stop', 'length']))"
+      - "[steps.s2, steps.s3, steps.s4, steps.s5, steps.s6, steps.s7, steps.s8, steps.s9, steps.s10, steps.s11, steps.s12, steps.s13].exists(st, st.result.value.request_outputs.exists(o, o.request_id == 'chatcmpl-abc123' && size(o.token_ids) > 0))"
+      - "trace.filter(e, e.type == 'call.start' && e.interface == 'scheduler.add-request').size() == 1"
+
+  - id: engine-core-generate-caller-cancel-token
+    name: The caller's disconnect token cancels generate and aborts the request
+    description: "serving-api passes its own disconnect token as cancel_token; cancelling it fails generate's pending await, and generate aborts the request in the output processor and the engine core."
+    fixtures: [full-tp1-llama-8b]
+    steps:
+      - {flow: engine-core-busy-loop, as: loop, await: false, input: {iterations: 30}}
+      - {flow: async-llm-generate, as: gen, at_ms: 0, await: false, input: {request_id: chatcmpl-req-1, cancel_token: disconnect-req-1, prompt_token_ids: [128000, 9906], sampling_params: {max_tokens: 4, n: 1}}}
+      - {cancel: disconnect-req-1, at_ms: 16}
+    expect:
+      - "!steps.gen.result.ok && steps.gen.result.error.code == 'canceled'"
+      - "trace.exists(e, e.type == 'call.start' && e.interface == 'engine-core-proc.process-input-sockets' && e.input.request_type == 'ABORT' && e.input.request_ids == ['chatcmpl-req-1-00000001'])"
+
+  - id: engine-core-errored-state
+    name: errored reads the engine-dead state and the output handler's liveness
+    description: "A dead engine (engine_dead seeded, as ENGINE_CORE_DEAD leaves it) or a finished output handler makes AsyncLLM.errored true; a live one is false."
+    fixtures: [full-tp1-llama-8b]
+    steps:
+      - {interface: async-llm.errored, caller: api-server, as: live}
+      - {interface: async-mp-client.process-outputs-socket, caller: engine-core, as: dead, input: {dead: true}}
+      - {interface: async-llm.errored, caller: api-server, as: after}
+    expect:
+      - "!steps.live.result.value.errored && steps.live.result.value.is_running"
+      - "steps.after.result.value.errored && !steps.after.result.value.is_running"
+      - "state['async-mp-client'].engine_dead && state['async-llm'].output_handler_done"
+
+  - id: engine-core-errored-seeded
+    name: A seeded dead engine is errored and refuses requests
+    fixtures: [full-tp1-llama-8b]
+    state:
+      async-mp-client: {engine_dead: true}
+    steps:
+      - {interface: async-llm.errored, caller: api-server, as: e}
+      - {flow: async-llm-generate, as: gen}
+    expect:
+      - "steps.e.result.value.errored && steps.e.result.value.is_running"
+      - "!steps.gen.result.ok && steps.gen.result.error.code == 'engine-dead-error'"
+
+  # ------------------------------------------------------------------ fix round: features and judged behaviors
+  - id: engine-core-parallel-sampling-merge
+    name: n=2 children share one stream; the parent output finishes when both children have
+    description: "Both children (0_<id>, 1_<id>) are registered with the one parent queue; each child's output lands there as completion index 0 or 1; the stream ends only when no child remains, and its request_id is the external id."
+    fixtures: [full-tp1-llama-8b]
+    steps:
+      - {flow: engine-core-busy-loop, as: loop, await: false, input: {iterations: 30}}
+      - {flow: async-llm-parallel-sampling, as: gen, at_ms: 0}
+      - {interface: async-llm.get-num-unfinished-requests, caller: api-server, as: left}
+    expect:
+      - "steps.left.result.value == 0"
+      - "steps.gen.result.ok && steps.gen.result.value.value.finished && steps.gen.result.value.value.request_id == 'chatcmpl-abc123'"
+      - "size(steps.gen.result.value.value.token_ids) >= 2"
+      - "trace.filter(e, e.type == 'call.start' && e.interface == 'scheduler.add-request').map(e, e.input.request_id) == ['0_chatcmpl-abc123-00000001', '1_chatcmpl-abc123-00000001']"
+
+  - id: engine-core-parallel-sampling-final-only
+    name: FINAL_ONLY with n=2 returns one aggregated output
+    fixtures: [full-tp1-llama-8b]
+    state:
+      output-processor:
+        request_states:
+          0_chatcmpl-p-00000001: {external_req_id: chatcmpl-p, prompt_len: 2, is_prefilling: false, output_text: "", num_output_tokens: 0, token_ids: [], output_kind: final_only, stop: [], parent: chatcmpl-p-00000001, index: 0, queue_id: chatcmpl-p-00000001, has_queue: true}
+          1_chatcmpl-p-00000001: {external_req_id: chatcmpl-p, prompt_len: 2, is_prefilling: false, output_text: "", num_output_tokens: 0, token_ids: [], output_kind: final_only, stop: [], parent: chatcmpl-p-00000001, index: 1, queue_id: chatcmpl-p-00000001, has_queue: true}
+        parent_requests:
+          chatcmpl-p-00000001: {external_req_id: chatcmpl-p, output_kind: final_only, remaining: [0_chatcmpl-p-00000001, 1_chatcmpl-p-00000001], final: {}}
+        external_req_ids: {chatcmpl-p: [0_chatcmpl-p-00000001, 1_chatcmpl-p-00000001]}
+      request-output-collector: {queues: {chatcmpl-p-00000001: {output: null, error: null}}}
+    steps:
+      - {interface: output-processor.process-outputs, caller: async-llm, as: a, input: {outputs: [{request_id: 0_chatcmpl-p-00000001, new_token_ids: [5, 6], finish_reason: length, stop_reason: null}, {request_id: 1_chatcmpl-p-00000001, new_token_ids: [7], finish_reason: null, stop_reason: null}]}}
+      - {interface: request-output-collector.get, caller: async-llm, as: g1, input: {request_id: chatcmpl-p-00000001}}
+      - {interface: output-processor.process-outputs, caller: async-llm, as: b, input: {outputs: [{request_id: 1_chatcmpl-p-00000001, new_token_ids: [8], finish_reason: length, stop_reason: null}]}}
+      - {interface: request-output-collector.get, caller: async-llm, as: g2, input: {request_id: chatcmpl-p-00000001}}
+    expect:
+      - "steps.g1.result.value.output == null && ctx.final_only_held == '1_chatcmpl-p-00000001'"
+      - "steps.g2.result.value.output.finished && steps.g2.result.value.output.request_id == 'chatcmpl-p'"
+      - "steps.g2.result.value.output.completions.map(c, c.token_ids) == [[5, 6], [7, 8]]"
+      - "size(state['output-processor'].parent_requests) == 0"
+
+  - id: engine-core-output-kinds
+    name: DELTA, CUMULATIVE and FINAL_ONLY outputs carry the external id and the right tokens
+    fixtures: [full-tp1-llama-8b]
+    state:
+      output-processor:
+        request_states:
+          r-d-00000001: {external_req_id: r-d, prompt_len: 2, is_prefilling: false, output_text: " t1", num_output_tokens: 1, token_ids: [1], output_kind: delta, stop: [], parent: null, index: 0, queue_id: r-d-00000001, has_queue: false}
+          r-c-00000002: {external_req_id: r-c, prompt_len: 2, is_prefilling: false, output_text: " t1", num_output_tokens: 1, token_ids: [1], output_kind: cumulative, stop: [], parent: null, index: 0, queue_id: r-c-00000002, has_queue: false}
+          r-f-00000003: {external_req_id: r-f, prompt_len: 2, is_prefilling: false, output_text: " t1", num_output_tokens: 1, token_ids: [1], output_kind: final_only, stop: [], parent: null, index: 0, queue_id: r-f-00000003, has_queue: false}
+        external_req_ids: {r-d: [r-d-00000001], r-c: [r-c-00000002], r-f: [r-f-00000003]}
+    steps:
+      - interface: output-processor.process-outputs
+        caller: llm-engine
+        as: p
+        input: {outputs: [{request_id: r-d-00000001, new_token_ids: [2], finish_reason: length, stop_reason: null}, {request_id: r-c-00000002, new_token_ids: [2], finish_reason: length, stop_reason: null}, {request_id: r-f-00000003, new_token_ids: [2], finish_reason: length, stop_reason: null}]}
+    expect:
+      - "steps.p.result.value.request_outputs.map(o, o.request_id) == ['r-d', 'r-c', 'r-f']"
+      - "steps.p.result.value.request_outputs.map(o, o.token_ids) == [[2], [1, 2], [1, 2]]"
+      - "size(state['output-processor'].external_req_ids) == 0"
+
+  - id: engine-core-graceful-shutdown-drain-teardown
+    name: SIGTERM with a 5 s grace lets the engine abort, tear down the executor and exit
+    description: "With the default grace the engine-core process handles SIGTERM: aborts the in-flight request, exits once idle, and its finally shuts the executor and the worker down, before the grace ends; nothing is killed."
+    fixtures: [full-tp1-llama-8b]
+    steps:
+      - {flow: engine-core-busy-loop, as: loop, await: false, input: {iterations: 40}}
+      - {flow: async-llm-generate, as: gen, at_ms: 0, await: false, input: {request_id: chatcmpl-abc123, prompt_token_ids: [128000, 9906], sampling_params: {max_tokens: 64, n: 1}}}
+      - {flow: engine-shutdown, as: sd, at_ms: 30}
+    expect:
+      - "steps.sd.result.ok && !steps.sd.result.value.killed"
+      - "trace.filter(e, e.type == 'call.start' && e.interface in ['engine-core-proc.signal-handler', 'engine-core.shutdown', 'executor.shutdown', 'gpu-worker-impl.shutdown']).map(e, e.interface) == ['engine-core-proc.signal-handler', 'engine-core.shutdown', 'executor.shutdown', 'gpu-worker-impl.shutdown']"
+
+  - id: engine-core-graceful-shutdown-zero-grace-kill
+    name: shutdown_timeout 0 on CUDA kills the engine-core process right after SIGTERM
+    description: "The API server shuts the client down with timeout=shutdown_timeout=0: the process manager sends SIGTERM and, with no grace, SIGKILLs the engine-core process tree before it can tear down."
+    fixtures: [full-tp1-llama-8b]
+    steps:
+      - {flow: engine-core-busy-loop, as: loop, await: false, input: {iterations: 40}}
+      - {flow: async-llm-generate, as: gen, at_ms: 0, await: false, input: {request_id: chatcmpl-abc123, prompt_token_ids: [128000, 9906], sampling_params: {max_tokens: 64, n: 1}}}
+      - {flow: engine-shutdown, as: sd, at_ms: 30, input: {timeout: 0}}
+    expect:
+      - "steps.sd.result.ok && steps.sd.result.value.killed"
+      - "trace.exists(e, e.type == 'kill')"
+
+  - id: engine-core-graceful-shutdown-tp4-workers
+    name: The mp executor shuts every rank's worker down
+    description: "The death pipes close together and each WorkerProc shuts its worker down on its own: every rank shuts down once, in no guaranteed order (multiproc_executor.py:509-542, 834-858)."
+    tags: [concurrency]
+    fixtures: [full-tp4-llama-70b]
+    steps:
+      - {flow: engine-core-busy-loop, as: loop, await: false, input: {iterations: 6}}
+      - {flow: engine-shutdown, as: sd, at_ms: 2}
+    expect:
+      - "steps.sd.result.ok"
+      - "trace.exists(e, e.type == 'call.start' && e.interface == 'scheduler.shutdown')"
+    invariants:
+      # every rank's worker shuts down exactly once; the order across ranks isn't guaranteed
+      - "['rank0', 'rank1', 'rank2', 'rank3'].all(r, trace.filter(e, e.type == 'call.start' && e.interface == 'gpu-worker-impl.shutdown' && e.instance == r).size() == 1)"
+
+  - id: engine-core-tp4-output-rank-replies
+    name: Only the output rank replies to execute_model
+    fixtures: [full-tp4-llama-70b]
+    steps:
+      - *add
+      - {flow: engine-core-busy-loop, as: loop, input: {iterations: 2}}
+    expect:
+      - "trace.filter(e, e.type == 'call.end' && e.interface == 'multiproc-executor.execute-model').size() >= 1"
+      - "trace.exists(e, e.type == 'call.end' && e.interface == 'worker-proc.execute-worker-rpc' && e.instance == '' && has(e.output.replied) && e.output.replied == false)"
+      - "trace.filter(e, e.type == 'call.end' && e.interface == 'multiproc-executor.collective-rpc' && e.output != null && has(e.output.results)).exists(e, size(e.output.results) == 1 && e.output.results[0].rank == 'rank0')"
+
+  - id: engine-core-tp4-nonoutput-rank-error-not-replied
+    name: An exception on a non-output rank sends no reply
+    fixtures: [full-tp4-llama-70b]
+    faults:
+      - {target: gpu-worker-impl.execute-model, instance: rank2, type: error, code: cuda-error, calls: [1]}
+    steps:
+      - *add
+      - {flow: engine-core-busy-loop, as: loop, await: false, input: {iterations: 2}}
+    expect:
+      - "trace.exists(e, e.type == 'call.end' && e.interface == 'executor.collective-rpc' && has(e.error) && e.error != null && e.error.code == 'timeout-error')"
+
+  - id: engine-core-dp-routing-and-utilities
+    name: The DP client spreads requests over engines and fans utilities out to all of them
+    description: "data_parallel_size 2: two ADDs go to dp0 then dp1 (equal load, rotating start); an abort goes to the request's engine; wake_up is sent once per engine and is true only if all engines are awake."
+    fixtures: [full-tp1-llama-8b]
+    topology: {engine-core-proc: [dp0, dp1]}
+    config: {data-parallel-size: 2}
+    steps:
+      - {flow: dp-client-add-request, as: a, input: {request_id: chatcmpl-a-00000001}}
+      - {flow: dp-client-add-request, as: b, input: {request_id: chatcmpl-b-00000002}}
+      - {interface: dp-lb-async-mp-client.abort-requests-async, caller: api-server, as: ab, input: {request_ids: [chatcmpl-a-00000001]}}
+      - {interface: async-llm.wake-up, caller: api-server, as: w}
+    expect:
+      - "steps.a.result.value.engine == 'dp0' && steps.b.result.value.engine == 'dp1'"
+      - "channel_len('engine-core-input:dp0') == 2 && channel_len('engine-core-input:dp1') == 1"
+      - "trace.filter(e, e.type == 'call.start' && e.interface == 'engine-core-proc.handle-utility' && e.instance == 'dp0').size() == 1 && trace.filter(e, e.type == 'call.start' && e.interface == 'engine-core-proc.handle-utility' && e.instance == 'dp1').size() == 1"
+      - "steps.w.result.value == true"
+
+  - id: engine-core-llm-engine-from-engine-args-sync-client
+    name: LLMEngine connects a SyncMPClient to the engine process
+    fixtures: [full-tp1-llama-8b]
+    steps:
+      - {interface: llm-engine.from-engine-args, caller: python-user, as: e}
+    expect:
+      - "steps.e.result.ok && state['engine-core-proc'].client_kind == 'sync'"
+
+  - id: engine-core-structured-outputs-invalid-regex
+    name: With the outlines backend an unbuildable regex is refused before anything is sent
+    fixtures: [full-tp1-llama-8b]
+    config: {structured-outputs-backend: outlines}
+    steps:
+      - {flow: async-llm-generate, as: bad, input: {request_id: chatcmpl-re, prompt_token_ids: [128000, 9906], sampling_params: {max_tokens: 4, n: 1, structured_outputs: {regex: "(?<=a)b"}}}}
+      - {flow: async-llm-generate, as: ok, input: {request_id: chatcmpl-re2, prompt_token_ids: [128000, 9906], sampling_params: {max_tokens: 4, n: 1, structured_outputs: {regex: "[a-z]+"}}}}
+    expect:
+      - "!steps.bad.result.ok && steps.bad.result.error.code == 'vllm-validation-error'"
+      - "calls['backend-outlines.validate-structured-output-request-outlines'] == 2"
+      - "trace.exists(e, e.type == 'call.start' && e.interface == 'scheduler.add-request' && e.input.request_id.startsWith('chatcmpl-re2')) || channel_len('engine-core-input:') == 1"
+
+  - id: engine-core-ray-dp-placement-allowlist
+    name: VLLM_RAY_DP_PLACEMENT_NODE_IPS confines the DP placement groups to the listed nodes
+    description: "Four 8-GPU Ray nodes, master 10.0.0.1, DP 16 with 8 local ranks, allowlist 10.0.0.1,10.0.0.3: 8 groups on the master and 8 on .3, none on .2 or .4 (tests/v1/engine/test_dp_placement_node_allowlist.py:67)."
+    fixtures: [full-tp1-llama-8b]
+    config: {vllm-ray-dp-placement-node-ips: "10.0.0.1,10.0.0.3"}
+    state:
+      ray-cluster: {nodes: [{ip: 10.0.0.2, GPU: 8}, {ip: 10.0.0.1, GPU: 8}, {ip: 10.0.0.3, GPU: 8}, {ip: 10.0.0.4, GPU: 8}]}
+    steps:
+      - {interface: core-engine-actor-manager.create-dp-placement-groups, caller: api-server, as: pg, input: {data_parallel_size: 16, data_parallel_size_local: 8, world_size: 1, master_ip: 10.0.0.1}}
+      - {interface: core-engine-actor-manager.create-dp-placement-groups, caller: api-server, as: short, input: {data_parallel_size: 24, data_parallel_size_local: 8, world_size: 1, master_ip: 10.0.0.1}}
+    expect:
+      - "steps.pg.result.ok && size(steps.pg.result.value.placement_groups) == 16"
+      - "steps.pg.result.value.placement_groups.all(p, p.node_ip in ['10.0.0.1', '10.0.0.3']) && steps.pg.result.value.placement_groups[0].node_ip == '10.0.0.1'"
+      - "!steps.short.result.ok && steps.short.result.error.code == 'value-error'"
+      - "size(state['ray-cluster'].placement_groups) == 16"
+
+  - id: engine-core-ray-dp-placement-master-too-small
+    name: The DP master must fit its local ranks
+    fixtures: [full-tp1-llama-8b]
+    state:
+      ray-cluster: {nodes: [{ip: 10.0.0.1, GPU: 4}, {ip: 10.0.0.2, GPU: 8}]}
+    steps:
+      - {interface: core-engine-actor-manager.create-dp-placement-groups, caller: api-server, as: pg, input: {data_parallel_size: 8, data_parallel_size_local: 8, world_size: 1, master_ip: 10.0.0.1}}
+      - {interface: core-engine-actor-manager.create-dp-placement-groups, caller: api-server, as: dead, input: {data_parallel_size: 2, data_parallel_size_local: 1, world_size: 1, master_ip: 10.0.0.9}}
+    expect:
+      - "!steps.pg.result.ok && steps.pg.result.error.message.contains('on DP master node 10.0.0.1')"
+      - "!steps.dead.result.ok && steps.dead.result.error.code == 'assertion-error'"
+      - "size(state['ray-cluster'].placement_groups) == 0"
+
+  # ------------------------------------------------------------------ serial_utils, Ray helpers (round 3)
+  - id: engine-core-msgpack-custom-class-with-pickle
+    name: With insecure serialization allowed a custom class round-trips through a pickle extension
+    fixtures: [full-tp1-llama-8b]
+    config: {vllm-allow-insecure-serialization: true}
+    steps:
+      - {interface: msgpack-serializer.encode, caller: api-server, as: enc, input: {obj: {kind: object, type: CustomClass, value: {value: test_value}}}}
+      - {interface: msgpack-serializer.decode, caller: api-server, as: dec, input: {bufs: "= steps.enc.result.value.bufs", type: CustomClass}}
+    expect:
+      - "steps.enc.result.value.bufs[0].ext == 1"
+      - "steps.dec.result.value.obj == {'kind': 'object', 'type': 'CustomClass', 'value': {'value': 'test_value'}}"
+
+  - id: engine-core-msgpack-custom-class-without-pickle
+    name: Without insecure serialization a custom class can't be encoded, and a pickle extension can't be decoded
+    fixtures: [full-tp1-llama-8b]
+    steps:
+      - {interface: msgpack-serializer.encode, caller: api-server, as: enc, input: {obj: {kind: object, type: CustomClass, value: {value: test_value}}}}
+      - {interface: msgpack-serializer.decode, caller: api-server, as: dec, input: {bufs: [{ext: 1, type: CustomClass, data: {value: test_value}}]}}
+      - {interface: msgpack-serializer.encode, caller: api-server, as: native, input: {obj: {kind: native, value: [1, 2]}}}
+    expect:
+      - "!steps.enc.result.ok && steps.enc.result.error.code == 'type-error' && steps.enc.result.error.message.contains('VLLM_ALLOW_INSECURE_SERIALIZATION=1')"
+      - "!steps.dec.result.ok && steps.dec.result.error.code == 'not-implemented-error' && steps.dec.result.error.message == 'Extension type code 1 is not supported'"
+      - "steps.native.result.ok && steps.native.result.value.bufs[0].value == [1, 2]"
+
+  - id: engine-core-ray-metric-name-sanitized
+    name: Ray metric names keep only letters, digits and underscores
+    fixtures: [full-tp1-llama-8b]
+    steps:
+      - {interface: ray-prometheus-metric.get-sanitized-opentelemetry-name, caller: api-server, as: ok, input: {name: valid_metric_123_abcDEF}}
+      - {interface: ray-prometheus-metric.get-sanitized-opentelemetry-name, caller: api-server, as: mixed, input: {name: "vllm:engine_stats/time.latency_ms-99p"}}
+    expect:
+      - "steps.ok.result.value == 'valid_metric_123_abcDEF'"
+      - "steps.mixed.result.value == 'vllm_engine_stats_time_latency_ms_99p'"
+
+  - id: engine-core-ray-env-vars-to-copy
+    name: Ray actors inherit prefixed, extra and additional env vars, minus excluded ones
+    fixtures: [full-tp1-llama-8b]
+    config: {vllm-ray-extra-env-var-prefixes-to-copy: " MYLIB_ , OTHER_ "}
+    steps:
+      - {interface: ray-env.get-env-vars-to-copy, caller: api-server, as: r, input: {environ: [CUSTOM_PLATFORM_VAR, NCCL_DEBUG, MYLIB_X, LMCACH_TYPO, HOME], additional_vars: [CUSTOM_PLATFORM_VAR], exclude_vars: [VLLM_HOST_IP]}}
+    expect:
+      - "'CUSTOM_PLATFORM_VAR' in steps.r.result.value && 'NCCL_DEBUG' in steps.r.result.value && 'MYLIB_X' in steps.r.result.value && 'PYTHONHASHSEED' in steps.r.result.value"
+      - "!('LMCACH_TYPO' in steps.r.result.value) && !('HOME' in steps.r.result.value) && !('VLLM_HOST_IP' in steps.r.result.value)"
+
+  - id: engine-core-llm-startup-error
+    name: LLMEngine startup fails with 'Engine core initialization failed' when rank 0 can't load weights
+    fixtures: [full-tp1-llama-8b]
+    faults:
+      - {target: gpu-worker-impl.load-model, type: error, code: runtime-error, message: "Simulated Error in startup!", instance: rank0}
+    steps:
+      - {interface: llm-engine.from-engine-args, caller: python-user, as: e}
+    expect:
+      - "!steps.e.result.ok && steps.e.result.error.message.contains('initialization failed')"
+      - "!trace.exists(e, e.type == 'call.start' && e.interface == 'kv-cache-utils.get-kv-cache-configs')"

@@ -1,0 +1,48 @@
+schema_version: 1
+id: vllm
+scenarios:
+  - id: bench-e3
+    name: "E3: abort a running request"
+    description: >-
+      Verified against v0.32.0: AsyncLLM.abort (async_llm.py:911-922) first has the
+      OutputProcessor pop the request state and put a final RequestOutput with
+      finish_reason=FinishReason.ABORT ("abort", engine/__init__.py:36) on the request's queue
+      (output_processor.py:552-605), then sends ABORT over ZMQ. process_input_sockets puts it on
+      both aborts_queue and input_queue (core.py:1921-1931); EngineCore.abort_requests calls
+      scheduler.finish_requests(ids, FINISHED_ABORTED) (core.py:554-560), which removes it from
+      running and frees its blocks through kv_cache_manager.free unless a KV connector defers
+      the free (scheduler.py:2649-2775; defer_block_free is False without kv_transfer_config).
+    fixtures: [full-tp1-llama-8b]
+    steps:
+      - flow: engine-core-busy-loop
+        input: {iterations: 30}
+        as: loop
+        await: false
+      - flow: async-llm-generate
+        input:
+          priority: 0
+          prompt_token_ids: [128000, 9906, 11, 856, 836, 374]
+          request_id: chatcmpl-abc123
+          sampling_params: {max_tokens: 64, n: 1, stop: [], temperature: 0}
+        at_ms: 0
+        as: gen
+        await: false
+      - flow: async-llm-abort
+        input: {internal: false, request_ids: [chatcmpl-abc123]}
+        at_ms: 200
+        as: ab
+    expect:
+      # the generator ends with a final abort output, before max_tokens
+      - "steps.gen.result.ok && steps.gen.result.value.items[size(steps.gen.result.value.items)-1].finished && steps.gen.result.value.items[size(steps.gen.result.value.items)-1].finish_reason == 'abort' && size(steps.gen.result.value.items[size(steps.gen.result.value.items)-1].token_ids) < 64"
+      # path: output processor first, then ABORT to the engine core, then the scheduler frees the blocks
+      - >-
+        trace.filter(e, e.type == 'call.start' && e.interface in ['output-processor.abort-requests', 'async-mp-client.abort-requests-async',
+        'engine-core-proc.handle-abort', 'engine-core.abort-requests', 'scheduler.finish-requests', 'kv-cache-manager.free'])
+        .map(e, e.interface).slice(0, 6) == ['output-processor.abort-requests', 'async-mp-client.abort-requests-async',
+        'engine-core-proc.handle-abort', 'engine-core.abort-requests', 'scheduler.finish-requests', 'kv-cache-manager.free']
+      - "trace.exists(e, e.type == 'call.start' && e.interface == 'block-pool.free-blocks')"
+      # the request was running when aborted (it had generated tokens), and it is gone everywhere afterwards
+      - "size(steps.gen.result.value.items[size(steps.gen.result.value.items)-1].token_ids) > 0"
+      - "state.scheduler.requests == {} && state.scheduler.running == [] && state['output-processor'].request_states == {} && state['output-processor'].external_req_ids == {}"
+      # no blocks remain allocated: every block id handed out is back in the free queue
+      - "state['block-pool'].ref_cnt == {} && size(state['block-pool'].free_front) + size(state['block-pool'].free_tail) == state['block-pool'].next_fresh - 1"

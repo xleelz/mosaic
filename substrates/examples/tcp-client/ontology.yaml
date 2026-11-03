@@ -1,0 +1,158 @@
+# A tiny client and server built on the TCP/TLS substrate, to show an import works. The quote
+# service fetches a quote from a TLS backend: it dials with a 2 s connect timeout, retrying a
+# refused connection twice, verifies the backend's certificate, writes the request and reads
+# the reply with a 1 s read timeout. The backend accepts, reads the request, answers and closes
+# with close_notify.
+# Imported ids: components and interfaces under "tcp/" (tcp/tcp-stack.connect, tcp/tls.handshake),
+# schemas under "tcp.", state at state['tcp/tcp-stack'] and state['tcp/tls']. The local
+# tcp-rtt-ms overrides the substrate's 10 ms: the backend is in another region.
+schema_version: 1
+id: tcp-client
+name: Quote client over TLS (substrate import example)
+level: system
+imports:
+  - {ontology: ../../tcp-tls/tcp-tls.yaml, as: tcp}
+
+configs:
+  - id: tcp-rtt-ms
+    type: integer
+    value: 40
+    default: 10
+    summary: "The backend is in another region: 40 ms round trips (overrides the substrate's LAN default)."
+
+components:
+  - {id: user, kind: client, summary: The caller of the quote API.}
+  - {id: quote-api, kind: service, summary: "Fetches quotes from the backend over TLS (host 10.0.1.1)."}
+  - {id: quote-backend, kind: service, summary: "The TLS backend on 10.0.1.5:443; one connection per serve call."}
+
+schemas:
+  - id: Cert
+    summary: The backend's certificate, as the substrate's listen takes it.
+    schema: {$ref: tcp.Certificate}
+
+interfaces:
+  - component: quote-api
+    name: fetch-quote
+    kind: http
+    attributes: {method: GET, path: /v1/quote}
+    request: {type: object, properties: {symbol: {type: string, default: ACME}}}
+    response: {type: object, properties: {quote: {type: string}, attempts: {type: integer}}}
+    errors: [{code: upstream_unavailable, status: 502}, {code: upstream_tls, status: 502}, {code: upstream_timeout, status: 504}]
+    behavior:
+      - call: tcp/tcp-stack.connect
+        input: {host: 10.0.1.1, addr: "10.0.1.5:443", timeout_ms: 2000}
+        retry: {max_attempts: 3, backoff_ms: 100, on_codes: [ECONNREFUSED]}
+        as: conn
+        on_error:
+          - fail: {code: upstream_unavailable, status: 502, message: "= 'dial backend: ' + error.code"}
+      - call: tcp/tls.handshake
+        input: {sock: "= vars.conn.value.sock", server_name: quotes.example.test}
+        on_error:
+          - fail: {code: upstream_tls, status: 502, message: "= 'tls: ' + error.code", data: {alert: "= error.code"}}
+      - call: tcp/tls.write
+        input: {sock: "= vars.conn.value.sock", data: "= 'GET /quote/' + input.symbol"}
+      - call: tcp/tls.read
+        input: {sock: "= vars.conn.value.sock", timeout_ms: 1000}
+        as: reply
+        on_error:
+          - call: tcp/tcp-stack.close
+            input: {sock: "= vars.conn.value.sock", linger_zero: true}
+          - fail: {code: upstream_timeout, status: 504, message: "= 'read backend: ' + error.code"}
+      - call: tcp/tls.close
+        input: {sock: "= vars.conn.value.sock"}
+      - return: {quote: "= vars.reply.value.data", attempts: "= vars.conn.attempts"}
+
+  - component: quote-backend
+    name: start
+    kind: function
+    request: {type: object, required: [cert], properties: {cert: Cert}}
+    response: {type: object, properties: {addr: {type: string}}}
+    behavior:
+      - call: tcp/tcp-stack.listen
+        input: {addr: "10.0.1.5:443", backlog: 16, cert: "= input.cert"}
+        as: l
+      - return: {addr: "= vars.l.value.addr"}
+
+  - component: quote-backend
+    name: serve
+    kind: function
+    summary: Accept one connection, read the request, answer it (unless reply is false) and close.
+    request: {type: object, properties: {reply: {type: boolean, default: true}}}
+    response: {type: object, properties: {request: {type: string}, alert: {type: string}}}
+    behavior:
+      - call: tcp/tcp-stack.accept
+        input: {addr: "10.0.1.5:443"}
+        as: a
+      - call: tcp/tls.accept-handshake
+        input: {sock: "= vars.a.value.sock", timeout_ms: 5000}
+        on_error: [{return: {request: "", alert: "= has(error.data) && error.data != null ? error.data.alert : error.code"}}]
+      - call: tcp/tls.read
+        input: {sock: "= vars.a.value.sock", timeout_ms: 5000}
+        as: req
+        on_error: [{return: {request: ""}}]
+      - if: "!input.reply"
+        then: [{return: {request: "= vars.req.value.data"}}]
+      - call: tcp/tls.write
+        input: {sock: "= vars.a.value.sock", data: "quote:ACME=42"}
+      - call: tcp/tls.close
+        input: {sock: "= vars.a.value.sock"}
+      - return: {request: "= vars.req.value.data"}
+
+flows:
+  - {id: fetch-quote, tags: [reads], entry: {caller: user, interface: quote-api.fetch-quote}}
+  - {id: backend-start, tags: [writes], entry: {caller: user, interface: quote-backend.start}}
+  - {id: backend-serve, tags: [writes], entry: {caller: user, interface: quote-backend.serve}}
+
+fixtures:
+  - id: certs
+    clock: {epoch: "2026-11-01T00:00:00Z"}
+
+scenarios:
+  - id: quote-over-tls
+    name: The quote comes back over a verified TLS 1.3 connection, after connect, handshake and one exchange
+    fixtures: [certs]
+    steps:
+      - {flow: backend-start, as: up, input: {cert: {subject: quotes.example.test, sans: [quotes.example.test], issuer: "Example Root CA", not_before: "2026-01-01T00:00:00Z", not_after: "2027-01-01T00:00:00Z"}}}
+      - {flow: backend-serve, as: srv, await: false}
+      - {flow: fetch-quote, as: q, at_ms: 10, input: {symbol: ACME}}
+    expect:
+      - "steps.q.result.ok && steps.q.result.value.quote == 'quote:ACME=42' && steps.q.result.value.attempts == 1"
+      - "steps.srv.result.value.request == 'GET /quote/ACME'"
+      # 1 ms handler + 40 connect (one RTT) + 41 TLS 1.3 (one RTT + crypto) + 20 request + 20 reply
+      - "steps.q.duration_ms == 122"
+      - "state['tcp/tls'].sessions.exists(k, state['tcp/tls'].sessions[k].close_notify_received)"
+
+  - id: expired-backend-certificate
+    name: An expired backend certificate fails the call 502 upstream_tls, and the backend sees the alert
+    fixtures: [certs]
+    steps:
+      - {flow: backend-start, as: up, input: {cert: {subject: quotes.example.test, sans: [quotes.example.test], issuer: "Example Root CA", not_before: "2025-01-01T00:00:00Z", not_after: "2026-10-01T00:00:00Z"}}}
+      - {flow: backend-serve, as: srv, await: false}
+      - {flow: fetch-quote, as: q, at_ms: 10}
+    expect:
+      - "!steps.q.result.ok && steps.q.result.error.code == 'upstream_tls' && steps.q.result.error.data.alert == 'certificate_expired'"
+      - "steps.srv.result.value.request == '' && steps.srv.result.value.alert == 'certificate_expired'"
+      - "state['tcp/tls'].sessions.exists(k, state['tcp/tls'].sessions[k].alert == 'certificate_expired' && !state['tcp/tls'].sessions[k].alert_sent)"
+
+  - id: refused-until-backend-listens
+    name: Dials refused while the backend is down are retried; the third attempt connects
+    fixtures: [certs]
+    steps:
+      - {flow: fetch-quote, as: q, await: false}
+      - {flow: backend-start, as: up, at_ms: 150, input: {cert: {subject: quotes.example.test, sans: [quotes.example.test], issuer: "Example Root CA", not_before: "2026-01-01T00:00:00Z", not_after: "2027-01-01T00:00:00Z"}}}
+      - {flow: backend-serve, as: srv, at_ms: 151, await: false}
+    expect:
+      - "steps.q.result.ok && steps.q.result.value.attempts == 3"
+      - "retries == 2"
+      - "size(state['tcp/tcp-stack'].socks) == 2"
+
+  - id: backend-never-replies
+    name: A backend that reads the request and never answers trips the 1 s read timeout (504), and the client resets the connection
+    fixtures: [certs]
+    steps:
+      - {flow: backend-start, as: up, input: {cert: {subject: quotes.example.test, sans: [quotes.example.test], issuer: "Example Root CA", not_before: "2026-01-01T00:00:00Z", not_after: "2027-01-01T00:00:00Z"}}}
+      - {flow: backend-serve, as: srv, await: false, input: {reply: false}}
+      - {flow: fetch-quote, as: q, at_ms: 10}
+    expect:
+      - "!steps.q.result.ok && steps.q.result.error.code == 'upstream_timeout' && steps.q.result.error.status == 504"
+      - "state['tcp/tcp-stack'].socks.exists(k, state['tcp/tcp-stack'].socks[k].role == 'client' && state['tcp/tcp-stack'].socks[k].closed)"

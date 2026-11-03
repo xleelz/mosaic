@@ -1,0 +1,633 @@
+interfaces:
+  # ------------------------------------------------------------------ middleware
+  - component: authentication-middleware
+    name: call
+    kind: function
+    summary: "AuthenticationMiddleware.__call__: guarded prefixes need `Authorization: Bearer <one of --api-key>`."
+    sources: ["vllm/entrypoints/serve/middleware/authenticate.py:47-62"]
+    request: {type: object, properties: {path: {type: string, examples: [/v1/chat/completions]}, method: {type: string, default: POST}, headers: {$ref: ServingHttpHeaders}}}
+    errors: [{code: unauthorized, status: 401, retryable: false}]
+    behavior:
+      - title: No --api-key (nor VLLM_API_KEY) means the middleware is not installed
+        source: "vllm/entrypoints/serve/middleware/register.py:32-36"
+        if: "!('api-key' in config) || config['api-key'] == null || size(config['api-key']) == 0"
+        then: [{return: {authenticated: false, reason: no-api-key}}]
+      - title: OPTIONS and paths outside /v1, /v2, /inference, /cohere pass unauthenticated
+        source: "vllm/entrypoints/serve/middleware/authenticate.py:48-59"
+        if: "(has(input.method) && input.method == 'OPTIONS') || !(input.path.startsWith('/v1') || input.path.startsWith('/v2') || input.path.startsWith('/inference') || input.path.startsWith('/cohere'))"
+        then: [{return: {authenticated: false, reason: unguarded}}]
+      - title: verify_token compares the SHA-256 of the bearer token against every configured key
+        source: "vllm/entrypoints/serve/middleware/authenticate.py:30-45"
+        set:
+          vars.auth: "= has(input.headers) && 'Authorization' in input.headers ? input.headers['Authorization'] : ''"
+      - if: "!vars.auth.lowerAscii().startsWith('bearer ') || !(vars.auth.substring(7) in config['api-key'])"
+        then:
+          - title: Unauthorized
+            source: "vllm/entrypoints/serve/middleware/authenticate.py:59-61"
+            fail: {code: unauthorized, status: 401, message: Unauthorized}
+      - return: {authenticated: true}
+  - component: scaling-middleware
+    name: call
+    kind: function
+    summary: "ScalingMiddleware.__call__: 503 for every HTTP request while elastic EP is scaling."
+    sources: ["vllm/entrypoints/serve/elastic_ep/middleware.py:33-48"]
+    request: {type: object, properties: {path: {type: string, examples: [/v1/chat/completions]}}}
+    errors: [{code: Service Unavailable, status: 503, retryable: true}]
+    behavior:
+      - title: Installed only when the model supports generate
+        source: "vllm/entrypoints/serve/middleware/register.py:43-47"
+        call: app-state.supported-tasks
+        as: tasks
+      - if: "('generate' in vars.tasks.value) && state.scaling_elastic_ep"
+        then:
+          - title: The model is scaling
+            source: "vllm/entrypoints/serve/elastic_ep/middleware.py:38-46"
+            fail: {code: Service Unavailable, status: 503, retryable: true, message: The model is currently scaling. Please try again later.}
+      - return: {admitted: true}
+  - component: scaling-middleware
+    name: set-scaling-elastic-ep
+    kind: function
+    summary: "set_scaling_elastic_ep(value): AsyncLLM sets it around an elastic-EP scale."
+    sources: ["vllm/entrypoints/serve/elastic_ep/middleware.py:17-19"]
+    request: {type: object, properties: {value: {type: boolean, examples: [true]}}, required: [value]}
+    behavior:
+      - set: {state.scaling_elastic_ep: "= input.value"}
+      - return: {scaling_elastic_ep: "= input.value"}
+  - component: scaling-middleware
+    name: get-scaling-elastic-ep
+    kind: function
+    summary: "get_scaling_elastic_ep()"
+    sources: ["vllm/entrypoints/serve/elastic_ep/middleware.py:13-14"]
+    request: {type: object, properties: {}}
+    behavior:
+      - return: "= state.scaling_elastic_ep"
+  - component: app-state
+    name: supported-tasks
+    kind: function
+    summary: "The supported tasks build_and_serve got from the engine and passed to build_app / init_app_state."
+    sources: ["vllm/entrypoints/launchers/api_server/entry.py:133-138"]
+    request: {type: object, properties: {}}
+    behavior:
+      - return: "= state.supported_tasks"
+  - component: app-state
+    name: init-app-state
+    kind: function
+    summary: "init_app_state: record the supported tasks and build the handlers (models, renderer, tokenization, generate, pooling)."
+    sources: ["vllm/entrypoints/launchers/api_server/app_state.py:24-176"]
+    request: {type: object, properties: {supported_tasks: {type: array, items: {type: string, examples: [generate]}}}}
+    behavior:
+      - title: Handlers for generate (chat, completion, responses, messages) exist only when the model supports generate; pooling handlers only for pooling tasks
+        source: "vllm/entrypoints/launchers/api_server/app_state.py:132-158"
+        set: {state.supported_tasks: "= input.supported_tasks", state.initialized: true}
+      - title: Load-tracking state starts at zero
+        source: "vllm/entrypoints/launchers/api_server/app_state.py:175-176"
+        call: server-load-metrics.reset
+      - return: {supported_tasks: "= state.supported_tasks"}
+  - component: server-load-metrics
+    name: increment
+    kind: function
+    summary: "load_aware_call: server_load_metrics += 1 before the handler runs."
+    sources: ["vllm/entrypoints/serve/utils/api_utils.py:110-117"]
+    request: {type: object, properties: {}}
+    store: {table: counters, op: incr, key: server_load_metrics, value: 1}
+  - component: server-load-metrics
+    name: decrement
+    kind: function
+    summary: "decrement_server_load: -1 as a response BackgroundTask, on a handler exception, or when listen_for_disconnect sees the client leave."
+    sources: ["vllm/entrypoints/serve/utils/api_utils.py:96-97"]
+    request: {type: object, properties: {}}
+    store: {table: counters, op: incr, key: server_load_metrics, value: -1}
+  - component: server-load-metrics
+    name: read
+    kind: function
+    summary: "Read app.state.server_load_metrics."
+    sources: ["vllm/entrypoints/serve/instrumentator/basic.py:50"]
+    request: {type: object, properties: {}}
+    store: {table: counters, op: get, key: server_load_metrics, default: 0}
+  - component: server-load-metrics
+    name: reset
+    kind: function
+    summary: "init_app_state sets server_load_metrics = 0."
+    sources: ["vllm/entrypoints/launchers/api_server/app_state.py:176"]
+    request: {type: object, properties: {}}
+    store: {table: counters, op: put, key: server_load_metrics, value: 0}
+  # ------------------------------------------------------------------ errors
+  - component: exception-handling
+    name: create-error-response
+    kind: function
+    summary: "create_error_response: an ErrorResponse passes through; an exception maps to its HTTP status and error type."
+    sources: ["vllm/entrypoints/serve/exception_handling/error_response.py:14-100", "vllm/exceptions.py:28-56"]
+    request: {type: object, properties: {code: {type: string, examples: [value-error]}, status: {type: integer, examples: [0]}, message: {type: string}, param: {type: [string, "null"], default: null}, value: {default: null}}, required: [code]}
+    errors:
+      - {code: BadRequestError, status: 400}
+      - {code: NotFoundError, status: 404}
+      - {code: InternalServerError, status: 500}
+      - {code: ServiceUnavailableError, status: 503}
+      - {code: NotImplementedError, status: 501}
+      - {code: Service Unavailable, status: 503}
+      - {code: UnprocessableEntityError, status: 422}
+    behavior:
+      - title: An ErrorResponse built by the handler already carries its HTTP status
+        source: "vllm/entrypoints/openai/chat_completion/api_router.py:64-67"
+        if: "has(input.status) && input.status != null && input.status >= 400 && !(input.code in ['engine-dead-error', 'engine-generate-error', 'generation-error', 'retryable-request-error', 'queue-overflow-error', 'max-queued-tokens-error'])"
+        then: [{fail: "= {'code': input.code, 'status': input.status, 'message': has(input.message) ? input.message : '', 'data': {'param': has(input.param) ? input.param : null}}"}]
+      - title: GracefulHTTPError (queue overflow, prefill backlog) keeps its own status, with the status phrase as type
+        source: "vllm/entrypoints/serve/exception_handling/error_response.py:37-40"
+        if: "input.code in ['queue-overflow-error', 'max-queued-tokens-error']"
+        then: [{fail: {code: Service Unavailable, status: 503, retryable: true, message: "= input.message"}}]
+      - title: "VLLMValidationError: 400 BadRequestError, param = exc.parameter; message = str(exc), which appends ' (parameter=..., value=...)' when they are set"
+        source: "vllm/entrypoints/serve/exception_handling/error_response.py:41-44"
+        if: "input.code == 'vllm-validation-error'"
+        then:
+          - title: "VLLMValidationError.__str__: the base message plus the parameter and the rejected value"
+            source: "vllm/exceptions.py:49-56"
+            set:
+              vars.extras: "= (has(input.param) && input.param != null ? ['parameter=' + input.param] : []) + (has(input.value) && input.value != null ? ['value=' + string(input.value)] : [])"
+          - fail: {code: BadRequestError, status: 400, message: "= size(vars.extras) > 0 ? input.message + ' (' + vars.extras.join(', ') + ')' : input.message", data: {param: "= has(input.param) ? input.param : null"}}
+      - title: "VLLMUnprocessableEntityError: 422 with its parameter"
+        source: "vllm/entrypoints/serve/exception_handling/error_response.py:45-48"
+        if: "input.code == 'vllm-unprocessable-entity-error'"
+        then: [{fail: {code: UnprocessableEntityError, status: 422, message: "= input.message", data: {param: "= has(input.param) ? input.param : null"}}}]
+      - title: Other client errors are 400 BadRequestError with no param (raw ValueError/TypeError/OverflowError included)
+        source: "vllm/entrypoints/serve/exception_handling/error_response.py:53-76"
+        if: "input.code in ['value-error', 'type-error', 'overflow-error', 'vllm-client-error']"
+        then: [{fail: {code: BadRequestError, status: 400, message: "= input.message"}}]
+      - if: "input.code in ['vllm-not-found-error', 'lora-adapter-not-found-error']"
+        then: [{source: "vllm/entrypoints/serve/exception_handling/error_response.py:49-52", fail: {code: NotFoundError, status: 404, message: "= input.message"}}]
+      - title: RetryableRequestError is 503, any other GenerationError 500
+        source: "vllm/entrypoints/serve/exception_handling/error_response.py:58-65"
+        if: "input.code == 'retryable-request-error'"
+        then: [{fail: {code: ServiceUnavailableError, status: 503, retryable: true, message: "= input.message"}}]
+      - if: "input.code == 'not-implemented-error'"
+        then: [{source: "vllm/entrypoints/serve/exception_handling/error_response.py:77-80", fail: {code: NotImplementedError, status: 501, message: "= input.message"}}]
+      - title: Server errors (EngineDeadError, EngineGenerateError, GenerationError, anything else) are 500
+        source: "vllm/entrypoints/serve/exception_handling/error_response.py:66-89"
+        fail: {code: InternalServerError, status: 500, message: "= input.message"}
+  - component: exception-handling
+    name: vllm-error-handler
+    kind: function
+    summary: "The app's exception handlers: engine errors also run terminate_if_errored, then every exception becomes an ErrorResponse."
+    sources: ["vllm/entrypoints/serve/exception_handling/handlers/vllm_error.py:18-77"]
+    request: {type: object, properties: {code: {type: string, examples: [engine-dead-error]}, status: {type: integer}, message: {type: string}, param: {type: [string, "null"], default: null}, value: {default: null}}, required: [code]}
+    behavior:
+      - title: EngineDeadError / EngineGenerateError go through engine_error_handler, which may stop the server
+        source: "vllm/entrypoints/serve/exception_handling/handlers/vllm_error.py:20-64"
+        if: "input.code in ['engine-dead-error', 'engine-generate-error']"
+        then:
+          - call: launcher.terminate-if-errored
+      - call: exception-handling.create-error-response
+        input: {code: "= input.code", status: "= has(input.status) ? input.status : 0", message: "= has(input.message) ? input.message : ''", param: "= has(input.param) ? input.param : null", value: "= has(input.value) ? input.value : null"}
+  # ------------------------------------------------------------------ api_utils
+  - component: api-utils
+    name: listen-for-disconnect
+    kind: function
+    summary: "listen_for_disconnect: loop on request.receive() until http.disconnect, then drop the load counter."
+    sources: ["vllm/entrypoints/serve/utils/api_utils.py:36-48"]
+    request: {type: object, properties: {}}
+    behavior:
+      - if: "state.disconnected"
+        then: [{return: {disconnected: true, stopped: true}}]
+      - title: await request.receive() -- nothing arrived yet
+        source: "vllm/entrypoints/serve/utils/api_utils.py:38-39"
+        if: "size(state.inbox) == 0"
+        then: [{return: {disconnected: false, waiting: true}}]
+      - set: {vars.msg: "= state.inbox[0]", state.inbox: "= state.inbox.slice(1, size(state.inbox))"}
+      - if: "vars.msg.type == 'http.disconnect'"
+        then:
+          - set: {state.disconnected: true}
+          - title: Client disconnected; decrement the load counter when tracking is on
+            source: "vllm/entrypoints/serve/utils/api_utils.py:40-48"
+            when: "config['enable-server-load-tracking']"
+            call: server-load-metrics.decrement
+          - return: {disconnected: true}
+      - return: {disconnected: false, consumed: "= vars.msg.type"}
+  - component: api-utils
+    name: get-max-tokens
+    kind: function
+    summary: "get_max_tokens: refuse prompts longer than max_model_len, else min(max_model_len - prompt, requested or default, override)."
+    sources: ["vllm/entrypoints/serve/utils/api_utils.py:169-202"]
+    request: {type: object, properties: {prompt_len: {type: integer, examples: [14]}, max_tokens: {type: [integer, "null"], examples: [16]}}, required: [prompt_len]}
+    errors: [{code: value-error, status: 0, retryable: false}]
+    behavior:
+      - if: "config['max-model-len'] < input.prompt_len"
+        then:
+          - title: Input length exceeds the model's maximum context length
+            source: "vllm/entrypoints/serve/utils/api_utils.py:184-188"
+            fail: {code: value-error, message: "= 'Input length (' + string(input.prompt_len) + ') exceeds model\\'s maximum context length (' + string(config['max-model-len']) + ').'"}
+      - set:
+          vars.model_max: "= config['max-model-len'] - input.prompt_len"
+      - title: The requested max_tokens (or the generation-config default) is capped by the remaining context
+        source: "vllm/entrypoints/serve/utils/api_utils.py:189-202"
+        return: {max_tokens: "= has(input.max_tokens) && input.max_tokens != null && input.max_tokens < vars.model_max ? input.max_tokens : vars.model_max"}
+  # ------------------------------------------------------------------ launcher
+  - component: launcher
+    name: terminate-if-errored
+    kind: function
+    summary: "terminate_if_errored: when the engine errored and is not running, set uvicorn's should_exit (unless VLLM_KEEP_ALIVE_ON_ENGINE_DEATH)."
+    sources: ["vllm/entrypoints/launchers/launcher.py:323-333"]
+    request: {type: object, properties: {}}
+    behavior:
+      - title: "engine.errored is engine_core.resources.engine_dead (or a stopped output handler); read through ensure_alive"
+        source: "vllm/entrypoints/launchers/launcher.py:330"
+        call: async-mp-client.ensure-alive
+        as: st
+        on_error: continue
+      - title: "errored and not is_running: a dead engine core also stops the output handler (ASSUMPTION: the handler is not otherwise stopped)"
+        source: "vllm/v1/engine/async_llm.py:1298-1309"
+        set:
+          vars.errored: "= !vars.st.ok"
+      - if: "vars.errored && !config['vllm-keep-alive-on-engine-death']"
+        then:
+          - title: server.should_exit = True
+            source: "vllm/entrypoints/launchers/launcher.py:331-333"
+            set: {state.server_should_exit: true}
+          - return: {should_exit: true}
+      - return: {should_exit: "= state.server_should_exit"}
+  - component: launcher
+    name: watchdog-loop
+    kind: function
+    summary: "watchdog_loop: every VLLM_WATCHDOG_TIME_S (5 s) check the engine and stop the server if it died (needed because streaming errors are not raised)."
+    sources: ["vllm/entrypoints/launchers/launcher.py:312-320"]
+    request: {type: object, properties: {}}
+    behavior:
+      - title: await asyncio.sleep(VLLM_WATCHDOG_TIME_S)
+        source: "vllm/entrypoints/launchers/launcher.py:317-319"
+        wait: "= config['vllm-watchdog-time-ms']"
+      - call: launcher.terminate-if-errored
+        as: t
+      - return: {should_exit: "= vars.t.value.should_exit"}
+  - component: launcher
+    name: serve-http
+    kind: function
+    summary: "serve_http: run uvicorn with the watchdog task; uvicorn's main loop exits once should_exit is set."
+    sources: ["vllm/entrypoints/launchers/launcher.py:175-310"]
+    request: {type: object, properties: {}}
+    behavior:
+      - title: uvicorn's main loop checks should_exit on every tick
+        source: "vllm/entrypoints/launchers/launcher.py:229-234"
+        if: "state.server_should_exit"
+        then: [{return: {serving: false, shutdown: true}}]
+      - title: "uvicorn starts listening on the pre-bound socket: connections are accepted from here on"
+        source: "vllm/entrypoints/launchers/launcher.py:175-200"
+        set: {state.listening: true}
+      - title: The watchdog is started only when there is an engine client
+        source: "vllm/entrypoints/launchers/launcher.py:231-235"
+        emit: launcher.watchdog-loop
+      - return: {serving: true, shutdown: false}
+  - component: launcher
+    name: setup-server
+    kind: function
+    summary: "setup_server: validate the parser args, bind the socket (TCP or Unix) before the engine starts."
+    sources: ["vllm/entrypoints/launchers/launcher.py:378-411"]
+    request: {type: object, properties: {host: {type: string, examples: [0.0.0.0]}, port: {type: integer, examples: [8000]}, uds: {type: [string, "null"], default: null}}}
+    errors: [{code: key-error, status: 0, retryable: false}]
+    behavior:
+      - title: validate_api_server_args -- auto tool choice needs a registered tool parser
+        source: "vllm/entrypoints/launchers/launcher.py:356-362"
+        if: "config['enable-auto-tool-choice']"
+        then: [{fail: {code: key-error, message: "invalid tool call parser: None"}}]
+      - title: "The port is bound before the engine is set up, but nothing listens on it until serve_http: connections are refused meanwhile"
+        source: "vllm/entrypoints/launchers/launcher.py:390-397"
+        set: {state.listening: false}
+      - if: "has(input.uds) && input.uds != null && input.uds != ''"
+        then: [{source: "vllm/entrypoints/launchers/launcher.py:395-404", return: {listen_address: "= 'unix:' + input.uds"}}]
+      - return: {listen_address: "= 'http://' + (has(input.host) ? input.host : '0.0.0.0') + ':' + string(has(input.port) ? input.port : 8000)"}
+  # ------------------------------------------------------------------ base serving
+  - component: base-serving
+    name: check-model
+    kind: function
+    summary: "_check_model: the request's model must be a served name or a loaded LoRA adapter (an empty model is fine)."
+    sources: ["vllm/entrypoints/serve/engine/serving.py:49-91"]
+    request: {type: object, properties: {model: {type: string, examples: [llama-8b]}}}
+    errors: [{code: NotFoundError, status: 404, retryable: false}]
+    behavior:
+      - title: "base_model_paths: one BaseModelPath(name, model_path) per served name (the model path when none is given)"
+        source: "vllm/entrypoints/openai/models/protocol.py:8-11"
+        set:
+          vars.served: "= config['served-model-name'] != null ? config['served-model-name'] : [config['model']]"
+      - title: An empty model, or a served alias, is the base model
+        source: "vllm/entrypoints/serve/engine/serving.py:58-59"
+        if: "!has(input.model) || input.model == null || input.model == '' || input.model in vars.served"
+        then: [{return: {model_name: "= vars.served[0]", lora_name: null}}]
+      - title: A LoRA adapter loaded under that name
+        source: "vllm/entrypoints/serve/engine/serving.py:60-61"
+        call: openai-serving-models.lookup-lora
+        input: {lora_name: "= input.model"}
+        as: lora
+      - if: "vars.lora.value != null"
+        then: [{return: {model_name: "= input.model", lora_name: "= input.model"}}]
+      - title: Unknown model
+        source: "vllm/entrypoints/serve/engine/serving.py:75-84"
+        fail: {code: NotFoundError, status: 404, message: "= 'The model `' + input.model + '` does not exist. Valid aliases: ' + vars.served.join(', ') + '.'", data: {param: model}}
+  - component: generate-base-serving
+    name: preflight
+    kind: function
+    summary: "_preflight: raise the engine's dead_error if it errored, then check_admission(n) (queue limits)."
+    sources: ["vllm/entrypoints/generate/base/serving.py:169-182"]
+    request: {type: object, properties: {n: {type: integer, default: 1}}}
+    behavior:
+      - title: engine_client.errored -> raise dead_error
+        source: "vllm/entrypoints/generate/base/serving.py:179-180"
+        call: async-mp-client.ensure-alive
+      - title: check_admission(n)
+        source: "vllm/entrypoints/generate/base/serving.py:181"
+        call: async-llm.check-admission
+        input: {n: "= has(input.n) ? input.n : 1"}
+      - return: {admitted: true}
+  - component: generate-base-serving
+    name: raise-if-error
+    kind: function
+    summary: "_raise_if_error: finish_reason 'error' raises GenerationError (500)."
+    sources: ["vllm/entrypoints/generate/base/serving.py:200-207"]
+    request: {type: object, properties: {finish_reason: {type: [string, "null"], examples: [stop]}, request_id: {type: string}}}
+    errors: [{code: generation-error, status: 0, retryable: false}]
+    behavior:
+      - if: "has(input.finish_reason) && input.finish_reason == 'error'"
+        then:
+          - title: Request failed with an internal error during generation
+            source: "vllm/entrypoints/generate/base/serving.py:202-207"
+            fail: {code: generation-error, message: Internal server error}
+      - return: {ok: true}
+  # ------------------------------------------------------------------ renderers
+  - component: online-renderer
+    name: validate-chat-template
+    kind: function
+    summary: "validate_chat_template: a request-supplied chat template is refused unless --trust-request-chat-template."
+    sources: ["vllm/renderers/online_renderer.py:678-697"]
+    request: {type: object, properties: {chat_template: {type: [string, "null"]}}}
+    errors: [{code: BadRequestError, status: 400}]
+    behavior:
+      - if: "!config['trust-request-chat-template'] && has(input.chat_template) && input.chat_template != null"
+        then:
+          - title: Untrusted request chat template
+            source: "vllm/renderers/online_renderer.py:686-696"
+            fail: {code: BadRequestError, status: 400, message: "Chat template is passed with request, but --trust-request-chat-template is not set. Refused request with untrusted chat template."}
+      - return: {ok: true}
+  - component: online-renderer
+    name: render-chat
+    kind: function
+    summary: "render_chat: tool_choice checks, chat-template check, then preprocess_chat: chat template, tokenization and the parser's adjust_request."
+    sources: ["vllm/renderers/online_renderer.py:224-317"]
+    request: {type: object, properties: {body: {$ref: ServingChatCompletionRequest}}, required: [body]}
+    errors: [{code: BadRequestError, status: 400}]
+    behavior:
+      - set:
+          vars.has_parser: "= ('tool-call-parser' in config) && config['tool-call-parser'] != null && config['tool-call-parser'] != ''"
+      - title: Without a tool parser, tool_choice=auto needs --enable-auto-tool-choice; required/named needs --tool-call-parser
+        source: "vllm/renderers/online_renderer.py:252-280"
+        if: "!vars.has_parser && has(input.body.tool_choice) && input.body.tool_choice != null && input.body.tool_choice != 'none'"
+        then:
+          - if: "input.body.tool_choice == 'auto'"
+            then:
+              - when: "!config['enable-auto-tool-choice']"
+                fail: {code: BadRequestError, status: 400, message: "\"auto\" tool choice requires --enable-auto-tool-choice and --tool-call-parser to be set"}
+            else:
+              - fail: {code: BadRequestError, status: 400, message: "= 'tool_choice=\"' + string(input.body.tool_choice) + '\" requires --tool-call-parser to be set'"}
+      - call: online-renderer.validate-chat-template
+        input: {chat_template: "= has(input.body.chat_template) ? input.body.chat_template : null"}
+      - title: "validate_request_mm_kwargs: per-request media_io_kwargs / mm_processor_kwargs need --trust-request-mm-kwargs"
+        source: "vllm/entrypoints/generate/base/protocol.py:72-97"
+        if: "!config['trust-request-mm-kwargs'] && ((has(input.body.media_io_kwargs) && input.body.media_io_kwargs != null && size(input.body.media_io_kwargs) > 0) || (has(input.body.mm_processor_kwargs) && input.body.mm_processor_kwargs != null && size(input.body.mm_processor_kwargs) > 0))"
+        then: [{fail: {code: BadRequestError, status: 400, message: Per-request media_io_kwargs are disabled by default because they can change multimodal media loading resource usage. Start the server with --trust-request-mm-kwargs only when clients are trusted., data: {param: media_io_kwargs}}}]
+      - title: "preprocess_chat builds the request's TokenizeParams first (build_tok_params: max_completion_tokens, else max_tokens, against max_model_len)"
+        source: "vllm/renderers/online_renderer.py:784"
+        call: tokenize-params.post-init
+        input:
+          max_total_tokens: "= config['max-model-len']"
+          max_output_tokens: "= has(input.body.max_completion_tokens) && input.body.max_completion_tokens != null ? input.body.max_completion_tokens : (has(input.body.max_tokens) && input.body.max_tokens != null ? input.body.max_tokens : 0)"
+          max_output_tokens_param: "= has(input.body.max_completion_tokens) && input.body.max_completion_tokens != null ? 'max_completion_tokens' : 'max_tokens'"
+          max_total_tokens_param: max_model_len
+      - if: "config['tokenizer-mode'] == 'cohere'"
+        then:
+          - title: "The server's renderer is the one registered for --tokenizer-mode (renderer_from_config): cohere renders with melody"
+            source: "vllm/renderers/registry.py:82-88"
+            call: cohere-renderer.render-messages
+            input: {messages: "= input.body.messages"}
+            as: ch
+          - set: {vars.prompt: "= {'value': {'prompt_token_ids': vars.ch.value.prompt_token_ids, 'max_token_id': null, 'multi_modal_data': null, 'prompt_embeds': null}}"}
+        else:
+          - title: preprocess_chat -- parse the content parts, apply the chat template and tokenize
+            source: "vllm/renderers/online_renderer.py:752-824"
+            call: hf-renderer.render-messages
+            input: {messages: "= input.body.messages", media_io_kwargs: "= has(input.body.media_io_kwargs) ? input.body.media_io_kwargs : null"}
+            as: prompt
+      - call: base-renderer.tokenize-prompt
+        input: {prompt_token_ids: "= vars.prompt.value.prompt_token_ids", max_token_id: "= vars.prompt.value.max_token_id"}
+        as: tok
+      - set: {vars.body: "= input.body"}
+      - title: "The parser adjusts the request when tools are in play (always_adjust_request, a reasoning parser, or tool_choice != none)"
+        source: "vllm/renderers/online_renderer.py:825-854"
+        if: "vars.has_parser && has(input.body.tool_choice) && input.body.tool_choice != null && input.body.tool_choice != 'none'"
+        then:
+          - call: llama3-json-tool-parser.adjust-request
+            input: {body: "= input.body"}
+            as: adj
+          - set: {vars.body: "= vars.adj.value"}
+      - return: {conversation: "= input.body.messages", prompt_token_ids: "= vars.tok.value.prompt_token_ids", body: "= vars.body", multi_modal_data: "= vars.prompt.value.multi_modal_data", prompt_embeds: "= vars.prompt.value.prompt_embeds"}
+  - component: online-renderer
+    name: render-completion
+    kind: function
+    summary: "render_completion: suffix/echo/prompt-embeds checks, then tokenize each prompt (preprocess_completion)."
+    sources: ["vllm/renderers/online_renderer.py:588-667"]
+    request: {type: object, properties: {body: {$ref: ServingCompletionRequest}}, required: [body]}
+    errors: [{code: BadRequestError, status: 400}]
+    behavior:
+      - if: "has(input.body.suffix) && input.body.suffix != null"
+        then:
+          - if: "has(input.body.echo) && input.body.echo"
+            then: [{source: "vllm/renderers/online_renderer.py:600-605", fail: {code: BadRequestError, status: 400, message: Echo is unsupported with suffix., data: {param: suffix}}}]
+          - title: Llama has no FIM completion rendering, so render_completion_suffix returns None
+            source: "vllm/renderers/online_renderer.py:619-628"
+            fail: {code: BadRequestError, status: 400, message: suffix is only supported for models with FIM completion rendering, data: {param: suffix}}
+      - title: "preprocess_cmpl builds the request's TokenizeParams (build_tok_params: max_tokens against max_model_len)"
+        source: "vllm/renderers/online_renderer.py:739"
+        call: tokenize-params.post-init
+        input:
+          max_total_tokens: "= config['max-model-len']"
+          max_output_tokens: "= has(input.body.max_tokens) && input.body.max_tokens != null ? input.body.max_tokens : 16"
+          max_output_tokens_param: max_tokens
+          max_total_tokens_param: max_model_len
+      - set:
+          vars.prompts: "= type(input.body.prompt) == string ? [input.body.prompt] : input.body.prompt"
+          vars.inputs: []
+      - title: preprocess_cmpl renders every prompt in order
+        source: "vllm/renderers/online_renderer.py:715-750"
+        foreach: "= vars.prompts"
+        as: p
+        max: 16
+        steps:
+          - call: base-renderer.tokenize-prompt
+            input: {prompt: "= vars.p"}
+            as: tok
+          - set: {vars.inputs: "= vars.inputs + [{'prompt': vars.p, 'prompt_token_ids': vars.tok.value.prompt_token_ids}]"}
+      - return: {engine_inputs: "= vars.inputs"}
+  - component: online-renderer
+    name: render-responses
+    kind: function
+    summary: "render_responses: previous messages and outputs plus the new input (a string, or response items turned into chat messages), chat-templated (continuing a partial final message instead of adding a generation prompt) and tokenized."
+    sources: ["vllm/renderers/online_renderer.py:319-383"]
+    request: {type: object, properties: {input: {type: [string, array], items: {type: object}, examples: [Hello!]}, previous_messages: {type: [array, "null"]}, previous_output_text: {type: [string, "null"]}}, required: [input]}
+    behavior:
+      - if: "type(input.input) == string"
+        then:
+          - set: {vars.new: "= [{'role': 'user', 'content': input.input}]"}
+        else:
+          - title: "construct_chat_messages_with_tool_call: each response item becomes a chat message (messages keep their role and text; a reasoning item is an assistant message carrying the reasoning; function calls and their outputs become tool calls and tool messages)"
+            source: "vllm/entrypoints/openai/responses/utils.py:293-340"
+            set:
+              vars.new: "= input.input.map(it, !has(it.type) || it.type == 'message' ? {'role': has(it.role) ? it.role : 'assistant', 'content': type(it.content) == string ? it.content : it.content.filter(p, has(p.text)).map(p, p.text).join('')} : (it.type == 'reasoning' ? {'role': 'assistant', 'content': '', 'reasoning': has(it.content) && it.content != null ? it.content.filter(p, has(p.text)).map(p, p.text).join('') : ''} : (it.type == 'function_call' ? {'role': 'assistant', 'content': '', 'tool_calls': [{'id': it.call_id, 'type': 'function', 'function': {'name': it.name, 'arguments': it.arguments}}]} : {'role': 'tool', 'tool_call_id': has(it.call_id) ? it.call_id : '', 'content': has(it.output) ? string(it.output) : ''})))"
+      - set:
+          vars.messages: "= (has(input.previous_messages) && input.previous_messages != null ? input.previous_messages.filter(m, m.role != 'system') : []) + (has(input.previous_output_text) && input.previous_output_text != null ? [{'role': 'assistant', 'content': input.previous_output_text}] : []) + vars.new"
+      - title: "should_continue_final_message: continue only when the last item is an output message or reasoning item whose status is in_progress or incomplete"
+        source: "vllm/entrypoints/openai/responses/utils.py:206-245"
+        set:
+          vars.last: "= type(input.input) == string || size(input.input) == 0 ? null : input.input[size(input.input) - 1]"
+      - set:
+          vars.continue_final: "= vars.last != null && (!has(vars.last.type) || vars.last.type in ['message', 'reasoning']) && has(vars.last.status) && vars.last.status in ['in_progress', 'incomplete']"
+      - title: "build_chat_params: add_generation_prompt = not continue_final, continue_final_message = continue_final; construct_input_messages + chat template"
+        source: "vllm/entrypoints/openai/responses/protocol.py:420-436"
+        call: hf-renderer.render-messages
+        input: {messages: "= vars.messages", add_generation_prompt: "= !vars.continue_final", continue_final_message: "= vars.continue_final"}
+        as: prompt
+      - call: base-renderer.tokenize-prompt
+        input: {prompt_token_ids: "= vars.prompt.value.prompt_token_ids"}
+        as: tok
+      - return: {messages: "= vars.messages", prompt_token_ids: "= vars.tok.value.prompt_token_ids", continue_final_message: "= vars.continue_final"}
+  - component: hf-renderer
+    name: render-messages
+    kind: function
+    summary: "HfRenderer.render_messages_async: parse the chat messages and their content parts (text, image_url, video_url, image_embeds, prompt_embeds), apply the Llama-3.1 chat template with the generation prompt, tokenize."
+    sources: ["vllm/renderers/hf.py:1123-1180"]
+    latency_ms: "= config['api-chat-template-ms']"
+    request: {type: object, properties: {messages: {type: array, items: {type: object}}, media_io_kwargs: {type: [object, "null"], default: null}, add_generation_prompt: {type: boolean, default: true}, continue_final_message: {type: boolean, default: false}}, required: [messages]}
+    errors: [{code: BadRequestError, status: 400}]
+    behavior:
+      - set:
+          vars.agp: "= !has(input.add_generation_prompt) || input.add_generation_prompt"
+          vars.cont: "= has(input.continue_final_message) && input.continue_final_message"
+      - title: "safe_apply_chat_template's role handling: Llama-3.1's template has no developer role, so developer messages become one leading system message"
+        source: "vllm/renderers/hf.py:802-810"
+        call: hf-renderer.safe-apply-chat-template
+        input: {conversation: "= input.messages", chat_template: llama-3.1, tokenize: false, add_generation_prompt: "= vars.agp && !vars.cont"}
+        as: tpl
+      - set:
+          vars.msgs: "= vars.tpl.value.conversation"
+      - set:
+          vars.parts: "= vars.msgs.map(m, !has(m.content) || m.content == null || type(m.content) == string ? [] : m.content.filter(p, has(p.type) && p.type != 'text'))"
+      - set:
+          vars.media: "= vars.parts.map(ps, ps.filter(p, p.type in ['image_url', 'image_embeds', 'input_audio', 'audio_url', 'video_url']))"
+          vars.embeds: "= vars.parts.map(ps, ps.filter(p, p.type == 'prompt_embeds'))"
+      - set:
+          vars.n_media: "= sum(vars.media.map(ps, size(ps)))"
+          vars.n_embeds: "= sum(vars.embeds.map(ps, size(ps)))"
+          vars.placeholder_id: 0
+      - title: "A prompt_embeds part needs --enable-prompt-embeds"
+        source: "vllm/renderers/chat_utils.py:1062-1076"
+        if: "vars.n_embeds > 0 && !config['enable-prompt-embeds']"
+        then: [{fail: {code: BadRequestError, status: 400, message: "You must set `--enable-prompt-embeds` to input `prompt_embeds`", data: {param: prompt_embeds}}}]
+      - title: "Media parts go through the multimodal processor, which a text-only model does not have"
+        source: "vllm/renderers/base.py:228-230"
+        if: "vars.n_media > 0 && !config['model-is-multimodal']"
+        then: [{fail: {code: BadRequestError, status: 400, message: Multi-modal processor not available for text-only models}}]
+      - title: "The chat template rejects invalid input by raising; safe_apply_chat_template turns that into a 400 with the template's reason (Llama-3.1's template allows one tool call per assistant message)"
+        source: "vllm/renderers/hf.py:824-837"
+        if: "vars.msgs.exists(m, has(m.tool_calls) && m.tool_calls != null && size(m.tool_calls) > 1)"
+        then: [{fail: {code: BadRequestError, status: 400, message: This model only supports single tool-calls at once!}}]
+      - if: "vars.n_embeds > 0"
+        then:
+          - title: "Register <##PROMPT_EMBEDS##> as a special token (idempotent)"
+            source: "vllm/renderers/hf.py:1026-1030"
+            call: hf-renderer.ensure-prompt-embeds-placeholder-token
+            as: ph
+          - set: {vars.placeholder_id: "= vars.ph.value.token_id"}
+      - title: "ChatParams.with_defaults: the request's media_io_kwargs are merged over the server's --media-io-kwargs (merge_media_io_kwargs; a request GPU video backend is stripped)"
+        source: "vllm/renderers/params.py:88-114"
+        if: "has(input.media_io_kwargs) && input.media_io_kwargs != null && size(input.media_io_kwargs) > 0"
+        then:
+          - call: media-connector.merge-media-io-kwargs
+            input: {overrides: "= input.media_io_kwargs"}
+            as: mio
+          - set: {vars.mio_kwargs: "= vars.mio.value"}
+        else:
+          - set: {vars.mio_kwargs: null}
+      - title: "A video is loaded with num_frames from the merged media_io_kwargs, else the loader default (32)"
+        source: "vllm/multimodal/media/video.py:95-101"
+        set:
+          vars.frames: "= vars.mio_kwargs != null && 'video' in vars.mio_kwargs && vars.mio_kwargs.video != null && 'num_frames' in vars.mio_kwargs.video ? vars.mio_kwargs.video.num_frames : config['media-io-video-num-frames']"
+      - title: "Text parts are joined; each image leaves its placeholder, each video one placeholder per frame (ASSUMPTION: api-video-tokens-per-frame tokens each), each prompt_embeds part the placeholder token spliced after tokenization"
+        source: "vllm/renderers/chat_utils.py:1043-1110"
+        set:
+          vars.contents: "= vars.msgs.map(m, !has(m.content) || m.content == null ? '' : (type(m.content) == string ? m.content : m.content.map(p, p.type == 'text' ? p.text : (p.type == 'prompt_embeds' ? '<##PROMPT_EMBEDS##>' : (p.type == 'video_url' ? lists.range(int(vars.frames) * int(config['api-video-tokens-per-frame'])).map(k, '<|video|>').join(' ') : '<|image|>'))).join(' ')))"
+      - title: "ASSUMPTION: one token per whitespace-separated word, plus <|begin_of_text|>, the header/eot special tokens and the assistant generation prompt"
+        source: "vllm/renderers/hf.py:1130-1170"
+        set:
+          vars.words: "= lists.range(size(vars.msgs)).map(i, '<|start_header_id|> ' + vars.msgs[i].role + ' <|end_header_id|> ' + vars.contents[i] + (vars.cont && i == size(vars.msgs) - 1 ? '' : ' <|eot_id|>')).join(' ').split(' ')"
+      - set:
+          vars.ids: "= [128000] + vars.words.map(w, w == '<|start_header_id|>' ? 128006 : (w == '<|end_header_id|>' ? 128007 : (w == '<|eot_id|>' ? 128009 : (w == '<|image|>' ? 128011 : (w == '<|video|>' ? 128013 : (w == '<##PROMPT_EMBEDS##>' ? vars.placeholder_id : 1000 + size(w))))))) + (vars.agp && !vars.cont ? [128006, 78191, 128007] : [])"
+      - return:
+          prompt_token_ids: "= vars.ids"
+          max_token_id: "= 128255 + size(state.added_tokens)"
+          multi_modal_data: "= vars.n_media > 0 ? dyn({'image': vars.media.map(ps, ps.map(p, has(p.image_url) ? p.image_url.url : (has(p.video_url) ? p.video_url.url : ''))).filter(l, size(l) > 0)}) : null"
+          prompt_embeds: "= vars.n_embeds > 0 ? dyn(vars.embeds.map(ps, ps.map(p, p.data)).filter(l, size(l) > 0)) : null"
+  - component: hf-renderer
+    name: ensure-prompt-embeds-placeholder-token
+    kind: function
+    summary: "_ensure_prompt_embeds_placeholder_token: add <##PROMPT_EMBEDS##> to the tokenizer as one special token once, and return its id (cached)."
+    sources: ["vllm/renderers/hf.py:106-130"]
+    request: {type: object, properties: {}}
+    behavior:
+      - if: "'<##PROMPT_EMBEDS##>' in state.added_tokens"
+        then: [{title: Cached per tokenizer, source: "vllm/renderers/hf.py:109-111", return: {token_id: "= state.added_tokens['<##PROMPT_EMBEDS##>']"}}]
+      - title: "tokenizer.add_special_tokens: the next id after the vocabulary (128256 for Llama-3.1)"
+        source: "vllm/renderers/hf.py:113-115"
+        set: {state.added_tokens: "= merge(state.added_tokens, {'<##PROMPT_EMBEDS##>': 128256 + size(state.added_tokens)})"}
+      - source: "vllm/renderers/hf.py:117-130"
+        return: {token_id: "= state.added_tokens['<##PROMPT_EMBEDS##>']"}
+  - component: hf-renderer
+    name: encode
+    kind: function
+    summary: "tokenizer.encode(text, add_special_tokens=False): added special tokens are single tokens even back to back; other words one token each (ASSUMPTION)."
+    sources: ["vllm/renderers/hf.py:117"]
+    request: {type: object, properties: {text: {type: string, examples: [hello world]}}, required: [text]}
+    behavior:
+      - set:
+          vars.spaced: "= '<##PROMPT_EMBEDS##>' in state.added_tokens ? input.text.replace('<##PROMPT_EMBEDS##>', ' <##PROMPT_EMBEDS##> ') : input.text"
+      - if: "vars.spaced.trim() == ''"
+        then: [{return: {ids: []}}]
+      - return: {ids: "= vars.spaced.trim().split(' ').filter(w, w != '').map(w, w in state.added_tokens ? state.added_tokens[w] : 1000 + size(w))"}
+  - component: base-renderer
+    name: tokenize-prompt
+    kind: function
+    summary: "_tokenize_singleton_prompt + _validate_tokens: tokenize text, then refuse prompts over max_model_len and out-of-vocabulary ids."
+    sources: ["vllm/renderers/base.py:672-697", "vllm/renderers/params.py:515-552"]
+    latency_ms: "= 1 + (has(input.prompt) && input.prompt != null ? size(input.prompt.split(' ')) : (has(input.prompt_token_ids) && input.prompt_token_ids != null ? size(input.prompt_token_ids) : 0)) * config['api-tokenize-us-per-token'] / 1000"
+    request: {type: object, properties: {prompt: {type: [string, "null"], default: null}, prompt_token_ids: {type: [array, "null"], items: {type: integer}, default: null}, max_token_id: {type: [integer, "null"], default: null}}}
+    errors: [{code: BadRequestError, status: 400}]
+    behavior:
+      - title: "Tokenize text (ASSUMPTION: <|begin_of_text|> plus one token per word)"
+        source: "vllm/renderers/base.py:628-643"
+        set:
+          vars.ids: "= has(input.prompt) && input.prompt != null ? [128000] + input.prompt.split(' ').map(w, 1000 + size(w)) : input.prompt_token_ids"
+      - title: Token ids must be in vocabulary (128256 for Llama-3.1)
+        source: "vllm/renderers/base.py:420-455"
+        if: "vars.ids.exists(t, t < 0 || t > (has(input.max_token_id) && input.max_token_id != null ? input.max_token_id : 128255))"
+        then: [{fail: {code: BadRequestError, status: 400, message: Token id is out of vocabulary}}]
+      - title: _token_len_check -- the prompt alone exceeds the context
+        source: "vllm/renderers/params.py:515-537"
+        if: "size(vars.ids) > config['max-model-len']"
+        then:
+          - fail: {code: BadRequestError, status: 400, message: "= 'This model\\'s maximum context length is ' + string(config['max-model-len']) + ' tokens. However, your prompt contains ' + string(size(vars.ids)) + ' input tokens, which exceeds this limit even without any output tokens. Please reduce the length of the input prompt.'", data: {param: input_tokens}}
+      - return: {prompt_token_ids: "= vars.ids"}
+  - component: base-renderer
+    name: detokenize-prompt
+    kind: function
+    summary: "Detokenize token ids (tokenize_prompt_async on a TokensPrompt with detokenization), after the vocabulary check."
+    sources: ["vllm/renderers/base.py:645-657"]
+    request: {type: object, properties: {prompt_token_ids: {type: array, items: {type: integer}}}, required: [prompt_token_ids]}
+    errors: [{code: BadRequestError, status: 400}]
+    behavior:
+      - if: "input.prompt_token_ids.exists(t, t < 0 || t >= 128256)"
+        then: [{source: "vllm/renderers/base.py:446-455", fail: {code: BadRequestError, status: 400, message: Token id is out of vocabulary}}]
+      - title: "tokenizer.decode (ASSUMPTION: the text is not simulated, only its length)"
+        source: "vllm/renderers/base.py:645-649"
+        return: {prompt: "= '<decoded ' + string(size(input.prompt_token_ids)) + ' tokens>'"}

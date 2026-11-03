@@ -1,0 +1,79 @@
+# Oracle scenarios for the distributed, models-layers and kernels-ops areas (examples/vllm/oracle/ORACLE.md).
+# Only the tests that reach the model's level have a scenario; see gpu.md for the rest.
+schema_version: 1
+id: vllm
+
+scenarios:
+  - id: oracle-distributed-nixl-basic-interface
+    name: NixlConnector remote prefill queues a pull into the request's allocated blocks
+    description: >-
+      tests/v1/kv_connector/unit/test_nixl_connector.py::test_basic_interface (line 254).
+      A decode-side scheduler with NixlConnector admits a do_remote_prefill request of 2.5 blocks
+      (40 tokens, block_size 16). schedule() must ask the connector for external tokens, allocate
+      blocks, call update_state_after_alloc, park the request in WAITING_FOR_REMOTE_KVS (not
+      scheduled), and attach NixlConnectorMetadata whose reqs_to_recv holds the request with
+      local_block_ids equal to the blocks the KV cache manager allocated
+      (vllm/v1/core/sched/scheduler.py:979, :1289, :1323, :1530).
+    fixtures: [full-tp1-llama-8b]
+    config: {kv-connector: NixlConnector}
+    steps:
+      - flow: scheduler-add-request
+        as: add
+        input:
+          request_id: "1"
+          prompt_token_ids: [1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 17, 18, 19, 20,
+                             21, 22, 23, 24, 25, 26, 27, 28, 29, 30, 31, 32, 33, 34, 35, 36, 37, 38, 39, 40]
+          sampling_params: {max_tokens: 16}
+          kv_transfer_params:
+            do_remote_prefill: true
+            do_remote_decode: false
+            remote_engine_id: my-engine-id
+            remote_request_id: prefill-1
+            remote_block_ids: [0, 1, 2]
+            remote_host: my-host
+            remote_port: 1234
+      - flow: scheduler-schedule
+        as: s1
+        input: {}
+    expect:
+      # The scheduler consults the connector and records the pull after allocation.
+      - "calls['nixl-pull-connector-scheduler.get-num-new-matched-tokens'] >= 1"
+      - "calls['nixl-pull-connector-scheduler.update-state-after-alloc'] >= 1"
+      # The request waits for its remote KV instead of being scheduled.
+      - "!('1' in steps.s1.result.value.num_scheduled_tokens) && size(steps.s1.result.value.scheduled_new_reqs) == 0"
+      - "state.scheduler.requests['1'].status == 'WAITING_FOR_REMOTE_KVS'"
+      # kv_connector_metadata is a NixlConnectorMetadata with exactly this request to receive.
+      - "has(steps.s1.result.value.kv_connector_metadata) && has(steps.s1.result.value.kv_connector_metadata.reqs_to_recv) && size(steps.s1.result.value.kv_connector_metadata.reqs_to_recv) == 1 && '1' in steps.s1.result.value.kv_connector_metadata.reqs_to_recv"
+      # Its local_block_ids are the blocks the KV cache manager holds for the request (3 blocks).
+      # Round 2 (harness drift): local_block_ids is now per KV-cache group (BlockIds,
+      # nixl/metadata.py:243), so compare group 0 as the test does (test_nixl_connector.py:285).
+      - "has(steps.s1.result.value.kv_connector_metadata) && has(steps.s1.result.value.kv_connector_metadata.reqs_to_recv) && '1' in steps.s1.result.value.kv_connector_metadata.reqs_to_recv && '1' in state['full-attention-manager'].req_to_blocks && steps.s1.result.value.kv_connector_metadata.reqs_to_recv['1'].local_block_ids[0] == state['full-attention-manager'].req_to_blocks['1'] && size(state['full-attention-manager'].req_to_blocks['1']) == 3"
+
+  - id: oracle-models-layers-colqwen3-5-token-embed
+    name: A late-interaction pooling model answers one token_embed prompt with one output
+    description: >-
+      tests/models/multimodal/pooling/test_colqwen3_5.py::test_colqwen3_5_token_embed (line 111).
+      Only the control flow is translated: LLM.encode(pooling_task='token_embed') on a pooling
+      runner whose model supports token_embed returns one output for one prompt
+      (vllm/entrypoints/pooling/offline.py:62-170). The [num_tokens, 320] shape and the unit L2
+      norms are tensor contents and are not translated.
+    fixtures: [full-tp1-llama-8b]
+    config: {runner: pooling}
+    state:
+      llm: {supported_tasks: [token_embed, token_classify]}
+      # Round 2 (harness drift): LLM drives a SyncMPClient, so engine-core outputs go to its
+      # outputs_queue (vllm/v1/engine/core_client.py SyncMPClient); the model needs this seeded.
+      engine-core-proc: {client_kind: sync}
+    steps:
+      - interface: llm.encode
+        caller: python-user
+        as: enc
+        input:
+          prompts: ["What is the capital of France?"]
+          pooling_task: token_embed
+    expect:
+      - "steps.enc.result.ok"
+      - "steps.enc.result.value.num_outputs == 1 && steps.enc.result.value.pooling_task == 'token_embed'"
+      # Round 2 (harness drift): the boundary stub llm-engine.encode-request became the real
+      # LLMEngine.add_request path (offline.py:120-134, _run_tiling_engine).
+      - "calls['llm-engine.add-request'] == 1 && state.llm.request_counter == 1"

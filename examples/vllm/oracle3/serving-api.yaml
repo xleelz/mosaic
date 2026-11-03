@@ -1,0 +1,71 @@
+schema_version: 1
+id: vllm
+scenarios:
+- id: oracle-serving-api-test-empty-input
+  name: prompt_to_seq keeps an empty prompt list empty and a list of token lists as one prompt per token list
+  description: >-
+    tests/renderers/inputs/test_preprocess.py::test_empty_input (line 10). prompt_to_seq([]) == [],
+    prompt_to_seq([[]]) == [[]], prompt_to_seq([[], []]) == [[], []]. Driven through LLM.enqueue, whose
+    _add_completion_requests calls prompt_to_seq (vllm/entrypoints/common/offline.py:317) and then renders each
+    element with parse_dec_only_prompt (a list is a TokensPrompt, vllm/renderers/inputs/preprocess.py:134-138).
+    An empty token prompt is then refused by the input processor (vllm/v1/engine/input_processor.py:566), so
+    only the first element of [[], []] is ever rendered.
+  fixtures: [full-tp1-llama-8b]
+  steps:
+  - {interface: llm.enqueue, caller: python-user, input: {prompts: []}, as: none}
+  - {interface: llm.enqueue, caller: python-user, input: {prompts: [[]]}, as: one}
+  - {interface: llm.enqueue, caller: python-user, input: {prompts: [[], []]}, as: two}
+  expect:
+  - "steps.none.result.ok && steps.none.result.value == []"
+  - "trace.filter(e, e.type == 'call.start' && e.interface == 'base-renderer.tokenize-prompt').size() == 2"
+  - "trace.filter(e, e.type == 'call.start' && e.interface == 'base-renderer.tokenize-prompt').all(e, e.input.prompt_token_ids == [])"
+  - "!steps.one.result.ok && !steps.two.result.ok"
+
+- id: oracle-serving-api-test-model-dump-excludes-none
+  name: The Cohere error envelope is just {message} when there is no request id
+  description: >-
+    tests/entrypoints/cohere/test_protocol.py::TestCohereError::test_model_dump_excludes_none (line 46).
+    CohereError(message='boom').model_dump(exclude_none=True) == {'message': 'boom'}; the router builds every
+    error body this way (vllm/entrypoints/cohere/api_router.py:102-117, CohereError at
+    vllm/entrypoints/cohere/protocol.py:96-103). Driven through _error_response, then black-box through
+    POST /cohere/v2/chat without an X-Request-Id, where a failing generate becomes the same envelope.
+  fixtures: [full-tp1-llama-8b]
+  config: {vllm-enable-cohere-api: true}
+  faults:
+  - {target: async-llm.generate, type: error, code: value-error, message: boom}
+  steps:
+  - interface: cohere-serving-chat-v2.error-response
+    caller: api-server
+    input: {code: BadRequestError, message: boom, status: 400, param: {$null: true}, value: {$null: true}}
+    as: env
+  - interface: cohere-serving-chat-v2.post-cohere-v2-chat
+    caller: api-client
+    input: {path: /cohere/v2/chat, headers: {}, body: {model: llama-8b, max_tokens: 4, messages: [{role: user, content: hi}]}}
+    as: chat
+  expect:
+  - "!steps.env.result.ok && steps.env.result.error.data.body == {'message': 'boom'}"
+  - "!steps.chat.result.ok && has(steps.chat.result.error.data.body) && steps.chat.result.error.data.body.size() == 1 && 'message' in steps.chat.result.error.data.body"
+
+- id: oracle-serving-api-test-parser-selection
+  name: DeepSeekV3ReasoningParser delegates to the R1 parser when chat_template_kwargs.thinking is set, else to the identity parser
+  description: >-
+    tests/reasoning/test_deepseekv3_reasoning_parser.py::test_parser_selection (line 31), both parametrizations.
+    DeepSeekV3ReasoningParser.__init__ (vllm/reasoning/deepseek_v3_reasoning_parser.py:25-37) picks
+    DeepSeekR1ReasoningParser when thinking (or enable_thinking) is truthy, else IdentityReasoningParser.
+    Black-box: with --reasoning-parser deepseek_v3, a thinking request's output without </think> is all
+    reasoning (BaseThinkingReasoningParser.extract_reasoning, vllm/reasoning/basic_parsers.py:153-176), and a
+    non-thinking request's output is all content (IdentityReasoningParser.extract_reasoning,
+    vllm/reasoning/identity_reasoning_parser.py:67-72).
+  fixtures: [full-tp1-llama-8b]
+  config: {reasoning-parser: deepseek_v3}
+  steps:
+  - flow: serving-api-reasoning-outputs
+    input: {path: /v1/chat/completions, body: {model: llama-8b, max_tokens: 4, messages: [{role: user, content: hi}], chat_template_kwargs: {thinking: true}}}
+    as: think
+  - flow: serving-api-reasoning-outputs
+    input: {path: /v1/chat/completions, body: {model: llama-8b, max_tokens: 4, messages: [{role: user, content: hi}], chat_template_kwargs: {thinking: false}}}
+    as: plain
+  expect:
+  - "steps.think.result.ok && steps.think.result.value.choices[0].message.reasoning != null && steps.think.result.value.choices[0].message.content == null"
+  - "steps.plain.result.ok && steps.plain.result.value.choices[0].message.reasoning == null && steps.plain.result.value.choices[0].message.content != null"
+  - "trace.exists(e, e.type == 'call.start' && e.interface == 'reasoning-parser-manager.get-reasoning-parser' && e.input.name == 'deepseek_v3')"

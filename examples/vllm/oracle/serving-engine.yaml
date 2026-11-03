@@ -1,0 +1,308 @@
+# Oracle scenarios (pipeline stage 6) for the serving-api, engine-core and config-platform
+# areas: each one translates a test of vllm-project/vllm v0.32.0 from oracle/sample.json.
+# Verdicts and evidence are in serving-engine.md / serving-engine.json.
+schema_version: 1
+id: vllm
+scenarios:
+  # ---------------------------------------------------------------- serving-api
+  - id: oracle-serving-api-cohere-structural-tag-not-modified
+    name: A request that already carries structured_outputs.structural_tag reaches the engine unchanged
+    description: >-
+      tests/parser/cohere/test_structural_tags.py:163
+      TestAdjustRequestPassthrough::test_structured_outputs_structural_tag_not_modified.
+      CohereCommandParser.adjust_request (vllm/parser/cohere_command.py:504-518) returns the
+      request as is when structured_outputs.structural_tag is set. The test drives the parser
+      directly; here the same request goes through POST /v1/chat/completions and the tag must
+      arrive in the engine request's sampling params untouched.
+    fixtures: [full-tp1-llama-8b]
+    steps:
+      - interface: openai-serving-chat.post-v1-chat-completions
+        caller: api-client
+        as: chat
+        input:
+          path: /v1/chat/completions
+          body:
+            model: llama-8b
+            messages: [{role: user, content: "What is the weather in Paris?"}]
+            structured_outputs:
+              structural_tag: '{"type": "structural_tag", "format": {"type": "triggered_tags", "triggers": ["<|START_ACTION|>"], "tags": [{"begin": "<|START_ACTION|>", "content": {"type": "json_schema", "json_schema": {"type": "object"}}, "end": "<|END_ACTION|>"}]}}'
+    expect:
+      - "steps.chat.result.ok"
+      - >-
+        trace.exists(e, e.type == 'call.start' && e.interface == 'async-llm.generate'
+        && has(e.input.sampling_params.structured_outputs)
+        && e.input.sampling_params.structured_outputs.structural_tag == '{"type": "structural_tag", "format": {"type": "triggered_tags", "triggers": ["<|START_ACTION|>"], "tags": [{"begin": "<|START_ACTION|>", "content": {"type": "json_schema", "json_schema": {"type": "object"}}, "end": "<|END_ACTION|>"}]}}')
+
+  - id: oracle-serving-api-bi-encoder-score-one-pair
+    name: POST /score with one query and one document returns one score with an id
+    description: >-
+      tests/entrypoints/pooling/scoring/test_bi_encoder_online.py:1 (file), represented by
+      test_score_api_queries_str_1_documents_str_1. A bi-encoder (BAAI/bge-base-en-v1.5, an
+      embedding model) served with --max-model-len 100 answers /score {queries: str,
+      documents: str} with a ScoreResponse whose id is set and whose data has exactly one
+      entry. The score value compared against HF is numeric and not translated. The world is
+      the shared Llama one turned into an embedding model by its supported tasks and runner.
+    fixtures: [full-tp1-llama-8b]
+    config: {runner: pooling, max-model-len: 100}
+    state:
+      app-state: {supported_tasks: [embed]}
+      async-llm: {supported_tasks: [embed]}
+    steps:
+      - interface: serving-scores.post-score
+        caller: api-client
+        as: score
+        input:
+          path: /score
+          body:
+            model: llama-8b
+            queries: "What is the capital of France?"
+            documents: "The capital of France is Paris."
+    expect:
+      - "steps.score.result.ok"
+      - "steps.score.result.value.id != null && size(steps.score.result.value.data) == 1"
+      - "calls['async-llm.encode'] == 2"
+
+  - id: oracle-serving-api-tiling-engine-basic
+    name: LLM.encode of two prompts with max_num_seqs 2 returns two outputs through the engine
+    description: >-
+      tests/entrypoints/pooling/basic/test_tiling_engine.py:32 test_tiling_engine_basic.
+      LLM(intfloat/multilingual-e5-small, max_num_seqs=2).encode(["Hello", "World"],
+      pooling_task="embed") returns one PoolingRequestOutput per prompt. The code path is
+      PoolingLLM.encode -> _run_tiling_engine (vllm/entrypoints/pooling/offline.py:62-133,
+      396-480): add up to max_num_seqs*2 requests to the LLMEngine, then step it until every
+      request finished.
+    fixtures: [full-small-batch-limits]
+    config: {runner: pooling}
+    state:
+      llm: {supported_tasks: [embed]}
+      async-llm: {supported_tasks: [embed]}
+      # offline LLM owns a SyncMPClient (round-2 harness: the world default is async)
+      engine-core-proc: {client_kind: sync}
+    steps:
+      - interface: llm.encode
+        caller: python-user
+        as: enc
+        input: {prompts: [Hello, World], pooling_task: embed}
+    expect:
+      - "steps.enc.result.ok && steps.enc.result.value.num_outputs == 2 && state.llm.request_counter == 2"
+      - "calls['llm-engine.add-request'] >= 2 && calls['llm-engine.step'] >= 1"
+
+  - id: oracle-serving-api-chat-mixed-image-and-prompt-embeds
+    name: A chat message mixing an image part with a prompt_embeds part is accepted like its text twin
+    description: >-
+      tests/entrypoints/multimodal/openai/chat_completion/test_chat_completion_with_mixed_image_embeds.py:1
+      (file), represented by test_text_content_and_prompt_embeds_match_with_image_url
+      (image_url then text). With --enable-prompt-embeds --enable-mm-embeds, one chat request
+      whose content is [image_url, text] and one whose content is [image_url, prompt_embeds]
+      both succeed with non-empty content. The asserted equality of the two greedy outputs is
+      model numerics and not translated; the scenario checks both are accepted and that the
+      embeds request reaches the engine carrying prompt embeddings and the image.
+    fixtures: [full-tp1-llama-8b]
+    # server_args (test file :33-48) and the Qwen2-VL model (:24) is multimodal; round-2
+    # harness: these config ids did not exist in round 1
+    config:
+      enable-prompt-embeds: true
+      enable-mm-embeds: true
+      model-is-multimodal: true
+      limit-mm-per-prompt: {image: 1}
+    steps:
+      - interface: openai-serving-chat.post-v1-chat-completions
+        caller: api-client
+        as: text
+        at_ms: 0
+        input:
+          path: /v1/chat/completions
+          body:
+            model: llama-8b
+            max_tokens: 10
+            temperature: 0
+            messages:
+              - role: user
+                content:
+                  - {type: image_url, image_url: {url: "data:image/jpeg;base64,/9j/4AAQ"}}
+                  - {type: text, text: "Describe this image."}
+      - interface: openai-serving-chat.post-v1-chat-completions
+        caller: api-client
+        as: embeds
+        at_ms: 1000
+        input:
+          path: /v1/chat/completions
+          body:
+            model: llama-8b
+            max_tokens: 10
+            temperature: 0
+            messages:
+              - role: user
+                content:
+                  - {type: image_url, image_url: {url: "data:image/jpeg;base64,/9j/4AAQ"}}
+                  - {type: prompt_embeds, data: "AAAAAAAAAAA="}
+    expect:
+      - "steps.text.result.ok && steps.embeds.result.ok"
+      - "size(steps.text.result.value.choices[0].message.content) > 0 && size(steps.embeds.result.value.choices[0].message.content) > 0"
+      - >-
+        trace.exists(e, e.type == 'call.start' && e.interface == 'async-llm.generate'
+        && has(e.input.prompt_embeds) && has(e.input.multi_modal_data))
+
+  # ---------------------------------------------------------------- engine-core
+  - id: oracle-engine-core-dp-wake-up-requires-all-engines-awake
+    name: A data-parallel client wakes every engine and reports awake only when all are
+    description: >-
+      tests/v1/engine/test_wake_up_contract.py:1 (file) test_dp_wake_up_requires_all_engines_awake,
+      case ([True, True], True). DPLBAsyncMPClient.wake_up_async(["weights"])
+      (vllm/v1/engine/core_client.py:1352-1353, 1262-1269) sends one wake_up utility call per
+      core engine (engine-0, then engine-1) and returns all(results). Two DP engines are two
+      engine-core-proc instances; each engine's executor has its weights asleep.
+    fixtures: [full-tp1-llama-8b]
+    # round-2 harness: the model names DP engine instances dp0, dp1 (the test's b"engine-0",
+    # b"engine-1") and sizes the fan-out from data-parallel-size
+    topology: {engine-core-proc: [dp0, dp1]}
+    config: {data-parallel-size: 2}
+    state:
+      executor: {sleeping_tags: [weights]}
+    steps:
+      - interface: async-llm.wake-up
+        caller: api-server
+        as: wake
+        input: {tags: [weights]}
+    expect:
+      - "steps.wake.result.ok && steps.wake.result.value == true"
+      - >-
+        trace.filter(e, e.type == 'call.start' && e.interface == 'async-mp-client.call-utility-async'
+        && e.input.method == 'wake_up').map(e, e.input.engine) == ['dp0', 'dp1']
+      - >-
+        trace.exists(e, e.type == 'call.start' && e.interface == 'engine-core-proc.process-input-sockets' && e.instance == 'dp0')
+        && trace.exists(e, e.type == 'call.start' && e.interface == 'engine-core-proc.process-input-sockets' && e.instance == 'dp1')
+
+  - id: oracle-engine-core-kv-cache-oom-no-memory
+    name: Zero bytes available for the KV cache is a ValueError
+    description: >-
+      tests/v1/engine/test_init_error_messaging.py:9 test_kv_cache_oom_no_memory.
+      check_enough_kv_cache_memory(config, spec, 0) raises ValueError
+      (vllm/v1/core/kv_cache_utils.py:1104-1137 -> _check_enough_kv_cache_memory:1003-1017,
+      "No available memory for the cache blocks"). In the engine it runs inside
+      get_kv_cache_configs, which the engine core calls with each worker's available memory.
+    fixtures: [full-tp1-llama-8b]
+    steps:
+      - interface: kv-cache-utils.get-kv-cache-configs
+        caller: engine-core
+        as: kvc
+        input: {available_memory: [0]}
+    expect:
+      - "!steps.kvc.result.ok && steps.kvc.result.error.code == 'value-error'"
+      - "steps.kvc.result.error.message.startsWith('No available memory for the cache blocks')"
+      - "calls['block-pool.init'] == 0 && state['block-pool'].num_gpu_blocks == 28488"
+
+  - id: oracle-engine-core-allowlist-confines-dp-to-listed-nodes
+    name: VLLM_RAY_DP_PLACEMENT_NODE_IPS confines Ray DP placement groups to the listed nodes
+    description: >-
+      tests/v1/engine/test_dp_placement_node_allowlist.py:67 test_allowlist_confines_dp_to_listed_nodes.
+      With VLLM_RAY_DP_PLACEMENT_NODE_IPS=10.0.0.1,10.0.0.3 and four 8-GPU nodes,
+      CoreEngineActorManager.create_dp_placement_groups (vllm/v1/engine/utils.py) creates 16
+      placement groups (8 on the master .1, 8 on .3) pinned only to those nodes. Round 2: the test
+      calls create_dp_placement_groups directly with a patched Ray resource map (test :40-57,
+      :69-77), so the scenario does too; round 1 went through engine-config creation, which never
+      places groups.
+    fixtures: [full-tp1-llama-8b]
+    config: {vllm-ray-dp-placement-node-ips: "10.0.0.1,10.0.0.3"}
+    state:
+      ray-cluster:
+        nodes:
+          - {ip: 10.0.0.1, GPU: 8}
+          - {ip: 10.0.0.2, GPU: 8}
+          - {ip: 10.0.0.3, GPU: 8}
+          - {ip: 10.0.0.4, GPU: 8}
+    steps:
+      - interface: core-engine-actor-manager.create-dp-placement-groups
+        caller: api-server
+        as: pg
+        input: {data_parallel_size: 16, data_parallel_size_local: 8, world_size: 1, master_ip: 10.0.0.1}
+    expect:
+      - "steps.pg.result.ok && size(steps.pg.result.value.placement_groups) == 16"
+      - "steps.pg.result.value.placement_groups.all(p, p.node_ip in ['10.0.0.1', '10.0.0.3'])"
+
+  # ---------------------------------------------------------------- config-platform
+  - id: oracle-config-platform-cuda-empty-vs-unset-configs
+    name: CUDA_VISIBLE_DEVICES="" resolves the same VllmConfig as an untouched environment
+    description: >-
+      tests/config/test_config_generation.py:7 test_cuda_empty_vs_unset_configs.
+      EngineArgs(model=...).create_engine_config() gives a config equal to the untouched one
+      when CUDA_VISIBLE_DEVICES="" (instance_id aside): platform detection and the batch
+      defaults use NVML, which CUDA_VISIBLE_DEVICES doesn't remap (vllm/platforms/__init__.py:57-84,
+      vllm/platforms/cuda.py:745). The empty variable is the host whose torch device count is 0
+      while NVML still sees the H100; the expected values are the untouched world's
+      (config-create-engine-config-default). The test's DeepSeek-V2-Lite is replaced by the
+      world's Llama-3.1-8B; the property doesn't depend on the checkpoint.
+    fixtures: [full-tp1-llama-8b]
+    state:
+      platforms: {host: {device_count: 0}}
+    steps:
+      - interface: engine-args.create-engine-config
+        caller: operator
+        as: cfg
+        input: {model: meta-llama/Llama-3.1-8B-Instruct}
+    expect:
+      - "steps.cfg.result.ok"
+      - "steps.cfg.result.value.platform == 'vllm.platforms.cuda.CudaPlatform' && steps.cfg.result.value.device_config.device == 'cuda'"
+      - "steps.cfg.result.value.model_config.max_model_len == 131072 && steps.cfg.result.value.cache_config.block_size == 16"
+      - "steps.cfg.result.value.scheduler_config.max_num_seqs == 1024 && steps.cfg.result.value.scheduler_config.max_num_batched_tokens == 8192"
+      - "steps.cfg.result.value.parallel_config.world_size == 1 && steps.cfg.result.value.parallel_config.distributed_executor_backend == 'uni'"
+      - "steps.cfg.result.value.parallel_config.worker_cls == 'vllm.v1.worker.gpu_worker.Worker'"
+      - "state['vllm-config'].resolved == steps.cfg.result.value && state.platforms.current.qualname == 'vllm.platforms.cuda.CudaPlatform'"
+
+  - id: oracle-config-platform-modelopt-mixed-detects-nvfp4
+    name: A ModelOpt MIXED_PRECISION checkpoint with an NVFP4 layer is treated as NVFP4-quantized
+    description: >-
+      tests/config/test_modelopt_mixed_nvfp4.py:22 test_detects_nvfp4_alongside_another_algorithm.
+      _modelopt_mixed_has_nvfp4 (vllm/config/model.py:130-142) is true when any quantized
+      layer's quant_algo is NVFP4; ModelConfig.is_nvfp4_quantized (model.py:2283-2294) uses it
+      for quantization modelopt_mixed, and enable_act_fusion (vllm/config/vllm.py:159-168) then
+      turns on pass_config.fuse_act_quant at -O2. The checkpoint is seeded on the hub with FP8
+      attention projections and an NVFP4 MLP.
+    fixtures: [full-tp1-llama-8b]
+    state:
+      hf-hub:
+        models:
+          nvidia/Llama-3.1-8B-Instruct-Mixed-NVFP4:
+            architectures: [LlamaForCausalLM]
+            num_hidden_layers: 32
+            num_attention_heads: 32
+            num_key_value_heads: 8
+            hidden_size: 4096
+            intermediate_size: 14336
+            vocab_size: 128256
+            max_position_embeddings: 131072
+            torch_dtype: bfloat16
+            weights_bytes: 6000000000
+            quantization_config:
+              quant_method: modelopt
+              quant_algo: MIXED_PRECISION
+              quantized_layers:
+                model.layers.0.proj: {quant_algo: FP8}
+                model.layers.1.proj: {quant_algo: NVFP4}
+                model.layers.2.proj: {quant_algo: FP8}
+    steps:
+      - interface: engine-args.create-engine-config
+        caller: operator
+        as: cfg
+        input: {model: nvidia/Llama-3.1-8B-Instruct-Mixed-NVFP4}
+    expect:
+      - "steps.cfg.result.ok"
+      - "has(steps.cfg.result.value.model_config.quantization) && steps.cfg.result.value.model_config.quantization == 'modelopt_mixed'"
+      - "has(steps.cfg.result.value.compilation_config) && steps.cfg.result.value.compilation_config.pass_config.fuse_act_quant == true"
+      - "state['vllm-config'].resolved == steps.cfg.result.value"
+
+  - id: oracle-config-platform-object-storage-shm-default-name
+    name: The default object-storage shared-memory name fits macOS's 30-character limit
+    description: >-
+      tests/test_envs.py:19 test_object_storage_shm_default_name. VLLM_OBJECT_STORAGE_SHM_BUFFER_NAME
+      defaults to _generate_shm_name() (vllm/envs.py:546-551, 2040-2043): "vllm_mm_" plus an
+      unpadded url-safe base64 UUID, 30 characters. Read through vllm.envs.__getattr__.
+    fixtures: [full-tp1-llama-8b]
+    steps:
+      - interface: envs.getattr
+        caller: operator
+        as: name
+        input: {name: VLLM_OBJECT_STORAGE_SHM_BUFFER_NAME}
+    expect:
+      - "steps.name.result.ok && steps.name.result.value.value != null"
+      - "size(steps.name.result.value.value) <= 30 && steps.name.result.value.value.startsWith('vllm_mm_')"

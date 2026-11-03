@@ -1,0 +1,914 @@
+interfaces:
+  # ================= startup =================
+  - component: gpu-worker-impl
+    name: init-device
+    kind: rpc
+    summary: "collective_rpc init_device: binds cuda:<local_rank>, initializes torch.distributed and the model-parallel groups (before the memory snapshot, so NCCL buffers are excluded), seeds RNGs, snapshots free memory, checks the gpu_memory_utilization budget, then builds the workspace and the V1 or V2 model runner."
+    sources: ["vllm/v1/worker/gpu_worker.py:435-545"]
+    latency_ms: 0
+    errors:
+      - {code: runtime-error, status: 0, retryable: false}
+      - {code: value-error, status: 0, retryable: false}
+    request:
+      type: object
+      properties:
+        device_type: {type: string, default: cuda}
+        rank: {type: integer, examples: [0]}
+    response: {type: object, properties: {device: {type: string}, requested_memory: {type: integer}, runner: {type: string}}}
+    behavior:
+      - if: "input.device_type != 'cuda'"
+        then:
+          - title: Only CUDA devices are supported by this worker
+            source: "vllm/v1/worker/gpu_worker.py:542-543"
+            fail: {code: runtime-error, status: 0, message: "= 'Unsupported device type: ' + input.device_type"}
+      - title: Initialize the distributed environment before the memory snapshot
+        detail: "NCCL buffers are allocated here so the snapshot taken next excludes them."
+        source: "vllm/v1/worker/gpu_worker.py:507-515"
+        call: parallel-state.init-distributed-environment
+        input: {world_size: "= int(config['tensor-parallel-size'])", rank: "= input.rank", backend: nccl}
+      - source: "vllm/v1/worker/gpu_worker.py:1673-1678"
+        call: parallel-state.ensure-model-parallel-initialized
+        input: {tensor_model_parallel_size: "= int(config['tensor-parallel-size'])", pipeline_model_parallel_size: 1}
+      - title: Snapshot free memory after NCCL init
+        source: "vllm/v1/worker/gpu_worker.py:534"
+        call: gpu-memory.snapshot
+        input: {at_init: true}
+        as: snap
+      - title: Check free memory against ceil(total * gpu_memory_utilization)
+        source: "vllm/v1/worker/gpu_worker.py:535-537"
+        call: worker-utils.request-memory
+        input: {total_bytes: "= vars.snap.value.total_bytes", free_bytes: "= vars.snap.value.free_bytes", external_weight_memory: 0}
+        as: req
+      - set:
+          state.init_free_memory: "= vars.snap.value.free_bytes"
+          state.requested_memory: "= vars.req.value.requested_memory"
+          state.device_initialized: true
+          state.runner: "= config['use-v2-model-runner'] ? 'v2' : 'v1'"
+          state.pp_rank: "= self == '' ? 0 : int(self.substring(4)) / int(config['tensor-parallel-size'])"
+          state.is_first_pp_rank: "= self == '' || int(self.substring(4)) / int(config['tensor-parallel-size']) == 0"
+          state.is_last_pp_rank: "= self == '' || int(self.substring(4)) / int(config['tensor-parallel-size']) == int(config['pipeline-parallel-size']) - 1"
+      - title: Build the workspace and the model runner (V2 unless use_v2_model_runner is false)
+        source: "vllm/v1/worker/gpu_worker.py:547-579"
+        if: "config['use-v2-model-runner']"
+        then:
+          - call: gpu-model-runner.init
+            input: {}
+      - return: {device: "= 'cuda:' + string(input.rank)", requested_memory: "= state.requested_memory", runner: "= state.runner"}
+  - component: gpu-worker-impl
+    name: load-model
+    kind: rpc
+    summary: "collective_rpc load_model: loads weights through the model runner inside the CuMem 'weights' pool (when sleep mode is on), then creates the weight transfer engine if weight_transfer_config is set."
+    sources: ["vllm/v1/worker/gpu_worker.py:587-610"]
+    latency_ms: 0
+    request: {type: object, properties: {load_dummy_weights: {type: boolean, default: false}}}
+    response: {type: object, properties: {model_memory_usage: {type: integer}, weight_transfer_engine: {type: boolean}}}
+    behavior:
+      - call: gpu-model-runner.load-model
+        input: {load_dummy_weights: "= has(input.load_dummy_weights) && input.load_dummy_weights"}
+        as: lm
+      - set: {state.is_pooling_model: "= vars.lm.value.is_pooling_model"}
+      - if: "config['weight-transfer-backend'] != ''"
+        then:
+          - title: Create the weight transfer engine once the model exists
+            source: "vllm/v1/worker/gpu_worker.py:597-603"
+            set: {state.weight_transfer_engine: true}
+      - return: {model_memory_usage: "= vars.lm.value.model_memory_usage", weight_transfer_engine: "= state.weight_transfer_engine"}
+  - component: gpu-worker-impl
+    name: determine-available-memory
+    kind: rpc
+    summary: "collective_rpc determine_available_memory: the KV cache budget in bytes. kv_cache_memory_bytes short-circuits profiling; otherwise a max_num_batched_tokens dummy forward is profiled and available = requested - (consumed since init + transient peak) - CUDA graph estimate."
+    sources: ["vllm/v1/worker/gpu_worker.py:633-807"]
+    latency_ms: 0
+    errors: [{code: assertion-error, status: 0, retryable: false}]
+    request: {type: object}
+    response: {type: integer, examples: [59745650279]}
+    behavior:
+      - title: Bytes one KV block takes across all layers (page size * layers), for the block count
+        source: "vllm/v1/worker/gpu_worker.py:837-838"
+        call: gpu-model-runner.get-kv-cache-spec
+        input: {}
+        as: spec
+      - set: {state.bytes_per_block: "= vars.spec.value.page_size_bytes * vars.spec.value.num_layers"}
+      - if: "int(config['kv-cache-memory-bytes']) > 0"
+        then:
+          - title: kv_cache_memory_bytes given, skip memory profiling
+            detail: "A profile run still compiles the model for max_num_batched_tokens; gpu_memory_utilization is not respected."
+            source: "vllm/v1/worker/gpu_worker.py:649-673"
+            call: gpu-model-runner.profile-run
+            input: {}
+          - set:
+              state.available_kv_cache_memory_bytes: "= int(config['kv-cache-memory-bytes'])"
+              state.num_gpu_blocks: "= int(config['kv-cache-memory-bytes']) / state.bytes_per_block"
+          - return: "= int(config['kv-cache-memory-bytes'])"
+      - title: Profile a dummy forward of max_num_batched_tokens
+        source: "vllm/v1/worker/gpu_worker.py:677-691"
+        call: gpu-model-runner.profile-run
+        input: {}
+        as: prof
+      - set: {vars.cg_estimate: 0}
+      - if: "config['cudagraph-mode'] != 'NONE' && !config['enforce-eager']"
+        then:
+          - title: Estimate CUDA graph memory when graphs will be captured
+            source: "vllm/v1/worker/gpu_worker.py:700-704"
+            call: gpu-model-runner.profile-cudagraph-memory
+            input: {}
+            as: cg
+          - set: {vars.cg_estimate: "= vars.cg.value.cudagraph_memory_bytes"}
+      - set:
+          vars.cg_applied: "= config['vllm-memory-profiler-estimate-cudagraphs'] ? vars.cg_estimate : 0"
+      - call: gpu-memory.snapshot
+        input: {after_profile: true}
+        as: after
+      - if: "state.init_free_memory < vars.after.value.free_bytes"
+        then:
+          - title: Free memory grew during profiling
+            detail: "Another process sharing the GPU released memory while vLLM profiled (CUDA; ROCm falls back to torch reserved instead)."
+            source: "vllm/v1/worker/gpu_worker.py:717-728"
+            fail: {code: assertion-error, status: 0, message: "Error in memory profiling. This happens when other processes sharing the same container release GPU memory while vLLM is profiling during initialization. To fix this, ensure consistent GPU memory allocation or isolate vLLM in its own container."}
+      - set:
+          state.total_consumed: "= state.init_free_memory - vars.after.value.free_bytes"
+          state.peak_activation_memory: "= vars.prof.value.peak_activation_bytes + vars.cg_applied"
+          state.cudagraph_memory_estimate: "= vars.cg_estimate"
+      - title: available = requested - non_kv_cache_memory - applied CUDA graph estimate
+        source: "vllm/v1/worker/gpu_worker.py:740-744"
+        set:
+          state.available_kv_cache_memory_bytes: "= state.requested_memory - (state.total_consumed + vars.prof.value.peak_activation_bytes) - vars.cg_applied"
+      - title: KV blocks this budget holds (available // bytes_per_block, as get_kv_cache_configs computes)
+        source: "vllm/v1/core/kv_cache_utils.py:1627"
+        set:
+          state.num_gpu_blocks: "= state.available_kv_cache_memory_bytes > 0 ? state.available_kv_cache_memory_bytes / state.bytes_per_block : 0"
+      - return: "= state.available_kv_cache_memory_bytes"
+  - component: gpu-worker-impl
+    name: get-num-gpu-blocks
+    kind: function
+    summary: "The KV block count the last determine_available_memory budget holds on this rank: available bytes // (page size * layers), the arithmetic of kv_cache_utils.get_kv_cache_configs for uniform full attention (block 16, Llama-3.1-8B: 2 MiB per block). Exposed so scheduler-kv's block pool can be seeded with num_gpu_blocks; not a Worker method (the engine core computes it from the worker's answer)."
+    sources: ["vllm/v1/core/kv_cache_utils.py:1622-1628", "vllm/v1/worker/gpu_worker.py:740-744"]
+    attributes: {synthetic: true, consumer: scheduler-kv}
+    latency_ms: 0
+    response: {type: object, properties: {num_gpu_blocks: {type: integer, examples: [28488]}, bytes_per_block: {type: integer, examples: [2097152]}, available_kv_cache_memory_bytes: {type: integer, examples: [59745650279]}}}
+    behavior:
+      - if: "state.num_gpu_blocks == 0"
+        then:
+          - title: Memory not profiled yet on this rank
+            fail: {code: runtime-error, status: 0, message: "determine_available_memory has not run on this worker"}
+      - return: {num_gpu_blocks: "= state.num_gpu_blocks", bytes_per_block: "= state.bytes_per_block", available_kv_cache_memory_bytes: "= state.available_kv_cache_memory_bytes"}
+  - component: gpu-worker-impl
+    name: get-kv-cache-spec
+    kind: rpc
+    summary: "collective_rpc get_kv_cache_spec: per-layer KV cache specs from the model runner."
+    sources: ["vllm/v1/worker/gpu_worker.py:837-838"]
+    latency_ms: 0
+    response: {type: object, properties: {num_layers: {type: integer}, block_size: {type: integer}, page_size_bytes: {type: integer}}}
+    behavior:
+      - call: gpu-model-runner.get-kv-cache-spec
+        input: {}
+        as: spec
+      - return: "= vars.spec.value"
+  - component: gpu-worker-impl
+    name: update-max-model-len
+    kind: rpc
+    summary: "collective_rpc update_max_model_len: adopts the engine's auto-fitted max_model_len (max_model_len=-1)."
+    sources: ["vllm/v1/worker/gpu_worker.py:840-850"]
+    latency_ms: 0
+    request: {type: object, required: [max_model_len], properties: {max_model_len: {type: integer, examples: [65536]}}}
+    response: {type: object, properties: {max_model_len: {type: integer}}}
+    behavior:
+      - call: gpu-model-runner.update-max-model-len
+        input: {max_model_len: "= input.max_model_len"}
+      - return: {max_model_len: "= input.max_model_len"}
+  - component: gpu-worker-impl
+    name: initialize-from-config
+    kind: rpc
+    summary: "collective_rpc initialize_from_config: records num_gpu_blocks, adopts layout and hash granularity, initializes the KV transfer connector, then allocates the KV cache through the model runner (CuMem 'kv_cache' pool under sleep mode)."
+    sources: ["vllm/v1/worker/gpu_worker.py:852-905"]
+    latency_ms: 0
+    request:
+      type: object
+      properties:
+        num_blocks: {type: integer, examples: [28488]}
+        needs_kv_cache_zeroing: {type: boolean, default: false}
+    response: {type: object, properties: {num_blocks: {type: integer}, kv_cache_bytes: {type: integer}}}
+    behavior:
+      - set: {vars.n: "= has(input.num_blocks) && input.num_blocks != null ? input.num_blocks : (has(input.num_gpu_blocks) ? input.num_gpu_blocks : state.num_gpu_blocks)"}
+      - title: Record the engine's block count for warmup
+        source: "vllm/v1/worker/gpu_worker.py:857"
+        set: {state.num_gpu_blocks: "= vars.n"}
+      - title: "KV tensors are allocated in the CuMem 'kv_cache' pool under sleep mode (no KV connector pool here)"
+        source: "vllm/v1/worker/gpu_worker.py:879-897"
+        call: gpu-model-runner.initialize-kv-cache
+        input: {num_blocks: "= vars.n", allocation_pool: "= config['enable-sleep-mode'] ? dyn('kv_cache') : dyn(null)"}
+        as: kv
+      - set: {vars.zero: "= has(input.needs_kv_cache_zeroing) && input.needs_kv_cache_zeroing"}
+      - if: "vars.zero"
+        then:
+          - title: Build KV-zero metadata outside the CuMem pool
+            source: "vllm/v1/worker/gpu_worker.py:900-905"
+            call: kv-block-zeroer.init
+            input: {num_blocks: "= vars.n"}
+      - return: {num_blocks: "= vars.n", kv_cache_bytes: "= vars.kv.value.kv_cache_bytes"}
+  - component: gpu-worker-impl
+    name: compile-or-warm-up-model
+    kind: rpc
+    summary: "collective_rpc compile_or_warm_up_model: warms up compile sizes, tunes kernels, captures CUDA graphs unless enforce_eager, logs the suggested --kv-cache-memory, (V1) warms the sampler, reseeds, freezes the GC heap."
+    sources: ["vllm/v1/worker/gpu_worker.py:907-1092"]
+    latency_ms: 0
+    response: {type: object, properties: {cuda_graph_memory_bytes: {type: integer}, suggested_kv_cache_memory_bytes: {type: integer}}}
+    behavior:
+      - title: Dummy runs for compile sizes outside the capture sizes, then kernel warmup
+        source: "vllm/v1/worker/gpu_worker.py:937-951"
+        call: gpu-model-runner.dummy-run
+        input: {num_tokens: "= int(config['max-num-batched-tokens'])", uniform_decode: false}
+      - title: "V2 with JIT warmup: scheduler-realistic prefill and decode steps through the worker's execute_model and sample_tokens compile the kernels before capture"
+        source: "vllm/v1/worker/gpu/warmup.py:218-247"
+        when: "config['use-v2-model-runner'] && !config['enforce-eager']"
+        set: {ctx.jit_warmup: true}
+      - set: {vars.cg_bytes: 0}
+      - if: "!config['enforce-eager']"
+        then:
+          - title: Capture CUDA graphs
+            source: "vllm/v1/worker/gpu_worker.py:961-963"
+            call: gpu-model-runner.capture-model
+            input: {}
+            as: cap
+          - set: {vars.cg_bytes: "= vars.cap.value.cuda_graph_memory_bytes"}
+      - set: {vars.suggested: 0}
+      - if: "int(config['kv-cache-memory-bytes']) == 0"
+        then:
+          - title: Suggest --kv-cache-memory from the measured usage (150 MiB redundancy)
+            source: "vllm/v1/worker/gpu_worker.py:980-1043"
+            set:
+              vars.suggested: "= state.requested_memory - (state.total_consumed + state.peak_activation_memory + vars.cg_bytes) - 157286400"
+          - set: {state.suggested_kv_cache_memory_bytes: "= vars.suggested"}
+      - if: "!config['use-v2-model-runner']"
+        then:
+          - title: V1 warms the sampler with a max_num_reqs dummy batch after capture
+            source: "vllm/v1/worker/gpu_worker.py:1045-1063"
+            call: gpu-model-runner-v1.dummy-sampler-run
+            input: {num_tokens: "= int(config['max-num-seqs']) < int(config['max-num-batched-tokens']) ? int(config['max-num-seqs']) : int(config['max-num-batched-tokens'])"}
+      - return: {cuda_graph_memory_bytes: "= vars.cg_bytes", suggested_kv_cache_memory_bytes: "= vars.suggested"}
+
+  # ================= the step =================
+  - component: gpu-worker-impl
+    name: execute-model
+    kind: rpc
+    summary: "collective_rpc execute_model (the engine-core -> worker seam): waits for the previous step's PP sends, receives PP intermediate tensors on non-first ranks, runs the model runner's forward. The V2 runner returns None for generation (sample_tokens follows) or a ModelRunnerOutput when no forward ran; pooling models pool immediately."
+    sources: ["vllm/v1/worker/gpu_worker.py:1300-1360", "vllm/v1/worker/worker_base.py:363-368"]
+    latency_ms: 0
+    request:
+      allOf:
+        - {$ref: SchedulerOutput}
+        - type: object
+          properties:
+            scheduled_spec_decode_tokens: {type: object, description: "req_id -> draft token ids (-1 placeholders under async scheduling)"}
+            new_block_ids_to_zero: {type: array, items: {type: integer}}
+            preempted_req_ids: {type: array, items: {type: string}}
+            kv_connector_metadata: {type: ["object", "null"], default: null, description: "SchedulerOutput.kv_connector_metadata (with a KV transfer connector)"}
+    response:
+      anyOf:
+        - {$ref: ModelRunnerOutput}
+        - {type: "null"}
+    behavior:
+      - title: Apply the multimodal receiver cache to new requests (WorkerWrapperBase)
+        source: "vllm/v1/worker/worker_base.py:355-363"
+        when: "size(input.scheduled_new_reqs) > 0 && input.scheduled_new_reqs.exists(r, has(r.mm_features) && size(r.mm_features) > 0)"
+        set: {ctx.mm_cache_applied: true}
+      - if: "state.runner == 'v1'"
+        then:
+          - call: gpu-model-runner-v1.execute-model
+            input: "= input"
+            as: v1
+          - return: "= vars.v1.value"
+      - if: "has(state.pp_send_pending) && state.pp_send_pending"
+        then:
+          - title: Wait for the previous step's PP sends before overwriting their buffers
+            source: "vllm/v1/worker/gpu_worker.py:1304-1309"
+            set: {state.pp_send_pending: false}
+      - if: "input.total_num_scheduled_tokens > 0 && has(state.is_first_pp_rank) && !state.is_first_pp_rank"
+        then:
+          - title: "A non-first PP rank receives the previous stage's intermediate tensors from its counterpart (same TP rank) in that stage; the hand-off is keyed by (stage, TP rank), TP rank 0 keeping the bare stage key"
+            source: "vllm/v1/worker/gpu_worker.py:1311-1324"
+            receive: "= 'pp-hidden:' + string(state.pp_rank) + ((self == '' || int(self.substring(4)) % int(config['tensor-parallel-size']) == 0) ? '' : ':tp' + string(int(self.substring(4)) % int(config['tensor-parallel-size'])))"
+            as: hidden
+            timeout_ms: 600000
+      - call: gpu-model-runner.execute-model
+        input: "= input"
+        as: out
+      - if: "vars.out.value != null && has(vars.out.value.intermediate_tensors)"
+        then:
+          - title: A non-last PP rank sends its intermediate tensors to the same TP rank of the next stage (non-blocking)
+            source: "vllm/v1/worker/gpu_worker.py:1338-1351"
+            put: "= 'pp-hidden:' + string(state.pp_rank + 1) + ((self == '' || int(self.substring(4)) % int(config['tensor-parallel-size']) == 0) ? '' : ':tp' + string(int(self.substring(4)) % int(config['tensor-parallel-size'])))"
+            value: "= vars.out.value.intermediate_tensors"
+          - set: {state.pp_send_pending: true}
+          - if: "state.is_pooling_model"
+            then:
+              - call: gpu-model-runner.pool
+                input: {}
+                as: ppool
+              - return: "= vars.ppool.value"
+          - return: null
+      - if: "vars.out.value == null && state.is_pooling_model"
+        then:
+          - title: Pooling models pool right after the forward (V2)
+            source: "vllm/v1/worker/gpu_worker.py:1330-1336"
+            call: gpu-model-runner.pool
+            input: {}
+            as: pooled
+          - return: "= vars.pooled.value"
+      - return: "= vars.out.value"
+  - component: gpu-worker-impl
+    name: sample-tokens
+    kind: rpc
+    summary: "collective_rpc sample_tokens: called right after execute_model returned None, with the scheduler's grammar output; returns the step's ModelRunnerOutput."
+    sources: ["vllm/v1/worker/gpu_worker.py:1293-1298"]
+    latency_ms: 0
+    request:
+      type: object
+      properties:
+        grammar_output: {type: ["object", "null"]}
+    response:
+      anyOf:
+        - {$ref: ModelRunnerOutput}
+        - {type: "null"}
+    behavior:
+      - if: "state.runner == 'v1'"
+        then:
+          - call: gpu-model-runner-v1.sample-tokens
+            input: {grammar_output: "= has(input.grammar_output) ? input.grammar_output : null"}
+            as: v1
+          - return: "= vars.v1.value"
+      - call: gpu-model-runner.sample-tokens
+        input: {grammar_output: "= has(input.grammar_output) ? input.grammar_output : null"}
+        as: out
+      - return: "= vars.out.value"
+  - component: gpu-worker-impl
+    name: take-draft-token-ids
+    kind: rpc
+    summary: "collective_rpc take_draft_token_ids: the drafts the speculator proposed in the last sample_tokens, for the scheduler's next step."
+    sources: ["vllm/v1/worker/gpu_worker.py:1362-1363"]
+    latency_ms: 0
+    response: {type: ["object", "null"], properties: {req_ids: {type: array}, draft_token_ids: {type: array}}}
+    behavior:
+      - call: gpu-model-runner.take-draft-token-ids
+        input: {}
+        as: d
+      - return: "= vars.d.value"
+  - component: gpu-worker-impl
+    name: execute-dummy-batch
+    kind: rpc
+    summary: "collective_rpc execute_dummy_batch: a uniform-decode dummy forward so an idle DP rank joins its peers' collectives."
+    sources: ["vllm/v1/worker/gpu_worker.py:1431-1437"]
+    latency_ms: 0
+    response: {type: object, properties: {num_tokens: {type: integer}}}
+    behavior:
+      - call: gpu-model-runner.dummy-run
+        input: {num_tokens: 1, uniform_decode: true}
+        as: d
+      - return: {num_tokens: "= vars.d.value.num_tokens"}
+
+  # ================= sleep mode =================
+  - component: gpu-worker-impl
+    name: sleep
+    kind: rpc
+    summary: "collective_rpc sleep(level): level 2 first saves model buffers (and preserved parameters) to CPU; the sleep backend offloads/discards pools; logs the memory freed. Asserts memory did not grow."
+    sources: ["vllm/v1/worker/gpu_worker.py:294-330"]
+    latency_ms: 0
+    request: {type: object, properties: {level: {type: integer, enum: [1, 2], default: 1}}}
+    response: {type: object, properties: {freed_bytes: {type: integer}}}
+    behavior:
+      - if: "input.level == 2"
+        then:
+          - title: Save model buffers to CPU before a level 2 sleep
+            source: "vllm/v1/worker/gpu_worker.py:299-309"
+            set: {state.saved_buffers: true}
+      - title: Suspend through the sleep-mode backend
+        source: "vllm/v1/worker/gpu_worker.py:311"
+        call: cu-mem-allocator.sleep
+        input: {level: "= input.level"}
+        as: s
+      - set: {state.sleep_level: "= input.level"}
+      - return: {freed_bytes: "= vars.s.value.freed_bytes"}
+  - component: gpu-worker-impl
+    name: wake-up
+    kind: rpc
+    summary: "collective_rpc wake_up(tags): resumes the backend, restores the level-2 buffers when weights wake, synchronizes the device."
+    sources: ["vllm/v1/worker/gpu_worker.py:332-356"]
+    latency_ms: 0
+    request: {type: object, properties: {tags: {type: array, items: {type: string}, default: []}}}
+    response: {type: object, properties: {restored: {type: array}, buffers_restored: {type: boolean}}}
+    behavior:
+      - call: cu-mem-allocator.wake-up
+        input: {tags: "= has(input.tags) ? input.tags : []"}
+        as: w
+      - set:
+          vars.wake_weights: "= !has(input.tags) || size(input.tags) == 0 || 'weights' in input.tags"
+      - set: {vars.restored_buffers: "= vars.wake_weights && state.saved_buffers"}
+      - if: "vars.restored_buffers"
+        then:
+          - title: Copy the saved buffers back into the model
+            source: "vllm/v1/worker/gpu_worker.py:340-346"
+            set: {state.saved_buffers: false}
+      - set: {state.sleep_level: "= vars.wake_weights ? 0 : state.sleep_level"}
+      - call: worker-base.synchronize-device
+        input: {}
+      - return: {restored: "= vars.w.value.restored", buffers_restored: "= vars.restored_buffers"}
+  - component: gpu-worker-impl
+    name: discard
+    kind: rpc
+    summary: "collective_rpc discard(tags): drops suspended state for the tags through the sleep backend."
+    sources: ["vllm/v1/worker/gpu_worker.py:358-359"]
+    latency_ms: 0
+    request: {type: object, properties: {tags: {type: array, items: {type: string}, examples: [["weights"]]}}}
+    response: {type: object, properties: {discarded: {type: array}}}
+    behavior:
+      - call: cu-mem-allocator.discard
+        input: {tags: "= input.tags"}
+        as: d
+      - return: {discarded: "= vars.d.value.discarded"}
+
+  # ================= weights, checkpoints =================
+  - component: gpu-worker-impl
+    name: checkpoint-prepare
+    kind: rpc
+    summary: "collective_rpc checkpoint_prepare: prepares distributed state for a process checkpoint."
+    sources: ["vllm/v1/worker/gpu_worker.py:361-362"]
+    latency_ms: 0
+    response: {type: object, properties: {ok: {type: boolean}}}
+    behavior:
+      - call: parallel-state.checkpoint-prepare-distributed-state
+        input: {}
+      - return: {ok: true}
+  - component: gpu-worker-impl
+    name: checkpoint-restore
+    kind: rpc
+    summary: "collective_rpc checkpoint_restore: restores distributed state after a checkpoint."
+    sources: ["vllm/v1/worker/gpu_worker.py:364-365"]
+    latency_ms: 0
+    response: {type: object, properties: {ok: {type: boolean}}}
+    behavior:
+      - call: parallel-state.checkpoint-restore-distributed-state
+        input: {}
+      - return: {ok: true}
+  - component: gpu-worker-impl
+    name: compute-weight-checksums
+    kind: rpc
+    summary: "collective_rpc compute_weight_checksums: parameter digests keyed 'dp<i>:pp<r>:pcp<r>:tp<r>:<name>'."
+    sources: ["vllm/v1/worker/gpu_worker.py:367-378"]
+    latency_ms: 0
+    request: {type: object, properties: {tp_rank: {type: integer, examples: [0]}}}
+    response: {type: object, properties: {checksums: {type: object}}}
+    behavior:
+      - set: {vars.prefix: "= 'dp0:pp0:pcp0:tp' + string(has(input.tp_rank) ? input.tp_rank : 0) + ':'"}
+      - call: weight-checksum.compute-tensor-digests
+        input: {}
+        as: dg
+      - return: {checksums: "= vars.dg.value.digests.transformMapEntry(k, v, {vars.prefix + k: v})"}
+  - component: gpu-worker-impl
+    name: reset-weights
+    kind: rpc
+    summary: "collective_rpc reset_weights: zeroes every model parameter."
+    sources: ["vllm/v1/worker/gpu_worker.py:380-381"]
+    latency_ms: 0
+    response: {type: object, properties: {ok: {type: boolean}}}
+    behavior:
+      - call: weight-checksum.zero-weights
+        input: {}
+      - return: {ok: true}
+  - component: gpu-worker-impl
+    name: reload-weights
+    kind: rpc
+    summary: "collective_rpc reload_weights: reloads checkpoint weights in place through the model runner."
+    sources: ["vllm/v1/worker/gpu_worker.py:629-631"]
+    latency_ms: 0
+    response: {type: object, properties: {ok: {type: boolean}}}
+    behavior:
+      - call: gpu-model-runner.reload-weights
+        input: {}
+      - return: {ok: true}
+  - component: gpu-worker-impl
+    name: save-sharded-state
+    kind: rpc
+    summary: "collective_rpc save_sharded_state: ShardedStateLoader.save_model for this rank."
+    sources: ["vllm/v1/worker/gpu_worker.py:1455-1468"]
+    latency_ms: 0
+    request: {type: object, properties: {path: {type: string, examples: [/models/llama-8b-sharded]}}}
+    response: {type: object, properties: {path: {type: string}}}
+    behavior:
+      - call: sharded-state-loader.save-model
+        input: {path: "= input.path"}
+      - return: {path: "= input.path"}
+  - component: gpu-worker-impl
+    name: save-tensorized-model
+    kind: rpc
+    summary: "collective_rpc save_tensorized_model: TensorizerLoader.save_model."
+    sources: ["vllm/v1/worker/gpu_worker.py:1470-1475"]
+    latency_ms: 0
+    request: {type: object, properties: {tensorizer_uri: {type: string, examples: [/models/llama-8b.tensors]}}}
+    response: {type: object, properties: {tensorizer_uri: {type: string}}}
+    behavior:
+      - call: tensorizer-loader.save-model
+        input: {tensorizer_uri: "= input.tensorizer_uri"}
+      - return: {tensorizer_uri: "= input.tensorizer_uri"}
+
+  # ================= weight transfer (RL weight sync) =================
+  - component: gpu-worker-impl
+    name: init-weight-transfer-engine
+    kind: rpc
+    summary: "collective_rpc init_weight_transfer_engine: requires weight_transfer_config; parses init info and connects the engine to the trainer."
+    sources: ["vllm/v1/worker/gpu_worker.py:1477-1496"]
+    latency_ms: 0
+    errors: [{code: runtime-error, status: 0, retryable: false}]
+    request: {type: object, properties: {init_info: {type: object}}}
+    response: {type: object, properties: {ok: {type: boolean}}}
+    behavior:
+      - if: "!state.weight_transfer_engine"
+        then:
+          - title: Weight transfer not configured
+            source: "vllm/v1/worker/gpu_worker.py:1477-1482"
+            fail: {code: runtime-error, status: 0, message: "Weight transfer not configured. Please set weight_transfer_config to enable weight transfer."}
+      - call: weight-transfer-engine.init-transfer-engine
+        input: {init_info: "= has(input.init_info) ? input.init_info : {}"}
+      - return: {ok: true}
+  - component: gpu-worker-impl
+    name: shutdown-weight-transfer-engine
+    kind: rpc
+    summary: "collective_rpc shutdown_weight_transfer_engine: releases the trainer connection; refused during an active update."
+    sources: ["vllm/v1/worker/gpu_worker.py:1498-1505"]
+    latency_ms: 0
+    errors: [{code: runtime-error, status: 0, retryable: false}]
+    response: {type: object, properties: {released: {type: boolean}}}
+    behavior:
+      - call: weight-update-session.get
+        input: {}
+        as: sess
+      - if: "vars.sess.value.active"
+        then:
+          - fail: {code: runtime-error, status: 0, message: "Cannot release a trainer connection during a weight update"}
+      - if: "state.weight_transfer_engine"
+        then:
+          - call: weight-transfer-engine.shutdown
+            input: {}
+          - return: {released: true}
+      - return: {released: false}
+  - component: gpu-worker-impl
+    name: start-weight-update
+    kind: rpc
+    summary: "collective_rpc start_weight_update: opens an update session on the target model; refused when not configured or a session is already active."
+    sources: ["vllm/v1/worker/gpu_worker.py:1507-1515"]
+    latency_ms: 0
+    errors: [{code: runtime-error, status: 0, retryable: false}]
+    response: {type: object, properties: {active: {type: boolean}, is_draft: {type: boolean}}}
+    behavior:
+      - call: gpu-worker-impl.start-weight-update-session
+        input: {is_draft: false}
+        as: s
+      - return: "= vars.s.value"
+  - component: gpu-worker-impl
+    name: start-draft-weight-update
+    kind: rpc
+    summary: "collective_rpc start_draft_weight_update: like start_weight_update but retargets the engine at the speculative draft model."
+    sources: ["vllm/v1/worker/gpu_worker.py:1517-1522"]
+    latency_ms: 0
+    errors: [{code: runtime-error, status: 0, retryable: false}]
+    response: {type: object, properties: {active: {type: boolean}, is_draft: {type: boolean}}}
+    behavior:
+      - call: gpu-worker-impl.start-weight-update-session
+        input: {is_draft: true}
+        as: s
+      - return: "= vars.s.value"
+  - component: gpu-worker-impl
+    name: start-weight-update-session
+    kind: function
+    summary: "_start_weight_update: the shared checks and the session flag."
+    sources: ["vllm/v1/worker/gpu_worker.py:1524-1548"]
+    latency_ms: 0
+    errors: [{code: runtime-error, status: 0, retryable: false}]
+    request: {type: object, properties: {is_draft: {type: boolean}}}
+    response: {type: object, properties: {active: {type: boolean}, is_draft: {type: boolean}}}
+    behavior:
+      - if: "!state.weight_transfer_engine"
+        then:
+          - fail: {code: runtime-error, status: 0, message: "Weight transfer not configured. Please set weight_transfer_config to enable weight transfer."}
+      - if: "input.is_draft"
+        then:
+          - title: A draft update needs a draft model
+            source: "vllm/v1/worker/gpu_worker.py:1148-1163"
+            if: "config['speculative-method'] == ''"
+            then:
+              - fail: {code: runtime-error, status: 0, message: "Draft model weight update requested, but no draft model is configured."}
+      - title: One session at a time (the flag is checked and set on the worker's single RPC thread)
+        source: "vllm/v1/worker/gpu_worker.py:1534-1538"
+        call: weight-update-session.claim
+        input: {is_draft: "= input.is_draft"}
+        on_error:
+          - fail: {code: runtime-error, status: 0, message: "start_weight_update called while a weight update is already active. Call finish_weight_update first."}
+      - call: weight-transfer-engine.start-weight-update
+        input: {}
+        on_error:
+          - title: A failed start resets the target and leaves no session
+            source: "vllm/v1/worker/gpu_worker.py:1540-1546"
+            call: weight-update-session.release
+            input: {}
+          - fail: "= error"
+      - return: {active: true, is_draft: "= input.is_draft"}
+  - component: gpu-worker-impl
+    name: update-weights
+    kind: rpc
+    summary: "collective_rpc update_weights: loads one chunk into the session's model; a list is indexed by dp_index * world_size + rank. A failing chunk ends the session."
+    sources: ["vllm/v1/worker/gpu_worker.py:1550-1585"]
+    latency_ms: 0
+    errors: [{code: runtime-error, status: 0, retryable: false}]
+    request: {type: object, properties: {update_info: {type: object}}}
+    response: {type: object, properties: {chunks: {type: integer}}}
+    behavior:
+      - if: "!state.weight_transfer_engine"
+        then:
+          - fail: {code: runtime-error, status: 0, message: "Weight transfer not configured. Please set weight_transfer_config to enable weight transfer."}
+      - call: weight-update-session.get
+        input: {}
+        as: sess
+      - if: "!vars.sess.value.active"
+        then:
+          - title: update_weights before start_weight_update
+            source: "vllm/v1/worker/gpu_worker.py:1567-1570"
+            fail: {code: runtime-error, status: 0, message: "start_weight_update must be called before update_weights."}
+      - call: weight-transfer-engine.update-weights
+        input: {update_info: "= has(input.update_info) ? input.update_info : {}"}
+        as: up
+        on_error:
+          - title: A failed chunk resets the session
+            source: "vllm/v1/worker/gpu_worker.py:1581-1585"
+            call: weight-update-session.release
+            input: {}
+          - fail: "= error"
+      - set: {state.weight_chunks: "= (has(state.weight_chunks) ? state.weight_chunks : 0) + 1"}
+      - return: {chunks: "= state.weight_chunks"}
+  - component: gpu-worker-impl
+    name: finish-weight-update
+    kind: rpc
+    summary: "collective_rpc finish_weight_update: closes the session; a non-draft update resets LoRA state because weight transfer bypasses reload_weights."
+    sources: ["vllm/v1/worker/gpu_worker.py:1587-1604"]
+    latency_ms: 0
+    errors: [{code: runtime-error, status: 0, retryable: false}]
+    response: {type: object, properties: {finished: {type: boolean}, lora_reset: {type: boolean}}}
+    behavior:
+      - if: "!state.weight_transfer_engine"
+        then:
+          - fail: {code: runtime-error, status: 0, message: "Weight transfer not configured. Please set weight_transfer_config to enable weight transfer."}
+      - call: weight-update-session.get
+        input: {}
+        as: sess
+      - if: "!vars.sess.value.active"
+        then:
+          - fail: {code: runtime-error, status: 0, message: "finish_weight_update called without a matching start_weight_update."}
+      - call: weight-transfer-engine.finish-weight-update
+        input: {}
+      - call: weight-update-session.release
+        input: {}
+      - if: "!vars.sess.value.is_draft"
+        then:
+          - title: Reset LoRA state after a target-model update
+            source: "vllm/v1/worker/gpu_worker.py:1602-1604"
+            call: gpu-model-runner.reset-lora-state
+            input: {}
+          - return: {finished: true, lora_reset: true}
+      - return: {finished: true, lora_reset: false}
+  - component: gpu-worker-impl
+    name: supports-draft-weight-updates
+    kind: rpc
+    summary: "collective_rpc supports_draft_weight_updates: true only with a weight transfer engine that supports drafts and a configured draft model."
+    sources: ["vllm/v1/worker/gpu_worker.py:1135-1146"]
+    latency_ms: 0
+    response: {type: object, properties: {supported: {type: boolean}}}
+    behavior:
+      - if: "state.weight_transfer_engine && config['speculative-method'] != '' && config['speculative-method'] != 'ngram'"
+        then: [{return: {supported: true}}]
+      - return: {supported: false}
+
+  # ================= LoRA =================
+  - component: gpu-worker-impl
+    name: add-lora
+    kind: rpc
+    summary: "collective_rpc add_lora -> LoRAModelRunnerMixin.add_lora (RuntimeError unless --enable-lora)."
+    sources: ["vllm/v1/worker/gpu_worker.py:1439-1440"]
+    latency_ms: 0
+    request: {type: object, properties: {lora_name: {type: string, examples: [sql-lora]}, lora_int_id: {type: integer, examples: [1]}, lora_path: {type: string, examples: [/adapters/sql-lora]}}}
+    response: {type: object, properties: {added: {type: boolean}}}
+    behavior:
+      - call: gpu-model-runner.add-lora
+        input: {lora_name: "= input.lora_name", lora_int_id: "= input.lora_int_id", lora_path: "= input.lora_path"}
+        as: r
+      - return: "= vars.r.value"
+  - component: gpu-worker-impl
+    name: remove-lora
+    kind: rpc
+    summary: "collective_rpc remove_lora."
+    sources: ["vllm/v1/worker/gpu_worker.py:1442-1443"]
+    latency_ms: 0
+    request: {type: object, properties: {lora_int_id: {type: integer, examples: [1]}}}
+    response: {type: object, properties: {removed: {type: boolean}}}
+    behavior:
+      - call: gpu-model-runner.remove-lora
+        input: {lora_int_id: "= input.lora_int_id"}
+        as: r
+      - return: "= vars.r.value"
+  - component: gpu-worker-impl
+    name: list-loras
+    kind: rpc
+    summary: "collective_rpc list_loras."
+    sources: ["vllm/v1/worker/gpu_worker.py:1445-1446"]
+    latency_ms: 0
+    response: {type: object, properties: {lora_ids: {type: array}}}
+    behavior:
+      - call: gpu-model-runner.list-loras
+        input: {}
+        as: r
+      - return: "= vars.r.value"
+  - component: gpu-worker-impl
+    name: pin-lora
+    kind: rpc
+    summary: "collective_rpc pin_lora."
+    sources: ["vllm/v1/worker/gpu_worker.py:1448-1449"]
+    latency_ms: 0
+    request: {type: object, properties: {lora_int_id: {type: integer, examples: [1]}}}
+    response: {type: object, properties: {pinned: {type: boolean}}}
+    behavior:
+      - call: gpu-model-runner.pin-lora
+        input: {lora_int_id: "= input.lora_int_id"}
+        as: r
+      - return: "= vars.r.value"
+
+  # ================= admin =================
+  - component: gpu-worker-impl
+    name: profile
+    kind: rpc
+    summary: "collective_rpc profile(is_start, prefix): RuntimeError unless profiler_config.profiler is set; start validates the prefix and creates the profiler once; stop without a start only warns."
+    sources: ["vllm/v1/worker/gpu_worker.py:1365-1421"]
+    latency_ms: 0
+    errors: [{code: runtime-error, status: 0, retryable: false}]
+    request: {type: object, properties: {is_start: {type: boolean, default: true}, profile_prefix: {type: string, examples: [bench]}}}
+    response: {type: object, properties: {running: {type: boolean}, trace_name: {type: string}}}
+    behavior:
+      - if: "!('profiler' in config) || config['profiler'] == ''"
+        then:
+          - title: Profiling is not enabled
+            source: "vllm/v1/worker/gpu_worker.py:1374-1380"
+            fail: {code: runtime-error, status: 0, message: "Profiling is not enabled. Please set --profiler-config to enable profiling."}
+      - if: "input.is_start"
+        then:
+          - set: {vars.name: "= (has(input.profile_prefix) && input.profile_prefix != '' ? input.profile_prefix + '_' : '') + 'dp0_pp0_tp0'"}
+          - set: {state.profiler_running: true, state.trace_name: "= vars.name"}
+          - return: {running: true, trace_name: "= vars.name"}
+      - if: "!state.profiler_running"
+        then:
+          - title: Stop without a start only warns
+            source: "vllm/v1/worker/gpu_worker.py:1410-1412"
+            return: {running: false, trace_name: ""}
+      - set: {state.profiler_running: false}
+      - return: {running: false, trace_name: "= state.trace_name"}
+  - component: gpu-worker-impl
+    name: check-health
+    kind: rpc
+    summary: "collective_rpc check_health: a GPU worker is healthy as long as it is running."
+    sources: ["vllm/v1/worker/gpu_worker.py:1451-1453"]
+    latency_ms: 0
+    response: {type: object, properties: {healthy: {type: boolean}}}
+    behavior:
+      - title: Always healthy while running
+        source: "vllm/v1/worker/gpu_worker.py:1451-1453"
+        return: {healthy: true}
+  - component: gpu-worker-impl
+    name: get-supported-tasks
+    kind: rpc
+    summary: "collective_rpc get_supported_tasks: ('generate',) for generative models, pooling tasks for pooling models."
+    sources: ["vllm/v1/worker/gpu_worker.py:1168-1169"]
+    latency_ms: 0
+    response: {type: object, properties: {tasks: {type: array, items: {type: string}}}}
+    behavior:
+      - call: gpu-model-runner.get-supported-tasks
+        input: {}
+        as: t
+      - return: "= vars.t.value"
+  - component: gpu-worker-impl
+    name: reset-mm-cache
+    kind: rpc
+    summary: "collective_rpc reset_mm_cache (the wrapper also clears its receiver cache)."
+    sources: ["vllm/v1/worker/gpu_worker.py:1123-1124"]
+    latency_ms: 0
+    response: {type: object, properties: {reset: {type: boolean}}}
+    behavior:
+      - call: gpu-model-runner.reset-mm-cache
+        input: {}
+      - return: {reset: true}
+  - component: gpu-worker-impl
+    name: reset-encoder-cache
+    kind: rpc
+    summary: "collective_rpc reset_encoder_cache."
+    sources: ["vllm/v1/worker/gpu_worker.py:1126-1127"]
+    latency_ms: 0
+    response: {type: object, properties: {reset: {type: boolean}}}
+    behavior:
+      - call: gpu-model-runner.reset-encoder-cache
+        input: {}
+      - return: {reset: true}
+  - component: gpu-worker-impl
+    name: get-encoder-timing-stats
+    kind: rpc
+    summary: "collective_rpc get_encoder_timing_stats (multimodal encoder timings)."
+    sources: ["vllm/v1/worker/gpu_worker.py:1176-1178"]
+    latency_ms: 0
+    response: {type: object, properties: {stats: {type: object}}}
+    behavior:
+      - call: gpu-model-runner.get-encoder-timing-stats
+        input: {}
+        as: s
+      - return: "= vars.s.value"
+  - component: gpu-worker-impl
+    name: get-kv-connector-handshake-metadata
+    kind: rpc
+    summary: "collective_rpc get_kv_connector_handshake_metadata: None without a KV transfer group or when the connector exchanges no metadata; else {(pp_rank, tp_rank): metadata}."
+    sources: ["vllm/v1/worker/gpu_worker.py:809-835"]
+    latency_ms: 0
+    response: {type: ["object", "null"], properties: {key: {type: string}}}
+    behavior:
+      - if: "config['kv-transfer-config'] == ''"
+        then:
+          - title: No KV transfer group
+            source: "vllm/v1/worker/gpu_worker.py:816-817"
+            return: null
+      - return: {key: "pp0:tp0"}
+  - component: gpu-worker-impl
+    name: handle-ft-command
+    kind: rpc
+    summary: "collective_rpc handle_ft_command: forwards an FT command to the WorkerSentinel (asserts one exists: enable_fault_tolerance)."
+    sources: ["vllm/v1/worker/gpu_worker.py:581-583"]
+    latency_ms: 0
+    errors: [{code: assertion-error, status: 0, retryable: false}]
+    request: {type: object, properties: {instruction: {type: string, examples: [retry]}}}
+    response: {type: object, properties: {instruction: {type: string}, done: {type: boolean}}}
+    behavior:
+      - if: "!config['enable-fault-tolerance']"
+        then:
+          - title: No WorkerSentinel without enable_fault_tolerance
+            source: "vllm/v1/worker/gpu_worker.py:217-218"
+            fail: {code: assertion-error, status: 0, message: "assert self.worker_sentinel is not None"}
+      - call: worker-sentinel.handle-command
+        input: {instruction: "= input.instruction"}
+        as: r
+      - return: "= vars.r.value"
+  - component: gpu-worker-impl
+    name: elastic-ep-execute
+    kind: rpc
+    summary: "collective_rpc elastic_ep_execute: runs one elastic EP scaling method on the worker."
+    sources: ["vllm/v1/worker/gpu_worker.py:1636-1637"]
+    latency_ms: 0
+    request: {type: object, properties: {execute_method: {type: string, examples: [receive_weights]}}}
+    response: {type: object, properties: {ok: {type: boolean}}}
+    behavior:
+      - call: elastic-ep-scaling-executor.execute
+        input: {execute_method: "= input.execute_method"}
+      - return: {ok: true}
+  - component: gpu-worker-impl
+    name: shutdown
+    kind: rpc
+    summary: "collective_rpc shutdown: unfreezes GC, shuts down KV/EC transfer, the profiler, the weight transfer engine and elastic EP, releases the model runner's GPU tensors and the CuMem pools."
+    sources: ["vllm/v1/worker/gpu_worker.py:1606-1634"]
+    latency_ms: 0
+    response: {type: object, properties: {shut_down: {type: boolean}}}
+    behavior:
+      - if: "state.weight_transfer_engine"
+        then:
+          - call: weight-transfer-engine.shutdown
+            input: {}
+      - title: Release model weights, KV caches and workspace
+        source: "vllm/v1/worker/gpu_worker.py:1620-1624"
+        call: gpu-model-runner.shutdown
+        input: {}
+      - set: {state.shut_down: true, state.profiler_running: false}
+      - return: {shut_down: true}
+
+  # ---- the weight-update session flag (Worker._weight_update_active / _weight_update_is_draft) ----
+  - component: weight-update-session
+    name: get
+    kind: io
+    summary: "Reads the worker's weight-update session flags (no session: inactive)."
+    sources: ["vllm/v1/worker/gpu_worker.py:226-227"]
+    latency_ms: 0
+    store: {table: sessions, op: get, key: "session", default: {active: false, is_draft: false}}
+  - component: weight-update-session
+    name: claim
+    kind: io
+    summary: "Opens a session only when none is active (the check-then-set of _start_weight_update, on the worker's single RPC thread)."
+    sources: ["vllm/v1/worker/gpu_worker.py:1534-1548"]
+    latency_ms: 0
+    errors: [{code: session-active, status: 0, retryable: false}]
+    request: {type: object, properties: {is_draft: {type: boolean, default: false}}}
+    store: {table: sessions, op: put, key: "session", value: {active: true, is_draft: "= input.is_draft"}, where: "row == null || !row.active", conflict: session-active}
+  - component: weight-update-session
+    name: release
+    kind: io
+    summary: "Ends the session (finish, a failed chunk, or a failed start)."
+    sources: ["vllm/v1/worker/gpu_worker.py:1581-1600"]
+    latency_ms: 0
+    errors: [{code: no-session, status: 0, retryable: false}]
+    store: {table: sessions, op: put, key: "session", value: {active: false, is_draft: false}, where: "row != null && row.active", conflict: no-session}

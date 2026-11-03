@@ -1,0 +1,196 @@
+# A small API on the Redis substrate, to show an import works. It rate limits each client with a
+# sliding window kept in a sorted set and updated by one Lua script (trim, count, add, expire,
+# atomically), failing open when Redis is down; keeps login sessions as strings with a TTL; and
+# caches feature flags in process, dropping the cache when a pub/sub invalidation arrives.
+# Imported ids: components and interfaces under "redis/", schemas under "redis.", state at
+# state['redis/redis'], the pub/sub topic is redis/redis-message (§17 item 8), and the config is
+# redis/redis-script-max-keys.
+#   go run ./internal/devtools/check -f substrates/examples/rate-limited-api/ontology.yaml
+schema_version: 1
+id: rate-limited-api
+name: Rate-limited API (Redis substrate import example)
+level: system
+imports:
+  - {ontology: ../../redis, as: redis}
+
+configs:
+  - {id: rate-limit, type: integer, value: 3, default: 100, summary: "Requests one client may make per window."}
+  - {id: rate-window-ms, type: integer, value: 1000, default: 60000, summary: "The sliding window."}
+  - {id: session-ttl-ms, type: integer, value: 30000, default: 3600000, summary: "How long a login session lives."}
+
+components:
+  - {id: user, kind: client, summary: The API caller.}
+  - {id: admin, kind: client, summary: An operator changing feature flags.}
+  - id: api
+    kind: service
+    summary: "The API process, connected to Redis as client api-1, with an in-process flag cache."
+    state: {initial: {flag_cache: {}}}
+
+interfaces:
+  - component: api
+    name: request
+    kind: http
+    attributes: {method: GET, path: /v1/things}
+    request: {type: object, required: [client_id], properties: {client_id: {type: string, examples: [c1]}}}
+    response: {type: object, properties: {ok: {type: boolean}, limited_by: {type: string}}}
+    errors: [{code: rate_limited, status: 429}]
+    behavior:
+      - call: redis/redis.eval
+        timeout_ms: 50
+        input:
+          keys: ["= 'rl:' + input.client_id"]
+          args: ["= string(config['rate-window-ms'])", "= string(config['rate-limit'])", "= id('req', seq('req'))"]
+          script: >-
+            [data[KEYS[0]] == null ? {} : data[KEYS[0]].value].map(z,
+              [z.transformMap(m, s, s > now - int(ARGV[0]), s)].map(kept,
+                size(kept) < int(ARGV[1])
+                  ? {'reply': 1, 'writes': {KEYS[0]: {'type': 'zset', 'value': merge(kept, {ARGV[2]: double(now)}), 'px': int(ARGV[0])}}}
+                  : {'reply': 0, 'writes': {KEYS[0]: {'type': 'zset', 'value': kept, 'px': int(ARGV[0])}}}
+              )[0])[0]
+        as: rl
+        on_error:
+          - title: Fail open
+            detail: Redis is down or slow; the limiter lets the request through rather than refuse everyone.
+            set: {ctx.fail_open: true}
+          - return: {ok: true, limited_by: none}
+      - if: "vars.rl.value.reply == 0"
+        then: [{fail: {code: rate_limited, status: 429, message: "= 'more than ' + string(config['rate-limit']) + ' requests per window'"}}]
+      - return: {ok: true, limited_by: window}
+
+  - component: api
+    name: login
+    kind: http
+    attributes: {method: POST, path: /v1/login}
+    request: {type: object, required: [user], properties: {user: {type: string, examples: [ada]}}}
+    response: {type: object, properties: {token: {type: string}}}
+    behavior:
+      - set: {vars.token: "= id('session', input.user)"}
+      - call: redis/redis.set
+        input: {key: "= 'session:' + vars.token", value: "= input.user", px: "= config['session-ttl-ms']"}
+      - return: {token: "= vars.token"}
+
+  - component: api
+    name: whoami
+    kind: http
+    attributes: {method: GET, path: /v1/me}
+    request: {type: object, required: [token], properties: {token: {type: string}}}
+    response: {type: object, properties: {user: {type: string}}}
+    errors: [{code: unauthenticated, status: 401}]
+    behavior:
+      - {call: redis/redis.get, input: {key: "= 'session:' + input.token"}, as: s}
+      - if: "vars.s.value.value == null"
+        then: [{fail: {code: unauthenticated, status: 401, message: session expired or unknown}}]
+      - return: {user: "= vars.s.value.value"}
+
+  - component: api
+    name: boot
+    kind: event
+    summary: "Process start: subscribe to flag invalidations."
+    request: {type: object, properties: {}}
+    behavior:
+      - call: redis/redis.subscribe
+        input: {client: api-1, channels: [flags]}
+
+  - component: api
+    name: flag
+    kind: http
+    attributes: {method: GET, path: "/v1/flags/:name"}
+    request: {type: object, required: [name], properties: {name: {type: string, examples: [dark-mode]}}}
+    response: {type: object, properties: {value: {type: [string, "null"]}, cached: {type: boolean}}}
+    behavior:
+      - if: "input.name in state.flag_cache"
+        then: [{return: {value: "= state.flag_cache[input.name]", cached: true}}]
+      - {call: redis/redis.hget, input: {key: flags, field: "= input.name"}, as: h}
+      - set: {state.flag_cache: "= merge(state.flag_cache, {input.name: vars.h.value.value})"}
+      - return: {value: "= vars.h.value.value", cached: false}
+
+  - component: api
+    name: set-flag
+    kind: http
+    attributes: {method: PUT, path: "/v1/flags/:name"}
+    request: {type: object, required: [name, value], properties: {name: {type: string, examples: [dark-mode]}, value: {type: string, examples: ["on"]}}}
+    response: {type: object, properties: {notified: {type: integer}}}
+    behavior:
+      - call: redis/redis.hset
+        input: {key: flags, fields: "= {input.name: input.value}"}
+      - {call: redis/redis.publish, input: {channel: flags, message: "= input.name"}, as: p}
+      - return: {notified: "= vars.p.value.receivers"}
+
+  - component: api
+    name: on-flag-change
+    kind: event
+    summary: "The pub/sub push handler: drops a flag from the in-process cache."
+    subscribe: [redis/redis-message]
+    request: {type: object, properties: {channel: {type: string}, message: {type: string}, receivers: {type: array}}}
+    behavior:
+      - set: {state.flag_cache: "= omit(state.flag_cache, input.message)"}
+        when: "input.channel == 'flags' && 'api-1' in input.receivers"
+
+flows:
+  - {id: request, tags: [writes], entry: {caller: user, interface: api.request}}
+  - {id: login, tags: [writes], entry: {caller: user, interface: api.login}}
+  - {id: whoami, tags: [reads], entry: {caller: user, interface: api.whoami}}
+  - {id: boot, tags: [writes], entry: {caller: admin, interface: api.boot, input: {}}}
+  - {id: flag, tags: [reads], entry: {caller: user, interface: api.flag}}
+  - {id: set-flag, tags: [writes], entry: {caller: admin, interface: api.set-flag}}
+
+fixtures:
+  - id: start
+    clock: {epoch: "2026-11-01T00:00:00Z"}
+
+scenarios:
+  - id: sliding-window-limit
+    name: The fourth request inside one second is refused 429; a second later the window has room again
+    fixtures: [start]
+    steps:
+      - {flow: request, as: r1, input: {client_id: c1}}
+      - {flow: request, as: r2, at_ms: 100, input: {client_id: c1}}
+      - {flow: request, as: r3, at_ms: 200, input: {client_id: c1}}
+      - {flow: request, as: r4, at_ms: 300, input: {client_id: c1}}
+      - {flow: request, as: other, at_ms: 310, input: {client_id: c2}}
+      - {flow: request, as: r5, at_ms: 1150, input: {client_id: c1}}
+    expect:
+      - "steps.r1.result.ok && steps.r2.result.ok && steps.r3.result.ok"
+      - "!steps.r4.result.ok && steps.r4.result.error.code == 'rate_limited' && steps.r4.result.error.status == 429"
+      - "steps.other.result.ok && steps.r5.result.ok"
+      - "size(state['redis/redis'].keys['rl:c1'].value) == 2 && 'expires_at' in state['redis/redis'].keys['rl:c1']"
+
+  - id: limiter-fails-open
+    name: With Redis down the limiter lets requests through instead of refusing them
+    fixtures: [start]
+    faults: [{target: redis/redis, type: unavailable}]
+    steps:
+      - {flow: request, as: r1, input: {client_id: c1}}
+      - {flow: request, as: r2, input: {client_id: c1}}
+      - {flow: request, as: r3, input: {client_id: c1}}
+      - {flow: request, as: r4, input: {client_id: c1}}
+    expect:
+      - "[steps.r1, steps.r2, steps.r3, steps.r4].all(s, s.result.ok && s.result.value.limited_by == 'none')"
+      - "ctx.fail_open && faults == 4 && size(state['redis/redis'].keys) == 0"
+
+  - id: session-expires
+    name: A session reads back until its TTL passes, then the API answers 401
+    fixtures: [start]
+    steps:
+      - {flow: login, as: in, input: {user: ada}}
+      - {flow: whoami, as: me, at_ms: 1000, input: {token: "= steps['in'].result.value.token"}}
+      - {flow: whoami, as: late, at_ms: 31000, input: {token: "= steps['in'].result.value.token"}}
+    expect:
+      - "steps.me.result.ok && steps.me.result.value.user == 'ada'"
+      - "!steps.late.result.ok && steps.late.result.error.status == 401"
+
+  - id: flag-invalidation
+    name: A flag change published on Redis drops the API's cached value, so the next read sees it
+    fixtures: [start]
+    state:
+      redis/redis: {keys: {flags: {type: hash, value: {dark-mode: "off"}}}}
+    steps:
+      - {flow: boot, as: boot}
+      - {flow: flag, as: f1, input: {name: dark-mode}}
+      - {flow: flag, as: f2, input: {name: dark-mode}}
+      - {flow: set-flag, as: change, input: {name: dark-mode, value: "on"}}
+      - {flow: flag, as: f3, input: {name: dark-mode}}
+    expect:
+      - "steps.f1.result.value == {'value': 'off', 'cached': false} && steps.f2.result.value.cached"
+      - "steps.change.result.value.notified == 1"
+      - "steps.f3.result.value == {'value': 'on', 'cached': false}"

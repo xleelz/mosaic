@@ -1,0 +1,65 @@
+schema_version: 1
+id: vllm
+scenarios:
+- id: oracle-worker-runner-profile-cg-memory-disabled-returns-zero
+  name: profile_cudagraph_memory with cudagraph_mode NONE returns 0 without bootstrapping a KV cache
+  description: tests/v1/worker/test_gpu_model_runner_v2_cudagraph_profiling.py::test_profile_cudagraph_memory_disabled_returns_zero
+    (line 117). Code under test vllm/v1/worker/gpu/cudagraph_utils.py:873-891 (early return 0 when
+    compilation_config.cudagraph_mode == NONE, before any KV-cache bootstrap or teardown).
+  fixtures: [full-tp1-llama-8b]
+  config:
+    cudagraph-mode: NONE
+  steps:
+  - interface: gpu-model-runner.profile-cudagraph-memory
+    caller: gpu-worker-impl
+    input: {}
+    as: prof
+  expect:
+  - steps.prof.result.ok && steps.prof.result.value.cudagraph_memory_bytes == 0
+  - calls['gpu-memory.allocate'] == 0 && calls['cuda-graph-manager.capture'] == 0 && calls['gpu-model-runner.capture-model'] == 0
+- id: oracle-worker-runner-full-capture-sets-graph-pool-id
+  name: FULL capture points NCCL's graph_pool_id at the pool before entering torch.cuda.graph
+  description: tests/v1/cudagraph/test_cudagraph_manager.py::test_full_capture_sets_graph_pool_id_before_cuda_graph
+    (line 59). Code under test CudaGraphManager.capture, vllm/v1/worker/gpu/cudagraph_utils.py:419-510 (line 491-494
+    enters capture_pool, which calls pynccl_allocator.set_graph_pool_id, vllm/compilation/cudagraph_pool.py:33-45,
+    before torch.cuda.graph).
+  fixtures: [full-tp1-llama-8b]
+  config:
+    cudagraph-mode: FULL
+  steps:
+  - interface: cuda-graph-manager.init
+    caller: gpu-model-runner
+    input: {decode_query_len: 1}
+    as: init
+  - interface: cuda-graph-manager.capture
+    caller: gpu-model-runner
+    input: {}
+    as: cap
+  expect:
+  - steps.init.result.value.cudagraph_mode == 'FULL'
+  - steps.cap.result.ok && steps.cap.result.value.captured
+  - "trace.exists(e, e.type == 'call.start' && (e.interface.contains('graph-pool') || e.interface.contains('capture-pool')))"
+  - "trace.exists(p, p.type == 'call.start' && (p.interface.contains('graph-pool') || p.interface.contains('capture-pool')) && trace.exists(g, g.type == 'call.start' && g.interface.contains('cuda-graph') && g.interface != 'cuda-graph-manager.capture' && g.interface != 'cuda-graph-manager.init' && g.seq > p.seq))"
+- id: oracle-worker-runner-backend-and-cudagraph-mode-combo
+  name: FA2 with cudagraph_mode FULL falls back to FULL_AND_PIECEWISE and generates
+  description: tests/v1/cudagraph/test_cudagraph_mode.py::test_backend_and_cudagraph_mode_combo (line 42), case
+    ("FA2", "FULL", True). Code under test CompilationConfig.resolve_cudagraph_mode_and_sizes,
+    vllm/config/compilation.py:1369-1411 (FA2 reports UNIFORM_BATCH, vllm/v1/attention/backends/flash_attn.py:614-617;
+    FULL mixed mode needs ALWAYS, so with attention in the splitting ops it becomes FULL_AND_PIECEWISE).
+  fixtures: [full-tp1-llama-8b]
+  config:
+    cudagraph-mode: FULL
+    compilation-mode: 3
+    attention-backend: FLASH_ATTN
+    flash-attn-version: 2
+  steps:
+  - flow: wr-initialize-kv-cache
+    as: kv
+  - flow: serving-api-offline-generate
+    input: {prompts: ["Hello, my name is", "Hello, my name is", "Hello, my name is", "Hello, my name is", "Hello, my name is",
+        "Hello, my name is", "Hello, my name is", "Hello, my name is", "Hello, my name is", "Hello, my name is"]}
+    as: gen
+  expect:
+  - steps.kv.result.ok && steps.gen.result.ok
+  - "trace.exists(e, e.type == 'call.end' && e.interface == 'gpu-model-runner.initialize-kv-cache' && e.output.cudagraph_mode == 'FULL_AND_PIECEWISE')"
+  - "!trace.exists(e, e.type == 'call.end' && e.interface == 'cuda-graph-manager.dispatch' && e.output.cg_mode == 'FULL' && e.input.uniform_token_count == 0)"

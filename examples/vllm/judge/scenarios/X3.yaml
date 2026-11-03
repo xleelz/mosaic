@@ -1,0 +1,46 @@
+schema_version: 1
+id: vllm
+scenarios:
+  - id: bench-x3-kv-sizing-h100-8b
+    name: "X3: startup profiles a dummy run, sizes the KV cache from requested - non-KV - CUDA graph estimate"
+    description: >
+      Verified (vllm/v1/worker/gpu_worker.py:633-807, vllm/v1/worker/utils.py:716-726,
+      vllm/utils/mem_utils.py:318-321): requested = ceil(total * 0.92) = 79027398247;
+      non_kv = total_consumed (weights 16060522496 + non-torch 1 GiB) + transient peak (1.5 GiB);
+      the CUDA graph estimate (0.5 GiB, assumption) is also subtracted
+      (VLLM_MEMORY_PROFILER_ESTIMATE_CUDAGRAPHS=1). 59745650279 B // 2 MiB per block = 28488 blocks.
+      The order is determine_available_memory -> get_kv_cache_configs (capacity check) ->
+      initialize_from_config -> compile_or_warm_up_model (vllm/v1/engine/core.py:310-379).
+    flow: engine-startup
+    fixtures: [full-tp1-llama-8b]
+    expect:
+      - "result.ok"
+      - >
+        trace.filter(e, e.type == 'call.start' && e.interface in ['gpu-model-runner.profile-run', 'gpu-memory.profile-peak',
+        'gpu-model-runner.profile-cudagraph-memory', 'kv-cache-utils.get-kv-cache-configs', 'block-pool.init',
+        'gpu-worker-impl.initialize-from-config', 'gpu-worker-impl.compile-or-warm-up-model']).map(e, e.interface) ==
+        ['gpu-model-runner.profile-run', 'gpu-memory.profile-peak', 'gpu-model-runner.profile-cudagraph-memory',
+         'kv-cache-utils.get-kv-cache-configs', 'block-pool.init', 'gpu-worker-impl.initialize-from-config',
+         'gpu-worker-impl.compile-or-warm-up-model']
+      - "trace.exists(e, e.type == 'call.start' && e.interface == 'gpu-memory.profile-peak' && e.input.num_tokens == 8192)"
+      - "state['gpu-worker-impl@rank0'].available_kv_cache_memory_bytes == 85899345920 * 92 / 100 + 1 - (16060522496 + 1073741824) - 1610612736 - 536870912"
+      - "trace.filter(e, e.type == 'call.end' && e.interface == 'engine-core.initialize-kv-caches')[0].output.num_gpu_blocks == 28488"
+      - "trace.exists(e, e.type == 'call.start' && e.interface == 'gpu-worker-impl.initialize-from-config' && e.input.num_blocks == 28488)"
+
+  - id: bench-x3-kv-too-small-for-max-model-len
+    name: "X3: startup fails when the KV budget can't hold one max_model_len (131072-token) request"
+    description: >
+      At gpu_memory_utilization 0.4 the budget is 34359738368 - 17134264320 - 1610612736 - 536870912
+      = 15077990400 B (7189 blocks), less than the 8192 blocks x 2 MiB = 16 GiB one 131072-token request
+      needs. get_kv_cache_configs -> _check_enough_kv_cache_memory raises ValueError
+      "To serve at least one request with the model's max seq len (131072) ..."
+      (vllm/v1/core/kv_cache_utils.py:1003-1040, 2638-2647) before initialize_from_config, so the engine
+      core fails to start and the client sees "Engine core initialization failed".
+    flow: engine-startup
+    fixtures: [full-tp1-llama-8b]
+    config: {gpu-memory-utilization: 0.4}
+    expect:
+      - "state['gpu-worker-impl@rank0'].available_kv_cache_memory_bytes == 15077990400"
+      - "!result.ok && result.error.code == 'runtime-error' && result.error.message.contains('Engine core initialization failed')"
+      - "trace.exists(e, e.type == 'call.end' && e.interface == 'kv-cache-utils.get-kv-cache-configs' && has(e.error) && e.error != null && e.error.code == 'value-error' && e.error.message.contains('max seq len'))"
+      - "calls['gpu-worker-impl.initialize-from-config'] == 0"

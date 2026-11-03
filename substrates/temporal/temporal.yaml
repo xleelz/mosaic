@@ -1,0 +1,788 @@
+# Temporal substrate (DESIGN §15.6, §16.5). Import it instead of modeling Temporal again:
+#   imports: [{ontology: <path to this file or its directory>, as: temporal}]
+# There is no code snapshot: every interface cites Temporal's documentation by URL.
+# Scope: one Temporal cluster (frontend, history and matching as one component): workflow
+# start with the workflow-id reuse and conflict policies, workflow tasks with their timeout and
+# redelivery, activities with retry policies, start-to-close, schedule-to-close and heartbeat
+# timeouts, timers, signals, continue-as-new, termination, DescribeWorkflowExecution and the
+# history. Workers are the importer's: interfaces subscribed to the topics
+# temporal-workflow-task and temporal-activity-task, answering with the Respond* calls.
+# Not modeled: queries, updates, child workflows, cancellation requests, local activities,
+# schedule-to-start timeouts, workflow run/execution timeouts, search attributes, namespaces,
+# sticky queues, versioning, and the WorkflowTaskScheduled/Started/Completed history events.
+schema_version: 1
+id: temporal
+name: Temporal (substrate)
+level: service
+description: >-
+  A Temporal cluster. Starting a workflow creates a run and a workflow task; the server pushes
+  each workflow task to the topic temporal-workflow-task with the run's new history events,
+  and the worker answers with commands (schedule_activity, start_timer, cancel_timer,
+  complete_workflow, fail_workflow, continue_as_new). Activities are pushed to
+  temporal-activity-task; a worker heartbeats and completes or fails them. Failures and
+  timeouts are retried by the activity's retry policy with exponential backoff. A worker that
+  crashes never answers: the workflow task times out and is redelivered, and an activity is
+  retried after its heartbeat or start-to-close timeout. Answers from a superseded attempt
+  are refused not_found.
+source: {url: "https://docs.temporal.io/"}
+
+configs:
+  - id: temporal-workflow-task-timeout-ms
+    type: integer
+    value: 10000
+    default: 10000
+    summary: "WorkflowTaskTimeout: how long a worker has to answer a workflow task before it is redelivered (default 10 s)."
+    sources: ["https://docs.temporal.io/encyclopedia/detecting-workflow-failures#workflow-task-timeout"]
+  - id: temporal-retry-initial-interval-ms
+    type: integer
+    value: 1000
+    default: 1000
+    summary: "The default activity retry policy's InitialInterval (1 s). Its MaximumInterval defaults to 100 times this."
+    sources: ["https://docs.temporal.io/encyclopedia/retry-policies#default-values-for-retry-policy"]
+  - id: temporal-retry-backoff-coefficient
+    type: number
+    value: 2.0
+    default: 2.0
+    summary: "The default activity retry policy's BackoffCoefficient."
+    sources: ["https://docs.temporal.io/encyclopedia/retry-policies#default-values-for-retry-policy"]
+
+components:
+  - id: temporal-server
+    name: Temporal server
+    kind: service
+    layer: platform
+    summary: "One Temporal cluster and namespace: workflow runs, their histories, pending workflow tasks, activities and timers."
+    attributes: {technology: temporal}
+    sources: ["https://docs.temporal.io/temporal-service", "https://docs.temporal.io/workflow-execution"]
+    state:
+      schema:
+        type: object
+        properties:
+          workflows: {type: object, description: "workflow_id -> {run_id}: the latest run"}
+          runs: {type: object, description: "run_id -> {workflow_id, run_id, workflow_type, task_queue, input, status, start_time, close_time, history, wft, processed}"}
+          activities: {type: object, description: "<run_id>|<activity_id> -> a pending activity (scheduled or started)"}
+          timers: {type: object, description: "<run_id>|<timer_id> -> {timer_id, fire_at}"}
+      initial: {workflows: {}, runs: {}, activities: {}, timers: {}}
+
+schemas:
+  - id: Execution
+    summary: "A workflow id, and optionally a run id (\"\": the latest run)."
+    schema:
+      type: object
+      required: [workflow_id]
+      properties:
+        workflow_id: {type: string, examples: [order-1]}
+        run_id: {type: string, default: ""}
+  - id: RetryPolicy
+    summary: "An activity retry policy. Missing fields take Temporal's defaults."
+    schema:
+      type: object
+      properties:
+        initial_interval_ms: {type: integer, description: "default: config temporal-retry-initial-interval-ms (1 s)"}
+        backoff_coefficient: {type: number, description: "default 2.0"}
+        maximum_interval_ms: {type: integer, description: "default 100 x initial_interval_ms"}
+        maximum_attempts: {type: integer, description: "0: unlimited (the default)"}
+        non_retryable_error_types: {type: array, items: {type: string}, description: "failure types never retried"}
+  - id: Failure
+    summary: "An application failure: its type, message and whether it may be retried."
+    schema:
+      type: object
+      properties:
+        type: {type: string, examples: [PaymentDeclined]}
+        message: {type: string}
+        non_retryable: {type: boolean, default: false}
+  - id: Command
+    summary: "One command of a workflow task completion; `type` selects the other fields."
+    schema:
+      type: object
+      required: [type]
+      properties:
+        type: {type: string, enum: [schedule_activity, start_timer, cancel_timer, complete_workflow, fail_workflow, continue_as_new]}
+        activity_id: {type: string}
+        activity_type: {type: string}
+        task_queue: {type: string}
+        input: {description: "schedule_activity and continue_as_new: the input"}
+        start_to_close_timeout_ms: {type: integer}
+        schedule_to_close_timeout_ms: {type: integer}
+        heartbeat_timeout_ms: {type: integer}
+        retry_policy: {$ref: RetryPolicy}
+        timer_id: {type: string}
+        duration_ms: {type: integer}
+        result: {description: "complete_workflow"}
+        failure: {$ref: Failure}
+        workflow_type: {type: string, description: "continue_as_new: defaults to the current type"}
+  - id: WorkflowTask
+    summary: "What temporal-workflow-task delivers to a workflow worker."
+    schema:
+      type: object
+      properties:
+        task_token: {type: string}
+        workflow_id: {type: string}
+        run_id: {type: string}
+        workflow_type: {type: string}
+        task_queue: {type: string}
+        input: {description: "The run's input"}
+        attempt: {type: integer}
+        history: {type: array, description: "Every event of the run"}
+        new_events: {type: array, description: "The events since the last completed workflow task"}
+  - id: ActivityTask
+    summary: "What temporal-activity-task delivers to an activity worker."
+    schema:
+      type: object
+      properties:
+        task_token: {type: string}
+        workflow_id: {type: string}
+        run_id: {type: string}
+        activity_id: {type: string}
+        activity_type: {type: string}
+        task_queue: {type: string}
+        input: {}
+        attempt: {type: integer}
+        heartbeat_details: {description: "The last heartbeat's details from an earlier attempt, or null"}
+
+interfaces:
+  # ---- Client API --------------------------------------------------------------------------
+  - component: temporal-server
+    name: start-workflow
+    kind: rpc
+    summary: >-
+      StartWorkflowExecution. With a run of this workflow id still running, the conflict policy
+      decides: fail (the default; workflow_execution_already_started), use_existing (returns
+      that run, started: false) or terminate_existing. With only closed runs, the reuse policy
+      decides: allow_duplicate (the default), allow_duplicate_failed_only (only after a failed,
+      terminated, canceled or timed-out run), reject_duplicate, or terminate_if_running (which
+      also terminates a running one).
+    sources: ["https://docs.temporal.io/workflow-execution/workflowid-runid#workflow-id-reuse-policy", "https://docs.temporal.io/workflow-execution/workflowid-runid#workflow-id-conflict-policy", "https://api-docs.temporal.io/#temporal.api.workflowservice.v1.WorkflowService.StartWorkflowExecution"]
+    latency_ms: 5
+    request:
+      type: object
+      required: [workflow_id, workflow_type, task_queue]
+      properties:
+        workflow_id: {type: string, examples: [order-1]}
+        workflow_type: {type: string, examples: [OrderWorkflow]}
+        task_queue: {type: string, examples: [orders]}
+        input: {description: "The workflow's arguments"}
+        id_reuse_policy: {type: string, enum: [allow_duplicate, allow_duplicate_failed_only, reject_duplicate, terminate_if_running], default: allow_duplicate}
+        id_conflict_policy: {type: string, enum: [fail, use_existing, terminate_existing], default: fail}
+    response: {type: object, properties: {run_id: {type: string}, started: {type: boolean}}}
+    errors: [{code: workflow_execution_already_started, retryable: false}]
+    behavior:
+      - set:
+          vars.reuse: "= has(input.id_reuse_policy) ? input.id_reuse_policy : 'allow_duplicate'"
+          vars.conflict: "= has(input.id_conflict_policy) ? input.id_conflict_policy : 'fail'"
+          vars.prev: "= input.workflow_id in state.workflows ? state.runs[state.workflows[input.workflow_id].run_id] : null"
+      - if: "vars.prev != null && vars.prev.status == 'running'"
+        then:
+          - {title: "A run of this workflow id is running"}
+          - if: "vars.conflict == 'use_existing'"
+            then: [{return: {run_id: "= vars.prev.run_id", started: false}}]
+          - if: "vars.conflict == 'terminate_existing' || vars.reuse == 'terminate_if_running'"
+            then:
+              - call: temporal-server.close-run
+                input: {run_id: "= vars.prev.run_id", status: terminated, event_type: workflow_execution_terminated, attrs: {reason: "terminated by a start with the same workflow id"}}
+            else:
+              - &already-started
+                fail:
+                  code: workflow_execution_already_started
+                  retryable: false
+                  message: "= 'Workflow execution is already running. WorkflowId: ' + input.workflow_id + ', RunId: ' + vars.prev.run_id"
+                  data: {workflow_id: "= input.workflow_id", run_id: "= vars.prev.run_id"}
+      - if: >-
+          vars.prev != null && vars.prev.status != 'running' &&
+          (vars.reuse == 'reject_duplicate' ||
+           (vars.reuse == 'allow_duplicate_failed_only' && !(vars.prev.status in ['failed', 'terminated', 'canceled', 'timed_out'])))
+        then: [{title: "The reuse policy refuses a new run"}, *already-started]
+      - call: temporal-server.new-run
+        input: {workflow_id: "= input.workflow_id", workflow_type: "= input.workflow_type", task_queue: "= input.task_queue", input: "= has(input.input) ? input.input : null", continued_from: ""}
+        as: nr
+      - return: {run_id: "= vars.nr.value.run_id", started: true}
+
+  - component: temporal-server
+    name: signal-workflow
+    kind: rpc
+    summary: >-
+      SignalWorkflowExecution: append a workflow_execution_signaled event to the run (the latest
+      one by default) and schedule a workflow task. A closed or unknown run is not_found.
+    sources: ["https://docs.temporal.io/sending-messages#sending-signals", "https://api-docs.temporal.io/#temporal.api.workflowservice.v1.WorkflowService.SignalWorkflowExecution"]
+    latency_ms: 5
+    request:
+      allOf:
+        - {$ref: Execution}
+        - {type: object, required: [signal_name], properties: {signal_name: {type: string, examples: [approve]}, input: {}}}
+    response: {type: object, properties: {}}
+    errors: &not-found [{code: not_found, retryable: false}]
+    behavior:
+      - &resolve-run
+        set: {vars.rid: "= has(input.run_id) && input.run_id != '' ? input.run_id : (input.workflow_id in state.workflows ? state.workflows[input.workflow_id].run_id : '')"}
+      - &require-run
+        if: "!(vars.rid in state.runs) || state.runs[vars.rid].workflow_id != input.workflow_id"
+        then: [{fail: {code: not_found, retryable: false, message: "= 'workflow not found for ID: ' + input.workflow_id"}}]
+      - &require-running
+        if: "state.runs[vars.rid].status != 'running'"
+        then: [{fail: {code: not_found, retryable: false, message: "workflow execution already completed"}}]
+      - set: {vars.ev: "= {'type': 'workflow_execution_signaled', 'attrs': {'signal_name': input.signal_name, 'input': has(input.input) ? input.input : null}}"}
+      - &append
+        transact:
+          - {table: runs, op: update, key: "= vars.rid", value: "= {'history': state.runs[vars.rid].history + [merge(vars.ev, {'event_id': size(state.runs[vars.rid].history) + 1, 'time': now})]}"}
+      - call: temporal-server.schedule-workflow-task
+        input: {run_id: "= vars.rid", attempt: 1}
+      - return: {}
+
+  - component: temporal-server
+    name: terminate-workflow
+    kind: rpc
+    summary: "TerminateWorkflowExecution: close the run as terminated at once; its pending activities, timers and workflow task are dropped, and late answers from workers are refused."
+    sources: ["https://docs.temporal.io/workflow-execution#terminate", "https://api-docs.temporal.io/#temporal.api.workflowservice.v1.WorkflowService.TerminateWorkflowExecution"]
+    latency_ms: 5
+    request:
+      allOf:
+        - {$ref: Execution}
+        - {type: object, properties: {reason: {type: string, default: ""}}}
+    response: {type: object, properties: {}}
+    errors: *not-found
+    behavior:
+      - *resolve-run
+      - *require-run
+      - *require-running
+      - call: temporal-server.close-run
+        input: {run_id: "= vars.rid", status: terminated, event_type: workflow_execution_terminated, attrs: {reason: "= has(input.reason) ? input.reason : ''"}}
+      - return: {}
+
+  - component: temporal-server
+    name: describe-workflow
+    kind: rpc
+    summary: >-
+      DescribeWorkflowExecution: the run's execution info (status, type, task queue, start and
+      close times, history length), its pending activities (state, attempt, maximum attempts,
+      last failure, heartbeat details and time, next attempt time) and its pending workflow task.
+      The history length counts the events this model records (no WorkflowTask* events).
+    sources: ["https://api-docs.temporal.io/#temporal.api.workflowservice.v1.WorkflowService.DescribeWorkflowExecution", "https://docs.temporal.io/cli/workflow#describe"]
+    latency_ms: 5
+    request: Execution
+    response:
+      type: object
+      properties:
+        execution_info: {type: object}
+        pending_activities: {type: array}
+        pending_workflow_task: {type: [object, "null"]}
+    errors: *not-found
+    behavior:
+      - *resolve-run
+      - *require-run
+      - set: {vars.run: "= state.runs[vars.rid]"}
+      - return:
+          execution_info:
+            workflow_id: "= vars.run.workflow_id"
+            run_id: "= vars.rid"
+            type: "= vars.run.workflow_type"
+            task_queue: "= vars.run.task_queue"
+            status: "= vars.run.status"
+            start_time: "= vars.run.start_time"
+            close_time: "= vars.run.close_time"
+            history_length: "= size(vars.run.history)"
+          pending_activities: >-
+            = state.activities.filter(k, k.startsWith(vars.rid + '|')).map(k, {
+                'activity_id': state.activities[k].activity_id,
+                'activity_type': state.activities[k].activity_type,
+                'state': state.activities[k].state,
+                'attempt': state.activities[k].attempt,
+                'maximum_attempts': state.activities[k].retry_policy.maximum_attempts,
+                'last_failure': state.activities[k].last_failure,
+                'heartbeat_details': state.activities[k].heartbeat_details,
+                'last_heartbeat_time': state.activities[k].last_heartbeat_at,
+                'last_started_time': state.activities[k].started_at,
+                'next_attempt_schedule_time': state.activities[k].next_attempt_at})
+          pending_workflow_task: "= !('wft' in vars.run) ? null : dyn({'attempt': vars.run.wft.attempt, 'started_time': vars.run.wft.started_at})"
+
+  - component: temporal-server
+    name: get-workflow-history
+    kind: rpc
+    summary: "GetWorkflowExecutionHistory: the run's events ({event_id, time, type, attrs}) and its status; a closed run's last event holds its result or failure."
+    sources: ["https://api-docs.temporal.io/#temporal.api.workflowservice.v1.WorkflowService.GetWorkflowExecutionHistory", "https://docs.temporal.io/workflow-execution/event"]
+    latency_ms: 5
+    request: Execution
+    response: {type: object, properties: {run_id: {type: string}, status: {type: string}, events: {type: array}}}
+    errors: *not-found
+    behavior:
+      - *resolve-run
+      - *require-run
+      - return: {run_id: "= vars.rid", status: "= state.runs[vars.rid].status", events: "= state.runs[vars.rid].history"}
+
+  # ---- Worker API --------------------------------------------------------------------------
+  - component: temporal-server
+    name: respond-workflow-task-completed
+    kind: rpc
+    summary: >-
+      RespondWorkflowTaskCompleted: the worker's commands for the run, applied in order. A
+      token that is no longer the run's pending workflow task (it timed out and was redelivered,
+      or the run closed) is not_found. A close command (complete, fail, continue-as-new) while
+      new events arrived after the task was handed out is refused as an unhandled command:
+      nothing applies, and a new workflow task carries the new events too.
+    sources: ["https://api-docs.temporal.io/#temporal.api.workflowservice.v1.WorkflowService.RespondWorkflowTaskCompleted", "https://docs.temporal.io/references/commands", "https://docs.temporal.io/references/failures#workflow-task-failures"]
+    latency_ms: 5
+    request:
+      type: object
+      required: [task_token]
+      properties:
+        task_token: {type: string}
+        commands: {type: array, items: {$ref: Command}, default: []}
+    response: {type: object, properties: {accepted: {type: boolean}, cause: {type: string}}}
+    errors: [{code: not_found, retryable: false}, {code: invalid_argument, retryable: false}]
+    behavior:
+      - set: {vars.rid: "= input.task_token.split('|')[0]"}
+      - if: "!(vars.rid in state.runs) || state.runs[vars.rid].status != 'running' || !('wft' in state.runs[vars.rid]) || state.runs[vars.rid].wft.token != input.task_token"
+        then: [{title: "Stale workflow task"}, {fail: {code: not_found, retryable: false, message: "Workflow task not found."}}]
+      - set:
+          vars.cmds: "= has(input.commands) ? input.commands : []"
+          vars.wft: "= state.runs[vars.rid].wft"
+          vars.arrived: "= size(state.runs[vars.rid].history) > state.runs[vars.rid].wft.history_len"
+      - if: "!vars.cmds.all(c, c.type != 'schedule_activity' || ((has(c.start_to_close_timeout_ms) && c.start_to_close_timeout_ms > 0) || (has(c.schedule_to_close_timeout_ms) && c.schedule_to_close_timeout_ms > 0)))"
+        then: [{fail: {code: invalid_argument, retryable: false, message: "A valid StartToClose or ScheduleToCloseTimeout is not set on command"}}]
+      - if: "vars.cmds.exists(c, c.type in ['complete_workflow', 'fail_workflow', 'continue_as_new']) && vars.arrived"
+        then:
+          - {title: "Unhandled command", detail: "New events arrived while the worker held the task, so the workflow may not close yet; the task fails and a new one carries every unprocessed event."}
+          - transact: [{table: runs, op: update, key: "= vars.rid", value: "= {'wft': {'$absent': true}}"}]
+          - call: temporal-server.schedule-workflow-task
+            input: {run_id: "= vars.rid", attempt: 1}
+          - return: {accepted: false, cause: unhandled_command}
+      - transact:
+          - {table: runs, op: update, key: "= vars.rid", value: "= {'wft': {'$absent': true}}"}
+        title: Workflow task completed
+      - foreach: "= vars.cmds"
+        as: c
+        max: 100
+        steps:
+          - if: "vars.c.type == 'schedule_activity'"
+            then:
+              - set:
+                  vars.akey: "= vars.rid + '|' + vars.c.activity_id"
+                  vars.p: "= has(vars.c.retry_policy) ? vars.c.retry_policy : {}"
+                  vars.s2c: "= has(vars.c.schedule_to_close_timeout_ms) ? vars.c.schedule_to_close_timeout_ms : 0"
+                  vars.ev: "= {'type': 'activity_task_scheduled', 'attrs': {'activity_id': vars.c.activity_id, 'activity_type': vars.c.activity_type, 'input': has(vars.c.input) ? vars.c.input : null}}"
+              - set:
+                  vars.init: "= 'initial_interval_ms' in vars.p ? vars.p.initial_interval_ms : config['temporal-retry-initial-interval-ms']"
+              - *append
+              - transact:
+                  - table: activities
+                    op: put
+                    key: "= vars.akey"
+                    value:
+                      run_id: "= vars.rid"
+                      workflow_id: "= state.runs[vars.rid].workflow_id"
+                      activity_id: "= vars.c.activity_id"
+                      activity_type: "= vars.c.activity_type"
+                      task_queue: "= has(vars.c.task_queue) ? vars.c.task_queue : state.runs[vars.rid].task_queue"
+                      input: "= has(vars.c.input) ? vars.c.input : null"
+                      state: scheduled
+                      attempt: 0
+                      token: ""
+                      start_to_close_ms: "= has(vars.c.start_to_close_timeout_ms) && vars.c.start_to_close_timeout_ms > 0 ? vars.c.start_to_close_timeout_ms : vars.s2c"
+                      schedule_to_close_ms: "= vars.s2c"
+                      heartbeat_timeout_ms: "= has(vars.c.heartbeat_timeout_ms) ? vars.c.heartbeat_timeout_ms : 0"
+                      retry_policy:
+                        initial_interval_ms: "= vars.init"
+                        backoff_coefficient: "= 'backoff_coefficient' in vars.p ? double(vars.p.backoff_coefficient) : double(config['temporal-retry-backoff-coefficient'])"
+                        maximum_interval_ms: "= 'maximum_interval_ms' in vars.p ? vars.p.maximum_interval_ms : 100 * vars.init"
+                        maximum_attempts: "= 'maximum_attempts' in vars.p ? vars.p.maximum_attempts : 0"
+                        non_retryable_error_types: "= 'non_retryable_error_types' in vars.p ? vars.p.non_retryable_error_types : []"
+                      next_interval_ms: "= vars.init"
+                      first_scheduled_at: "= now"
+                      started_at: null
+                      last_heartbeat_at: null
+                      heartbeat_details: null
+                      last_failure: null
+                      next_attempt_at: null
+                    if: "row == null"
+                    conflict: invalid_argument
+              - call: temporal-server.dispatch-activity
+                input: {activity_key: "= vars.akey", attempt: 1}
+          - if: "vars.c.type == 'start_timer'"
+            then:
+              - set: {vars.ev: "= {'type': 'timer_started', 'attrs': {'timer_id': vars.c.timer_id, 'duration_ms': vars.c.duration_ms}}"}
+              - *append
+              - transact:
+                  - {table: timers, op: put, key: "= vars.rid + '|' + vars.c.timer_id", value: {timer_id: "= vars.c.timer_id", fire_at: "= now + vars.c.duration_ms"}}
+              - emit: temporal-server.timer-fired
+                input: {run_id: "= vars.rid", timer_id: "= vars.c.timer_id"}
+                after_ms: "= vars.c.duration_ms"
+          - if: "vars.c.type == 'cancel_timer' && (vars.rid + '|' + vars.c.timer_id) in state.timers"
+            then:
+              - transact: [{table: timers, op: delete, key: "= vars.rid + '|' + vars.c.timer_id"}]
+              - set: {vars.ev: "= {'type': 'timer_canceled', 'attrs': {'timer_id': vars.c.timer_id}}"}
+              - *append
+          - if: "vars.c.type == 'complete_workflow'"
+            then:
+              - call: temporal-server.close-run
+                input: {run_id: "= vars.rid", status: completed, event_type: workflow_execution_completed, attrs: {result: "= has(vars.c.result) ? vars.c.result : null"}}
+              - break: true
+          - if: "vars.c.type == 'fail_workflow'"
+            then:
+              - call: temporal-server.close-run
+                input: {run_id: "= vars.rid", status: failed, event_type: workflow_execution_failed, attrs: {failure: "= has(vars.c.failure) ? vars.c.failure : null"}}
+              - break: true
+          - if: "vars.c.type == 'continue_as_new'"
+            then:
+              - {title: "Continue as new", detail: "The run closes as continued_as_new and a new run of the same workflow id starts with a fresh history."}
+              - call: temporal-server.close-run
+                input: {run_id: "= vars.rid", status: continued_as_new, event_type: workflow_execution_continued_as_new, attrs: {input: "= has(vars.c.input) ? vars.c.input : null"}}
+              - call: temporal-server.new-run
+                input:
+                  workflow_id: "= state.runs[vars.rid].workflow_id"
+                  workflow_type: "= has(vars.c.workflow_type) ? vars.c.workflow_type : state.runs[vars.rid].workflow_type"
+                  task_queue: "= state.runs[vars.rid].task_queue"
+                  input: "= has(vars.c.input) ? vars.c.input : null"
+                  continued_from: "= vars.rid"
+                as: next
+              - transact:
+                  - {table: runs, op: update, key: "= vars.rid", value: {new_execution_run_id: "= vars.next.value.run_id"}}
+              - break: true
+      - transact:
+          - {table: runs, op: update, key: "= vars.rid", value: {processed: "= vars.arrived ? vars.wft.history_len : size(state.runs[vars.rid].history)"}}
+        when: "state.runs[vars.rid].status == 'running'"
+      - call: temporal-server.schedule-workflow-task
+        input: {run_id: "= vars.rid", attempt: 1}
+        when: "state.runs[vars.rid].status == 'running' && vars.arrived"
+      - return: {accepted: true, cause: ""}
+
+  - component: temporal-server
+    name: record-activity-heartbeat
+    kind: rpc
+    summary: >-
+      RecordActivityTaskHeartbeat: the attempt is alive; `details` (its progress) are kept and
+      handed to the next attempt if this one fails or times out. Restarts the heartbeat
+      timeout. A superseded attempt's token is not_found, which tells the worker to stop.
+    sources: ["https://docs.temporal.io/encyclopedia/detecting-activity-failures#activity-heartbeat", "https://api-docs.temporal.io/#temporal.api.workflowservice.v1.WorkflowService.RecordActivityTaskHeartbeat"]
+    latency_ms: 2
+    request: {type: object, required: [task_token], properties: {task_token: {type: string}, details: {}}}
+    response: {type: object, properties: {cancel_requested: {type: boolean}}}
+    errors: *not-found
+    behavior:
+      - &activity-token
+        set:
+          vars.akey: "= input.task_token.split('|')[0] + '|' + input.task_token.split('|')[1]"
+      - &require-attempt
+        if: "!(vars.akey in state.activities) || state.activities[vars.akey].token != input.task_token"
+        then: [{title: "Superseded or closed activity attempt"}, {fail: {code: not_found, retryable: false, message: "invalid activityID or activity already timed out or invoking workflow is completed"}}]
+      - transact:
+          - {table: activities, op: update, key: "= vars.akey", value: {last_heartbeat_at: "= now", heartbeat_details: "= has(input.details) ? input.details : null"}}
+      - emit: temporal-server.activity-timeout
+        input: {task_token: "= input.task_token", kind: heartbeat}
+        after_ms: "= state.activities[vars.akey].heartbeat_timeout_ms"
+        when: "state.activities[vars.akey].heartbeat_timeout_ms > 0"
+      - return: {cancel_requested: false}
+
+  - component: temporal-server
+    name: respond-activity-completed
+    kind: rpc
+    summary: "RespondActivityTaskCompleted: the activity is done; an activity_task_completed event and a workflow task follow. A superseded attempt's answer is not_found."
+    sources: ["https://api-docs.temporal.io/#temporal.api.workflowservice.v1.WorkflowService.RespondActivityTaskCompleted"]
+    latency_ms: 2
+    request: {type: object, required: [task_token], properties: {task_token: {type: string}, result: {}}}
+    response: {type: object, properties: {}}
+    errors: *not-found
+    behavior:
+      - *activity-token
+      - *require-attempt
+      - set:
+          vars.a: "= state.activities[vars.akey]"
+          vars.rid: "= state.activities[vars.akey].run_id"
+      - transact: [{table: activities, op: delete, key: "= vars.akey"}]
+      - set: {vars.ev: "= {'type': 'activity_task_completed', 'attrs': {'activity_id': vars.a.activity_id, 'result': has(input.result) ? input.result : null, 'attempt': vars.a.attempt}}"}
+      - *append
+      - call: temporal-server.schedule-workflow-task
+        input: {run_id: "= vars.rid", attempt: 1}
+      - return: {}
+
+  - component: temporal-server
+    name: respond-activity-failed
+    kind: rpc
+    summary: >-
+      RespondActivityTaskFailed: the attempt failed. The retry policy decides: another attempt
+      after the backoff; or, for a non-retryable failure (or type) or exhausted attempts, an
+      activity_task_failed event for the workflow; or, when the next attempt would start past
+      the schedule-to-close timeout, activity_task_timed_out.
+    sources: ["https://api-docs.temporal.io/#temporal.api.workflowservice.v1.WorkflowService.RespondActivityTaskFailed", "https://docs.temporal.io/encyclopedia/retry-policies"]
+    latency_ms: 2
+    request: {type: object, required: [task_token], properties: {task_token: {type: string}, failure: {$ref: Failure}}}
+    response: {type: object, properties: {retrying: {type: boolean}}}
+    errors: *not-found
+    behavior:
+      - *activity-token
+      - *require-attempt
+      - call: temporal-server.activity-attempt-failed
+        input: {activity_key: "= vars.akey", failure: "= has(input.failure) ? input.failure : {'type': 'Error', 'message': ''}"}
+        as: r
+      - return: {retrying: "= vars.r.value.retrying"}
+
+  # ---- Server internals (timers and shared steps) ------------------------------------------
+  - component: temporal-server
+    name: new-run
+    kind: rpc
+    summary: "Create a run: its history starts with workflow_execution_started, it becomes the workflow id's latest run, and its first workflow task is scheduled."
+    sources: ["https://docs.temporal.io/workflow-execution", "https://docs.temporal.io/workflow-execution/continue-as-new"]
+    latency_ms: 0
+    request: {type: object, required: [workflow_id, workflow_type, task_queue], properties: {workflow_id: {type: string}, workflow_type: {type: string}, task_queue: {type: string}, input: {}, continued_from: {type: string, default: ""}}}
+    response: {type: object, properties: {run_id: {type: string}}}
+    behavior:
+      - set: {vars.rid: "= id('run', input.workflow_id, string(seq('run')))"}
+      - transact:
+          - table: runs
+            op: put
+            key: "= vars.rid"
+            value:
+              workflow_id: "= input.workflow_id"
+              run_id: "= vars.rid"
+              workflow_type: "= input.workflow_type"
+              task_queue: "= input.task_queue"
+              input: "= has(input.input) ? input.input : null"
+              status: running
+              start_time: "= now"
+              close_time: null
+              processed: 0
+              history:
+                - event_id: 1
+                  time: "= now"
+                  type: workflow_execution_started
+                  attrs:
+                    workflow_type: "= input.workflow_type"
+                    task_queue: "= input.task_queue"
+                    input: "= has(input.input) ? input.input : null"
+                    continued_execution_run_id: "= has(input.continued_from) ? input.continued_from : ''"
+          - {table: workflows, op: put, key: "= input.workflow_id", value: {run_id: "= vars.rid"}}
+      - call: temporal-server.schedule-workflow-task
+        input: {run_id: "= vars.rid", attempt: 1}
+      - return: {run_id: "= vars.rid"}
+
+  - component: temporal-server
+    name: close-run
+    kind: rpc
+    summary: "Close a run with a status and its closing event; its pending activities, timers and workflow task go away."
+    sources: ["https://docs.temporal.io/workflow-execution#workflow-execution-status"]
+    latency_ms: 0
+    request: {type: object, required: [run_id, status, event_type], properties: {run_id: {type: string}, status: {type: string}, event_type: {type: string}, attrs: {type: object}}}
+    response: {type: object, properties: {}}
+    behavior:
+      - set:
+          vars.rid: "= input.run_id"
+          vars.ev: "= {'type': input.event_type, 'attrs': has(input.attrs) ? input.attrs : {}}"
+      - *append
+      - transact:
+          - {table: runs, op: update, key: "= vars.rid", value: "= {'status': input.status, 'close_time': now, 'wft': {'$absent': true}}"}
+        title: Run closed
+      - foreach: "= state.activities.filter(k, k.startsWith(vars.rid + '|'))"
+        as: k
+        max: 1000
+        steps:
+          - transact: [{table: activities, op: delete, key: "= vars.k"}]
+      - foreach: "= state.timers.filter(k, k.startsWith(vars.rid + '|'))"
+        as: k
+        max: 1000
+        steps:
+          - transact: [{table: timers, op: delete, key: "= vars.k"}]
+      - return: {}
+
+  - component: temporal-server
+    name: schedule-workflow-task
+    kind: rpc
+    summary: >-
+      Hand the run a workflow task unless one is already outstanding (its events then wait for
+      the next one): push it to temporal-workflow-task with the new events, and start its
+      timeout.
+    sources: ["https://docs.temporal.io/tasks#workflow-task", "https://docs.temporal.io/workers#task-queue"]
+    latency_ms: 0
+    request: {type: object, required: [run_id], properties: {run_id: {type: string}, attempt: {type: integer, default: 1}}}
+    response: {type: object, properties: {scheduled: {type: boolean}}}
+    behavior:
+      - set: {vars.run: "= input.run_id in state.runs ? state.runs[input.run_id] : null"}
+      - if: "vars.run == null || vars.run.status != 'running' || 'wft' in vars.run"
+        then: [{return: {scheduled: false}}]
+      - set:
+          vars.attempt: "= has(input.attempt) ? input.attempt : 1"
+          vars.token: "= input.run_id + '|wft' + string(size(vars.run.history)) + '-' + string(seq('wft'))"
+      - transact:
+          - {table: runs, op: update, key: "= input.run_id", value: {wft: {token: "= vars.token", attempt: "= vars.attempt", started_at: "= now", history_len: "= size(vars.run.history)"}}}
+      - publish: temporal-workflow-task
+        input:
+          task_token: "= vars.token"
+          workflow_id: "= vars.run.workflow_id"
+          run_id: "= input.run_id"
+          workflow_type: "= vars.run.workflow_type"
+          task_queue: "= vars.run.task_queue"
+          input: "= vars.run.input"
+          attempt: "= vars.attempt"
+          history: "= vars.run.history"
+          new_events: "= vars.run.history.filter(e, e.event_id > vars.run.processed)"
+      - emit: temporal-server.workflow-task-timeout
+        input: {run_id: "= input.run_id", task_token: "= vars.token"}
+        after_ms: "= config['temporal-workflow-task-timeout-ms']"
+      - return: {scheduled: true}
+
+  - component: temporal-server
+    name: workflow-task-timeout
+    kind: event
+    summary: >-
+      The workflow task's StartToClose timeout: if the worker hasn't answered (it crashed, or is
+      stuck), the task is redelivered with attempt + 1, to any worker of the queue.
+    sources: ["https://docs.temporal.io/encyclopedia/detecting-workflow-failures#workflow-task-timeout"]
+    latency_ms: 0
+    request: {type: object, required: [run_id, task_token], properties: {run_id: {type: string}, task_token: {type: string}}}
+    response: {type: object, properties: {redelivered: {type: boolean}}}
+    behavior:
+      - if: "!(input.run_id in state.runs) || state.runs[input.run_id].status != 'running' || !('wft' in state.runs[input.run_id]) || state.runs[input.run_id].wft.token != input.task_token"
+        then: [{return: {redelivered: false}}]
+      - set: {vars.attempt: "= state.runs[input.run_id].wft.attempt + 1"}
+      - transact: [{table: runs, op: update, key: "= input.run_id", value: "= {'wft': {'$absent': true}}"}]
+        title: Workflow task timed out
+      - call: temporal-server.schedule-workflow-task
+        input: {run_id: "= input.run_id", attempt: "= vars.attempt"}
+      - return: {redelivered: true}
+
+  - component: temporal-server
+    name: dispatch-activity
+    kind: event
+    summary: >-
+      Start an activity attempt: push it to temporal-activity-task (with the last heartbeat's
+      details) and start its start-to-close and heartbeat timeouts. The start-to-close timeout
+      is capped by what is left of the schedule-to-close timeout. Workers are assumed to be
+      polling (no schedule-to-start wait).
+    sources: ["https://docs.temporal.io/tasks#activity-task", "https://docs.temporal.io/encyclopedia/detecting-activity-failures"]
+    latency_ms: 0
+    request: {type: object, required: [activity_key, attempt], properties: {activity_key: {type: string}, attempt: {type: integer}}}
+    response: {type: object, properties: {}}
+    behavior:
+      - if: "!(input.activity_key in state.activities) || state.activities[input.activity_key].state != 'scheduled'"
+        then: [{return: {}}]
+      - set:
+          vars.a: "= state.activities[input.activity_key]"
+          vars.token: "= input.activity_key + '|' + string(input.attempt)"
+      - set:
+          vars.s2c_left: "= vars.a.schedule_to_close_ms > 0 ? vars.a.first_scheduled_at + vars.a.schedule_to_close_ms - now : 0"
+      - set:
+          vars.limit: "= vars.s2c_left > 0 && vars.s2c_left < vars.a.start_to_close_ms ? vars.s2c_left : vars.a.start_to_close_ms"
+          vars.limit_kind: "= vars.s2c_left > 0 && vars.s2c_left < vars.a.start_to_close_ms ? 'schedule_to_close' : 'start_to_close'"
+      - transact:
+          - {table: activities, op: update, key: "= input.activity_key", value: {state: started, attempt: "= input.attempt", token: "= vars.token", started_at: "= now", next_attempt_at: {$null: true}}}
+        title: Activity attempt started
+      - publish: temporal-activity-task
+        input:
+          task_token: "= vars.token"
+          workflow_id: "= vars.a.workflow_id"
+          run_id: "= vars.a.run_id"
+          activity_id: "= vars.a.activity_id"
+          activity_type: "= vars.a.activity_type"
+          task_queue: "= vars.a.task_queue"
+          input: "= vars.a.input"
+          attempt: "= input.attempt"
+          heartbeat_details: "= vars.a.heartbeat_details"
+      - emit: temporal-server.activity-timeout
+        input: {task_token: "= vars.token", kind: "= vars.limit_kind"}
+        after_ms: "= vars.limit"
+      - emit: temporal-server.activity-timeout
+        input: {task_token: "= vars.token", kind: heartbeat}
+        after_ms: "= vars.a.heartbeat_timeout_ms"
+        when: "vars.a.heartbeat_timeout_ms > 0"
+      - return: {}
+
+  - component: temporal-server
+    name: activity-timeout
+    kind: event
+    summary: >-
+      An activity attempt's timer. start_to_close: the attempt ran too long. heartbeat: no
+      heartbeat for heartbeat_timeout (each heartbeat restarts it), the usual sign of a crashed
+      worker. Both are retried by the retry policy; schedule_to_close ends the activity.
+    sources: ["https://docs.temporal.io/encyclopedia/detecting-activity-failures#start-to-close-timeout", "https://docs.temporal.io/encyclopedia/detecting-activity-failures#heartbeat-timeout", "https://docs.temporal.io/encyclopedia/detecting-activity-failures#schedule-to-close-timeout"]
+    latency_ms: 0
+    request: {type: object, required: [task_token, kind], properties: {task_token: {type: string}, kind: {type: string, enum: [start_to_close, schedule_to_close, heartbeat]}}}
+    response: {type: object, properties: {timed_out: {type: boolean}}}
+    behavior:
+      - *activity-token
+      - if: "!(vars.akey in state.activities) || state.activities[vars.akey].token != input.task_token || state.activities[vars.akey].state != 'started'"
+        then: [{return: {timed_out: false}}]
+      - set:
+          vars.a: "= state.activities[vars.akey]"
+      - if: "input.kind == 'heartbeat' && now - (vars.a.last_heartbeat_at != null ? vars.a.last_heartbeat_at : vars.a.started_at) < vars.a.heartbeat_timeout_ms"
+        then: [{return: {timed_out: false}}]
+      - call: temporal-server.activity-attempt-failed
+        input:
+          activity_key: "= vars.akey"
+          failure: {type: timeout, timeout_type: "= input.kind", message: "= 'activity ' + input.kind + ' timeout'", non_retryable: "= input.kind == 'schedule_to_close'"}
+      - return: {timed_out: true}
+
+  - component: temporal-server
+    name: activity-attempt-failed
+    kind: rpc
+    summary: >-
+      Apply the retry policy to a failed or timed-out attempt. The wait before attempt n + 1 is
+      initial_interval x coefficient^(n - 1), capped at maximum_interval. No retry when the
+      failure is non-retryable (or its type listed), maximum_attempts is reached, or the next
+      attempt would start past the schedule-to-close timeout: then the activity closes with
+      activity_task_failed (activity_task_timed_out for a timeout) and the workflow gets a task.
+    sources: ["https://docs.temporal.io/encyclopedia/retry-policies", "https://docs.temporal.io/encyclopedia/retry-policies#per-error-next-retry-delay"]
+    latency_ms: 0
+    request: {type: object, required: [activity_key, failure], properties: {activity_key: {type: string}, failure: {type: object}}}
+    response: {type: object, properties: {retrying: {type: boolean}}}
+    behavior:
+      - set:
+          vars.a: "= state.activities[input.activity_key]"
+          vars.f: "= input.failure"
+      - set:
+          vars.p: "= vars.a.retry_policy"
+          vars.backoff: "= vars.a.next_interval_ms"
+          vars.rid: "= vars.a.run_id"
+      - set:
+          vars.stop: >-
+            = ('non_retryable' in vars.f && vars.f.non_retryable) || ('type' in vars.f && vars.f.type in vars.p.non_retryable_error_types) ? 'non_retryable_failure' :
+              (vars.p.maximum_attempts > 0 && vars.a.attempt >= vars.p.maximum_attempts ? 'maximum_attempts_reached' :
+              (vars.a.schedule_to_close_ms > 0 && now + vars.backoff >= vars.a.first_scheduled_at + vars.a.schedule_to_close_ms ? 'timeout' : ''))
+      - if: "vars.stop == ''"
+        then:
+          - {title: "Retry after backoff"}
+          - transact:
+              - table: activities
+                op: update
+                key: "= input.activity_key"
+                value:
+                  state: scheduled
+                  token: ""
+                  last_failure: "= vars.f"
+                  next_attempt_at: "= now + vars.backoff"
+                  next_interval_ms: "= math.least(int(double(vars.backoff) * vars.p.backoff_coefficient), vars.p.maximum_interval_ms)"
+          - emit: temporal-server.dispatch-activity
+            input: {activity_key: "= input.activity_key", attempt: "= vars.a.attempt + 1"}
+            after_ms: "= vars.backoff"
+          - return: {retrying: true}
+      - transact: [{table: activities, op: delete, key: "= input.activity_key"}]
+        title: Activity failed for good
+      - set:
+          vars.ev: >-
+            = vars.stop == 'timeout' ?
+                {'type': 'activity_task_timed_out',
+                 'attrs': {'activity_id': vars.a.activity_id, 'attempt': vars.a.attempt, 'retry_state': vars.stop,
+                           'failure': {'type': 'timeout', 'timeout_type': 'schedule_to_close', 'message': 'activity schedule_to_close timeout', 'cause': vars.f}}} :
+                {'type': 'type' in vars.f && vars.f.type == 'timeout' ? 'activity_task_timed_out' : 'activity_task_failed',
+                 'attrs': {'activity_id': vars.a.activity_id, 'failure': vars.f, 'attempt': vars.a.attempt, 'retry_state': vars.stop}}
+      - *append
+      - call: temporal-server.schedule-workflow-task
+        input: {run_id: "= vars.rid", attempt: 1}
+      - return: {retrying: false}
+
+  - component: temporal-server
+    name: timer-fired
+    kind: event
+    summary: "A durable timer fires: a timer_fired event and a workflow task, unless the timer was canceled or the run closed."
+    sources: ["https://docs.temporal.io/workflow-execution/timers-delays"]
+    latency_ms: 0
+    request: {type: object, required: [run_id, timer_id], properties: {run_id: {type: string}, timer_id: {type: string}}}
+    response: {type: object, properties: {fired: {type: boolean}}}
+    behavior:
+      - set:
+          vars.rid: "= input.run_id"
+          vars.tkey: "= input.run_id + '|' + input.timer_id"
+      - if: "!(vars.tkey in state.timers) || !(vars.rid in state.runs) || state.runs[vars.rid].status != 'running'"
+        then: [{return: {fired: false}}]
+      - transact: [{table: timers, op: delete, key: "= vars.tkey"}]
+      - set: {vars.ev: "= {'type': 'timer_fired', 'attrs': {'timer_id': input.timer_id}}"}
+      - *append
+      - call: temporal-server.schedule-workflow-task
+        input: {run_id: "= vars.rid", attempt: 1}
+      - return: {fired: true}

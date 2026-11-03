@@ -1,0 +1,1345 @@
+# Linux substrate (DESIGN §14.2, §14.6, §16.5). Import it instead of modeling the kernel again:
+#   imports: [{ontology: <path to this file>, as: linux}]
+# The first `runtime`-level model: processes, file descriptors, signals, the system calls a
+# runtime-level refinement needs, and the OOM killer. Every behavior cites the man page (man7.org)
+# or kernel document it follows; there is no code snapshot.
+#
+# Conventions.
+# - A process (or a thread: Linux schedules tasks, and a thread is a task with its own tid) is a
+#   row of `procs` keyed by its pid as a string. Every syscall takes the calling `pid` first.
+# - A failed syscall fails with the errno name as its code (EBADF, EAGAIN, ...) and
+#   `data.errno`, the number from errno(3) on x86-64. A process killed while inside a syscall
+#   never returns from it: the call fails `killed`.
+# - Blocking syscalls (read, accept, waitpid, epoll_wait, futex wait, nanosleep) sleep in a
+#   blocking `wait` (DESIGN §17 item 2) on the kernel's state: until the condition they sleep on
+#   holds (a zombie child, a readable socket, a queued connection, a ready epoll interest, a
+#   FUTEX_WAKE dequeuing the waiter), until the process dies, until their timeout, or until the
+#   signal `sig:<pid>`, which a handled signal delivers (EINTR). The process's `blocked` record
+#   says what it sleeps on (and is the futex wait queue). Drive a blocking syscall from a scenario
+#   step with `await: false` and the waker from a later step, or call both from one behavior.
+#
+# Not modeled: threads sharing an fd table (each task has its own here), SA_RESTART, signal
+# masks and sigprocmask, real-time signals, SIGSTOP/SIGCONT and job control, pipes, UDP, file
+# permissions and directories, nonblocking connect (EINPROGRESS), dup/dup2, page cache and
+# memory overcommit heuristics (a single memory limit stands for the cgroup's memory.max).
+schema_version: 1
+id: linux
+name: Linux kernel (substrate)
+level: runtime
+description: >-
+  One Linux host as a runtime substrate: processes with fork, execve, exit and waitpid (zombies
+  until reaped, SIGCHLD to the parent), per-process file descriptor tables bounded by
+  RLIMIT_NOFILE (lowest free fd first, close-on-exec at execve), signals with default actions or
+  installed handlers (SIGKILL can't be caught), the open, read, write, close, socket, listen,
+  connect, accept, epoll, futex and nanosleep system calls with their errno codes, and the OOM
+  killer, which SIGKILLs the process with the highest oom_score when memory runs out.
+source: {url: "https://man7.org/linux/man-pages/"}
+
+configs:
+  - id: linux-rlimit-nofile
+    type: integer
+    value: 1024
+    default: 1024
+    summary: >-
+      RLIMIT_NOFILE soft limit a new process starts with: one greater than the highest fd it may
+      open. Past it, syscalls that create an fd fail EMFILE. Inherited across fork and execve.
+    sources: ["https://man7.org/linux/man-pages/man2/getrlimit.2.html"]
+  - id: linux-memory-limit-mb
+    type: integer
+    value: 4096
+    default: 4096
+    summary: >-
+      Memory the processes may hold resident (MB) before the OOM killer runs: the host's RAM, or a
+      cgroup v2 memory.max. Swap is not modeled.
+    sources: ["https://docs.kernel.org/admin-guide/cgroup-v2.html#memory-interface-files", "https://docs.kernel.org/admin-guide/mm/concepts.html#oom-killer"]
+  - id: linux-tcp-syn-timeout-ms
+    type: integer
+    value: 127000
+    default: 127000
+    summary: >-
+      How long a blocking connect waits when its SYNs are dropped (a full accept backlog) before
+      it fails ETIMEDOUT: net.ipv4.tcp_syn_retries = 6 gives 1+2+4+8+16+32+64 = 127 s.
+    sources: ["https://man7.org/linux/man-pages/man7/tcp.7.html", "https://docs.kernel.org/networking/ip-sysctl.html"]
+  - id: linux-exec-rss-mb
+    type: integer
+    value: 4
+    default: 4
+    summary: Resident memory (MB) of a freshly exec'd image before it touches more (a file's rss_mb overrides it).
+    sources: ["https://man7.org/linux/man-pages/man2/execve.2.html"]
+
+components:
+  - id: linux
+    name: Linux host
+    kind: service
+    layer: platform
+    summary: "One Linux host: the kernel and the processes running on it."
+    attributes: {technology: linux}
+    sources: ["https://man7.org/linux/man-pages/man7/"]
+  - id: kernel
+    name: Linux kernel
+    kind: service
+    parent: linux
+    layer: platform
+    summary: >-
+      The system call interface and the kernel objects behind it: the process table, per-process
+      fd tables, open file descriptions (files, sockets, listeners, epoll instances), futex words,
+      signal dispositions and memory accounting.
+    sources: ["https://man7.org/linux/man-pages/man2/syscalls.2.html"]
+    state:
+      schema:
+        type: object
+        properties:
+          procs: {type: object, description: "pid -> {pid, ppid, state: running|zombie, exe, handlers: {<signo>: handle|ignore}, caught: [signo], blocked: {on: ''|read|accept|wait|epoll|futex|sleep, obj, addr, seq}, nofile, rss_mb, oom_score_adj, status: null|{exited, code, signaled, signal}}"}
+          fds: {type: object, description: "<pid>:<fd> -> {pid, fd, obj, cloexec}"}
+          objs: {type: object, description: "id -> an open file description: {type: file, path, offset} | {type: socket, state: unbound|listening|connected, nonblock, rcvtimeo_ms, peer, rbuf, peer_closed, peer_reset, port, backlog, queue} | {type: epoll, interest: {<obj>: {fd}}}; refs counts fds"}
+          files: {type: object, description: "path -> {path, data, exec, rss_mb}"}
+          words: {type: object, description: "user-space address -> int: futex words"}
+          next_pid: {type: integer}
+          oom_kills: {type: array, description: "{pid, rss_mb, score, at_ms}, what dmesg reports"}
+      initial: {procs: {}, fds: {}, objs: {}, files: {}, words: {}, next_pid: 2, oom_kills: []}
+
+schemas:
+  - id: Pid
+    schema: {type: integer, minimum: 1, examples: [100]}
+  - id: WaitStatus
+    summary: What waitpid reports for a reaped child, decoded (the WIFEXITED/WEXITSTATUS/WIFSIGNALED/WTERMSIG macros).
+    schema:
+      type: object
+      properties:
+        pid: {type: integer, description: "the reaped child; 0 with WNOHANG when no child has changed state"}
+        wstatus: {type: integer, description: "raw status: exit code << 8, or the terminating signal number"}
+        exited: {type: boolean}
+        exit_code: {type: integer}
+        signaled: {type: boolean}
+        term_sig: {type: integer}
+        shell_status: {type: integer, description: "what a shell reports in $?: the exit code, or 128 + the signal"}
+
+interfaces:
+  # ---- Internals: guards, blocking and waking -------------------------------------------------
+  - component: kernel
+    name: alive
+    kind: function
+    summary: >-
+      Model guard: the calling pid must be a live process. A dead process makes no syscalls, so
+      ESRCH here flags a scenario driving a pid that has exited or never existed.
+    sources: ["https://man7.org/linux/man-pages/man5/proc.5.html"]
+    latency_ms: 0
+    request: {type: object, required: [pid], properties: {pid: {$ref: Pid}}}
+    errors: [{code: ESRCH, summary: "errno 3"}]
+    behavior:
+      - if: "!(string(input.pid) in state.procs) || state.procs[string(input.pid)].state != 'running'"
+        then: [{fail: {code: ESRCH, message: "= 'no live process ' + string(input.pid)", data: {errno: 3}}}]
+      - return: "= state.procs[string(input.pid)]"
+
+  - component: kernel
+    name: block
+    kind: function
+    summary: >-
+      Put the calling task to sleep (TASK_INTERRUPTIBLE) in a blocking wait on the kernel's state.
+      It wakes when what it sleeps on is ready (on wait: a matching child is a zombie, or no
+      matching child is left; read: the socket has data, EOF or a reset; accept: a connection is
+      queued; epoll: an interest is readable; futex: a FUTEX_WAKE dequeued it), when the process
+      dies, when a handled signal delivers `sig:<pid>`, or after timeout_ms (-1: no timeout).
+      Returns {reason: ready|signal|killed|timeout, sig, elapsed_ms}.
+    sources: ["https://man7.org/linux/man-pages/man7/signal.7.html", "https://man7.org/linux/man-pages/man2/wait.2.html", "https://man7.org/linux/man-pages/man7/epoll.7.html", "https://man7.org/linux/man-pages/man2/futex.2.html"]
+    latency_ms: 0
+    request:
+      type: object
+      required: [pid, on]
+      properties:
+        pid: {$ref: Pid}
+        on: {type: string, enum: [read, accept, wait, epoll, futex, sleep]}
+        obj: {type: string, default: ""}
+        addr: {type: string, default: ""}
+        child: {type: integer, default: -1, description: "on wait: the child waited for, -1 for any"}
+        timeout_ms: {type: integer, default: -1}
+    response: {type: object, properties: {reason: {type: string}, sig: {type: integer}, elapsed_ms: {type: integer}}}
+    behavior:
+      - set:
+          vars.start: "= now"
+          vars.n: "= seq('block')"
+          vars.p: "= string(input.pid)"
+          vars.obj: "= has(input.obj) ? input.obj : ''"
+          vars.child: "= has(input.child) ? input.child : -1"
+          vars.timeout: "= has(input.timeout_ms) ? input.timeout_ms : -1"
+      - if: "vars.timeout == 0"
+        title: A zero timeout expires at once
+        then: [{return: {reason: timeout, sig: 0, elapsed_ms: 0}}]
+      - transact:
+          - table: procs
+            op: update
+            key: "= vars.p"
+            value: "= {'blocked': {'on': input.on, 'obj': vars.obj, 'addr': has(input.addr) ? input.addr : '', 'seq': vars.n}}"
+        title: The task sleeps; the blocked record is what it waits on
+      - wait:
+          until: >-
+            !(vars.p in state.procs) || state.procs[vars.p].state != 'running' ||
+            state.procs[vars.p].blocked.seq != vars.n ||
+            (input.on == 'wait' && (
+              state.procs.exists(k, state.procs[k].ppid == input.pid && state.procs[k].state == 'zombie' && (vars.child == -1 || state.procs[k].pid == vars.child)) ||
+              !state.procs.exists(k, state.procs[k].ppid == input.pid && (vars.child == -1 || state.procs[k].pid == vars.child)))) ||
+            (input.on == 'read' && vars.obj in state.objs &&
+              (size(state.objs[vars.obj].rbuf) > 0 || state.objs[vars.obj].peer_closed || state.objs[vars.obj].peer_reset)) ||
+            (input.on == 'accept' && vars.obj in state.objs && size(state.objs[vars.obj].queue) > 0) ||
+            (input.on == 'epoll' && vars.obj in state.objs && state.objs[vars.obj].interest.exists(o, o in state.objs &&
+              state.objs[o].type == 'socket' &&
+              (state.objs[o].state == 'listening' ? size(state.objs[o].queue) > 0
+                : state.objs[o].state == 'connected' && (size(state.objs[o].rbuf) > 0 || state.objs[o].peer_closed || state.objs[o].peer_reset))))
+          signal: "= 'sig:' + vars.p"
+          timeout_ms: "= vars.timeout > 0 ? vars.timeout : 0"
+          on_timeout: continue
+          as: w
+        title: Sleep until ready, a handled signal, death or the timeout
+      - set:
+          vars.dead: "= !(vars.p in state.procs) || state.procs[vars.p].state != 'running'"
+      - set:
+          vars.reason: "= vars.dead ? 'killed' : vars.w.reason == 'until' ? 'ready' : vars.w.reason"
+      - transact:
+          - {table: procs, op: update, key: "= vars.p", value: "= {'blocked': {'on': '', 'obj': '', 'addr': '', 'seq': 0}}"}
+        when: "vars.p in state.procs"
+      - return:
+          reason: "= vars.reason"
+          sig: "= vars.reason == 'signal' && size(state.procs[vars.p].caught) > 0 ? state.procs[vars.p].caught[size(state.procs[vars.p].caught) - 1] : 0"
+          elapsed_ms: "= now - vars.start"
+
+  - component: kernel
+    name: fd-install
+    kind: function
+    summary: >-
+      Allocate the lowest-numbered free fd in the process's table for an open file description
+      (POSIX requires the lowest), or fail EMFILE when every fd below RLIMIT_NOFILE is in use.
+    sources: ["https://man7.org/linux/man-pages/man2/open.2.html", "https://man7.org/linux/man-pages/man2/getrlimit.2.html"]
+    latency_ms: 0
+    request: {type: object, required: [pid, obj], properties: {pid: {$ref: Pid}, obj: {type: string}, cloexec: {type: boolean, default: false}}}
+    response: {type: object, properties: {fd: {type: integer}}}
+    errors: [{code: EMFILE, summary: "errno 24: the per-process limit on open fds has been reached"}]
+    behavior:
+      - set:
+          vars.free: "= lists.range(state.procs[string(input.pid)].nofile).filter(i, !((string(input.pid) + ':' + string(i)) in state.fds))"
+      - if: "size(vars.free) == 0"
+        then: [{fail: {code: EMFILE, message: too many open files, data: {errno: 24}}}]
+      - transact:
+          - {table: fds, op: put, key: "= string(input.pid) + ':' + string(vars.free[0])", value: {pid: "= input.pid", fd: "= vars.free[0]", obj: "= input.obj", cloexec: "= has(input.cloexec) && input.cloexec"}}
+          - {table: objs, op: incr, key: "= input.obj", value: {refs: 1}}
+      - return: {fd: "= vars.free[0]"}
+
+  - component: kernel
+    name: fd-get
+    kind: function
+    summary: Resolve a process's fd to its open file description, or fail EBADF.
+    sources: ["https://man7.org/linux/man-pages/man2/close.2.html"]
+    latency_ms: 0
+    request: {type: object, required: [pid, fd], properties: {pid: {$ref: Pid}, fd: {type: integer}}}
+    errors: [{code: EBADF, summary: "errno 9: fd isn't an open file descriptor"}]
+    behavior:
+      - set: {vars.k: "= string(input.pid) + ':' + string(input.fd)"}
+      - if: "!(vars.k in state.fds) || !(state.fds[vars.k].obj in state.objs)"
+        then: [{fail: {code: EBADF, message: "= 'bad file descriptor ' + string(input.fd)", data: {errno: 9}}}]
+      - return: "= merge(state.objs[state.fds[vars.k].obj], {'id': state.fds[vars.k].obj})"
+
+  - component: kernel
+    name: obj-unref
+    kind: function
+    summary: >-
+      Drop one reference to an open file description. At zero it is released: a connected
+      socket's peer sees EOF, a listener's queued connections are reset, and epoll instances stop
+      watching it (epoll removes a description once every fd referring to it is closed).
+    sources: ["https://man7.org/linux/man-pages/man2/close.2.html", "https://man7.org/linux/man-pages/man7/epoll.7.html", "https://man7.org/linux/man-pages/man7/tcp.7.html"]
+    latency_ms: 0
+    request: {type: object, required: [obj], properties: {obj: {type: string}}}
+    behavior:
+      - if: "!(input.obj in state.objs)"
+        then: [{return: {released: false}}]
+      - transact:
+          - {table: objs, op: incr, key: "= input.obj", value: {refs: -1}}
+      - if: "state.objs[input.obj].refs > 0"
+        then: [{return: {released: false}}]
+      - set: {vars.o: "= state.objs[input.obj]"}
+      - if: "vars.o.type == 'socket' && vars.o.state == 'connected' && vars.o.peer in state.objs"
+        title: The peer reads EOF (FIN)
+        then:
+          - transact:
+              - {table: objs, op: update, key: "= vars.o.peer", value: {peer_closed: true}}
+      - foreach: "= vars.o.type == 'socket' && vars.o.state == 'listening' ? vars.o.queue : []"
+        as: c
+        title: Connections never accepted are reset
+        steps:
+          - set: {vars.cp: "= state.objs[vars.c].peer"}
+          - transact:
+              - {table: objs, op: update, key: "= vars.cp", value: {peer_reset: true}}
+            when: "vars.cp in state.objs"
+          - transact:
+              - {table: objs, op: delete, key: "= vars.c"}
+      - foreach: "= state.objs.filter(k, state.objs[k].type == 'epoll' && input.obj in state.objs[k].interest)"
+        as: ep
+        steps:
+          - transact:
+              - {table: objs, op: update, key: "= vars.ep", value: "= {'interest': {input.obj: {'$absent': true}}}"}
+      - transact:
+          - {table: objs, op: delete, key: "= input.obj"}
+      - return: {released: true}
+
+  - component: kernel
+    name: readable
+    kind: function
+    summary: "Readiness of a description for EPOLLIN: a socket with buffered data, EOF or a reset; a listener with a queued connection."
+    sources: ["https://man7.org/linux/man-pages/man2/epoll_ctl.2.html"]
+    latency_ms: 0
+    request: {type: object, required: [obj], properties: {obj: {type: string}}}
+    response: {type: object, properties: {readable: {type: boolean}, rdhup: {type: boolean}}}
+    behavior:
+      - if: "!(input.obj in state.objs)"
+        then: [{return: {readable: false, rdhup: false}}]
+      - set: {vars.o: "= state.objs[input.obj]"}
+      - return:
+          readable: "= vars.o.type == 'socket' && (vars.o.state == 'listening' ? size(vars.o.queue) > 0 : vars.o.state == 'connected' && (size(vars.o.rbuf) > 0 || vars.o.peer_closed || vars.o.peer_reset))"
+          rdhup: "= vars.o.type == 'socket' && vars.o.state == 'connected' && (vars.o.peer_closed || vars.o.peer_reset)"
+
+  # ---- Processes ----------------------------------------------------------------------------
+  - component: kernel
+    name: fork
+    kind: function
+    attributes: {syscall: fork}
+    summary: >-
+      Create a child process, a copy of the caller: it gets the next pid, the caller as parent,
+      a duplicate of every fd (sharing the open file descriptions, so offsets and sockets are
+      shared), the signal dispositions, RLIMIT_NOFILE and oom_score_adj. Pending signals are not
+      inherited, and memory is copy-on-write, so the child starts with no resident memory of its
+      own. Returns the child's pid to the parent; drive the child by its pid.
+    sources: ["https://man7.org/linux/man-pages/man2/fork.2.html"]
+    latency_ms: 0
+    request: {type: object, required: [pid], properties: {pid: {$ref: Pid}}}
+    response: {type: object, properties: {child: {type: integer}}}
+    errors: [{code: ESRCH, summary: "model guard: the caller isn't a live process"}]
+    behavior:
+      - call: kernel.alive
+        input: {pid: "= input.pid"}
+        as: me
+      - set: {vars.child: "= state.next_pid"}
+      - set: {state.next_pid: "= vars.child + 1"}
+      - transact:
+          - table: procs
+            op: put
+            key: "= string(vars.child)"
+            value: "= merge(vars.me.value, {'pid': vars.child, 'ppid': input.pid, 'caught': [], 'blocked': {'on': '', 'obj': '', 'addr': '', 'seq': 0}, 'rss_mb': 0, 'status': null})"
+      - foreach: "= state.fds.filter(k, state.fds[k].pid == input.pid).map(k, state.fds[k])"
+        as: f
+        max: 1000
+        title: The child's fd table duplicates the parent's
+        steps:
+          - transact:
+              - {table: fds, op: put, key: "= string(vars.child) + ':' + string(vars.f.fd)", value: "= merge(vars.f, {'pid': vars.child})"}
+              - {table: objs, op: incr, key: "= vars.f.obj", value: {refs: 1}}
+      - return: {child: "= vars.child"}
+
+  - component: kernel
+    name: execve
+    kind: function
+    attributes: {syscall: execve}
+    summary: >-
+      Replace the process image with the program at path. Fds marked close-on-exec are closed;
+      handled signals are reset to their default action (ignored ones stay ignored); the pid,
+      parent, other fds and limits are kept. ENOENT when the file doesn't exist, EACCES when it
+      isn't executable. The sim fields run_ms and exit_code make the new program exit by itself.
+    sources: ["https://man7.org/linux/man-pages/man2/execve.2.html", "https://man7.org/linux/man-pages/man2/fcntl.2.html"]
+    latency_ms: 1
+    request:
+      type: object
+      required: [pid, path]
+      properties:
+        pid: {$ref: Pid}
+        path: {type: string, examples: [/usr/bin/worker]}
+        run_ms: {type: integer, default: -1, description: "sim: exit run_ms after the exec; -1 runs until killed or told to exit"}
+        exit_code: {type: integer, default: 0}
+    response: {type: object, properties: {closed: {type: array, items: {type: integer}}}}
+    errors:
+      - {code: ESRCH, summary: "model guard: the caller isn't a live process"}
+      - {code: ENOENT, summary: "errno 2: the file doesn't exist"}
+      - {code: EACCES, summary: "errno 13: the file isn't executable"}
+    behavior:
+      - call: kernel.alive
+        input: {pid: "= input.pid"}
+      - if: "!(input.path in state.files)"
+        then: [{fail: {code: ENOENT, message: "= input.path + ': no such file or directory'", data: {errno: 2}}}]
+      - if: "!(has(state.files[input.path].exec) && state.files[input.path].exec)"
+        then: [{fail: {code: EACCES, message: "= input.path + ': permission denied'", data: {errno: 13}}}]
+      - set:
+          vars.cloexec: "= state.fds.filter(k, state.fds[k].pid == input.pid && state.fds[k].cloexec).map(k, state.fds[k])"
+          vars.gen: "= seq('exec')"
+          vars.handlers: "= state.procs[string(input.pid)].handlers"
+      - foreach: "= vars.cloexec"
+        as: f
+        max: 1000
+        title: Close-on-exec fds are closed
+        steps:
+          - transact:
+              - {table: fds, op: delete, key: "= string(input.pid) + ':' + string(vars.f.fd)"}
+          - call: kernel.obj-unref
+            input: {obj: "= vars.f.obj"}
+      - transact:
+          - table: procs
+            op: put
+            key: "= string(input.pid)"
+            value: >-
+              = merge(omit(state.procs[string(input.pid)], 'handlers'), {'exe': input.path, 'exec_gen': vars.gen,
+                  'handlers': vars.handlers.filter(s, vars.handlers[s] == 'ignore').transformMapEntry(i, s, {s: 'ignore'}),
+                  'rss_mb': has(state.files[input.path].rss_mb) ? state.files[input.path].rss_mb : config['linux-exec-rss-mb']})
+        title: The new image; handled signals reset to default
+      - emit: kernel.exit
+        input: {pid: "= input.pid", code: "= has(input.exit_code) ? input.exit_code : 0", exec_gen: "= vars.gen"}
+        after_ms: "= input.run_ms"
+        when: "has(input.run_ms) && input.run_ms >= 0"
+      - return: {closed: "= vars.cloexec.map(f, f.fd)"}
+
+  - component: kernel
+    name: exit
+    kind: function
+    attributes: {syscall: exit_group}
+    summary: >-
+      The process calls _exit(code) (exit_group): it terminates with exit status code & 0xff. An
+      exit scheduled by execve's run_ms is ignored when the process has since exec'd again or died.
+    sources: ["https://man7.org/linux/man-pages/man2/exit.2.html", "https://man7.org/linux/man-pages/man2/exit_group.2.html"]
+    latency_ms: 0
+    request: {type: object, required: [pid], properties: {pid: {$ref: Pid}, code: {type: integer, default: 0}, exec_gen: {type: integer, default: 0}}}
+    behavior:
+      - if: "!(string(input.pid) in state.procs) || state.procs[string(input.pid)].state != 'running'"
+        then: [{return: {exited: false}}]
+      - if: "has(input.exec_gen) && input.exec_gen > 0 && (!has(state.procs[string(input.pid)].exec_gen) || state.procs[string(input.pid)].exec_gen != input.exec_gen)"
+        then: [{return: {exited: false}}]
+      - call: kernel.do-exit
+        input: {pid: "= input.pid", code: "= (has(input.code) ? input.code : 0) % 256", signal: 0}
+      - return: {exited: true}
+
+  - component: kernel
+    name: do-exit
+    kind: function
+    summary: >-
+      Process termination (do_exit): a syscall it is blocked in fails `killed`; every fd is
+      closed; its children are reparented to init (which reaps zombies at once); it becomes a
+      zombie holding its wait status, and its parent gets SIGCHLD. When the parent ignores
+      SIGCHLD (SIG_IGN) the child is reaped at once and never becomes a zombie; init (pid 1)
+      reaps its children itself.
+    sources: ["https://man7.org/linux/man-pages/man2/exit.2.html", "https://man7.org/linux/man-pages/man2/wait.2.html", "https://man7.org/linux/man-pages/man7/signal.7.html"]
+    latency_ms: 0
+    request: {type: object, required: [pid], properties: {pid: {$ref: Pid}, code: {type: integer, default: 0}, signal: {type: integer, default: 0}}}
+    behavior:
+      - set:
+          vars.p: "= string(input.pid)"
+          vars.ppid: "= state.procs[string(input.pid)].ppid"
+      - transact:
+          - table: procs
+            op: update
+            key: "= vars.p"
+            value: "= {'state': 'zombie', 'rss_mb': 0, 'exit_seq': seq('exit'), 'status': input.signal > 0 ? {'exited': false, 'code': 0, 'signaled': true, 'signal': input.signal} : {'exited': true, 'code': input.code, 'signaled': false, 'signal': 0}}"
+        title: A zombie; a syscall it sleeps in wakes and never returns, and a parent in waitpid wakes
+      - foreach: "= state.fds.filter(k, state.fds[k].pid == input.pid).map(k, state.fds[k])"
+        as: f
+        max: 1000
+        title: Every fd is closed
+        steps:
+          - transact:
+              - {table: fds, op: delete, key: "= vars.p + ':' + string(vars.f.fd)"}
+          - call: kernel.obj-unref
+            input: {obj: "= vars.f.obj"}
+      - foreach: "= state.procs.filter(k, state.procs[k].ppid == input.pid).map(k, state.procs[k])"
+        as: c
+        title: Orphans are reparented to init
+        steps:
+          - transact:
+              - {table: procs, op: update, key: "= string(vars.c.pid)", value: {ppid: 1}}
+            when: "vars.c.state == 'running'"
+          - transact:
+              - {table: procs, op: delete, key: "= string(vars.c.pid)"}
+            when: "vars.c.state == 'zombie'"
+      - if: "vars.ppid == 1 || !(string(vars.ppid) in state.procs) || state.procs[string(vars.ppid)].state != 'running' || ('17' in state.procs[string(vars.ppid)].handlers && state.procs[string(vars.ppid)].handlers['17'] == 'ignore')"
+        title: Reaped at once (parent is init, gone, or ignores SIGCHLD)
+        then:
+          - transact:
+              - {table: procs, op: delete, key: "= vars.p"}
+          - return: {zombie: false}
+      - call: kernel.deliver-signal
+        input: {pid: "= vars.ppid", sig: 17}
+        title: SIGCHLD to the parent
+      - return: {zombie: true}
+
+  - component: kernel
+    name: waitpid
+    kind: function
+    attributes: {syscall: wait4}
+    summary: >-
+      Wait for a child (child -1: any) to terminate and reap it, removing the zombie and returning
+      its decoded status. ECHILD when the caller has no such child. With WNOHANG, returns pid 0 at
+      once when no child has terminated yet. Otherwise it blocks; a handled signal interrupts it
+      with EINTR (SA_RESTART isn't modeled).
+    sources: ["https://man7.org/linux/man-pages/man2/wait.2.html", "https://man7.org/linux/man-pages/man7/signal.7.html"]
+    latency_ms: 0
+    request: {type: object, required: [pid], properties: {pid: {$ref: Pid}, child: {type: integer, default: -1}, wnohang: {type: boolean, default: false}}}
+    response: WaitStatus
+    errors:
+      - {code: ESRCH, summary: "model guard: the caller isn't a live process"}
+      - {code: ECHILD, summary: "errno 10: no child matches"}
+      - {code: EINTR, summary: "errno 4: a handled signal arrived while blocked"}
+      - {code: killed, summary: "the caller was killed while blocked; the call never returns"}
+    behavior:
+      - call: kernel.alive
+        input: {pid: "= input.pid"}
+      - set: {vars.target: "= has(input.child) ? input.child : -1"}
+      - foreach: "= lists.range(1000)"
+        as: round
+        max: 1000
+        steps:
+          - set:
+              vars.kids: "= state.procs.filter(k, state.procs[k].ppid == input.pid && (vars.target == -1 || state.procs[k].pid == vars.target)).map(k, state.procs[k])"
+          - if: "size(vars.kids) == 0"
+            then: [{fail: {code: ECHILD, message: no child processes, data: {errno: 10}}}]
+          - set: {vars.z: "= vars.kids.filter(c, c.state == 'zombie').sortBy(c, c.exit_seq)"}
+          - if: "size(vars.z) > 0"
+            title: Reap the zombie
+            then:
+              - set: {vars.c: "= vars.z[0]"}
+              - transact:
+                  - {table: procs, op: delete, key: "= string(vars.c.pid)"}
+              - return:
+                  pid: "= vars.c.pid"
+                  wstatus: "= vars.c.status.signaled ? vars.c.status.signal : vars.c.status.code * 256"
+                  exited: "= vars.c.status.exited"
+                  exit_code: "= vars.c.status.code"
+                  signaled: "= vars.c.status.signaled"
+                  term_sig: "= vars.c.status.signal"
+                  shell_status: "= vars.c.status.signaled ? 128 + vars.c.status.signal : vars.c.status.code"
+          - if: "has(input.wnohang) && input.wnohang"
+            then: [{return: {pid: 0}}]
+          - call: kernel.block
+            input: {pid: "= input.pid", on: wait, child: "= vars.target", timeout_ms: -1}
+            as: b
+          - if: "vars.b.value.reason == 'signal'"
+            then: [{fail: {code: EINTR, message: interrupted system call, data: {errno: 4, sig: "= vars.b.value.sig"}}}]
+          - if: "vars.b.value.reason == 'killed'"
+            then: [{fail: {code: killed, message: the process was killed in waitpid}}]
+
+  # ---- Signals ------------------------------------------------------------------------------
+  - component: kernel
+    name: sigaction
+    kind: function
+    attributes: {syscall: rt_sigaction}
+    summary: >-
+      Set a signal's disposition: default, ignore, or handle (an installed handler). SIGKILL (9)
+      and SIGSTOP (19) can't be caught or ignored: EINVAL. Returns the previous disposition.
+    sources: ["https://man7.org/linux/man-pages/man2/sigaction.2.html", "https://man7.org/linux/man-pages/man7/signal.7.html"]
+    latency_ms: 0
+    request:
+      type: object
+      required: [pid, sig, action]
+      properties:
+        pid: {$ref: Pid}
+        sig: {type: integer, examples: [15]}
+        action: {type: string, enum: [default, ignore, handle]}
+    response: {type: object, properties: {old: {type: string}}}
+    errors:
+      - {code: ESRCH, summary: "model guard: the caller isn't a live process"}
+      - {code: EINVAL, summary: "errno 22: an invalid signal, or SIGKILL/SIGSTOP"}
+    behavior:
+      - call: kernel.alive
+        input: {pid: "= input.pid"}
+        as: me
+      - if: "input.sig in [9, 19] || input.sig < 1 || input.sig > 64"
+        then: [{fail: {code: EINVAL, message: "= 'signal ' + string(input.sig) + ' cannot be caught or ignored'", data: {errno: 22}}}]
+      - set: {vars.s: "= string(input.sig)"}
+      - transact:
+          - table: procs
+            op: put
+            key: "= string(input.pid)"
+            value: "= merge(omit(vars.me.value, 'handlers'), {'handlers': input.action == 'default' ? omit(vars.me.value.handlers, vars.s) : merge(vars.me.value.handlers, {vars.s: input.action})})"
+      - return: {old: "= vars.s in vars.me.value.handlers ? vars.me.value.handlers[vars.s] : 'default'"}
+
+  - component: kernel
+    name: kill
+    kind: function
+    attributes: {syscall: kill}
+    summary: >-
+      Send a signal to a process. ESRCH when no process has that pid; a zombie accepts it and
+      nothing happens; EINVAL for an invalid signal. Permission checks are not modeled.
+    sources: ["https://man7.org/linux/man-pages/man2/kill.2.html", "https://man7.org/linux/man-pages/man7/signal.7.html"]
+    latency_ms: 0
+    request: {type: object, required: [pid, target, sig], properties: {pid: {$ref: Pid}, target: {$ref: Pid}, sig: {type: integer, examples: [15]}}}
+    response: {type: object, properties: {action: {type: string}}}
+    errors:
+      - {code: ESRCH, summary: "errno 3: no such process"}
+      - {code: EINVAL, summary: "errno 22: invalid signal"}
+    behavior:
+      - call: kernel.alive
+        input: {pid: "= input.pid"}
+      - if: "input.sig < 0 || input.sig > 64"
+        then: [{fail: {code: EINVAL, message: invalid signal, data: {errno: 22}}}]
+      - if: "!(string(input.target) in state.procs)"
+        then: [{fail: {code: ESRCH, message: no such process, data: {errno: 3}}}]
+      - if: "input.sig == 0"
+        title: Signal 0 checks that the process exists
+        then: [{return: {action: none}}]
+      - call: kernel.deliver-signal
+        input: {pid: "= input.target", sig: "= input.sig"}
+        as: d
+      - return: {action: "= vars.d.value.action"}
+
+  - component: kernel
+    name: deliver-signal
+    kind: function
+    summary: >-
+      Deliver a signal. SIGKILL always terminates. A handled signal runs the handler (recorded in
+      `caught`) and interrupts a blocking syscall with EINTR. An ignored signal is discarded.
+      Otherwise the default action applies: terminate for SIGHUP, SIGINT, SIGPIPE, SIGALRM,
+      SIGTERM, SIGUSR1 and SIGUSR2 (and the core-dumping signals, cores not modeled); ignore for
+      SIGCHLD, SIGURG and SIGWINCH. A terminated process's status records the signal.
+    sources: ["https://man7.org/linux/man-pages/man7/signal.7.html"]
+    latency_ms: 0
+    request: {type: object, required: [pid, sig], properties: {pid: {$ref: Pid}, sig: {type: integer}}}
+    response: {type: object, properties: {action: {type: string, enum: [terminate, handle, ignore, none]}}}
+    behavior:
+      - set: {vars.p: "= string(input.pid)", vars.s: "= string(input.sig)"}
+      - if: "!(vars.p in state.procs) || state.procs[vars.p].state != 'running'"
+        then: [{return: {action: none}}]
+      - set:
+          vars.disp: "= input.sig == 9 || input.sig == 19 ? 'default' : (vars.s in state.procs[vars.p].handlers ? state.procs[vars.p].handlers[vars.s] : 'default')"
+      - set:
+          vars.action: "= vars.disp == 'handle' ? 'handle' : vars.disp == 'ignore' ? 'ignore' : (input.sig in [17, 23, 28, 18] ? 'ignore' : 'terminate')"
+      - if: "vars.action == 'handle'"
+        title: The handler runs; a blocking syscall returns EINTR
+        then:
+          - transact:
+              - {table: procs, op: update, key: "= vars.p", value: {caught: "= state.procs[vars.p].caught + [input.sig]"}}
+          - signal: "= 'sig:' + vars.p"
+            title: A syscall the process sleeps in wakes with EINTR
+      - call: kernel.do-exit
+        input: {pid: "= input.pid", signal: "= input.sig"}
+        when: "vars.action == 'terminate'"
+        title: Default action, terminate
+      - return: {action: "= vars.action"}
+
+  # ---- Limits -------------------------------------------------------------------------------
+  - component: kernel
+    name: setrlimit-nofile
+    kind: function
+    attributes: {syscall: prlimit64}
+    summary: Set the process's RLIMIT_NOFILE soft limit (fds already open above it stay open). Inherited by fork and kept across execve.
+    sources: ["https://man7.org/linux/man-pages/man2/getrlimit.2.html"]
+    latency_ms: 0
+    request: {type: object, required: [pid, soft], properties: {pid: {$ref: Pid}, soft: {type: integer, examples: [8]}}}
+    errors:
+      - {code: ESRCH, summary: "model guard: the caller isn't a live process"}
+      - {code: EINVAL, summary: "errno 22: a negative limit"}
+    behavior:
+      - call: kernel.alive
+        input: {pid: "= input.pid"}
+      - if: "input.soft < 0"
+        then: [{fail: {code: EINVAL, message: invalid limit, data: {errno: 22}}}]
+      - transact:
+          - {table: procs, op: update, key: "= string(input.pid)", value: {nofile: "= input.soft"}}
+      - return: {nofile: "= input.soft"}
+
+  # ---- Files --------------------------------------------------------------------------------
+  - component: kernel
+    name: open
+    kind: function
+    attributes: {syscall: openat}
+    summary: >-
+      Open a file and return the lowest free fd, with a new open file description at offset 0.
+      O_CREAT creates a missing file, O_TRUNC empties it, O_CLOEXEC sets close-on-exec. The fd is
+      allocated first, so a full table fails EMFILE even for a missing file; otherwise a missing
+      file without O_CREAT fails ENOENT.
+    sources: ["https://man7.org/linux/man-pages/man2/open.2.html"]
+    latency_ms: 0
+    request:
+      type: object
+      required: [pid, path]
+      properties:
+        pid: {$ref: Pid}
+        path: {type: string, examples: [/var/log/app.log]}
+        create: {type: boolean, default: false}
+        truncate: {type: boolean, default: false}
+        cloexec: {type: boolean, default: false}
+    response: {type: object, properties: {fd: {type: integer}}}
+    errors:
+      - {code: ESRCH, summary: "model guard: the caller isn't a live process"}
+      - {code: EMFILE, summary: "errno 24: the fd table is full"}
+      - {code: ENOENT, summary: "errno 2: no such file, and no O_CREAT"}
+    behavior:
+      - call: kernel.alive
+        input: {pid: "= input.pid"}
+        as: me
+      - if: "size(state.fds.filter(k, state.fds[k].pid == input.pid && state.fds[k].fd < vars.me.value.nofile)) >= vars.me.value.nofile"
+        then: [{fail: {code: EMFILE, message: too many open files, data: {errno: 24}}}]
+      - if: "!(input.path in state.files) && !(has(input.create) && input.create)"
+        then: [{fail: {code: ENOENT, message: "= input.path + ': no such file or directory'", data: {errno: 2}}}]
+      - transact:
+          - {table: files, op: put, key: "= input.path", value: {path: "= input.path", data: ""}}
+        when: "!(input.path in state.files) || (has(input.truncate) && input.truncate)"
+      - set: {vars.o: "= 'f' + string(seq('obj'))"}
+      - transact:
+          - {table: objs, op: put, key: "= vars.o", value: {type: file, path: "= input.path", offset: 0, refs: 0}}
+      - call: kernel.fd-install
+        input: {pid: "= input.pid", obj: "= vars.o", cloexec: "= has(input.cloexec) && input.cloexec"}
+        as: fd
+      - return: {fd: "= vars.fd.value.fd"}
+
+  - component: kernel
+    name: close
+    kind: function
+    attributes: {syscall: close}
+    summary: Close an fd. EBADF when it isn't open. The description is released when its last fd closes.
+    sources: ["https://man7.org/linux/man-pages/man2/close.2.html"]
+    latency_ms: 0
+    request: {type: object, required: [pid, fd], properties: {pid: {$ref: Pid}, fd: {type: integer}}}
+    errors:
+      - {code: ESRCH, summary: "model guard: the caller isn't a live process"}
+      - {code: EBADF, summary: "errno 9: not an open fd"}
+    behavior:
+      - call: kernel.alive
+        input: {pid: "= input.pid"}
+      - call: kernel.fd-get
+        input: {pid: "= input.pid", fd: "= input.fd"}
+        as: o
+      - transact:
+          - {table: fds, op: delete, key: "= string(input.pid) + ':' + string(input.fd)"}
+      - call: kernel.obj-unref
+        input: {obj: "= vars.o.value.id"}
+      - return: {closed: "= input.fd"}
+
+  - component: kernel
+    name: read
+    kind: function
+    attributes: {syscall: read}
+    summary: >-
+      Read up to count bytes. A file reads from the description's offset and advances it ("" at
+      end of file). A connected socket returns buffered data; with none it returns "" once the
+      peer has closed (EOF), fails ECONNRESET after a reset, fails EAGAIN when nonblocking, and
+      otherwise blocks: until data arrives, until SO_RCVTIMEO passes (EAGAIN), or until a handled
+      signal interrupts it (EINTR). EBADF for a bad fd, EINVAL on a listener or epoll fd, ENOTCONN
+      on an unconnected socket.
+    sources: ["https://man7.org/linux/man-pages/man2/read.2.html", "https://man7.org/linux/man-pages/man7/socket.7.html", "https://man7.org/linux/man-pages/man2/recv.2.html"]
+    latency_ms: 0
+    request: {type: object, required: [pid, fd], properties: {pid: {$ref: Pid}, fd: {type: integer}, count: {type: integer, default: 4096}}}
+    response: {type: object, properties: {data: {type: string}, n: {type: integer}}}
+    errors:
+      - {code: ESRCH, summary: "model guard: the caller isn't a live process"}
+      - {code: EBADF, summary: "errno 9"}
+      - {code: EINVAL, summary: "errno 22: the fd can't be read"}
+      - {code: ENOTCONN, summary: "errno 107: the socket isn't connected"}
+      - {code: EAGAIN, summary: "errno 11: nonblocking with no data, or SO_RCVTIMEO expired"}
+      - {code: EINTR, summary: "errno 4: a handled signal arrived before any data"}
+      - {code: ECONNRESET, summary: "errno 104: the peer reset the connection"}
+      - {code: killed, summary: "the caller was killed while blocked"}
+    behavior:
+      - call: kernel.alive
+        input: {pid: "= input.pid"}
+      - set: {vars.count: "= has(input.count) ? input.count : 4096"}
+      - foreach: "= lists.range(1000)"
+        as: round
+        max: 1000
+        steps:
+          - call: kernel.fd-get
+            input: {pid: "= input.pid", fd: "= input.fd"}
+            as: o
+          - set: {vars.ob: "= vars.o.value"}
+          - if: "vars.ob.type == 'file'"
+            title: A file reads at the offset
+            then:
+              - set:
+                  vars.d: "= state.files[vars.ob.path].data"
+              - set:
+                  vars.out: "= vars.d.substring(math.least(vars.ob.offset, size(vars.d)), math.least(vars.ob.offset + vars.count, size(vars.d)))"
+              - transact:
+                  - {table: objs, op: update, key: "= vars.ob.id", value: {offset: "= vars.ob.offset + size(vars.out)"}}
+              - return: {data: "= vars.out", n: "= size(vars.out)"}
+          - if: "vars.ob.type != 'socket' || vars.ob.state == 'listening'"
+            then: [{fail: {code: EINVAL, message: invalid argument, data: {errno: 22}}}]
+          - if: "vars.ob.state != 'connected'"
+            then: [{fail: {code: ENOTCONN, message: transport endpoint is not connected, data: {errno: 107}}}]
+          - if: "size(vars.ob.rbuf) > 0"
+            title: Buffered data is returned
+            then:
+              - set: {vars.out: "= vars.ob.rbuf.substring(0, math.least(vars.count, size(vars.ob.rbuf)))"}
+              - transact:
+                  - {table: objs, op: update, key: "= vars.ob.id", value: {rbuf: "= vars.ob.rbuf.substring(size(vars.out), size(vars.ob.rbuf))"}}
+              - return: {data: "= vars.out", n: "= size(vars.out)"}
+          - if: "vars.ob.peer_reset"
+            then: [{fail: {code: ECONNRESET, message: connection reset by peer, data: {errno: 104}}}]
+          - if: "vars.ob.peer_closed"
+            title: End of file after the peer's FIN
+            then: [{return: {data: "", n: 0}}]
+          - if: "vars.ob.nonblock"
+            then: [{fail: {code: EAGAIN, message: resource temporarily unavailable, data: {errno: 11}}}]
+          - call: kernel.block
+            input: {pid: "= input.pid", on: read, obj: "= vars.ob.id", timeout_ms: "= vars.ob.rcvtimeo_ms > 0 ? vars.ob.rcvtimeo_ms : -1"}
+            as: b
+          - if: "vars.b.value.reason == 'timeout'"
+            title: SO_RCVTIMEO expired
+            then: [{fail: {code: EAGAIN, message: resource temporarily unavailable, data: {errno: 11, timed_out: true}}}]
+          - if: "vars.b.value.reason == 'signal'"
+            then: [{fail: {code: EINTR, message: interrupted system call, data: {errno: 4, sig: "= vars.b.value.sig"}}}]
+          - if: "vars.b.value.reason == 'killed'"
+            then: [{fail: {code: killed, message: the process was killed in read}}]
+
+  - component: kernel
+    name: write
+    kind: function
+    attributes: {syscall: write}
+    summary: >-
+      Write data. A file writes at the description's offset (overwriting, extending) and advances
+      it. A connected socket appends to the peer's receive buffer and wakes its readers (buffer
+      limits and flow control belong to the tcp-tls substrate). After the peer has closed, the
+      write fails EPIPE and the writer gets SIGPIPE, which by default terminates it. EBADF,
+      EINVAL (listener, epoll), ENOTCONN as for read.
+    sources: ["https://man7.org/linux/man-pages/man2/write.2.html", "https://man7.org/linux/man-pages/man2/send.2.html", "https://man7.org/linux/man-pages/man7/signal.7.html"]
+    latency_ms: 0
+    request: {type: object, required: [pid, fd, data], properties: {pid: {$ref: Pid}, fd: {type: integer}, data: {type: string}}}
+    response: {type: object, properties: {n: {type: integer}}}
+    errors:
+      - {code: ESRCH, summary: "model guard: the caller isn't a live process"}
+      - {code: EBADF, summary: "errno 9"}
+      - {code: EINVAL, summary: "errno 22"}
+      - {code: ENOTCONN, summary: "errno 107"}
+      - {code: EPIPE, summary: "errno 32: the peer closed; SIGPIPE is raised too"}
+    behavior:
+      - call: kernel.alive
+        input: {pid: "= input.pid"}
+      - call: kernel.fd-get
+        input: {pid: "= input.pid", fd: "= input.fd"}
+        as: o
+      - set: {vars.ob: "= vars.o.value"}
+      - if: "vars.ob.type == 'file'"
+        then:
+          - set: {vars.d: "= state.files[vars.ob.path].data"}
+          - set:
+              vars.nd: "= vars.d.substring(0, math.least(vars.ob.offset, size(vars.d))) + input.data + (vars.ob.offset + size(input.data) < size(vars.d) ? vars.d.substring(vars.ob.offset + size(input.data), size(vars.d)) : '')"
+          - transact:
+              - {table: files, op: update, key: "= vars.ob.path", value: {data: "= vars.nd"}}
+              - {table: objs, op: update, key: "= vars.ob.id", value: {offset: "= vars.ob.offset + size(input.data)"}}
+          - return: {n: "= size(input.data)"}
+      - if: "vars.ob.type != 'socket' || vars.ob.state == 'listening'"
+        then: [{fail: {code: EINVAL, message: invalid argument, data: {errno: 22}}}]
+      - if: "vars.ob.state != 'connected'"
+        then: [{fail: {code: ENOTCONN, message: transport endpoint is not connected, data: {errno: 107}}}]
+      - if: "!(vars.ob.peer in state.objs)"
+        title: The peer is gone; SIGPIPE, then EPIPE
+        then:
+          - call: kernel.deliver-signal
+            input: {pid: "= input.pid", sig: 13}
+          - fail: {code: EPIPE, message: broken pipe, data: {errno: 32}}
+      - transact:
+          - {table: objs, op: update, key: "= vars.ob.peer", value: {rbuf: "= state.objs[vars.ob.peer].rbuf + input.data"}}
+      - return: {n: "= size(input.data)"}
+
+  # ---- Sockets (TCP over loopback, by port) ----------------------------------------------------
+  - component: kernel
+    name: socket
+    kind: function
+    attributes: {syscall: socket}
+    summary: Create a TCP socket (AF_INET, SOCK_STREAM) and return the lowest free fd. SOCK_NONBLOCK, SOCK_CLOEXEC and SO_RCVTIMEO (rcvtimeo_ms) are options. EMFILE when the table is full.
+    sources: ["https://man7.org/linux/man-pages/man2/socket.2.html", "https://man7.org/linux/man-pages/man7/socket.7.html"]
+    latency_ms: 0
+    request:
+      type: object
+      required: [pid]
+      properties:
+        pid: {$ref: Pid}
+        nonblock: {type: boolean, default: false}
+        cloexec: {type: boolean, default: false}
+        rcvtimeo_ms: {type: integer, default: 0, description: "SO_RCVTIMEO; 0 blocks forever"}
+    response: {type: object, properties: {fd: {type: integer}}}
+    errors:
+      - {code: ESRCH, summary: "model guard: the caller isn't a live process"}
+      - {code: EMFILE, summary: "errno 24"}
+    behavior:
+      - call: kernel.alive
+        input: {pid: "= input.pid"}
+      - set: {vars.o: "= 's' + string(seq('obj'))"}
+      - transact:
+          - table: objs
+            op: put
+            key: "= vars.o"
+            value: {type: socket, state: unbound, nonblock: "= has(input.nonblock) && input.nonblock", rcvtimeo_ms: "= has(input.rcvtimeo_ms) ? input.rcvtimeo_ms : 0", peer: "", rbuf: "", peer_closed: false, peer_reset: false, refs: 0}
+      - call: kernel.fd-install
+        input: {pid: "= input.pid", obj: "= vars.o", cloexec: "= has(input.cloexec) && input.cloexec"}
+        as: fd
+        on_error:
+          - transact:
+              - {table: objs, op: delete, key: "= vars.o"}
+          - fail: "= error"
+      - return: {fd: "= vars.fd.value.fd"}
+
+  - component: kernel
+    name: listen
+    kind: function
+    attributes: {syscall: listen}
+    summary: >-
+      bind(port) and listen(backlog) in one: the socket accepts connections into a queue of at
+      most backlog completed connections. EADDRINUSE when another socket listens on the port;
+      EINVAL when the socket is already connected.
+    sources: ["https://man7.org/linux/man-pages/man2/listen.2.html", "https://man7.org/linux/man-pages/man2/bind.2.html"]
+    latency_ms: 0
+    request: {type: object, required: [pid, fd, port], properties: {pid: {$ref: Pid}, fd: {type: integer}, port: {type: integer, examples: [8080]}, backlog: {type: integer, default: 128}}}
+    errors:
+      - {code: ESRCH, summary: "model guard: the caller isn't a live process"}
+      - {code: EBADF, summary: "errno 9"}
+      - {code: EINVAL, summary: "errno 22: not an unbound socket"}
+      - {code: EADDRINUSE, summary: "errno 98: the port is taken"}
+    behavior:
+      - call: kernel.alive
+        input: {pid: "= input.pid"}
+      - call: kernel.fd-get
+        input: {pid: "= input.pid", fd: "= input.fd"}
+        as: o
+      - if: "vars.o.value.type != 'socket' || vars.o.value.state != 'unbound'"
+        then: [{fail: {code: EINVAL, message: invalid argument, data: {errno: 22}}}]
+      - if: "state.objs.exists(k, state.objs[k].type == 'socket' && state.objs[k].state == 'listening' && state.objs[k].port == input.port)"
+        then: [{fail: {code: EADDRINUSE, message: address already in use, data: {errno: 98}}}]
+      - transact:
+          - {table: objs, op: update, key: "= vars.o.value.id", value: {state: listening, port: "= input.port", backlog: "= has(input.backlog) ? input.backlog : 128", queue: []}}
+      - return: {port: "= input.port"}
+
+  - component: kernel
+    name: connect
+    kind: function
+    attributes: {syscall: connect}
+    summary: >-
+      Connect to a local port. No listener: the peer answers the SYN with RST and connect fails
+      ECONNREFUSED. A listener whose accept queue holds backlog connections drops the SYN; the
+      client retransmits and fails ETIMEDOUT after the SYN retries (linux-tcp-syn-timeout-ms).
+      Otherwise the handshake completes in the kernel, before any accept: the server side is
+      queued on the listener, whose acceptors and epoll watchers wake. EISCONN when connected.
+    sources: ["https://man7.org/linux/man-pages/man2/connect.2.html", "https://man7.org/linux/man-pages/man2/listen.2.html", "https://man7.org/linux/man-pages/man7/tcp.7.html"]
+    latency_ms: 0
+    request: {type: object, required: [pid, fd, port], properties: {pid: {$ref: Pid}, fd: {type: integer}, port: {type: integer, examples: [8080]}}}
+    errors:
+      - {code: ESRCH, summary: "model guard: the caller isn't a live process"}
+      - {code: EBADF, summary: "errno 9"}
+      - {code: EINVAL, summary: "errno 22: not a socket that can connect"}
+      - {code: EISCONN, summary: "errno 106: already connected"}
+      - {code: ECONNREFUSED, summary: "errno 111: nothing listens on the port"}
+      - {code: ETIMEDOUT, summary: "errno 110: the SYNs went unanswered"}
+    behavior:
+      - call: kernel.alive
+        input: {pid: "= input.pid"}
+      - call: kernel.fd-get
+        input: {pid: "= input.pid", fd: "= input.fd"}
+        as: o
+      - if: "vars.o.value.type == 'socket' && vars.o.value.state == 'connected'"
+        then: [{fail: {code: EISCONN, message: transport endpoint is already connected, data: {errno: 106}}}]
+      - if: "vars.o.value.type != 'socket' || vars.o.value.state != 'unbound'"
+        then: [{fail: {code: EINVAL, message: invalid argument, data: {errno: 22}}}]
+      - set:
+          vars.ls: "= state.objs.filter(k, state.objs[k].type == 'socket' && state.objs[k].state == 'listening' && state.objs[k].port == input.port)"
+      - if: "size(vars.ls) == 0"
+        title: RST in answer to the SYN
+        then: [{fail: {code: ECONNREFUSED, message: connection refused, data: {errno: 111}}}]
+      - set: {vars.l: "= vars.ls[0]"}
+      - if: "size(state.objs[vars.l].queue) >= state.objs[vars.l].backlog"
+        title: Accept queue full; the SYN is dropped and retried until the timeout
+        then:
+          - wait: "= config['linux-tcp-syn-timeout-ms']"
+          - fail: {code: ETIMEDOUT, message: connection timed out, data: {errno: 110}}
+      - set: {vars.srv: "= 's' + string(seq('obj'))"}
+      - transact:
+          - {table: objs, op: put, key: "= vars.srv", value: {type: socket, state: connected, nonblock: false, rcvtimeo_ms: 0, peer: "= vars.o.value.id", rbuf: "", peer_closed: false, peer_reset: false, port: "= input.port", refs: 0}}
+          - {table: objs, op: update, key: "= vars.o.value.id", value: {state: connected, peer: "= vars.srv", port: "= input.port"}}
+          - {table: objs, op: update, key: "= vars.l", value: {queue: "= state.objs[vars.l].queue + [vars.srv]"}}
+        title: Three-way handshake complete; queued for accept
+      - return: {connected: true}
+
+  - component: kernel
+    name: accept
+    kind: function
+    attributes: {syscall: accept4}
+    summary: >-
+      Take the oldest completed connection from a listener's queue and return a new fd for it.
+      With an empty queue, EAGAIN when nonblocking, else block until a connection arrives or a
+      handled signal interrupts (EINTR). EMFILE when the fd table is full: the connection stays
+      queued (the classic accept-loop spin). EINVAL when the socket isn't listening.
+    sources: ["https://man7.org/linux/man-pages/man2/accept.2.html"]
+    latency_ms: 0
+    request: {type: object, required: [pid, fd], properties: {pid: {$ref: Pid}, fd: {type: integer}, cloexec: {type: boolean, default: false}}}
+    response: {type: object, properties: {fd: {type: integer}}}
+    errors:
+      - {code: ESRCH, summary: "model guard: the caller isn't a live process"}
+      - {code: EBADF, summary: "errno 9"}
+      - {code: EINVAL, summary: "errno 22: not listening"}
+      - {code: EAGAIN, summary: "errno 11: nonblocking and nothing queued"}
+      - {code: EMFILE, summary: "errno 24: the fd table is full; the connection stays queued"}
+      - {code: EINTR, summary: "errno 4"}
+      - {code: killed, summary: "the caller was killed while blocked"}
+    behavior:
+      - call: kernel.alive
+        input: {pid: "= input.pid"}
+      - foreach: "= lists.range(1000)"
+        as: round
+        max: 1000
+        steps:
+          - call: kernel.fd-get
+            input: {pid: "= input.pid", fd: "= input.fd"}
+            as: o
+          - set: {vars.ob: "= vars.o.value"}
+          - if: "vars.ob.type != 'socket' || vars.ob.state != 'listening'"
+            then: [{fail: {code: EINVAL, message: invalid argument, data: {errno: 22}}}]
+          - if: "size(vars.ob.queue) > 0"
+            then:
+              - call: kernel.fd-install
+                input: {pid: "= input.pid", obj: "= vars.ob.queue[0]", cloexec: "= has(input.cloexec) && input.cloexec"}
+                as: nfd
+              - transact:
+                  - {table: objs, op: update, key: "= vars.ob.id", value: {queue: "= vars.ob.queue.slice(1, size(vars.ob.queue))"}}
+              - return: {fd: "= vars.nfd.value.fd"}
+          - if: "vars.ob.nonblock"
+            then: [{fail: {code: EAGAIN, message: resource temporarily unavailable, data: {errno: 11}}}]
+          - call: kernel.block
+            input: {pid: "= input.pid", on: accept, obj: "= vars.ob.id", timeout_ms: -1}
+            as: b
+          - if: "vars.b.value.reason == 'signal'"
+            then: [{fail: {code: EINTR, message: interrupted system call, data: {errno: 4, sig: "= vars.b.value.sig"}}}]
+          - if: "vars.b.value.reason == 'killed'"
+            then: [{fail: {code: killed, message: the process was killed in accept}}]
+
+  # ---- epoll --------------------------------------------------------------------------------
+  - component: kernel
+    name: epoll-create
+    kind: function
+    attributes: {syscall: epoll_create1}
+    summary: Create an epoll instance and return its fd. EMFILE when the table is full.
+    sources: ["https://man7.org/linux/man-pages/man2/epoll_create.2.html"]
+    latency_ms: 0
+    request: {type: object, required: [pid], properties: {pid: {$ref: Pid}, cloexec: {type: boolean, default: false}}}
+    response: {type: object, properties: {fd: {type: integer}}}
+    errors:
+      - {code: ESRCH, summary: "model guard: the caller isn't a live process"}
+      - {code: EMFILE, summary: "errno 24"}
+    behavior:
+      - call: kernel.alive
+        input: {pid: "= input.pid"}
+      - set: {vars.o: "= 'e' + string(seq('obj'))"}
+      - transact:
+          - {table: objs, op: put, key: "= vars.o", value: {type: epoll, interest: {}, refs: 0}}
+      - call: kernel.fd-install
+        input: {pid: "= input.pid", obj: "= vars.o", cloexec: "= has(input.cloexec) && input.cloexec"}
+        as: fd
+        on_error:
+          - transact:
+              - {table: objs, op: delete, key: "= vars.o"}
+          - fail: "= error"
+      - return: {fd: "= vars.fd.value.fd"}
+
+  - component: kernel
+    name: epoll-ctl
+    kind: function
+    attributes: {syscall: epoll_ctl}
+    summary: >-
+      Add an fd to (or delete it from) an epoll instance's interest list, for EPOLLIN
+      (level-triggered). EBADF for a bad fd; EINVAL when epfd isn't an epoll fd or fd is epfd
+      itself; EPERM for a regular file (epoll doesn't support them); EEXIST adding twice; ENOENT
+      deleting an fd that isn't registered.
+    sources: ["https://man7.org/linux/man-pages/man2/epoll_ctl.2.html"]
+    latency_ms: 0
+    request: {type: object, required: [pid, epfd, op, fd], properties: {pid: {$ref: Pid}, epfd: {type: integer}, op: {type: string, enum: [add, del]}, fd: {type: integer}}}
+    errors:
+      - {code: ESRCH, summary: "model guard: the caller isn't a live process"}
+      - {code: EBADF, summary: "errno 9"}
+      - {code: EINVAL, summary: "errno 22"}
+      - {code: EPERM, summary: "errno 1: the fd doesn't support epoll (a regular file)"}
+      - {code: EEXIST, summary: "errno 17: already registered"}
+      - {code: ENOENT, summary: "errno 2: not registered"}
+    behavior:
+      - call: kernel.alive
+        input: {pid: "= input.pid"}
+      - call: kernel.fd-get
+        input: {pid: "= input.pid", fd: "= input.epfd"}
+        as: ep
+      - call: kernel.fd-get
+        input: {pid: "= input.pid", fd: "= input.fd"}
+        as: o
+      - if: "vars.ep.value.type != 'epoll' || input.fd == input.epfd"
+        then: [{fail: {code: EINVAL, message: invalid argument, data: {errno: 22}}}]
+      - if: "vars.o.value.type == 'file'"
+        then: [{fail: {code: EPERM, message: operation not permitted, data: {errno: 1}}}]
+      - set: {vars.has: "= vars.o.value.id in vars.ep.value.interest"}
+      - if: "input.op == 'add' && vars.has"
+        then: [{fail: {code: EEXIST, message: file exists, data: {errno: 17}}}]
+      - if: "input.op == 'del' && !vars.has"
+        then: [{fail: {code: ENOENT, message: no such file or directory, data: {errno: 2}}}]
+      - transact:
+          - {table: objs, op: update, key: "= vars.ep.value.id", value: "= {'interest': {vars.o.value.id: input.op == 'add' ? {'fd': input.fd} : {'$absent': true}}}"}
+      - return: {ok: true}
+
+  - component: kernel
+    name: epoll-wait
+    kind: function
+    attributes: {syscall: epoll_wait}
+    summary: >-
+      Return up to max ready fds ({fd, events}: in, plus rdhup after the peer closed). With none
+      ready: timeout_ms 0 returns [] at once; otherwise it blocks until one becomes ready, until
+      timeout_ms passes (returns [], not an error), or until a handled signal interrupts (EINTR);
+      -1 waits forever. EBADF; EINVAL when epfd isn't an epoll fd or max <= 0.
+    sources: ["https://man7.org/linux/man-pages/man2/epoll_wait.2.html", "https://man7.org/linux/man-pages/man7/epoll.7.html"]
+    latency_ms: 0
+    request: {type: object, required: [pid, epfd], properties: {pid: {$ref: Pid}, epfd: {type: integer}, max: {type: integer, default: 64}, timeout_ms: {type: integer, default: -1}}}
+    response: {type: object, properties: {events: {type: array, items: {type: object, properties: {fd: {type: integer}, events: {type: array, items: {type: string}}}}}}}
+    errors:
+      - {code: ESRCH, summary: "model guard: the caller isn't a live process"}
+      - {code: EBADF, summary: "errno 9"}
+      - {code: EINVAL, summary: "errno 22"}
+      - {code: EINTR, summary: "errno 4"}
+      - {code: killed, summary: "the caller was killed while blocked"}
+    behavior:
+      - call: kernel.alive
+        input: {pid: "= input.pid"}
+      - set:
+          vars.max: "= has(input.max) ? input.max : 64"
+          vars.timeout: "= has(input.timeout_ms) ? input.timeout_ms : -1"
+          vars.start: "= now"
+      - if: "vars.max <= 0"
+        then: [{fail: {code: EINVAL, message: invalid argument, data: {errno: 22}}}]
+      - foreach: "= lists.range(1000)"
+        as: round
+        max: 1000
+        steps:
+          - call: kernel.fd-get
+            input: {pid: "= input.pid", fd: "= input.epfd"}
+            as: ep
+          - if: "vars.ep.value.type != 'epoll'"
+            then: [{fail: {code: EINVAL, message: invalid argument, data: {errno: 22}}}]
+          - set: {vars.ready: []}
+          - foreach: "= vars.ep.value.interest"
+            as: reg
+            index: obj
+            steps:
+              - call: kernel.readable
+                input: {obj: "= vars.obj"}
+                as: r
+              - set:
+                  vars.ready: "= vars.r.value.readable ? vars.ready + [{'fd': vars.reg.fd, 'events': vars.r.value.rdhup ? ['in', 'rdhup'] : ['in']}] : vars.ready"
+          - if: "size(vars.ready) > 0"
+            then: [{return: {events: "= vars.ready.sortBy(e, e.fd).slice(0, math.least(vars.max, size(vars.ready)))"}}]
+          - set: {vars.left: "= vars.timeout < 0 ? -1 : vars.timeout - (now - vars.start)"}
+          - if: "vars.timeout >= 0 && vars.left <= 0"
+            title: Timed out with nothing ready
+            then: [{return: {events: []}}]
+          - call: kernel.block
+            input: {pid: "= input.pid", on: epoll, obj: "= vars.ep.value.id", timeout_ms: "= vars.left"}
+            as: b
+          - if: "vars.b.value.reason == 'signal'"
+            then: [{fail: {code: EINTR, message: interrupted system call, data: {errno: 4, sig: "= vars.b.value.sig"}}}]
+          - if: "vars.b.value.reason == 'killed'"
+            then: [{fail: {code: killed, message: the process was killed in epoll_wait}}]
+
+  # ---- futex --------------------------------------------------------------------------------
+  - component: kernel
+    name: atomic-store
+    kind: function
+    summary: >-
+      Not a syscall: a user-space atomic store to a futex word (what a mutex unlock or a
+      condition-variable signal does before FUTEX_WAKE). Words start at 0.
+    sources: ["https://man7.org/linux/man-pages/man7/futex.7.html"]
+    latency_ms: 0
+    request: {type: object, required: [pid, addr, value], properties: {pid: {$ref: Pid}, addr: {type: string, examples: ["0x1000"]}, value: {type: integer}}}
+    errors: [{code: ESRCH, summary: "model guard: the caller isn't a live process"}]
+    behavior:
+      - call: kernel.alive
+        input: {pid: "= input.pid"}
+      - transact:
+          - {table: words, op: put, key: "= input.addr", value: "= input.value"}
+      - return: {value: "= input.value"}
+
+  - component: kernel
+    name: futex-wait
+    kind: function
+    attributes: {syscall: futex, op: FUTEX_WAIT}
+    summary: >-
+      FUTEX_WAIT: if the word at addr still holds expected, sleep until a FUTEX_WAKE on addr, the
+      relative timeout (ETIMEDOUT), or a handled signal (EINTR); if it doesn't, fail EAGAIN at
+      once (the value changed between the user-space check and the call). Waiters queue in
+      arrival order.
+    sources: ["https://man7.org/linux/man-pages/man2/futex.2.html"]
+    latency_ms: 0
+    request: {type: object, required: [pid, addr, expected], properties: {pid: {$ref: Pid}, addr: {type: string, examples: ["0x1000"]}, expected: {type: integer}, timeout_ms: {type: integer, default: -1}}}
+    errors:
+      - {code: ESRCH, summary: "model guard: the caller isn't a live process"}
+      - {code: EAGAIN, summary: "errno 11: the word didn't hold expected"}
+      - {code: ETIMEDOUT, summary: "errno 110: the timeout passed before a wake"}
+      - {code: EINTR, summary: "errno 4"}
+      - {code: killed, summary: "the caller was killed while blocked"}
+    behavior:
+      - call: kernel.alive
+        input: {pid: "= input.pid"}
+      - set: {vars.v: "= input.addr in state.words ? state.words[input.addr] : 0"}
+      - if: "vars.v != input.expected"
+        then: [{fail: {code: EAGAIN, message: "= 'futex word is ' + string(vars.v)", data: {errno: 11, value: "= vars.v"}}}]
+      - call: kernel.block
+        input: {pid: "= input.pid", on: futex, addr: "= input.addr", timeout_ms: "= has(input.timeout_ms) ? input.timeout_ms : -1"}
+        as: b
+      - if: "vars.b.value.reason == 'timeout'"
+        then: [{fail: {code: ETIMEDOUT, message: connection timed out, data: {errno: 110}}}]
+      - if: "vars.b.value.reason == 'signal'"
+        then: [{fail: {code: EINTR, message: interrupted system call, data: {errno: 4, sig: "= vars.b.value.sig"}}}]
+      - if: "vars.b.value.reason == 'killed'"
+        then: [{fail: {code: killed, message: the process was killed in futex_wait}}]
+      - return: {woken: true, waited_ms: "= vars.b.value.elapsed_ms"}
+
+  - component: kernel
+    name: futex-wake
+    kind: function
+    attributes: {syscall: futex, op: FUTEX_WAKE}
+    summary: "FUTEX_WAKE: wake at most n waiters on addr, oldest first, and return how many were woken (0 when none wait)."
+    sources: ["https://man7.org/linux/man-pages/man2/futex.2.html"]
+    latency_ms: 0
+    request: {type: object, required: [pid, addr], properties: {pid: {$ref: Pid}, addr: {type: string, examples: ["0x1000"]}, n: {type: integer, default: 1}}}
+    response: {type: object, properties: {woken: {type: integer}, pids: {type: array, items: {type: integer}}}}
+    errors: [{code: ESRCH, summary: "model guard: the caller isn't a live process"}]
+    behavior:
+      - call: kernel.alive
+        input: {pid: "= input.pid"}
+      - set:
+          vars.waiters: "= state.procs.filter(p, state.procs[p].blocked.on != '' && state.procs[p].blocked.on == 'futex' && state.procs[p].blocked.addr == input.addr).sortBy(p, state.procs[p].blocked.seq)"
+      - set:
+          vars.take: "= vars.waiters.slice(0, math.least(has(input.n) ? input.n : 1, size(vars.waiters)))"
+      - foreach: "= vars.take"
+        as: q
+        title: Dequeued waiters wake
+        steps:
+          - transact:
+              - {table: procs, op: update, key: "= vars.q", value: "= {'blocked': {'on': '', 'obj': '', 'addr': '', 'seq': 0}}"}
+      - return: {woken: "= size(vars.take)", pids: "= vars.take.map(q, int(q))"}
+
+  # ---- nanosleep ----------------------------------------------------------------------------
+  - component: kernel
+    name: nanosleep
+    kind: function
+    attributes: {syscall: nanosleep}
+    summary: >-
+      Sleep for ms. A handled signal interrupts it: EINTR with data.remaining_ms, the time left
+      (what the rem argument receives). EINVAL for a negative duration.
+    sources: ["https://man7.org/linux/man-pages/man2/nanosleep.2.html"]
+    latency_ms: 0
+    request: {type: object, required: [pid, ms], properties: {pid: {$ref: Pid}, ms: {type: integer, examples: [1000]}}}
+    response: {type: object, properties: {slept_ms: {type: integer}}}
+    errors:
+      - {code: ESRCH, summary: "model guard: the caller isn't a live process"}
+      - {code: EINVAL, summary: "errno 22"}
+      - {code: EINTR, summary: "errno 4; data.remaining_ms is the unslept time"}
+      - {code: killed, summary: "the caller was killed while asleep"}
+    behavior:
+      - call: kernel.alive
+        input: {pid: "= input.pid"}
+      - if: "input.ms < 0"
+        then: [{fail: {code: EINVAL, message: invalid argument, data: {errno: 22}}}]
+      - if: "input.ms == 0"
+        then: [{return: {slept_ms: 0}}]
+      - call: kernel.block
+        input: {pid: "= input.pid", on: sleep, timeout_ms: "= input.ms"}
+        as: b
+      - if: "vars.b.value.reason == 'signal'"
+        then: [{fail: {code: EINTR, message: interrupted system call, data: {errno: 4, sig: "= vars.b.value.sig", remaining_ms: "= input.ms - vars.b.value.elapsed_ms"}}}]
+      - if: "vars.b.value.reason == 'killed'"
+        then: [{fail: {code: killed, message: the process was killed in nanosleep}}]
+      - return: {slept_ms: "= vars.b.value.elapsed_ms"}
+
+  # ---- Memory and the OOM killer --------------------------------------------------------------
+  - component: kernel
+    name: mem-touch
+    kind: function
+    attributes: {syscall: "mmap + page faults"}
+    summary: >-
+      The process faults in mb more of anonymous memory. When resident memory across the
+      processes exceeds linux-memory-limit-mb, the OOM killer runs: it SIGKILLs the eligible
+      process with the highest badness (resident share of the limit in thousandths plus
+      oom_score_adj; -1000 is never chosen; init is exempt), repeating until memory fits. A caller
+      that is itself chosen never returns from the fault: the call fails `killed`. ENOMEM when
+      nothing is eligible.
+    sources: ["https://docs.kernel.org/admin-guide/mm/concepts.html#oom-killer", "https://man7.org/linux/man-pages/man5/proc_pid_oom_score_adj.5.html", "https://man7.org/linux/man-pages/man2/mmap.2.html"]
+    latency_ms: 0
+    request: {type: object, required: [pid, mb], properties: {pid: {$ref: Pid}, mb: {type: integer, minimum: 0, examples: [512]}}}
+    response: {type: object, properties: {rss_mb: {type: integer}, oom_killed: {type: array, items: {type: integer}}}}
+    errors:
+      - {code: ESRCH, summary: "model guard: the caller isn't a live process"}
+      - {code: ENOMEM, summary: "errno 12: over the limit and nothing can be killed"}
+      - {code: killed, summary: "the OOM killer chose the caller"}
+    behavior:
+      - call: kernel.alive
+        input: {pid: "= input.pid"}
+      - transact:
+          - {table: procs, op: incr, key: "= string(input.pid)", value: {rss_mb: "= input.mb"}}
+      - set: {vars.killed: []}
+      - foreach: "= lists.range(20)"
+        as: round
+        steps:
+          - set:
+              vars.live: "= state.procs.filter(k, state.procs[k].state == 'running')"
+              vars.limit: "= config['linux-memory-limit-mb']"
+          - if: "sum(vars.live.map(k, state.procs[k].rss_mb)) <= vars.limit"
+            then: [{break: true}]
+          - set:
+              vars.cands: "= vars.live.filter(k, state.procs[k].pid != 1 && state.procs[k].oom_score_adj > -1000)"
+          - if: "size(vars.cands) == 0"
+            then: [{fail: {code: ENOMEM, message: out of memory and no killable process, data: {errno: 12}}}]
+          - set:
+              vars.victim: "= vars.cands.sortBy(k, -(state.procs[k].rss_mb * 1000 / vars.limit + state.procs[k].oom_score_adj))[0]"
+          - transact:
+              - table: procs
+                op: update
+                key: "= vars.victim"
+                value: {oom_killed: true}
+          - set:
+              state.oom_kills: "= state.oom_kills + [{'pid': state.procs[vars.victim].pid, 'rss_mb': state.procs[vars.victim].rss_mb, 'score': state.procs[vars.victim].rss_mb * 1000 / vars.limit + state.procs[vars.victim].oom_score_adj, 'at_ms': now}]"
+              vars.killed: "= vars.killed + [state.procs[vars.victim].pid]"
+            title: "Out of memory: Killed process"
+          - call: kernel.deliver-signal
+            input: {pid: "= state.procs[vars.victim].pid", sig: 9}
+      - if: "input.pid in vars.killed"
+        then: [{fail: {code: killed, message: the OOM killer chose the caller, data: {oom_killed: "= vars.killed"}}}]
+      - return: {rss_mb: "= state.procs[string(input.pid)].rss_mb", oom_killed: "= vars.killed"}
+
+  - component: kernel
+    name: mem-release
+    kind: function
+    attributes: {syscall: munmap}
+    summary: The process unmaps mb of anonymous memory (its resident memory can't go below 0).
+    sources: ["https://man7.org/linux/man-pages/man2/munmap.2.html"]
+    latency_ms: 0
+    request: {type: object, required: [pid, mb], properties: {pid: {$ref: Pid}, mb: {type: integer, minimum: 0}}}
+    errors: [{code: ESRCH, summary: "model guard: the caller isn't a live process"}]
+    behavior:
+      - call: kernel.alive
+        input: {pid: "= input.pid"}
+        as: me
+      - transact:
+          - {table: procs, op: update, key: "= string(input.pid)", value: {rss_mb: "= math.greatest(0, vars.me.value.rss_mb - input.mb)"}}
+      - return: {rss_mb: "= math.greatest(0, vars.me.value.rss_mb - input.mb)"}
+
+  - component: kernel
+    name: oom-score-adj
+    kind: function
+    attributes: {path: "/proc/<pid>/oom_score_adj"}
+    summary: Write /proc/<pid>/oom_score_adj, from -1000 (never OOM-killed) to 1000 (killed first). EINVAL outside that range. Inherited by fork.
+    sources: ["https://man7.org/linux/man-pages/man5/proc_pid_oom_score_adj.5.html"]
+    latency_ms: 0
+    request: {type: object, required: [pid, adj], properties: {pid: {$ref: Pid}, adj: {type: integer, examples: [500]}}}
+    errors:
+      - {code: ESRCH, summary: "model guard: the caller isn't a live process"}
+      - {code: EINVAL, summary: "errno 22: outside -1000..1000"}
+    behavior:
+      - call: kernel.alive
+        input: {pid: "= input.pid"}
+      - if: "input.adj < -1000 || input.adj > 1000"
+        then: [{fail: {code: EINVAL, message: invalid argument, data: {errno: 22}}}]
+      - transact:
+          - {table: procs, op: update, key: "= string(input.pid)", value: {oom_score_adj: "= input.adj"}}
+      - return: {adj: "= input.adj"}
+
+  - component: kernel
+    name: proc-status
+    kind: function
+    summary: Read a process's row (/proc/<pid>/status in spirit), live or zombie. ESRCH once it has been reaped or never existed.
+    sources: ["https://man7.org/linux/man-pages/man5/proc_pid_status.5.html"]
+    latency_ms: 0
+    request: {type: object, required: [pid], properties: {pid: {$ref: Pid}}}
+    errors: [{code: ESRCH, summary: "errno 3: no such process"}]
+    behavior:
+      - if: "!(string(input.pid) in state.procs)"
+        then: [{fail: {code: ESRCH, message: no such process, data: {errno: 3}}}]
+      - return: "= merge(state.procs[string(input.pid)], {'fds': state.fds.filter(k, state.fds[k].pid == input.pid).map(k, state.fds[k].fd).sortBy(f, f)})"

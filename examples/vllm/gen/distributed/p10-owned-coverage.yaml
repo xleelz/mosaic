@@ -1,0 +1,1273 @@
+# distributed area, part 10 (fix round 4, owner-ranked coverage): the KV event aggregator and
+# event types, GroupCoordinator barrier/gather/graph capture, world-group teardown, the
+# StatelessProcessGroup metadata store, the EC connector base and CPU scheduler with its shared
+# mmap region, MultiConnector and HiSparseConnector, and the RL trainer's weight-sync round trip.
+schema_version: 1
+id: vllm
+
+schemas:
+  - id: DistKvCacheEvent
+    summary: "A KV cache event as the publisher batches it: BlockStored (block hashes, parent hash, token ids, block size, medium, group, spec kind) or BlockRemoved (block hashes, medium, group); its identity is its hashed fields (BlockStored vllm/distributed/kv_events.py:56-113, BlockRemoved vllm/distributed/kv_events.py:116-134)."
+    schema:
+      type: object
+      required: [type]
+      properties:
+        type: {type: string, enum: [BlockStored, BlockRemoved, AllBlocksCleared], examples: [BlockStored]}
+        block_hashes: {type: array, items: {type: string}}
+        parent_block_hash: {type: [string, "null"], default: null}
+        token_ids: {type: array, items: {type: integer}}
+        block_size: {type: integer}
+        medium: {type: [string, "null"], default: null}
+        group_idx: {type: [integer, "null"], default: null}
+
+components:
+  - id: kv-event-aggregator
+    name: KVEventAggregator
+    kind: module
+    layer: kv-events
+    parent: engine-core
+    capacity: {concurrency: 1}   # owned by the connector's KVConnectorKVEvents on the engine-core thread that aggregates worker outputs (kv_connector/utils.py:154-165)
+    summary: "Counts each KV cache event across the workers' batches and keeps only the events every worker emitted (the events a connector reports back with its output)."
+    sources: ["vllm/distributed/kv_events.py:145-157", "vllm/distributed/kv_events.py:227-262"]
+    state:
+      schema: {type: object, properties: {num_workers: {type: integer}, counter: {type: object}, events: {type: object}}}
+      initial: {num_workers: 1, counter: {}, events: {}}
+  - id: stateless-process-group
+    name: StatelessProcessGroup
+    kind: module
+    layer: distributed
+    parent: gpu-worker
+    capacity: {concurrency: 1}   # a per-process dataclass with plain-dict counters, used by the one thread that set up the group (utils.py:195-222)
+    summary: "Metadata-only process group over a shared TCPStore: point-to-point objects under send_to/<dst>/<n> and broadcasts under broadcast_from/<src>/<n>, each side keeping its own counters."
+    sources: ["vllm/distributed/utils.py:195-222"]
+    state:
+      schema: {type: object, properties: {send_dst_counter: {type: object}, recv_src_counter: {type: object}, broadcast_send_counter: {type: integer}, broadcast_recv_src_counter: {type: object}}}
+      initial: {send_dst_counter: {}, recv_src_counter: {}, broadcast_send_counter: 0, broadcast_recv_src_counter: {}}
+  - id: stateless-tcp-store
+    name: torch TCPStore (metadata store)
+    kind: datastore
+    layer: distributed
+    parent: engine-core
+    summary: "The key-value store a StatelessProcessGroup's ranks share (one per group; the rank-0 process hosts it)."
+    sources: ["vllm/distributed/utils.py:465-510"]
+    state:
+      schema: {type: object, properties: {keys: {type: object}}}
+      initial: {keys: {}}
+  - id: ec-connector-base
+    name: ECConnectorBase
+    kind: module
+    layer: ec-transfer
+    parent: gpu-worker
+    summary: "The encoder-cache connector base: role (SCHEDULER or WORKER) and producer/consumer from ec_transfer_config; save_caches is the worker hook after the encoder runs (ECExampleConnector writes a safetensors file per mm_hash on producers)."
+    sources: ["vllm/distributed/ec_transfer/ec_connector/base.py:49-54", "vllm/distributed/ec_transfer/ec_connector/base.py:83-108"]
+    state:
+      schema: {type: object, properties: {role: {type: [string, "null"]}, is_producer: {type: boolean}, is_consumer: {type: boolean}, saved: {type: array}}}
+      initial: {role: null, is_producer: false, is_consumer: false, saved: []}
+  - id: ec-shared-region
+    name: ECSharedRegion
+    kind: module
+    layer: ec-transfer
+    parent: gpu-worker
+    capacity: {concurrency: 1}   # lifecycle methods with no concurrent access (ec_shared_region.py:163-164)
+    summary: "Flat mmap of /dev/shm/vllm_ec_<engine_id>.mmap that all TP workers map: the first process creates and sizes it (and unlinks it at cleanup), the others open it once it has its full size; each process pins it for DMA."
+    sources: ["vllm/distributed/ec_transfer/ec_connector/cpu/ec_shared_region.py:68-80"]
+    state:
+      schema: {type: object, properties: {path: {type: [string, "null"]}, is_creator: {type: boolean}, is_pinned: {type: boolean}, mapped: {type: boolean}}}
+      initial: {path: null, is_creator: false, is_pinned: false, mapped: false}
+  - id: dev-shm-files
+    name: /dev/shm (node tmpfs)
+    kind: datastore
+    layer: ec-transfer
+    parent: engine-core
+    summary: "The node's tmpfs: files by path with their size; O_CREAT|O_EXCL creation fails when the path exists."
+    sources: ["vllm/distributed/ec_transfer/ec_connector/cpu/ec_shared_region.py:99-104"]
+    state:
+      schema: {type: object, properties: {files: {type: object}}}
+      initial: {files: {}}
+  - id: ec-cpu-scheduler
+    name: ECCPUScheduler
+    kind: module
+    layer: ec-transfer
+    parent: engine-core
+    capacity: {concurrency: 1}   # the scheduler-role EC connector runs on the engine-core busy-loop thread (cpu/scheduler/__init__.py:50-53)
+    summary: "Scheduler side of the CPU EC connector: producers allocate shared-region blocks for each new encoder output and queue a save; consumers queue a load of a ready entry; build_connector_meta hands the step's saves and loads to the workers."
+    sources: ["vllm/distributed/ec_transfer/ec_connector/cpu/scheduler/__init__.py:50-124"]
+    state:
+      schema: {type: object, properties: {is_producer: {type: boolean}, is_consumer: {type: boolean}, nixl_enabled: {type: boolean}, block_size_bytes: {type: integer}, dtype_itemsize: {type: integer}, pending_saves: {type: object}, pending_loads: {type: object}, next_transfer_id: {type: integer}, load_acks: {type: object}, expected_load_reports: {type: integer}}}
+      initial: {is_producer: true, is_consumer: false, nixl_enabled: false, block_size_bytes: 1048576, dtype_itemsize: 2, pending_saves: {}, pending_loads: {}, next_transfer_id: 0, load_acks: {}, expected_load_reports: 1}
+  - id: multi-connector
+    name: MultiConnector
+    kind: module
+    layer: kv-transfer
+    parent: engine-core
+    capacity: {concurrency: 1}   # the scheduler-role connector runs on the engine-core busy-loop thread
+    summary: "Wraps several KV connectors: loads from the first child that reports matched tokens (in config order) and saves to all; the step metadata is the tuple of every child's metadata."
+    sources: ["vllm/distributed/kv_transfer/kv_connector/v1/multi_connector.py:135-142", "vllm/distributed/kv_transfer/kv_connector/v1/multi_connector.py:174-211"]
+    state:
+      schema: {type: object, properties: {connectors: {type: array, items: {type: string}}, requests_to_connector: {type: object}, extra_async_saves: {type: object}}}
+      initial: {connectors: [], requests_to_connector: {}, extra_async_saves: {}}
+  - id: hisparse-connector
+    name: HiSparseConnector
+    kind: module
+    layer: kv-transfer
+    parent: engine-core
+    summary: "Joins the HiSparse scheduler coordinator to the worker's host-pool transfer engine. It never supplies prefix tokens itself (0 matched); it records allocated requests and needs a HiSparse host pool and the BLHNC layout."
+    sources: ["vllm/distributed/kv_transfer/kv_connector/v1/hisparse/connector.py:221-264"]
+    state:
+      schema: {type: object, properties: {initialized: {type: boolean}, requests: {type: array}}}
+      initial: {initialized: false, requests: []}
+  - id: weight-transfer-trainer-factory
+    name: WeightTransferTrainerFactory
+    kind: module
+    layer: weight-transfer
+    parent: python-user
+    summary: "Trainer-side registry of weight-transfer engines (nccl, ipc, sparse_nccl, sharded_rdt, m2n); trainer_init builds the engine named by init_info.backend and runs its rendezvous."
+    sources: ["vllm/distributed/weight_transfer/factory.py:124-135", "vllm/distributed/weight_transfer/factory.py:258-288"]
+    state:
+      schema: {type: object, properties: {registry: {type: array, items: {type: string}}}}
+      initial: {registry: [nccl, ipc, sparse_nccl, sharded_rdt, nccl_m2n]}
+  - id: nccl-trainer-weight-transfer-engine
+    name: NCCLTrainerWeightTransferEngine
+    kind: module
+    layer: weight-transfer
+    parent: python-user
+    summary: "Trainer-side NCCL engine: the sender rank (rank 0) drives the round trip through the weight-sync client and broadcasts the parameters; other ranks only replay the source iteration to stay in the collective."
+    sources: ["vllm/distributed/weight_transfer/nccl_engine.py:318-372"]
+    state:
+      schema: {type: object, properties: {is_sender: {type: boolean}, rounds: {type: integer}}}
+      initial: {is_sender: true, rounds: 0}
+  - id: vllm-weight-sync-client
+    name: HTTPVLLMWeightSyncClient
+    kind: module
+    layer: weight-transfer
+    parent: python-user
+    summary: "The trainer's control-plane client of the vLLM server's RLHF routes (/start_weight_update, /update_weights, /finish_weight_update); the modeled client records the POSTs it makes and the weight version it finishes with."
+    sources: ["vllm/distributed/weight_transfer/clients.py:58-97", "vllm/distributed/weight_transfer/base.py:522-546"]
+    state:
+      schema: {type: object, properties: {posts: {type: array}, weight_version: {type: [string, "null"]}}}
+      initial: {posts: [], weight_version: null}
+  - id: nccl-weight-transfer-engine
+    name: NCCLWeightTransferEngine (worker side)
+    kind: module
+    layer: weight-transfer
+    parent: gpu-worker
+    summary: "Worker-side NCCL engine: start_weight_update begins layerwise reloading, finish_weight_update finalizes it (WeightTransferEngine's update hooks)."
+    sources: ["vllm/distributed/weight_transfer/nccl_engine.py:159-173", "vllm/distributed/weight_transfer/base.py:472-489"]
+    state:
+      schema: {type: object, properties: {reloading: {type: boolean}, updates_finished: {type: integer}}}
+      initial: {reloading: false, updates_finished: 0}
+
+interfaces:
+  # ---------------------------------------------------------------- KV event aggregation
+  - component: kv-event-aggregator
+    name: init
+    kind: function
+    summary: "KVEventAggregator(num_workers): an empty counter; num_workers must be positive."
+    sources: ["vllm/distributed/kv_events.py:153-157"]
+    request: {type: object, required: [num_workers], properties: {num_workers: {type: integer, examples: [2]}}}
+    response: {type: object, properties: {num_workers: {type: integer}}}
+    errors:
+      - {code: value-error, status: 0, retryable: false}
+    behavior:
+      - if: "input.num_workers <= 0"
+        then:
+          - source: "vllm/distributed/kv_events.py:154-155"
+            fail: {code: value-error, status: 0, message: "num_workers must be greater than zero."}
+      - set: {state.num_workers: "= input.num_workers", state.counter: {}, state.events: {}}
+      - return: {num_workers: "= input.num_workers"}
+
+  - component: kv-event-aggregator
+    name: add-events
+    kind: function
+    summary: "add_events: count one worker's events (Counter.update keyed by each event's hashed fields)."
+    sources: ["vllm/distributed/kv_events.py:159-168", "vllm/distributed/kv_events.py:98-113", "vllm/distributed/kv_events.py:124-134"]
+    request: {type: object, required: [events], properties: {events: {type: array, items: DistKvCacheEvent}}}
+    response: {type: object, properties: {distinct: {type: integer}}}
+    behavior:
+      - foreach: "= input.events"
+        as: ev
+        steps:
+          - set: {vars.k: "= json(vars.ev)"}
+          - source: "vllm/distributed/kv_events.py:168"
+            set:
+              state.counter: "= merge(state.counter, {vars.k: (vars.k in state.counter ? state.counter[vars.k] : 0) + 1})"
+              state.events: "= merge(state.events, {vars.k: vars.ev})"
+      - return: {distinct: "= size(state.counter)"}
+
+  - component: kv-event-aggregator
+    name: get-common-events
+    kind: function
+    summary: "get_common_events: the events whose count equals the number of workers, i.e. every worker emitted them."
+    sources: ["vllm/distributed/kv_events.py:170-181", "vllm/distributed/kv_events.py:236-238"]
+    request: {type: object, properties: {}}
+    response: {type: array, items: DistKvCacheEvent}
+    behavior:
+      - if: "size(state.counter) == 0"
+        then:
+          - return: []
+      - source: "vllm/distributed/kv_events.py:177-181"
+        return: "= state.counter.filter(k, state.counter[k] == state.num_workers).map(k, state.events[k])"
+
+  - component: kv-event-aggregator
+    name: increment-workers
+    kind: function
+    summary: "increment_workers: add contributing workers (the count must be positive); clear_events empties the counter."
+    sources: ["vllm/distributed/kv_events.py:196-205", "vllm/distributed/kv_events.py:192-194"]
+    request: {type: object, properties: {count: {type: integer, default: 1}, clear: {type: boolean, default: false}}}
+    response: {type: object, properties: {num_workers: {type: integer}}}
+    errors:
+      - {code: value-error, status: 0, retryable: false}
+    behavior:
+      - if: "input.clear"
+        then:
+          - source: "vllm/distributed/kv_events.py:192-194"
+            set: {state.counter: {}, state.events: {}}
+          - return: {num_workers: "= state.num_workers"}
+      - if: "input.count <= 0"
+        then:
+          - source: "vllm/distributed/kv_events.py:203-204"
+            fail: {code: value-error, status: 0, message: "count must be positive."}
+      - set: {state.num_workers: "= state.num_workers + input.count"}
+      - return: {num_workers: "= state.num_workers"}
+
+  # ---------------------------------------------------------------- GroupCoordinator extras
+  - component: group-coordinator
+    name: barrier
+    kind: function
+    summary: "GroupCoordinator.barrier: torch.distributed.barrier on the group's CPU (gloo) group; every rank of the group must arrive."
+    sources: ["vllm/distributed/parallel_state.py:1370-1377"]
+    request: {type: object, properties: {group_name: {type: string, default: "tp:0"}, world_size: {type: integer, examples: [4]}}}
+    response: {type: object, properties: {arrived: {type: integer}}}
+    errors:
+      - {code: dist-backend-error, status: 0, retryable: false}
+    behavior:
+      - source: "vllm/distributed/parallel_state.py:1377"
+        rendezvous: "= 'barrier:' + input.group_name"
+        count: "= input.world_size"
+        value: "= self"
+        timeout_ms: "= !('distributed-timeout-seconds' in config) || config['distributed-timeout-seconds'] == null ? 600000 : config['distributed-timeout-seconds'] * 1000"
+        as: meet
+        on_error:
+          - fail: {code: dist-backend-error, status: 0, message: "= 'barrier timed out: ' + string(error.data.arrived) + ' of ' + string(error.data.count) + ' ranks arrived'"}
+      - return: {arrived: "= vars.meet.count"}
+
+  - component: group-coordinator
+    name: gather
+    kind: function
+    summary: "GroupCoordinator.gather: at world size 1 return the input; without a device communicator raise; otherwise every rank contributes and only the dst rank receives the concatenation in rank order (None elsewhere)."
+    sources: ["vllm/distributed/parallel_state.py:824-837"]
+    request:
+      type: object
+      required: [value, world_size]
+      properties:
+        value: {type: array, examples: [[1, 2]]}
+        world_size: {type: integer, examples: [2]}
+        dst: {type: integer, default: 0}
+        has_device_communicator: {type: boolean, default: true}
+    response: {type: [array, "null"]}
+    errors:
+      - {code: value-error, status: 0, retryable: false}
+      - {code: dist-backend-error, status: 0, retryable: false}
+    behavior:
+      - if: "input.world_size == 1"
+        then:
+          - title: Bypass at world size 1
+            source: "vllm/distributed/parallel_state.py:832-834"
+            return: "= input.value"
+      - if: "!input.has_device_communicator"
+        then:
+          - source: "vllm/distributed/parallel_state.py:835-836"
+            fail: {code: value-error, status: 0, message: "No device communicator found"}
+      - set: {vars.me: "= int(self.replace('rank', '')) % input.world_size"}
+      - source: "vllm/distributed/parallel_state.py:837"
+        rendezvous: "gather:tp"
+        count: "= input.world_size"
+        value: {rank: "= vars.me", v: "= input.value"}
+        timeout_ms: "= !('distributed-timeout-seconds' in config) || config['distributed-timeout-seconds'] == null ? 600000 : config['distributed-timeout-seconds'] * 1000"
+        as: meet
+        on_error:
+          - fail: {code: dist-backend-error, status: 0, message: "gather timed out"}
+      - if: "vars.me != input.dst"
+        then:
+          - return: null
+      - return: "= lists.range(input.world_size).map(i, vars.meet.values.filter(x, x.rank == i)[0].v).flatten()"
+
+  - component: group-coordinator
+    name: graph-capture
+    kind: function
+    summary: "GroupCoordinator.graph_capture (context manager, entered then exited): on the side stream, enter the custom all-reduce's capture context so collectives use registered buffers; on exit that context registers the graph's buffers."
+    sources: ["vllm/distributed/parallel_state.py:672-722"]
+    request: {type: object, required: [phase], properties: {phase: {type: string, enum: [enter, exit], examples: [enter]}}}
+    response: {type: object, properties: {capturing: {type: boolean}}}
+    behavior:
+      - title: "ca_comm.capture() (the custom all-reduce of the group's CudaCommunicator)"
+        source: "vllm/distributed/parallel_state.py:697-699"
+        call: custom-allreduce.capture
+        input: {phase: "= input.phase"}
+        as: c
+      - return: {capturing: "= vars.c.value.capturing"}
+
+  - component: custom-allreduce
+    name: capture
+    kind: function
+    summary: "CustomAllreduce.capture: while capturing, all-reduces use the registered (graph) buffer in place; on exit, unless disabled, register the graph buffers' IPC handles with every rank."
+    sources: ["vllm/distributed/device_communicators/custom_all_reduce.py:467-478"]
+    request: {type: object, required: [phase], properties: {phase: {type: string, enum: [enter, exit]}}}
+    response: {type: object, properties: {capturing: {type: boolean}, registered_graph_buffers: {type: boolean}}}
+    behavior:
+      - if: "input.phase == 'enter'"
+        then:
+          - source: "vllm/distributed/device_communicators/custom_all_reduce.py:473"
+            set: {state.capturing: true}
+          - return: {capturing: true, registered_graph_buffers: false}
+      - source: "vllm/distributed/device_communicators/custom_all_reduce.py:476-478"
+        set: {state.capturing: false}
+      - return: {capturing: false, registered_graph_buffers: "= !state.disabled"}
+
+  - component: parallel-state
+    name: graph-capture
+    kind: function
+    summary: "graph_capture(device): one GraphCaptureContext on a new stream, entering (or exiting) the TP, PP and DP groups' graph_capture contexts."
+    sources: ["vllm/distributed/parallel_state.py:1683-1703"]
+    request: {type: object, required: [phase], properties: {phase: {type: string, enum: [enter, exit], examples: [enter]}}}
+    response: {type: object, properties: {capturing: {type: boolean}}}
+    errors:
+      - {code: assertion-error, status: 0, retryable: false}
+    behavior:
+      - call: parallel-state.get-tp-group
+        as: tp
+      - title: "get_tp_group().graph_capture(context) (the PP and DP groups have no custom all-reduce here)"
+        source: "vllm/distributed/parallel_state.py:1698-1702"
+        call: group-coordinator.graph-capture
+        input: {phase: "= input.phase"}
+        as: g
+      - return: {capturing: "= vars.g.value.capturing"}
+
+  - component: parallel-state
+    name: get-world-group
+    kind: function
+    summary: "get_world_group: the world GroupCoordinator; asserts it was initialized."
+    sources: ["vllm/distributed/parallel_state.py:1492-1494"]
+    request: {type: object, properties: {}}
+    response: {type: object, properties: {world_size: {type: integer}, backend: {type: string}}}
+    errors:
+      - {code: assertion-error, status: 0, retryable: false}
+    behavior:
+      - if: "!state.world_initialized"
+        then:
+          - source: "vllm/distributed/parallel_state.py:1493"
+            fail: {code: assertion-error, status: 0, message: "world group is not initialized"}
+      - return: {world_size: "= state.world_size", backend: "= state.backend"}
+
+  - component: parallel-state
+    name: cleanup-dist-env-and-memory
+    kind: function
+    summary: "cleanup_dist_env_and_memory: destroy the model-parallel groups, then the world group and torch's default process group (destroy_distributed_environment); optionally shut Ray down; then free cached device memory."
+    sources: ["vllm/distributed/parallel_state.py:2516-2561", "vllm/distributed/parallel_state.py:2506-2513"]
+    request: {type: object, properties: {shutdown_ray: {type: boolean, default: false}}}
+    response: {type: object, properties: {destroyed: {type: array}, ray_shutdown: {type: boolean}}}
+    behavior:
+      - source: "vllm/distributed/parallel_state.py:2537"
+        call: parallel-state.destroy-model-parallel
+        as: d
+      - title: "destroy_distributed_environment: drop _WORLD and destroy torch's process group"
+        source: "vllm/distributed/parallel_state.py:2506-2513"
+        set:
+          state.world_initialized: false
+          state.groups: {}
+      - return: {destroyed: "= vars.d.value.destroyed", ray_shutdown: "= input.shutdown_ray"}
+
+  # ---------------------------------------------------------------- StatelessProcessGroup
+  - component: stateless-process-group
+    name: send-obj
+    kind: function
+    summary: "send_obj: store the object under send_to/<dst>/<n> (n is this rank's per-dst send counter) and count it."
+    sources: ["vllm/distributed/utils.py:224-230"]
+    request: {type: object, required: [obj, dst], properties: {obj: {}, dst: {type: integer, examples: [1]}}}
+    response: {type: object, properties: {key: {type: string}}}
+    behavior:
+      - set:
+          vars.n: "= string(input.dst) in state.send_dst_counter ? state.send_dst_counter[string(input.dst)] : 0"
+      - set: {vars.key: "= 'send_to/' + string(input.dst) + '/' + string(vars.n)"}
+      - call: stateless-tcp-store.set
+        input: {key: "= vars.key", value: "= input.obj"}
+      - set: {state.send_dst_counter: "= merge(state.send_dst_counter, {string(input.dst): vars.n + 1})"}
+      - return: {key: "= vars.key"}
+
+  - component: stateless-process-group
+    name: recv-obj
+    kind: function
+    summary: "recv_obj: read send_to/<this rank>/<n> where n is the receive counter of src (the store's get blocks until the key appears; a key that never appears times out), and count it."
+    sources: ["vllm/distributed/utils.py:243-249"]
+    request: {type: object, required: [src, world_size], properties: {src: {type: integer, examples: [0]}, world_size: {type: integer, examples: [2]}}}
+    response: {}
+    errors:
+      - {code: dist-store-error, status: 0, retryable: false}
+    behavior:
+      - set:
+          vars.me: "= int(self.replace('rank', '')) % input.world_size"
+          vars.n: "= string(input.src) in state.recv_src_counter ? state.recv_src_counter[string(input.src)] : 0"
+      - call: stateless-tcp-store.get
+        input: {key: "= 'send_to/' + string(vars.me) + '/' + string(vars.n)"}
+        as: v
+        on_error:
+          - source: "vllm/distributed/utils.py:245-247"
+            fail: {code: dist-store-error, status: 0, message: "= 'store get timed out: send_to/' + string(vars.me) + '/' + string(vars.n)"}
+      - set: {state.recv_src_counter: "= merge(state.recv_src_counter, {string(input.src): vars.n + 1})"}
+      - return: "= vars.v.value.value"
+
+  - component: stateless-process-group
+    name: broadcast-obj
+    kind: function
+    summary: "broadcast_obj: the src rank stores the object under broadcast_from/<src>/<n> and returns it; other ranks read the next key of that src."
+    sources: ["vllm/distributed/utils.py:251-267"]
+    request: {type: object, required: [src, world_size], properties: {obj: {default: null}, src: {type: integer, examples: [0]}, world_size: {type: integer, examples: [2]}}}
+    response: {}
+    errors:
+      - {code: dist-store-error, status: 0, retryable: false}
+    behavior:
+      - set: {vars.me: "= int(self.replace('rank', '')) % input.world_size"}
+      - if: "vars.me == input.src"
+        then:
+          - set: {vars.key: "= 'broadcast_from/' + string(input.src) + '/' + string(state.broadcast_send_counter)"}
+          - source: "vllm/distributed/utils.py:256-262"
+            call: stateless-tcp-store.set
+            input: {key: "= vars.key", value: "= input.obj"}
+          - set: {state.broadcast_send_counter: "= state.broadcast_send_counter + 1"}
+          - return: "= input.obj"
+      - set:
+          vars.n: "= string(input.src) in state.broadcast_recv_src_counter ? state.broadcast_recv_src_counter[string(input.src)] : 0"
+      - source: "vllm/distributed/utils.py:263-267"
+        call: stateless-tcp-store.get
+        input: {key: "= 'broadcast_from/' + string(input.src) + '/' + string(vars.n)"}
+        as: v
+        on_error:
+          - fail: {code: dist-store-error, status: 0, message: "store get timed out"}
+      - set: {state.broadcast_recv_src_counter: "= merge(state.broadcast_recv_src_counter, {string(input.src): vars.n + 1})"}
+      - return: "= vars.v.value.value"
+
+  - component: stateless-tcp-store
+    name: set
+    kind: io
+    summary: "store.set(key, pickle.dumps(obj))"
+    sources: ["vllm/distributed/utils.py:228"]
+    request: {type: object, required: [key, value], properties: {key: {type: string}, value: {}}}
+    store: {table: keys, op: put, key: "= input.key", value: "= {'value': input.value}"}
+
+  - component: stateless-tcp-store
+    name: get
+    kind: io
+    summary: "store.get(key) (the real store waits for the key until its timeout)."
+    sources: ["vllm/distributed/utils.py:245-247"]
+    request: {type: object, required: [key], properties: {key: {type: string}}}
+    errors:
+      - {code: not_found, status: 404, retryable: false}
+    store: {table: keys, op: get, key: "= input.key"}
+
+  # ---------------------------------------------------------------- EC connector base and CPU scheduler
+  - component: ec-connector-base
+    name: init
+    kind: function
+    summary: "ECConnectorBase.__init__: record the role (ECConnectorRole SCHEDULER or WORKER) and producer/consumer from ec_transfer_config; without one, ValueError."
+    sources: ["vllm/distributed/ec_transfer/ec_connector/base.py:84-92", "vllm/distributed/ec_transfer/ec_connector/base.py:49-54"]
+    request:
+      type: object
+      required: [role]
+      properties:
+        role: {type: string, enum: [SCHEDULER, WORKER], examples: [WORKER]}
+        ec_role: {type: [string, "null"], enum: [ec_producer, ec_consumer, ec_both, null], default: ec_producer}
+    response: {type: object, properties: {role: {type: string}, is_producer: {type: boolean}, is_consumer: {type: boolean}}}
+    errors:
+      - {code: value-error, status: 0, retryable: false}
+    behavior:
+      - if: "input.ec_role == null"
+        then:
+          - source: "vllm/distributed/ec_transfer/ec_connector/base.py:91-92"
+            fail: {code: value-error, status: 0, message: "ec_transfer_config must be set for ECConnectorBase"}
+      - source: "vllm/distributed/ec_transfer/ec_connector/base.py:86-90"
+        set:
+          state.role: "= input.role"
+          state.is_producer: "= input.ec_role in ['ec_producer', 'ec_both']"
+          state.is_consumer: "= input.ec_role in ['ec_consumer', 'ec_both']"
+      - return: {role: "= state.role", is_producer: "= state.is_producer", is_consumer: "= state.is_consumer"}
+
+  - component: ec-connector-base
+    name: is-producer
+    kind: function
+    summary: "The is_producer property (and is_consumer)."
+    sources: ["vllm/distributed/ec_transfer/ec_connector/base.py:98-104"]
+    request: {type: object, properties: {}}
+    response: {type: object, properties: {is_producer: {type: boolean}, is_consumer: {type: boolean}}}
+    behavior:
+      - return: {is_producer: "= state.is_producer", is_consumer: "= state.is_consumer"}
+
+  - component: ec-connector-base
+    name: save-caches
+    kind: function
+    summary: "save_caches (ECExampleConnector): a consumer-only instance returns; a producer saves encoder_cache[mm_hash] to its safetensors file; an mm_hash missing from the cache is a KeyError."
+    sources: ["vllm/distributed/ec_transfer/ec_connector/base.py:182-198", "vllm/distributed/ec_transfer/ec_connector/example_connector.py:110-131"]
+    attributes: {seam: true, callers: [worker-runner]}
+    request: {type: object, required: [encoder_cache, mm_hash], properties: {encoder_cache: {type: object}, mm_hash: {type: string, examples: [mm-a]}}}
+    response: {type: object, properties: {saved: {type: boolean}}}
+    errors:
+      - {code: key-error, status: 0, retryable: false}
+    behavior:
+      - if: "!state.is_producer"
+        then:
+          - title: Not a producer (PD instance); nothing to save
+            source: "vllm/distributed/ec_transfer/ec_connector/example_connector.py:123-125"
+            return: {saved: false}
+      - if: "!(input.mm_hash in input.encoder_cache)"
+        then:
+          - source: "vllm/distributed/ec_transfer/ec_connector/example_connector.py:127"
+            fail: {code: key-error, status: 0, message: "= input.mm_hash"}
+      - source: "vllm/distributed/ec_transfer/ec_connector/example_connector.py:126-131"
+        set: {state.saved: "= state.saved + [input.mm_hash]"}
+      - return: {saved: true}
+
+  - component: ec-shared-region
+    name: init
+    kind: function
+    summary: "ECSharedRegion.__init__: create /dev/shm/vllm_ec_<engine_id>.mmap exclusively and size it (this process becomes its creator), or, if it exists, open it once it reaches the full size (else TimeoutError); then map it."
+    sources: ["vllm/distributed/ec_transfer/ec_connector/cpu/ec_shared_region.py:82-139", "vllm/distributed/ec_transfer/ec_connector/cpu/ec_shared_region.py:55-66"]
+    request:
+      type: object
+      required: [engine_id, num_blocks, block_size_bytes]
+      properties:
+        engine_id: {type: string, examples: [engine-0]}
+        num_blocks: {type: integer, examples: [8]}
+        block_size_bytes: {type: integer, examples: [1048576]}
+    response: {type: object, properties: {path: {type: string}, is_creator: {type: boolean}}}
+    errors:
+      - {code: timeout-error, status: 0, retryable: false}
+    behavior:
+      - set:
+          vars.path: "= '/dev/shm/vllm_ec_' + input.engine_id + '.mmap'"
+          vars.size: "= input.num_blocks * input.block_size_bytes"
+      - title: "os.open(O_CREAT | O_EXCL) and ftruncate to the full size"
+        source: "vllm/distributed/ec_transfer/ec_connector/cpu/ec_shared_region.py:99-110"
+        call: dev-shm-files.create
+        input: {path: "= vars.path", size: "= vars.size"}
+        as: cr
+        on_error: continue
+      - if: "!vars.cr.ok"
+        then:
+          - title: "FileExistsError: open the existing file and wait for its full size"
+            source: "vllm/distributed/ec_transfer/ec_connector/cpu/ec_shared_region.py:111-119"
+            call: dev-shm-files.stat
+            input: {path: "= vars.path"}
+            as: st
+          - if: "vars.st.value.size < vars.size"
+            then:
+              - source: "vllm/distributed/ec_transfer/ec_connector/cpu/ec_shared_region.py:61-64"
+                fail: {code: timeout-error, status: 0, message: "= 'Timed out waiting for EC mmap file to reach ' + string(vars.size) + ' bytes'"}
+      - source: "vllm/distributed/ec_transfer/ec_connector/cpu/ec_shared_region.py:121-139"
+        set: {state.path: "= vars.path", state.is_creator: "= vars.cr.ok", state.mapped: true}
+      - return: {path: "= vars.path", is_creator: "= vars.cr.ok"}
+
+  - component: ec-shared-region
+    name: pin-memory
+    kind: function
+    summary: "pin_memory: cudaHostRegister the whole mapping once per process (no-op when already pinned or without CUDA)."
+    sources: ["vllm/distributed/ec_transfer/ec_connector/cpu/ec_shared_region.py:141-161"]
+    request: {type: object, properties: {cuda_available: {type: boolean, default: true}}}
+    response: {type: object, properties: {pinned: {type: boolean}}}
+    behavior:
+      - if: "state.is_pinned || !input.cuda_available"
+        then:
+          - source: "vllm/distributed/ec_transfer/ec_connector/cpu/ec_shared_region.py:148-149"
+            return: {pinned: "= state.is_pinned"}
+      - source: "vllm/distributed/ec_transfer/ec_connector/cpu/ec_shared_region.py:150-161"
+        set: {state.is_pinned: true}
+      - return: {pinned: true}
+
+  - component: ec-shared-region
+    name: cleanup
+    kind: function
+    summary: "ECSharedRegion.cleanup: the creator unlinks the file; a pinned mapping is unregistered; the mapping and fd are closed."
+    sources: ["vllm/distributed/ec_transfer/ec_connector/cpu/ec_shared_region.py:163-193"]
+    request: {type: object, properties: {}}
+    response: {type: object, properties: {unlinked: {type: boolean}}}
+    behavior:
+      - set: {vars.unlinked: false}
+      - if: "state.is_creator"
+        then:
+          - set: {vars.unlinked: true, state.is_creator: false}
+          - source: "vllm/distributed/ec_transfer/ec_connector/cpu/ec_shared_region.py:166-173"
+            call: dev-shm-files.unlink
+            input: {path: "= state.path"}
+            on_error: continue
+      - source: "vllm/distributed/ec_transfer/ec_connector/cpu/ec_shared_region.py:174-193"
+        set: {state.is_pinned: false, state.mapped: false}
+      - return: {unlinked: "= vars.unlinked"}
+
+  - component: dev-shm-files
+    name: create
+    kind: io
+    summary: "os.open(path, O_CREAT | O_EXCL) + ftruncate: fails with FileExistsError when the path exists."
+    sources: ["vllm/distributed/ec_transfer/ec_connector/cpu/ec_shared_region.py:99-104"]
+    request: {type: object, required: [path, size], properties: {path: {type: string}, size: {type: integer}}}
+    errors:
+      - {code: file-exists-error, status: 0, retryable: false}
+    store: {table: files, op: put, key: "= input.path", value: "= {'size': input.size}", where: "row == null", conflict: file-exists-error}
+
+  - component: dev-shm-files
+    name: stat
+    kind: io
+    summary: "The existing file's size (os.fstat in _wait_for_file_size)."
+    sources: ["vllm/distributed/ec_transfer/ec_connector/cpu/ec_shared_region.py:55-60"]
+    request: {type: object, required: [path], properties: {path: {type: string}}}
+    errors:
+      - {code: not_found, status: 404, retryable: false}
+    store: {table: files, op: get, key: "= input.path"}
+
+  - component: dev-shm-files
+    name: unlink
+    kind: io
+    summary: "os.unlink(path)"
+    sources: ["vllm/distributed/ec_transfer/ec_connector/cpu/ec_shared_region.py:168"]
+    request: {type: object, required: [path], properties: {path: {type: string}}}
+    store: {table: files, op: delete, key: "= input.path"}
+
+  - component: ec-cpu-scheduler
+    name: has-cache-item
+    kind: function
+    summary: "has_cache_item: only a consumer reports cached items, and only ready ones."
+    sources: ["vllm/distributed/ec_transfer/ec_connector/cpu/scheduler/__init__.py:191-195"]
+    request: {type: object, required: [identifier], properties: {identifier: {type: string, examples: [mm-a]}}}
+    response: {type: object, properties: {hit: {type: boolean}}}
+    behavior:
+      - if: "!state.is_consumer"
+        then:
+          - source: "vllm/distributed/ec_transfer/ec_connector/cpu/scheduler/__init__.py:192-193"
+            return: {hit: false}
+      - call: ec-embedding-cache.get
+        input: {key: "= input.identifier"}
+        as: e
+      - return: {hit: "= vars.e.value != null && vars.e.value.ready"}
+
+  - component: ec-cpu-scheduler
+    name: update-state-after-alloc
+    kind: function
+    summary: "ECCPUScheduler.update_state_after_alloc for one multimodal item: a producer allocates ceil(embeds x width x itemsize / block bytes) blocks for a new mm_hash and queues a save; a consumer queues a load of a ready entry under a new transfer id that each participating rank must acknowledge."
+    sources: ["vllm/distributed/ec_transfer/ec_connector/cpu/scheduler/__init__.py:504-534"]
+    attributes: {seam: true, callers: [scheduler-kv]}
+    request:
+      type: object
+      required: [mm_hash, num_embeds, width]
+      properties:
+        mm_hash: {type: string, examples: [mm-a]}
+        num_embeds: {type: integer, examples: [576]}
+        width: {type: integer, examples: [4096]}
+    response: {type: object, properties: {save_blocks: {type: [array, "null"]}, load_transfer_id: {type: [integer, "null"]}}}
+    behavior:
+      - set: {vars.save: null, vars.load: null}
+      - if: "state.is_producer"
+        then:
+          - call: ec-embedding-cache.get
+            input: {key: "= input.mm_hash"}
+            as: cur
+          - if: "vars.cur.value == null"
+            then:
+              - title: "_num_blocks: ceil(bytes / block_size_bytes); alloc may return None when full"
+                source: "vllm/distributed/ec_transfer/ec_connector/cpu/scheduler/__init__.py:504-521"
+                call: ec-embedding-cache.alloc
+                input: {key: "= input.mm_hash", n_blocks: "= (input.num_embeds * input.width * state.dtype_itemsize + state.block_size_bytes - 1) / state.block_size_bytes"}
+                as: al
+              - if: "vars.al.value != null"
+                then:
+                  - source: "vllm/distributed/ec_transfer/ec_connector/cpu/scheduler/__init__.py:518-520"
+                    set:
+                      state.pending_saves: "= merge(state.pending_saves, {input.mm_hash: vars.al.value.block_ids})"
+                      vars.save: "= vars.al.value.block_ids"
+      - if: "state.is_consumer && !(input.mm_hash in state.pending_loads)"
+        then:
+          - call: ec-embedding-cache.get
+            input: {key: "= input.mm_hash"}
+            as: rd
+          - if: "vars.rd.value != null && vars.rd.value.ready"
+            then:
+              - title: Pin the entry and queue the load under a fresh transfer id
+                source: "vllm/distributed/ec_transfer/ec_connector/cpu/scheduler/__init__.py:522-534"
+                set:
+                  state.pending_loads: "= merge(state.pending_loads, {input.mm_hash: {'transfer_id': state.next_transfer_id, 'block_ids': vars.rd.value.block_ids}})"
+                  state.load_acks: "= merge(state.load_acks, {string(state.next_transfer_id): {'mm_hash': input.mm_hash, 'reports': state.expected_load_reports}})"
+                  vars.load: "= state.next_transfer_id"
+                  state.next_transfer_id: "= state.next_transfer_id + 1"
+      - return: {save_blocks: "= vars.save", load_transfer_id: "= vars.load"}
+
+  - component: ec-cpu-scheduler
+    name: build-connector-meta
+    kind: function
+    summary: "build_connector_meta: hand this step's pending saves (producer) and loads (consumer) to the workers, and clear them."
+    sources: ["vllm/distributed/ec_transfer/ec_connector/cpu/scheduler/__init__.py:536-552"]
+    attributes: {seam: true, callers: [scheduler-kv]}
+    request: {type: object, properties: {}}
+    response: {type: object, properties: {saves: {type: object}, loads: {type: object}}}
+    behavior:
+      - set: {vars.saves: {}, vars.loads: {}}
+      - if: "state.is_producer"
+        then:
+          - source: "vllm/distributed/ec_transfer/ec_connector/cpu/scheduler/__init__.py:540-544"
+            set: {vars.saves: "= state.pending_saves", state.pending_saves: {}}
+      - if: "state.is_consumer"
+        then:
+          - source: "vllm/distributed/ec_transfer/ec_connector/cpu/scheduler/__init__.py:545-549"
+            set: {vars.loads: "= state.pending_loads", state.pending_loads: {}}
+      - return: {saves: "= vars.saves", loads: "= vars.loads"}
+
+  # ---------------------------------------------------------------- MultiConnector, HiSparse
+  - component: multi-connector
+    name: get-num-new-matched-tokens
+    kind: function
+    summary: "MultiConnector.get_num_new_matched_tokens: ask every child in config order; the first with matched tokens is assigned the request's load. (A child still looking up would answer None and make the whole answer None, multi_connector.py:444-447; no modeled child looks up asynchronously.)"
+    sources: ["vllm/distributed/kv_transfer/kv_connector/v1/multi_connector.py:434-453"]
+    request: DistKvRequest
+    response: DistKvMatch
+    behavior:
+      - set:
+          vars.impl: "= {'ExampleConnector': 'example-connector', 'NixlConnector': 'nixl-pull-connector-scheduler', 'NixlPullConnector': 'nixl-pull-connector-scheduler', 'MoRIIOConnector': 'moriio-connector-scheduler', 'SimpleCPUOffloadConnector': 'simple-cpu-offload-connector'}"
+          vars.out: {num_external_tokens: 0, load_async: false, connector: MultiConnector}
+      - foreach: "= lists.range(size(state.connectors))"
+        as: i
+        steps:
+          - if: "!(state.connectors[vars.i] in vars.impl)"
+            then:
+              - continue: true
+          - call: "= vars.impl[state.connectors[vars.i]] + '.get-num-new-matched-tokens'"
+            targets: [example-connector.get-num-new-matched-tokens, nixl-pull-connector-scheduler.get-num-new-matched-tokens, moriio-connector-scheduler.get-num-new-matched-tokens, simple-cpu-offload-connector.get-num-new-matched-tokens]
+            input: "= input"
+            as: m
+          - if: "vars.out.num_external_tokens == 0 && vars.m.value.num_external_tokens > 0"
+            then:
+              - title: The first child with matched tokens loads this request
+                source: "vllm/distributed/kv_transfer/kv_connector/v1/multi_connector.py:448-452"
+                set:
+                  state.requests_to_connector: "= merge(state.requests_to_connector, {input.request_id: vars.i})"
+                  vars.out: "= {'num_external_tokens': vars.m.value.num_external_tokens, 'load_async': vars.m.value.load_async, 'connector': state.connectors[vars.i]}"
+      - return: "= vars.out"
+
+  - component: multi-connector
+    name: build-connector-meta
+    kind: function
+    summary: "MultiConnector.build_connector_meta: the tuple of every child's metadata (children this model doesn't implement contribute an empty one), plus the pending extra async saves, which are then cleared."
+    sources: ["vllm/distributed/kv_transfer/kv_connector/v1/multi_connector.py:483-494"]
+    request: {type: object, properties: {scheduled_new_reqs: {type: array, default: []}}}
+    response: {type: object, properties: {metadata: {type: array}, extra_async_saves: {type: [object, "null"]}}}
+    behavior:
+      - set:
+          vars.impl: "= {'ExampleConnector': 'example-connector', 'NixlConnector': 'nixl-pull-connector-scheduler', 'NixlPullConnector': 'nixl-pull-connector-scheduler', 'MoRIIOConnector': 'moriio-connector-scheduler', 'SimpleCPUOffloadConnector': 'simple-cpu-offload-connector'}"
+          vars.metas: []
+      - foreach: "= state.connectors"
+        as: c
+        steps:
+          - if: "!(vars.c in vars.impl)"
+            then:
+              - set: {vars.metas: "= vars.metas + [{}]"}
+              - continue: true
+          - source: "vllm/distributed/kv_transfer/kv_connector/v1/multi_connector.py:486-490"
+            call: "= vars.impl[vars.c] + '.build-connector-meta'"
+            targets: [example-connector.build-connector-meta, nixl-pull-connector-scheduler.build-connector-meta, moriio-connector-scheduler.build-connector-meta, simple-cpu-offload-connector.build-connector-meta]
+            input: "= input"
+            as: bm
+          - set: {vars.metas: "= vars.metas + [vars.bm.value]"}
+      - set: {vars.extra: "= size(state.extra_async_saves) > 0 ? state.extra_async_saves : null"}
+      - source: "vllm/distributed/kv_transfer/kv_connector/v1/multi_connector.py:491-493"
+        set: {state.extra_async_saves: {}}
+      - return: {metadata: "= vars.metas", extra_async_saves: "= vars.extra"}
+
+  - component: hisparse-connector
+    name: init
+    kind: function
+    summary: "HiSparseConnector.__init__: requires a HiSparse host pool (kv_cache_config.hisparse_host_num_blocks), else ValueError; it needs the BLHNC KV cache layout."
+    sources: ["vllm/distributed/kv_transfer/kv_connector/v1/hisparse/connector.py:224-237"]
+    request: {type: object, properties: {hisparse_host_num_blocks: {type: [integer, "null"], default: null}}}
+    response: {type: object, properties: {required_kvcache_layout: {type: string}}}
+    errors:
+      - {code: value-error, status: 0, retryable: false}
+    behavior:
+      - if: "input.hisparse_host_num_blocks == null"
+        then:
+          - source: "vllm/distributed/kv_transfer/kv_connector/v1/hisparse/connector.py:235-236"
+            fail: {code: value-error, status: 0, message: "HiSparseConnector requires a HiSparse host pool"}
+      - set: {state.initialized: true}
+      - source: "vllm/distributed/kv_transfer/kv_connector/v1/hisparse/connector.py:224-226"
+        return: {required_kvcache_layout: BLHNC}
+
+  - component: hisparse-connector
+    name: update-state-after-alloc
+    kind: function
+    summary: "HiSparseConnector scheduler hooks: never any external matched tokens (0, False); after allocation, record the request for the coordinator."
+    sources: ["vllm/distributed/kv_transfer/kv_connector/v1/hisparse/connector.py:377-389"]
+    request: DistKvRequest
+    response: {type: object, properties: {num_external_tokens: {type: integer}, recorded: {type: integer}}}
+    errors:
+      - {code: assertion-error, status: 0, retryable: false}
+    behavior:
+      - if: "!state.initialized"
+        then:
+          - title: "assert self.connector_scheduler is not None"
+            source: "vllm/distributed/kv_transfer/kv_connector/v1/hisparse/connector.py:388"
+            fail: {code: assertion-error, status: 0, message: "HiSparse connector scheduler is not initialized"}
+      - source: "vllm/distributed/kv_transfer/kv_connector/v1/hisparse/connector.py:389"
+        set: {state.requests: "= state.requests + [input.request_id]"}
+      - return: {num_external_tokens: 0, recorded: "= size(state.requests)"}
+
+  # ---------------------------------------------------------------- KV connector: wait_for_layer_load
+  - component: kv-connector-base-v1-worker
+    name: wait-for-layer-load
+    kind: function
+    summary: "wait_for_layer_load, called from each attention layer: ExampleConnector loads synchronously in start_load_kv and NixlConnector doesn't load layerwise, so both return at once; this model has no layerwise-loading connector."
+    sources: ["vllm/distributed/kv_transfer/kv_connector/v1/base.py:334-346", "vllm/distributed/kv_transfer/kv_connector/v1/nixl/connector.py:294-296", "vllm/distributed/kv_transfer/kv_connector/v1/example_connector.py:200-211"]
+    attributes: {seam: true, callers: [attention]}
+    request: {type: object, required: [layer_name], properties: {layer_name: {type: string, examples: [model.layers.0.self_attn.attn]}}}
+    response: {type: object, properties: {waited: {type: boolean}, connector: {type: string}}}
+    behavior:
+      - if: "config['kv-connector'] in ['NixlConnector', 'NixlPullConnector']"
+        then:
+          - source: "vllm/distributed/kv_transfer/kv_connector/v1/nixl/connector.py:294-296"
+            return: {waited: false, connector: "= config['kv-connector']"}
+      - source: "vllm/distributed/kv_transfer/kv_connector/v1/example_connector.py:200-210"
+        return: {waited: false, connector: "= config['kv-connector']"}
+
+  # ---------------------------------------------------------------- RL weight sync (trainer side)
+  - component: weight-transfer-trainer-factory
+    name: trainer-init
+    kind: function
+    summary: "WeightTransferTrainerFactory.trainer_init: an unregistered init_info.backend is a ValueError listing the available engines; otherwise build that engine (its rendezvous runs on every trainer rank, the sender driving it)."
+    sources: ["vllm/distributed/weight_transfer/factory.py:166-215"]
+    request: {type: object, required: [backend], properties: {backend: {type: string, examples: [nccl]}, rank: {type: integer, default: 0}}}
+    response: {type: object, properties: {engine: {type: string}, is_sender: {type: boolean}}}
+    errors:
+      - {code: value-error, status: 0, retryable: false}
+    behavior:
+      - if: "!(input.backend in state.registry)"
+        then:
+          - source: "vllm/distributed/weight_transfer/factory.py:198-203"
+            fail: {code: value-error, status: 0, message: "= 'Invalid weight transfer backend: ' + input.backend + '. Available trainer engines: [' + state.registry.map(r, '\\'' + r + '\\'').join(', ') + ']'"}
+      - if: "input.backend == 'nccl'"
+        then:
+          - call: nccl-trainer-weight-transfer-engine.trainer-init
+            input: {rank: "= input.rank"}
+            as: e
+          - return: {engine: NCCLTrainerWeightTransferEngine, is_sender: "= vars.e.value.is_sender"}
+      - source: "vllm/distributed/weight_transfer/factory.py:204-215"
+        return: {engine: "= input.backend", is_sender: "= input.rank == 0"}
+
+  - component: nccl-trainer-weight-transfer-engine
+    name: trainer-init
+    kind: function
+    summary: "Mark the sender: trainer rank 0 sends; other ranks only join the trainer-side collective."
+    sources: ["vllm/distributed/weight_transfer/base.py:597-612"]
+    request: {type: object, properties: {rank: {type: integer, default: 0}}}
+    response: {type: object, properties: {is_sender: {type: boolean}}}
+    behavior:
+      - set: {state.is_sender: "= input.rank == 0"}
+      - return: {is_sender: "= state.is_sender"}
+
+  - component: nccl-trainer-weight-transfer-engine
+    name: send-weights
+    kind: function
+    summary: "send_weights: every rank reads the source metadata; a non-sender only replays the iteration; the sender posts start_weight_update, posts update_weights with the parameter names, dtypes and shapes (concurrently with its broadcast), then finish_weight_update."
+    sources: ["vllm/distributed/weight_transfer/nccl_engine.py:318-360", "vllm/distributed/weight_transfer/base.py:614-621"]
+    request:
+      type: object
+      required: [params]
+      properties:
+        params: {type: array, items: {type: object, properties: {name: {type: string}, dtype: {type: string}, shape: {type: array, items: {type: integer}}}}, examples: [[{name: lm_head.weight, dtype: bfloat16, shape: [128256, 4096]}]]}
+        weight_version: {type: [string, "null"], default: null}
+    response: {type: object, properties: {sent: {type: boolean}, names: {type: array}}}
+    behavior:
+      - title: "ModuleSource.metadata: (name, dtype, shape) of module.named_parameters()"
+        source: "vllm/distributed/weight_transfer/base.py:244-264"
+        set: {vars.names: "= input.params.map(p, p.name)"}
+      - if: "!state.is_sender"
+        then:
+          - title: Non-sender ranks only join the trainer-side gather
+            source: "vllm/distributed/weight_transfer/nccl_engine.py:326-330"
+            return: {sent: false, names: []}
+      - source: "vllm/distributed/weight_transfer/nccl_engine.py:338"
+        call: vllm-weight-sync-client.post
+        input: {path: start_weight_update}
+      - source: "vllm/distributed/weight_transfer/nccl_engine.py:332-347"
+        call: vllm-weight-sync-client.post
+        input: {path: update_weights, body: {update_info: {names: "= vars.names", dtype_names: "= input.params.map(p, p.dtype)", shapes: "= input.params.map(p, p.shape)"}}}
+      - title: "finish_weight_update (VLLMWeightSyncClient protocol)"
+        source: "vllm/distributed/weight_transfer/base.py:546"
+        call: vllm-weight-sync-client.post
+        input: {path: finish_weight_update, body: "= input.weight_version == null ? dyn(null) : dyn({'weight_version': input.weight_version})"}
+      - set: {state.rounds: "= state.rounds + 1"}
+      - return: {sent: true, names: "= vars.names"}
+
+  - component: vllm-weight-sync-client
+    name: post
+    kind: function
+    summary: "HTTPVLLMWeightSyncClient._post to <base_url>/<path>; finish_weight_update sends the weight version only when one is given."
+    sources: ["vllm/distributed/weight_transfer/clients.py:70-96"]
+    request: {type: object, required: [path], properties: {path: {type: string}, body: {type: [object, "null"], default: null}}}
+    response: {type: object, properties: {posted: {type: string}}}
+    behavior:
+      - source: "vllm/distributed/weight_transfer/clients.py:70-76"
+        set:
+          state.posts: "= state.posts + [input.path]"
+      - if: "input.path == 'finish_weight_update' && input.body != null"
+        then:
+          - source: "vllm/distributed/weight_transfer/clients.py:92-96"
+            set: {state.weight_version: "= input.body.weight_version"}
+      - return: {posted: "= input.path"}
+
+  - component: nccl-weight-transfer-engine
+    name: start-weight-update
+    kind: function
+    summary: "start_weight_update: initialize layerwise reloading of the model for the incoming checkpoint weights."
+    sources: ["vllm/distributed/weight_transfer/nccl_engine.py:159-165", "vllm/distributed/weight_transfer/base.py:472-480"]
+    request: {type: object, properties: {}}
+    response: {type: object, properties: {reloading: {type: boolean}}}
+    behavior:
+      - set: {state.reloading: true}
+      - return: {reloading: true}
+
+  - component: nccl-weight-transfer-engine
+    name: finish-weight-update
+    kind: function
+    summary: "finish_weight_update: finalize layerwise reloading after all weights were received."
+    sources: ["vllm/distributed/weight_transfer/nccl_engine.py:167-173", "vllm/distributed/weight_transfer/base.py:482-489"]
+    request: {type: object, properties: {}}
+    response: {type: object, properties: {finished: {type: integer}}}
+    behavior:
+      - source: "vllm/distributed/weight_transfer/nccl_engine.py:169-173"
+        set: {state.reloading: false, state.updates_finished: "= state.updates_finished + 1"}
+      - return: {finished: "= state.updates_finished"}
+
+flows:
+  - id: distributed-kv-event-aggregate
+    name: Aggregate KV cache events across workers
+    tags: [writes]
+    entry: {caller: engine-core, interface: kv-event-aggregator.add-events, input: {events: [{type: BlockStored, block_hashes: [h1], token_ids: [1, 2], block_size: 16}]}}
+    sources: ["vllm/distributed/kv_events.py:159-168"]
+  - id: distributed-group-barrier
+    name: Group barrier on the CPU group
+    entry: {caller: gpu-worker, interface: group-coordinator.barrier, input: {group_name: "tp:0", world_size: 1}}
+    sources: ["vllm/distributed/parallel_state.py:1370-1377"]
+  - id: distributed-group-gather
+    name: Gather to one rank
+    entry: {caller: gpu-worker, interface: group-coordinator.gather, input: {value: [1, 2], world_size: 1}}
+    sources: ["vllm/distributed/parallel_state.py:824-837"]
+  - id: distributed-graph-capture
+    name: CUDA graph capture context
+    tags: [writes]
+    entry: {caller: gpu-worker, interface: parallel-state.graph-capture, input: {phase: enter}}
+    sources: ["vllm/distributed/parallel_state.py:1683-1703"]
+  - id: distributed-cleanup-dist-env
+    name: Tear down the distributed environment
+    tags: [writes]
+    entry: {caller: gpu-worker, interface: parallel-state.cleanup-dist-env-and-memory}
+    sources: ["vllm/distributed/parallel_state.py:2516-2561"]
+  - id: distributed-stateless-pg-send
+    name: StatelessProcessGroup object send
+    tags: [writes]
+    entry: {caller: gpu-worker, interface: stateless-process-group.send-obj, input: {obj: {hello: 1}, dst: 1}}
+    sources: ["vllm/distributed/utils.py:224-230"]
+  - id: distributed-stateless-pg-broadcast
+    name: StatelessProcessGroup broadcast
+    tags: [writes]
+    entry: {caller: gpu-worker, interface: stateless-process-group.broadcast-obj, input: {obj: {cfg: a}, src: 0, world_size: 2}}
+    sources: ["vllm/distributed/utils.py:251-267"]
+  - id: distributed-ec-connector-init
+    name: EC connector construction
+    tags: [writes]
+    entry: {caller: gpu-worker, interface: ec-connector-base.init, input: {role: WORKER, ec_role: ec_producer}}
+    sources: ["vllm/distributed/ec_transfer/ec_connector/base.py:84-92"]
+  - id: distributed-ec-shared-region
+    name: Map the EC shared region
+    tags: [writes]
+    entry: {caller: gpu-worker, interface: ec-shared-region.init, input: {engine_id: engine-0, num_blocks: 8, block_size_bytes: 1048576}}
+    sources: ["vllm/distributed/ec_transfer/ec_connector/cpu/ec_shared_region.py:82-139"]
+  - id: distributed-ec-cpu-alloc
+    name: EC CPU scheduler allocation for one multimodal item
+    tags: [writes]
+    entry: {caller: engine-core, interface: ec-cpu-scheduler.update-state-after-alloc, input: {mm_hash: mm-a, num_embeds: 256, width: 4096}}
+    sources: ["vllm/distributed/ec_transfer/ec_connector/cpu/scheduler/__init__.py:509-534"]
+  - id: distributed-multi-connector-match
+    name: MultiConnector matched tokens
+    tags: [writes]
+    entry: {caller: engine-core, interface: multi-connector.get-num-new-matched-tokens, input: {request_id: chatcmpl-m1, prompt_token_ids: [1, 2, 3], num_prompt_tokens: 3}}
+    sources: ["vllm/distributed/kv_transfer/kv_connector/v1/multi_connector.py:434-453"]
+  - id: distributed-hisparse-connector
+    name: HiSparse connector construction
+    tags: [writes]
+    entry: {caller: engine-core, interface: hisparse-connector.init, input: {hisparse_host_num_blocks: 1024}}
+    sources: ["vllm/distributed/kv_transfer/kv_connector/v1/hisparse/connector.py:224-237"]
+  - id: distributed-rl-trainer-init
+    name: RL trainer weight-transfer engine
+    tags: [writes]
+    entry: {caller: python-user, interface: weight-transfer-trainer-factory.trainer-init, input: {backend: nccl}}
+    sources: ["vllm/distributed/weight_transfer/factory.py:166-215"]
+  - id: distributed-rl-send-weights
+    name: RL trainer weight sync round trip
+    tags: [writes]
+    entry: {caller: python-user, interface: nccl-trainer-weight-transfer-engine.send-weights, input: {params: [{name: lm_head.weight, dtype: bfloat16, shape: [128256, 4096]}]}}
+    sources: ["vllm/distributed/weight_transfer/nccl_engine.py:318-372"]
+  - id: distributed-rl-worker-update
+    name: Worker-side weight update window
+    tags: [writes]
+    entry: {caller: gpu-worker, interface: nccl-weight-transfer-engine.start-weight-update}
+    sources: ["vllm/distributed/weight_transfer/nccl_engine.py:159-173"]
+
+scenarios:
+  - id: distributed-kv-event-aggregate-common
+    name: Only events every worker emitted are common; worker count and clearing
+    flow: distributed-kv-event-aggregate
+    fixtures: [tp1-llama-8b]
+    steps:
+      - {interface: kv-event-aggregator.init, caller: engine-core, as: bad, input: {num_workers: 0}}
+      - {interface: kv-event-aggregator.init, caller: engine-core, as: init, input: {num_workers: 2}}
+      - {flow: distributed-kv-event-aggregate, as: w0, input: {events: [{type: BlockStored, block_hashes: [h1], token_ids: [1, 2], block_size: 16}, {type: BlockRemoved, block_hashes: [h0]}]}}
+      - {flow: distributed-kv-event-aggregate, as: w1, input: {events: [{type: BlockStored, block_hashes: [h1], token_ids: [1, 2], block_size: 16}]}}
+      - {interface: kv-event-aggregator.get-common-events, caller: engine-core, as: common}
+      - {interface: kv-event-aggregator.increment-workers, caller: engine-core, as: inc}
+      - {interface: kv-event-aggregator.increment-workers, caller: engine-core, as: badinc, input: {count: 0}}
+      - {interface: kv-event-aggregator.get-common-events, caller: engine-core, as: none3}
+      - {interface: kv-event-aggregator.increment-workers, caller: engine-core, as: clr, input: {clear: true}}
+      - {interface: kv-event-aggregator.get-common-events, caller: engine-core, as: empty}
+    expect:
+      - "steps.bad.result.error.code == 'value-error' && steps.w0.result.value.distinct == 2"
+      - "size(steps.common.result.value) == 1 && steps.common.result.value[0].type == 'BlockStored' && steps.common.result.value[0].block_hashes == ['h1']"
+      - "steps.inc.result.value.num_workers == 3 && steps.badinc.result.error.code == 'value-error' && size(steps.none3.result.value) == 0 && steps.empty.result.value == []"
+      - "size(state['kv-event-aggregator'].counter) == 0"
+  - id: distributed-group-barrier-gather-ranks
+    name: Two ranks meet at the barrier; gather delivers the rank-ordered values to dst only
+    tags: [concurrency]
+    flow: distributed-group-gather
+    fixtures: [tp4-llama-70b]
+    steps:
+      - {flow: distributed-group-barrier, as: b0, on: rank0, at_ms: 0, await: false, input: {world_size: 2}}
+      - {flow: distributed-group-barrier, as: b1, on: rank1, at_ms: 3, await: false, input: {world_size: 2}}
+      - {flow: distributed-group-gather, as: g1, on: rank1, at_ms: 10, await: false, input: {value: [3, 4], world_size: 2}}
+      - {flow: distributed-group-gather, as: g0, on: rank0, at_ms: 11, await: false, input: {value: [1, 2], world_size: 2}}
+    expect:
+      - "steps.b0.result.value.arrived == 2 && steps.b1.result.value.arrived == 2"
+      - "steps.g0.result.value == [1, 2, 3, 4] && steps.g1.result.value == null"
+  - id: distributed-group-gather-bypass-and-errors
+    name: Gather bypasses at world size 1, needs a device communicator; a lone barrier times out
+    flow: distributed-group-gather
+    fixtures: [tp1-llama-8b]
+    config: {distributed-timeout-seconds: 1}
+    steps:
+      - {flow: distributed-group-gather, as: one}
+      - {flow: distributed-group-gather, as: nodev, input: {world_size: 2, has_device_communicator: false}}
+      - {flow: distributed-group-barrier, as: lone, input: {world_size: 2}}
+      - {flow: distributed-group-gather, as: lonegather, input: {world_size: 2}}
+    expect:
+      - "steps.lonegather.result.error.message == 'gather timed out'"
+      - "steps.one.result.value == [1, 2] && steps.nodev.result.error.message == 'No device communicator found'"
+      - "steps.lone.result.error.code == 'dist-backend-error' && steps.lone.result.error.message.contains('1 of 2')"
+  - id: distributed-graph-capture-registers-buffers
+    name: Collectives inside graph capture use registered buffers; leaving capture registers the graph buffers
+    flow: distributed-graph-capture
+    fixtures: [tp1-llama-8b]
+    steps:
+      - {flow: distributed-graph-capture, as: enter}
+      - {interface: custom-allreduce.custom-all-reduce, caller: gpu-worker, as: ar, input: {bytes: 1048576, world_size: 2}}
+      - {flow: distributed-graph-capture, as: exit, input: {phase: exit}}
+      - {interface: custom-allreduce.capture, caller: gpu-worker, as: exit2, input: {phase: exit}}
+    expect:
+      - "steps.enter.result.value.capturing && !steps.exit.result.value.capturing && steps.exit2.result.value.registered_graph_buffers"
+      - "state['custom-allreduce@rank0'].capturing == false"
+  - id: distributed-cleanup-dist-env-then-world
+    name: Cleanup destroys the model-parallel groups and the world group
+    flow: distributed-cleanup-dist-env
+    fixtures: [tp1-llama-8b]
+    steps:
+      - {interface: parallel-state.get-world-group, caller: gpu-worker, as: before}
+      - {flow: distributed-cleanup-dist-env, as: c, input: {shutdown_ray: true}}
+      - {interface: parallel-state.get-world-group, caller: gpu-worker, as: after}
+    expect:
+      - "steps.before.result.value.backend == 'nccl' && 'tp' in steps.c.result.value.destroyed && steps.c.result.value.ray_shutdown"
+      - "steps.after.result.error.code == 'assertion-error' && !state['parallel-state@rank0'].world_initialized"
+  - id: distributed-stateless-pg-send-recv-broadcast
+    name: Objects sent through the metadata store arrive in order; broadcasts are read by the other rank
+    flow: distributed-stateless-pg-send
+    fixtures: [tp4-llama-70b]
+    steps:
+      - {flow: distributed-stateless-pg-send, as: s0, on: rank0}
+      - {flow: distributed-stateless-pg-send, as: s1, on: rank0, input: {obj: {hello: 2}}}
+      - {interface: stateless-process-group.recv-obj, caller: gpu-worker, on: rank1, as: r0, input: {src: 0, world_size: 2}}
+      - {interface: stateless-process-group.recv-obj, caller: gpu-worker, on: rank1, as: r1, input: {src: 0, world_size: 2}}
+      - {interface: stateless-process-group.recv-obj, caller: gpu-worker, on: rank1, as: r2, input: {src: 0, world_size: 2}}
+      - {flow: distributed-stateless-pg-broadcast, as: b0, on: rank0}
+      - {flow: distributed-stateless-pg-broadcast, as: b1, on: rank1, input: {obj: null}}
+      - {flow: distributed-stateless-pg-broadcast, as: b2, on: rank1, input: {obj: null}}
+    expect:
+      - "steps.s0.result.value.key == 'send_to/1/0' && steps.s1.result.value.key == 'send_to/1/1'"
+      - "steps.r0.result.value == {'hello': 1} && steps.r1.result.value == {'hello': 2} && steps.r2.result.error.code == 'dist-store-error'"
+      - "steps.b0.result.value == {'cfg': 'a'} && steps.b1.result.value == {'cfg': 'a'} && steps.b2.result.error.code == 'dist-store-error'"
+      - "state['stateless-process-group@rank1'].recv_src_counter == {'0': 2} && size(state['stateless-tcp-store'].keys) == 3"
+  - id: distributed-stateless-pg-broadcast-then-read
+    name: A broadcast written by the source rank is read back by another rank
+    flow: distributed-stateless-pg-broadcast
+    fixtures: [tp4-llama-70b]
+    steps:
+      - {flow: distributed-stateless-pg-broadcast, as: w, on: rank0}
+      - {flow: distributed-stateless-pg-broadcast, as: r, on: rank1}
+      - {interface: stateless-tcp-store.get, caller: gpu-worker, as: key, input: {key: broadcast_from/0/0}}
+    expect:
+      - "steps.key.result.value.value == {'cfg': 'a'}"
+      - "steps.r.result.value == steps.w.result.value && steps.r.result.value == {'cfg': 'a'}"
+      - "state['stateless-process-group@rank0'].broadcast_send_counter == 1"
+  - id: distributed-ec-connector-roles
+    name: EC connector roles, producer saves, consumer skips, missing config refused
+    flow: distributed-ec-connector-init
+    fixtures: [tp1-llama-8b]
+    steps:
+      - {interface: ec-connector-base.is-producer, caller: gpu-worker, as: none}
+      - {flow: distributed-ec-connector-init, as: none2, input: {ec_role: {$null: true}}}
+      - {flow: distributed-ec-connector-init, as: prod}
+      - {interface: ec-connector-base.is-producer, caller: gpu-worker, as: isprod}
+      - {interface: ec-connector-base.save-caches, caller: gpu-worker, as: save, input: {encoder_cache: {mm-a: [1]}, mm_hash: mm-a}}
+      - {interface: ec-connector-base.save-caches, caller: gpu-worker, as: miss, input: {encoder_cache: {mm-a: [1]}, mm_hash: mm-b}}
+      - {flow: distributed-ec-connector-init, as: cons, input: {ec_role: ec_consumer}}
+      - {interface: ec-connector-base.save-caches, caller: gpu-worker, as: skip, input: {encoder_cache: {mm-a: [1]}, mm_hash: mm-a}}
+    expect:
+      - "!steps.none.result.value.is_producer && steps.none2.result.error.code == 'value-error' && steps.prod.result.value.role == 'WORKER'"
+      - "steps.isprod.result.value.is_producer && !steps.isprod.result.value.is_consumer && steps.save.result.value.saved && steps.miss.result.error.code == 'key-error'"
+      - "!steps.skip.result.value.saved && steps.cons.result.value.is_consumer"
+      - "state['ec-connector-base@rank0'].saved == ['mm-a']"
+  - id: distributed-ec-shared-region-lifecycle
+    name: The first worker creates the region, the second opens it; only the creator unlinks
+    flow: distributed-ec-shared-region
+    fixtures: [tp4-llama-70b]
+    steps:
+      - {flow: distributed-ec-shared-region, as: c0, on: rank0}
+      - {flow: distributed-ec-shared-region, as: c1, on: rank1}
+      - {flow: distributed-ec-shared-region, as: small, on: rank2, input: {num_blocks: 16}}
+      - {interface: ec-shared-region.pin-memory, caller: gpu-worker, on: rank1, as: p1}
+      - {interface: ec-shared-region.pin-memory, caller: gpu-worker, on: rank1, as: p2}
+      - {interface: ec-shared-region.pin-memory, caller: gpu-worker, on: rank0, as: nocuda, input: {cuda_available: false}}
+      - {interface: ec-shared-region.cleanup, caller: gpu-worker, on: rank1, as: x1}
+      - {interface: ec-shared-region.cleanup, caller: gpu-worker, on: rank0, as: x0}
+    expect:
+      - "steps.c0.result.value.is_creator && !steps.c1.result.value.is_creator && steps.small.result.error.code == 'timeout-error'"
+      - "steps.p1.result.value.pinned && steps.p2.result.value.pinned && !steps.nocuda.result.value.pinned"
+      - "!steps.x1.result.value.unlinked && steps.x0.result.value.unlinked && size(state['dev-shm-files'].files) == 0"
+  - id: distributed-ec-cpu-scheduler-save-and-load
+    name: A producer allocates blocks and queues a save; a consumer loads a ready entry; the metadata hands both over once
+    flow: distributed-ec-cpu-alloc
+    fixtures: [tp1-llama-8b]
+    state:
+      ec-cpu-scheduler: {is_producer: true, is_consumer: true}
+      ec-embedding-cache: {entries: {mm-r: {block_ids: [0], ready: true}}, num_blocks: 8, free_blocks: [1, 2, 3, 4, 5, 6, 7]}
+    steps:
+      - {flow: distributed-ec-cpu-alloc, as: a}
+      - {flow: distributed-ec-cpu-alloc, as: again}
+      - {flow: distributed-ec-cpu-alloc, as: big, input: {mm_hash: mm-big, num_embeds: 4096, width: 4096}}
+      - {flow: distributed-ec-cpu-alloc, as: full, input: {mm_hash: mm-full, num_embeds: 768, width: 4096}}
+      - {flow: distributed-ec-cpu-alloc, as: r, input: {mm_hash: mm-r}}
+      - {interface: ec-cpu-scheduler.has-cache-item, caller: engine-core, as: hit, input: {identifier: mm-r}}
+      - {interface: ec-cpu-scheduler.build-connector-meta, caller: engine-core, as: m1}
+      - {interface: ec-cpu-scheduler.build-connector-meta, caller: engine-core, as: m2}
+    expect:
+      - "steps.a.result.value.save_blocks == [6, 7] && steps.again.result.value.save_blocks == null && steps.big.result.error.code == 'assertion-error' && steps.full.result.value.save_blocks == null"
+      - "steps.r.result.value.load_transfer_id == 0 && steps.hit.result.value.hit"
+      - "steps.m1.result.value.saves == {'mm-a': [6, 7]} && steps.m1.result.value.loads['mm-r'].transfer_id == 0 && steps.m2.result.value == {'saves': {}, 'loads': {}}"
+      - "size(state['ec-cpu-scheduler'].pending_saves) == 0 && state['ec-cpu-scheduler'].next_transfer_id == 1"
+  - id: distributed-ec-cpu-scheduler-roles
+    name: A producer-only scheduler reports no cached items and queues no loads
+    flow: distributed-ec-cpu-alloc
+    fixtures: [tp1-llama-8b]
+    state:
+      ec-cpu-scheduler: {is_producer: false, is_consumer: false}
+    steps:
+      - {flow: distributed-ec-cpu-alloc, as: a}
+      - {interface: ec-cpu-scheduler.has-cache-item, caller: engine-core, as: hit, input: {identifier: mm-a}}
+      - {interface: ec-cpu-scheduler.build-connector-meta, caller: engine-core, as: m}
+    expect:
+      - "steps.a.result.value == {'save_blocks': null, 'load_transfer_id': null} && !steps.hit.result.value.hit && steps.m.result.value == {'saves': {}, 'loads': {}}"
+      - "size(state['ec-embedding-cache'].entries) == 0"
+  - id: distributed-multi-connector-first-match-loads
+    name: The first child with matched tokens loads the request; metadata is one entry per child
+    flow: distributed-multi-connector-match
+    fixtures: [tp1-llama-8b]
+    config: {kv-connector: MultiConnector, kv-role: kv_both}
+    state:
+      multi-connector: {connectors: [LMCacheConnectorV1, MoRIIOConnector, ExampleConnector], extra_async_saves: {r9: [1]}}
+      moriio-connector-scheduler: {is_producer: false, mode: READ}
+    steps:
+      - {flow: distributed-multi-connector-match, as: m, input: {num_prompt_tokens: 33, prompt_token_ids: [1, 2, 3]}}
+      - {interface: multi-connector.build-connector-meta, caller: engine-core, as: meta}
+      - {interface: multi-connector.build-connector-meta, caller: engine-core, as: meta2}
+    expect:
+      - "steps.m.result.value.connector == 'MoRIIOConnector' && steps.m.result.value.num_external_tokens == 32"
+      - "size(steps.meta.result.value.metadata) == 3 && steps.meta.result.value.metadata[0] == {} && steps.meta.result.value.extra_async_saves == {'r9': [1]} && steps.meta2.result.value.extra_async_saves == null"
+      - "state['multi-connector'].requests_to_connector == {'chatcmpl-m1': 1}"
+  - id: distributed-multi-connector-no-match
+    name: No child matches; the request stays unassigned
+    flow: distributed-multi-connector-match
+    fixtures: [tp1-llama-8b]
+    config: {kv-connector: MultiConnector, kv-role: kv_both}
+    state:
+      multi-connector: {connectors: [MoRIIOConnector]}
+      moriio-connector-scheduler: {is_producer: true}
+    steps:
+      - {flow: distributed-multi-connector-match, as: m}
+    expect:
+      - "steps.m.result.value.num_external_tokens == 0 && steps.m.result.value.connector == 'MultiConnector'"
+      - "size(state['multi-connector'].requests_to_connector) == 0"
+  - id: distributed-hisparse-connector-init-and-record
+    name: HiSparse needs a host pool; it matches nothing and records allocated requests
+    flow: distributed-hisparse-connector
+    fixtures: [tp1-llama-8b]
+    steps:
+      - {interface: hisparse-connector.update-state-after-alloc, caller: engine-core, as: early, input: {request_id: r0}}
+      - {flow: distributed-hisparse-connector, as: nopool, input: {hisparse_host_num_blocks: {$null: true}}}
+      - {flow: distributed-hisparse-connector, as: ok}
+      - {interface: hisparse-connector.update-state-after-alloc, caller: engine-core, as: rec, input: {request_id: r1}}
+    expect:
+      - "steps.early.result.error.code == 'assertion-error' && steps.nopool.result.error.message == 'HiSparseConnector requires a HiSparse host pool'"
+      - "steps.ok.result.value.required_kvcache_layout == 'BLHNC' && steps.rec.result.value.num_external_tokens == 0"
+      - "state['hisparse-connector'].requests == ['r1']"
+  - id: distributed-kv-worker-wait-for-layer-load
+    name: wait_for_layer_load returns at once for the NIXL and Example connectors
+    flow: distributed-kv-worker-connector-step
+    fixtures: [tp1-llama-8b]
+    config: {kv-connector: NixlConnector, kv-role: kv_consumer}
+    steps:
+      - {interface: kv-connector-base-v1-worker.wait-for-layer-load, caller: gpu-worker, as: unbound, input: {layer_name: model.layers.0.self_attn.attn}}
+      - {flow: distributed-kv-worker-connector-step, as: bind}
+    expect:
+      - "!steps.unbound.result.value.waited && steps.unbound.result.value.connector == 'NixlConnector'"
+      - "state['kv-connector-base-v1-worker@rank0'].connector_metadata != null"
+  - id: distributed-kv-worker-wait-for-layer-load-example
+    name: ExampleConnector's wait_for_layer_load returns at once too
+    flow: distributed-kv-worker-connector-step
+    fixtures: [tp1-llama-8b]
+    config: {kv-connector: ExampleConnector, kv-role: kv_both}
+    steps:
+      - {interface: kv-connector-base-v1-worker.wait-for-layer-load, caller: gpu-worker, as: w, input: {layer_name: model.layers.0.self_attn.attn}}
+    expect:
+      - "!steps.w.result.value.waited && steps.w.result.value.connector == 'ExampleConnector'"
+  - id: distributed-rl-weight-sync-round-trip
+    name: The sender posts start, update (names, dtypes, shapes) and finish; a non-sender only joins; unknown backends are refused
+    flow: distributed-rl-send-weights
+    fixtures: [tp1-llama-8b]
+    steps:
+      - {flow: distributed-rl-trainer-init, as: bad, input: {backend: grpc}}
+      - {flow: distributed-rl-trainer-init, as: ipc, input: {backend: ipc}}
+      - {flow: distributed-rl-trainer-init, as: init}
+      - {flow: distributed-rl-send-weights, as: send, input: {weight_version: v2}}
+      - {flow: distributed-rl-trainer-init, as: init1, input: {rank: 1}}
+      - {flow: distributed-rl-send-weights, as: follower}
+    expect:
+      - "steps.bad.result.error.message.contains(\"Available trainer engines: ['nccl', 'ipc'\") && steps.ipc.result.value.engine == 'ipc' && steps.init.result.value.is_sender"
+      - "steps.send.result.value.names == ['lm_head.weight'] && !steps.follower.result.value.sent"
+      - "state['vllm-weight-sync-client'].posts == ['start_weight_update', 'update_weights', 'finish_weight_update'] && state['vllm-weight-sync-client'].weight_version == 'v2'"
+  - id: distributed-rl-worker-update-window
+    name: Finish closes the layerwise reload that start opened
+    flow: distributed-rl-worker-update
+    fixtures: [tp1-llama-8b]
+    steps:
+      - {flow: distributed-rl-worker-update, as: s}
+      - {interface: nccl-weight-transfer-engine.finish-weight-update, caller: gpu-worker, as: f1}
+    expect:
+      - "steps.s.result.value.reloading && steps.f1.result.value.finished == 1"
+      - "!state['nccl-weight-transfer-engine@rank0'].reloading"

@@ -1,0 +1,68 @@
+schema_version: 1
+id: cassandra
+scenarios:
+  # Verified expectation (5.0.9): on the joining node StorageService.bootstrap (StorageService.java:2208-2264)
+  # gossips TOKENS and STATUS=BOOT (:2216-2224), sleeps RING_DELAY 30 s (:2225-2226), checks a seed was seen
+  # (:2232), streams its ranges via BootStrapper/RangeStreamer (:2247, 2271-2277), then finishJoiningRing sets
+  # the tokens and gossips NORMAL (:1428-1440). On the other nodes handleStateBootstrap (:3123) records bootstrap
+  # tokens and recalculates pending ranges; writes then include the pending replica and blockFor grows by the
+  # pending count (ConsistencyLevel.java:170-190); handleStateNormal (:3311) moves it into the ring.
+  - id: bench-g3-joining-node
+    flow: membership-node-startup
+    name: This node (10.0.0.1) is new and not a seed - gossips BOOT with its tokens, waits RING_DELAY, streams from 10.0.0.2/.3, becomes NORMAL
+    state:
+      gossiper: {seeds: ["10.0.0.2"]}
+      storage-service: {bootstrap_state: NEEDS_BOOTSTRAP, initialized: false, is_seed: false, joined: false, operation_mode: STARTING, saved_tokens: []}
+      token-metadata:
+        ring:
+          - {endpoint: 10.0.0.2, token: 0}
+          - {endpoint: 10.0.0.3, token: 6148914691236517205}
+    expect:
+      - "result.value.operation_mode == 'NORMAL' && state['storage-service'].bootstrap_state == 'COMPLETED'"
+      - "ctx.status_changes == ['10.0.0.1:BOOT', '10.0.0.1:NORMAL']"
+      - "calls['stream-plan.execute'] == 1 && duration_ms >= 30000"
+      - "state['token-metadata'].ring.exists(e, e.endpoint == '10.0.0.1')"
+      - "state['token-metadata'].bootstrap_tokens == [] && size(state['token-metadata'].pending_ranges) == 0"
+  - id: bench-g3-peer-sees-boot
+    flow: membership-gossip-ack2
+    name: Coordinator 10.0.0.1 learns 10.0.0.4 is BOOT with token 3074457345618258602 - pending ranges, not in the ring
+    input:
+      states:
+        - {endpoint: 10.0.0.4, generation: 1761800100, heartbeat: 3, max_version: 5, status: BOOT, tokens: [3074457345618258602], host_id: 6d194555-f6eb-41d0-c000-000000000004, dc: datacenter1, rack: rack1}
+    expect:
+      - "state['token-metadata'].bootstrap_tokens == [{'token': 3074457345618258602, 'endpoint': '10.0.0.4'}]"
+      - "!state['token-metadata'].ring.exists(e, e.endpoint == '10.0.0.4')"
+      - "size(state['token-metadata'].pending_ranges) > 0 && state['token-metadata'].pending_ranges.all(r, r.endpoint == '10.0.0.4')"
+      - "calls['server-event-notifier.on-join-cluster'] == 0"
+  - id: bench-g3-write-includes-pending
+    flow: coordinator-write
+    name: QUORUM write for token 100 while 10.0.0.4 bootstraps (0, 3074457345618258602] - 10.0.0.4 also gets the write, blockFor 3
+    state:
+      gossiper:
+        endpoint_state_map:
+          "10.0.0.4": {alive: true, dc: datacenter1, endpoint: 10.0.0.4, generation: 1761800100, heartbeat: 3, host_id: 6d194555-f6eb-41d0-c000-000000000004, load: 0, max_version: 5, rack: rack1, rpc_ready: false, status: BOOT, tokens: [3074457345618258602], update_ms: 0}
+        live_endpoints: ["10.0.0.2", "10.0.0.3", "10.0.0.4"]
+      token-metadata:
+        bootstrap_tokens: [{token: 3074457345618258602, endpoint: 10.0.0.4}]
+        pending_ranges: [{keyspace: "*", left: 0, right: 3074457345618258602, endpoint: 10.0.0.4}]
+    expect:
+      - "result.ok && result.value.block_for == 3"
+      - "calls['mutation-verb-handler.do-verb'] == 3"
+  - id: bench-g3-peer-sees-normal
+    flow: membership-gossip-ack2
+    name: 10.0.0.4 finishes and gossips NORMAL - it joins the ring, pending ranges are cleared, clients get NEW_NODE
+    input:
+      states:
+        - {endpoint: 10.0.0.4, generation: 1761800100, heartbeat: 40, max_version: 50, status: NORMAL, tokens: [3074457345618258602], host_id: 6d194555-f6eb-41d0-c000-000000000004, dc: datacenter1, rack: rack1, rpc_ready: true}
+    state:
+      gossiper:
+        endpoint_state_map:
+          "10.0.0.4": {alive: true, dc: datacenter1, endpoint: 10.0.0.4, generation: 1761800100, heartbeat: 3, host_id: 6d194555-f6eb-41d0-c000-000000000004, load: 0, max_version: 5, rack: rack1, rpc_ready: false, status: BOOT, tokens: [3074457345618258602], update_ms: 0}
+        live_endpoints: ["10.0.0.2", "10.0.0.3", "10.0.0.4"]
+      token-metadata:
+        bootstrap_tokens: [{token: 3074457345618258602, endpoint: 10.0.0.4}]
+        pending_ranges: [{keyspace: "*", left: 0, right: 3074457345618258602, endpoint: 10.0.0.4}]
+    expect:
+      - "state['token-metadata'].ring.exists(e, e.endpoint == '10.0.0.4' && e.token == 3074457345618258602)"
+      - "state['token-metadata'].bootstrap_tokens == [] && size(state['token-metadata'].pending_ranges) == 0"
+      - "calls['server-event-notifier.on-join-cluster'] == 1"

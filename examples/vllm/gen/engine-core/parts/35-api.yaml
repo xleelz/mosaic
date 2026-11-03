@@ -1,0 +1,971 @@
+interfaces:
+  # ------------------------------------------------------------------ construction and shutdown
+  - component: async-llm
+    name: from-engine-args
+    kind: function
+    summary: "AsyncLLM.from_engine_args: build the VllmConfig, pick the executor class, construct AsyncLLM (which launches the engine-core process and waits for its handshake)."
+    sources: ["vllm/v1/engine/async_llm.py:269-291"]
+    request: {type: object, properties: {model: {type: string, examples: [meta-llama/Llama-3.1-8B-Instruct]}, served_model_name: {type: string, examples: [llama-8b]}}}
+    behavior:
+      - title: "engine_args.create_engine_config(usage_context) (config-platform), then Executor.get_class"
+        source: "vllm/v1/engine/async_llm.py:278-280"
+        call: executor.get-class
+        as: cls
+      - call: async-llm.init
+        input: {executor_class: "= vars.cls.value.executor_class"}
+        as: eng
+      - return: "= vars.eng.value"
+
+  - component: async-llm
+    name: from-vllm-config
+    kind: function
+    summary: "AsyncLLM.from_vllm_config: construct AsyncLLM from an already-resolved VllmConfig."
+    sources: ["vllm/v1/engine/async_llm.py:240-267"]
+    behavior:
+      - call: executor.get-class
+        as: cls
+      - call: async-llm.init
+        input: {executor_class: "= vars.cls.value.executor_class"}
+        as: eng
+      - return: "= vars.eng.value"
+
+  - component: async-llm
+    name: init
+    kind: function
+    summary: "AsyncLLM.__init__: load stat-logger plugins, build the input/output processors, create the AsyncMPClient (launching the engine core), and create the StatLoggerManager."
+    sources: ["vllm/v1/engine/async_llm.py:87-226"]
+    request: {type: object, properties: {executor_class: {type: string}}}
+    behavior:
+      - title: "Custom stat loggers from the vllm.stat_logger_plugins entry points"
+        source: "vllm/v1/engine/async_llm.py:146-147"
+        call: stat-logger-manager.load-stat-logger-plugin-factories
+        as: plugins
+      - title: "EngineCoreClient.make_async_mp_client starts the engine in a background process"
+        source: "vllm/v1/engine/async_llm.py:182-190"
+        call: async-mp-client.init
+        as: client
+      - if: "!config['disable-log-stats'] || size(vars.plugins.value) > 0"
+        then:
+          - call: stat-logger-manager.init
+            input: {custom: "= vars.plugins.value", enable_default_loggers: "= !config['disable-log-stats']"}
+      - return: {num_gpu_blocks: "= vars.client.value.num_gpu_blocks", executor_class: "= input.executor_class"}
+
+  - component: async-mp-client
+    name: init
+    kind: function
+    summary: "MPClient.__init__: launch the engine-core process(es) through CoreEngineProcManager, wait for the startup handshake (READY carries num_gpu_blocks), then start the engine-core liveness monitor."
+    sources: ["vllm/v1/engine/core_client.py:595-764", "vllm/v1/engine/utils.py:94-109"]
+    response: {type: object, properties: {num_gpu_blocks: {type: integer}}}
+    behavior:
+      - set: {state.engine_dead: false}
+      - call: core-engine-proc-manager.launch
+        as: launch
+      - if: "config['enable-kv-cache-events']"
+        then:
+          - title: "_apply_ready_response: an engine whose READY carries kv_events_config is recorded as a KV-event source, keyed by its DP rank"
+            source: "vllm/v1/engine/core_client.py:883-886"
+            set: {state.kv_event_sources: "= {'0': {'enable_kv_cache_events': true, 'publisher': config['kv-events-publisher'] == null ? 'zmq' : config['kv-events-publisher']}}"}
+      - return: {num_gpu_blocks: "= vars.launch.value.num_gpu_blocks"}
+
+  - component: core-engine-proc-manager
+    name: launch
+    kind: function
+    summary: "CoreEngineProcManager: start a process per local engine with target EngineCoreProc.run_engine_core; wait_for_engine_startup waits for every engine's handshake."
+    sources: ["vllm/v1/engine/utils.py:242-333", "vllm/v1/engine/utils.py:1361-1400"]
+    request: {type: object, properties: {client_kind: {type: string, enum: [async, sync], default: async}}}
+    behavior:
+      - set: {state.started: true, state.killed: false, state.failed_proc_name: null, state.manager_stopped: false}
+      - title: "The engine process builds EngineCore and signals READY over the handshake socket"
+        source: "vllm/v1/engine/utils.py:1361-1400"
+        call: engine-core-proc.run-engine-core
+        input: {client_kind: "= has(input.client_kind) ? input.client_kind : 'async'"}
+        as: core
+        on_error:
+          - title: "An engine process exits during startup: 'Engine core initialization failed'"
+            source: "vllm/v1/engine/utils.py:1431-1437"
+            fail: {code: runtime-error, message: "Engine core initialization failed. See root cause above."}
+      - title: "MPClient.__init__ -> start_engine_core_monitor: a daemon MPClientEngineMonitor thread blocks on the engine processes' sentinels"
+        source: "vllm/v1/engine/core_client.py:758-759"
+        emit: core-engine-proc-manager.monitor-engine-liveness
+        input: {}
+      - return: "= vars.core.value"
+
+  - component: core-engine-proc-manager
+    name: monitor-engine-liveness
+    kind: function
+    summary: "The MPClientEngineMonitor thread: when an engine process dies outside a shutdown, mark the engine dead and shut the client down."
+    sources: ["vllm/v1/engine/utils.py:350-366", "vllm/v1/engine/core_client.py:800-827"]
+    request: {type: object, properties: {exitcode: {type: ["integer", "null"], default: null, description: "unset: block on the process sentinels until an engine-core process exits (the thread MPClient starts)"}}}
+    behavior:
+      - set: {vars.exitcode: "= has(input.exitcode) && input.exitcode != null ? input.exitcode : -9"}
+      - if: "!has(input.exitcode) || input.exitcode == null"
+        then:
+          - title: "connection.wait(sentinels): block until an engine-core process exits (a SIGKILLed process has exitcode -9)"
+            source: "vllm/v1/engine/utils.py:350-358"
+            wait: {signals: ["exit:engine-core-proc", "exit:engine-core-proc@dp0", "exit:engine-core-proc@dp1", "exit:engine-core-proc@dp2", "exit:engine-core-proc@dp3"], as: died}
+      - if: "state.manager_stopped"
+        then:
+          - title: "manager_stopped is set: the exit is our own shutdown, not a failure (the MPClient finalizer is no longer alive)"
+            source: "vllm/v1/engine/core_client.py:813-814"
+            return: {handled: false}
+      - if: "!state.started"
+        then: [{return: {handled: false}}]
+      - if: "vars.exitcode != 0"
+        then:
+          - set: {state.failed_proc_name: EngineCore}
+      - title: "engine core exited unexpectedly: engine_dead = True, client shutdown"
+        source: "vllm/v1/engine/core_client.py:814-823"
+        call: async-mp-client.mark-dead
+      - return: {handled: true}
+
+  - component: async-mp-client
+    name: mark-dead
+    kind: function
+    summary: "BackgroundResources.__call__: set engine_dead, shut the engine manager down, close sockets and cancel the output task (which queues EngineDeadError)."
+    sources: ["vllm/v1/engine/core_client.py:509-568", "vllm/v1/engine/exceptions.py:12-21"]
+    behavior:
+      - if: "state.engine_dead"
+        then: [{return: {already: true}}]
+      - set: {state.engine_dead: true}
+      - title: "Cancelling the output queue task queues EngineDeadError for the output handler"
+        source: "vllm/v1/engine/core_client.py:1220-1221"
+        call: async-llm.output-handler
+        input: {error: {code: engine-dead-error, status: 500, message: "EngineCore encountered an issue. See stack trace (above) for the root cause."}}
+      - return: {already: false}
+
+  - component: async-llm
+    name: shutdown
+    kind: function
+    summary: "AsyncLLM.shutdown(timeout): stop Prometheus and the renderer, shut the engine-core client down (SIGTERM to the engine process, a grace period, then SIGKILL), then cancel the output handler."
+    sources: ["vllm/v1/engine/async_llm.py:296-308"]
+    request: {type: object, properties: {timeout: {type: ["number", "null"], default: null, description: "seconds; the API server passes shutdown_timeout (0 by default), the finalizer None"}}}
+    behavior:
+      - title: "engine_core.shutdown(timeout=timeout)"
+        source: "vllm/v1/engine/async_llm.py:305-306"
+        call: async-mp-client.shutdown
+        input: {timeout: "= has(input.timeout) ? input.timeout : null"}
+        as: sd
+      - title: "cancel_task_threadsafe(output_handler)"
+        source: "vllm/v1/engine/async_llm.py:307-308"
+        set: {state.output_handler_running: false, state.output_handler_done: true}
+      - return: {shutdown: true, killed: "= vars.sd.value.killed"}
+
+  - component: async-mp-client
+    name: shutdown
+    kind: function
+    summary: "MPClient.shutdown: stop the engine manager under the timeout, then run BackgroundResources (engine_dead, close sockets, cancel the output task)."
+    sources: ["vllm/v1/engine/core_client.py:766-777"]
+    request: {type: object, properties: {timeout: {type: ["number", "null"], default: null}}}
+    behavior:
+      - call: core-engine-proc-manager.shutdown
+        input: {timeout: "= has(input.timeout) ? input.timeout : null"}
+        as: mgr
+      - title: "self.resources(): engine_dead = True, sockets closed, output task cancelled"
+        source: "vllm/v1/engine/core_client.py:776"
+        call: async-mp-client.mark-dead
+      - return: {killed: "= vars.mgr.value.killed"}
+
+  - component: core-engine-proc-manager
+    name: shutdown
+    kind: function
+    summary: "CoreEngineProcManager.shutdown -> utils.shutdown(procs, timeout): SIGTERM each engine process, wait up to the grace (5 s when timeout is None; 0 s for the API server's shutdown_timeout 0 on CUDA), then SIGKILL the survivors' process trees."
+    sources: ["vllm/v1/engine/utils.py:335-348", "vllm/v1/utils.py:605-660"]
+    request: {type: object, properties: {timeout: {type: ["number", "null"], default: null}}}
+    behavior:
+      - title: "shutdown sets manager_stopped first, so the liveness monitor ignores the exits it causes"
+        source: "vllm/v1/engine/utils.py:335-339"
+        set: {state.manager_stopped: true}
+      - title: "get_engine_process_shutdown_timeout keeps the timeout on CUDA; None becomes the 5 s best-effort grace"
+        source: "vllm/v1/engine/utils.py:47-67"
+        set: {vars.grace_ms: "= has(input.timeout) && input.timeout != null ? int(double(input.timeout) * 1000.0) : 5000"}
+      - title: "proc.terminate(): SIGTERM the engine-core process"
+        source: "vllm/v1/utils.py:624-631"
+        call: engine-core-proc.signal-handler
+        input: {signal: SIGTERM}
+      - if: "vars.grace_ms <= 0"
+        then:
+          - title: "No grace (shutdown_timeout 0 on CUDA): the engine is still alive, so kill_process_tree (SIGKILL) at once"
+            source: "vllm/v1/utils.py:633-658"
+            kill: {component: engine-core-proc}
+          - set: {state.started: false, state.killed: true}
+          - return: {killed: true}
+      - title: "proc.join(remaining): wait for the engine to exit within the grace"
+        source: "vllm/v1/utils.py:633-639"
+        receive: engine-core-exit
+        as: exited
+        timeout_ms: "= vars.grace_ms"
+        on_error:
+          - title: "Still alive after the grace: kill_process_tree (SIGKILL) the engine-core process tree"
+            source: "vllm/v1/utils.py:641-658"
+            kill: {component: engine-core-proc}
+          - set: {state.started: false, state.killed: true}
+          - return: {killed: true}
+      - set: {state.started: false}
+      - return: {killed: false}
+
+  # ------------------------------------------------------------------ AsyncLLM: other entry points with logic
+  - component: async-llm
+    name: get-num-unfinished-requests
+    kind: function
+    sources: ["vllm/v1/engine/async_llm.py:310-311"]
+    response: {type: integer}
+    behavior:
+      - call: output-processor.get-num-unfinished-requests
+        as: n
+      - return: "= vars.n.value"
+
+  - component: async-llm
+    name: get-num-queued-tokens
+    kind: function
+    sources: ["vllm/v1/engine/async_llm.py:313-314"]
+    response: {type: integer}
+    behavior:
+      - call: output-processor.get-num-queued-tokens
+        as: n
+      - return: "= vars.n.value"
+
+  - component: async-llm
+    name: get-supported-tasks
+    kind: function
+    summary: "AsyncLLM.get_supported_tasks: ask the engine once and cache the answer."
+    sources: ["vllm/v1/engine/async_llm.py:381-386"]
+    attributes: {racy_in_code: "check-then-await-then-set with no lock: two tasks that both find no cached _supported_tasks both ask the engine and both write the cache (async_llm.py:381-386); the answers are equal, so the race is benign"}
+    response: {type: array, items: {type: string}}
+    behavior:
+      - if: "state.supported_tasks != null"
+        then: [{return: "= state.supported_tasks"}]
+      - call: async-mp-client.call-utility-async
+        input: {method: get_supported_tasks}
+        as: t
+      - set: {state.supported_tasks: "= vars.t.value"}
+      - return: "= vars.t.value"
+
+  - component: async-llm
+    name: notify-kv-transfer-request-rejected
+    kind: function
+    summary: "AsyncLLM.notify_kv_transfer_request_rejected: submit a pre-aborted 1-token request so the KV connector's request_finished hook frees pre-admission transfer resources."
+    sources: ["vllm/v1/engine/async_llm.py:924-950"]
+    request: {type: object, properties: {request_id: {type: string, examples: [chatcmpl-abc123]}, kv_transfer_params: {type: object, default: {}}, data_parallel_rank: {type: ["integer", "null"], default: null}}}
+    behavior:
+      - title: "A stub request: one prompt token, max_tokens 1, the transfer params in extra_args, watermarking off (the stub never samples), aborted on arrival"
+        source: "vllm/v1/engine/async_llm.py:934-950"
+        call: async-mp-client.add-request-async
+        input: {request_id: "= input.request_id", prompt_token_ids: [0], sampling_params: {max_tokens: 1, watermarking: false, extra_args: {kv_transfer_params: "= input.kv_transfer_params"}}, arrival_time: "= now", priority: 0, data_parallel_rank: "= input.data_parallel_rank", pooling_params: null, abort_immediately: true}
+      - return: {submitted: "= input.request_id"}
+
+  - component: async-llm
+    name: encode
+    kind: function
+    summary: "AsyncLLM.encode: the pooling counterpart of generate: validate the pooling task, add the request, and stream PoolingRequestOutputs until finished."
+    sources: ["vllm/v1/engine/async_llm.py:994-1073"]
+    request: {type: object, properties: {request_id: {type: string, examples: [embd-abc123]}, prompt_token_ids: {type: array, items: {type: integer}, examples: [[128000, 9906]]}, pooling_params: {type: object, properties: {task: {type: string, examples: [embed]}}}}}
+    errors: [{code: vllm-validation-error, status: 0}, {code: engine-dead-error, status: 500}]
+    behavior:
+      - call: async-llm.get-supported-tasks
+        as: tasks
+      - if: "!(input.pooling_params.task in vars.tasks.value)"
+        then:
+          - title: "InputProcessor._validate_params: the model doesn't support this pooling task"
+            source: "vllm/v1/engine/input_processor.py:228-229"
+            fail: {code: vllm-validation-error, message: "This model does not support pooling"}
+      - call: async-llm.add-request
+        input: {request_id: "= input.request_id", prompt_token_ids: "= input.prompt_token_ids", sampling_params: {n: 1, max_tokens: 1}}
+        as: add
+      - return: {request_id: "= vars.add.value.request_id", finished: false}
+
+  - component: async-llm
+    name: check-health
+    kind: function
+    summary: "AsyncLLM.check_health: raise EngineDeadError when the engine is dead."
+    sources: ["vllm/v1/engine/async_llm.py:1089-1092"]
+    errors: [{code: engine-dead-error, status: 500}]
+    behavior:
+      - call: async-llm.errored
+        as: err
+      - if: "vars.err.value.errored"
+        then:
+          - title: "raise self.dead_error"
+            source: "vllm/v1/engine/async_llm.py:1091-1092"
+            fail: {code: engine-dead-error, status: 500, message: "EngineCore encountered an issue. See stack trace (above) for the root cause."}
+      - return: {healthy: true}
+
+  - component: async-llm
+    name: errored
+    kind: function
+    summary: "AsyncLLM.errored: the engine is dead (BackgroundResources.engine_dead, set by ENGINE_CORE_DEAD, a dead engine process or shutdown) or the output handler task has finished."
+    sources: ["vllm/v1/engine/async_llm.py:1307-1309", "vllm/engine/protocol.py:59-61"]
+    request: {type: object, properties: {}}
+    response: {type: object, properties: {errored: {type: boolean, examples: [false]}, is_running: {type: boolean, examples: [true]}}}
+    errors: [{code: engine-dead-error, status: 500, retryable: false}]
+    behavior:
+      - call: async-mp-client.ensure-alive
+        as: alive
+        on_error: continue
+      - title: "is_running: the output handler is not started yet, or not done"
+        source: "vllm/v1/engine/async_llm.py:1298-1301"
+        set: {vars.running: "= !state.output_handler_done"}
+      - return: {errored: "= !vars.alive.ok || !vars.running", is_running: "= vars.running"}
+
+  - component: async-llm
+    name: do-log-stats
+    kind: function
+    sources: ["vllm/v1/engine/async_llm.py:1085-1087"]
+    behavior:
+      - if: "!config['disable-log-stats']"
+        then:
+          - call: stat-logger-manager.log
+      - return: {logged: "= !config['disable-log-stats']"}
+
+  - component: async-llm
+    name: start-profile
+    kind: function
+    summary: "AsyncLLM.start_profile: one profiling session at a time (single API server); start the profiler on the engine (and the frontend)."
+    sources: ["vllm/v1/engine/async_llm.py:1094-1127", "vllm/exceptions.py:186-194"]
+    request: {type: object, properties: {profile_prefix: {type: ["string", "null"], default: null}}}
+    attributes: {single_writer: "start_profile and stop_profile hold async with self._profile_lock around every read and write of _profile_session_active (async_llm.py:1101, 1130)"}
+    errors: [{code: profiler-already-active-error, status: 0, retryable: false, summary: "GracefulHTTPError carrying HTTP 409"}]
+    behavior:
+      - if: "state.profile_session_active"
+        then:
+          - title: "A session is already active: ProfilerAlreadyActiveError (HTTP 409)"
+            source: "vllm/v1/engine/async_llm.py:1102-1103"
+            fail: {code: profiler-already-active-error, message: "A profiling session is already active", data: {http_status: 409}}
+      - set: {state.profile_session_active: true}
+      - call: async-mp-client.call-utility-async
+        input: {method: profile, args: {is_start: true, profile_prefix: "= has(input.profile_prefix) ? input.profile_prefix : null"}}
+        on_error:
+          - title: "A reported engine failure clears the session"
+            source: "vllm/v1/engine/async_llm.py:1110-1121"
+            set: {state.profile_session_active: false}
+          - fail: "= error"
+      - return: {profiling: true}
+
+  - component: async-llm
+    name: stop-profile
+    kind: function
+    sources: ["vllm/v1/engine/async_llm.py:1129-1135"]
+    behavior:
+      - call: async-mp-client.call-utility-async
+        input: {method: profile, args: {is_start: false}}
+      - set: {state.profile_session_active: false}
+      - return: {profiling: false}
+
+  - component: async-llm
+    name: pause-generation
+    kind: function
+    summary: "AsyncLLM.pause_generation: pause the engine scheduler (abort, wait or keep in-flight requests; optionally clear caches), then sleep 20 ms so final outputs land first."
+    sources: ["vllm/v1/engine/async_llm.py:952-984"]
+    request: {type: object, properties: {mode: {type: string, enum: [abort, wait, keep], default: abort}, clear_cache: {type: boolean, default: true}}}
+    behavior:
+      - call: async-mp-client.call-utility-async
+        input: {method: pause_scheduler, args: {mode: "= has(input.mode) ? input.mode : 'abort'", clear_cache: "= has(input.clear_cache) ? input.clear_cache : true"}}
+        as: r
+      - title: "asyncio.sleep(0.02) so in-flight final outputs are delivered first"
+        source: "vllm/v1/engine/async_llm.py:984"
+        wait: 20
+      - return: "= vars.r.value"
+
+  - component: async-llm
+    name: sleep
+    kind: function
+    sources: ["vllm/v1/engine/async_llm.py:1154-1160", "vllm/engine/protocol.py:197-200"]
+    request: {type: object, properties: {level: {type: integer, default: 1}, mode: {type: string, default: abort}}}
+    behavior:
+      - call: async-mp-client.call-utility-async
+        input: {method: sleep, args: {level: "= has(input.level) ? input.level : 1", mode: "= has(input.mode) ? input.mode : 'abort'"}}
+        as: r
+      - if: "!config['disable-log-stats']"
+        then:
+          - call: stat-logger-manager.record-sleep-state
+            input: {sleep: 1, level: "= has(input.level) ? input.level : 1"}
+      - return: "= vars.r.value"
+
+  - component: async-llm
+    name: release-kv-cache-memory
+    kind: function
+    sources: ["vllm/v1/engine/async_llm.py:1162-1167"]
+    behavior:
+      - call: async-mp-client.call-utility-async
+        input: {method: release_kv_cache_memory}
+      - if: "!config['disable-log-stats']"
+        then:
+          - call: stat-logger-manager.record-sleep-state
+            input: {sleep: 1, level: 0}
+      - return: {released: true}
+
+  - component: async-llm
+    name: wake-up
+    kind: function
+    sources: ["vllm/v1/engine/async_llm.py:1169-1175"]
+    request: {type: object, properties: {tags: {type: ["array", "null"], items: {type: string}, default: null}}}
+    response: {type: boolean}
+    behavior:
+      - title: "wake_up_async: all(call_utility_all_async('wake_up', tags)): awake only when every engine is"
+        source: "vllm/v1/engine/core_client.py:1352-1353"
+        call: async-mp-client.call-utility-all-async
+        input: {method: wake_up, args: {tags: "= has(input.tags) ? input.tags : null"}}
+        as: r
+      - set: {vars.awake: "= vars.r.value.all(x, x == true)"}
+      - if: "!config['disable-log-stats'] && vars.awake"
+        then:
+          - call: stat-logger-manager.record-sleep-state
+            input: {sleep: 0, level: 0}
+      - return: "= vars.awake"
+
+  - component: async-llm
+    name: wait-for-requests-to-drain
+    kind: function
+    summary: "AsyncLLM.wait_for_requests_to_drain: poll every second until the engines are idle; TimeoutError after drain_timeout."
+    sources: ["vllm/v1/engine/async_llm.py:1217-1231"]
+    request: {type: object, properties: {drain_timeout: {type: integer, default: 300}}}
+    errors: [{code: timeout-error, status: 0}]
+    behavior:
+      - call: engine-core-proc.has-work
+        as: busy
+      - if: "!vars.busy.value"
+        then:
+          - title: Engines are idle, requests have been drained
+            source: "vllm/v1/engine/async_llm.py:1221-1223"
+            return: {drained: true}
+      - wait: "= (has(input.drain_timeout) ? input.drain_timeout : 300) * 1000"
+      - fail: {code: timeout-error, message: "= 'Timeout reached after ' + string(has(input.drain_timeout) ? input.drain_timeout : 300) + ' seconds waiting for requests to drain.'"}
+
+  - component: async-llm
+    name: handle-fault
+    kind: function
+    sources: ["vllm/v1/engine/async_llm.py:1289-1293"]
+    request: {type: object, properties: {request_id: {type: string, examples: [ft-1]}, instruction: {type: string, examples: [retry]}, params: {type: object, default: {}}}}
+    behavior:
+      - call: async-mp-client.handle-fault
+        input: "= input"
+        as: r
+      - return: "= vars.r.value"
+
+  - component: async-llm
+    name: get-status
+    kind: function
+    summary: "AsyncLLM.get_status: the client's cached per-engine fault-tolerance status."
+    sources: ["vllm/v1/engine/async_llm.py:1295-1296", "vllm/v1/engine/core_client.py:1411-1416"]
+    behavior:
+      - call: async-mp-client.get-status
+        as: s
+      - return: "= vars.s.value"
+
+  - component: async-mp-client
+    name: get-status
+    kind: function
+    sources: ["vllm/v1/engine/core_client.py:1411-1416"]
+    behavior:
+      - return: {schema_version: 1, total_engines: 1, engines: "= state.engine_status"}
+
+  - component: async-llm
+    name: finish-weight-update
+    kind: function
+    summary: "AsyncLLM.finish_weight_update: finish the update on every worker, then record the new weight version if given."
+    sources: ["vllm/v1/engine/async_llm.py:1351-1355"]
+    request: {type: object, properties: {weight_version: {type: ["string", "null"], examples: [step-200], default: null}}}
+    behavior:
+      - call: async-mp-client.call-utility-async
+        input: {method: collective_rpc, args: {method: finish_weight_update}}
+      - if: "has(input.weight_version) && input.weight_version != null"
+        then:
+          - call: async-llm.update-weight-version
+            input: {new_version: "= input.weight_version"}
+      - return: {finished: true}
+
+  # ------------------------------------------------------------------ LLMEngine
+  - component: llm-engine
+    name: from-engine-args
+    kind: function
+    summary: "LLMEngine.from_engine_args: build the config, pick the executor class, enable multiprocessing (VLLM_ENABLE_V1_MULTIPROCESSING, on by default) and construct the engine with a SyncMPClient."
+    sources: ["vllm/v1/engine/llm_engine.py:173-198"]
+    behavior:
+      - call: executor.get-class
+        as: cls
+      - set: {state.log_stats: "= !config['disable-log-stats']"}
+      - title: "make_client(multiprocess_mode=True, asyncio_mode=False): a SyncMPClient connects to the engine-core process"
+        source: "vllm/v1/engine/llm_engine.py:174-197"
+        call: core-engine-proc-manager.launch
+        input: {client_kind: sync}
+        as: core
+      - return: {executor_class: "= vars.cls.value.executor_class", num_gpu_blocks: "= vars.core.value.num_gpu_blocks"}
+
+  - component: llm-engine
+    name: from-vllm-config
+    kind: function
+    sources: ["vllm/v1/engine/llm_engine.py:156-171"]
+    behavior:
+      - call: executor.get-class
+        as: cls
+      - call: core-engine-proc-manager.launch
+        input: {client_kind: sync}
+        as: core
+      - return: {executor_class: "= vars.cls.value.executor_class", num_gpu_blocks: "= vars.core.value.num_gpu_blocks"}
+
+  - component: llm-engine
+    name: add-request
+    kind: function
+    summary: "LLMEngine.add_request: type-check the id, process inputs, assign the internal id, register in the output processor (no queue: outputs come back from step) and send ADD; n>1 fans out children."
+    sources: ["vllm/v1/engine/llm_engine.py:229-317"]
+    request: EngineCoreClientRequest
+    response: {type: string}
+    errors: [{code: type-error, status: 0}, {code: vllm-validation-error, status: 0}, {code: engine-dead-error, status: 500}]
+    behavior:
+      - if: "type(input.request_id) != string"
+        then:
+          - fail: {code: type-error, message: "request_id must be a string"}
+      - call: input-processor.process-inputs
+        input: "= input"
+        as: req
+      - call: input-processor.assign-request-id
+        input: "= vars.req.value"
+        as: rid
+      - set:
+          vars.request: "= merge(vars.req.value, {'request_id': vars.rid.value.request_id, 'external_req_id': input.request_id})"
+          vars.n: "= has(input.sampling_params) && has(input.sampling_params.n) && input.sampling_params.n != null ? input.sampling_params.n : 1"
+      - if: "vars.n == 1"
+        then:
+          - call: output-processor.add-request
+            input: {request: "= vars.request", parent_request_id: null, has_queue: false}
+          - call: sync-mp-client.add-request
+            input: "= vars.request"
+          - return: "= vars.request.request_id"
+      - title: "Fan out child requests (for n>1)"
+        source: "vllm/v1/engine/llm_engine.py:304-317"
+        foreach: "= lists.range(vars.n)"
+        as: idx
+        steps:
+          - set: {vars.child: "= merge(vars.request, {'request_id': string(vars.idx) + '_' + vars.request.request_id, 'sampling_params': merge(vars.request.sampling_params, {'n': 1})})"}
+          - call: output-processor.add-request
+            input: {request: "= vars.child", parent_request_id: "= vars.request.request_id", has_queue: false}
+          - call: sync-mp-client.add-request
+            input: "= vars.child"
+      - return: "= vars.request.request_id"
+
+  - component: llm-engine
+    name: step
+    kind: function
+    summary: "LLMEngine.step: (or a DP dummy batch) block for the next EngineCoreOutputs, process them into RequestOutputs, abort stop-string finishes in the engine core, record stats."
+    sources: ["vllm/v1/engine/llm_engine.py:319-366"]
+    response: {type: object, properties: {request_outputs: {type: array, items: {$ref: EngineCoreRequestOutput}}}}
+    errors: [{code: engine-dead-error, status: 500}]
+    behavior:
+      - if: "state.should_execute_dummy_batch"
+        then:
+          - title: "DP: run a dummy batch instead of waiting for outputs"
+            source: "vllm/v1/engine/llm_engine.py:320-323"
+            set: {state.should_execute_dummy_batch: false}
+          - call: sync-mp-client.call-utility
+            input: {method: execute_dummy_batch}
+          - return: {request_outputs: []}
+      - title: "1) Get EngineCoreOutputs from the engine core"
+        source: "vllm/v1/engine/llm_engine.py:326-327"
+        call: sync-mp-client.get-output
+        as: outs
+      - title: "2) Process EngineCoreOutputs"
+        source: "vllm/v1/engine/llm_engine.py:330-339"
+        call: output-processor.process-outputs
+        input: {outputs: "= has(vars.outs.value.outputs) ? vars.outs.value.outputs : []"}
+        as: proc
+      - title: "3) Abort any requests that finished due to stop strings"
+        source: "vllm/v1/engine/llm_engine.py:349-351"
+        call: sync-mp-client.abort-requests
+        input: {request_ids: "= vars.proc.value.reqs_to_abort"}
+      - if: "state.log_stats"
+        then:
+          - title: "4) Record stats"
+            source: "vllm/v1/engine/llm_engine.py:353-363"
+            call: stat-logger-manager.record
+            input: {num_outputs: "= has(vars.outs.value.outputs) ? size(vars.outs.value.outputs) : 0", finished: "= vars.proc.value.finished"}
+      - return: {request_outputs: "= vars.proc.value.request_outputs"}
+
+  - component: llm-engine
+    name: get-num-unfinished-requests
+    kind: function
+    sources: ["vllm/v1/engine/llm_engine.py:200-201"]
+    response: {type: integer}
+    behavior:
+      - call: output-processor.get-num-unfinished-requests
+        as: n
+      - return: "= vars.n.value"
+
+  - component: llm-engine
+    name: has-unfinished-requests
+    kind: function
+    summary: "LLMEngine.has_unfinished_requests: the output processor still tracks requests (or, without DP, the engines are running)."
+    sources: ["vllm/v1/engine/llm_engine.py:203-207"]
+    response: {type: boolean}
+    behavior:
+      - call: output-processor.get-num-unfinished-requests
+        as: n
+      - return: "= vars.n.value > 0"
+
+  - component: llm-engine
+    name: abort-request
+    kind: function
+    sources: ["vllm/v1/engine/llm_engine.py:224-227"]
+    request: {type: object, properties: {request_ids: {type: array, items: {type: string}}, internal: {type: boolean, default: false}}}
+    behavior:
+      - call: output-processor.abort-requests
+        input: {request_ids: "= input.request_ids", internal: "= has(input.internal) ? input.internal : false"}
+        as: ids
+      - call: sync-mp-client.abort-requests
+        input: {request_ids: "= vars.ids.value"}
+      - return: {aborted: "= vars.ids.value"}
+
+  - component: llm-engine
+    name: get-supported-tasks
+    kind: function
+    sources: ["vllm/v1/engine/llm_engine.py:217-222"]
+    behavior:
+      - call: sync-mp-client.call-utility
+        input: {method: get_supported_tasks}
+        as: t
+      - return: "= vars.t.value"
+
+  - component: llm-engine
+    name: start-profile
+    kind: function
+    sources: ["vllm/v1/engine/llm_engine.py:368-390"]
+    request: {type: object, properties: {profile_prefix: {type: ["string", "null"], default: null}}}
+    errors: [{code: profiler-already-active-error, status: 0}]
+    behavior:
+      - if: "state.profile_session_active"
+        then:
+          - fail: {code: profiler-already-active-error, message: "A profiling session is already active", data: {http_status: 409}}
+      - set: {state.profile_session_active: true}
+      - call: sync-mp-client.call-utility
+        input: {method: profile, args: {is_start: true}}
+        on_error:
+          - title: "except BaseException: clear the flag and re-raise. LLMEngine is driven from one thread (capacity 1), so the flag is still the True set above; the set reads it afresh"
+            source: "vllm/v1/engine/llm_engine.py:388-390"
+            set: {state.profile_session_active: "= state.profile_session_active && false"}
+          - fail: "= error"
+      - return: {profiling: true}
+
+  - component: llm-engine
+    name: stop-profile
+    kind: function
+    sources: ["vllm/v1/engine/llm_engine.py:392-394"]
+    behavior:
+      - call: sync-mp-client.call-utility
+        input: {method: profile, args: {is_start: false}}
+      - set: {state.profile_session_active: false}
+      - return: {profiling: false}
+
+  - component: llm-engine
+    name: sleep
+    kind: function
+    sources: ["vllm/v1/engine/llm_engine.py:418-424", "vllm/v1/engine/core_client.py:1070-1071", "vllm/v1/engine/core_client.py:204-205"]
+    request: {type: object, properties: {level: {type: integer, default: 1}, mode: {type: string, default: abort}}}
+    behavior:
+      - call: sync-mp-client.call-utility
+        input: {method: sleep, args: {level: "= has(input.level) ? input.level : 1", mode: "= has(input.mode) ? input.mode : 'abort'"}}
+      - if: "state.log_stats"
+        then:
+          - call: stat-logger-manager.record-sleep-state
+            input: {sleep: 1, level: "= has(input.level) ? input.level : 1"}
+      - return: {sleeping: true}
+
+  - component: llm-engine
+    name: release-kv-cache-memory
+    kind: function
+    sources: ["vllm/v1/engine/llm_engine.py:426-431"]
+    behavior:
+      - call: sync-mp-client.call-utility
+        input: {method: release_kv_cache_memory}
+      - if: "state.log_stats"
+        then:
+          - call: stat-logger-manager.record-sleep-state
+            input: {sleep: 1, level: 0}
+      - return: {released: true}
+
+  - component: llm-engine
+    name: wake-up
+    kind: function
+    sources: ["vllm/v1/engine/llm_engine.py:433-439"]
+    request: {type: object, properties: {tags: {type: ["array", "null"], items: {type: string}, default: null}}}
+    response: {type: boolean}
+    behavior:
+      - call: sync-mp-client.call-utility
+        input: {method: wake_up, args: {tags: "= has(input.tags) ? input.tags : null"}}
+        as: r
+      - if: "state.log_stats && vars.r.value"
+        then:
+          - call: stat-logger-manager.record-sleep-state
+            input: {sleep: 0, level: 0}
+      - return: "= vars.r.value"
+
+  - component: llm-engine
+    name: get-metrics
+    kind: function
+    summary: "LLMEngine.get_metrics: requires stat logging (assert), then snapshot the vllm:* Prometheus metrics."
+    sources: ["vllm/v1/engine/llm_engine.py:444-446"]
+    errors: [{code: assertion-error, status: 0}]
+    behavior:
+      - if: "!state.log_stats"
+        then:
+          - fail: {code: assertion-error, message: "Stat logging disabled"}
+      - call: reader.get-metrics-snapshot
+        as: m
+      - return: "= vars.m.value"
+
+  - component: llm-engine
+    name: do-log-stats
+    kind: function
+    sources: ["vllm/v1/engine/llm_engine.py:455-458"]
+    behavior:
+      - if: "state.log_stats"
+        then:
+          - call: stat-logger-manager.log
+      - return: {logged: "= state.log_stats"}
+
+  - component: llm-engine
+    name: do-log-stats-with-interval
+    kind: function
+    summary: "Log stats only when VLLM_LOG_STATS_INTERVAL (10 s) has passed since the last log."
+    sources: ["vllm/v1/engine/llm_engine.py:460-467"]
+    behavior:
+      - if: "!has(state.last_log_ms)"
+        then:
+          - set: {state.last_log_ms: "= now"}
+      - if: "now - state.last_log_ms >= 10000"
+        then:
+          - call: llm-engine.do-log-stats
+          - set: {state.last_log_ms: "= now"}
+          - return: {logged: true}
+      - return: {logged: false}
+
+  # ------------------------------------------------------------------ metrics
+  - component: stat-logger-manager
+    name: load-stat-logger-plugin-factories
+    kind: function
+    summary: "Load every vllm.stat_logger_plugins entry point; each must be a StatLoggerBase subclass or TypeError."
+    sources: ["vllm/v1/metrics/loggers.py:84-98"]
+    response: {type: array, items: {type: string}}
+    errors: [{code: type-error, status: 0}]
+    behavior:
+      - set: {vars.factories: []}
+      - title: "load_plugins_by_group(STAT_LOGGER_PLUGINS_GROUP)"
+        source: "vllm/v1/metrics/loggers.py:87"
+        foreach: "= state.entry_points"
+        index: name
+        as: ep
+        steps:
+          - if: "!vars.ep.subclass_of_stat_logger_base"
+            then:
+              - title: "Not a StatLoggerBase subclass"
+                source: "vllm/v1/metrics/loggers.py:88-94"
+                fail: {code: type-error, message: "= 'Stat logger plugin ' + vars.name + ' must be a subclass of StatLoggerBase'"}
+          - set: {vars.factories: "= vars.factories + [vars.name]"}
+      - return: "= vars.factories"
+
+  - component: stat-logger-manager
+    name: init
+    kind: function
+    summary: "StatLoggerManager.__init__: custom loggers, plus LoggingStatLogger for a single API server, plus PrometheusStatLogger unless a custom one replaces it."
+    sources: ["vllm/v1/metrics/loggers.py:1370-1419"]
+    request: {type: object, properties: {custom: {type: array, items: {type: string}}, enable_default_loggers: {type: boolean}}}
+    behavior:
+      - set:
+          state.loggers: "= input.custom + (input.enable_default_loggers ? ['LoggingStatLogger'] : []) + (input.custom.exists(c, c == 'PrometheusStatLogger') ? [] : ['PrometheusStatLogger'])"
+      - return: {loggers: "= state.loggers"}
+
+  - component: stat-logger-manager
+    name: record
+    kind: function
+    summary: "StatLoggerManager.record: every stat logger records the step; the Prometheus logger counts finished requests and generation tokens."
+    sources: ["vllm/v1/metrics/loggers.py:1421-1436"]
+    request: {type: object, properties: {num_outputs: {type: integer}, finished: {type: integer}, num_prompt_tokens: {type: integer, default: 0}, scheduler_stats: {type: ["object", "null"], default: null}, engine_idx: {type: ["integer", "null"], default: null}}}
+    behavior:
+      - set: {vars.idx: "= has(input.engine_idx) && input.engine_idx != null ? input.engine_idx : 0"}
+      - title: "for stat_logger in self.stat_loggers: stat_logger.record(scheduler_stats, iteration_stats, engine_idx) (StatLoggerBase.record)"
+        source: "vllm/v1/metrics/loggers.py:1430-1436"
+        foreach: "= state.loggers.filter(l, l != 'PrometheusStatLogger')"
+        as: lg
+        steps:
+          - call: "= vars.lg == 'LoggingStatLogger' ? 'logging-stat-logger.record' : (vars.lg == 'AggregatedLoggingStatLogger' ? 'logging-stat-logger.record-aggregated' : 'per-engine-stat-logger-adapter.record')"
+            targets: [logging-stat-logger.record, logging-stat-logger.record-aggregated, per-engine-stat-logger-adapter.record]
+            input:
+              engine_idx: "= vars.idx"
+              iteration_stats: {num_prompt_tokens: "= has(input.num_prompt_tokens) ? input.num_prompt_tokens : 0", num_generation_tokens: "= input.num_outputs"}
+              scheduler_stats: "= has(input.scheduler_stats) ? input.scheduler_stats : null"
+      - title: "PrometheusStatLogger.record: the generation-token and request-success counters"
+        source: "vllm/v1/metrics/loggers.py:1138-1330"
+        call: prometheus-registry.incr
+        input: {name: "vllm:generation_tokens", value: "= input.num_outputs"}
+      - if: "input.finished > 0"
+        then:
+          - call: prometheus-registry.incr
+            input: {name: "vllm:request_success", value: "= input.finished"}
+
+  - component: stat-logger-manager
+    name: record-admission-rejection
+    kind: function
+    sources: ["vllm/v1/metrics/loggers.py:1442-1445", "vllm/v1/metrics/loggers.py:1332-1333"]
+    request: {type: object, properties: {reason: {type: string, enum: [max_num_queued_reqs, max_num_queued_tokens]}}}
+    behavior:
+      - call: prometheus-registry.incr
+        input: {name: "vllm:admission_rejections", value: 1}
+      - set: {state.admission_rejections: "= merge(state.admission_rejections, {input.reason: (input.reason in state.admission_rejections ? state.admission_rejections[input.reason] : 0) + 1})"}
+
+  - component: stat-logger-manager
+    name: record-sleep-state
+    kind: function
+    summary: "Set the vllm:engine_sleep_state gauges: awake, weights_offloaded (level 1) or discard_all (level 2)."
+    sources: ["vllm/v1/metrics/loggers.py:1438-1440", "vllm/v1/metrics/loggers.py:1335-1353"]
+    request: {type: object, properties: {sleep: {type: integer}, level: {type: integer}}}
+    behavior:
+      - set: {state.sleep_state: "= {'awake': input.sleep == 1 ? 0 : 1, 'weights_offloaded': input.sleep == 1 && input.level == 1 ? 1 : 0, 'discard_all': input.sleep == 1 && input.level == 2 ? 1 : 0}"}
+      - call: prometheus-registry.set
+        input: {name: "vllm:engine_sleep_state", value: "= state.sleep_state"}
+
+  - component: stat-logger-manager
+    name: log
+    kind: function
+    sources: ["vllm/v1/metrics/loggers.py:1447-1449"]
+    behavior:
+      - set: {state.last_log_ms: "= now"}
+      - return: {loggers: "= state.loggers"}
+
+  - component: prometheus-registry
+    name: incr
+    kind: io
+    request: {type: object, properties: {name: {type: string}, value: {type: integer}}}
+    sources: ["vllm/v1/metrics/loggers.py:1138-1160"]
+    store: {table: metrics, op: incr, key: "= input.name", value: "= input.value"}
+
+  - component: prometheus-registry
+    name: set
+    kind: io
+    request: {type: object, properties: {name: {type: string}, value: {}}}
+    sources: ["vllm/v1/metrics/loggers.py:1335-1353"]
+    store: {table: metrics, op: put, key: "= input.name", value: "= input.value"}
+
+  - component: prometheus-registry
+    name: collect
+    kind: io
+    sources: ["vllm/v1/metrics/reader.py:88"]
+    store: {table: metrics, op: query}
+
+  - component: reader
+    name: get-metrics-snapshot
+    kind: function
+    summary: "get_metrics_snapshot: collect the registry and keep only the vllm:* metrics."
+    sources: ["vllm/v1/metrics/reader.py:70-130", "vllm/v1/metrics/reader.py:25-42", "vllm/v1/metrics/reader.py:11-21"]
+    behavior:
+      - call: prometheus-registry.collect
+        as: all
+      - return: {count: "= size(vars.all.value)"}
+
+  - component: buckets
+    name: histogram-buckets
+    kind: function
+    summary: "histogram_buckets: an override wins verbatim; request_tokens needs max_model_len and is a 1-2-5 series up to it; every other family returns a fresh copy of its static default."
+    sources: ["vllm/v1/metrics/buckets.py:206-240"]
+    request: {type: object, required: [family], properties: {family: {type: string, enum: [request_latency, time_to_first_token, inter_token_latency, iteration_tokens, request_params_n, request_num_preemptions, request_tokens, kv_cache_residency], examples: [request_latency]}, max_model_len: {type: ["integer", "null"], default: null}, overrides: {type: ["object", "null"], default: null}}}
+    response: {type: array, items: {type: number}}
+    errors: [{code: value-error, status: 0, retryable: false}]
+    behavior:
+      - if: "has(input.overrides) && input.overrides != null && input.family in input.overrides"
+        then:
+          - title: "A present override replaces the family's defaults verbatim"
+            source: "vllm/v1/metrics/buckets.py:232-233"
+            return: "= input.overrides[input.family]"
+      - if: "input.family == 'request_tokens'"
+        then:
+          - if: "!has(input.max_model_len) || input.max_model_len == null"
+            then:
+              - title: "request_tokens without max_model_len"
+                source: "vllm/v1/metrics/buckets.py:235-239"
+                fail: {code: value-error, message: "max_model_len is required for the 'request_tokens' bucket family"}
+          - title: "build_1_2_5_buckets(max_model_len)"
+            source: "vllm/v1/metrics/buckets.py:195-204"
+            return: "= [1, 10, 100, 1000, 10000, 100000, 1000000, 10000000, 100000000, 1000000000].map(p, [1, 2, 5].map(m, m * p)).flatten().filter(v, v <= input.max_model_len)"
+      - return: "= state.static_families[input.family]"
+
+  # ------------------------------------------------------------------ Ray data-parallel placement
+  - component: ray-cluster
+    name: available-resources-per-node
+    kind: rpc
+    sources: ["vllm/v1/engine/utils.py:651-660"]
+    response: {type: array}
+    behavior:
+      - return: "= state.nodes"
+
+  - component: ray-cluster
+    name: placement-group
+    kind: rpc
+    summary: "ray.util.placement_group(name, strategy, bundles): reserve the devices of one DP rank on one node."
+    sources: ["vllm/v1/engine/utils.py:822-826"]
+    request: {type: object, properties: {name: {type: string}, strategy: {type: string}, node_ip: {type: string}, num_devices: {type: integer}}}
+    store: {table: placement_groups, op: put, key: "= input.name", value: "= input"}
+
+  - component: core-engine-actor-manager
+    name: create-dp-placement-groups
+    kind: function
+    summary: "CoreEngineActorManager.create_dp_placement_groups: list the live nodes master first, keep only VLLM_RAY_DP_PLACEMENT_NODE_IPS (plus the master) when set, then give the master data_parallel_size_local ranks and every other node that fits them the same (strict), until data_parallel_size placement groups exist."
+    sources: ["vllm/v1/engine/utils.py:642-850"]
+    request:
+      type: object
+      properties:
+        data_parallel_size: {type: integer, examples: [16]}
+        data_parallel_size_local: {type: integer, examples: [8]}
+        world_size: {type: integer, default: 1}
+        master_ip: {type: string, examples: [10.0.0.1]}
+    response: {type: object, properties: {placement_groups: {type: array}}}
+    errors: [{code: value-error, status: 0, retryable: false}, {code: assertion-error, status: 0, retryable: false}]
+    behavior:
+      - call: ray-cluster.available-resources-per-node
+        as: res
+      - title: "_dp_nodes_master_first: the DP master node first; it must be alive"
+        source: "vllm/v1/engine/utils.py:159-181"
+        set:
+          vars.nodes: "= vars.res.value.filter(n, n.ip == input.master_ip) + vars.res.value.filter(n, n.ip != input.master_ip)"
+      - if: "size(vars.nodes) == 0 || vars.nodes[0].ip != input.master_ip"
+        then:
+          - fail: {code: assertion-error, message: "= 'The DP master node (ip: ' + input.master_ip + ') is missing or dead'"}
+      - set:
+          vars.allow: "= config['vllm-ray-dp-placement-node-ips'].split(',').map(x, x.trim()).filter(x, x != '')"
+      - if: "size(vars.allow) > 0"
+        then:
+          - title: "VLLM_RAY_DP_PLACEMENT_NODE_IPS set: restrict placement to the listed nodes, always keeping the master"
+            source: "vllm/v1/engine/utils.py:668-688"
+            set:
+              vars.nodes: "= vars.nodes.filter(n, n.ip in vars.allow || n.ip == input.master_ip)"
+      - set:
+          vars.ws: "= has(input.world_size) ? input.world_size : 1"
+          vars.local: "= has(input.data_parallel_size_local) ? input.data_parallel_size_local : 1"
+          vars.pgs: []
+      - foreach: "= vars.nodes"
+        as: node
+        steps:
+          - if: "size(vars.pgs) >= input.data_parallel_size"
+            then: [{break: true}]
+          - set: {vars.avail: "= vars.node.GPU / vars.ws"}
+          - if: "vars.node.ip == input.master_ip && vars.avail < vars.local"
+            then:
+              - title: "The master must host data_parallel_size_local ranks"
+                source: "vllm/v1/engine/utils.py:766-772"
+                fail: {code: value-error, message: "= 'Not enough resources to allocate ' + string(vars.local) + ' DP ranks on DP master node ' + input.master_ip + ', possible to fit ' + string(vars.avail) + ' DP ranks.'"}
+          - if: "vars.node.ip != input.master_ip && vars.avail < vars.local"
+            then:
+              - title: "strict: skip a node where data_parallel_size_local ranks don't fit"
+                source: "vllm/v1/engine/utils.py:774-783"
+                continue: true
+          - title: "One STRICT_PACK placement group per DP rank, with node affinity to this node"
+            source: "vllm/v1/engine/utils.py:795-833"
+            foreach: "= lists.range(vars.local)"
+            as: i
+            steps:
+              - if: "size(vars.pgs) >= input.data_parallel_size"
+                then: [{break: true}]
+              - call: ray-cluster.placement-group
+                input: {name: "= 'dp_rank_' + string(size(vars.pgs))", strategy: STRICT_PACK, node_ip: "= vars.node.ip", num_devices: "= vars.ws"}
+              - set: {vars.pgs: "= vars.pgs + [{'name': 'dp_rank_' + string(size(vars.pgs)), 'node_ip': vars.node.ip}]"}
+      - if: "size(vars.pgs) < input.data_parallel_size"
+        then:
+          - title: "Not enough resources for data_parallel_size placement groups"
+            source: "vllm/v1/engine/utils.py:837-844"
+            fail: {code: value-error, message: "= 'Not enough resources to allocate ' + string(input.data_parallel_size) + ' placement groups, only created ' + string(size(vars.pgs)) + ' placement groups.'"}
+      - return: {placement_groups: "= vars.pgs"}

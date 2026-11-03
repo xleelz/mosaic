@@ -1,0 +1,58 @@
+schema_version: 1
+id: vllm
+scenarios:
+  - id: bench-p3-1
+    name: "P3-1 sampling in the V2 model runner: seeded, unseeded, greedy and penalised+logprobs rows in one batch; then the seeded and unseeded prompts re-run alone"
+    fixtures: [full-tp1-llama-8b]
+    steps:
+      - flow: wr-execute-model
+        as: e1
+        input:
+          total_num_scheduled_tokens: 16
+          num_scheduled_tokens: {r-seeded: 4, r-unseeded: 4, r-greedy: 4, r-pen: 4}
+          scheduled_new_reqs:
+            - {req_id: r-seeded, block_ids: [1], num_computed_tokens: 0, prompt_token_ids: [128000, 9906, 1917, 11],
+               sampling_params: {temperature: 0.8, seed: 42}}
+            - {req_id: r-unseeded, block_ids: [2], num_computed_tokens: 0, prompt_token_ids: [128000, 9906, 1917, 12],
+               sampling_params: {temperature: 0.8}}
+            - {req_id: r-greedy, block_ids: [3], num_computed_tokens: 0, prompt_token_ids: [128000, 9906, 1917, 13],
+               sampling_params: {temperature: 0.0, seed: 42}}
+            - {req_id: r-pen, block_ids: [4], num_computed_tokens: 0, prompt_token_ids: [128000, 9906, 1917, 14],
+               sampling_params: {temperature: 0.5, repetition_penalty: 1.3, frequency_penalty: 0.5, top_k: -1, top_p: 1.0, logprobs: 2}}
+      - flow: wr-sample-tokens
+        as: s1
+      # Re-run: same prompt and params as r-seeded / r-unseeded, alone in a new batch (different neighbours).
+      - flow: wr-execute-model
+        as: e2
+        input:
+          total_num_scheduled_tokens: 12
+          num_scheduled_tokens: {r-seeded-again: 4, r-unseeded-again: 4, r-greedy-noseed: 4}
+          scheduled_new_reqs:
+            - {req_id: r-seeded-again, block_ids: [5], num_computed_tokens: 0, prompt_token_ids: [128000, 9906, 1917, 11],
+               sampling_params: {temperature: 0.8, seed: 42}}
+            - {req_id: r-unseeded-again, block_ids: [6], num_computed_tokens: 0, prompt_token_ids: [128000, 9906, 1917, 12],
+               sampling_params: {temperature: 0.8}}
+            - {req_id: r-greedy-noseed, block_ids: [7], num_computed_tokens: 0, prompt_token_ids: [128000, 9906, 1917, 13],
+               sampling_params: {temperature: 0.0}}
+      - flow: wr-sample-tokens
+        as: s2
+    expect:
+      # (a) seeded draw is batch-independent and reproducible; unseeded differs; the fused FlashInfer sampler is off when any seed is set
+      - "steps.s1.result.ok && steps.s2.result.ok"
+      - "steps.s1.result.value.sampled_token_ids[steps.s1.result.value.req_ids.indexOf('r-seeded')] == steps.s2.result.value.sampled_token_ids[steps.s2.result.value.req_ids.indexOf('r-seeded-again')]"
+      - "steps.s1.result.value.sampled_token_ids[steps.s1.result.value.req_ids.indexOf('r-unseeded')] != steps.s2.result.value.sampled_token_ids[steps.s2.result.value.req_ids.indexOf('r-unseeded-again')]"
+      - "state['sampler@rank0'].slots.exists(k, state['sampler@rank0'].slots[k].seeded && state['sampler@rank0'].slots[k].seed == 42 && state['sampler@rank0'].slots[k].temperature == 0.8)"
+      - "!trace.exists(e, e.type == 'call.start' && e.interface.contains('flashinfer') && e.interface.contains('sampl'))"
+      - "trace.exists(e, e.type == 'call.start' && e.interface == 'gumbel.gumbel-sample-kernel')"
+      # (b) pipeline order: logit_bias (none here) -> penalties -> bad words -> temperature -> (min_p none) -> gumbel; greedy row ignores the seed
+      - "trace.filter(e, e.type == 'call.start' && e.interface in ['penalties-state.penalties-kernel', 'bad-words-state.apply', 'gumbel.temperature-kernel', 'gumbel.gumbel-sample-kernel']).map(e, e.interface).slice(0, 4) == ['penalties-state.penalties-kernel', 'bad-words-state.apply', 'gumbel.temperature-kernel', 'gumbel.gumbel-sample-kernel']"
+      - "!trace.exists(e, e.type == 'call.start' && e.interface in ['logit-bias-state.bias-kernel', 'min-p.min-p-kernel'])"
+      # temperature 0 is a plain argmax: the seed must not change the greedy token (sampling_params.py:612-616, gumbel.py:176-198)
+      - "steps.s1.result.value.sampled_token_ids[steps.s1.result.value.req_ids.indexOf('r-greedy')] == steps.s2.result.value.sampled_token_ids[steps.s2.result.value.req_ids.indexOf('r-greedy-noseed')]"
+      - "state['sampler@rank0'].slots.exists(k, state['sampler@rank0'].slots[k].temperature == 0.0 && state['sampler@rank0'].slots[k].top_k == 128256)"
+      # (c) top_k -1 -> vocab, top_p 1.0 -> no top-k/top-p kernel
+      - "state['sampler@rank0'].slots.exists(k, state['sampler@rank0'].slots[k].penalties && state['sampler@rank0'].slots[k].top_k == 128256 && state['sampler@rank0'].slots[k].top_p == 1.0)"
+      - "calls['topk-topp-triton.apply-top-k-top-p'] == 0"
+      # (d) penalties counted from the prompt at add time; logprobs computed (raw by default)
+      - "calls['penalties-state.bincount-kernel'] >= 1"
+      - "trace.exists(e, e.type == 'call.start' && e.interface == 'logprob.compute-topk-scores' && e.input.num_logprobs == 2)"

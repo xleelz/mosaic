@@ -1,0 +1,45 @@
+from base import SCEN
+NOS="!('session-1' in state['debug-model@w1'].sessions)"
+RUN="state['debug-model@w1'].sessions['session-1'].state == 'running'"
+TT="state['terminal-task-system@w1'].active_tasks == {}"
+X={
+ 'debug-start-untrusted':["state['debug-service@w1'].has_debugged == false"],'task-commands-untrusted':["state['terminal-task-system@w1'].active_tasks == {}"],'task-run-untrusted-api':["state['task-service@w1'].recently_used == []"],'task-run-untrusted-denied':["state['task-service@w1'].recently_used == []"],'terminal-create-no-backend':["size(state['terminal-service@w1'].instances) == 0"],
+ 'debug-before-shutdown-confirm-cancel':[RUN],'debug-before-shutdown-confirm-stop':[RUN],'debug-before-shutdown-never':[RUN],
+ 'debug-breakpoints-everywhere':["state['debug-model@w1'].breakpoints['bp-1'].uri == 'file:///work/app/README.md'","state['debug-storage@w1'].workspace_storage['debug.breakpoint'].size() == 1"],
+ 'debug-contributions-start':["'node' in state['adapter-manager@w1'].debuggers","state['debug-visualizer-service@w1'].visualizers == []"],
+ 'debug-post-debug-task':["state['debug-model@w1'].sessions['session-1'].state == 'inactive'",TT],
+ 'debug-prelaunch-task-errors-abort-setting':[NOS,TT],'debug-prelaunch-task-errors-debug-anyway-setting':[RUN,TT],'debug-prelaunch-task-errors-setting':[NOS],
+ 'debug-prelaunch-task-fails-debug-anyway':[RUN],'debug-prelaunch-task-fails-prompt-abort':[NOS],'debug-prelaunch-task-fails-show-errors':[NOS],
+ 'debug-prelaunch-task-missing':[NOS,"state['debug-service@w1'].initializing == false"],'debug-prelaunch-task-missing-debug-anyway':[RUN],
+ 'debug-raw-shutdown-twice':["state['raw-debug-session@w1'].sessions['session-1'].in_shutdown && !state['raw-debug-session@w1'].sessions['session-1'].adapter_running"],
+ 'debug-start-adapter-fails-initialize':["state['debug-model@w1'].sessions['session-1'].state == 'inactive'"],'debug-start-bad-request':[NOS],
+ 'debug-start-concurrent-cancel':["size(state['debug-model@w1'].sessions) == 1"],'debug-start-disabled-debugger':[NOS],'debug-start-guess-no-candidates':[NOS],
+ 'debug-start-launch-fails':["state['debug-model@w1'].sessions['session-1'].state == 'inactive'"],'debug-start-selected-none':[NOS],'debug-start-then-list':[RUN],
+ 'debug-start-unsupported-type':[NOS,"state['debug-service@w1'].next_session_seq == 2"],
+ 'debug-stopped-on-breakpoint-opens-view':["state['debug-model@w1'].sessions['session-1'].stopped_reason == 'breakpoint' && state['debug-model@w1'].focused_session == 'session-1'"],
+ 'debug-terminate-adapter-gone':["state['debug-model@w1'].sessions['session-5'].state == 'inactive'"],
+ 'debug-toggle-breakpoint-add':["state['debug-model@w1'].breakpoints['bp-1'].enabled"],'debug-toggle-breakpoint-remove':["size(state['debug-model@w1'].breakpoints) == 0 && !('debug.breakpoint' in state['debug-storage@w1'].workspace_storage)"],
+ 'output-no-active-channel':["!('git' in state['output-service@w1'].channels) && state['output-service@w1'].active_channel == null"],
+ 'pty-host-exit-gives-up':["state['pty-host-service'].started == false && state['pty-host-service'].restart_count == 6"],'pty-host-exit-on-quit':["state['pty-host-service'].started == false"],
+ 'pty-host-main-start':["trace.filter(e, e.type == 'note' && e.title.startsWith('registerChannel')).size() == 4"],
+ 'pty-layout-write-then-list':["state['pty-service'].layouts['w1-app'].tabs == [[1]]"],'pty-list-processes-persistent':["state['pty-service'].ptys['1'].should_persist"],
+ 'task-automatic-already-prompted':["state['run-automatic-tasks@w1'].has_run_tasks"],'task-automatic-none':["state['run-automatic-tasks@w1'].has_run_tasks && !state['run-automatic-tasks@w1'].has_prompted"],
+ 'task-automatic-prompt-disallow':["state['run-automatic-tasks@w1'].has_prompted && state['terminal-task-system@w1'].active_tasks == {}"],
+ 'task-commands-walkthrough':["state['task-service@w1'].recently_used[0] == 'build'"],'task-run-already-active':["'watch' in state['terminal-task-system@w1'].active_tasks"],
+ 'task-run-background-then-list':["state['terminal-task-system@w1'].active_tasks.watch.terminal == 1"],'task-run-quick-pick':["state['task-service@w1'].recently_used.size() == 1"],
+ 'task-run-save-never-and-prompt':["state['task-service@w1'].recently_used == ['build']"],'task-run-save-prompt':["state['task-service@w1'].recently_used == ['build']"],
+ 'task-run-untrusted-granted':["state['task-service@w1'].recently_used == ['build']"],'tasks-contributions-start-then-active':["state['run-automatic-tasks@w1'].has_run_tasks"],
+ 'terminal-agent-host-create':["state['terminal-service@w1'].instances['1'].should_persist == false"],
+ 'terminal-auto-replies':["state['terminal-instance-service@w1'].backends.local"],
+ 'terminal-before-shutdown-persist-timeout':["state['terminal-service@w1'].is_shutting_down"],
+ 'terminal-create-executable-missing':["state['pty-service'].ptys['1'].started == false"],'terminal-create-explicit-executable':["state['pty-service'].ptys['1'].executable == '/usr/bin/zsh'"],
+ 'terminal-create-feature-terminal':["state['pty-service'].ptys['1'].should_persist == false"],'terminal-create-spawn-failed':["state['pty-service'].ptys['1'].started == false"],
+ 'terminal-create-then-list':["state['terminal-group-service@w1'].groups == [[1]]"],'terminal-reconnect-attach-fails':["state['pty-service'].ptys['1'].started && !('7' in state['pty-service'].ptys) == false"],
+ 'terminal-reconnect-disabled':["state['terminal-service@w1'].connection_state == 'connected'"],'terminal-reconnect-task-terminal-skipped':["size(state['terminal-service@w1'].instances) == 0 && state['terminal-service@w1'].layout_listeners_attached"],
+ 'terminal-reconnect-then-list':["state['pty-service'].ptys['1'].grace_scheduled_at == null"],'terminal-rename-tab-then-read':["state['terminal-editing-service@w1'].editing_terminal == null"],
+ 'terminal-revive-window-close-mode':["state['terminal-service@w1'].is_shutting_down"],
+ 'test-run-happy':["state['test-service@w1'].running == {}"],'test-run-no-profile':["state['test-result-service@w1'].results[0].completed"],'test-run-no-save':["state['test-result-service@w1'].results[0].completed"],
+ 'test-run-unknown-test':["state['test-result-service@w1'].next_seq == 2"],'testing-cancel-and-clear':["state['test-service@w1'].running == {} && state['testing-continuous-run-service@w1'].running == {}"],
+}
+for s in SCEN:
+    if s['id'] in X: s['expect']=s['expect']+X[s['id']]

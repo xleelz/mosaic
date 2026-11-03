@@ -1,0 +1,27 @@
+schema_version: 1
+id: vllm
+scenarios:
+  - id: bench-l5
+    name: "L5 non-streaming n=3 chat completion whose client disconnects mid-generation"
+    fixtures: [full-tp1-llama-8b]
+    max_events: 500000
+    max_iterations: 100000
+    steps:
+      - flow: serving-api-chat-completion
+        input: {path: /v1/chat/completions, headers: {X-Request-Id: req-l5}, body: {model: llama-8b, messages: [{role: user, content: "Write a long story about a lighthouse keeper who finds a message in a bottle on a stormy night by the sea"}], n: 3, max_tokens: 64, stream: false, temperature: 1.0}}
+        as: chat
+        await: false
+      - {at_ms: 60, cancel: disconnect-chatcmpl-req-l5}
+      - {flow: engine-core-busy-loop, input: {iterations: 2}, at_ms: 400, as: drain}
+    expect:
+      # (a) the disconnect cancels the handler; generate's CancelledError aborts the parent request (internal id)
+      - "steps.chat.result.ok && steps.chat.result.value.disconnected"
+      - "trace.exists(e, e.type == 'call.start' && e.interface == 'async-llm.abort' && e.input.internal == true && e.input.request_ids == ['chatcmpl-req-l5-00000001'])"
+      # (b) all three children are aborted in the engine core and every block is released; the shared prompt block goes back to the cache once its last holder is gone
+      - "trace.exists(e, e.type == 'call.start' && e.interface == 'scheduler.finish-requests' && e.input.request_ids.size() == 3 && ['0_chatcmpl-req-l5-00000001', '1_chatcmpl-req-l5-00000001', '2_chatcmpl-req-l5-00000001'].all(r, r in e.input.request_ids))"
+      - "trace.filter(e, e.type == 'call.start' && e.interface == 'scheduler.add-request').size() == 3"
+      - "size(state.scheduler.requests) == 0 && size(state.scheduler.running) == 0 && size(state['block-pool'].ref_cnt) == 0"
+      - "size(state['block-pool'].cached) == 1 && 1 in state['block-pool'].free_tail"
+      - "size(state['output-processor'].request_states) == 0"
+      # (c) nothing is written to the closed connection
+      - "!has(steps.chat.result.value.choices)"

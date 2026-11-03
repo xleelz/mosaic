@@ -1,0 +1,64 @@
+schema_version: 1
+id: vllm
+scenarios:
+  # (a) fp8 KV stores 1-byte elements: one Llama-8B layer's block is 8 x 16 x (128+128) x 1 = 32 KiB
+  # (vllm/utils/torch_utils.py:33-40 fp8 -> torch.uint8; vllm/v1/kv_cache_interface.py:544-561).
+  # Unit check: the spec formula given an fp8 spec.
+  - id: bench-p3-7a-unit
+    fixtures: [full-tp1-llama-8b]
+    steps:
+      - {interface: kv-cache-interface.page-size-bytes, caller: engine-core, as: bf16,
+         input: {spec: {kind: full_attention, block_size: 16, num_kv_heads: 8, head_size: 128, dtype: bfloat16}}}
+      - {interface: kv-cache-interface.page-size-bytes, caller: engine-core, as: fp8,
+         input: {spec: {kind: full_attention, block_size: 16, num_kv_heads: 8, head_size: 128, dtype: uint8}}}
+    expect:
+      - "steps.bf16.result.value == 65536"
+      - "steps.fp8.result.value == 32768"
+  # (a) deployed path: --kv-cache-dtype fp8 must reach the runner's per-layer spec.
+  - id: bench-p3-7a-runner
+    fixtures: [full-tp1-llama-8b]
+    config: {kv-cache-dtype: fp8}
+    steps:
+      - {interface: gpu-model-runner.get-kv-cache-spec, caller: gpu-worker-impl, on: rank0, as: spec}
+    expect:
+      - "steps.spec.result.ok"
+      - "steps.spec.result.value.page_size_bytes == 32768"
+  # (b) num_blocks = available // bytes_per_block (kv_cache_utils.py:1624-1628): fp8 doubles the block count.
+  - id: bench-p3-7b-auto
+    fixtures: [full-tp1-llama-8b]
+    steps:
+      - {interface: engine-core.initialize-kv-caches, caller: engine-core, as: init}
+    expect:
+      - "steps.init.result.ok"
+      - "steps.init.result.value.num_gpu_blocks == 36147"
+      - "trace.exists(e, e.type == 'call.start' && e.interface == 'kv-cache-utils.get-kv-cache-configs')"
+  - id: bench-p3-7b-fp8
+    fixtures: [full-tp1-llama-8b]
+    config: {kv-cache-dtype: fp8}
+    steps:
+      - {interface: engine-core.initialize-kv-caches, caller: engine-core, as: init}
+    expect:
+      - "steps.init.result.ok"
+      - "steps.init.result.value.num_gpu_blocks >= 2 * 36147 - 2"
+      - "trace.exists(e, e.type == 'call.start' && e.interface == 'kv-cache-utils.get-kv-cache-configs' && e.input.bytes_per_block == 32 * 32768)"
+  # (c) bf16 checkpoint: no quant method, so the k/v/q/prob scales are registered as 1.0
+  # (attention.py:133-153,185) and CacheConfig logs the accuracy-drop info for any quantized dtype (cache.py:360-367).
+  - id: bench-p3-7c
+    fixtures: [full-tp1-llama-8b]
+    config: {kv-cache-dtype: fp8}
+    steps:
+      - {flow: wr-load-model, as: load}
+    expect:
+      - "steps.load.result.ok"
+      # The model only narrates 'Attention layers process their weights (KV-cache scales)'; nothing sets
+      # k/v scales to 1.0 or depends on kv-cache-dtype. Require a note naming the 1.0 default or the log.
+      - "trace.exists(e, e.type == 'note' && (e.title.contains('1.0') || e.title.contains('accuracy drop')))"
+  # (d) fp8_e5m2 KV with an FP8 checkpoint (quant method provides a KV-cache method) -> ValueError at
+  # layer init (attention.py:205-219).
+  - id: bench-p3-7d
+    fixtures: [full-tp1-llama-8b]
+    config: {kv-cache-dtype: fp8_e5m2, quantization: fp8}
+    steps:
+      - {flow: wr-load-model, as: load}
+    expect:
+      - "!steps.load.result.ok && steps.load.result.error.message.contains('fp8_e5m2 kv-cache is not supported with fp8 checkpoints')"

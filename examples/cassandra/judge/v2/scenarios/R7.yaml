@@ -1,0 +1,259 @@
+schema_version: 1
+id: cassandra
+scenarios:
+- id: bench-r7-local-read-merges-sources
+  name: 'R7: memtable + sstables on n2: a non-intersecting sstable is ruled out by key range/bloom filter, a partition deletion in a newer sstable stops the scan before the older sstable, the newest cell wins, the cell tombstone is kept'
+  flow: replica-read
+  fixtures:
+  - three-node-rf3
+  input:
+    from: n1
+    read_command:
+      digest: false
+      keyspace: shop
+      kind: single_partition
+      limit: 100
+      partition_key: user:42
+      table: users
+      token: 100
+  state:
+    skip-list-memtable@n2:
+      cells:
+        shop.users:user:42:city:
+          keyspace: shop
+          table: users
+          partition_key: user:42
+          replica: n2
+          column: city
+          timestamp: 2000
+          value: Rome
+        shop.users:user:42:email:
+          keyspace: shop
+          table: users
+          partition_key: user:42
+          replica: n2
+          column: email
+          timestamp: 2500
+          value: null
+          deleted: true
+        shop.users:user:42:name:
+          keyspace: shop
+          table: users
+          partition_key: user:42
+          replica: n2
+          column: name
+          timestamp: 1200
+          value: Old
+    tracker@n2:
+      views:
+        shop.users:
+          sstables:
+          - age_s: 3600
+            droppable_tombstone_ratio: 0
+            fully_expired: false
+            id: nb-1
+            level: 0
+            max_timestamp: 1000
+            partitions:
+              user:42:
+                cells:
+                - column: name
+                  timestamp: 1000
+                  value: Ada
+                - column: email
+                  timestamp: 1000
+                  value: ada@x
+            pending_repair: ''
+            purgeable_tombstones: 0
+            read_rate: 0
+            repaired: false
+            size_mb: 10
+            tombstones: 0
+            unowned_mb: 0
+            window: 0
+          - age_s: 3600
+            droppable_tombstone_ratio: 0
+            fully_expired: false
+            id: nb-2
+            level: 0
+            max_timestamp: 5000
+            partitions:
+              user:7:
+                cells:
+                - column: name
+                  timestamp: 5000
+                  value: Zed
+            pending_repair: ''
+            purgeable_tombstones: 0
+            read_rate: 0
+            repaired: false
+            size_mb: 10
+            tombstones: 0
+            unowned_mb: 0
+            window: 0
+          - age_s: 3600
+            droppable_tombstone_ratio: 0
+            fully_expired: false
+            id: nb-3
+            level: 0
+            max_timestamp: 1500
+            partitions:
+              user:42:
+                cells: []
+                deletion_ts: 1500
+                tombstones: 1
+            pending_repair: ''
+            purgeable_tombstones: 0
+            read_rate: 0
+            repaired: false
+            size_mb: 10
+            tombstones: 0
+            unowned_mb: 0
+            window: 0
+  expect:
+  - result.ok && size(result.value.partitions) == 1
+  - result.value.partitions[0].deletion_ts == 1500
+  - result.value.partitions[0].cells.exists(c, c.column == 'city' && c.value == 'Rome' && c.timestamp == 2000)
+  - result.value.partitions[0].cells.exists(c, c.column == 'email' && c.deleted && c.timestamp == 2500)
+  - '!result.value.partitions[0].cells.exists(c, c.column == ''name'')'
+  - calls_by_instance['big-table-reader.row-iterator@n2'] == 2
+  - trace.exists(e, e.type == 'call.start' && e.interface == 'big-table-reader.row-iterator' && e.input.sstable.id == 'nb-2')
+  - '!trace.exists(e, e.type == ''call.start'' && e.interface == ''big-table-reader.row-iterator'' && e.input.sstable.id == ''nb-1'')'
+  - '!trace.exists(e, e.type == ''call.start'' && e.interface == ''data-disk.sstable-read'' && e.input.sstable_id == ''nb-2'')'
+  - ctx.sstable_skip == 'OLDER_THAN_PARTITION_TOMBSTONE'
+- id: bench-r7-tie-rules
+  name: 'R7: equal timestamps: a tombstone beats a live cell; between live cells the greater value wins'
+  flow: replica-read
+  fixtures:
+  - three-node-rf3
+  input:
+    from: n1
+    read_command:
+      digest: false
+      keyspace: shop
+      kind: single_partition
+      limit: 100
+      partition_key: user:42
+      table: users
+      token: 100
+  state:
+    skip-list-memtable@n2:
+      cells:
+        shop.users:user:42:name:
+          keyspace: shop
+          table: users
+          partition_key: user:42
+          replica: n2
+          column: name
+          timestamp: 3000
+          value: Bea
+        shop.users:user:42:city:
+          keyspace: shop
+          table: users
+          partition_key: user:42
+          replica: n2
+          column: city
+          timestamp: 3000
+          value: null
+          deleted: true
+    tracker@n2:
+      views:
+        shop.users:
+          sstables:
+          - age_s: 3600
+            droppable_tombstone_ratio: 0
+            fully_expired: false
+            id: nb-1
+            level: 0
+            max_timestamp: 3000
+            partitions:
+              user:42:
+                cells:
+                - column: name
+                  timestamp: 3000
+                  value: Ada
+                - column: city
+                  timestamp: 3000
+                  value: Oslo
+            pending_repair: ''
+            purgeable_tombstones: 0
+            read_rate: 0
+            repaired: false
+            size_mb: 10
+            tombstones: 0
+            unowned_mb: 0
+            window: 0
+  expect:
+  - result.ok
+  - result.value.partitions[0].cells.exists(c, c.column == 'name' && c.value == 'Bea')
+  - result.value.partitions[0].cells.exists(c, c.column == 'city' && c.deleted)
+- id: bench-r7-coordinator-sees-merged-row
+  name: 'R7 end to end: a ONE read on n1 returns only the live merged cells (tombstones filtered before the client)'
+  flow: coordinator-read
+  fixtures:
+  - three-node-rf3
+  input:
+    consistency: ONE
+    read_command:
+      keyspace: shop
+      table: users
+      partition_key: user:42
+      token: -7000000000000000000
+      columns:
+      - name
+      - city
+      - email
+      digest: false
+      limit: 100
+  state:
+    skip-list-memtable@n1:
+      cells:
+        shop.users:user:42:city:
+          keyspace: shop
+          table: users
+          partition_key: user:42
+          replica: n1
+          column: city
+          timestamp: 2000
+          value: Rome
+        shop.users:user:42:email:
+          keyspace: shop
+          table: users
+          partition_key: user:42
+          replica: n1
+          column: email
+          timestamp: 2500
+          value: null
+          deleted: true
+    tracker@n1:
+      views:
+        shop.users:
+          sstables:
+          - age_s: 3600
+            droppable_tombstone_ratio: 0
+            fully_expired: false
+            id: nb-1
+            level: 0
+            max_timestamp: 1000
+            partitions:
+              user:42:
+                cells:
+                - column: name
+                  timestamp: 1000
+                  value: Ada
+                - column: email
+                  timestamp: 1000
+                  value: ada@x
+            pending_repair: ''
+            purgeable_tombstones: 0
+            read_rate: 0
+            repaired: false
+            size_mb: 10
+            tombstones: 0
+            unowned_mb: 0
+            window: 0
+  expect:
+  - result.ok && ctx.read.contacts == ['n1']
+  - result.value.rows[0].cells.exists(c, c.column == 'city' && c.value == 'Rome')
+  - result.value.rows[0].cells.exists(c, c.column == 'name' && c.value == 'Ada')
+  - '!result.value.rows[0].cells.exists(c, c.column == ''email'')'
