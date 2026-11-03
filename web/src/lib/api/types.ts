@@ -1235,13 +1235,25 @@ export interface ReplayFile {
   jitter_ms?: number;
   decisions: number[];
   points?: SchedulePoint[];
+  /** What failed when `check --explore` wrote the file (not necessarily now). */
   failed?: string[];
+  /** Unfiltered lists only: the ontologies whose draft has the scenario. */
+  scenario_in?: string[];
 }
 
-/** api.ReplayList: GET /v1/replays */
+/** api.ReplayList: GET /v1/replays[?ontology=&rev=] */
 export interface ReplayList {
   dir: string;
+  /** Set when the list is filtered to one ontology's scenarios at a revision. */
+  ontology?: string;
+  revision?: string;
   replays: ReplayFile[];
+}
+
+/** Narrows GET /v1/replays to the replays of one ontology's scenarios at a revision. */
+export interface ReplayFilter {
+  ontology?: string;
+  rev?: RevSelector;
 }
 
 /** api.ReplayRun: POST /v1/ontologies/{id}/replays/{name} (never saved). */

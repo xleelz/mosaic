@@ -31,6 +31,7 @@ import type {
   OntologyList,
   JsonValue,
   Plan,
+  ReplayFilter,
   ReplayList,
   ReplayRun,
   RevisionList,
@@ -210,13 +211,17 @@ export class HttpClient implements MosaicClient {
     return this.request<JsonValue>("GET", `/compose/runs/${enc(task)}/artifacts/${key.split("/").map(enc).join("/")}`);
   }
 
-  async listReplays(): Promise<ReplayList> {
-    const l = await this.request<ReplayList>("GET", "/replays");
-    return { dir: l.dir, replays: l.replays ?? [] };
+  async listReplays(filter?: ReplayFilter): Promise<ReplayList> {
+    const l = await this.request<ReplayList>("GET", `/replays${query({ ontology: filter?.ontology, rev: filter?.ontology ? filter.rev : undefined })}`);
+    return { ...l, replays: l.replays ?? [] };
   }
 
   async runReplay(id: string, name: string, rev?: RevSelector): Promise<ReplayRun> {
     const r = await this.request<ReplayRun>("POST", `/ontologies/${enc(id)}/replays/${enc(name)}${query({ rev })}`);
     return { ...r, failures: r.failures ?? [], run: normalizeRun(r.run) };
+  }
+
+  async deleteReplay(name: string): Promise<void> {
+    await this.request<unknown>("DELETE", `/replays/${enc(name)}`);
   }
 }

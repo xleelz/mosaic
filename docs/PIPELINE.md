@@ -122,7 +122,7 @@ runbook uses:
 | `--lint internal-assertions,clock-ids` | **internal-assertions**: per fragment, the share of expectations that name a non-boundary interface or the state of a component that isn't a store; assert on `io`, `result` and `steps.*` instead. **clock-ids**: id-shaped templates that read `now`; mint ids with `id(prefix, key...)` and `seq(name)` (DESIGN §15.1) |
 | `--max-exemption-issues N`, `--max-clock-ids N`, `--max-unknown-inputs N` | Run that lint, and exit 1 above N findings in total |
 | `--max-internal-assertions R` | Run `--lint internal-assertions`, and exit 1 when a fragment's share is above R |
-| `--explore REGEX --schedules N` | Rerun the matching scenarios under up to N schedules (tie orders, `parallel` branch and join order, `--jitter-ms` at_ms jitter); a failing schedule is written to `--replay-dir` (default `.mosaic/replay`) and `--replay FILE` reproduces it (DESIGN §15.5). Any failure exits 1, unless `--max-explore-failures N` allows N, or the profile's gates record exploration without gating it |
+| `--explore REGEX --schedules N` | Rerun the matching scenarios under up to N schedules (tie orders, `parallel` branch and join order, `--jitter-ms` at_ms jitter); a failing schedule is written to `--replay-dir` (default `.mosaic/replay`) and `--replay FILE` reproduces it (DESIGN §15.5). A scenario that passes every schedule has its stale replay removed (`--keep-replays` keeps it). Any failure exits 1, unless `--max-explore-failures N` allows N, or the profile's gates record exploration without gating it |
 | `--profile PROFILE` | The profile the racy and choice-for-computed lints read, and the **gates**: its `gates:` section gives the defaults of `--strict-stubs`, `--max-exemption-issues`, `--max-internal-assertions`, `--max-clock-ids`, `--max-unknown-inputs` and `--max-explore-failures` (a flag on the command line wins). A missing entry takes the template's value (`examples/_profile-template/profile.yaml`, section 12); unset `max_explore_failures` records exploration failures without gating. The check prints `~ ratchet: --<flag> can go down to N` when a measured value is below its gate |
 
 The **full gate**, used at the end of stages 4, 4b, 5 and 6, and by every fix round:
@@ -148,7 +148,8 @@ assertions per fragment, 0 clock ids, 0 unknown inputs, 0 racy, 0 seam names, 0.
 area, 0 contract and conformance issues. `--explore` reruns the scenarios whose id names a race
 or concurrency (`race|concurr`) under 20 schedules each. Its failures are always printed, with a
 replay file under `$WS/replay`, but they fail the gate only when the profile sets
-`gates.max_explore_failures`; otherwise they are recorded for the next fix round.
+`gates.max_explore_failures`; otherwise they are recorded for the next fix round. A scenario a
+fix round makes pass has its replay file removed, so `$WS/replay` holds only current failures.
 
 **The ratchet.** When a profile is written for an existing model, its gates are today's measured
 values, rounded toward passing (shares up, reach down, to 3 places), so the model passes as it
@@ -760,8 +761,11 @@ reruns the matching scenarios (say the areas' `race` scenarios) under up to N sc
 tie-break orders of same-time tasks and deliveries, other orders of `parallel` branches and join
 counting, and at_ms jitter of up to M ms. It skips reorderings of work on disjoint components
 (DESIGN §15.5). A failing schedule is written to `.mosaic/replay/<scenario>.replay.json`
-(`--replay-dir`), and `check --replay <file>` reproduces it exactly. Add `--scenario '^$'` to skip
-the ordinary runs.
+(`--replay-dir`), replacing an older one, and `check --replay <file>` reproduces it exactly. When a
+scenario passes every schedule (a later round fixed the race), its replay file is stale: the check
+removes it and prints `removed stale replay (passes every schedule now): <path>`. `--keep-replays`
+keeps such files. Add `--scenario '^$'` to skip the ordinary runs. The UI's Exploration tab re-runs
+each remaining replay against the revision it shows, so a file that passes there is stale too.
 
 For a Go component refined to the `runtime` level, Gomela (Go to Promela, checked with SPIN) is an
 independent oracle on the code itself:

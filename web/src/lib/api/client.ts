@@ -17,6 +17,7 @@ import type {
   OntologyList,
   Plan,
   JsonValue,
+  ReplayFilter,
   ReplayList,
   ReplayRun,
   RevisionList,
@@ -71,10 +72,12 @@ export interface MosaicClient {
   /** A task's run.json, the change requests addressed to it, and its agent sessions. */
   getComposeRun(task: string): Promise<ComposeRunDetail>;
   getComposeArtifact(task: string, key: string): Promise<JsonValue>;
-  /** `check --explore` replay files. */
-  listReplays(): Promise<ReplayList>;
-  /** Runs a replay's scenario under its schedule; never saved. */
+  /** `check --explore` replay files; with `ontology`, only those of its scenarios at `rev`. */
+  listReplays(filter?: ReplayFilter): Promise<ReplayList>;
+  /** Runs a replay's scenario under its schedule; never saved. Empty `failures`: it passes now. */
   runReplay(id: string, name: string, rev?: RevSelector): Promise<ReplayRun>;
+  /** Removes a replay file (local-only on mosaicd: loopback and the token). */
+  deleteReplay(name: string): Promise<void>;
 }
 
 /** A non-2xx response from mosaicd, or a transport failure (status 0). */

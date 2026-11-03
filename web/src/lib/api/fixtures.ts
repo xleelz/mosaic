@@ -42,6 +42,7 @@ import type {
   OntologyDetail,
   OntologyList,
   Plan,
+  ReplayFilter,
   ReplayList,
   ReplayRun,
   RevisionList,
@@ -86,6 +87,8 @@ export class FixtureClient implements MosaicClient {
   readonly target = "web/fixtures";
   private readonly base: string;
   private readonly cache = new Map<string, Promise<unknown>>();
+  /** Replay files removed this session (fixtures are read-only, so removal is in memory). */
+  private readonly removedReplays = new Set<string>();
 
   constructor(base = "/fixture-data") {
     this.base = base;
@@ -332,13 +335,26 @@ export class FixtureClient implements MosaicClient {
     return this.load<JsonValue>(`compose/${task}/artifacts/${key}.json`);
   }
 
-  async listReplays(): Promise<ReplayList> {
+  /** replays.json, less the ones removed this session; with `ontology`, only its scenarios' at `rev`. */
+  async listReplays(filter?: ReplayFilter): Promise<ReplayList> {
+    let l: ReplayList;
     try {
-      return await this.load<ReplayList>("replays.json");
+      l = await this.load<ReplayList>("replays.json");
     } catch (err) {
       if (!is404(err)) throw err;
-      return { dir: ".mosaic/replay", replays: [] };
+      l = { dir: ".mosaic/replay", replays: [] };
     }
+    const replays = l.replays.filter((r) => !this.removedReplays.has(r.name));
+    if (!filter?.ontology) return { ...l, replays };
+    const doc = await this.getDocument(filter.ontology, filter.rev);
+    const ids = new Set(doc.scenarios.map((s) => s.id));
+    return { ...l, ontology: filter.ontology, revision: filter.rev || "draft", replays: replays.filter((r) => ids.has(r.scenario)) };
+  }
+
+  async deleteReplay(name: string): Promise<void> {
+    const { replays } = await this.listReplays();
+    if (!replays.some((r) => r.name === name)) throw new ApiError(404, { code: "not_found", message: `no replay ${name} in .mosaic/replay` });
+    this.removedReplays.add(name);
   }
 
   /** Serves the recorded replay run when there is one. */

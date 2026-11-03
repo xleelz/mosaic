@@ -24,15 +24,7 @@ func (s *Server) systemVersion(w http.ResponseWriter, r *http.Request) {
 }
 
 func (s *Server) systemUpdate(w http.ResponseWriter, r *http.Request) {
-	// The bearer token, when configured, was checked by s.auth.
-	if !isLoopback(r.RemoteAddr) {
-		writeError(w, http.StatusForbidden, "forbidden", "updates are only accepted from a loopback address", nil)
-		return
-	}
-	// A browser page on another site could post to the UI's proxy, which
-	// reaches mosaicd from loopback: only the allowed origins may update.
-	if o := strings.TrimRight(r.Header.Get("Origin"), "/"); o != "" && !s.anyOrig && !s.origins[o] {
-		writeError(w, http.StatusForbidden, "forbidden", "updates are not accepted from origin "+o+" (add it with mosaicd --cors-origin)", nil)
+	if !s.localOnly(w, r, "updates are only accepted") {
 		return
 	}
 	res, err := s.updater.Update(r.Context())
@@ -54,6 +46,23 @@ func (s *Server) systemUpdate(w http.ResponseWriter, r *http.Request) {
 		}
 		s.cfg.OnRestart()
 	}
+}
+
+// localOnly admits a request to a local-only endpoint, or answers 403 and
+// returns false. what starts the refusal ("updates are only accepted").
+// The bearer token, when configured, was checked by s.auth.
+func (s *Server) localOnly(w http.ResponseWriter, r *http.Request, what string) bool {
+	if !isLoopback(r.RemoteAddr) {
+		writeError(w, http.StatusForbidden, "forbidden", what+" from a loopback address", nil)
+		return false
+	}
+	// A browser page on another site could post to the UI's proxy, which
+	// reaches mosaicd from loopback: only the allowed origins are admitted.
+	if o := strings.TrimRight(r.Header.Get("Origin"), "/"); o != "" && !s.anyOrig && !s.origins[o] {
+		writeError(w, http.StatusForbidden, "forbidden", what+" from the allowed origins, not "+o+" (add it with mosaicd --cors-origin)", nil)
+		return false
+	}
+	return true
 }
 
 func isLoopback(remoteAddr string) bool {

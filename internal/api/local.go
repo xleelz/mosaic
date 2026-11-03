@@ -1,10 +1,11 @@
 package api
 
-// Read-only views of the repo-local stores next to mosaicd's working
-// directory (DESIGN §16.6): the compose run store (.mosaic/compose/runs,
-// §14.11) and the replay files `check --explore` writes (.mosaic/replay,
-// §15.5). Replaying a schedule runs the simulator against a stored ontology
-// and saves nothing.
+// Views of the repo-local stores next to mosaicd's working directory
+// (DESIGN §16.6): the compose run store (.mosaic/compose/runs, §14.11) and
+// the replay files `check --explore` writes (.mosaic/replay, §15.5).
+// Replaying a schedule runs the simulator against a stored ontology and
+// saves nothing. The only write is DELETE /v1/replays/{name}, accepted
+// from loopback only (§6), to drop a replay that passes now.
 
 import (
 	"errors"
@@ -18,7 +19,9 @@ import (
 
 	"github.com/xleelz/mosaic/internal/compose"
 	"github.com/xleelz/mosaic/internal/explore"
+	"github.com/xleelz/mosaic/internal/model"
 	"github.com/xleelz/mosaic/internal/sim"
+	"github.com/xleelz/mosaic/internal/store"
 	wire "github.com/xleelz/mosaic/pkg/api"
 )
 
@@ -33,6 +36,7 @@ func (s *Server) localRoutes(m *http.ServeMux) {
 	m.HandleFunc("GET /v1/compose/runs/{task}/tree", s.getComposeTree)
 	m.HandleFunc("GET /v1/compose/runs/{task}/artifacts/{key...}", s.getComposeArtifact)
 	m.HandleFunc("GET /v1/replays", s.listReplays)
+	m.HandleFunc("DELETE /v1/replays/{name}", s.deleteReplay)
 	m.HandleFunc("POST /v1/ontologies/{id}/replays/{name}", s.runReplay)
 }
 
@@ -182,13 +186,21 @@ func (s *Server) getComposeArtifact(w http.ResponseWriter, r *http.Request) {
 type ReplayFile struct {
 	Name     string    `json:"name"`
 	Modified time.Time `json:"modified"`
+	// ScenarioIn lists the ontologies whose draft has the replay's
+	// scenario. It is set only on an unfiltered list (no ?ontology=);
+	// an empty list means no stored ontology has the scenario.
+	ScenarioIn *[]string `json:"scenario_in,omitempty"`
 	explore.Replay
 }
 
-// ReplayList is GET /v1/replays.
+// ReplayList is GET /v1/replays[?ontology=ID[&rev=R]]. With ?ontology=,
+// it holds only the replays whose scenario exists in that ontology at
+// ?rev= (default draft), and names both.
 type ReplayList struct {
-	Dir     string       `json:"dir"`
-	Replays []ReplayFile `json:"replays"`
+	Dir      string       `json:"dir"`
+	Ontology string       `json:"ontology,omitempty"`
+	Revision string       `json:"revision,omitempty"`
+	Replays  []ReplayFile `json:"replays"`
 }
 
 // ReplayRun is POST /v1/ontologies/{id}/replays/{name}: the scenario run
@@ -226,6 +238,22 @@ func (s *Server) loadReplay(name string) (*ReplayFile, error) {
 
 func (s *Server) listReplays(w http.ResponseWriter, r *http.Request) {
 	out := ReplayList{Dir: ReplayDir, Replays: []ReplayFile{}}
+	// The scenario ids of the ontology asked for, or of every ontology's
+	// draft when none is (for scenario_in).
+	var only map[string]bool
+	var byOntology map[string]map[string]bool
+	if id := r.URL.Query().Get("ontology"); id != "" {
+		rv, err := s.store.ResolveRev(r.Context(), id, r.URL.Query().Get("rev"))
+		if err != nil {
+			s.fail(w, r, err)
+			return
+		}
+		if only, err = s.scenarioIDs(r, id, rv); err != nil {
+			s.fail(w, r, err)
+			return
+		}
+		out.Ontology, out.Revision = id, rv.String()
+	}
 	entries, err := os.ReadDir(s.replayDir())
 	if err != nil && !errors.Is(err, os.ErrNotExist) {
 		s.fail(w, r, err)
@@ -240,10 +268,84 @@ func (s *Server) listReplays(w http.ResponseWriter, r *http.Request) {
 		if err != nil {
 			continue // unreadable files are skipped, as the run store does
 		}
+		if only != nil {
+			if !only[rf.Scenario] {
+				continue
+			}
+		} else {
+			if byOntology == nil {
+				if byOntology, err = s.allScenarioIDs(r); err != nil {
+					s.fail(w, r, err)
+					return
+				}
+			}
+			in := []string{}
+			for id, ids := range byOntology {
+				if ids[rf.Scenario] {
+					in = append(in, id)
+				}
+			}
+			sort.Strings(in)
+			rf.ScenarioIn = &in
+		}
 		out.Replays = append(out.Replays, *rf)
 	}
 	sort.Slice(out.Replays, func(i, j int) bool { return out.Replays[i].Name < out.Replays[j].Name })
 	writeJSON(w, http.StatusOK, out)
+}
+
+// scenarioIDs is the set of an ontology's scenario ids at a revision.
+func (s *Server) scenarioIDs(r *http.Request, id string, rv store.Rev) (map[string]bool, error) {
+	es, err := s.store.Entities(r.Context(), id, rv, model.KindScenario)
+	if err != nil {
+		return nil, err
+	}
+	ids := make(map[string]bool, len(es))
+	for _, e := range es {
+		ids[e.ID] = true
+	}
+	return ids, nil
+}
+
+// allScenarioIDs maps every stored ontology to its draft's scenario ids.
+func (s *Server) allScenarioIDs(r *http.Request) (map[string]map[string]bool, error) {
+	onts, err := s.store.ListOntologies(r.Context())
+	if err != nil {
+		return nil, err
+	}
+	out := make(map[string]map[string]bool, len(onts))
+	for _, o := range onts {
+		ids, err := s.scenarioIDs(r, o.ID, store.Draft)
+		if err != nil {
+			return nil, err
+		}
+		out[o.ID] = ids
+	}
+	return out, nil
+}
+
+// deleteReplay removes one replay file: a stale one whose scenario passes
+// now. Like POST /v1/system/update it is local-only (§6): a loopback
+// remote address, the bearer token when one is set (s.auth), and no
+// Origin header or an allowed one.
+func (s *Server) deleteReplay(w http.ResponseWriter, r *http.Request) {
+	if !s.localOnly(w, r, "replay files are only removed") {
+		return
+	}
+	name := r.PathValue("name")
+	if !replayName.MatchString(name) || strings.Contains(name, "..") {
+		s.fail(w, r, badRequest("invalid replay name %q", name))
+		return
+	}
+	err := os.Remove(filepath.Join(s.replayDir(), name+replaySuffix))
+	if errors.Is(err, os.ErrNotExist) {
+		err = notFound("no replay %s in %s", name, ReplayDir)
+	}
+	if err != nil {
+		s.fail(w, r, err)
+		return
+	}
+	w.WriteHeader(http.StatusNoContent)
 }
 
 // runReplay runs a replay's scenario against the ontology at ?rev= under

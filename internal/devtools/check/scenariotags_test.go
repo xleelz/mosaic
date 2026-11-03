@@ -48,7 +48,7 @@ scenarios:
 	}
 
 	out.Reset()
-	exploreAll(&out, doc, regexp.MustCompile("race|concurr"), explore.Options{Schedules: 2}, t.TempDir())
+	exploreAll(&out, doc, regexp.MustCompile("race|concurr"), explore.Options{Schedules: 2}, t.TempDir(), false)
 	s := out.String()
 	for _, id := range []string{"writers", "pool", "race-by-id"} {
 		if !strings.Contains(s, "explore "+id+":") {

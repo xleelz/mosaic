@@ -201,6 +201,9 @@ as a **warning**, not an error.
 | `GET /ontologies/{id}/source?path=&rev=&repo=&sha=` | A cited file's text from GitHub at the document's commit |
 | `GET /system/version?refresh=` | The running build and whether its checkout can be updated |
 | `POST /system/update` | Fast-forward the checkout to its upstream, then restart when supervised (§8) |
+| `GET /replays?ontology=&rev=` | `check --explore` replay files (§15.5) in `.mosaic/replay` under mosaicd's working directory |
+| `POST /ontologies/{id}/replays/{name}?rev=` | Run a replay's scenario under its schedule at `?rev=` (never saved): the current status |
+| `DELETE /replays/{name}` | Remove one replay file (local-only, like `/system/update`) |
 
 Server details:
 - POST `/simulations` returns 201 when the run is saved and 200 with `save: false`.
@@ -229,6 +232,20 @@ Server details:
   `git merge --ff-only @{u}`, and returns `{updated_to, from, restarting, note}`; a failing git
   command returns 500 with git's stderr and leaves the tree as it was. It never builds: see §8.
   Git runs without a shell, with fixed arguments and timeouts.
+- **Replays** (`internal/api/local.go`). `GET /replays?ontology=ID` lists only the replays whose
+  scenario the ontology has at `?rev=` (default draft), and returns `{dir, ontology, revision,
+  replays}`; an unknown ontology is 404. Without `ontology` every file is listed, each with
+  `scenario_in`: the ids of the stored ontologies whose draft has its scenario (`[]` when none).
+  A replay's `failed` is what failed when `check --explore` wrote it. Its **current status** is
+  `POST /ontologies/{id}/replays/{name}?rev=`: `{replay, diverged?, failures, run}`, where an
+  empty `failures` means the schedule passes now (the race was fixed and the file is stale), and
+  `diverged` says the model changed under the recorded decisions. There is no batch status
+  call: each replay is one bounded simulation, and the UI runs them a few at a time, one request
+  each (§16.6). A scenario the ontology lacks is 400.
+  `DELETE /replays/{name}` removes `<name>.replay.json` and answers 204 (404 when missing, 400
+  for a name outside `[A-Za-z0-9_][A-Za-z0-9._-]*` or containing `..`). Like `/system/update` it
+  is accepted only from a loopback remote address, with the bearer token when one is set, and
+  with no `Origin` header or an allowed CORS origin (403 otherwise).
 - `/ontologies/{id}/source` returns JSON `{repo, sha, path, content, language_hint, size, url}`
   for one file of the code the document at `?rev=` cites; `url` is the github.com blob URL
   without a line anchor, and `language_hint` comes from the extension (`go`, `python`, `cpp`,
@@ -2076,7 +2093,11 @@ The UI shows the hierarchy:
 - a simulation can pick a resolution per component;
 - the compose run tree for a task is browsable, with stage states, stats, change requests and
   artifacts;
-- exploration results show failing schedules, and replay them.
+- exploration results show the current ontology's replays (`GET /replays?ontology=`), each
+  re-run against the viewed revision on load (at most 3 at a time) and shown as **Still fails**
+  (the current failures) or **Passes now** (stale), with the recorded failure as secondary text,
+  still-failing first. A passing replay can be removed, one at a time or all at once
+  (`DELETE /replays/{name}`), and replayed in full.
 
 ### 16.7 Compose protections
 

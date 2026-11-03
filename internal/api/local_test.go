@@ -7,6 +7,7 @@ import (
 	"net/http/httptest"
 	"os"
 	"path/filepath"
+	"slices"
 	"testing"
 	"time"
 
@@ -111,23 +112,19 @@ func TestReplays(t *testing.T) {
 	if l := getLocal[api.ReplayList](t, base, "GET", "/v1/replays", 200); len(l.Replays) != 0 {
 		t.Fatalf("no dir: %+v", l)
 	}
-	if err := os.MkdirAll(filepath.Join(dir, api.ReplayDir), 0o755); err != nil {
-		t.Fatal(err)
-	}
-	rp := &explore.Replay{Version: 1, Scenario: "ask-ok", Decisions: []int{}, Failed: []string{"result.ok"}}
-	if err := rp.Write(filepath.Join(dir, api.ReplayDir, "ask-ok.replay.json")); err != nil {
-		t.Fatal(err)
-	}
-	ghost := &explore.Replay{Version: 1, Scenario: "no-such-scenario", Decisions: []int{}}
-	if err := ghost.Write(filepath.Join(dir, api.ReplayDir, "ghost.replay.json")); err != nil {
-		t.Fatal(err)
-	}
+	writeReplays(t, dir)
+	putFile(t, "replay-shop", "../model/testdata/refine/parent.yaml")
 	l := getLocal[api.ReplayList](t, base, "GET", "/v1/replays", 200)
 	if len(l.Replays) != 2 || l.Replays[0].Name != "ask-ok" || l.Replays[0].Scenario != "ask-ok" || len(l.Replays[0].Failed) != 1 {
 		t.Fatalf("list: %+v", l)
 	}
+	if in := l.Replays[0].ScenarioIn; in == nil || !slices.Contains(*in, "replay-shop") {
+		t.Fatalf("ask-ok scenario_in: %v", in)
+	}
+	if in := l.Replays[1].ScenarioIn; in == nil || len(*in) != 0 {
+		t.Fatalf("ghost scenario_in: %v", in)
+	}
 
-	putFile(t, "replay-shop", "../model/testdata/refine/parent.yaml")
 	before := decode[map[string][]any](t, call(t, "GET", "/v1/ontologies/replay-shop/simulations", nil, 200))
 	run := getLocal[api.ReplayRun](t, base, "POST", "/v1/ontologies/replay-shop/replays/ask-ok", 200)
 	if run.Run.ID != "" || run.Run.Scenario != "ask-ok" || !run.Run.Summary.Passed || len(run.Failures) != 0 || run.Diverged != "" {
@@ -142,5 +139,96 @@ func TestReplays(t *testing.T) {
 	}
 	if e := errCode(t, callURL(t, base, nil, "POST", "/v1/ontologies/replay-shop/replays/missing", nil, 404)); e.Code != "not_found" {
 		t.Fatalf("missing: %+v", e)
+	}
+}
+
+func writeReplays(t *testing.T, dir string) {
+	t.Helper()
+	if err := os.MkdirAll(filepath.Join(dir, api.ReplayDir), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	rp := &explore.Replay{Version: 1, Scenario: "ask-ok", Decisions: []int{}, Failed: []string{"result.ok"}}
+	if err := rp.Write(filepath.Join(dir, api.ReplayDir, "ask-ok.replay.json")); err != nil {
+		t.Fatal(err)
+	}
+	ghost := &explore.Replay{Version: 1, Scenario: "no-such-scenario", Decisions: []int{}}
+	if err := ghost.Write(filepath.Join(dir, api.ReplayDir, "ghost.replay.json")); err != nil {
+		t.Fatal(err)
+	}
+}
+
+// TestReplaysForOntology: ?ontology= lists only the replays whose scenario
+// the ontology has at ?rev= (§6).
+func TestReplaysForOntology(t *testing.T) {
+	dir := t.TempDir()
+	base := localServer(t, dir)
+	writeReplays(t, dir)
+	putFile(t, "replay-filter", "../model/testdata/refine/parent.yaml")
+	l := getLocal[api.ReplayList](t, base, "GET", "/v1/replays?ontology=replay-filter", 200)
+	if l.Ontology != "replay-filter" || l.Revision != "draft" || len(l.Replays) != 1 || l.Replays[0].Name != "ask-ok" || l.Replays[0].ScenarioIn != nil {
+		t.Fatalf("filtered: %+v", l)
+	}
+	// An ontology without the scenario: nothing.
+	call(t, "POST", "/v1/ontologies", map[string]string{"id": "replay-empty", "name": "empty"}, 201)
+	if l := getLocal[api.ReplayList](t, base, "GET", "/v1/replays?ontology=replay-empty", 200); len(l.Replays) != 0 {
+		t.Fatalf("other ontology: %+v", l)
+	}
+	if e := errCode(t, callURL(t, base, nil, "GET", "/v1/replays?ontology=no-such-ontology", nil, 404)); e.Code != "not_found" {
+		t.Fatalf("unknown ontology: %+v", e)
+	}
+	if e := errCode(t, callURL(t, base, nil, "GET", "/v1/replays?ontology=replay-filter&rev=bogus", nil, 400)); e.Code != "bad_request" {
+		t.Fatalf("bad rev: %+v", e)
+	}
+}
+
+// TestDeleteReplay: DELETE /v1/replays/{name} is local-only like
+// /system/update: loopback, the token, an allowed origin, a clean name.
+func TestDeleteReplay(t *testing.T) {
+	dir := t.TempDir()
+	writeReplays(t, dir)
+	h := api.New(api.Config{Store: st, Version: "test", Token: "s3cret", Logger: log.New(io.Discard, "", 0), Workdir: dir})
+	do := func(path, remote string, hdr map[string]string) *httptest.ResponseRecorder {
+		req := httptest.NewRequest("DELETE", path, nil)
+		req.RemoteAddr = remote
+		for k, v := range hdr {
+			req.Header.Set(k, v)
+		}
+		rec := httptest.NewRecorder()
+		h.ServeHTTP(rec, req)
+		return rec
+	}
+	auth := map[string]string{"Authorization": "Bearer s3cret"}
+	file := filepath.Join(dir, api.ReplayDir, "ghost.replay.json")
+	present := func() bool { _, err := os.Stat(file); return err == nil }
+
+	if rec := do("/v1/replays/ghost", "127.0.0.1:5000", nil); rec.Code != 401 || !present() {
+		t.Fatalf("without token: %d %s", rec.Code, rec.Body)
+	}
+	if rec := do("/v1/replays/ghost", "192.0.2.7:4000", auth); rec.Code != 403 || !present() {
+		t.Fatalf("not loopback: %d %s", rec.Code, rec.Body)
+	}
+	if rec := do("/v1/replays/ghost", "127.0.0.1:5000", map[string]string{"Authorization": "Bearer s3cret", "Origin": "http://evil.example"}); rec.Code != 403 || !present() {
+		t.Fatalf("foreign origin: %d %s", rec.Code, rec.Body)
+	}
+	// The mux redirects a dot-dot path to its clean form; nothing is removed.
+	if rec := do("/v1/replays/..", "127.0.0.1:5000", auth); rec.Code/100 == 2 || !present() {
+		t.Fatalf("dot-dot: %d %s", rec.Code, rec.Body)
+	}
+	for _, bad := range []string{".hidden", "a..b", "-x"} {
+		if rec := do("/v1/replays/"+bad, "127.0.0.1:5000", auth); rec.Code != 400 {
+			t.Fatalf("name %q: %d %s", bad, rec.Code, rec.Body)
+		}
+	}
+	if rec := do("/v1/replays/..%2Fask-ok", "127.0.0.1:5000", auth); rec.Code != 400 {
+		t.Fatalf("escaped path: %d %s", rec.Code, rec.Body)
+	}
+	if rec := do("/v1/replays/ghost", "[::1]:5000", map[string]string{"Authorization": "Bearer s3cret", "Origin": "http://localhost:3000"}); rec.Code != 204 || present() {
+		t.Fatalf("delete: %d %s", rec.Code, rec.Body)
+	}
+	if rec := do("/v1/replays/ghost", "127.0.0.1:5000", auth); rec.Code != 404 {
+		t.Fatalf("delete again: %d %s", rec.Code, rec.Body)
+	}
+	if _, err := os.Stat(filepath.Join(dir, api.ReplayDir, "ask-ok.replay.json")); err != nil {
+		t.Fatalf("the other replay is gone: %v", err)
 	}
 }

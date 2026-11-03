@@ -2,7 +2,7 @@ package main
 
 // Schedule exploration (DESIGN §15.5; internal/explore):
 //
-//	--explore REGEX --schedules N [--jitter-ms M] [--replay-dir DIR]
+//	--explore REGEX --schedules N [--jitter-ms M] [--replay-dir DIR] [--keep-replays]
 //	--replay FILE
 //
 // --explore reruns each scenario whose id or one of whose tags (§17 item
@@ -12,7 +12,10 @@ package main
 // parallel branch and join order, and with --jitter-ms, step at_ms
 // jitter), with partial-order reduction. A scenario fails if any schedule
 // fails its expectations; that schedule is written to DIR (default
-// .mosaic/replay) as <scenario>.replay.json. --replay FILE runs a replay
+// .mosaic/replay) as <scenario>.replay.json, replacing an older one. When
+// every schedule passes, the scenario's replay file, if any, is stale (a
+// later round fixed the race) and is removed, unless --keep-replays.
+// --replay FILE runs a replay
 // file's scenario under its schedule, exactly. Both count as failing
 // scenarios in the exit status. A scenario with invariants (§16.2) is
 // held to its expect on the default schedule only, and to its invariants
@@ -41,6 +44,7 @@ var (
 	exploreN     = flag.Int("schedules", 50, "with --explore, the most schedules to run per scenario, the default one included")
 	exploreJit   = flag.Float64("jitter-ms", 0, "with --explore, also jitter each step's at_ms by up to ±`M` ms (fractional: µs, §17 item 4)")
 	exploreDir   = flag.String("replay-dir", filepath.Join(".mosaic", "replay"), "with --explore, the directory replay files are written to")
+	exploreKeep  = flag.Bool("keep-replays", false, "with --explore, keep the replay file of a scenario that now passes every schedule (default: it is stale and removed)")
 	exploreRerun = flag.String("replay", "", "run the scenario of this replay `FILE` under its recorded schedule (DESIGN §15.5)")
 )
 
@@ -50,8 +54,8 @@ var (
 func runExplore(w io.Writer, doc *model.Document, run bool) int {
 	set := map[string]bool{}
 	flag.Visit(func(f *flag.Flag) { set[f.Name] = true })
-	if *exploreRE == "" && (set["schedules"] || set["jitter-ms"] || set["replay-dir"]) {
-		fail(fmt.Errorf("--schedules, --jitter-ms and --replay-dir need --explore"))
+	if *exploreRE == "" && (set["schedules"] || set["jitter-ms"] || set["replay-dir"] || set["keep-replays"]) {
+		fail(fmt.Errorf("--schedules, --jitter-ms, --replay-dir and --keep-replays need --explore"))
 	}
 	if *exploreRE == "" && *exploreRerun == "" {
 		return 0
@@ -72,12 +76,14 @@ func runExplore(w io.Writer, doc *model.Document, run bool) int {
 		if err != nil {
 			fail(fmt.Errorf("--explore: %w", err))
 		}
-		failed += exploreAll(w, doc, re, explore.Options{Schedules: *exploreN, JitterMS: *exploreJit}, *exploreDir)
+		failed += exploreAll(w, doc, re, explore.Options{Schedules: *exploreN, JitterMS: *exploreJit}, *exploreDir, *exploreKeep)
 	}
 	return failed
 }
 
-func exploreAll(w io.Writer, doc *model.Document, re *regexp.Regexp, o explore.Options, dir string) int {
+// exploreAll explores the scenarios re selects. A failing one's replay is
+// written to dir; a passing one's stale replay there is removed unless keep.
+func exploreAll(w io.Writer, doc *model.Document, re *regexp.Regexp, o explore.Options, dir string, keep bool) int {
 	var ids []string
 	for i := range doc.Scenarios {
 		if doc.Scenarios[i].MatchesIDOrTag(re) {
@@ -107,6 +113,7 @@ func exploreAll(w io.Writer, doc *model.Document, re *regexp.Regexp, o explore.O
 		if rep.Failure == nil {
 			passed++
 			fmt.Fprintf(w, "✓ explore %s: %d schedules (%s%s)\n    coverage: %s\n", id, rep.Runs, scope, inv, rep.Coverage)
+			removeStaleReplay(w, filepath.Join(dir, safeName(id)+".replay.json"), keep)
 			continue
 		}
 		failed++
@@ -136,6 +143,23 @@ func exploreAll(w io.Writer, doc *model.Document, re *regexp.Regexp, o explore.O
 	}
 	fmt.Fprintf(w, "explore: %d scenarios, %d passed every schedule, %d failed (%d schedules run; %s)\n", len(ids), passed, failed, runs, cov.Coverage)
 	return failed
+}
+
+// removeStaleReplay removes the replay file of a scenario that passed
+// every schedule, or with keep, says it was kept.
+func removeStaleReplay(w io.Writer, path string, keep bool) {
+	if _, err := os.Stat(path); err != nil {
+		return
+	}
+	if keep {
+		fmt.Fprintf(w, "    stale replay kept (--keep-replays): %s\n", path)
+		return
+	}
+	if err := os.Remove(path); err != nil {
+		fmt.Fprintf(w, "    ! stale replay not removed: %v\n", err)
+		return
+	}
+	fmt.Fprintf(w, "    removed stale replay (passes every schedule now): %s\n", path)
 }
 
 func replayFile(w io.Writer, doc *model.Document, path string) int {

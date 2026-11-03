@@ -76,6 +76,31 @@ export function useQuery<T>(key: string | null, fn: (c: MosaicClient) => Promise
   };
 }
 
+/**
+ * Like useQuery for a list of keyed fetches; each keeps its own state and
+ * reload. A key dropped by invalidate() is fetched again on the next render.
+ */
+export function useQueries<T>(items: { key: string; fn: (c: MosaicClient) => Promise<T> }[]): QueryState<T>[] {
+  useSyncExternalStore(subscribe, () => version, () => 0);
+  useEffect(() => {
+    for (const it of items) if (!cache.has(it.key)) start(it.key, it.fn);
+  });
+
+  return items.map((it) => {
+    const entry = cache.get(it.key);
+    return {
+      data: entry?.data as T | undefined,
+      error: entry?.error,
+      loading: !entry || !entry.done,
+      reload: () => {
+        cache.delete(it.key);
+        start(it.key, it.fn);
+        notify();
+      },
+    };
+  });
+}
+
 /** Drops every cached key that starts with prefix. */
 export function invalidate(prefix: string) {
   for (const k of Array.from(cache.keys())) if (k.startsWith(prefix)) cache.delete(k);
