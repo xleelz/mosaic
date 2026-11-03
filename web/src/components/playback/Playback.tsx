@@ -1,6 +1,6 @@
 "use client";
 
-import { useCallback, useEffect, useMemo, useState, type ReactNode } from "react";
+import { useCallback, useEffect, useLayoutEffect, useMemo, useRef, useState, type ReactNode } from "react";
 import type { Document, Graph, SimulationRun } from "@/lib/api/types";
 import { buildPlayback, activeFor, eventTone, laneComponent, openSpans } from "@/lib/sim/playback";
 import { ArchitectureMap, COLLAPSE_ABOVE, useColorScale, type MapHighlight } from "@/components/map/ArchitectureMap";
@@ -59,10 +59,12 @@ function isTyping(el: EventTarget | null, key: string): boolean {
  */
 export type PlaybackLayout = "page" | "embedded";
 
-/** A floating panel's state: collapsed to a tab or bar, docked, or expanded over its neighbours. */
+/** A floating panel's state: collapsed to a tab or bar, shown at its normal size, or expanded over its neighbours. */
 type FloatState = "hidden" | "open" | "expanded";
 
 const FLOAT_STATES: FloatState[] = ["hidden", "open", "expanded"];
+/** The gap between a floating panel and the edges and panels around it, in px. */
+const FLOAT_GAP = 8;
 const nextFloat = (s: FloatState): FloatState => (s === "hidden" ? "open" : s === "open" ? "expanded" : "hidden");
 
 /** A floating panel's state, remembered in localStorage. */
@@ -153,6 +155,30 @@ export function Playback({
   const [side, setSide] = useFloatState("mosaic.run.inspector", "open");
   const [mapState, setMapState] = useFloatState("mosaic.run.map", "open");
   const colorScale = useColorScale(graph, "layer");
+
+  // On the run page the panels float over the sequence diagram; measure how
+  // much of its right and bottom edges they cover, so the cursor row scrolls
+  // into the uncovered region.
+  const stageRef = useRef<HTMLDivElement>(null);
+  const sideRef = useRef<HTMLElement>(null);
+  const mapRef = useRef<HTMLDivElement>(null);
+  const [insets, setInsets] = useState({ right: 0, bottom: 0 });
+  useLayoutEffect(() => {
+    const stage = stageRef.current;
+    if (!page || !stage) return;
+    const measure = () => {
+      const s = stage.getBoundingClientRect();
+      const sideBox = sideRef.current?.getBoundingClientRect();
+      const mapBox = mapRef.current?.getBoundingClientRect();
+      const right = sideBox ? Math.max(0, Math.round(s.right - sideBox.left) + FLOAT_GAP) : 0;
+      const bottom = mapBox ? Math.max(0, Math.round(s.bottom - mapBox.top) + FLOAT_GAP) : 0;
+      setInsets((p) => (p.right === right && p.bottom === bottom ? p : { right, bottom }));
+    };
+    measure();
+    const ro = new ResizeObserver(measure);
+    for (const el of [stage, sideRef.current, mapRef.current]) if (el) ro.observe(el);
+    return () => ro.disconnect();
+  }, [page, side, mapState, graph, n]);
 
   const setCursor = useCallback(
     (i: number) => {
@@ -266,7 +292,9 @@ export function Playback({
       {playback.events.some((e) => e.type === "kill") && <span className="text-bad">✖ kill</span>}
     </span>
   );
-  const sequence = <SequenceDiagram playback={playback} doc={doc} scale={colorScale} colorKey={colorKey} cursor={cursor} onCursor={onJump} />;
+  const sequence = (
+    <SequenceDiagram playback={playback} doc={doc} scale={colorScale} colorKey={colorKey} cursor={cursor} onCursor={onJump} insets={page ? insets : undefined} />
+  );
   const map = mapGraph && <ArchitectureMap graph={mapGraph} highlight={highlight} ariaLabel="Architecture map highlighting the current event" />;
   const inspector = <Inspector playback={playback} cursor={cursor} doc={doc} onJump={onJump} />;
   const ledger = <StateLedger playback={playback} cursor={cursor} doc={doc} />;
@@ -276,54 +304,55 @@ export function Playback({
 
   if (page) {
     // The stage below the transport: the sequence diagram fills it, and the
-    // floating panels dock over its edges. Docked panels inset the diagram (so
-    // the cursor row never scrolls under them); expanded ones overlay it.
-    const sideDocked = side !== "hidden";
-    const right = cx("right-9", sideDocked && "lg:right-[428px]");
-    const bottom = !graph ? "bottom-0" : mapState === "hidden" ? "bottom-[46px]" : "bottom-[calc(30%+8px)]";
+    // panels float over it as cards. The right panel runs from below the
+    // sequence header to the bottom; the map floats along the bottom, to the
+    // panel's left, unless the panel is expanded and overlays it. Both keep
+    // 14px off the right and bottom edges, clear of the diagram's scrollbars,
+    // and the diagram scrolls its cursor row into the region they leave.
+    const mapRight =
+      side === "hidden" ? "right-[50px]" : side === "open" ? "right-[50px] lg:right-[442px]" : "right-[14px]";
     return (
       <div className={cx("flex min-h-0 flex-col gap-2", className)}>
         <div className="max-h-[40%] shrink-0 overflow-y-auto">
           <SummaryCard run={run} />
         </div>
         {transport}
-        <div className="relative min-h-0 flex-1 overflow-hidden">
-          <Panel title="Sequence" className={cx("absolute left-0 top-0", right, bottom)} bodyClassName="p-0" actions={legend}>
+        <div ref={stageRef} className="relative min-h-0 flex-1 overflow-hidden">
+          <Panel title="Sequence" className="absolute inset-0" bodyClassName="p-0" actions={legend}>
             {sequence}
           </Panel>
           {graph && (
-            <Panel
-              id="run-map"
-              title="Architecture"
-              className={cx(
-                "absolute bottom-0 left-0 z-10",
-                right,
-                mapState === "open" && "h-[30%]",
-                mapState === "expanded" && "h-[75%] shadow-[0_-8px_28px_rgba(0,0,0,0.5)]",
-              )}
-              bodyClassName={mapState === "hidden" ? "hidden" : "p-0"}
-              actions={
-                <FloatControls
-                  state={mapState}
-                  setState={setMapState}
-                  controls="run-map"
-                  name="map"
-                  shortcut="m"
-                  labels={{ hidden: "Hide", open: "Open", expanded: "Expand ▴" }}
-                />
-              }
-            >
-              {mapState !== "hidden" && map}
-            </Panel>
+            <div ref={mapRef} className={cx("absolute bottom-[14px] left-2 z-10", mapRight, mapState === "open" && "h-[30%]", mapState === "expanded" && "h-[75%]")}>
+              <Panel
+                id="run-map"
+                title="Architecture"
+                className="run-float h-full"
+                bodyClassName={mapState === "hidden" ? "hidden" : "p-0"}
+                actions={
+                  <FloatControls
+                    state={mapState}
+                    setState={setMapState}
+                    controls="run-map"
+                    name="map"
+                    shortcut="m"
+                    labels={{ hidden: "Hide ▾", open: "Show", expanded: "Expand ▴" }}
+                  />
+                }
+              >
+                {mapState !== "hidden" && map}
+              </Panel>
+            </div>
           )}
           <aside
+            ref={sideRef}
             id="run-inspector"
             aria-label="Inspector and state ledger"
             className={cx(
-              "absolute bottom-0 right-0 top-0 z-20 flex flex-col gap-2 rounded-lg",
+              "absolute bottom-[14px] right-[14px] top-[45px] z-20 flex flex-col",
               side === "hidden" && "w-7",
-              side === "open" && "w-[min(420px,100%)] bg-bg max-lg:shadow-[-8px_0_28px_rgba(0,0,0,0.5)]",
-              side === "expanded" && "w-[max(min(420px,100%),60%)] bg-bg shadow-[-8px_0_28px_rgba(0,0,0,0.5)]",
+              side !== "hidden" && "run-float run-float-stack overflow-hidden rounded-lg border border-line",
+              side === "open" && "w-[min(420px,calc(100%-22px))]",
+              side === "expanded" && "w-[max(min(420px,calc(100%-22px)),60%)]",
             )}
           >
             {side === "hidden" ? (
@@ -333,7 +362,7 @@ export function Playback({
                 aria-controls="run-inspector"
                 aria-expanded={false}
                 title="Show the inspector and state ledger (i)"
-                className="flex h-full w-7 flex-col items-center gap-2 rounded-lg border border-line bg-panel py-2 text-[11px] font-semibold uppercase tracking-[0.08em] text-muted hover:bg-panel-2 hover:text-ink"
+                className="run-float flex h-full w-7 flex-col items-center gap-2 rounded-lg border border-line py-2 text-[11px] font-semibold uppercase tracking-[0.08em] text-muted hover:text-ink"
               >
                 <span aria-hidden>‹</span>
                 <span className="[writing-mode:vertical-rl]">Inspector · State</span>
@@ -351,7 +380,7 @@ export function Playback({
                       controls="run-inspector"
                       name="inspector"
                       shortcut="i"
-                      labels={{ hidden: "Hide »", open: "Dock", expanded: "« Expand" }}
+                      labels={{ hidden: "Hide »", open: "Show", expanded: "« Expand" }}
                     />
                   }
                 >

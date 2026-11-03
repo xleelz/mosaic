@@ -124,6 +124,12 @@ interface Props {
   colorKey: (component: string) => string | undefined;
   cursor: number;
   onCursor: (i: number) => void;
+  /**
+   * How far floating panels cover the diagram's right and bottom edges, in
+   * pixels. The cursor row scrolls into the uncovered region, and the content
+   * gets that much extra room so its last rows and lifelines can clear them.
+   */
+  insets?: { right: number; bottom: number };
 }
 
 function Glyph({ x, y, color, children, title }: { x: number; y: number; color: string; children: string; title?: string }) {
@@ -710,7 +716,9 @@ function EventMark({
   }
 }
 
-export function SequenceDiagram({ playback, doc, scale, colorKey, cursor, onCursor }: Props) {
+const NO_INSETS = { right: 0, bottom: 0 };
+
+export function SequenceDiagram({ playback, doc, scale, colorKey, cursor, onCursor, insets = NO_INSETS }: Props) {
   const scrollRef = useRef<HTMLDivElement>(null);
   const { events, lifelines } = playback;
 
@@ -742,23 +750,26 @@ export function SequenceDiagram({ playback, doc, scale, colorKey, cursor, onCurs
     const el = scrollRef.current;
     if (!el || !curRow) return;
     // Rows sit below the sticky lifeline heads.
+    // Floating panels cover the right and bottom edges; aim for what's left.
+    const viewH = Math.max(HEAD_H + curRow.h, el.clientHeight - insets.bottom);
+    const viewW = Math.max(LIFE_W, el.clientWidth - insets.right);
     const top = HEAD_H + curRow.top;
     const bottom = top + curRow.h;
-    if (top < el.scrollTop + HEAD_H + 6 || bottom > el.scrollTop + el.clientHeight - 6) {
-      el.scrollTop = Math.max(0, top - HEAD_H - (el.clientHeight - HEAD_H) * 0.4);
+    if (top < el.scrollTop + HEAD_H + 6 || bottom > el.scrollTop + viewH - 6) {
+      el.scrollTop = Math.max(0, top - HEAD_H - (viewH - HEAD_H) * 0.4);
     }
     // Keep the active lifelines and their labels in view, moving as little as possible.
     const xs = Array.from(activeLife).map((c) => lifeX(c));
     if (xs.length) {
       const lo = Math.max(0, Math.min(...xs) - 70);
       const hi = Math.max(...xs) + 300;
-      const minLeft = hi - el.clientWidth;
+      const minLeft = hi - viewW;
       if (minLeft > lo) el.scrollLeft = lo;
       else el.scrollLeft = Math.min(Math.max(el.scrollLeft, minLeft), lo);
     }
     // activeLife derives from cursor; recomputing on cursor is intended.
     // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [cursor, curRow, lifeX]);
+  }, [cursor, curRow, lifeX, insets.right, insets.bottom]);
 
   const name = (c: string) => {
     if (c.startsWith("?")) return `? ${c.slice(1)}`;
@@ -769,7 +780,7 @@ export function SequenceDiagram({ playback, doc, scale, colorKey, cursor, onCurs
 
   return (
     <div ref={scrollRef} className="relative h-full overflow-auto" role="group" aria-label="Sequence diagram">
-      <div style={{ width, minWidth: "100%" }}>
+      <div style={{ width: width + insets.right, minWidth: "100%", paddingBottom: insets.bottom }}>
         {/* Lifeline heads */}
         <div className="sticky top-0 z-10 bg-panel/95 backdrop-blur" style={{ height: HEAD_H, width }}>
           <svg width={width} height={HEAD_H} aria-hidden>
