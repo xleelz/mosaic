@@ -57,6 +57,10 @@ with an `unreachable` error.
   and the badge shows `✗ mosaicd unauthorized`.
 - The header badge shows `● mosaicd <version>` when `GET /v1/health` answers and
   `✗ mosaicd unreachable` when it doesn't.
+- Next to it, a chip shows the running commit (`GET /v1/system/version`), and "N new commits" when
+  mosaicd's checkout is behind its upstream. Its popover checks now and runs **Update and restart**
+  (`POST /v1/system/update`), which needs mosaicd under `scripts/serve.sh` to restart on its own
+  (docs/DESIGN.md §8). In fixture mode it reports "not available: fixtures mode".
 
 ### Fixture mode
 

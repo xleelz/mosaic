@@ -21,6 +21,17 @@ func init() {
 	commands = []*command{
 		{name: "health", synopsis: "health", run: cmdHealth,
 			help: "Check that mosaicd is up. Prints {status, version, dolt}."},
+		{name: "version", synopsis: "version [--refresh] [--format text|json]", run: cmdVersion,
+			help: `Show the running mosaicd's version and commit, its checkout's branch and upstream, and
+whether an update is available (behind, ahead, the latest upstream commit) or why not.
+--refresh fetches the upstream now (at most every 30 s); otherwise mosaicd fetches at
+most every 10 minutes.`},
+		{name: "update", synopsis: "update --yes", run: cmdUpdate,
+			help: `Fast-forward mosaicd's checkout (its --source-dir) to its upstream. Under
+scripts/serve.sh, mosaicd then exits and the supervisor rebuilds and restarts mosaicd and
+the web UI; otherwise restart them yourself. Refused (exit 1, with the reason) unless the
+worktree has no local changes, the branch is behind its upstream and not ahead of it,
+and self-update isn't disabled. Only accepted from a loopback address. --yes is required.`},
 		{name: "ontology list", synopsis: "ontology list", run: cmdOntologyList,
 			help: "List ontologies with their latest revision."},
 		{name: "ontology get", synopsis: "ontology get <ont>", run: cmdOntologyGet,
@@ -132,6 +143,51 @@ multi-step scenarios and its mock count (mocks declared, calls mocked) when it u
 exits 1 if any fails.`},
 	}
 	commands = append(commands, composeCommands()...)
+}
+
+func cmdVersion(e *env, c *command, args []string) error {
+	fs := e.flags(c)
+	refresh := fs.Bool("refresh", false, "fetch the upstream now")
+	format := fs.String("format", "text", "output `F`ormat: text or json")
+	if _, err := e.parse(fs, args, 0, 0, ""); err != nil {
+		return err
+	}
+	if *format != "text" && *format != "json" {
+		return usageErrorf("--format must be text or json, got %q", *format)
+	}
+	cl, err := e.client()
+	if err != nil {
+		return err
+	}
+	v, err := cl.SystemVersion(e.ctx, *refresh)
+	if err != nil {
+		return err
+	}
+	if *format == "json" {
+		return printJSON(e.stdout, v)
+	}
+	writeVersion(e.stdout, v)
+	return nil
+}
+
+func cmdUpdate(e *env, c *command, args []string) error {
+	fs := e.flags(c)
+	yes := fs.Bool("yes", false, "confirm the update")
+	if _, err := e.parse(fs, args, 0, 0, ""); err != nil {
+		return err
+	}
+	if !*yes {
+		return usageErrorf("refusing to update mosaicd's checkout without --yes (see mosaic version)")
+	}
+	cl, err := e.client()
+	if err != nil {
+		return err
+	}
+	res, err := cl.SystemUpdate(e.ctx)
+	if err != nil {
+		return err
+	}
+	return printJSON(e.stdout, res)
 }
 
 // Shared flag helpers.

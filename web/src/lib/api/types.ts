@@ -731,6 +731,45 @@ export interface Health {
   dolt: string;
 }
 
+/** api.SystemVersion: GET /v1/system/version */
+export interface SystemVersion {
+  version: string;
+  /** The running build's commit ("" when unknown). */
+  commit: string;
+  /** The build had local changes. */
+  dirty: boolean;
+  branch: string;
+  /** Such as origin/main. */
+  upstream: string;
+  /** "" when mosaicd has no --source-dir. */
+  source_dir: string;
+  update: UpdateStatus;
+}
+
+/** api.UpdateStatus */
+export interface UpdateStatus {
+  available: boolean;
+  /** Why no update is possible, when unavailable. */
+  reason?: string;
+  /** Commits in HEAD..@{u}. */
+  behind: number;
+  /** Commits in @{u}..HEAD. */
+  ahead: number;
+  latest_commit: string;
+  latest_subject: string;
+  /** The last fetch (RFC 3339); null when never. */
+  checked_at: string | null;
+}
+
+/** api.SystemUpdate: POST /v1/system/update */
+export interface SystemUpdate {
+  updated_to: string;
+  from: string;
+  /** mosaicd exits so that scripts/serve.sh rebuilds and restarts it and the UI. */
+  restarting: boolean;
+  note?: string;
+}
+
 /** api.OntologySummary */
 export interface OntologySummary {
   id: string;

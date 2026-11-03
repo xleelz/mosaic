@@ -24,6 +24,8 @@ import type {
   RunList,
   SimulationRequest,
   SimulationRun,
+  SystemUpdate,
+  SystemVersion,
   TestReport,
   Validation,
 } from "./types";
@@ -36,6 +38,10 @@ export interface MosaicClient {
   readonly target: string;
 
   health(): Promise<Health>;
+  /** The running build and whether its checkout can be updated; refresh fetches the upstream now. */
+  systemVersion(refresh?: boolean): Promise<SystemVersion>;
+  /** Fast-forwards mosaicd's checkout; under scripts/serve.sh mosaicd then restarts with the UI. */
+  systemUpdate(): Promise<SystemUpdate>;
   listOntologies(): Promise<OntologyList>;
   getOntology(id: string): Promise<OntologyDetail>;
   getDocument(id: string, rev?: RevSelector): Promise<Document>;

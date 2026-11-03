@@ -99,16 +99,18 @@ const toneClass: Record<Tone, string> = {
   violet: "border-[#3d3766] bg-[#1d1a33] text-violet",
 };
 
+/** A badge's classes, for elements that look like one (such as a button). */
+export function badgeClass(tone: Tone = "neutral", className?: string): string {
+  return cx(
+    "inline-flex h-5 shrink-0 items-center gap-1 whitespace-nowrap rounded border px-1.5 text-[11px] font-medium leading-none",
+    toneClass[tone],
+    className,
+  );
+}
+
 export function Badge({ tone = "neutral", children, className, title }: { tone?: Tone; children: ReactNode; className?: string; title?: string }) {
   return (
-    <span
-      title={title}
-      className={cx(
-        "inline-flex h-5 shrink-0 items-center gap-1 whitespace-nowrap rounded border px-1.5 text-[11px] font-medium leading-none",
-        toneClass[tone],
-        className,
-      )}
-    >
+    <span title={title} className={badgeClass(tone, className)}>
       {children}
     </span>
   );

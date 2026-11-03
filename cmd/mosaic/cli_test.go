@@ -146,6 +146,9 @@ func TestHelpAndUsage(t *testing.T) {
 		{[]string{"sim", "run", "o", "--flow", "f", "--input", "@/does/not/exist.yaml"}, "no such file"},
 		{[]string{"sim", "list", "o", "--limit", "-1"}, "--limit must not be negative"},
 		{[]string{"test", "o", "--format", "summary"}, "--format must be text or json"},
+		{[]string{"update"}, "without --yes"},
+		{[]string{"version", "--format", "yaml"}, "--format must be text or json"},
+		{[]string{"version", "extra"}, `unexpected argument "extra"`},
 	} {
 		// Usage errors are detected before any request: point at a closed port.
 		args := append([]string{"--server", "http://127.0.0.1:9"}, tc.args...)
@@ -816,4 +819,38 @@ func TestConfigAndFixtureCommands(t *testing.T) {
 	}
 	mustCLI(t, f, 0, "delete", ont, "config", "timeout-ms")
 	mustCLI(t, f, 1, "get", ont, "config", "timeout-ms")
+}
+
+func TestVersionAndUpdate(t *testing.T) {
+	f := newFake(t)
+	out, _ := mustCLI(t, f, 0, "version")
+	for _, want := range []string{"mosaicd fake at 1111111", "on main, tracking origin/main", "upstream 2222222 web: a new page (2 behind, 0 ahead)", "available: 2 new commits"} {
+		if !strings.Contains(out, want) {
+			t.Errorf("version lacks %q:\n%s", want, out)
+		}
+	}
+	mustCLI(t, f, 0, "version", "--refresh")
+	if got := f.lastRequest(); got != "GET /v1/system/version?refresh=1" {
+		t.Errorf("--refresh sent %s", got)
+	}
+	v := decode[api.SystemVersion](t, func() string { o, _ := mustCLI(t, f, 0, "version", "--format", "json"); return o }())
+	if v.Update.Behind != 2 || !v.Update.Available {
+		t.Errorf("version json = %+v", v)
+	}
+
+	out, _ = mustCLI(t, f, 0, "update", "--yes")
+	res := decode[api.SystemUpdate](t, out)
+	if res.UpdatedTo != "2222222bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb" || !res.Restarting {
+		t.Errorf("update = %+v", res)
+	}
+	if got := f.lastRequest(); got != "POST /v1/system/update" {
+		t.Errorf("update sent %s", got)
+	}
+	// Refused: exit 1 with the reason.
+	if _, errOut := mustCLI(t, f, 1, "update", "--yes"); !strings.Contains(errOut, "up to date") {
+		t.Errorf("refused update stderr: %s", errOut)
+	}
+	if out, _ := mustCLI(t, f, 0, "version"); !strings.Contains(out, "not available: up to date") {
+		t.Errorf("version after update:\n%s", out)
+	}
 }

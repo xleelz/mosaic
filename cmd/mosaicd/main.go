@@ -2,6 +2,11 @@
 //
 //	mosaicd [--addr 127.0.0.1:7878] [--data-dir ~/.mosaic] [--dolt-bin dolt] [--dolt-port 0]
 //	        [--dolt-dsn DSN] [--token T] [--cors-origin http://localhost:3000]
+//	        [--source-dir DIR] [--no-self-update]
+//
+// After a self-update (POST /v1/system/update) under scripts/serve.sh
+// (MOSAIC_SUPERVISED=1), it shuts down gracefully and exits with
+// selfupdate.ExitRestart (75) so that the supervisor rebuilds and restarts it.
 package main
 
 import (
@@ -24,6 +29,7 @@ import (
 
 	"github.com/xleelz/mosaic/internal/api"
 	"github.com/xleelz/mosaic/internal/doltserver"
+	"github.com/xleelz/mosaic/internal/selfupdate"
 	"github.com/xleelz/mosaic/internal/store"
 )
 
@@ -43,8 +49,16 @@ func (o *origins) Set(v string) error {
 	return nil
 }
 
+// errRestart ends run after a supervised self-update: exit with
+// selfupdate.ExitRestart.
+var errRestart = errors.New("restart requested")
+
 func main() {
 	if err := run(os.Args[1:]); err != nil {
+		if errors.Is(err, errRestart) {
+			log.Printf("exiting with code %d for the supervisor to rebuild and restart mosaicd", selfupdate.ExitRestart)
+			os.Exit(selfupdate.ExitRestart)
+		}
 		log.Printf("mosaicd: %v", err)
 		os.Exit(1)
 	}
@@ -60,6 +74,8 @@ func run(args []string) error {
 	token := fs.String("token", os.Getenv("MOSAIC_TOKEN"), "bearer token required on every request (default $MOSAIC_TOKEN)")
 	var cors origins
 	fs.Var(&cors, "cors-origin", "allowed CORS origin, repeatable or comma-separated (default http://localhost:3000,http://127.0.0.1:3000)")
+	sourceDir := fs.String("source-dir", "", "the mosaic checkout mosaicd was built from, for GET /v1/system/version and self-update (none: updates unavailable)")
+	noSelfUpdate := fs.Bool("no-self-update", false, "refuse POST /v1/system/update")
 	version := fs.Bool("version", false, "print the version and exit")
 	if err := fs.Parse(args); err != nil {
 		if errors.Is(err, flag.ErrHelp) {
@@ -124,8 +140,24 @@ func run(args []string) error {
 	if err != nil {
 		return err
 	}
+	src := *sourceDir
+	if src != "" {
+		if src, err = expandHome(src); err != nil {
+			return err
+		}
+	}
+	supervised := os.Getenv("MOSAIC_SUPERVISED") == "1"
+	updater := selfupdate.New(selfupdate.Options{SourceDir: src, Version: Version, Disabled: *noSelfUpdate, Supervised: supervised})
+	restart := make(chan struct{}, 1)
 	handler := api.New(api.Config{
 		Store: st, Version: Version, Token: *token, Origins: []string(cors),
+		Updater: updater,
+		OnRestart: func() {
+			select {
+			case restart <- struct{}{}:
+			default:
+			}
+		},
 		DoltVersion: func(ctx context.Context) (string, error) {
 			var v string
 			err := dolt.DB.QueryRowContext(ctx, "SELECT dolt_version()").Scan(&v)
@@ -144,14 +176,26 @@ func run(args []string) error {
 		auth = "bearer token"
 	}
 	log.Printf("mosaicd %s listening on http://%s (auth %s)", Version, ln.Addr(), auth)
+	switch {
+	case src == "":
+		log.Printf("self-update unavailable: no --source-dir")
+	case *noSelfUpdate:
+		log.Printf("self-update disabled; source %s at %s", src, updater.Commit())
+	default:
+		log.Printf("self-update from %s at %s (supervised: %v)", src, updater.Commit(), supervised)
+	}
 
 	var exited <-chan struct{}
 	if *doltDSN == "" {
 		exited = dolt.Exited()
 	}
+	var result error
 	select {
 	case <-ctx.Done():
 		log.Printf("shutting down")
+	case <-restart:
+		log.Printf("self-update applied; shutting down to restart")
+		result = errRestart
 	case err := <-served:
 		return fmt.Errorf("http server: %w", err)
 	case <-exited:
@@ -164,7 +208,7 @@ func run(args []string) error {
 		log.Printf("http shutdown: %v", err)
 		_ = srv.Close()
 	}
-	return nil
+	return result
 }
 
 func expandHome(p string) (string, error) {

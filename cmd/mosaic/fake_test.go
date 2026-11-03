@@ -36,6 +36,7 @@ type fakeServer struct {
 	log     []string // "METHOD /path?query"
 	lastSim *api.SimulationRequest
 	lastRaw string // last request body
+	behind  int    // commits the fake checkout is behind its upstream
 }
 
 type ekey struct{ kind, id string }
@@ -56,7 +57,7 @@ type fakeRev struct {
 var fakeNow = time.Date(2026, 10, 30, 12, 0, 0, 0, time.UTC)
 
 func newFake(t *testing.T) *fakeServer {
-	f := &fakeServer{t: t, onts: map[string]*fakeOnt{}, runs: map[string]*api.SimulationRun{}}
+	f := &fakeServer{t: t, onts: map[string]*fakeOnt{}, runs: map[string]*api.SimulationRun{}, behind: 2}
 	mux := http.NewServeMux()
 	mux.HandleFunc("GET /v1/health", func(w http.ResponseWriter, r *http.Request) {
 		writeJSON(w, 200, api.Health{Status: "ok", Version: "fake", Dolt: "ok"})
@@ -89,6 +90,8 @@ func newFake(t *testing.T) *fakeServer {
 	mux.HandleFunc("POST /v1/ontologies/{id}/simulations", f.withOnt(f.runSimulation))
 	mux.HandleFunc("POST /v1/ontologies/{id}/test", f.withOnt(f.test))
 	mux.HandleFunc("GET /v1/simulations/{run}", f.getRun)
+	mux.HandleFunc("GET /v1/system/version", f.systemVersion)
+	mux.HandleFunc("POST /v1/system/update", f.systemUpdate)
 	mux.HandleFunc("/", func(w http.ResponseWriter, r *http.Request) {
 		writeErr(w, 404, "not_found", "no route "+r.Method+" "+r.URL.Path, nil)
 	})
@@ -799,4 +802,29 @@ func (f *fakeServer) test(w http.ResponseWriter, r *http.Request, o *fakeOnt) {
 		rep.Results = append(rep.Results, res)
 	}
 	writeJSON(w, 200, rep)
+}
+
+const (
+	fakeHead   = "1111111aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
+	fakeLatest = "2222222bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb"
+)
+
+func (f *fakeServer) systemVersion(w http.ResponseWriter, r *http.Request) {
+	checked := fakeNow
+	v := api.SystemVersion{Version: "fake", Commit: fakeHead, Branch: "main", Upstream: "origin/main", SourceDir: "/src/mosaic",
+		Update: api.UpdateStatus{Available: f.behind > 0, Behind: f.behind, LatestCommit: fakeLatest, LatestSubject: "web: a new page", CheckedAt: &checked}}
+	if f.behind == 0 {
+		v.Commit = fakeLatest
+		v.Update.Reason = "up to date with origin/main"
+	}
+	writeJSON(w, 200, v)
+}
+
+func (f *fakeServer) systemUpdate(w http.ResponseWriter, r *http.Request) {
+	if f.behind == 0 {
+		writeErr(w, 409, "conflict", "up to date with origin/main", nil)
+		return
+	}
+	f.behind = 0
+	writeJSON(w, 200, api.SystemUpdate{From: fakeHead, UpdatedTo: fakeLatest, Restarting: true})
 }

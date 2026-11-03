@@ -38,6 +38,8 @@ import type {
   RunList,
   SimulationRequest,
   SimulationRun,
+  SystemUpdate,
+  SystemVersion,
   TestReport,
   Validation,
 } from "./types";
@@ -110,6 +112,14 @@ export class HttpClient implements MosaicClient {
 
   health() {
     return this.request<Health>("GET", "/health");
+  }
+
+  systemVersion(refresh?: boolean) {
+    return this.request<SystemVersion>("GET", `/system/version${query({ refresh: refresh ? 1 : undefined })}`);
+  }
+
+  systemUpdate() {
+    return this.request<SystemUpdate>("POST", "/system/update");
   }
 
   async listOntologies(): Promise<OntologyList> {

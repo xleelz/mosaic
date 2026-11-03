@@ -12,6 +12,7 @@ These commands are specified in docs/DESIGN.md §7. The output shapes come from 
 - [Validation, revisions and diffs](#validation-revisions-and-diffs)
 - [Graph and plan](#graph-and-plan)
 - [Simulation and tests](#simulation-and-tests)
+- [Version and self-update](#version-and-self-update)
 - [Errors](#errors)
 
 ## Global behavior
@@ -154,6 +155,23 @@ mosaic test <ont> [--rev R] [--format text|json]
   if any scenario fails.
 
 How to read summaries and traces is covered in mosaic-simulation.
+
+## Version and self-update
+
+```
+mosaic version [--refresh] [--format text|json]   # the running commit, branch, upstream, behind/ahead, update status
+mosaic update --yes                               # {updated_to, from, restarting, note}
+```
+
+- `version` reads `GET /v1/system/version`. `--refresh` makes mosaicd fetch the upstream now (at
+  most every 30 s); otherwise it fetches at most every 10 minutes. When no update is possible,
+  `update.reason` says why: no `--source-dir`, not a git checkout, no upstream, local changes,
+  diverged, disabled with `--no-self-update`, already up to date, or the fetch failed.
+- `update` fast-forwards mosaicd's checkout to its upstream (`git merge --ff-only`). Under
+  `scripts/serve.sh`, mosaicd then exits and the supervisor rebuilds and restarts it and the web
+  UI (`restarting: true`); otherwise restart them yourself. It exits 1 with the reason when the
+  update is refused (409), and is only accepted from a loopback address. Don't run it unless the
+  user asked to update mosaic.
 
 ## Errors
 

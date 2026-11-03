@@ -264,6 +264,30 @@ func (c *Client) Health(ctx context.Context) (*api.Health, error) {
 	return &out, nil
 }
 
+// SystemVersion is GET /v1/system/version; refresh forces a fetch of the
+// upstream (the server rate-limits it).
+func (c *Client) SystemVersion(ctx context.Context, refresh bool) (*api.SystemVersion, error) {
+	var q url.Values
+	if refresh {
+		q = url.Values{"refresh": {"1"}}
+	}
+	var out api.SystemVersion
+	if err := c.do(ctx, http.MethodGet, "/system/version", q, nil, &out); err != nil {
+		return nil, err
+	}
+	return &out, nil
+}
+
+// SystemUpdate is POST /v1/system/update: fast-forward mosaicd's checkout,
+// then restart when supervised.
+func (c *Client) SystemUpdate(ctx context.Context) (*api.SystemUpdate, error) {
+	var out api.SystemUpdate
+	if err := c.do(ctx, http.MethodPost, "/system/update", nil, nil, &out); err != nil {
+		return nil, err
+	}
+	return &out, nil
+}
+
 // Ontologies.
 
 // ListOntologies is GET /v1/ontologies.

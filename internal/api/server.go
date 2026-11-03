@@ -15,6 +15,7 @@ import (
 	"time"
 
 	"github.com/xleelz/mosaic/internal/model"
+	"github.com/xleelz/mosaic/internal/selfupdate"
 	"github.com/xleelz/mosaic/internal/store"
 	wire "github.com/xleelz/mosaic/pkg/api"
 )
@@ -43,6 +44,13 @@ type Config struct {
 	// Workdir is the repo root whose local stores are served read-only
 	// (.mosaic/compose/runs and .mosaic/replay, local.go); default ".".
 	Workdir string
+	// Updater serves /v1/system/version and /v1/system/update; nil reports
+	// updates as unavailable (no source directory).
+	Updater *selfupdate.Updater
+	// OnRestart is called, without blocking, after a supervised update's
+	// response is written: mosaicd then shuts down and exits with
+	// selfupdate.ExitRestart.
+	OnRestart func()
 }
 
 // Server serves the API.
@@ -51,6 +59,7 @@ type Server struct {
 	store   *store.Store
 	origins map[string]bool
 	anyOrig bool
+	updater *selfupdate.Updater
 	handler http.Handler
 }
 
@@ -65,7 +74,10 @@ func New(cfg Config) *Server {
 	if cfg.Now == nil {
 		cfg.Now = time.Now
 	}
-	s := &Server{cfg: cfg, store: cfg.Store, origins: map[string]bool{}}
+	s := &Server{cfg: cfg, store: cfg.Store, origins: map[string]bool{}, updater: cfg.Updater}
+	if s.updater == nil {
+		s.updater = selfupdate.New(selfupdate.Options{Version: cfg.Version})
+	}
 	for _, o := range cfg.Origins {
 		o = strings.TrimRight(strings.TrimSpace(o), "/")
 		if o == "*" {
@@ -115,6 +127,7 @@ func (s *Server) routes(m *http.ServeMux) {
 	m.HandleFunc("PATCH /v1/ontologies/{id}/{kind}/{eid}", s.patchEntity)
 	m.HandleFunc("DELETE /v1/ontologies/{id}/{kind}/{eid}", s.deleteEntity)
 	s.localRoutes(m)
+	s.systemRoutes(m)
 	m.HandleFunc("/", func(w http.ResponseWriter, r *http.Request) {
 		writeError(w, http.StatusNotFound, "not_found", "no route for "+r.Method+" "+r.URL.Path, nil)
 	})

@@ -74,6 +74,29 @@ mosaic-generate skill to build an ontology of ~/src/<repo>", or, for a small pro
 service with mosaic". Writing the YAML by hand and applying it with `-f`, as in Run below, is the
 manual path, for small models and edits.
 
+### Run with `scripts/serve.sh` (recommended)
+
+From a checkout, after `scripts/install.sh`, one command builds and runs `mosaicd` and the web UI
+together, and keeps them up to date:
+
+```sh
+scripts/serve.sh                 # mosaicd on 127.0.0.1:7878, the UI on http://127.0.0.1:3000
+scripts/serve.sh --dev           # the UI with pnpm dev instead of a production build
+scripts/serve.sh --data-dir ~/.mosaic --addr 127.0.0.1:7878 --web-port 3000 -- --token "$MOSAIC_TOKEN"
+```
+
+Logs from both go to stdout, prefixed `[mosaicd]` and `[web]`; Ctrl-C stops both. Arguments after
+`--` go to `mosaicd`.
+
+**Updating.** The chip next to the `mosaicd` badge in the UI's top bar shows the commit you are
+running, and "N new commits" when the checkout's upstream has moved. Click it, then **Update and
+restart**: `mosaicd` fast-forwards the checkout (`git merge --ff-only`) and exits, and `serve.sh`
+rebuilds the binaries and the UI and restarts both; the page reloads when they are back. From a
+terminal, `mosaic version` shows the same status and `mosaic update --yes` does the same update.
+Updates are refused, with the reason, when the checkout has local changes to tracked files, has
+commits that aren't upstream, or isn't on a branch with an upstream; `mosaicd --no-self-update`
+turns them off.
+
 ### Run
 
 The commands below assume `mosaic` and `mosaicd` are on your `PATH`: install them with

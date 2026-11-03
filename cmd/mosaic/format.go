@@ -462,3 +462,51 @@ func writeTestReport(w io.Writer, rep *api.TestReport) error {
 	_, err := io.WriteString(w, b.String())
 	return err
 }
+
+// writeVersion prints GET /v1/system/version for people.
+func writeVersion(w io.Writer, v *api.SystemVersion) {
+	commit := shortSHA(v.Commit)
+	if commit == "" {
+		commit = "unknown commit"
+	}
+	if v.Dirty {
+		commit += " (built with local changes)"
+	}
+	fmt.Fprintf(w, "mosaicd %s at %s\n", v.Version, commit)
+	if v.SourceDir != "" {
+		fmt.Fprintf(w, "source   %s", v.SourceDir)
+		if v.Branch != "" {
+			fmt.Fprintf(w, " on %s", v.Branch)
+			if v.Upstream != "" {
+				fmt.Fprintf(w, ", tracking %s", v.Upstream)
+			}
+		}
+		fmt.Fprintln(w)
+	}
+	u := v.Update
+	if u.LatestCommit != "" {
+		fmt.Fprintf(w, "upstream %s %s (%d behind, %d ahead)\n", shortSHA(u.LatestCommit), u.LatestSubject, u.Behind, u.Ahead)
+	}
+	if u.CheckedAt != nil {
+		fmt.Fprintf(w, "checked  %s\n", u.CheckedAt.Local().Format("2006-01-02 15:04:05"))
+	}
+	if u.Available {
+		fmt.Fprintf(w, "update   available: %d new commit%s; run mosaic update --yes\n", u.Behind, plural(u.Behind))
+	} else {
+		fmt.Fprintf(w, "update   not available: %s\n", u.Reason)
+	}
+}
+
+func shortSHA(sha string) string {
+	if len(sha) > 7 {
+		return sha[:7]
+	}
+	return sha
+}
+
+func plural(n int) string {
+	if n == 1 {
+		return ""
+	}
+	return "s"
+}

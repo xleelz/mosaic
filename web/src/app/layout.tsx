@@ -1,6 +1,7 @@
 import type { Metadata } from "next";
 import Link from "next/link";
 import { ModeBadge } from "@/components/ModeBadge";
+import { UpdateChip } from "@/components/UpdateChip";
 import "./globals.css";
 
 export const metadata: Metadata = {
@@ -40,7 +41,10 @@ export default function RootLayout({ children }: LayoutProps<"/">) {
               </Link>
             </nav>
           </div>
-          <ModeBadge />
+          <div className="flex items-center gap-2">
+            <UpdateChip />
+            <ModeBadge />
+          </div>
         </header>
         <main id="main" className="flex min-h-0 flex-1 flex-col">
           {children}

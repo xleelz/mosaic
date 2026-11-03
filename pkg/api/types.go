@@ -23,6 +23,38 @@ type Health struct {
 	Dolt    string `json:"dolt"`
 }
 
+// SystemVersion is GET /v1/system/version: the running build and whether the
+// checkout it was built from (--source-dir) can be fast-forwarded.
+type SystemVersion struct {
+	Version   string       `json:"version"`
+	Commit    string       `json:"commit"`     // the running build's commit ("" when unknown)
+	Dirty     bool         `json:"dirty"`      // the build had local changes
+	Branch    string       `json:"branch"`     // the checkout's branch
+	Upstream  string       `json:"upstream"`   // its upstream, such as origin/main
+	SourceDir string       `json:"source_dir"` // "" when mosaicd has no --source-dir
+	Update    UpdateStatus `json:"update"`
+}
+
+// UpdateStatus says whether POST /v1/system/update would fast-forward the
+// checkout, and why not.
+type UpdateStatus struct {
+	Available     bool       `json:"available"`
+	Reason        string     `json:"reason,omitempty"` // why not, when unavailable
+	Behind        int        `json:"behind"`           // commits in HEAD..@{u}
+	Ahead         int        `json:"ahead"`            // commits in @{u}..HEAD
+	LatestCommit  string     `json:"latest_commit"`    // the upstream's head
+	LatestSubject string     `json:"latest_subject"`
+	CheckedAt     *time.Time `json:"checked_at"` // the last fetch; null when never
+}
+
+// SystemUpdate is the response of POST /v1/system/update.
+type SystemUpdate struct {
+	UpdatedTo  string `json:"updated_to"`
+	From       string `json:"from"`
+	Restarting bool   `json:"restarting"` // mosaicd exits for scripts/serve.sh to rebuild and restart it
+	Note       string `json:"note,omitempty"`
+}
+
 // OntologySummary is one ontology in the registry.
 type OntologySummary struct {
 	ID             string    `json:"id"`

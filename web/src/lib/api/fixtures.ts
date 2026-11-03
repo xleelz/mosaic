@@ -49,6 +49,8 @@ import type {
   RunList,
   SimulationRequest,
   SimulationRun,
+  SystemUpdate,
+  SystemVersion,
   TestReport,
   Validation,
 } from "./types";
@@ -109,6 +111,22 @@ export class FixtureClient implements MosaicClient {
 
   async health(): Promise<Health> {
     return { status: "ok", version: "fixtures", dolt: "none" };
+  }
+
+  async systemVersion(): Promise<SystemVersion> {
+    return {
+      version: "fixtures",
+      commit: "",
+      dirty: false,
+      branch: "",
+      upstream: "",
+      source_dir: "",
+      update: { available: false, reason: "not available: fixtures mode", behind: 0, ahead: 0, latest_commit: "", latest_subject: "", checked_at: null },
+    };
+  }
+
+  async systemUpdate(): Promise<SystemUpdate> {
+    throw new FixtureUnsupportedError("not available: fixtures mode");
   }
 
   async listOntologies(): Promise<OntologyList> {

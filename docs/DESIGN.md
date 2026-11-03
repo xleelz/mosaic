@@ -198,6 +198,8 @@ as a **warning**, not an error.
 | `GET, POST /ontologies/{id}/simulations` | List runs; run `{rev, flow, scenario, seed, input, choices, state, faults, expect, fixtures, topology, config, clock, save}` |
 | `GET /simulations/{run}` | A run with its trace |
 | `POST /ontologies/{id}/test?rev=` | Run every scenario's expectations |
+| `GET /system/version?refresh=` | The running build and whether its checkout can be updated |
+| `POST /system/update` | Fast-forward the checkout to its upstream, then restart when supervised (§8) |
 
 Server details:
 - POST `/simulations` returns 201 when the run is saved and 200 with `save: false`.
@@ -210,6 +212,22 @@ Server details:
 - A run's `fixtures` apply after the scenario's, then its `topology`, `config`, `clock` and `state` (§11.7).
 - A run of a multi-step scenario without a `flow` is listed under its first step's flow.
 - Each `/test` result adds `steps` (multi-step scenarios), `mocks` (declared) and `mocked_calls`.
+- `/system/version` returns `{version, commit, dirty, branch, upstream, source_dir, update:
+  {available, reason?, behind, ahead, latest_commit, latest_subject, checked_at}}`. `commit` and
+  `dirty` describe the running build (`vcs.revision` and `vcs.modified` from the build info, else
+  `git rev-parse HEAD` in `--source-dir`). `behind` counts `HEAD..@{u}` and `ahead` counts
+  `@{u}..HEAD`. mosaicd runs `git fetch` of the branch's upstream at most every 10 minutes and
+  caches the result; `?refresh=1` forces a fetch, at most once per 30 s. When `available` is false,
+  `reason` says why: no `--source-dir`, not a git checkout, a detached HEAD or no upstream, the
+  fetch failed (with git's error), disabled by `--no-self-update`, local changes to tracked files,
+  diverged (ahead > 0), already up to date, or the checkout moved past the running build (restart
+  to run it).
+- `POST /system/update` is accepted only from a loopback remote address, with the bearer token
+  when one is set, and with no `Origin` header or an allowed CORS origin (403 otherwise). It
+  answers 409 with the reason unless an update is available. It runs `git fetch`, then
+  `git merge --ff-only @{u}`, and returns `{updated_to, from, restarting, note}`; a failing git
+  command returns 500 with git's stderr and leaves the tree as it was. It never builds: see §8.
+  Git runs without a shell, with fixed arguments and timeouts.
 
 YAML input is parsed as YAML 1.2: only `true` and `false` are booleans.
 
@@ -255,6 +273,8 @@ mosaic sim run <ont> (--flow F | --scenario S) [--rev R] [--seed N] [--input JSO
 mosaic sim list <ont> [--limit N]
 mosaic sim get <run-id> [--format summary|trace|json]
 mosaic test <ont> [--rev R] [--format text|json]
+mosaic version [--refresh] [--format text|json]
+mosaic update --yes
 ```
 
 `<kind>` accepts singular or plural names, so configs and fixtures use the generic entity
@@ -271,11 +291,25 @@ parallel joins, scenario steps and deadlines.
 ```
 mosaicd [--addr 127.0.0.1:7878] [--data-dir ~/.mosaic] [--dolt-bin dolt] [--dolt-port 0]
         [--dolt-dsn DSN] [--token T] [--cors-origin http://localhost:3000]
+        [--source-dir DIR] [--no-self-update]
 ```
 
 With no `--dolt-dsn`, it initializes `<data-dir>/dolt` and supervises
 `dolt sql-server -H 127.0.0.1 -P <port>` (a free port when 0). It waits for readiness, and on
 SIGINT or SIGTERM it stops the child before exiting.
+
+**Self-update.** `--source-dir` names the mosaic checkout mosaicd was built from; without it (for
+example, a `go install` binary) updates are reported as unavailable. `--no-self-update` refuses
+every update. `scripts/serve.sh` is the supervisor: it builds `bin/mosaic` and `bin/mosaicd`,
+starts mosaicd with `--source-dir <checkout>` and `MOSAIC_SUPERVISED=1`, then the web UI
+(`pnpm build` and `pnpm start`, or `pnpm dev` with `--dev`) with `MOSAIC_SERVER` set, and
+prefixes each process's log lines. After a successful `POST /system/update`, a supervised mosaicd
+shuts down gracefully, letting in-flight responses finish, and exits with code 75 (EX_TEMPFAIL).
+The supervisor then rebuilds both binaries, stops the UI, runs `pnpm install --frozen-lockfile`
+if the lockfile changed and `pnpm build` in production mode, and starts both again. Any other
+exit of either process, or Ctrl-C, stops both (each runs in its own process group). Unsupervised,
+mosaicd updates the checkout, answers `restarting: false` with a note to restart by hand, and
+keeps running.
 
 ## 9. Repository layout
 
