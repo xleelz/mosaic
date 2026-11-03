@@ -854,3 +854,23 @@ func TestVersionAndUpdate(t *testing.T) {
 		t.Errorf("version after update:\n%s", out)
 	}
 }
+
+func TestSource(t *testing.T) {
+	f := newFake(t)
+	ont := "shop"
+	mustCLI(t, f, 0, "ontology", "create", ont, "--name", "Shop")
+	if out, _ := mustCLI(t, f, 0, "source", ont, "main.go"); out != "package main\n" {
+		t.Errorf("source = %q", out)
+	}
+	out, _ := mustCLI(t, f, 0, "source", ont, "main.go", "--rev", "2", "--repo", "acme/lib", "--sha", "abc1234", "--format", "json")
+	if got := f.lastRequest(); got != "GET /v1/ontologies/shop/source?path=main.go&repo=acme%2Flib&rev=2&sha=abc1234" {
+		t.Errorf("sent %s", got)
+	}
+	if sf := decode[api.SourceFile](t, out); sf.Repo != "acme/lib" || sf.LanguageHint != "go" {
+		t.Errorf("json = %+v", sf)
+	}
+	if _, errOut := mustCLI(t, f, 1, "source", ont, "nope.go"); !strings.Contains(errOut, "file not found at that commit") {
+		t.Errorf("missing stderr: %s", errOut)
+	}
+	mustCLI(t, f, 2, "source", ont)
+}

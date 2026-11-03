@@ -51,6 +51,16 @@ type Config struct {
 	// response is written: mosaicd then shuts down and exits with
 	// selfupdate.ExitRestart.
 	OnRestart func()
+	// DataDir holds the source cache (<data-dir>/source-cache, source.go);
+	// "" disables the cache.
+	DataDir string
+	// GitHubRawURL is the base that GET /ontologies/{id}/source fetches
+	// files from; default https://raw.githubusercontent.com (tests inject a
+	// fake). The token is sent to it only when it is GitHub or was injected.
+	GitHubRawURL string
+	// GitHubToken returns the token for private repos; nil reads GITHUB_TOKEN,
+	// GH_TOKEN or `gh auth token` once, lazily.
+	GitHubToken func(context.Context) string
 }
 
 // Server serves the API.
@@ -60,6 +70,7 @@ type Server struct {
 	origins map[string]bool
 	anyOrig bool
 	updater *selfupdate.Updater
+	source  *sourceFetcher
 	handler http.Handler
 }
 
@@ -78,6 +89,7 @@ func New(cfg Config) *Server {
 	if s.updater == nil {
 		s.updater = selfupdate.New(selfupdate.Options{Version: cfg.Version})
 	}
+	s.source = newSourceFetcher(cfg)
 	for _, o := range cfg.Origins {
 		o = strings.TrimRight(strings.TrimSpace(o), "/")
 		if o == "*" {
@@ -128,6 +140,7 @@ func (s *Server) routes(m *http.ServeMux) {
 	m.HandleFunc("DELETE /v1/ontologies/{id}/{kind}/{eid}", s.deleteEntity)
 	s.localRoutes(m)
 	s.systemRoutes(m)
+	s.sourceRoutes(m)
 	m.HandleFunc("/", func(w http.ResponseWriter, r *http.Request) {
 		writeError(w, http.StatusNotFound, "not_found", "no route for "+r.Method+" "+r.URL.Path, nil)
 	})

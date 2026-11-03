@@ -55,6 +55,18 @@ type SystemUpdate struct {
 	Note       string `json:"note,omitempty"`
 }
 
+// SourceFile is GET /v1/ontologies/{id}/source: one file of the code an
+// ontology was derived from, fetched from GitHub at a pinned commit.
+type SourceFile struct {
+	Repo         string `json:"repo"`          // owner/name
+	SHA          string `json:"sha"`           // the commit
+	Path         string `json:"path"`          // relative to the repo root
+	Content      string `json:"content"`       // the file's text
+	LanguageHint string `json:"language_hint"` // from the extension, such as go, python, cpp ("" when unknown)
+	Size         int    `json:"size"`          // bytes
+	URL          string `json:"url"`           // the github.com blob URL, without a line anchor
+}
+
 // OntologySummary is one ontology in the registry.
 type OntologySummary struct {
 	ID             string    `json:"id"`

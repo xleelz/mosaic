@@ -90,6 +90,7 @@ func newFake(t *testing.T) *fakeServer {
 	mux.HandleFunc("POST /v1/ontologies/{id}/simulations", f.withOnt(f.runSimulation))
 	mux.HandleFunc("POST /v1/ontologies/{id}/test", f.withOnt(f.test))
 	mux.HandleFunc("GET /v1/simulations/{run}", f.getRun)
+	mux.HandleFunc("GET /v1/ontologies/{id}/source", f.withOnt(f.source))
 	mux.HandleFunc("GET /v1/system/version", f.systemVersion)
 	mux.HandleFunc("POST /v1/system/update", f.systemUpdate)
 	mux.HandleFunc("/", func(w http.ResponseWriter, r *http.Request) {
@@ -818,6 +819,23 @@ func (f *fakeServer) systemVersion(w http.ResponseWriter, r *http.Request) {
 		v.Update.Reason = "up to date with origin/main"
 	}
 	writeJSON(w, 200, v)
+}
+
+func (f *fakeServer) source(w http.ResponseWriter, r *http.Request, _ *fakeOnt) {
+	q := r.URL.Query()
+	if q.Get("path") != "main.go" {
+		writeErr(w, 404, "not_found", "file not found at that commit", nil)
+		return
+	}
+	repo, sha := q.Get("repo"), q.Get("sha")
+	if repo == "" {
+		repo = "acme/shop"
+	}
+	if sha == "" {
+		sha = fakeHead
+	}
+	writeJSON(w, 200, api.SourceFile{Repo: repo, SHA: sha, Path: "main.go", Content: "package main\n", LanguageHint: "go", Size: 13,
+		URL: "https://github.com/" + repo + "/blob/" + sha + "/main.go"})
 }
 
 func (f *fakeServer) systemUpdate(w http.ResponseWriter, r *http.Request) {

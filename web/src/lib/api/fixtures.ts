@@ -49,6 +49,7 @@ import type {
   RunList,
   SimulationRequest,
   SimulationRun,
+  SourceFile,
   SystemUpdate,
   SystemVersion,
   TestReport,
@@ -127,6 +128,10 @@ export class FixtureClient implements MosaicClient {
 
   async systemUpdate(): Promise<SystemUpdate> {
     throw new FixtureUnsupportedError("not available: fixtures mode");
+  }
+
+  async getSource(): Promise<SourceFile> {
+    throw new FixtureUnsupportedError("Source files are not available in fixtures mode; the viewer fetches them through a live mosaicd.");
   }
 
   async listOntologies(): Promise<OntologyList> {

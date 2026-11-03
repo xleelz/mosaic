@@ -770,6 +770,30 @@ export interface SystemUpdate {
   note?: string;
 }
 
+/**
+ * api.SourceFile: GET /v1/ontologies/{id}/source, a cited file's content at
+ * the model's commit, fetched by mosaicd from GitHub.
+ */
+export interface SourceFile {
+  repo: string;
+  sha: string;
+  path: string;
+  content: string;
+  /** A lowercase language name from the extension ("go", "cpp", ...), or "". */
+  language_hint: string;
+  /** Bytes. */
+  size: number;
+  /** The github.com blob URL, without a line anchor. */
+  url: string;
+}
+
+/** Options of getSource: the revision, and an explicit repo/sha from a citation. */
+export interface SourceOptions {
+  rev?: RevSelector;
+  repo?: string;
+  sha?: string;
+}
+
 /** api.OntologySummary */
 export interface OntologySummary {
   id: string;

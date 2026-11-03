@@ -151,7 +151,7 @@ func run(args []string) error {
 	restart := make(chan struct{}, 1)
 	handler := api.New(api.Config{
 		Store: st, Version: Version, Token: *token, Origins: []string(cors),
-		Updater: updater,
+		Updater: updater, DataDir: dir,
 		OnRestart: func() {
 			select {
 			case restart <- struct{}{}:

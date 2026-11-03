@@ -40,6 +40,8 @@ const DWELL: Record<string, number> = {
 function isTyping(el: EventTarget | null, key: string): boolean {
   if (!(el instanceof HTMLElement)) return false;
   if (el.isContentEditable) return true;
+  // The code viewer (components/code) owns its keys: vim's normal mode, its prompts.
+  if (el.closest(".cm-editor, [data-code-viewer]")) return true;
   const tag = el.tagName;
   if (tag === "TEXTAREA" || tag === "SELECT") return true;
   if (tag === "INPUT") {

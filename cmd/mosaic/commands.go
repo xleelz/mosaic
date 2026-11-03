@@ -13,6 +13,7 @@ import (
 
 	"github.com/xleelz/mosaic/internal/model"
 	"github.com/xleelz/mosaic/pkg/api"
+	"github.com/xleelz/mosaic/pkg/client"
 )
 
 var commands []*command
@@ -100,6 +101,11 @@ the commit created, modified or affected.`},
 			help: "List entity changes between two revisions or the draft. Defaults: --from latest --to draft."},
 		{name: "graph", synopsis: "graph <ont> [--rev R]", run: cmdGraph,
 			help: "Print the architecture map: components plus explicit and derived edges."},
+		{name: "source", synopsis: "source <ont> <path> [--rev R] [--repo X --sha S] [--format text|json]", run: cmdSource,
+			help: `Print a file of the code the ontology cites, as mosaicd fetches it from GitHub at the
+document's source commit (cached under <data-dir>/source-cache). --repo and --sha pick a
+citation's repo and commit instead; they must be the document's source or appear on one
+of its citations. For private repos, mosaicd needs GITHUB_TOKEN or gh auth login.`},
 		{name: "plan", synopsis: "plan <ont> <flow> [--rev R]", run: cmdPlan,
 			help: `Show what a flow can reach: interfaces, components, choice points (keys for --choice),
 stateful components (for --state), fault targets (for --fault) and its scenarios.`},
@@ -188,6 +194,34 @@ func cmdUpdate(e *env, c *command, args []string) error {
 		return err
 	}
 	return printJSON(e.stdout, res)
+}
+
+func cmdSource(e *env, c *command, args []string) error {
+	fs := e.flags(c)
+	rev := revFlag(fs)
+	repo := fs.String("repo", "", "a citation's `repo` (owner/name)")
+	sha := fs.String("sha", "", "a citation's commit `sha`")
+	format := fs.String("format", "text", "output `F`ormat: text (the file) or json")
+	pos, err := e.parse(fs, args, 2, 2, "<ont> <path>")
+	if err != nil {
+		return err
+	}
+	if *format != "text" && *format != "json" {
+		return usageErrorf("--format must be text or json, got %q", *format)
+	}
+	cl, err := e.client()
+	if err != nil {
+		return err
+	}
+	f, err := cl.Source(e.ctx, pos[0], pos[1], client.SourceOptions{Rev: *rev, Repo: *repo, SHA: *sha})
+	if err != nil {
+		return err
+	}
+	if *format == "json" {
+		return printJSON(e.stdout, f)
+	}
+	_, err = io.WriteString(e.stdout, f.Content)
+	return err
 }
 
 // Shared flag helpers.

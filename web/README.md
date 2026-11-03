@@ -254,7 +254,47 @@ PATH=/usr/local/go/bin:$PATH go run ./internal/devtools/fixtures -out web/fixtur
 | m | Run page: cycle the map (open, expanded, hidden) |
 | Tab, Enter, Space | Move between and activate every control; Enter on a focused map node opens it |
 
-Playback shortcuts are ignored while you type in an input, select or text area.
+Playback shortcuts are ignored while you type in an input, select or text area, and while focus is
+in the code viewer.
+
+### Code viewer
+
+Every code citation (`path:line` under components, interfaces, flows, steps, notes and the run
+inspector) is a button inside a workspace. Clicking it opens a floating **code viewer** with the
+file at the model's commit: mosaicd fetches it from GitHub (`GET /v1/ontologies/{id}/source`,
+docs/DESIGN.md §6) with its own `GITHUB_TOKEN` or `gh auth token`, so private repos work and no
+token reaches the browser. Outside a workspace a citation stays plain text. In fixture mode the
+viewer says source files are not available.
+
+- The window opens centered at 70% × 70% of the viewport. Drag it by its title bar, resize it from
+  its bottom-right corner, and expand it to 95% with □ (or a double-click on the title bar).
+  Clicking another citation while it is open reuses the window and swaps the file.
+- The title bar shows `repo@shortsha path:L-L`, the **vim** toggle, **Open on GitHub** (the blob
+  URL with `#L10-L20`), **Copy path** (`path:L-L`) and ✕.
+- The editor is CodeMirror 6, read-only, with line numbers and syntax coloring by extension: Go,
+  Python, C/C++ and CUDA (`.cu`, `.cuh`), JavaScript, TypeScript, JSX/TSX, Rust, Java, YAML, JSON,
+  Markdown, SQL, shell, HCL/Terraform, protobuf, TOML and Dockerfiles; anything else is plain text.
+  The cited lines are highlighted and centered, with the cursor on the first.
+- CodeMirror and the languages load on the first click (dynamic imports), never with a page.
+
+Vim keys are on by default, starting in normal mode; the **vim** toggle turns them off, and the
+choice is kept in `localStorage` (`mosaic.codeViewer.vim`). The status line at the bottom shows the
+mode, pending keys and `line:col`. Edits are no-ops.
+
+| Key (vim on) | Action |
+|---|---|
+| h j k l, w b e, 0 $ | Move by character, word, line edge |
+| gg / G, `:42` | First line / last line, line 42 |
+| Ctrl-d / Ctrl-u, Ctrl-f / Ctrl-b | Half page / full page down and up |
+| `/text`, `?text`, n / N, `*` | Search forward and back, next and previous match |
+| % | Matching bracket |
+| v, V, y | Visual and line-visual selection, yank |
+| `:q`, q, Esc in normal mode | Close the viewer |
+
+Esc belongs to vim: it leaves insert or visual mode and cancels a pending command, and closes the
+viewer only from normal mode with nothing pending. With vim off, arrows, Page Up/Down and Ctrl-F
+(search) work, and Esc closes. While the viewer has focus it owns the keyboard, so the run page's
+Space, arrows, `i` and `m` don't fire.
 
 ## Code layout
 
@@ -267,6 +307,9 @@ src/lib/model/docindex.ts  lookup maps built once per document (components, inte
                     scenarios by id, scenarios by flow, members by parent, top-level parent, area),
                     flow grouping and the component tree rows; tests in docindex.test.ts
 src/components/     ui primitives, JSON/CEL views, diff.tsx (line diffs), behavior StepList, map/, playback/, workspace/
+src/components/code/  the code viewer: CodeViewer.tsx (provider and window), CodeEditor.tsx (CodeMirror,
+                    vim, theme; lazy), languages.ts (per-language chunks), hcl.ts; lib/source.ts for
+                    the language, blob URL and title (tests in source.test.ts)
 src/components/map/ ArchitectureMap, layout.ts (ELK), graphview.ts (collapse, before/after union, change scope)
 src/app/            routes; fixture-data/[...path] serves web/fixtures in fixture mode
 ```

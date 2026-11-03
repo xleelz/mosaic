@@ -6,6 +6,7 @@ import { createContext, useCallback, useContext, useEffect, useMemo, useState, t
 import type { CommitDetail, CommitList, Document, Graph, OntologyDetail, RevisionList } from "@/lib/api/types";
 import { useQuery, type QueryState } from "@/lib/hooks";
 import { Badge, ErrorBox, Select, Spinner, cx } from "@/components/ui";
+import { CodeViewerProvider } from "@/components/code/CodeViewer";
 
 export interface WorkspaceCtx {
   id: string;
@@ -213,7 +214,7 @@ export function WorkspaceShell({ children }: { children: ReactNode }) {
           ) : detail.loading && !detail.data ? (
             <Spinner label="Loading ontology" />
           ) : (
-            children
+            <CodeViewerProvider>{children}</CodeViewerProvider>
           )}
         </div>
       </div>

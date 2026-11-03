@@ -38,6 +38,8 @@ import type {
   RunList,
   SimulationRequest,
   SimulationRun,
+  SourceFile,
+  SourceOptions,
   SystemUpdate,
   SystemVersion,
   TestReport,
@@ -133,6 +135,13 @@ export class HttpClient implements MosaicClient {
 
   getDocument(id: string, rev?: RevSelector) {
     return this.request<Document>("GET", `/ontologies/${enc(id)}/document${query({ rev })}`);
+  }
+
+  getSource(id: string, path: string, opts: SourceOptions = {}) {
+    return this.request<SourceFile>(
+      "GET",
+      `/ontologies/${enc(id)}/source${query({ path, rev: opts.rev, repo: opts.repo, sha: opts.sha })}`,
+    );
   }
 
   async getGraph(id: string, rev?: RevSelector): Promise<Graph> {

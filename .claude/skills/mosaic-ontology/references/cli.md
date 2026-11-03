@@ -12,6 +12,7 @@ These commands are specified in docs/DESIGN.md §7. The output shapes come from 
 - [Validation, revisions and diffs](#validation-revisions-and-diffs)
 - [Graph and plan](#graph-and-plan)
 - [Simulation and tests](#simulation-and-tests)
+- [Cited source files](#cited-source-files)
 - [Version and self-update](#version-and-self-update)
 - [Errors](#errors)
 
@@ -155,6 +156,18 @@ mosaic test <ont> [--rev R] [--format text|json]
   if any scenario fails.
 
 How to read summaries and traces is covered in mosaic-simulation.
+
+## Cited source files
+
+```
+mosaic source <ont> <path> [--rev R] [--repo X --sha S] [--format text|json]
+```
+
+- Prints a cited file as mosaicd fetches it from GitHub at the document's `source.sha`
+  (`GET /v1/ontologies/{id}/source`); `--format json` gives `{repo, sha, path, content,
+  language_hint, size, url}`. `--repo`/`--sha` must be the document's source or a citation's.
+  Secret-looking files (`.env*`, `*.pem`, `*.key`, ...) are refused; private repos need
+  `GITHUB_TOKEN` or `gh auth login` for mosaicd.
 
 ## Version and self-update
 

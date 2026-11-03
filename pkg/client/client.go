@@ -601,6 +601,30 @@ func (c *Client) Graph(ctx context.Context, ont, rev string) (*model.Graph, erro
 	return &out, nil
 }
 
+// SourceOptions select the revision and, for a citation in another repo or at
+// another commit, its repo and sha.
+type SourceOptions struct {
+	Rev  string
+	Repo string
+	SHA  string
+}
+
+// Source is GET /v1/ontologies/{id}/source?path=: a file of the code the
+// ontology cites, fetched by mosaicd from GitHub at the document's commit.
+func (c *Client) Source(ctx context.Context, ont, path string, opts SourceOptions) (*api.SourceFile, error) {
+	q := url.Values{"path": {path}}
+	for k, v := range map[string]string{"rev": opts.Rev, "repo": opts.Repo, "sha": opts.SHA} {
+		if v != "" {
+			q.Set(k, v)
+		}
+	}
+	var out api.SourceFile
+	if err := c.do(ctx, http.MethodGet, "/ontologies/"+esc(ont)+"/source", q, nil, &out); err != nil {
+		return nil, err
+	}
+	return &out, nil
+}
+
 // Plan is GET /v1/ontologies/{id}/flows/{flow}/plan?rev=.
 func (c *Client) Plan(ctx context.Context, ont, flow, rev string) (*model.Plan, error) {
 	var out model.Plan

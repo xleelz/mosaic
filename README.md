@@ -122,6 +122,9 @@ cd web && pnpm dev
 
 The web UI lives in [web/](web/README.md). Set `MOSAIC_SERVER` if `mosaicd` listens somewhere else,
 or set `NEXT_PUBLIC_MOSAIC_FIXTURES=1` to use fixtures generated from the engine, with no daemon.
+Click any code citation (`path:line`) to open the cited file in a floating viewer, fetched by
+`mosaicd` from GitHub at the model's commit, with syntax coloring and vim keys; private repos need
+`GITHUB_TOKEN` or `gh auth login` where `mosaicd` runs.
 
 The Architecture tab shows the Envoy model's components, nested by their parent, and the calls
 between them:

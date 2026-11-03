@@ -4,6 +4,7 @@ import { useEffect, useRef, useState, type ButtonHTMLAttributes, type ReactNode,
 import { errorMessage, isFixtureUnsupported } from "@/lib/api";
 import type { Source } from "@/lib/api/types";
 import { sourceString } from "@/lib/model/format";
+import { useOpenSource } from "@/components/code/context";
 
 export function cx(...parts: (string | false | null | undefined)[]): string {
   return parts.filter(Boolean).join(" ");
@@ -135,12 +136,38 @@ export function Kbd({ children }: { children: ReactNode }) {
   );
 }
 
+/**
+ * A code citation. Inside a CodeViewerProvider (the workspace) it is a button
+ * that opens the file at the model's commit in the code viewer; elsewhere,
+ * plain text.
+ */
 export function SourceRef({ source, className }: { source: Source; className?: string }) {
+  const open = useOpenSource();
   const s = sourceString(source);
+  const title = source.repo ? `${source.repo} ${s}` : s;
+  if (!open) {
+    return (
+      <span className={cx("font-mono text-[11px] text-link", className)} title={title}>
+        {s}
+      </span>
+    );
+  }
   return (
-    <span className={cx("font-mono text-[11px] text-link", className)} title={source.repo ? `${source.repo} ${s}` : s}>
+    <button
+      type="button"
+      onClick={(e) => {
+        e.stopPropagation();
+        open(source, e.currentTarget);
+      }}
+      title={`Open ${title} in the code viewer`}
+      data-source-ref=""
+      className={cx(
+        "cursor-pointer break-all rounded-sm text-left font-mono text-[11px] text-link decoration-link/60 underline-offset-2 hover:underline",
+        className,
+      )}
+    >
       {s}
-    </span>
+    </button>
   );
 }
 

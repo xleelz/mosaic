@@ -24,6 +24,8 @@ import type {
   RunList,
   SimulationRequest,
   SimulationRun,
+  SourceFile,
+  SourceOptions,
   SystemUpdate,
   SystemVersion,
   TestReport,
@@ -46,6 +48,8 @@ export interface MosaicClient {
   getOntology(id: string): Promise<OntologyDetail>;
   getDocument(id: string, rev?: RevSelector): Promise<Document>;
   getGraph(id: string, rev?: RevSelector): Promise<Graph>;
+  /** A cited file at the document's commit (or a citation's repo/sha), through mosaicd. */
+  getSource(id: string, path: string, opts?: SourceOptions): Promise<SourceFile>;
   listRevisions(id: string): Promise<RevisionList>;
   diff(id: string, from?: RevSelector, to?: RevSelector): Promise<Diff>;
   validate(id: string, rev?: RevSelector): Promise<Validation>;

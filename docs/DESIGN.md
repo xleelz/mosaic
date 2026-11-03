@@ -198,6 +198,7 @@ as a **warning**, not an error.
 | `GET, POST /ontologies/{id}/simulations` | List runs; run `{rev, flow, scenario, seed, input, choices, state, faults, expect, fixtures, topology, config, clock, save}` |
 | `GET /simulations/{run}` | A run with its trace |
 | `POST /ontologies/{id}/test?rev=` | Run every scenario's expectations |
+| `GET /ontologies/{id}/source?path=&rev=&repo=&sha=` | A cited file's text from GitHub at the document's commit |
 | `GET /system/version?refresh=` | The running build and whether its checkout can be updated |
 | `POST /system/update` | Fast-forward the checkout to its upstream, then restart when supervised (§8) |
 
@@ -228,6 +229,30 @@ Server details:
   `git merge --ff-only @{u}`, and returns `{updated_to, from, restarting, note}`; a failing git
   command returns 500 with git's stderr and leaves the tree as it was. It never builds: see §8.
   Git runs without a shell, with fixed arguments and timeouts.
+- `/ontologies/{id}/source` returns JSON `{repo, sha, path, content, language_hint, size, url}`
+  for one file of the code the document at `?rev=` cites; `url` is the github.com blob URL
+  without a line anchor, and `language_hint` comes from the extension (`go`, `python`, `cpp`,
+  `cuda`, `tsx`, `hcl`, `dockerfile`, ...; `""` when unknown). It is not an open proxy:
+  - `repo` and `sha` default to the document's `source.repo` and `source.sha`; a missing half of
+    an explicit pair is filled the same way. The pair must be the document's source or appear
+    on one of its citations (a citation's missing repo or sha is the document's), else 403.
+    `repo` must be `owner/name` and `sha` a 7–64 digit hex commit (400).
+  - `path` must be relative and clean: no leading `/`, no `..`, `.` or empty segments, no `\`,
+    no NUL (400). Base names matching `SecretFilePatterns` in `internal/api/source.go`
+    (`.env*`, `*.pem`, `*.key`, `*.age`, `*.jks`, `*.p12`, `credentials*`, `.netrc`,
+    `*secret*.json`, `id_rsa*`, case-insensitive) are refused with 403 before any fetch.
+  - mosaicd fetches `https://raw.githubusercontent.com/{repo}/{sha}/{path}` with a 20 s timeout
+    and a 2 MiB limit (413 above it). GitHub's 404 answers 404 `file not found at that commit`
+    (when no token was sent, it adds that a private repo needs one, since raw.githubusercontent.com
+    answers 404 for private repos); 401 and 403 answer 502 `private repo: set GITHUB_TOKEN or run
+    gh auth login for mosaicd`; anything else, or a network error, answers 502.
+  - For private repos, mosaicd reads `GITHUB_TOKEN`, else `GH_TOKEN`, else the output of
+    `gh auth token` (run without a shell, 5 s timeout) once, on the first fetch, and keeps it for
+    the process. It is sent as `Authorization: Bearer` only to `raw.githubusercontent.com` and
+    `api.github.com` (dropped on a redirect anywhere else), and is never logged or returned.
+  - Fetched files are cached, written atomically, at
+    `<data-dir>/source-cache/<repo>/<sha>/<path>`: a file at a fixed commit never changes, so
+    the cache is never invalidated. Errors are not cached.
 
 YAML input is parsed as YAML 1.2: only `true` and `false` are booleans.
 
@@ -273,6 +298,7 @@ mosaic sim run <ont> (--flow F | --scenario S) [--rev R] [--seed N] [--input JSO
 mosaic sim list <ont> [--limit N]
 mosaic sim get <run-id> [--format summary|trace|json]
 mosaic test <ont> [--rev R] [--format text|json]
+mosaic source <ont> <path> [--rev R] [--repo X --sha S] [--format text|json]
 mosaic version [--refresh] [--format text|json]
 mosaic update --yes
 ```
