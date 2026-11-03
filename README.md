@@ -100,6 +100,17 @@ cd web && pnpm dev
 The web UI lives in [web/](web/README.md). Set `MOSAIC_SERVER` if `mosaicd` listens somewhere else,
 or set `NEXT_PUBLIC_MOSAIC_FIXTURES=1` to use fixtures generated from the engine, with no daemon.
 
+The Architecture tab shows the Envoy model's components, nested by their parent, and the calls
+between them:
+
+![The Envoy example's architecture map](docs/images/envoy-architecture.png)
+
+A simulation run, paused mid-way through `upstream-503-retried`: h1's 503 comes back, and the
+router's retry policy sends attempt 2 after a back-off. The sequence diagram, the inspector, the
+state ledger and the architecture map all follow the playback cursor:
+
+![A run of upstream-503-retried, paused at the retry](docs/images/envoy-run.png)
+
 ## The example
 
 [examples/envoy](examples/envoy/ontology.yaml) models one downstream HTTP request through the
