@@ -51,7 +51,7 @@ func (r *run) closeStep(i int, c *model.CloseSpec) error {
 		switch t := v.(type) {
 		case string:
 			key = t
-		case int64, float64, bool:
+		case int64, uint64, float64, bool:
 			key = fmt.Sprint(t)
 		default:
 			key = ""

@@ -58,3 +58,35 @@ func TestBigInt(t *testing.T) {
 		t.Errorf("bytes %v %v", got, err)
 	}
 }
+
+// behavior-language §30: integers beyond int64.
+func TestNativeBigInts(t *testing.T) {
+	if v := Native(json.Number("18446744073709551615")); v != uint64(18446744073709551615) {
+		t.Errorf("uint64 max: %T %v", v, v)
+	}
+	if v := Native(json.Number("18446744073709551616")); v != float64(18446744073709551616) {
+		t.Errorf("2^64: %T %v", v, v)
+	}
+	if v := Native(json.Number("-9223372036854775808")); v != int64(-9223372036854775808) {
+		t.Errorf("int64 min: %T %v", v, v)
+	}
+	v, err := Behavior.Eval("input.n + 0u", map[string]any{"input": map[string]any{"n": uint64(18446744073709551615)}})
+	if err != nil || v != uint64(18446744073709551615) {
+		t.Errorf("uint round trip: %T %v %v", v, v, err)
+	}
+	if got := LossyInts([]byte(`{"a": [1, {"id": "x", "n": 18446744073709551616}], "u": 18446744073709551615, "f": 1e30}`)); len(got) != 1 || got[0] != "a[x].n=18446744073709551616" {
+		t.Errorf("LossyInts %v", got)
+	}
+	if v := SchemaView(map[string]any{"u": uint64(1 << 63)}).(map[string]any)["u"]; v != BigInt("9223372036854775808") {
+		t.Errorf("SchemaView %v", v)
+	}
+}
+
+// Over the cost limit, the error names the limit and what it costs.
+func TestCostError(t *testing.T) {
+	_, err := Behavior.Eval("input.s.split('').map(c, c + c).size()", map[string]any{"input": map[string]any{"s": strings.Repeat("ab", 40)}, CostLimitKey: int64(50)})
+	if err == nil || !strings.Contains(err.Error(), "CEL cost limit 50 exceeded; it costs ") || !IsCostLimit(err) {
+		t.Errorf("err %v", err)
+	}
+	t.Log(err)
+}

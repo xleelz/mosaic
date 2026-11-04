@@ -6,6 +6,7 @@ package expr
 import (
 	"encoding/json"
 	"fmt"
+	"math"
 	"sort"
 	"strconv"
 	"strings"
@@ -74,6 +75,15 @@ const CostLimitKey = "__cost_limit"
 // DefaultCostLimit bounds the work of one evaluation. It was 1,000,000
 // before §13.1 item 18, which prompts of about 500 tokens exceeded.
 const DefaultCostLimit = 10_000_000
+
+// MaxCostLimit is the safety bound on any cost limit: a scenario's
+// cost_limit or max_cel_cost, a run's limits and the limit scaled from
+// the input's size (behavior-language §30).
+const MaxCostLimit = 10_000_000_000
+
+// costProbeFactor is how far past the limit an over-limit expression is
+// re-run to measure what it needs, for the error message.
+const costProbeFactor = 20
 
 // Env compiles and caches programs for one set of variables.
 type Env struct {
@@ -173,9 +183,47 @@ func (e *Env) Eval(src string, act map[string]any) (any, error) {
 	}
 	out, _, err := p.Eval(activation(act))
 	if err != nil {
+		if IsCostLimit(err) {
+			return nil, e.costError(src, act, err)
+		}
 		return nil, fmt.Errorf("%s: %w", src, err)
 	}
 	return ToNative(out), nil
+}
+
+// IsCostLimit reports whether err is CEL's cost limit error.
+func IsCostLimit(err error) bool {
+	return err != nil && strings.Contains(err.Error(), "cost limit exceeded")
+}
+
+// costError reports an expression over its cost limit (behavior-language
+// §30): the limit, and what the expression costs, measured by running it
+// again under a limit costProbeFactor times higher (with random() and the
+// id helpers detached, so the run's sequences don't move). The message
+// keeps CEL's "actual cost limit exceeded" text.
+func (e *Env) costError(src string, act map[string]any, err error) error {
+	limit := CostLimit(act)
+	need := ""
+	if probe := min(limit*costProbeFactor, MaxCostLimit); probe > limit {
+		pa := make(map[string]any, len(act))
+		for k, v := range act {
+			pa[k] = v
+		}
+		pa[CostLimitKey] = probe
+		pa[RandomKey] = func(int64) int64 { return 0 }
+		pa[IDsKey] = NewIDs(0)
+		if p, cerr := e.compile(src, probe); cerr == nil {
+			_, det, perr := p.Eval(activation(pa))
+			switch {
+			case perr == nil && det != nil && det.ActualCost() != nil:
+				need = fmt.Sprintf("; it costs %d", *det.ActualCost())
+			case IsCostLimit(perr):
+				need = fmt.Sprintf("; it costs more than %d", probe)
+			}
+		}
+	}
+	return fmt.Errorf("%s: CEL cost limit %d exceeded%s (raise it with the scenario's max_cel_cost, up to %d): %w",
+		src, limit, need, int64(MaxCostLimit), err)
 }
 
 // EvalBool evaluates src and requires a boolean.
@@ -281,6 +329,12 @@ func Native(v any) any {
 			if n, err := strconv.ParseInt(string(t), 10, 64); err == nil {
 				return n
 			}
+			// Beyond int64 (behavior-language §30): up to 2^64-1 a whole
+			// number is a uint64 (CEL uint); past that, a double, which
+			// validation and runs warn about (LossyInt).
+			if n, err := strconv.ParseUint(string(t), 10, 64); err == nil {
+				return n
+			}
 		}
 		f, _ := t.Float64()
 		return f
@@ -313,7 +367,7 @@ func Native(v any) any {
 }
 
 // ToNative converts a CEL value to plain Go: nil, bool, int64, float64,
-// string, []any and map[string]any.
+// string, []any and map[string]any; a uint beyond int64 stays a uint64.
 func ToNative(v ref.Val) any {
 	switch v.Type() {
 	case types.NullType:
@@ -323,6 +377,9 @@ func ToNative(v ref.Val) any {
 	case types.IntType:
 		return int64(v.(types.Int))
 	case types.UintType:
+		if u := uint64(v.(types.Uint)); u > math.MaxInt64 {
+			return u // behavior-language §30: kept, not wrapped
+		}
 		return int64(v.(types.Uint))
 	case types.DoubleType:
 		return float64(v.(types.Double))

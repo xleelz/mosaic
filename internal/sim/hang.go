@@ -220,7 +220,7 @@ func (r *run) sessionOf(f *frame, v, p string) (string, error) {
 		if t != "" {
 			return t, nil
 		}
-	case int64, float64, bool:
+	case int64, uint64, float64, bool:
 		return fmt.Sprint(t), nil
 	}
 	return "", abortf("%s: a session key must be a non-empty string or a number, got %#v", p, out)

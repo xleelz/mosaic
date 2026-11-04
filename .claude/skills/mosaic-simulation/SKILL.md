@@ -135,9 +135,14 @@ The full semantics of every step, call option and CEL variable are in
 - **`streams_when: "= input.stream == true"`** on an interface that yields: a plain call (false) returns the bare value instead of `{items, value}`; a yield on it aborts (§23).
 - **CEL `list.indexOf(x)` / `list.lastIndexOf(x)`**: an int, -1 when absent (§22).
 - **Input markers `{$bytes: "<base64>"}`** (raw bytes) and **`{$bigint: "<decimal>"}`** (beyond int64).
+- **Config overrides: `null` is a value** (`has(config.x)` is true); **`{$absent: true}`** removes the key, to drive "the flag was not given" (§30).
+- **Quoted path segments**: `set: {"state['ORG#acme.v2'].plan": pro}`, and `['a.b'].c` in a scenario `set` step (§30).
+- **Whole numbers to 2^64-1 are CEL `uint`** (`x == 18446744073709551615u`); bigger ones become doubles, with a warning (§30).
+- **The CEL cost limit scales with the input** (20,000 per byte, up to 10^9); over it, the abort names the expression and its cost (§30).
 
 Semantics: [references/behavior-language.md](references/behavior-language.md) §13–27 (§26:
-run caps, headers, fault matching, hangs, sessions and retry on status; §27: the §15.3 items above). Recipes
+run caps, headers, fault matching, hangs, sessions and retry on status; §27: the §15.3 items above;
+§30: config unsets, quoted paths, big integers and the cost limit). Recipes
 from a distributed database, a front-end editor and a GPU serving engine:
 [references/recipes.md](references/recipes.md) §15–24.
 

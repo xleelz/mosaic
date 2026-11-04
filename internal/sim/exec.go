@@ -859,8 +859,7 @@ func (r *run) set(f *frame, set map[string]any, p string) error {
 			if !ok {
 				return abortf("%s.set.%s: a dynamic path must give a string, got %T", p, k, pv)
 			}
-			segs := strings.Split(path, ".")
-			if len(segs) < 2 || containsStr(segs, "") {
+			if segs, err := model.ParsePath(path); err != nil || len(segs) < 2 || segs[0].Quoted {
 				return abortf("%s.set.%s: invalid path %q", p, k, path)
 			}
 			paths[i] = path
@@ -868,7 +867,10 @@ func (r *run) set(f *frame, set map[string]any, p string) error {
 	}
 	for i := range keys {
 		k := paths[i]
-		segs := strings.Split(k, ".")
+		segs, err := model.SplitPath(k) // ['a.b'] quotes a key with dots (behavior-language §30)
+		if err != nil {
+			return abortf("%s.set.%s: %v", p, k, err)
+		}
 		var root map[string]any
 		switch segs[0] {
 		case "vars":

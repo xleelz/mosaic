@@ -1615,6 +1615,48 @@ The stages are the same for every repo:
       - A run that a cap ends reports `caps: {max_events, max_virtual_ms, hit}`.
       - A forever hang leaves the call in the summary's `pending` list, with a warning, and gives
         the step or run status `pending`.
+37. **The `unwritten-fields` lint: a field read that no writer writes (binding; from a
+    gateway-platform blind round).** A gateway's auth refused a deleted owner when
+    `profile.deletedAt` was set. The code, and the model's own account-deletion writers, store
+    the marker as `deletion`, so a deleted owner's key kept working. `seam-names` (item 29)
+    catches one name spelled two ways, and `dataflow` (item 20) works on state paths and
+    tables, so neither caught it.
+    - **Writers.** `check --lint unwritten-fields` reuses the `seam-names` shape inference.
+      Writers are store writes (`put`, `update`, `incr`, `transact` items), fixture rows,
+      component initial state, emits and publishes, call inputs and `return` templates.
+      Request and response schemas declare fields without writing them. Scenario state seeds
+      fields without writing them.
+    - **Store partitions.** Rows are grouped by key pattern: the literal text of the key, with
+      a wildcard for each unknown part, so `'USER#' + id + '|A#PROFILE'` is
+      `USER#*|A#PROFILE`. One entity of a single-table store doesn't lend its fields to
+      another. A store-only interface is evaluated at each call site, with that caller's
+      input. A query takes its pattern from `key.startsWith`, `endsWith`, `contains` or `==`
+      in its `where`. A condition string that a store evaluates over `row`
+      (`eval(input.cond, ...)`) is read against the rows it guards.
+    - **Finding.** A member read (`x.f`, `x['f']` or `has(x.f)`) where every writer of `x` is
+      known and none writes `f`. Here `x` can be a store row, a call's result or value, an
+      event's input, a comprehension item, or a nested field of a variable. The finding names
+      the reader, the field, the operand, the names that are written and their writers, and
+      the closest written name as a hint (`deletedAt`: closest written `deletion`).
+    - **Unknown, not findings.**
+      - Dynamic keys: a key with no letter or digit reads an unknown row, and a write under
+        one is in no partition.
+      - Values of unknown shape: an expression the inference can't follow, a request body,
+        a channel receive, or a dynamically keyed map. These make whatever they are written
+        into unknown, and everything read out of it.
+      - The input of an interface entered from outside the model: a route, a flow entry, a
+        scenario step, or an interface nothing calls.
+      - The state of an `external` component, which the world writes.
+    - **Not findings.**
+      - A called interface's input fields (optional parameters by design).
+      - The top level of `vars` and `state`, which is `dataflow`'s unit.
+      - A shape that only the reader itself writes.
+      - An optional read with a fallback: `has(x.f) ? <uses x.f> : d`,
+        `!has(x.f) ? d : <uses x.f>`, `has(x.f) ? x.f : x.g`, and `!has(x.f) || <uses x.f>`.
+        `has(x.f) && x.f != ''` is still a finding.
+    - **Gate.** `--max-unwritten-fields N` fails above N findings in total. The profile key is
+      `gates.max_unwritten_fields`. The template has no default, so the findings are recorded
+      without gating until a profile sets the key.
 
 ## 14. Hierarchical, recursive ontologies (direction; binding where marked)
 

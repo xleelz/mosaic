@@ -27,6 +27,7 @@ type mockUse struct {
 // runReport is what running the scenarios found.
 type runReport struct {
 	Passed, Failed int
+	FailedIDs      []string        // the failing scenarios, for --stage's attribution (stage.go)
 	Executed       map[string]bool // union of Summary.Executed
 	Counted        int             // runs whose executed sets are in the union
 	Called         map[string]bool // interfaces of every call.start in the run traces
@@ -56,9 +57,11 @@ func runAll(w io.Writer, doc *model.Document, origins map[string]string, o runOp
 		switch {
 		case err != nil:
 			r.Failed++
+			r.FailedIDs = append(r.FailedIDs, sc.ID)
 			fmt.Fprintf(w, "✗ scenario %s: %v\n", sc.ID, err)
 		case !res.Summary.Passed:
 			r.Failed++
+			r.FailedIDs = append(r.FailedIDs, sc.ID)
 			fmt.Fprintf(w, "✗ scenario %s: status %s %s\n", sc.ID, res.Summary.Status, res.Summary.Abort)
 			for _, a := range res.Summary.Assertions {
 				if !a.Passed {

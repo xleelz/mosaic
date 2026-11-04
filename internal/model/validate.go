@@ -142,6 +142,7 @@ func (v *validator) run() {
 	v.fixtures()
 	v.scenarios()
 	v.hierarchy()
+	v.lossyInts() // behavior-language §30, paths.go
 }
 
 func (v *validator) unique(kind, id, path string, seen map[string]bool) {
@@ -176,7 +177,7 @@ func (v *validator) components() {
 			v.nonNegative(p+".capacity.queue_timeout_ms", cp.QueueTimeoutMS)
 		}
 		if c.State != nil && c.State.Schema != nil && c.State.Initial != nil {
-			for _, m := range jsonschema.Validate(c.State.Schema, expr.Native(c.State.Initial), v.x.SchemaRef()) {
+			for _, m := range jsonschema.Validate(c.State.Schema, expr.SchemaView(expr.Native(c.State.Initial)), v.x.SchemaRef()) {
 				v.warnf(p+".state.initial", "%s", m)
 			}
 		}
@@ -985,13 +986,16 @@ func ValidOption(s string) bool {
 var pathRoots = map[string]bool{"vars": true, "ctx": true, "state": true}
 
 func checkPath(path string) error {
-	segs := strings.Split(path, ".")
-	if len(segs) < 2 || !pathRoots[segs[0]] {
+	segs, err := ParsePath(path)
+	if err != nil {
+		return err
+	}
+	if len(segs) < 2 || segs[0].Quoted || !pathRoots[segs[0].Key] {
 		return fmt.Errorf("path %q must start with vars., ctx. or state.", path)
 	}
 	for _, s := range segs[1:] {
-		if !ValidIdent(s) {
-			return fmt.Errorf("invalid path segment %q in %q", s, path)
+		if !s.Quoted && !ValidIdent(s.Key) {
+			return fmt.Errorf("invalid path segment %q in %q (quote a key that isn't an identifier: state['ORG#acme.v2'])", s.Key, path)
 		}
 	}
 	return nil
@@ -1432,7 +1436,7 @@ func hasType(val any, typ string) bool {
 		return typ == "string"
 	case bool:
 		return typ == "boolean"
-	case int64:
+	case int64, uint64:
 		return typ == "integer" || typ == "number"
 	case float64:
 		return typ == "number"

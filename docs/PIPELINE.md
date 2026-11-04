@@ -118,6 +118,9 @@ runbook uses:
 | `--scenario REGEX` | Run only matching scenarios |
 | `--trace` | Print each run's trace: calls, notes, faults, retries, instances |
 | `--strict-stubs` | Make "stubs disagree" (two boundary stubs with different definitions) an error naming both (DESIGN §15.2) |
+| `--stage FILE` (repeatable, or comma-separated) | Staging (DESIGN §15.2): run these `-f` fragments' working copies against every other `-f` fragment's **last-good** copy in `--stage-dir`, or its working copy when it has none. Several fragments form a **joint stage**, validated together. A failed run ends with a report: per staged fragment, its own failing items (conflicts, validation errors, failing scenarios); apart from those, the failures in non-staged copies, a **stale peer** being a last-good copy whose working copy differs; and `~ suggest staging <peer> too` for each stale peer whose working copy changes a failing item or an id a failure names, with a `~ try: --stage ...` line. Gate findings (citations, coverage, lints) are not attributed |
+| `--accept` | With `--stage`, record every staged fragment as last-good, all at once and only when the run passes. A failed run records nothing |
+| `--stage-dir DIR` | The last-good snapshot directory (default `.mosaic/stage`, gitignored). Each copy lives at its fragment's path relative to the working directory |
 | `--lint unknown-inputs,exemptions` | **unknown-inputs**: scenario, step and entry input keys the target's request schema doesn't declare, at any depth (route-header aliases and `x_*` excepted). **exemptions**: each `racy_in_code`, `single_writer`, `reachable_by` and `choice_ok` exemption's citation resolves and its cited lines plausibly support it (with `--code`; without it, only that citations exist and CEL compiles) (DESIGN §15.2) |
 | `--lint internal-assertions,clock-ids` | **internal-assertions**: per fragment, the share of expectations that name a non-boundary interface or the state of a component that isn't a store; assert on `io`, `result` and `steps.*` instead. **clock-ids**: id-shaped templates that read `now`; mint ids with `id(prefix, key...)` and `seq(name)` (DESIGN §15.1) |
 | `--max-exemption-issues N`, `--max-clock-ids N`, `--max-unknown-inputs N` | Run that lint, and exit 1 above N findings in total |
@@ -793,6 +796,24 @@ compose `README.md` draws the whole graph.
 `.claude/skills/mosaic-generate/scripts/mcheck --stage $WS/fragments/<area>.yaml --accept` passes
 (DESIGN §15.2). It runs the fragment against the other fragments as they last passed, so a broken
 fragment fails its own staging and never blocks the others.
+
+A **joint stage** is for changes that depend on each other: A's new copy needs B's, and B's
+needs A's, so neither passes alone against the other's last-good copy. Stage them together with
+`--stage $WS/fragments/a.yaml,$WS/fragments/b.yaml --accept` (or `--stage` twice). The run
+validates both working copies against everyone else's last-good, and records both, or neither.
+Use one when:
+- a staged run fails, and its report suggests a stale peer (`~ suggest staging <peer> too`)
+  whose working copy defines the id the failure names; rerun with the `~ try:` line;
+- a contract change spans two areas (a renamed interface and its callers, a world fixture and
+  the area fixtures it extends) and the coordinator routed it to both.
+
+Don't widen a joint stage past the suggested peers, and don't use it to carry a fragment that
+fails on its own: its items are listed under its name, and it gets fixed, not staged along.
+Suggestions find direct dependencies only, so a joint run can suggest one more peer; add it and
+rerun. A joint stage runs no slower than a single one: the merge is the same size. In a trial
+with vLLM's round-5 fragments against round-4 last-good copies, staging engine-core alone
+suggested five peers; that joint run suggested distributed, and the seven together passed
+(1,540 scenarios). The coordinator no longer builds a scratch stage directory by hand.
 
 **Budgets.** Each agent turn has a turn and time budget: for example 45 minutes per build, and
 15 per judge. Where `claude` has no `--max-turns`, the executor enforces the turn limit itself: it

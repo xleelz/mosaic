@@ -22,6 +22,19 @@ translate a sample of them into mosaic scenarios and find out whether the model 
 - **Never read** {{independence.oracle_never_read}}.
 - How mosaic works: `.claude/skills/mosaic-simulation/SKILL.md` and its references.
 
+## One entry, one verdict
+
+Your list is the sample's entries for your area. **Cover every entry**: skipping one silently
+breaks the round-to-round comparison, so an entry you can't finish still gets a row, with the
+verdict that fits (`untranslatable` or `sim-gap`) and the reason.
+
+**Each entry gets exactly one verdict**, even when it is a whole test file or class rather than
+one test method. Then translate each of its methods (or parametrized cases) as a sub-scenario,
+`oracle-<area>-<test-slug>-<method-slug>`, and give each a verdict of its own. The entry's verdict
+is `pass` only if every sub-verdict is `pass`; otherwise it is the worst sub-verdict, in the order
+`model-bug` (worst), `sim-gap`, `untranslatable`, `test-mismatch`, `pass`. Never split an entry
+into several rows: one entry split into 16 rows broke a round's comparability.
+
 ## For each test
 
 1. **Understand what it proves.** Name the behavior in one sentence, and the code under test
@@ -71,14 +84,21 @@ translate a sample of them into mosaic scenarios and find out whether the model 
 - `oracle/<area>.yaml`: a fragment with `schema_version: 1`, `id: {{id}}`, and only
   `scenarios` (ids `oracle-<area>-<test-slug>`). Each has a `description` naming the test file
   and method.
-- `oracle/<area>.md`: one row per test: test (`path:line`), behavior, scenario id, verdict, the
-  entity at fault or the missing feature, and evidence. Then the model bugs as fix requests, one
-  per owning area.
-- `oracle/<area>.json`: `[{"test", "scenario", "verdict", "area_at_fault", "summary"}]`.
+- `oracle/<area>.md`: one row per sample entry: test (`path:line`), behavior, scenario id,
+  verdict, the entity at fault or the missing feature, and evidence; an entry with sub-scenarios
+  lists them under its row. Then the model bugs as fix requests, one per owning area.
+- `oracle/<area>.json`: one row per sample entry, in the sample's order:
+  `[{"test", "scenario", "verdict", "area_at_fault", "summary"}]`, where `test` is the entry
+  (`<file>:<line>::<name>`). An entry with sub-scenarios nests them in the same row, as
+  `"sub": [{"name", "scenario", "verdict", "summary"}]`, and its `verdict` is the combined one.
+
+**Count check.** Before you report, count the entries in your area of the sample and the rows in
+`oracle/<area>.json`. They must be equal, with every entry's `test` appearing exactly once. If
+they differ, add the missing rows or merge the split ones before you finish.
 
 Write only these files. Don't commit.
 
 ## Report (≤120 words)
 
-Verdict counts; the model bugs with their owning areas; the simulator gaps with the test that
+The count check (entries in the sample = rows written); verdict counts; the model bugs with their owning areas; the simulator gaps with the test that
 exposed each; tests you found untranslatable and why.

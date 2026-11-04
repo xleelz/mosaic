@@ -128,10 +128,11 @@
 // (see contract.go). --max-contract-issues N fails above N issues.
 //
 // Strictness and staging (DESIGN §15.2): --strict-stubs makes stub-vs-stub
-// disagreements errors. --stage F runs -f fragment F against the other -f
-// files' last-good copies in .mosaic/stage/ (--stage-dir), or their working
-// copies when they have none; --accept records F as last-good when the run
-// passes (stage.go). --lint unknown-inputs lists scenario, step and flow
+// disagreements errors. --stage F (repeatable, or F,G: a joint stage) runs
+// the -f fragments' working copies against the other -f files' last-good
+// copies in .mosaic/stage/ (--stage-dir), or their working copies when they
+// have none; --accept records every staged fragment as last-good, only when
+// the run passes, and a failed run is attributed per fragment (stage.go). --lint unknown-inputs lists scenario, step and flow
 // entry input keys the target's request schema doesn't declare; --lint
 // exemptions checks the citations of racy_in_code, single_writer,
 // reachable_by and choice_ok, and --max-exemption-issues N gates them
@@ -240,8 +241,8 @@ func main() {
 	if *lint != "" {
 		for _, l := range strings.Split(*lint, ",") {
 			l = strings.TrimSpace(l)
-			if l != "hollow" && l != "trivial" && !integrityLints[l] && !blackboxLints[l] {
-				fmt.Fprintf(os.Stderr, "check: unknown --lint %q (want hollow, trivial, inert, unscheduled, dataflow, racy, seam-names, unraised-errors or choice-for-computed, comma-separated)\n", l)
+			if l != "hollow" && l != "trivial" && !integrityLints[l] && !blackboxLints[l] && !unwrittenLints[l] {
+				fmt.Fprintf(os.Stderr, "check: unknown --lint %q (want hollow, trivial, inert, unscheduled, dataflow, racy, seam-names, unwritten-fields, unraised-errors or choice-for-computed, comma-separated)\n", l)
 				os.Exit(2)
 			}
 			lints[l] = true
@@ -541,6 +542,9 @@ func main() {
 			strictFail = true
 		}
 	}
+	if runUnwrittenFields(os.Stdout, doc, origins, lints, *quiet) { // unwritten-fields (unwritten.go)
+		strictFail = true
+	}
 	if runInputLints(os.Stdout, doc, origins, lints, *code, *quiet) { // unknown-inputs, exemptions (inputlints.go)
 		strictFail = true
 	}
@@ -613,7 +617,8 @@ func main() {
 			fail(err)
 		}
 	}
-	stageFinish(os.Stdout, !(bad || errs > 0 || failed > 0 || strictFail || hollowFail || mockFail)) // --stage, --accept (stage.go)
+	stageFinish(os.Stdout, !(bad || errs > 0 || failed > 0 || strictFail || hollowFail || mockFail), // --stage, --accept (stage.go)
+		stageFailures{Conflicts: res.Conflicts, Issues: issues, Scenarios: rr.FailedIDs, Origins: origins, Doc: doc})
 	if bad || errs > 0 || failed > 0 || strictFail || hollowFail || mockFail {
 		os.Exit(1)
 	}

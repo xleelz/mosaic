@@ -131,12 +131,15 @@ func (x *Index) BaseWorld() *World {
 // by key; any other value replaces). Values are normalized with
 // expr.Native (whole numbers become int64). l is not modified.
 //
-// A null deletes its key when the value it merges over has it (§13.1 item
-// 12; see MergeValue). In config the key is removed at once. In state the
-// deletion stays as a Deleted marker or a null, since the component's
-// initial state is merged later (the simulator deletes the key from it
-// with MergeValue); a null for a whole state key drops the earlier
-// overrides of that key.
+// In state, a null deletes its key when the value it merges over has it
+// (§13.1 item 12; see MergeValue): the deletion stays as a Deleted marker
+// or a null, since the component's initial state is merged later (the
+// simulator deletes the key from it with MergeValue); a null for a whole
+// state key drops the earlier overrides of that key.
+//
+// In config, a null is a value (behavior-language §30): config['x'] is null and
+// has(config.x) is true. {$absent: true} removes a config key, at any
+// depth (see MergeConfig).
 func (w *World) Apply(l WorldLayer) error {
 	for c, inst := range l.Topology {
 		w.Topology[c] = append([]string(nil), inst...)
@@ -154,11 +157,7 @@ func (w *World) Apply(l WorldLayer) error {
 			delete(w.Config, k)
 			continue
 		}
-		if _, has := w.Config[k]; has && nv == nil {
-			delete(w.Config, k)
-			continue
-		}
-		w.Config[k] = MergeValue(w.Config[k], nv, false)
+		w.Config[k] = MergeConfig(w.Config[k], nv, false)
 	}
 	for k, v := range l.State {
 		if IsAbsentMark(expr.Native(v)) {
@@ -321,6 +320,39 @@ func MergeValue(base, over any, mark bool) any {
 			}
 		default:
 			out[k] = MergeValue(bv, ov, mark)
+		}
+	}
+	return out
+}
+
+// MergeConfig deep-merges a config override over onto base (behavior-language §30):
+// maps merge key by key and any other value replaces, as in MergeValue,
+// but a null is a value at every depth, and only {$absent: true} removes
+// a key. With keep, the removals stay in the result as {$absent: true}
+// marks, for an override that is itself merged later (a request's echo);
+// a mark in base is then replaced by whatever over sets. The result shares
+// nothing with over.
+func MergeConfig(base, over any, keep bool) any {
+	om, ok := asMap(over)
+	if !ok || IsAbsentMark(over) {
+		return deepCopy(over)
+	}
+	bm, _ := asMap(base)
+	if IsAbsentMark(base) {
+		bm = nil
+	}
+	out := make(map[string]any, len(bm)+len(om))
+	for k, v := range bm {
+		out[k] = v
+	}
+	for k, ov := range om {
+		switch {
+		case IsAbsentMark(ov) && keep:
+			out[k] = map[string]any{"$absent": true}
+		case IsAbsentMark(ov):
+			delete(out, k)
+		default:
+			out[k] = MergeConfig(bm[k], ov, keep)
 		}
 	}
 	return out

@@ -179,9 +179,9 @@ func (r *run) setStep(i int, st model.ScenarioStep) error {
 		paths := st.Set[k]
 		for _, path := range sortedKeys(paths) {
 			p := fmt.Sprintf("steps[%d].set.%s.%s", i, k, path)
-			segs := strings.Split(path, ".")
-			if containsStr(segs, "") {
-				return abortf("%s: invalid state path %q", p, path)
+			segs, err := model.SplitPath(path) // ['a.b'] quotes a key with dots (behavior-language §30)
+			if err != nil {
+				return abortf("%s: invalid state path: %v", p, err)
 			}
 			v, err := expr.Step.Template(expr.Native(paths[path]), act)
 			if err != nil {
@@ -189,7 +189,11 @@ func (r *run) setStep(i int, st model.ScenarioStep) error {
 			}
 			v = resolveInput(markInput(v))
 			old := assign(state, segs, deepCopy(v))
-			if err := r.ev(Event{Type: "set", Component: comp, Instance: inst, Scope: "state", Path: "state." + path,
+			full := "state." + path
+			if strings.HasPrefix(path, "[") {
+				full = "state" + path
+			}
+			if err := r.ev(Event{Type: "set", Component: comp, Instance: inst, Scope: "state", Path: full,
 				Old: deepCopy(old), New: deepCopy(v), Message: "scenario step set"}); err != nil {
 				return err
 			}

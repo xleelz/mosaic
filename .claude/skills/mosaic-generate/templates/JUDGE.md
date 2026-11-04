@@ -22,6 +22,8 @@ find out whether the model is **right about the system**.
   You may read the fragments and the notes to find things, but judge the merged document.
 - **How mosaic works:** `.claude/skills/mosaic-simulation/SKILL.md` and its references;
   `docs/DESIGN.md` §2–5 and §11.
+- **Secrets:** never open {{snapshot.forbidden}}. Never copy a token, key, password or internal
+  hostname into a scenario, your notes or your report.
 
 ## Step 1: verify each expectation against the code
 
@@ -63,6 +65,13 @@ go run ./internal/devtools/check -f {{workspace}}/{{id}}.json -f {{workspace}}/j
 
 ## Step 3: score
 
+**Score every labeled step, exactly as the benchmark labels it.** A case broken into steps (a),
+(b), (c) gets one score per step, under the benchmark's own letters: don't merge steps, split
+them, add your own, or skip one you didn't reach (score it `missing`, and say why). Step counts
+are compared across rounds, so they must match the benchmark's. A corrected expectation keeps its
+step's letter. The case scores its worst step, in the order fail, missing, sim-gap, partial,
+pass (worst first); a case passes only when every step passes.
+
 | Score | Meaning |
 |---|---|
 | **pass** | The verified outcome **and** the code's path are reproduced |
@@ -95,16 +104,20 @@ confirmed or refuted.
 ## Output
 
 Write `judge/<group>.md` with:
-1. one row per case: ID, verified expectation (corrected?), score, root cause, evidence;
+1. one row per case: ID, verified expectation (corrected?), each step's score, the case score,
+   root cause, evidence;
 2. wrong claims found in the model;
 3. builder findings confirmed or refuted;
 4. simulator gaps, with the case that exposed each.
 
 Also write `judge/<group>.json`: an array of
-`{"case", "score", "cause", "expectation_corrected": bool, "summary"}`.
+`{"case", "score", "cause", "expectation_corrected": bool, "steps": {"a": "<score>", ...}, "summary"}`,
+one row per case in your group, with every labeled step in `steps` (a case without lettered steps
+gives `{"a": <its score>}`). Before you finish, check that the steps you scored equal the steps
+your group labels, case by case.
 
 Write only your own files under `judge/`. Don't commit.
 
 ## Report (≤150 words)
 
-Scores per case, the corrected expectations, the top 3 wrong claims, and the top simulator gaps.
+Scores per case and steps scored (= steps labeled), the corrected expectations, the top 3 wrong claims, and the top simulator gaps.

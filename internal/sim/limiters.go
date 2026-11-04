@@ -506,6 +506,8 @@ func keyString(v any) string {
 		return t
 	case int64:
 		return strconv.FormatInt(t, 10)
+	case uint64:
+		return strconv.FormatUint(t, 10)
 	case float64:
 		return strconv.FormatFloat(t, 'f', -1, 64)
 	case bool:

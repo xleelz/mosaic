@@ -1,8 +1,6 @@
 package model
 
 import (
-	"strings"
-
 	"github.com/xleelz/mosaic/internal/expr"
 )
 
@@ -28,6 +26,13 @@ func (v *validator) scenarioCaps(p string, s *Scenario) {
 			v.errf(p+".max_cel_cost", "max_cel_cost is cost_limit's other name; give one of them")
 		}
 	}
+	// The safety bound (behavior-language §30).
+	if s.MaxCELCost != nil && *s.MaxCELCost > expr.MaxCostLimit {
+		v.errf(p+".max_cel_cost", "max_cel_cost must be at most %d", int64(expr.MaxCostLimit))
+	}
+	if s.CostLimit != nil && *s.CostLimit > expr.MaxCostLimit {
+		v.errf(p+".cost_limit", "cost_limit must be at most %d", int64(expr.MaxCostLimit))
+	}
 }
 
 // setStep checks a scenario step's set (§15.3): known components and
@@ -49,8 +54,8 @@ func (v *validator) setStep(p string, st ScenarioStep, topo map[string][]string)
 			v.errf(kp, "set needs at least one path per component")
 		}
 		for _, path := range sortedKeys(st.Set[k]) {
-			if path == "" || strings.HasPrefix(path, ".") || strings.HasSuffix(path, ".") || strings.Contains(path, "..") {
-				v.errf(kp+"."+path, "invalid state path %q", path)
+			if _, err := ParsePath(path); err != nil {
+				v.errf(kp+"."+path, "invalid state path: %v", err)
 			}
 			for _, src := range expr.TemplateExprs(expr.Native(st.Set[k][path])) {
 				v.celText(kp+"."+path, src)

@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"encoding/hex"
 	"encoding/json"
+	"strconv"
 	"strings"
 
 	"cel.dev/cel-go/cel"
@@ -89,4 +90,127 @@ type BigInt string
 
 func (b BigInt) MarshalJSON() ([]byte, error) {
 	return json.Marshal(map[string]string{"$bigint": string(b)})
+}
+
+// LossyInts lists the whole-number literals in raw JSON that fit neither
+// int64 nor uint64 (behavior-language §30): Native turns them into
+// doubles, which lose digits. Raw that doesn't decode gives nil.
+func LossyInts(raw []byte) []string {
+	if !hasLongDigits(raw) {
+		return nil
+	}
+	dec := json.NewDecoder(bytes.NewReader(raw))
+	dec.UseNumber()
+	var v any
+	if dec.Decode(&v) != nil {
+		return nil
+	}
+	var out []string
+	WalkLossyInts(v, "", func(path, lit string) { out = append(out, path+"="+lit) })
+	return out
+}
+
+// hasLongDigits reports whether raw holds a run of 19 or more digits, the
+// shortest text an integer beyond int64 can have.
+func hasLongDigits(raw []byte) bool {
+	run := 0
+	for _, c := range raw {
+		if c >= '0' && c <= '9' {
+			run++
+			if run >= 19 {
+				return true
+			}
+		} else {
+			run = 0
+		}
+	}
+	return false
+}
+
+// WalkLossyInts calls f with the path and text of every json.Number in v
+// that is a whole-number literal beyond both int64 and uint64. Paths are
+// dotted; list items are [i], or [<id>] for a map with a string id.
+func WalkLossyInts(v any, path string, f func(path, lit string)) {
+	switch t := v.(type) {
+	case json.Number:
+		s := string(t)
+		if strings.ContainsAny(s, ".eE") {
+			return
+		}
+		if _, err := strconv.ParseInt(s, 10, 64); err == nil {
+			return
+		}
+		if _, err := strconv.ParseUint(s, 10, 64); err == nil {
+			return
+		}
+		f(path, s)
+	case map[string]any:
+		for k, x := range t {
+			p := k
+			if path != "" {
+				p = path + "." + k
+			}
+			WalkLossyInts(x, p, f)
+		}
+	case []any:
+		for i, x := range t {
+			idx := strconv.Itoa(i)
+			if m, ok := x.(map[string]any); ok {
+				if id, ok := m["id"].(string); ok && id != "" {
+					idx = id
+				}
+			}
+			WalkLossyInts(x, path+"["+idx+"]", f)
+		}
+	}
+}
+
+// SchemaView prepares a native value for a JSON Schema check: a uint64
+// (a whole number beyond int64, behavior-language §30) is an integer, so
+// it is passed as a BigInt. Values without one are returned as they are.
+func SchemaView(v any) any {
+	if !hasUint(v) {
+		return v
+	}
+	return toSchemaView(v)
+}
+
+func hasUint(v any) bool {
+	switch t := v.(type) {
+	case uint64:
+		return true
+	case map[string]any:
+		for _, x := range t {
+			if hasUint(x) {
+				return true
+			}
+		}
+	case []any:
+		for _, x := range t {
+			if hasUint(x) {
+				return true
+			}
+		}
+	}
+	return false
+}
+
+func toSchemaView(v any) any {
+	switch t := v.(type) {
+	case uint64:
+		return BigInt(strconv.FormatUint(t, 10))
+	case map[string]any:
+		out := make(map[string]any, len(t))
+		for k, x := range t {
+			out[k] = toSchemaView(x)
+		}
+		return out
+	case []any:
+		out := make([]any, len(t))
+		for i, x := range t {
+			out[i] = toSchemaView(x)
+		}
+		return out
+	}
+	return v
 }

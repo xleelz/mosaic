@@ -110,7 +110,8 @@ different set of variables; see the SKILL.md or reading-results.md.
 ```
 
 - Each key is a path: `vars.`, `ctx.` or `state.` followed by one or more identifier segments
-  (`[A-Za-z_][A-Za-z0-9_]*`). Paths are static, so you can't index by a runtime value.
+  (`[A-Za-z_][A-Za-z0-9_]*`), or a quoted key in brackets for any other key
+  (`state['ORG#acme.v2'].plan`, §30). Paths are static, so you can't index by a runtime value.
 - **Parallel assignment**: every right-hand side is evaluated against the same snapshot first,
   then the paths are assigned in sorted order, so a value never sees another assignment in the
   same `set`. To compute from a just-assigned value, use a second `set` step.
@@ -301,7 +302,8 @@ Calls to the flow's entry interface go through the same path, so it can be fault
   `call` or `emit` input (there an unset key is simply not written).
 - **State**: each component's `state.initial`, deep-merged with the scenario's `state`, then the
   run's `--state`. A null deletes a key the layer below has; `{$absent: true}` deletes a key,
-  row or field at any depth, including a fixture-seeded row (§29).
+  row or field at any depth, including a fixture-seeded row (§29). In `config` overrides a null
+  is a value and only `{$absent: true}` deletes (§30).
 - **Choices** are overlaid (the run wins). **Faults** and **expectations** are concatenated
   (scenario first). **Seed**: the run's value, else the scenario's, else 1.
 - **Budgets**: 20,000 events, call depth 64, 1,000 emits and 10,000 `foreach` iterations
@@ -314,8 +316,9 @@ Calls to the flow's entry interface go through the same path, so it can be fault
   3,600,000 for scenarios with `await`, `cancel` or `restart` steps, otherwise none). When either
   cap ends a run, the summary's `caps: {max_events, max_virtual_ms, hit}` reports both (§26).
 - **CEL cost limit**: each evaluation may cost at most 10,000,000 (it was 1,000,000, which
-  prompts of about 500 tokens exceeded). A scenario can set its own: `cost_limit: 50000000`.
-  An expression over the limit aborts the run with `operation cancelled: actual cost limit exceeded`.
+  prompts of about 500 tokens exceeded), and more for big inputs (§30). A scenario can set its
+  own: `cost_limit: 50000000`. An expression over the limit aborts the run with
+  `operation cancelled: actual cost limit exceeded`, the expression, the limit and its cost (§30).
 - An unknown flow or scenario, a scenario run with a different `--flow`, an invalid fault, a bad
   entry input template, or a `--choice` whose key is not a choice point or whose option doesn't
   exist is a request error: the run doesn't start.
@@ -1255,7 +1258,8 @@ steps:
 ```
 
 - Keys are `<component>` or `<component>@<instance>` (the instance may be `"=cel"`); paths are
-  dotted, inside that state; values are templates that see `steps`.
+  dotted, inside that state (`['a.b']` quotes a key with dots, §30); values are templates that
+  see `steps`.
 - It's a control step, like `cancel` or `kill`: it names no flow or interface, and makes the run
   concurrent. With `at_ms` it lands while earlier steps still run: a node coming back, or a job
   placed by an outside scheduler. Each path records a `set` event.
@@ -1421,6 +1425,84 @@ expect:
 - The key is a literal or `"=cel"` over the step variables (`steps`, `now`, `config`).
 - Every call in flight that carries the key fails with `{code: canceled}` at the step's time, and
   a `close` event records `output.pending`. The session can be used again afterwards.
+
+## 30. Unsetting config, quoted state paths, integers beyond int64 and the CEL cost limit
+
+### Config: `null` is a value, `{$absent: true}` removes the key
+
+```yaml
+- id: no-flag-given              # the world sets the flag; this run doesn't give it
+  fixtures: [prod]
+  config: {stream-usage: {$absent: true}}
+  expect: ["!has(config['stream-usage'])"]
+- id: flag-given-null            # given, as null
+  config: {stream-usage: null, limits: {rpm: null}}
+  expect: ["has(config['stream-usage']) && config['stream-usage'] == null"]
+```
+
+- In a fixture's, scenario's or request's `config`, a `null` is a value, at any depth:
+  `config['x']` is `null` and `has(config.x)` and `'x' in config` are true. This changes the
+  earlier rule, where a config null deleted the key; state keeps that rule (§13.1 item 12).
+- `{$absent: true}` removes a config key, at any depth (`{limits: {rpm: {$absent: true}}}`
+  removes only `rpm`). A later layer can set the key again.
+- With the key gone, `has(config.x)` and `'x' in config` are false, and `config['x']` aborts
+  with `no such key`. Guard reads with `has()` or `in`.
+- A config whose model has neither `value` nor `default` is not in `config` at all.
+- The run's echoed request shows a removal as `{$absent: true}` and a null as `null`.
+
+### Quoted segments in state paths
+
+```yaml
+- {set: {"state['ORG#acme.v2'].plan": pro, 'state["k.v1"]': 1}}          # behavior set
+steps:
+  - {set: {billing: {"['ORG#acme.v2'].credits": 0, "['ORG#acme.v2']['a.b']": 1}}, at_ms: 500}
+```
+
+- A path segment in brackets, `['...']` or `["..."]`, is one key, dots and all. A backslash
+  escapes the quote or a backslash inside. The bracket follows the previous segment directly
+  (`state['a.b'].c`), or starts a scenario `set` step's path (`['a.b'].c`).
+- It works in behavior `set` keys (after `vars`, `ctx` or `state`; quoted segments needn't be
+  identifiers), in dynamic `"= ..."` paths and in scenario `set` steps. Paths without brackets
+  split on dots, as before.
+- The `set` event's `path` is the path as written (`state['ORG#acme.v2'].plan`).
+- Reading needs no new syntax: `state['ORG#acme.v2'].plan` is CEL.
+
+### Integers beyond int64
+
+- A whole number from 2^63 to 2^64-1 in a fixture, a `state.initial`, a config, an input or a
+  request is a **uint64**: CEL sees a `uint` (`type(x) == uint`). Compare and add with `u`
+  literals (`x == 18446744073709551615u`, `x - 1u`); CEL refuses to mix `int` and `uint` in
+  arithmetic, but comparisons across them work. JSON and `string(x)` keep every digit, and an
+  `integer` schema accepts it.
+- Past 2^64-1 (or below -2^63) a whole number becomes a **double** and loses digits. Validation
+  warns at the number's path, and a run warns for each one in its inputs:
+  `input.n: the integer 18446744073709551616 is beyond uint64 ...`. To keep the digits, write
+  `{$bigint: "18446744073709551616"}` in an input: CEL sees the decimal string (§27).
+- Nothing turns a plain number into a string.
+
+### The CEL cost limit scales, and names its expression
+
+- Without `cost_limit` or `max_cel_cost`, a run's limit grows with its inputs: 20,000 per byte
+  of JSON input (the request's, the scenario's, the flow entry's and the steps'), from the
+  10,000,000 default up to 1,000,000,000. An 8,000-token prompt (about 32 KB) gets 640,000,000.
+- A scenario's `cost_limit` or `max_cel_cost` replaces it, up to 10,000,000,000 (the safety
+  bound; validation refuses more). Runs can set a default for scenarios without one (the
+  check tool's `--max-cel-cost`, the simulator's `Limits.CELCost`).
+- Over the limit, the abort names the expression, the limit and what it costs, measured by
+  running it again under a limit 20 times higher:
+  `<expr>: CEL cost limit 10000000 exceeded; it costs 187607515 (raise it with the scenario's
+  max_cel_cost, up to 10000000000): operation cancelled: actual cost limit exceeded`, or
+  `it costs more than <20 x limit>`.
+- An expression that is quadratic in its input (a `slice(0, j)` inside a `map`) outgrows any
+  linear scale; set `max_cel_cost`, or rewrite it as a running sum.
+
+### Upstream usage in a model
+
+A stub's response is the stub's behavior: when a judge finds an upstream's token usage fixed,
+the model returns literals. Drive it from the run instead: read the stub component's `state`
+(seeded by a fixture or scenario `state`, or changed mid-run with a `set` step), a `config`, a
+choice, or the call's input (`ceil(size(input.body.prompt) / 4)`). No simulator change is
+needed.
 
 ## What the summary adds
 

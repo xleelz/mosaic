@@ -50,8 +50,14 @@ type nt struct {
 	elem    *nt
 	parent  *nt
 	persist bool
-	lvl     int
-	stamp   uint64
+	// open (unwritten-fields mode only): some writer put a value of unknown
+	// shape here, so a name missing from kids may still be written.
+	open bool
+	lvl  int
+	// pats (unwritten-fields mode only): the string patterns this value can
+	// take, literal text with patWild for an unknown part.
+	pats  *[]string
+	stamp uint64
 	// The last copy into this node from below a tracked one (see union).
 	copyFrom  *nt
 	copyDepth int
@@ -168,6 +174,14 @@ func (a *seamAnalysis) union(dst, src *nt, depth int, under bool) bool {
 			changed = true
 		}
 	}
+	if src.open && !dst.open {
+		dst.open, changed = true, true
+	}
+	if src.pats != nil {
+		if p := patUnion(dst.pats, src.pats); p != dst.pats {
+			dst.pats, changed = p, true
+		}
+	}
 	if changed && dst.persist {
 		a.touch(dst)
 	}
@@ -201,6 +215,8 @@ func seamMerge(a, b *nt, depth int) *nt {
 		}
 	}
 	n.elem = seamMerge(a.elem, b.elem, depth+1)
+	n.open = a.open || b.open
+	n.pats = patUnion(a.pats, b.pats)
 	return n
 }
 
@@ -239,6 +255,8 @@ func seamMergeAll(xs []*nt, depth int) *nt {
 			group[k] = append(group[k], v.n)
 		}
 		elems = append(elems, x.elem)
+		n.open = n.open || x.open
+		n.pats = patUnion(n.pats, x.pats)
 	}
 	for _, k := range order {
 		n.set(k, seamMergeAll(group[k], depth+1), writer[k])
@@ -256,6 +274,9 @@ func dynIndex(n *nt) *nt {
 	xs := []*nt{n.elem}
 	for _, k := range sortedKeys(n.kids) {
 		xs = append(xs, n.kids[k].n)
+	}
+	if n.open {
+		return openWrap(seamMergeAll(xs, 0))
 	}
 	return seamMergeAll(xs, 0)
 }
@@ -299,6 +320,8 @@ type seamAnalysis struct {
 	sync    map[[2]*nt]uint64 // (dst, persistent src) -> clock of their last union
 	views   map[*nt]*nt       // a table node -> the union of its rows
 	found   map[string]*seamFinding
+	// uw is the unwritten-fields mode (unwritten.go); nil in seam-names.
+	uw *uwState
 }
 
 // seamCtx is what one template or expression is evaluated against.
@@ -312,6 +335,8 @@ type seamCtx struct {
 	row    *nt
 	route  bool // input is a route's input (headers normalized)
 	locals map[string]*nt
+	// nocheck: an inlined store interface's own expressions (unwritten-fields)
+	nocheck bool
 }
 
 func (a *seamAnalysis) parse(src string) celast.Expr {
@@ -347,7 +372,14 @@ func (c *seamCtx) tmpl(v any) *nt {
 	switch t := v.(type) {
 	case string:
 		if e, ok := strings.CutPrefix(t, "="); ok {
-			return c.cel(e)
+			v := c.cel(e)
+			if v == nil && c.a.uw != nil {
+				return openLeaf
+			}
+			return v
+		}
+		if c.a.uw != nil {
+			return c.a.uw.lit(t)
 		}
 	case map[string]any:
 		n := newNT()
@@ -399,6 +431,10 @@ func exprPath(e celast.Expr) string {
 
 // selects checks a member selection: field read from the shape op.
 func (c *seamCtx) selects(op *nt, operand celast.Expr, field string) {
+	if c.a.uw != nil {
+		c.unwrittenSelect(op, operand, field)
+		return
+	}
 	if !c.a.check || op == nil || len(op.kids) == 0 || headerAlias(field) {
 		return
 	}
@@ -457,7 +493,14 @@ func (c *seamCtx) eval(e celast.Expr) *nt {
 		if op == nil || s.IsTestOnly() {
 			return nil
 		}
+		if op.open {
+			return openWrap(op.kid(s.FieldName()))
+		}
 		return op.kid(s.FieldName())
+	case celast.LiteralKind:
+		if s, ok := e.AsLiteral().(types.String); ok && c.a.uw != nil {
+			return c.a.uw.lit(string(s))
+		}
 	case celast.ListKind:
 		n := newNT()
 		for _, x := range e.AsList().Elements() {
@@ -502,7 +545,11 @@ func (c *seamCtx) eval(e celast.Expr) *nt {
 		accu := c.eval(cp.AccuInit())
 		c.locals[cp.AccuVar()] = accu
 		c.eval(cp.LoopCondition())
-		accu = seamMerge(accu, c.eval(cp.LoopStep()), 0)
+		step := c.eval(cp.LoopStep())
+		accu = seamMerge(accu, step, 0)
+		if c.a.uw != nil && isUnknown(cp.LoopStep(), step) {
+			accu = openWrap(accu) // a step the inference can't follow (@mapInsert, a bool)
+		}
 		c.locals[cp.AccuVar()] = accu
 		res := c.eval(cp.Result())
 		c.locals = saved
@@ -515,6 +562,18 @@ func (c *seamCtx) eval(e celast.Expr) *nt {
 			vals = append(vals, c.eval(call.Target()))
 		}
 		fn := call.FunctionName()
+		if c.a.uw != nil && (fn == "_?_:_" || fn == "_||_") {
+			if ks := optionalIdiom(fn, args); len(ks) > 0 {
+				for _, k := range ks {
+					c.a.uw.skip[k]++
+				}
+				defer func() {
+					for _, k := range ks {
+						c.a.uw.skip[k]--
+					}
+				}()
+			}
+		}
 		if fn == "_[_]" && len(args) == 2 {
 			op := c.eval(args[0])
 			if args[1].Kind() == celast.LiteralKind {
@@ -523,10 +582,14 @@ func (c *seamCtx) eval(e celast.Expr) *nt {
 					if op == nil {
 						return nil
 					}
-					if n := op.kid(string(s)); n != nil {
-						return n
+					n := op.kid(string(s))
+					if n == nil {
+						n = op.elem
 					}
-					return op.elem
+					if op.open {
+						return openWrap(n)
+					}
+					return n
 				}
 			}
 			c.eval(args[1])
@@ -534,6 +597,11 @@ func (c *seamCtx) eval(e celast.Expr) *nt {
 		}
 		for _, x := range args {
 			vals = append(vals, c.eval(x))
+		}
+		if c.a.uw != nil {
+			if v, ok := c.uwCall(fn, args, vals); ok {
+				return v
+			}
 		}
 		switch fn {
 		case "_?_:_":
@@ -649,9 +717,12 @@ func (a *seamAnalysis) setPath(root *nt, segs []string, writer string, dyn bool)
 }
 
 // callResult is the shape of vars.<as> after a call: {ok, value, error, ...}.
-func callResult(value *nt) *nt {
+func callResult(value *nt) *nt { return callResultKeys(value, nil) }
+
+// callResultKeys is callResult with extra fixed keys.
+func callResultKeys(value *nt, extra []string) *nt {
 	n := newNT()
-	for _, k := range []string{"ok", "error", "attempts", "duration_ms", "target", "route"} {
+	for _, k := range append([]string{"ok", "error", "attempts", "duration_ms", "target", "route"}, extra...) {
 		n.set(k, newNT(), "the call result")
 	}
 	if value == nil {
@@ -716,9 +787,18 @@ func (a *seamAnalysis) behavior(i *model.Interface, c *seamCtx) {
 			input = asJSON(s.Input)
 		}
 		for _, t := range targets {
+			if a.uw != nil {
+				if st := storeOnly(a.x.Interfaces[t]); st != nil {
+					v := a.storeInline(c, a.x.Interfaces[t], st, input)
+					if s.As != "" {
+						a.grow(a.child(c.vars, s.As, c.writer), a.callRes(v))
+					}
+					continue
+				}
+			}
 			a.send(c, t, input)
 			if s.As != "" {
-				a.grow(a.child(c.vars, s.As, c.writer), callResult(a.out[t]))
+				a.grow(a.child(c.vars, s.As, c.writer), a.callRes(a.out[t]))
 			}
 		}
 		if len(targets) == 0 && input != nil && s.Emit == "" && s.Publish == "" {
@@ -768,8 +848,11 @@ func (a *seamAnalysis) behavior(i *model.Interface, c *seamCtx) {
 			if s.As != "" {
 				l := newNT()
 				l.elem = vals
-				a.grow(a.child(c.vars, s.As, c.writer), callResult(l))
+				a.grow(a.child(c.vars, s.As, c.writer), a.callRes(l))
 			}
+		}
+		if a.uw != nil {
+			a.openUnmodeled(c, s, len(targets) > 0 || len(s.Transact) > 0 || s.Foreach != nil || s.Parallel != nil)
 		}
 	}
 }
@@ -793,6 +876,9 @@ func (a *seamAnalysis) rowsOf(rows *nt) *nt {
 // storeSpec evaluates one store operation against its table's rows and
 // returns what it gives back.
 func (a *seamAnalysis) storeSpec(c *seamCtx, st *model.StoreSpec, rows *nt) *nt {
+	if a.uw != nil {
+		return a.storeUW(c, st, rows, nil)
+	}
 	rc := *c
 	rc.row = a.rowsOf(rows)
 	if st.Key != nil {
@@ -833,8 +919,17 @@ func newSeamEnv() *cel.Env {
 
 // lintSeamNames runs the analysis to a fixed point, then checks every read.
 func lintSeamNames(doc *model.Document, origins map[string]string) *seamReport {
+	a := runSeamAnalysis(doc, nil)
+	return a.seamReport(origins)
+}
+
+// runSeamAnalysis infers the shapes to a fixed point and runs the check
+// pass. With uw it is the unwritten-fields analysis: no schema is a
+// writer, stores are partitioned by key pattern and unknown values are
+// open (unwritten.go).
+func runSeamAnalysis(doc *model.Document, uw *uwState) *seamAnalysis {
 	x := indexed(doc)
-	a := &seamAnalysis{
+	a := &seamAnalysis{uw: uw,
 		x: x, env: newSeamEnv(), asts: map[string]celast.Expr{},
 		in: map[string]*nt{}, out: map[string]*nt{}, vars: map[string]*nt{}, state: map[string]*nt{},
 		routes: map[string]bool{}, reqs: map[string]*shape{}, found: map[string]*seamFinding{},
@@ -850,6 +945,9 @@ func lintSeamNames(doc *model.Document, origins map[string]string) *seamReport {
 			a.routes[id] = true
 		}
 		// The declared contract: request and response schema properties.
+		if uw != nil {
+			continue // a schema declares a field; it doesn't write one
+		}
 		if i.Request != nil {
 			a.grow(a.node(a.in, id), shapeNT(buildShape(asJSON(i.Request), a.resolve, 0), "schema of "+id, 0))
 		}
@@ -870,12 +968,18 @@ func lintSeamNames(doc *model.Document, origins map[string]string) *seamReport {
 			a.grow(a.node(a.state, comp.ID), c.tmpl(asJSON(comp.State.Initial)))
 		}
 	}
+	if uw != nil {
+		uw.prepare(a, doc)
+	}
 	pass := func() {
 		for _, id := range ids {
 			i := x.Interfaces[id]
 			c := &seamCtx{a: a, iface: id, writer: id, input: a.node(a.in, id),
 				vars: a.node(a.vars, id), state: a.node(a.state, i.Component), route: a.routes[id]}
 			if st := storeOnly(i); st != nil {
+				if uw != nil {
+					continue // inlined at each call site
+				}
 				rows := a.child(c.state, st.Table, id)
 				if v := a.storeSpec(c, st, rows); v != nil {
 					a.grow(a.node(a.out, id), v)
@@ -896,19 +1000,13 @@ func lintSeamNames(doc *model.Document, origins map[string]string) *seamReport {
 	}
 	a.check = true
 	pass()
+	return a
+}
 
+// seamReport collects the seam-names findings.
+func (a *seamAnalysis) seamReport(origins map[string]string) *seamReport {
 	r := &seamReport{Frags: map[string]string{}}
-	frag := func(who string) string {
-		switch {
-		case strings.HasPrefix(who, "fixture "):
-			return origins[model.KindFixture+"/"+strings.TrimPrefix(who, "fixture ")]
-		case strings.HasPrefix(who, "initial state of "):
-			return origins[model.KindComponent+"/"+strings.TrimPrefix(who, "initial state of ")]
-		case strings.HasPrefix(who, "schema of "):
-			return origins[model.KindInterface+"/"+strings.TrimPrefix(who, "schema of ")]
-		}
-		return origins[model.KindInterface+"/"+who]
-	}
+	frag := func(who string) string { return writerFrag(origins, who) }
 	for _, f := range a.found {
 		r.Findings = append(r.Findings, *f)
 		r.Frags[f.Reader] = frag(f.Reader)
@@ -928,6 +1026,20 @@ func lintSeamNames(doc *model.Document, origins map[string]string) *seamReport {
 		return p.Writer+p.At < q.Writer+q.At
 	})
 	return r
+}
+
+// writerFrag is the fragment of a reader or writer: an interface id,
+// "fixture <id>", "initial state of <c>" or "schema of <iface>".
+func writerFrag(origins map[string]string, who string) string {
+	switch {
+	case strings.HasPrefix(who, "fixture "):
+		return origins[model.KindFixture+"/"+strings.TrimPrefix(who, "fixture ")]
+	case strings.HasPrefix(who, "initial state of "):
+		return origins[model.KindComponent+"/"+strings.TrimPrefix(who, "initial state of ")]
+	case strings.HasPrefix(who, "schema of "):
+		return origins[model.KindInterface+"/"+strings.TrimPrefix(who, "schema of ")]
+	}
+	return origins[model.KindInterface+"/"+who]
 }
 
 // print lists the findings (unless quiet), the count per reader fragment

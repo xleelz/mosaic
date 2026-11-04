@@ -5,6 +5,7 @@ import (
 	"strings"
 	"testing"
 
+	"github.com/xleelz/mosaic/internal/model"
 	"github.com/xleelz/mosaic/internal/sim"
 )
 
@@ -217,10 +218,11 @@ scenarios:
 	eq(t, "warnings", len(res.Summary.Warnings), 0)
 }
 
-// TestNullDeletes: a null in state or config overrides deletes a key that
-// the earlier layers or the initial state set, across fixtures, the
-// scenario and the request; inside a map the override introduces, a null
-// stays a value (a row may hold null fields, as before).
+// TestNullDeletes: a null in state overrides deletes a key that the
+// earlier layers or the initial state set, across fixtures, the scenario
+// and the request; inside a map the override introduces, a null stays a
+// value (a row may hold null fields, as before). In config, a null is a
+// value and {$absent: true} deletes (behavior-language §30).
 func TestNullDeletes(t *testing.T) {
 	doc := langDoc(t, `
 configs:
@@ -237,7 +239,7 @@ flows:
   - {id: get, entry: {caller: user, interface: svc.get}}
 fixtures:
   - id: base
-    config: {b: {y: null}}
+    config: {b: {y: {$absent: true}}}
     state: {svc: {drop: null, added: {z: 1}}, "node@n1": {v: 1, w: 2}}
   - id: readd
     config: {c: 4}
@@ -247,7 +249,7 @@ scenarios:
     flow: get
     fixtures: [base, readd]
     topology: {node: [n1, n2]}
-    config: {a: null}
+    config: {a: {$absent: true}}
     state: {svc: {nested: {q: null}, gone: null, fresh: {v: null}}, "node@n1": {w: null}}
     expect:
       - "!('a' in config)"
@@ -258,12 +260,12 @@ scenarios:
       - "state['node@n1'] == {'v': 1}"
 `)
 	res := passes(t, doc, sim.Request{Scenario: "deletes"})
-	if _, ok := res.Request.Config["a"]; !ok || res.Request.Config["a"] != nil {
+	if !model.IsAbsentMark(res.Request.Config["a"]) {
 		t.Errorf("effective config %v should echo the deletion of a", res.Request.Config)
 	}
 	// A request's own nulls delete too, after its fixtures.
 	passes(t, doc, sim.Request{Flow: "get", Fixtures: []string{"base", "readd"}, State: map[string]map[string]any{"svc": {"keep": nil}},
-		Config: map[string]any{"c": nil}, Expect: []string{"state.svc == {'nested': {'p': 1, 'q': 2}, 'gone': 0}", "!('c' in config)", "config.b == {'x': 1}"}})
+		Config: map[string]any{"c": map[string]any{"$absent": true}}, Expect: []string{"state.svc == {'nested': {'p': 1, 'q': 2}, 'gone': 0}", "!('c' in config)", "config.b == {'x': 1}"}})
 	// A null for a whole state key drops the earlier overrides: the
 	// initial state applies.
 	passes(t, doc, sim.Request{Flow: "get", Fixtures: []string{"base"}, State: map[string]map[string]any{"svc": nil},

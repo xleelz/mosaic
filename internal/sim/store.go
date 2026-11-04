@@ -101,6 +101,8 @@ func (r *run) storeOp(fr *frame, st *model.StoreSpec, p string, lookup func(stri
 		key = t
 	case int64:
 		key = strconv.FormatInt(t, 10)
+	case uint64: // beyond int64 (behavior-language §30)
+		key = strconv.FormatUint(t, 10)
 	case float64:
 		if t == math.Trunc(t) && math.Abs(t) < 1<<53 {
 			key = strconv.FormatInt(int64(t), 10)
@@ -262,6 +264,8 @@ func addNumbers(a, b any) (any, error) {
 func toFloat(v any) (float64, bool) {
 	switch t := v.(type) {
 	case int64:
+		return float64(t), true
+	case uint64:
 		return float64(t), true
 	case float64:
 		return t, true

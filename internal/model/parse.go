@@ -72,11 +72,21 @@ func fromNode(n *yaml.Node, depth int) (any, error) {
 	case "!!bool":
 		return strconv.ParseBool(strings.ToLower(n.Value))
 	case "!!int":
-		if i, err := strconv.ParseInt(strings.ReplaceAll(n.Value, "_", ""), 0, 64); err == nil {
+		lit := strings.ReplaceAll(n.Value, "_", "")
+		if i, err := strconv.ParseInt(lit, 0, 64); err == nil {
 			return i, nil
 		}
-		return json.Number(n.Value), nil
+		if u, err := strconv.ParseUint(strings.TrimPrefix(lit, "+"), 0, 64); err == nil {
+			return json.Number(strconv.FormatUint(u, 10)), nil // a uint64 (behavior-language §30)
+		}
+		return json.Number(lit), nil
 	case "!!float":
+		if wholeLiteral(n.Value) {
+			// yaml.v3 tags a whole number beyond uint64 as a float; keep
+			// its digits (behavior-language §30: it becomes a double later,
+			// with a warning).
+			return json.Number(strings.TrimPrefix(n.Value, "+")), nil
+		}
 		f, err := strconv.ParseFloat(n.Value, 64)
 		if err != nil || math.IsInf(f, 0) || math.IsNaN(f) {
 			return nil, fmt.Errorf("line %d: unsupported number %q", n.Line, n.Value)
@@ -84,6 +94,21 @@ func fromNode(n *yaml.Node, depth int) (any, error) {
 		return f, nil
 	}
 	return n.Value, nil
+}
+
+// wholeLiteral reports whether s is a decimal integer literal beyond
+// int64: an optional sign and digits, without a leading zero.
+func wholeLiteral(s string) bool {
+	s = strings.TrimPrefix(strings.TrimPrefix(s, "-"), "+")
+	if len(s) < 19 || s[0] == '0' {
+		return false
+	}
+	for _, c := range s {
+		if c < '0' || c > '9' {
+			return false
+		}
+	}
+	return true
 }
 
 // ParseDocument strictly parses a YAML or JSON ontology document.

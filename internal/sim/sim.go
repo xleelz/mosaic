@@ -249,6 +249,11 @@ type Limits struct {
 	// parallel (§17 item 18); 0 keeps the per-step rule (max, default
 	// 100, at most 1000).
 	MaxForeach int
+	// CELCost is the CEL cost limit of one evaluation in runs whose
+	// scenario sets no cost_limit or max_cel_cost (behavior-language §30);
+	// 0 scales the default with the size of the run's inputs. At most
+	// expr.MaxCostLimit.
+	CELCost int64
 }
 
 // DefaultLimits are the documented budgets.
@@ -290,6 +295,13 @@ type plan struct {
 	maxVirtualMS int64
 	// costLimit is the scenario's cost_limit; 0 means the default.
 	costLimit int64
+	// inputBytes is the JSON size of the run's inputs (the request's, the
+	// scenario's, the flow entry's and the steps'), which scales the
+	// default cost limit (behavior-language §30).
+	inputBytes int
+	// warnings are recorded when the run starts: integers in the inputs
+	// beyond uint64 (behavior-language §30).
+	warnings []string
 	// maxEvents is the scenario's max_events (§13.1 item 35); 0 means the
 	// limits' own.
 	maxEvents int
@@ -344,7 +356,18 @@ func RunWithLimits(doc *model.Document, req Request, lim Limits) (*Result, error
 	if pl.maxForeach > 0 {
 		lim.MaxForeach = pl.maxForeach // a scenario's max_foreach (§17 item 18)
 	}
+	switch {
+	case pl.costLimit > 0: // the scenario's own
+	case lim.CELCost > 0:
+		pl.costLimit = min(lim.CELCost, expr.MaxCostLimit)
+	default:
+		pl.costLimit = ScaledCostLimit(pl.inputBytes)
+	}
+	pl.costLimit = min(pl.costLimit, expr.MaxCostLimit)
 	r := newRun(x, lim, seed, eff, pl)
+	for _, w := range pl.warnings {
+		r.warn(w)
+	}
 	r.s.xp = req.Schedule.start(r)
 	if err := r.seedLimiters(pl.world.Limiters, "limiters"); err != nil {
 		return nil, err
@@ -514,16 +537,13 @@ func effective(x *model.Index, req Request) (Request, *plan, error) {
 		if err := w.Apply(l); err != nil {
 			return &RequestError{fmt.Sprintf("%s: %v", what, err)}
 		}
-		// over echoes the overrides: config nulls stay in it as deletions.
+		// over echoes the overrides: config removals stay in it as
+		// {$absent: true}, and nulls as values (behavior-language §30).
 		for c, inst := range l.Topology {
 			over.Topology[c] = append([]string(nil), inst...)
 		}
 		for k, v := range l.Config {
-			if model.IsAbsentMark(expr.Native(v)) {
-				over.Config[k] = nil // §17 item 16: as a deletion
-				continue
-			}
-			over.Config[k] = model.MergeValue(over.Config[k], expr.Native(v), true)
+			over.Config[k] = model.MergeConfig(over.Config[k], expr.Native(v), true)
 		}
 		return nil
 	}
@@ -624,6 +644,7 @@ func effective(x *model.Index, req Request) (Request, *plan, error) {
 		eff.Input, _ = json.Marshal(inputTpl)
 	}
 	pl.inputTpl = inputTpl
+	pl.scanInputs(sc, req)
 	if len(req.Choices) > 0 {
 		// Scenario choices are checked by validation; a run's own must be
 		// checked here, or a typo would silently fall back to the default.
@@ -1008,7 +1029,7 @@ func (r *run) checkSchema(ref any, v any, what string) {
 	if !ok {
 		return
 	}
-	for _, m := range jsonschema.Validate(s, v, r.x.SchemaRef()) {
+	for _, m := range jsonschema.Validate(s, expr.SchemaView(v), r.x.SchemaRef()) {
 		r.warn(what + ": " + m)
 	}
 }

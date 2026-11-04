@@ -2,13 +2,14 @@ package main
 
 // Flags of the round-4 lints (DESIGN §13.1 item 33), kept apart from
 // main.go: unraised-errors, choice-for-computed and the profile they and
-// racy's transitions read.
+// racy's transitions read; and unwritten-fields' gate (unwritten.go).
 
 import "flag"
 
 var (
 	maxUnraised     = flag.Float64("max-unraised", -1, "run --lint unraised-errors and exit 1 when a fragment's share of declared errors that nothing raises is above this ratio")
 	maxChoice       = flag.Int("max-choice-for-computed", -1, "run --lint choice-for-computed and exit 1 when more than N choice points decide what the code computes from config, a flag or a policy")
+	maxUnwritten    = flag.Int("max-unwritten-fields", -1, "run --lint unwritten-fields and exit 1 when more than N fields are read that no store write, fixture, seed, emit, call input or return writes (unwritten.go)")
 	lintProfileFlag = flag.String("profile", "", "generation profile for the lints' naming.state_fields (racy transitions) and config.sources (choice-for-computed); default: the --features or --failures file")
 )
 
@@ -19,6 +20,9 @@ func round4Implied(lints map[string]bool) {
 	}
 	if *maxChoice >= 0 {
 		lints["choice-for-computed"] = true
+	}
+	if *maxUnwritten >= 0 {
+		lints["unwritten-fields"] = true
 	}
 }
 
