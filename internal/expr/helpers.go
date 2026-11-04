@@ -51,9 +51,11 @@ func helperOpts(sandbox bool) []cel.EnvOption {
 	}
 	opts = append(opts, byteHelpers()...)
 	opts = append(opts, ipHelpers()...)
-	opts = append(opts, jsonHelpers()...) // §15.3, json.go
-	opts = append(opts, listHelpers()...) // §17 item 13, lists.go
-	opts = append(opts, quantMacros())    // §16.2, quant.go
+	opts = append(opts, jsonHelpers()...)   // §15.3, json.go
+	opts = append(opts, listHelpers()...)   // §17 item 13, lists.go
+	opts = append(opts, clockHelpers()...)  // §17 item 17, clock.go
+	opts = append(opts, stringHelpers()...) // §17 item 19, strconv.go
+	opts = append(opts, quantMacros())      // §16.2, quant.go
 	if sandbox {
 		return opts
 	}

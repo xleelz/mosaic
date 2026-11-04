@@ -150,6 +150,10 @@ func (w *World) Apply(l WorldLayer) error {
 	}
 	for k, v := range l.Config {
 		nv := expr.Native(v)
+		if IsAbsentMark(nv) {
+			delete(w.Config, k)
+			continue
+		}
 		if _, has := w.Config[k]; has && nv == nil {
 			delete(w.Config, k)
 			continue
@@ -157,6 +161,9 @@ func (w *World) Apply(l WorldLayer) error {
 		w.Config[k] = MergeValue(w.Config[k], nv, false)
 	}
 	for k, v := range l.State {
+		if IsAbsentMark(expr.Native(v)) {
+			v = nil // a whole component's state: as a null, the initial state applies
+		}
 		cur, _ := MergeValue(w.State[k], expr.Native(v), true).(map[string]any)
 		w.State[k] = cur
 	}
@@ -296,6 +303,12 @@ func MergeValue(base, over any, mark bool) any {
 		switch {
 		case ov == Deleted && !mark:
 			delete(out, k)
+		case IsAbsentMark(ov): // §17 item 16: {$absent: true} removes the key, row or field
+			if mark {
+				out[k] = Deleted
+			} else {
+				delete(out, k)
+			}
 		case ov == nil && has && bv != Deleted:
 			if mark {
 				out[k] = Deleted
@@ -311,6 +324,18 @@ func MergeValue(base, over any, mark bool) any {
 		}
 	}
 	return out
+}
+
+// IsAbsentMark reports whether v is exactly {$absent: true}: in a state or
+// config override it removes its key at any depth, whether or not the
+// value it merges over has it (§17 item 16).
+func IsAbsentMark(v any) bool {
+	m, ok := v.(map[string]any)
+	if !ok || len(m) != 1 {
+		return false
+	}
+	b, ok := m["$absent"].(bool)
+	return ok && b
 }
 
 func asMap(v any) (map[string]any, bool) {

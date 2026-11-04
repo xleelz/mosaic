@@ -146,6 +146,9 @@ func (pl *plan) applyCaps(sc *model.Scenario) {
 	if sc.MaxIterations != nil {
 		pl.maxIterations = int(max(1, min(*sc.MaxIterations, model.MaxMaxIterations)))
 	}
+	if sc.MaxForeach != nil {
+		pl.maxForeach = int(max(1, min(*sc.MaxForeach, model.MaxMaxForeach))) // §17 item 18
+	}
 	if sc.MaxCELCost != nil && sc.CostLimit == nil {
 		pl.costLimit = *sc.MaxCELCost
 	}

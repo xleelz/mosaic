@@ -12,6 +12,7 @@ import (
 //
 //	{seq, t, dir: in|out, kind: entry|external|route, interface, component,
 //	 instance, input, output: {ok, value, error}, headers, duration_ms, duration_us}
+//	 (and t_us, the exact clock of t, §17 item 17)
 //
 // Scenarios that assert on io, result and steps survive internal renames.
 // The items are collected from the run's call events: a call.start opens
@@ -48,7 +49,7 @@ func IsBoundaryComponent(c *model.Component) bool {
 // ioItem is one boundary item while it's being collected.
 type ioItem struct {
 	t, dur      int64
-	durUS       int64
+	tUS, durUS  int64
 	dir, kind   string
 	iface, comp string
 	inst        string
@@ -67,7 +68,7 @@ func (r *run) ioValue() []any {
 		if it.ended {
 			dur, durUS = it.dur, it.durUS // durUS exact (§17 item 10)
 		}
-		out[i] = map[string]any{"seq": int64(i + 1), "t": it.t, "dir": it.dir, "kind": it.kind, "interface": it.iface,
+		out[i] = map[string]any{"seq": int64(i + 1), "t": it.t, "t_us": it.tUS, "dir": it.dir, "kind": it.kind, "interface": it.iface,
 			"component": it.comp, "instance": it.inst, "input": it.input, "output": it.output, "headers": it.headers,
 			"duration_ms": dur, "duration_us": durUS}
 	}
@@ -83,7 +84,7 @@ func (r *run) ioItems() []*ioItem {
 		e := &r.events[i]
 		switch e.Type {
 		case "route":
-			it := &ioItem{t: e.T, dir: "out", kind: "route", iface: e.Interface, comp: e.To, inst: e.Instance, input: e.Input}
+			it := &ioItem{t: e.T, tUS: e.tUS, dir: "out", kind: "route", iface: e.Interface, comp: e.To, inst: e.Instance, input: e.Input}
 			if e.Error != nil || e.Output != nil {
 				// The router answered itself: a refusal, a redirect or no route.
 				it.output, it.ended = ioOutcome(e.Error == nil, e.Output, e.Error), true
@@ -107,7 +108,7 @@ func (r *run) ioItems() []*ioItem {
 			default:
 				continue
 			}
-			it.t, it.iface, it.comp, it.inst, it.input = e.T, e.Interface, e.To, e.Instance, e.Input
+			it.t, it.tUS, it.iface, it.comp, it.inst, it.input = e.T, e.tUS, e.Interface, e.To, e.Instance, e.Input
 			open[e.Span] = it
 			items = append(items, it)
 		case "call.end":

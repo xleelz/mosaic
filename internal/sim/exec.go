@@ -405,11 +405,20 @@ func (r *run) invokeCall(c callSpec, ac *activeCall) (res callResult, err error)
 		if e.Message == "" {
 			e.Message = f.Component + " is unavailable"
 		}
+		// A fault's latency_ms delays the refusal (§17 item 20).
+		if ft.LatencyMS > 0 {
+			if err := r.sleep(r.msToUS(ft.LatencyMS)); err != nil {
+				return callResult{}, err
+			}
+		}
 		res = callResult{err: e}
 	case ft != nil && ft.Type == "error":
 		lat, err := r.latency(f, c.input, c.inst, c.deadline)
 		if err != nil {
 			return callResult{}, err
+		}
+		if ft.LatencyMS > 0 {
+			lat += r.msToUS(ft.LatencyMS) // the fault's own delay, as a latency fault adds (§17 item 20)
 		}
 		if err := r.sleep(lat); err != nil {
 			return callResult{}, err
@@ -776,11 +785,7 @@ func (r *run) foreach(f *frame, s model.Step, depth int, p string) (*exit, error
 	if err != nil {
 		return nil, err
 	}
-	limit := s.Max
-	if limit <= 0 {
-		limit = model.DefaultForeachMax
-	}
-	limit = min(limit, model.MaxForeachMax)
+	limit := r.foreachLimit(s.Max) // §17 item 18, sim17.go
 	if len(items) > limit {
 		r.warn(fmt.Sprintf("%s: foreach stopped after max %d of %d items", p, limit, len(items)))
 		items = items[:limit]

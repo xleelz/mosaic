@@ -928,8 +928,8 @@ func (v *validator) foreach(f *Interface, p string, s Step, depth int, choices m
 	if as == index {
 		v.errf(p+".index", "index and as must name different variables")
 	}
-	if s.Max < 0 || s.Max > MaxForeachMax {
-		v.errf(p+".max", "must be between 1 and %d", MaxForeachMax)
+	if s.Max < 0 || s.Max > MaxMaxForeach { // §17 item 18: cut to the run's foreach cap
+		v.errf(p+".max", "must be between 1 and %d", MaxMaxForeach)
 	}
 	if len(s.Steps) == 0 {
 		v.errf(p+".steps", "a foreach needs steps")
@@ -1117,6 +1117,7 @@ func (v *validator) scenarios() {
 			v.errf(p+".cost_limit", "cost_limit must be positive")
 		}
 		v.scenarioCaps(p, s) // §15.3, sim153.go
+		v.foreachCap(p, s)   // §17 item 18, sim17.go
 		stepNames := map[string]bool{}
 		for j, st := range s.Steps {
 			v.scenarioStep(fmt.Sprintf("%s.steps[%d]", p, j), st, points, topo, stepNames)
@@ -1250,12 +1251,14 @@ func (v *validator) instanceIn(p string, topo map[string][]string, comp, inst st
 func (v *validator) scenarioStep(p string, st ScenarioStep, points map[string]ChoicePoint, topo map[string][]string, names map[string]bool) {
 	comp := ""
 	n := 0
-	for _, set := range []bool{st.Flow != "", st.Interface != "", st.Cancel != "", st.Restart != nil, st.Kill != nil, st.Set != nil} {
+	for _, set := range []bool{st.Flow != "", st.Interface != "", st.Cancel != "", st.Restart != nil, st.Kill != nil, st.Set != nil, st.Close != nil} {
 		if set {
 			n++
 		}
 	}
 	switch {
+	case st.IsControl() && n > 1 && st.Close != nil:
+		v.errf(p, "a step names one of a flow, an interface, cancel, restart, kill, set or close")
 	case st.IsControl() && n > 1 && st.Set != nil:
 		v.errf(p, "a step names one of a flow, an interface, cancel, restart, kill or set")
 	case st.IsControl() && n > 1 && st.Kill != nil:
@@ -1281,6 +1284,8 @@ func (v *validator) scenarioStep(p string, st ScenarioStep, points map[string]Ch
 			v.kill(p+".kill", st.Kill, topo, nil)
 		case st.Set != nil:
 			v.setStep(p+".set", st, topo) // §15.3, sim153.go
+		case st.Close != nil:
+			v.closeStep(p+".close", st.Close) // §17 item 21, sim17.go
 		default:
 			v.restart(p+".restart", st.Restart, topo, nil)
 		}

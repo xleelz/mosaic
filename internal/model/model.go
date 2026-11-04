@@ -843,6 +843,11 @@ type Scenario struct {
 	// MaxMaxIterations. MaxCELCost is cost_limit's other name.
 	MaxIterations *int64 `json:"max_iterations,omitempty"`
 	MaxCELCost    *int64 `json:"max_cel_cost,omitempty"`
+	// MaxForeach is the most items any foreach or parallel foreach takes
+	// in this scenario's runs (§17 item 18), and what one without its own
+	// max takes. Nil keeps DefaultForeachMax (100) for a step without max
+	// and MaxForeachMax (1000) as the ceiling; at most MaxMaxForeach.
+	MaxForeach *int64 `json:"max_foreach,omitempty"`
 	// Limiters seeds limiter state (§13.1 item 27), over the fixtures'.
 	Limiters LimiterSeeds `json:"limiters,omitempty"`
 	// Resolution chooses, per component path, black_box (the default) or
@@ -913,12 +918,16 @@ type ScenarioStep struct {
 	// "<component>[@instance]", then by a dotted path in that state; the
 	// values are templates. Such a step names no flow or interface.
 	Set map[string]map[string]any `json:"set,omitempty"`
+	// Close closes a session from outside (§17 item 21), as a behavior's
+	// close step does: every call in flight that carries the session key
+	// fails with canceled. Such a step names no flow or interface.
+	Close *CloseSpec `json:"close,omitempty"`
 }
 
-// IsControl reports whether the step is a cancel, restart, kill or set
-// step rather than a call.
+// IsControl reports whether the step is a cancel, restart, kill, set or
+// close step rather than a call.
 func (s ScenarioStep) IsControl() bool {
-	return s.Cancel != "" || s.Restart != nil || s.Kill != nil || s.Set != nil
+	return s.Cancel != "" || s.Restart != nil || s.Kill != nil || s.Set != nil || s.Close != nil
 }
 
 // Awaited reports whether the next step waits for this one: Await, true by

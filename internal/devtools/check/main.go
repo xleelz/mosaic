@@ -231,6 +231,7 @@ func main() {
 	maxScenarios := flag.Int("max-scenarios", 0, "with --extract-contract, keep only the first N crossing scenarios (0: all)")
 	flag.Parse()
 	applyProfileGates() // --profile's gates: defaults of the §16.1 gate flags (gates.go)
+	applySimLimits()    // --max-events, --max-iterations, --max-foreach (simlimits.go)
 	if len(in) == 0 {
 		fmt.Fprintln(os.Stderr, "usage: check -f FILE [-f FILE]... [-o OUT] [-q] [-v] [--scenario RE] [--trace] [--state] [--steps [--steps-full]] [--behavior-coverage [--behavior-coverage-md FILE]] [--lint hollow,trivial,inert,unscheduled,dataflow,racy,seam-names] [--no-mocks] [--code DIR [--strict-citations] [--cite-sample N --seed S]] [--inventory FILE [--coverage-md FILE] [--strict-coverage] [--min-modeled R] [--min-substantive R] [--max-trivial R]] [--tests FILE [--min-test-reach R]] [--features PROFILE [--strict-features]] [--failures PROFILE [--strict-failures]]")
 		os.Exit(2)

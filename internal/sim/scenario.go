@@ -301,10 +301,13 @@ func (r *run) runStep(sp *stepPlan, start int64, finish func(callResult, int64))
 	return nil
 }
 
-// controlStep runs a cancel, restart or kill step in the driver.
+// controlStep runs a cancel, restart, kill, set or close step in the driver.
 func (r *run) controlStep(i int, key string, st model.ScenarioStep, start int64) error {
 	if st.Set != nil {
 		return r.setStep(i, st) // §15.3, sim153.go
+	}
+	if st.Close != nil {
+		return r.closeStep(i, st.Close) // §17 item 21, sim17.go
 	}
 	act := r.topAct(nil, r.stepsValue())
 	if st.Cancel != "" {

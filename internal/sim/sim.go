@@ -92,6 +92,7 @@ type Pass struct {
 	DurationMS int64   `json:"duration_ms"`
 	DurationUS *int64  `json:"duration_us,omitempty"` // §13.1 item 16, in runs with sub-ms time
 	durUS      int64
+	startUS    int64 // the exact start, CEL passes[i].start_us (§17 item 17)
 }
 
 // Assertion is one evaluated expectation.
@@ -244,6 +245,10 @@ type Limits struct {
 	MaxEmits      int
 	MaxIterations int // foreach iterations in the whole run; 0 means the default
 	MaxTimers     int // timer deliveries in the whole run (§11.3); 0 means the default
+	// MaxForeach caps the items of every foreach and the branches of every
+	// parallel (§17 item 18); 0 keeps the per-step rule (max, default
+	// 100, at most 1000).
+	MaxForeach int
 }
 
 // DefaultLimits are the documented budgets.
@@ -291,6 +296,9 @@ type plan struct {
 	// maxIterations is the scenario's max_iterations (§15.3); 0 means the
 	// limits' own.
 	maxIterations int
+	// maxForeach is the scenario's max_foreach (§17 item 18); 0 means the
+	// limits' own.
+	maxForeach int
 }
 
 // RunWithLimits runs a request against a document.
@@ -332,6 +340,9 @@ func RunWithLimits(doc *model.Document, req Request, lim Limits) (*Result, error
 	}
 	if pl.maxIterations > 0 {
 		lim.MaxIterations = pl.maxIterations // a scenario's max_iterations (§15.3)
+	}
+	if pl.maxForeach > 0 {
+		lim.MaxForeach = pl.maxForeach // a scenario's max_foreach (§17 item 18)
 	}
 	r := newRun(x, lim, seed, eff, pl)
 	r.s.xp = req.Schedule.start(r)
@@ -487,7 +498,7 @@ func (r *run) runEntry(flow *model.Flow, entry *model.Interface, inputTpl any) (
 			err = r.waitQuiet()
 		}
 		if err == nil {
-			r.passes = append(r.passes, Pass{Pass: i + 1, Result: res.outcome(), StartMS: msFloor(start), DurationMS: msFloor(r.now - start), durUS: r.now - start})
+			r.passes = append(r.passes, Pass{Pass: i + 1, Result: res.outcome(), StartMS: msFloor(start), DurationMS: msFloor(r.now - start), durUS: r.now - start, startUS: start})
 		}
 	}
 	return res, err
@@ -508,6 +519,10 @@ func effective(x *model.Index, req Request) (Request, *plan, error) {
 			over.Topology[c] = append([]string(nil), inst...)
 		}
 		for k, v := range l.Config {
+			if model.IsAbsentMark(expr.Native(v)) {
+				over.Config[k] = nil // §17 item 16: as a deletion
+				continue
+			}
 			over.Config[k] = model.MergeValue(over.Config[k], expr.Native(v), true)
 		}
 		return nil
@@ -645,7 +660,7 @@ func effective(x *model.Index, req Request) (Request, *plan, error) {
 	for c, st := range req.State {
 		// A null marks a deletion (§13.1 item 12), applied over the initial
 		// state in newRun.
-		if st == nil {
+		if st == nil || model.IsAbsentMark(expr.Native(st)) { // §17 item 16
 			eff.State[c] = nil
 			continue
 		}
@@ -675,6 +690,8 @@ func checkStep(x *model.Index, i int, st model.ScenarioStep) error {
 		return &RequestError{fmt.Sprintf("step %d names more than one of a flow, an interface, cancel and restart", i)}
 	case st.Kill != nil && (st.Flow != "" || st.Interface != "" || st.Cancel != "" || st.Restart != nil):
 		return &RequestError{fmt.Sprintf("step %d names more than one of a flow, an interface, cancel, restart and kill", i)}
+	case st.Close != nil && (st.Flow != "" || st.Interface != "" || st.Cancel != "" || st.Restart != nil || st.Kill != nil || st.Set != nil):
+		return &RequestError{fmt.Sprintf("step %d names more than one of a flow, an interface, cancel, restart, kill, set and close", i)}
 	case st.IsControl():
 	case st.Flow != "" && st.Interface != "":
 		return &RequestError{fmt.Sprintf("step %d names a flow and an interface", i)}
@@ -1055,7 +1072,7 @@ func (r *run) expectations(exprs []string, s Summary) []Assertion {
 	}
 	passes := make([]any, len(r.passes))
 	for i, ps := range r.passes {
-		passes[i] = map[string]any{"pass": int64(ps.Pass), "start_ms": ps.StartMS, "duration_ms": ps.DurationMS, "duration_us": ps.durUS,
+		passes[i] = map[string]any{"pass": int64(ps.Pass), "start_ms": ps.StartMS, "start_us": ps.startUS, "duration_ms": ps.DurationMS, "duration_us": ps.durUS,
 			"result": outcomeMap(ps.Result)}
 	}
 	topology := map[string]any{}

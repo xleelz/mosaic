@@ -74,7 +74,7 @@ func TestValidateForeachAndRepeat(t *testing.T) {
 		{"invalid index", set(`[{"foreach": "= [1]", "index": "1i", "steps": [{"wait": 1}]}]`), p + "[0].index", `invalid variable name "1i"`, ""},
 		{"same names", set(`[{"foreach": "= [1]", "as": "i", "index": "i", "steps": [{"wait": 1}]}]`), p + "[0].index", "different variables", ""},
 		{"default names clash", set(`[{"foreach": "= [1]", "as": "index", "steps": [{"wait": 1}]}]`), p + "[0].index", "different variables", ""},
-		{"max too large", set(`[{"foreach": "= [1]", "max": 1001, "steps": [{"wait": 1}]}]`), p + "[0].max", "must be between 1 and 1000", ""},
+		{"max too large", set(`[{"foreach": "= [1]", "max": 1000001, "steps": [{"wait": 1}]}]`), p + "[0].max", "must be between 1 and 1000000", ""},
 		{"negative max", set(`[{"foreach": "= [1]", "max": -1, "steps": [{"wait": 1}]}]`), p + "[0].max", "must be between 1 and 1000", ""},
 		{"no steps", set(`[{"foreach": "= [1]"}]`), p + "[0].steps", "a foreach needs steps", ""},
 		{"body is checked", set(`[{"foreach": "= [1]", "steps": [{"call": "b.nope"}]}]`), p + "[0].steps[0].call", `unknown interface "b.nope"`, ""},

@@ -2205,3 +2205,33 @@ Building `tcp-tls`, `linux` and `cuda` (§16.5) exposed these:
     and duration in ms, and `value <json>` or `error <json>`. A scenario without steps prints its
     `result`. The JSON is compact with sorted keys, and is cut at 200 bytes with the full size
     noted. `--steps-full` prints it whole. The lines come before `--trace` and `--state` output.
+16. **`{$absent: true}` deletes state rows.** In a scenario's or request's `state`, and in
+    `config`, a key whose override is exactly `{$absent: true}` is removed at any depth: a
+    fixture-seeded row (`state: {dynamodb: {core: {"<key>": {$absent: true}}}}`), a field, or a
+    nested field. Unlike a null, it removes the key whether or not the layer below has it, so a
+    key no layer set stays unset. A whole component's `{$absent: true}` acts as a null: the initial
+    state applies. A map with other keys beside `$absent`, or `$absent: false`, is a plain value.
+17. **The microsecond clock reaches timestamps.** `now` stays whole epoch milliseconds and
+    `duration_ms` whole milliseconds. CEL gains `timestampUS(us)` and `timestampMS(ms)`, which make
+    a timestamp from epoch microseconds (`now_us`) or milliseconds without dropping the
+    sub-second part, as `timestamp(int(now / 1000))` does. A timestamp prints in RFC 3339 with
+    fractional seconds only when they aren't zero. Expectations gain `io[i].t_us` and
+    `passes[i].start_us`, beside the existing `t_us`, `start_us` and `duration_us`.
+18. **Run caps are settable.** A scenario's `max_foreach` (1 to 1,000,000) caps the items of every
+    `foreach` and the branches of every `parallel` in its runs. A `foreach` without `max` takes up
+    to the cap, and a step's `max` (now valid up to 1,000,000) is cut to it. Without it the old
+    rule holds: `max`, default 100, at most 1,000. `max_events` and `max_iterations` stay as they
+    were. The check tool's `--max-events`, `--max-iterations` and `--max-foreach` set the default
+    caps of every scenario that doesn't set its own. A 30 s drain can then run in one scenario.
+19. **`string()` of maps and lists.** `string(map)` and `string(list)` give canonical JSON, the
+    text `json(x)` gives: keys sorted, no spaces, strings quoted. CEL had no conversion for either.
+    Scalars keep CEL's own (`string('x')` is `x`).
+20. **Error faults honor `latency_ms`.** An `error` fault adds its `latency_ms` to the callee's
+    latency before it fails, as a `latency` fault adds it before the behavior runs. An `unavailable`
+    fault with `latency_ms` fails after that delay instead of at once. A caller's timeout or
+    deadline shorter than the delay times out first.
+21. **Scenario steps close sessions.** A scenario step `{close: {session: <key>}}` (a literal or
+    `"=cel"` over the step variables) is a control step, like `set` or `kill`. It cancels every
+    call in flight that carries the key, as the behavior step does (§13.1 item 35): the callers
+    get `{code: canceled}`, and a `close` event records `output.pending`. It models a client that
+    ends its session mid-run.

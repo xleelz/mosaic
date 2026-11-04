@@ -38,6 +38,7 @@ Additions for systems with many parts (requires DESIGN §11, in progress):
 26. [Run caps, headers, fault matching, hangs, sessions and retry on status](#26-run-caps-headers-fault-matching-hangs-sessions-and-retry-on-status)
 27. [Route streams, frame headers, retry-after, fault payloads, caps, set steps, JSON and markers](#27-route-streams-frame-headers-retry-after-fault-payloads-caps-set-steps-json-and-markers)
 28. [Cancel time and stream flow control](#28-cancel-time-and-stream-flow-control)
+29. [Row deletes, the microsecond clock, run caps, string(), fault latency and closing sessions](#29-row-deletes-the-microsecond-clock-run-caps-string-fault-latency-and-closing-sessions)
 
 ## 1. Steps
 
@@ -250,9 +251,9 @@ For each attempt, in order:
    fault to some calls, and its `calls` then count only those (§26). It records a `fault` event and adds one to `faults`.
    - `unavailable`: fails immediately, with no latency:
      `{code: unavailable, status: 503, retryable: true}`. `code`, `status`, `message` and
-     `retryable` override these.
-   - `error`: adds the callee's latency, then fails with `{code, status, message}`, where
-     `retryable` is **false unless set**.
+     `retryable` override these. With `latency_ms` it fails after that delay instead (§29).
+   - `error`: adds the callee's latency, plus the fault's own `latency_ms` when set (§29), then
+     fails with `{code, status, message}`, where `retryable` is **false unless set**.
    - `latency`: adds `latency_ms` on top of the normal latency, then runs normally. Combine it with
      the caller's `timeout_ms` to get late completions.
    - `timeout` (or its other name, `hang`): the callee never answers. The caller waits its
@@ -299,10 +300,13 @@ Calls to the flow's entry interface go through the same path, so it can be fault
   `{meta: {b: {$absent: true}}}`. These markers apply to entry inputs only, not to a behavior's
   `call` or `emit` input (there an unset key is simply not written).
 - **State**: each component's `state.initial`, deep-merged with the scenario's `state`, then the
-  run's `--state`.
+  run's `--state`. A null deletes a key the layer below has; `{$absent: true}` deletes a key,
+  row or field at any depth, including a fixture-seeded row (§29).
 - **Choices** are overlaid (the run wins). **Faults** and **expectations** are concatenated
   (scenario first). **Seed**: the run's value, else the scenario's, else 1.
-- **Budgets**: 20,000 events, call depth 64, 1,000 emits and 10,000 `foreach` iterations.
+- **Budgets**: 20,000 events, call depth 64, 1,000 emits and 10,000 `foreach` iterations
+  (`max_events`, `max_iterations` and `max_foreach` per scenario, or the check tool's
+  `--max-events`, `--max-iterations` and `--max-foreach`, change them; §29).
   Exceeding one, or any runtime CEL error, makes the status `aborted`, and `abort` names the cause.
 - **Run caps are per scenario, not fixed.** **`max_events: N`** on a scenario raises (or lowers)
   the event budget, default 20,000, up to 1,000,000: a load test of 200 requests does not need
@@ -410,7 +414,7 @@ store: {table: runs, op: put, key: "= input.id", value: "= input", if_absent: tr
 - foreach: "= input.hooks"   # a list, a map (e.g. "= state.webhooks") or a literal list
   as: hook        # vars.hook holds the item (default: item)
   index: i        # vars.i holds the 0-based position, or the key for a map (default: index)
-  max: 20         # default 100, at most 1000
+  max: 20         # default 100, at most 1000 (a scenario's max_foreach changes both, §29)
   steps:
     - {if: "vars.hook == 'muted'", then: [{continue: true}]}
     - {call: webhook-sender.deliver, input: {url: "= vars.hook"}, as: sent, on_error: continue}
@@ -741,6 +745,8 @@ Available in every environment (behaviors, templates, `where`, expectations):
 | `ip(s)`: the normalized address (an IPv4-mapped IPv6 becomes IPv4, `2001:DB8::1` becomes `2001:db8::1`); an invalid address is an error | `ip(input.x_forwarded_for.split(',')[0].trim())` for a client-IP key |
 | `inCidr(ip, cidr)`, `inAnyCidr(ip, [cidrs])`: the prefix is masked; families never cross; an invalid address or prefix is an error | `inAnyCidr(input.peer, config.trusted_proxies)` |
 | `ipFamily(ip)`: 4 or 6 | `ipFamily(input.peer) == 6` |
+| `string(map)`, `string(list)`: canonical JSON, keys sorted, no spaces, the same text as `json(x)` (§29) | `string(input.labels)` for a cache key |
+| `timestampUS(us)`, `timestampMS(ms)`: a timestamp from epoch microseconds or milliseconds; it prints with fractional seconds when they aren't zero (§29) | `string(timestampUS(now_us))` gives `2026-10-30T00:00:00.00025Z` |
 | `ipIsLoopback`, `ipIsPrivate`, `ipIsLinkLocal`, `ipIsMulticast`, `ipIsUnspecified`: Go's `net/netip` predicates (`ipIsLinkLocal` is link-local unicast or multicast) | `ipIsLoopback(h) \|\| ipIsPrivate(h) \|\| ipIsLinkLocal(h)` for an SSRF netguard |
 
 The hashing, HMAC, base64, `substrBytes` and `fnv64a` helpers cost 1 plus 1 per 10 bytes of input
@@ -1149,6 +1155,7 @@ with that key, as the death of a tunnel or connection that the peer sees:
 - A closed session isn't closed for good: a later call carrying the key runs.
 - Each close records a `close` event: `key` is the session, `output.pending` the calls canceled.
 - `session` doesn't go with `stream`. Using either makes the run concurrent.
+- A scenario step `{close: {session: <key>}}` closes a session from outside the model (§29).
 
 ### Retry on status: `on_status` and `on_codes`
 
@@ -1336,6 +1343,85 @@ A streaming call may bound its frames in flight:
   a whole number of at least 1. `stall_ms` must be positive and needs a `window`. Without a
   window, a producer never blocks.
 
+## 29. Row deletes, the microsecond clock, run caps, string(), fault latency and closing sessions
+
+DESIGN §17 items 16 to 21.
+
+### Deleting a fixture row: `{$absent: true}` in `state`
+
+```yaml
+- id: session-missing
+  fixtures: [two-sessions]
+  state: {dynamodb: {core: {"sess#alice": {$absent: true}}}}   # the fixture's row is gone
+```
+
+- In a scenario's or request's `state` (and in `config`), a key whose override is exactly
+  `{$absent: true}` is removed, at any depth: a row, a field of a row, or a nested field. It
+  removes keys from fixtures and from `state.initial`, and is a no-op for a key nobody set.
+- A whole component (`state: {db: {$absent: true}}`) acts like `null`: the initial state applies.
+- `{$absent: false}` and a map with other keys beside `$absent` are plain values.
+
+### The microsecond clock
+
+`now` stays whole epoch milliseconds and `duration_ms` whole milliseconds, for compatibility.
+For finer time:
+
+- `now_us` is the clock in epoch microseconds, in behaviors and step templates.
+- `timestampUS(now_us)` is a CEL timestamp with the microseconds kept;
+  `timestamp(int(now / 1000))` drops everything below a second. `string()` of a timestamp prints
+  RFC 3339 with fractional seconds only when they aren't zero (`...T00:00:00.00025Z`).
+  `timestampMS(now)` keeps milliseconds.
+- In expectations, `io[i].t_us`, `passes[i].start_us`, `steps.<as>.start_us`, `trace[i].t_us`
+  and every `duration_us` are exact. Fractional `at_ms`, `latency_ms` and `jitter_ms` are honored.
+
+### Run caps: `max_events`, `max_iterations` and `max_foreach`
+
+```yaml
+- id: drain-30s
+  max_events: 400000      # default 20,000; up to 1,000,000
+  max_iterations: 200000  # foreach iterations in the whole run; default 10,000; up to 1,000,000
+  max_foreach: 5000       # items per foreach or parallel; up to 1,000,000
+```
+
+- Without `max_foreach`, a `foreach` takes its `max` (default 100, cut to 1,000) and a `parallel`
+  at most 1,000 branches, as before. With it, a `foreach` without `max` takes up to
+  `max_foreach` items, and a step's `max` (now valid up to 1,000,000) is cut to it.
+- A big loop usually needs `max_iterations` too: every iteration counts against it.
+- The check tool's `--max-events`, `--max-iterations` and `--max-foreach` set the same caps for
+  every scenario that doesn't set its own.
+
+### `string()` of maps and lists
+
+`string({'b': 1, 'a': [1, 'x']})` is `{"a":[1,"x"],"b":1}`, the canonical JSON that `json(x)`
+gives: keys sorted, no spaces, strings quoted. Lists and nested values follow the same rule.
+Scalars keep CEL's own conversion (`string('x')` is `x`, `string(1.5)` is `1.5`).
+
+### Error faults with `latency_ms`
+
+```yaml
+faults: [{target: upstream.chat, type: error, code: upstream_timeout, status: 504, latency_ms: 30000}]
+```
+
+- `error` waits the callee's latency plus the fault's `latency_ms`, then fails.
+- `unavailable` with `latency_ms` waits that long, then fails (without it, it fails at once).
+- A caller's `timeout_ms` or deadline shorter than the delay gets a `timeout` instead.
+
+### Closing a session from a scenario step
+
+```yaml
+steps:
+  - {interface: client.stream, caller: user, input: {sid: s1}, as: s, await: false}
+  - {close: {session: s1}, at_ms: 250}                 # or "= steps.login.result.value.sid"
+expect:
+  - "steps.s.result.value.error.code == 'canceled'"
+```
+
+- The same `close: {session: <key>}` as the behavior step (§26), as a control step: it names no
+  flow or interface, takes no `input`, `caller`, `on` or `lane`, and makes the run concurrent.
+- The key is a literal or `"=cel"` over the step variables (`steps`, `now`, `config`).
+- Every call in flight that carries the key fails with `{code: canceled}` at the step's time, and
+  a `close` event records `output.pending`. The session can be used again afterwards.
+
 ## What the summary adds
 
 `calls_by_instance`; `steps` (multi-step results); `queued` (queue waits); `mocks` (mocked
@@ -1345,4 +1431,5 @@ across scenarios. The trace gains `queue` events (a capacity wait), marks mocked
 `instance` on events and `late` on events after a join or timeout. §23 adds `yield`, `put`,
 `receive` and `kill` events. §25 adds `limit` events and the summary's `limits`. §26 adds `close`
 events, `headers` on `call.end`, and the summary's `caps` and `pending`. §27 adds `headers` on `yield`
-events and `set` events from scenario `set` steps.
+events and `set` events from scenario `set` steps. §29 adds `t_us` on `io` items, `start_us` on
+`passes`, and `close` events from scenario `close` steps.

@@ -159,9 +159,9 @@ func (r *run) parallel(f *frame, s model.Step, depth int, p string) (*exit, erro
 			bs = append(bs, branch{item: items[i], key: keys[i], steps: s.Steps, path: p + ".steps"})
 		}
 	}
-	if len(bs) > model.MaxForeachMax {
-		r.warn(fmt.Sprintf("%s: parallel stopped after %d of %d branches", p, model.MaxForeachMax, len(bs)))
-		bs = bs[:model.MaxForeachMax]
+	if n := r.branchLimit(); len(bs) > n { // §17 item 18
+		r.warn(fmt.Sprintf("%s: parallel stopped after %d of %d branches", p, n, len(bs)))
+		bs = bs[:n]
 	}
 	n := len(bs)
 	need, err := r.need(f, s.Join, n, p)
@@ -504,9 +504,9 @@ func (r *run) parallelSequential(f *frame, s model.Step, depth int, p string) (*
 			bs = append(bs, branch{item: items[i], key: keys[i], steps: s.Steps, path: p + ".steps"})
 		}
 	}
-	if len(bs) > model.MaxForeachMax {
-		r.warn(fmt.Sprintf("%s: parallel stopped after %d of %d branches", p, model.MaxForeachMax, len(bs)))
-		bs = bs[:model.MaxForeachMax]
+	if n := r.branchLimit(); len(bs) > n { // §17 item 18
+		r.warn(fmt.Sprintf("%s: parallel stopped after %d of %d branches", p, n, len(bs)))
+		bs = bs[:n]
 	}
 	n := len(bs)
 	need, err := r.need(f, s.Join, n, p)
