@@ -1,0 +1,351 @@
+# Fix round 5 (precision) scenarios: the judge3 / oracle3 findings, the new worlds, the error sweep.
+scenarios:
+  # ---------------- sampler (judge3 P3-1) ----------------
+  - id: wr-r5-greedy-ignores-seed
+    name: "At temperature 0 the token is a plain argmax: a seed does not change it, while a seeded random row is reproducible across batches"
+    description: "gumbel.py:182-198 adds noise only when temp != 0, so the seed of a greedy row has no effect; SamplingParams resets greedy rows' top_k/top_p (sampling_params.py:612-616)."
+    fixtures: [full-tp1-llama-8b]
+    steps:
+      - flow: wr-execute-model
+        as: e1
+        input:
+          total_num_scheduled_tokens: 8
+          num_scheduled_tokens: {g-seed: 4, s-a: 4}
+          scheduled_new_reqs:
+            - {req_id: g-seed, block_ids: [1], num_computed_tokens: 0, prompt_token_ids: [128000, 9906, 1917, 13], sampling_params: {temperature: 0.0, seed: 42}}
+            - {req_id: s-a, block_ids: [2], num_computed_tokens: 0, prompt_token_ids: [128000, 9906, 1917, 11], sampling_params: {temperature: 0.8, seed: 7}}
+      - {flow: wr-sample-tokens, as: s1}
+      - flow: wr-execute-model
+        as: e2
+        input:
+          total_num_scheduled_tokens: 8
+          num_scheduled_tokens: {g-noseed: 4, s-b: 4}
+          scheduled_new_reqs:
+            - {req_id: g-noseed, block_ids: [3], num_computed_tokens: 0, prompt_token_ids: [128000, 9906, 1917, 13], sampling_params: {temperature: 0.0}}
+            - {req_id: s-b, block_ids: [4], num_computed_tokens: 0, prompt_token_ids: [128000, 9906, 1917, 11], sampling_params: {temperature: 0.8, seed: 7}}
+      - {flow: wr-sample-tokens, as: s2}
+    expect:
+      - "steps.e1.result.ok && steps.e2.result.ok && size(steps.s1.result.value.req_ids) == 2"
+      - "steps.s1.result.value.sampled_token_ids[steps.s1.result.value.req_ids.indexOf('g-seed')] == steps.s2.result.value.sampled_token_ids[steps.s2.result.value.req_ids.indexOf('g-noseed')]"
+      - "steps.s1.result.value.sampled_token_ids[steps.s1.result.value.req_ids.indexOf('s-a')] == steps.s2.result.value.sampled_token_ids[steps.s2.result.value.req_ids.indexOf('s-b')]"
+      - "(state['sampler@rank0'].slots.exists(k, state['sampler@rank0'].slots[k].temperature == 0.0 && state['sampler@rank0'].slots[k].seeded)) && (calls['topk-topp-sampler.flashinfer-sample'] == 0 && calls['gumbel.gumbel-sample-kernel'] == 2)"
+  - id: wr-r5-fused-flashinfer-sampler
+    name: "An unseeded top-p batch takes the fused FlashInfer sampler; a greedy or seeded row in the batch, or VLLM_USE_FLASHINFER_SAMPLER=0, keeps the Triton top-k/top-p + Gumbel path"
+    description: "sampler.py:304-355: fused only when some row uses top-k/top-p and no row is greedy or explicitly seeded (and no processed logprobs are returned)."
+    fixtures: [full-tp1-llama-8b]
+    state:
+      sampler:
+        slots:
+          '1': {temperature: 0.7, top_p: 0.9, top_k: 128256, min_p: 0.0, seeded: false, seed: 0, logprobs: -1, penalties: false, logit_bias: false, thinking: false, needs_processing: false}
+          '2': {temperature: 0.7, top_p: 1.0, top_k: 40, min_p: 0.0, seeded: false, seed: 0, logprobs: -1, penalties: false, logit_bias: false, thinking: false, needs_processing: false}
+          '3': {temperature: 0.0, top_p: 1.0, top_k: 128256, min_p: 0.0, seeded: false, seed: 0, logprobs: -1, penalties: false, logit_bias: false, thinking: false, needs_processing: false}
+    steps:
+      - {interface: sampler.sample, caller: gpu-model-runner, input: {rows: [{req_id: a, slot: 1, is_final: true, seq_len: 5, prompt_len: 4}]}, as: topp}
+      - {interface: sampler.sample, caller: gpu-model-runner, input: {rows: [{req_id: a, slot: 1, is_final: true, seq_len: 5, prompt_len: 4}, {req_id: b, slot: 2, is_final: true, seq_len: 5, prompt_len: 4}]}, as: both}
+      - {interface: sampler.sample, caller: gpu-model-runner, input: {rows: [{req_id: a, slot: 1, is_final: true, seq_len: 5, prompt_len: 4}, {req_id: g, slot: 3, is_final: true, seq_len: 5, prompt_len: 4}]}, as: with_greedy}
+    expect:
+      - "trace.filter(e, e.type == 'call.end' && e.interface == 'topk-topp-sampler.flashinfer-sample').map(e, e.output.kernel) == ['top_p_sampling_from_probs', 'top_k_top_p_sampling_from_logits']"
+      - "calls['gumbel.gumbel-sample-kernel'] == 1 && calls['topk-topp-triton.apply-top-k-top-p'] == 1"
+      - "steps.topp.result.ok && steps.both.result.ok && steps.with_greedy.result.ok"
+  - id: wr-r5-flashinfer-sampler-off
+    name: "VLLM_USE_FLASHINFER_SAMPLER=0 or processed logprobs keep an eligible batch on the Triton + Gumbel path"
+    description: "envs.py:875-882; sampler.py:304-316 (return_logprobs with a processed_* logprobs_mode); logprob.py:130-133 (logits mode skips the log-softmax)."
+    fixtures: [full-tp1-llama-8b]
+    config: {logprobs-mode: processed_logits}
+    state:
+      sampler:
+        slots:
+          '1': {temperature: 0.7, top_p: 0.9, top_k: 128256, min_p: 0.0, seeded: false, seed: 0, logprobs: 2, penalties: false, logit_bias: false, thinking: false, needs_processing: false}
+    steps:
+      - {interface: sampler.sample, caller: gpu-model-runner, input: {rows: [{req_id: a, slot: 1, is_final: true, seq_len: 5, prompt_len: 4}]}, as: s}
+    expect:
+      - "(steps.s.result.ok && calls['topk-topp-sampler.flashinfer-sample'] == 0 && calls['gumbel.gumbel-sample-kernel'] == 1) && (trace.exists(e, e.type == 'call.end' && e.interface == 'logprob.compute-topk-scores' && e.output.scores == 'logits' && e.output.from_processed) && calls['logprob.topk-log-softmax-kernel'] == 0)"
+
+  # ---------------- KV cache dtype (judge3 P3-7, worlds.md) ----------------
+  - id: wr-r5-kv-fp8-page-size-and-blocks
+    name: "In the FP8 world, --kv-cache-dtype fp8 halves the KV page (1-byte elements) and the budget holds twice the blocks of the auto (bf16) cache"
+    description: "attention.py:323-325,640-646 (kv_cache_torch_dtype), torch_utils.py:33-55 (fp8 -> uint8), kv_cache_interface.py:544-553; kv_cache_utils.py:1622-1628."
+    fixtures: [full-fp8-llama-3-8b-kv-fp8]
+    steps:
+      - {interface: gpu-model-runner.get-kv-cache-spec, caller: gpu-worker-impl, as: spec}
+      - {flow: wr-load-model, as: load}
+      - {flow: wr-determine-available-memory, as: mem}
+      - {interface: gpu-worker-impl.get-num-gpu-blocks, caller: engine-core, as: blocks}
+    expect:
+      - "steps.mem.result.value == steps.blocks.result.value.available_kv_cache_memory_bytes"
+      - "state['gpu-worker-impl@rank0'].bytes_per_block == 1048576"
+      - "steps.spec.result.value.page_size_bytes == 32768 && steps.spec.result.value.cache_dtype_str == 'fp8' && steps.spec.result.value.kv_dtype_bytes == 1"
+      - "steps.blocks.result.value.bytes_per_block == 1048576 && steps.blocks.result.value.num_gpu_blocks == steps.blocks.result.value.available_kv_cache_memory_bytes / 1048576"
+  - id: wr-r5-kv-auto-keeps-model-dtype
+    name: "In the FP8-checkpoint world, kv_cache_dtype auto keeps the KV cache in the model dtype (bf16, 2 bytes): 64 KiB pages, 2 MiB blocks"
+    description: "torch_utils.py:535-538 (auto -> model_config.dtype); an fp8 (non-ModelOpt) checkpoint names no KV algorithm (torch_utils.py:457-500)."
+    fixtures: [full-fp8-llama-3-8b]
+    steps:
+      - {interface: gpu-model-runner.get-kv-cache-spec, caller: gpu-worker-impl, as: spec}
+      - {flow: wr-load-model, as: load}
+      - {flow: wr-determine-available-memory, as: mem}
+      - {interface: gpu-worker-impl.get-num-gpu-blocks, caller: engine-core, as: blocks}
+    expect:
+      - "steps.mem.result.value == steps.blocks.result.value.available_kv_cache_memory_bytes && steps.blocks.result.value.num_gpu_blocks == 31816"
+      - "state['gpu-worker-impl@rank0'].bytes_per_block == 2097152"
+      - "steps.spec.result.value.page_size_bytes == 65536 && steps.spec.result.value.cache_dtype_str == 'auto'"
+      - "steps.blocks.result.value.bytes_per_block == 2097152"
+
+  # ---------------- CUDA graph mode resolution (oracle3) ----------------
+  - id: wr-r5-cudagraph-mode-fa2-full-falls-back
+    name: "cudagraph_mode FULL with FA2 (UNIFORM_BATCH) becomes FULL_AND_PIECEWISE with the code's warning; without VLLM_COMPILE it becomes FULL_DECODE_ONLY"
+    description: "model_runner.py:672-753 and compilation.py:1386-1413: FA2 reports UNIFORM_BATCH (flash_attn.py:614-617), and a FULL mixed mode needs ALWAYS."
+    fixtures: [full-tp1-llama-8b]
+    config: {cudagraph-mode: FULL, flash-attn-version: 2}
+    steps:
+      - {flow: wr-initialize-kv-cache, as: kv, input: {num_blocks: 1024}}
+      - {interface: cuda-graph-manager.resolve-cudagraph-mode, caller: gpu-model-runner, input: {min_cg_support: UNIFORM_BATCH, min_cg_attn_backend: FLASH_ATTN}, as: w}
+    expect:
+      - "steps.kv.result.ok && steps.w.result.ok"
+      - "steps.kv.result.ok && trace.exists(e, e.type == 'call.end' && e.interface == 'gpu-model-runner.initialize-kv-cache' && e.output.cudagraph_mode == 'FULL_AND_PIECEWISE')"
+      - "steps.w.result.value.warnings == ['CUDAGraphMode.FULL is not supported with FLASH_ATTN backend (support: AttentionCGSupport.UNIFORM_BATCH); setting cudagraph_mode=FULL_AND_PIECEWISE']"
+  - id: wr-r5-cudagraph-mode-resolution-branches
+    name: "Mode resolution: FA3 keeps FULL; NEVER support raises for FULL; FULL_AND_PIECEWISE with NEVER drops to PIECEWISE; spec decode with single-token-decode support drops to PIECEWISE; no piecewise capture drops FULL_AND_PIECEWISE to FULL_DECODE_ONLY"
+    description: "compilation.py:1383-1486."
+    fixtures: [full-tp1-llama-8b]
+    steps:
+      - {interface: cuda-graph-manager.resolve-cudagraph-mode, caller: gpu-model-runner, input: {min_cg_support: ALWAYS}, as: fa3}
+      - {interface: cuda-graph-manager.resolve-cudagraph-mode, caller: gpu-model-runner, input: {min_cg_support: NEVER, min_cg_attn_backend: SOME_BACKEND}, as: never_fap}
+      - {interface: cuda-graph-manager.resolve-cudagraph-mode, caller: gpu-model-runner, input: {min_cg_support: UNIFORM_SINGLE_TOKEN_DECODE, min_cg_attn_backend: FLASHINFER, uniform_decode_query_len: 4}, as: spec}
+    expect:
+      - "steps.fa3.result.value.cudagraph_mode == 'FULL_AND_PIECEWISE' && steps.fa3.result.value.warnings == []"
+      - "steps.never_fap.result.value.cudagraph_mode == 'PIECEWISE' && steps.never_fap.result.value.warnings[0].endsWith('; setting cudagraph_mode=PIECEWISE because attention is compiled piecewise')"
+      - "steps.spec.result.value.cudagraph_mode == 'PIECEWISE' && steps.spec.result.value.warnings[0] == 'CUDAGraphMode.FULL_AND_PIECEWISE is not supported with spec-decode for attention backend FLASHINFER (support: AttentionCGSupport.UNIFORM_SINGLE_TOKEN_DECODE); setting cudagraph_mode=PIECEWISE'"
+  - id: wr-r5-cudagraph-mode-full-never-raises
+    name: "cudagraph_mode FULL with a backend that supports no CUDA graphs is a ValueError with the code's text"
+    description: "compilation.py:1388-1404."
+    fixtures: [full-tp1-llama-8b]
+    config: {cudagraph-mode: FULL}
+    steps:
+      - {interface: cuda-graph-manager.resolve-cudagraph-mode, caller: gpu-model-runner, input: {min_cg_support: NEVER, min_cg_attn_backend: SOME_BACKEND}, as: r}
+    expect:
+      - "!steps.r.result.ok && steps.r.result.error.code == 'value-error' && steps.r.result.error.message == 'CUDAGraphMode.FULL is not supported with SOME_BACKEND backend (support: AttentionCGSupport.NEVER); please try cudagraph_mode=PIECEWISE, and make sure compilation mode is VLLM_COMPILE'"
+  - id: wr-r5-cudagraph-mode-no-piecewise-capture
+    name: "Without VLLM_COMPILE (no compiled submodule) FULL_AND_PIECEWISE loses its piecewise half"
+    description: "model_runner.py:727-729, compilation.py:1459-1473."
+    fixtures: [full-tp1-llama-8b]
+    config: {compilation-mode: 0}
+    steps:
+      - {interface: cuda-graph-manager.resolve-cudagraph-mode, caller: gpu-model-runner, input: {min_cg_support: ALWAYS}, as: r}
+    expect:
+      - "steps.r.result.value.cudagraph_mode == 'FULL_DECODE_ONLY' && steps.r.result.value.warnings == ['Cudagraph mode CUDAGraphMode.FULL_AND_PIECEWISE requires piecewise capture, but the loaded model provides neither a compiled submodule nor breakable CUDA graphs. Overriding to CUDAGraphMode.FULL_DECODE_ONLY.']"
+
+  # ---------------- CUDA graph memory profiling and capture (oracle3) ----------------
+  - id: wr-r5-profile-cudagraph-memory-bootstrap-and-teardown
+    name: "profile_cudagraph_memory bootstraps a minimal KV cache (min(max_num_reqs, max capture size) = 512 blocks), captures PIECEWISE graphs and the 2 largest FULL graphs, then tears everything down"
+    description: "cudagraph_utils.py:873-1056 and capture (:445-453): _max_full_descs_to_capture = 2 while profiling."
+    fixtures: [full-tp1-llama-8b]
+    steps:
+      - {interface: gpu-model-runner.profile-cudagraph-memory, caller: gpu-worker-impl, as: p}
+      - {interface: gpu-memory.snapshot, caller: gpu-worker-impl, as: after}
+    expect:
+      - "steps.after.result.value.kv_cache_bytes == 0"
+      - "steps.p.result.value.cudagraph_memory_bytes == 536870912"
+      - "(trace.exists(e, e.type == 'call.start' && e.interface == 'gpu-model-runner.initialize-kv-cache' && e.input.num_blocks == 512 && e.input.is_profiling)) && (calls['cuda-graph-manager.capture-cuda-graph'] == 2 && trace.exists(e, e.type == 'call.end' && e.interface == 'cuda-graph-manager.capture' && e.output.num_full_captured == 2 && e.output.num_piecewise_captured == 51)) && (calls['gpu-model-runner.teardown-profiling-state'] == 1 && steps.after.result.value.kv_cache_bytes == 0)"
+  - id: wr-r5-full-capture-pool-before-graph
+    name: "A real capture of FULL_AND_PIECEWISE records one FULL graph per decode size, each after capture_pool points NCCL at the pool"
+    description: "cudagraph_utils.py:473-505, cudagraph_pool.py:33-45: 51 decode sizes up to 512."
+    fixtures: [full-tp1-llama-8b]
+    steps:
+      - {interface: cuda-graph-manager.init, caller: gpu-model-runner, input: {decode_query_len: 1}, as: init}
+      - {interface: cuda-graph-manager.capture, caller: gpu-model-runner, input: {}, as: cap}
+    expect:
+      - "steps.init.result.value.cudagraph_mode == 'FULL_AND_PIECEWISE' && steps.cap.result.value.captured && steps.cap.result.value.num_piecewise_captured == 51"
+      - "(steps.cap.result.value.num_full_captured == 51 && calls['cuda-graph-manager.capture-pool'] == 51) && (trace.filter(e, e.type == 'call.start' && e.interface in ['cuda-graph-manager.capture-pool', 'cuda-graph-manager.capture-cuda-graph']).map(e, e.interface).slice(0, 2) == ['cuda-graph-manager.capture-pool', 'cuda-graph-manager.capture-cuda-graph']) && (state['cuda-graph-manager@rank0'].graph_pool_id == 'global' && size(state['cuda-graph-manager@rank0'].full_graphs) == 51)"
+  - id: wr-r5-blackwell-capture-ceiling
+    name: "On a Blackwell (SM 10.0) GPU the default capture ceiling is 1024, not 512"
+    description: "vllm/config/vllm.py:2354-2363 (is_device_capability_family(100))."
+    fixtures: [full-tp1-llama-8b]
+    state: {"gpu-memory@rank0": {compute_capability: "10.0"}}
+    steps:
+      - {interface: cuda-graph-manager.init, caller: gpu-model-runner, input: {decode_query_len: 1}, as: init}
+    expect:
+      - "trace.exists(e, e.type == 'call.end' && e.interface == 'cuda-graph-manager.init' && e.output.cudagraph_mode == 'FULL_AND_PIECEWISE')"
+      - "steps.init.result.value.max_capture_size == 1024"
+
+  # ---------------- model dispatch (worlds.md: forward always runs Llama) ----------------
+  - id: wr-r5-moe-forward-runs-mixtral
+    name: "In the Mixtral TP 2 world both ranks forward and compute logits through MixtralForCausalLM, not Llama"
+    description: "model_runner.py:2043-2044, 1610-1615: self.model is whatever load_model built. Both TP ranks load and step together (their all-reduces pair up)."
+    fixtures: [full-moe-mixtral-8x7b-tp2-ep]
+    steps:
+      - {flow: wr-load-model, as: load0, on: rank0}
+      - {flow: wr-load-model, as: load1, on: rank1}
+      - flow: wr-execute-model
+        as: e0
+        on: rank0
+        await: false
+        input: &moestep
+          total_num_scheduled_tokens: 4
+          num_scheduled_tokens: {m1: 4}
+          scheduled_new_reqs:
+            - {req_id: m1, block_ids: [1], num_computed_tokens: 0, prompt_token_ids: [1, 733, 16289, 28793], sampling_params: {temperature: 0.0}}
+      - {flow: wr-execute-model, as: e1, on: rank1, input: *moestep}
+      - {flow: wr-sample-tokens, as: s0, on: rank0, await: false}
+      - {flow: wr-sample-tokens, as: s1, on: rank1}
+    expect:
+      - "steps.load0.result.ok && steps.load1.result.ok && steps.e1.result.ok"
+      - "state['gpu-model-runner@rank1'].model_component == 'mixtral-for-causal-lm'"
+      - "steps.s0.result.ok && steps.s1.result.ok"
+      - "calls_by_instance['mixtral-for-causal-lm.forward@rank0'] >= 1 && calls_by_instance['mixtral-for-causal-lm.forward@rank1'] >= 1 && calls['mixtral-for-causal-lm.compute-logits'] >= 2 && calls['llama-for-causal-lm.forward'] == 0"
+  # ---------------- multimodal encoder step (judge3 P3-8, VL world) ----------------
+  - id: wr-r5-vl-encoder-runs-once-per-mm-hash
+    name: "In the Qwen2-VL world a scheduled image is encoded once and cached by mm hash; a second request with the same image reuses it; a freed hash is dropped"
+    description: "model_runner.py:1213-1214 (add_request), 1939-1956 (prepare_inputs_embeds -> execute_mm_encoder), 1166-1169 (free_states); encoder_runner.py:86-108."
+    fixtures: [full-vl-qwen2-vl-7b]
+    steps:
+      - flow: wr-execute-model
+        as: e1
+        input:
+          total_num_scheduled_tokens: 8
+          num_scheduled_tokens: {v1: 8}
+          scheduled_new_reqs:
+            - {req_id: v1, block_ids: [1], num_computed_tokens: 0, prompt_token_ids: [151644, 151652, 151655, 151655, 151655, 151655, 151653, 13], sampling_params: {temperature: 0.0}, mm_features: [{identifier: img-a, modality: image, offset: 2, length: 4}]}
+          scheduled_encoder_inputs: {v1: [0]}
+      - {flow: wr-sample-tokens, as: s1}
+      - flow: wr-execute-model
+        as: e2
+        input:
+          total_num_scheduled_tokens: 8
+          num_scheduled_tokens: {v2: 8}
+          scheduled_new_reqs:
+            - {req_id: v2, block_ids: [2], num_computed_tokens: 0, prompt_token_ids: [151644, 151652, 151655, 151655, 151655, 151655, 151653, 14], sampling_params: {temperature: 0.0}, mm_features: [{identifier: img-a, modality: image, offset: 2, length: 4}]}
+          scheduled_encoder_inputs: {v2: [0]}
+      - {flow: wr-sample-tokens, as: s2}
+      - flow: wr-execute-model
+        as: e3
+        input:
+          total_num_scheduled_tokens: 0
+          num_scheduled_tokens: {}
+          scheduled_new_reqs: []
+          finished_req_ids: [v1, v2]
+          free_encoder_mm_hashes: [img-a]
+    expect:
+      - "steps.e1.result.ok && steps.e2.result.ok && steps.e3.result.ok && steps.s1.result.ok && steps.s2.result.ok"
+      - "calls['encoder-cache.free-encoder-cache'] == 1"
+      - "(calls['encoder-cache.update-encoder-outputs'] == 1 && trace.filter(e, e.type == 'call.end' && e.interface == 'encoder-runner.execute-mm-encoder').map(e, e.output.mm_hashes) == [['img-a'], []]) && (size(state['encoder-cache@rank0'].encoder_outputs) == 0 && size(state['encoder-cache@rank0'].mm_features) == 0)"
+
+  # ---------------- pooling tasks (oracle3 models-layers terratorch) ----------------
+  - id: wr-r5-supported-tasks-from-pooler
+    name: "Pooling tasks come from the model's pooler: an IdentityPooler supports only plugin, which the V2 runner filters out and the V1 runner keeps"
+    description: "pooler/special.py:153-155, pool/pooling_runner.py:61-64 (V2 intersects with _SUPPORTED_TASKS), gpu_model_runner.py:3151-3156 (V1)."
+    fixtures: [full-tp1-llama-8b]
+    config: {runner: pooling}
+    state: {gpu-model-runner: {model: {name: ibm-nasa-geospatial/Prithvi-EO-2.0-300M-TL-Sen1Floods11, architecture: Terratorch, num_hidden_layers: 1, num_kv_heads: 1, head_size: 64, dtype_bytes: 2, vocab_size: 1, hidden_size: 1024, uses_mrope: false, uses_prompt_embeds: false, is_hybrid: false}}}
+    steps:
+      - {interface: gpu-model-runner.get-supported-tasks, caller: gpu-worker-impl, as: v2}
+    expect:
+      - "steps.v2.result.value.tasks == []"
+  - id: wr-r5-supported-tasks-v1-keeps-plugin
+    name: "The V1 runner returns every task the pooler supports (plugin for an IdentityPooler)"
+    description: "gpu_model_runner.py:3151-3156."
+    fixtures: [full-tp1-llama-8b]
+    config: {runner: pooling, use-v2-model-runner: false}
+    state: {gpu-model-runner: {model: {name: ibm-nasa-geospatial/Prithvi-EO-2.0-300M-TL-Sen1Floods11, architecture: Terratorch, num_hidden_layers: 1, num_kv_heads: 1, head_size: 64, dtype_bytes: 2, vocab_size: 1, hidden_size: 1024, uses_mrope: false, uses_prompt_embeds: false, is_hybrid: false}}}
+    steps:
+      - {interface: gpu-model-runner.get-supported-tasks, caller: gpu-worker-impl, as: v1}
+    expect:
+      - "steps.v1.result.value.tasks == ['plugin']"
+
+  # ---------------- error-path precision ----------------
+  - id: wr-r5-memory-profiling-error-message
+    name: "When free memory grew during profiling, the AssertionError names both amounts in GiB as format_gib prints them"
+    description: "gpu_worker.py:717-728, mem_utils.py:30-31 (round(b / GiB, 2))."
+    fixtures: [full-tp1-llama-8b]
+    state: {gpu-worker-impl: {init_free_memory: 21474836480}}
+    steps:
+      - {flow: wr-determine-available-memory, as: mem}
+    expect:
+      - "state['gpu-worker-impl@rank0'].init_free_memory == 21474836480"
+      - "!steps.mem.result.ok && steps.mem.result.error.code == 'assertion-error' && steps.mem.result.error.message.startsWith('Error in memory profiling. Initial free memory 20.0 GiB, current free memory ') && steps.mem.result.error.message.endsWith(' GiB. This happens when other processes sharing the same container release GPU memory while vLLM is profiling during initialization. To fix this, ensure consistent GPU memory allocation or isolate vLLM in its own container.')"
+  - id: wr-r5-profile-errors
+    name: "profile() errors word for word: profiling off (with the example flags), a bad trace prefix, and negative bounds"
+    description: "gpu_worker.py:1374-1380, profiler.py:24-49."
+    fixtures: [full-tp1-llama-8b]
+    config: {profiler: torch}
+    steps:
+      - {interface: gpu-worker-impl.profile, caller: engine-core, input: {is_start: true, profile_prefix: "-bad prefix"}, as: badp}
+      - {interface: gpu-worker-impl.profile, caller: engine-core, input: {is_start: true, profile_prefix: ok, max_iterations: -1}, as: badmax}
+    expect:
+      - "!state['gpu-worker-impl@rank0'].profiler_running && !state['worker-profiler@rank0'].active"
+      - "!steps.badp.result.ok && steps.badp.result.error.code == 'value-error' && steps.badp.result.error.message == \"profile_prefix must be 1-128 ASCII characters, start with a letter or number, and contain only letters, numbers, '.', '_', or '-'\""
+      - "!steps.badmax.result.ok && steps.badmax.result.error.message == 'max_iterations must be greater than or equal to 0'"
+  - id: wr-r5-profile-not-enabled-text
+    name: "profile() without --profiler-config gives the full RuntimeError text"
+    description: "gpu_worker.py:1374-1380."
+    fixtures: [full-tp1-llama-8b]
+    steps:
+      - {interface: gpu-worker-impl.profile, caller: engine-core, input: {is_start: true}, as: p}
+    expect:
+      - "!steps.p.result.ok && steps.p.result.error.message == \"Profiling is not enabled. Please set --profiler-config to enable profiling. Example: '--profiler-config.profiler=torch --profiler-config.torch_profiler_dir=YOUR_DIR_PATH_TO_DUMP_TRACE'\""
+
+  # ---------------- MoE parallel groups (distributed's request) ----------------
+  - id: wr-r5-moe-init-device-builds-ep-group
+    name: "In the Mixtral world init_device builds the model-parallel groups with is_moe, so the EP group exists; in the Llama world it does not"
+    description: "gpu_worker.py:1673-1678 -> parallel_state.initialize_model_parallel, which reads model_config.is_moe (config/model.py:2276-2277; Mixtral's num_local_experts = 8)."
+    fixtures: [full-moe-mixtral-8x7b-tp2-ep]
+    state: {"gpu-memory@rank0": {weights_bytes: 0, kv_cache_bytes: 0, cudagraph_bytes: 0}, "gpu-memory@rank1": {weights_bytes: 0, kv_cache_bytes: 0, cudagraph_bytes: 0}}
+    steps:
+      - {interface: gpu-worker-impl.init-device, caller: engine-core, on: rank0, input: {device_type: cuda, rank: 0}, as: d0, await: false}
+      - {interface: gpu-worker-impl.init-device, caller: engine-core, on: rank1, input: {device_type: cuda, rank: 1}, as: d1}
+    expect:
+      - "trace.exists(e, e.type == 'call.start' && e.interface == 'parallel-state.ensure-model-parallel-initialized' && e.input.is_moe)"
+
+  # ---------------- remaining branches ----------------
+  - id: wr-r5-profiler-idempotent-and-restart
+    name: "A second start is ignored, a stop when inactive is ignored, and a start after an auto-stop restarts the profiler"
+    description: "wrapper.py:103-192 (test_duplicate_start_is_ignored, test_restart_after_max_iterations)."
+    fixtures: [full-tp1-llama-8b]
+    config: {profiler: torch, profiler-max-iterations: 2}
+    steps:
+      - {interface: worker-profiler.create, caller: gpu-worker-impl, input: {}}
+      - {interface: worker-profiler.stop, caller: gpu-worker-impl, as: early_stop}
+      - {interface: worker-profiler.start, caller: gpu-worker-impl, input: {}, as: s1}
+      - {interface: worker-profiler.start, caller: gpu-worker-impl, input: {}, as: s2}
+      - {interface: worker-profiler.step, caller: gpu-worker-impl}
+      - {interface: worker-profiler.step, caller: gpu-worker-impl}
+      - {interface: worker-profiler.step, caller: gpu-worker-impl, as: auto}
+      - {interface: worker-profiler.start, caller: gpu-worker-impl, input: {delay_iterations: -1}, as: neg}
+      - {interface: worker-profiler.start, caller: gpu-worker-impl, input: {}, as: again}
+    expect:
+      - "steps.early_stop.result.value.ignored && steps.s1.result.value.running && steps.s2.result.value.ignored"
+      - "!steps.auto.result.value.running && !steps.neg.result.ok && steps.neg.result.error.message == 'delay_iterations must be greater than or equal to 0'"
+      - "steps.again.result.value.running && state['worker-profiler@rank0'].start_call_count == 2 && state['worker-profiler@rank0'].stop_call_count == 1"
+  - id: wr-r5-profile-stop-and-proton
+    name: "profile(stop) without a profiler only warns; with proton the wrapper is recreated after a stop"
+    description: "gpu_worker.py:1409-1421."
+    fixtures: [full-tp1-llama-8b]
+    config: {profiler: proton}
+    steps:
+      - {interface: gpu-worker-impl.profile, caller: engine-core, input: {is_start: false}, as: none}
+      - {interface: gpu-worker-impl.profile, caller: engine-core, input: {is_start: true}, as: start}
+      - {interface: gpu-worker-impl.profile, caller: engine-core, input: {is_start: false}, as: stop}
+    expect:
+      - "steps.none.result.value.trace_name == '' && steps.start.result.value.trace_name == 'dp0_pp0_tp0_dcp0_ep0_rank0'"
+      - "!state['gpu-worker-impl@rank0'].profiler_created && calls['worker-profiler.create'] == 1"
+  - id: wr-r5-profile-cudagraph-memory-nothing-to-capture
+    name: "When resolution leaves nothing to capture (PIECEWISE without VLLM_COMPILE becomes NONE), profiling tears down and returns 0"
+    description: "cudagraph_utils.py:919-920 after compilation.py:1459-1473."
+    fixtures: [full-tp1-llama-8b]
+    config: {cudagraph-mode: PIECEWISE, compilation-mode: 0}
+    steps:
+      - {interface: gpu-model-runner.profile-cudagraph-memory, caller: gpu-worker-impl, as: p}
+    expect:
+      - "(steps.p.result.value.cudagraph_memory_bytes == 0 && calls['gpu-model-runner.teardown-profiling-state'] == 1 && calls['gpu-model-runner.capture-model'] == 0) && (!state['gpu-model-runner@rank0'].kv_cache_initialized)"
+  - id: wr-r5-flashinfer-kernel-choice-and-allocator-scope
+    name: "flashinfer_sample picks top-k-only or top-p-only kernels and asserts one is set; the allocator scope is a no-op off the native allocator"
+    description: "topk_topp_sampler.py:598-620; gpu_worker.py:409-414."
+    fixtures: [full-tp1-llama-8b]
+    steps:
+      - {interface: topk-topp-sampler.flashinfer-sample, caller: sampler, input: {num_rows: 2, topk_enabled: true, topp_enabled: false}, as: k}
+      - {interface: topk-topp-sampler.flashinfer-sample, caller: sampler, input: {num_rows: 2, topk_enabled: false, topp_enabled: false}, as: none}
+      - {interface: gpu-worker-impl.scoped-allocator-max-split, caller: gpu-worker-impl, input: {native_allocator: false, original_settings: "x:1"}, as: offn}
+    expect:
+      - "steps.k.result.value.kernel == 'top_k_sampling_from_probs' && !steps.none.result.ok && steps.none.result.error.code == 'assertion-error'"
+      - "steps.offn.result.value.settings_in_scope == 'x:1'"
+      - "trace.exists(e, e.type == 'call.end' && e.interface == 'topk-topp-sampler.flashinfer-sample')"

@@ -382,7 +382,13 @@ interfaces:
               - when: "!config['enable-auto-tool-choice']"
                 fail: {code: BadRequestError, status: 400, message: "\"auto\" tool choice requires --enable-auto-tool-choice and --tool-call-parser to be set"}
             else:
-              - fail: {code: BadRequestError, status: 400, message: "= 'tool_choice=\"' + string(input.body.tool_choice) + '\" requires --tool-call-parser to be set'"}
+              - title: "required or a named tool needs a tool parser; a named choice is described as function \"<name>\""
+                source: "vllm/renderers/online_renderer.py:265-280"
+                fail: {code: BadRequestError, status: 400, message: "= 'tool_choice=' + (type(input.body.tool_choice) == map ? 'function \"' + input.body.tool_choice.function.name + '\"' : '\"' + string(input.body.tool_choice) + '\"') + ' requires --tool-call-parser to be set'"}
+      - title: "tool_dicts: the request's tools, unless there are none or tool_choice is none with --exclude-tools-when-tool-choice-none"
+        source: "vllm/renderers/online_renderer.py:282-287"
+        set:
+          vars.tool_dicts: "= !has(input.body.tools) || input.body.tools == null || (has(input.body.tool_choice) && input.body.tool_choice == 'none' && config['exclude-tools-when-tool-choice-none']) ? null : input.body.tools"
       - call: online-renderer.validate-chat-template
         input: {chat_template: "= has(input.body.chat_template) ? input.body.chat_template : null"}
       - title: "validate_request_mm_kwargs: per-request media_io_kwargs / mm_processor_kwargs need --trust-request-mm-kwargs"
@@ -409,7 +415,7 @@ interfaces:
           - title: preprocess_chat -- parse the content parts, apply the chat template and tokenize
             source: "vllm/renderers/online_renderer.py:752-824"
             call: hf-renderer.render-messages
-            input: {messages: "= input.body.messages", media_io_kwargs: "= has(input.body.media_io_kwargs) ? input.body.media_io_kwargs : null"}
+            input: {messages: "= input.body.messages", media_io_kwargs: "= has(input.body.media_io_kwargs) ? input.body.media_io_kwargs : null", tools: "= vars.tool_dicts", add_generation_prompt: "= !has(input.body.add_generation_prompt) || input.body.add_generation_prompt", continue_final_message: "= has(input.body.continue_final_message) && input.body.continue_final_message"}
             as: prompt
       - call: base-renderer.tokenize-prompt
         input: {prompt_token_ids: "= vars.prompt.value.prompt_token_ids", max_token_id: "= vars.prompt.value.max_token_id"}
@@ -447,19 +453,33 @@ interfaces:
           max_output_tokens: "= has(input.body.max_tokens) && input.body.max_tokens != null ? input.body.max_tokens : 16"
           max_output_tokens_param: max_tokens
           max_total_tokens_param: max_model_len
-      - set:
-          vars.prompts: "= type(input.body.prompt) == string ? [input.body.prompt] : input.body.prompt"
+      - title: "prompt_to_seq: a string, a dict or a non-empty list of ints is one prompt; any other list is a sequence of prompts"
+        source: "vllm/renderers/inputs/preprocess.py:46-54"
+        set:
+          vars.prompts: "= type(input.body.prompt) == string || type(input.body.prompt) == map || (type(input.body.prompt) == list && size(input.body.prompt) > 0 && input.body.prompt.all(x, type(x) == int)) ? [input.body.prompt] : input.body.prompt"
           vars.inputs: []
       - title: preprocess_cmpl renders every prompt in order
         source: "vllm/renderers/online_renderer.py:715-750"
         foreach: "= vars.prompts"
         as: p
-        max: 16
         steps:
-          - call: base-renderer.tokenize-prompt
-            input: {prompt: "= vars.p"}
-            as: tok
-          - set: {vars.inputs: "= vars.inputs + [{'prompt': vars.p, 'prompt_token_ids': vars.tok.value.prompt_token_ids}]"}
+          - title: "parse_dec_only_prompt: a string is a TextPrompt, a list of ints a TokensPrompt; any other type is a TypeError (400)"
+            source: "vllm/renderers/inputs/preprocess.py:129-155"
+            if: "type(vars.p) == list && !vars.p.all(x, type(x) == int)"
+            then: [{fail: {code: BadRequestError, status: 400, message: Token prompt should be a list of integers}}]
+          - if: "type(vars.p) == list"
+            then:
+              - title: "A TokensPrompt is not re-tokenized; TokenizeParams still checks its length"
+                source: "vllm/renderers/base.py:672-697"
+                call: base-renderer.tokenize-prompt
+                input: {prompt_token_ids: "= vars.p"}
+                as: tok
+              - set: {vars.inputs: "= vars.inputs + [{'prompt': null, 'prompt_token_ids': vars.tok.value.prompt_token_ids}]"}
+            else:
+              - call: base-renderer.tokenize-prompt
+                input: {prompt: "= type(vars.p) == map ? vars.p.prompt : vars.p"}
+                as: tok
+              - set: {vars.inputs: "= vars.inputs + [{'prompt': type(vars.p) == map ? vars.p.prompt : vars.p, 'prompt_token_ids': vars.tok.value.prompt_token_ids}]"}
       - return: {engine_inputs: "= vars.inputs"}
   - component: online-renderer
     name: render-responses
@@ -499,7 +519,7 @@ interfaces:
     summary: "HfRenderer.render_messages_async: parse the chat messages and their content parts (text, image_url, video_url, image_embeds, prompt_embeds), apply the Llama-3.1 chat template with the generation prompt, tokenize."
     sources: ["vllm/renderers/hf.py:1123-1180"]
     latency_ms: "= config['api-chat-template-ms']"
-    request: {type: object, properties: {messages: {type: array, items: {type: object}}, media_io_kwargs: {type: [object, "null"], default: null}, add_generation_prompt: {type: boolean, default: true}, continue_final_message: {type: boolean, default: false}}, required: [messages]}
+    request: {type: object, properties: {messages: {type: array, items: {type: object}}, media_io_kwargs: {type: [object, "null"], default: null}, tools: {type: [array, "null"], items: {type: object}, default: null}, add_generation_prompt: {type: boolean, default: true}, continue_final_message: {type: boolean, default: false}}, required: [messages]}
     errors: [{code: BadRequestError, status: 400}]
     behavior:
       - set:
@@ -508,7 +528,7 @@ interfaces:
       - title: "safe_apply_chat_template's role handling: Llama-3.1's template has no developer role, so developer messages become one leading system message"
         source: "vllm/renderers/hf.py:802-810"
         call: hf-renderer.safe-apply-chat-template
-        input: {conversation: "= input.messages", chat_template: llama-3.1, tokenize: false, add_generation_prompt: "= vars.agp && !vars.cont"}
+        input: {conversation: "= input.messages", chat_template: "= config['model'].startsWith('Qwen/') ? '<|im_start|> (the checkpoint\\'s ChatML template)' : 'llama-3.1'", tokenize: false, add_generation_prompt: "= vars.agp && !vars.cont", tools: "= has(input.tools) ? input.tools : null"}
         as: tpl
       - set:
           vars.msgs: "= vars.tpl.value.conversation"
@@ -525,10 +545,54 @@ interfaces:
         source: "vllm/renderers/chat_utils.py:1062-1076"
         if: "vars.n_embeds > 0 && !config['enable-prompt-embeds']"
         then: [{fail: {code: BadRequestError, status: 400, message: "You must set `--enable-prompt-embeds` to input `prompt_embeds`", data: {param: prompt_embeds}}}]
-      - title: "Media parts go through the multimodal processor, which a text-only model does not have"
-        source: "vllm/renderers/base.py:228-230"
-        if: "vars.n_media > 0 && !config['model-is-multimodal']"
-        then: [{fail: {code: BadRequestError, status: 400, message: Multi-modal processor not available for text-only models}}]
+      - title: "MultiModalItemTracker.add, part by part in message order: image_embeds first needs --enable-mm-embeds; every media item creates the model's processor (a text-only model raises ValueError '<served name> is not a multimodal model') and validate_num_items checks the running count per modality"
+        source: "vllm/renderers/chat_utils.py:656-720"
+        set:
+          vars.flat_media: "= vars.media.flatten()"
+          vars.counts: {}
+          vars.served0: "= config['served-model-name'] != null && size(config['served-model-name']) > 0 ? config['served-model-name'][0] : config['model']"
+          vars.proc: null
+      - foreach: "= vars.flat_media"
+        as: part
+        steps:
+          - if: "vars.part.type == 'image_embeds'"
+            then:
+              - title: "parse_image_embeds: get_multimodal_config() (a text-only model has none), then --enable-mm-embeds"
+                source: "vllm/renderers/chat_utils.py:1286-1293"
+                if: "!config['model-is-multimodal']"
+                then: [{fail: {code: value-error, message: The model is not multimodal.}}]
+              - if: "!config['enable-mm-embeds']"
+                then: [{fail: {code: vllm-validation-error, message: "You must set `--enable-mm-embeds` to input `image_embeds`", data: {param: image_embeds}}}]
+          - set:
+              vars.modality: "= vars.part.type in ['image_url', 'image_embeds'] ? 'image' : (vars.part.type == 'video_url' ? 'video' : 'audio')"
+          - set:
+              vars.counts: "= merge(vars.counts, {vars.modality: (vars.modality in vars.counts ? vars.counts[vars.modality] : 0) + 1})"
+          - if: "vars.proc == null"
+            then:
+              - title: "the checkpoint's architectures, which ModelConfig resolved at init"
+                source: "vllm/config/model.py:1616-1617"
+                call: hf-hub.download-config
+                input: {model: "= config['model']"}
+                as: hfc
+                on_error: continue
+              - title: "self.mm_processor (a cached_property) = MULTIMODAL_REGISTRY.create_processor(model_config): a text-only model raises '<served_model_name> is not a multimodal model'"
+                source: "vllm/renderers/chat_utils.py:648-650"
+                call: multi-modal-registry.create-processor
+                input: {model: "= config['model']", architectures: "= vars.hfc.ok && has(vars.hfc.value.architectures) ? vars.hfc.value.architectures : []", is_multimodal_model: "= config['model-is-multimodal']", served_model_name: "= vars.served0"}
+                as: pr
+              - set: {vars.proc: "= vars.pr.value"}
+          - title: "mm_processor.info.validate_num_items(modality, count) against the processor's supported limits, unless an embeds item with --enable-mm-embeds and a 0 limit"
+            source: "vllm/renderers/chat_utils.py:708-718"
+            when: "!(vars.part.type == 'image_embeds' && config['enable-mm-embeds'] && 'image' in config['limit-mm-per-prompt'] && int(config['limit-mm-per-prompt']['image']) == 0)"
+            call: base-processing-info.validate-num-items
+            input: {modality: "= vars.modality", num_items: "= vars.counts[vars.modality]", supported_limits: "= vars.proc.supported_limits"}
+      - title: "Once every part is tracked, the tracker resolves its items: each image_url is fetched through MediaConnector.fetch_image_async (data:, http(s) or file URLs)"
+        source: "vllm/renderers/chat_utils.py:1273-1277"
+        foreach: "= vars.flat_media.filter(p, p.type == 'image_url' && has(p.image_url) && has(p.image_url.url))"
+        as: img
+        steps:
+          - call: media-connector.fetch-image
+            input: {image_url: "= vars.img.image_url.url"}
       - title: "The chat template rejects invalid input by raising; safe_apply_chat_template turns that into a 400 with the template's reason (Llama-3.1's template allows one tool call per assistant message)"
         source: "vllm/renderers/hf.py:824-837"
         if: "vars.msgs.exists(m, has(m.tool_calls) && m.tool_calls != null && size(m.tool_calls) > 1)"
@@ -558,15 +622,40 @@ interfaces:
         source: "vllm/renderers/chat_utils.py:1043-1110"
         set:
           vars.contents: "= vars.msgs.map(m, !has(m.content) || m.content == null ? '' : (type(m.content) == string ? m.content : m.content.map(p, p.type == 'text' ? p.text : (p.type == 'prompt_embeds' ? '<##PROMPT_EMBEDS##>' : (p.type == 'video_url' ? lists.range(int(vars.frames) * int(config['api-video-tokens-per-frame'])).map(k, '<|video|>').join(' ') : '<|image|>'))).join(' ')))"
-      - title: "ASSUMPTION: one token per whitespace-separated word, plus <|begin_of_text|>, the header/eot special tokens and the assistant generation prompt"
+      - title: "The served checkpoint's tokenizer and chat template: Llama-3 headers, Qwen's ChatML (Qwen2-VL), or Mistral's [INST] turns (Mixtral) (ASSUMPTION: one token per whitespace-separated word plus each template's real special-token ids)"
         source: "vllm/renderers/hf.py:1130-1170"
         set:
-          vars.words: "= lists.range(size(vars.msgs)).map(i, '<|start_header_id|> ' + vars.msgs[i].role + ' <|end_header_id|> ' + vars.contents[i] + (vars.cont && i == size(vars.msgs) - 1 ? '' : ' <|eot_id|>')).join(' ').split(' ')"
-      - set:
-          vars.ids: "= [128000] + vars.words.map(w, w == '<|start_header_id|>' ? 128006 : (w == '<|end_header_id|>' ? 128007 : (w == '<|eot_id|>' ? 128009 : (w == '<|image|>' ? 128011 : (w == '<|video|>' ? 128013 : (w == '<##PROMPT_EMBEDS##>' ? vars.placeholder_id : 1000 + size(w))))))) + (vars.agp && !vars.cont ? [128006, 78191, 128007] : [])"
+          vars.family: "= config['model'].startsWith('Qwen/') ? 'chatml' : (config['model'].startsWith('mistralai/') ? 'mistral' : 'llama3')"
+      - if: "vars.family == 'chatml'"
+        then:
+          - title: "ChatML: <|im_start|>role ... <|im_end|> per message, no BOS; an image is <|vision_start|><|image_pad|><|vision_end|>; the generation prompt is <|im_start|>assistant\\n"
+            source: "vllm/renderers/hf.py:1130-1170"
+            set:
+              vars.words: "= lists.range(size(vars.msgs)).map(i, '<|im_start|> ' + vars.msgs[i].role + ' ' + vars.contents[i] + (vars.cont && i == size(vars.msgs) - 1 ? '' : ' <|im_end|>')).join(' ').split(' ')"
+          - set:
+              vars.ids: "= vars.words.map(w, w == '<|im_start|>' ? [151644] : (w == '<|im_end|>' ? [151645] : (w == '<|image|>' ? [151652, 151655, 151653] : (w == '<|video|>' ? [151652, 151656, 151653] : (w == '<##PROMPT_EMBEDS##>' ? [vars.placeholder_id] : [1000 + size(w)]))))).flatten() + (vars.agp && !vars.cont ? [151644, 77091, 198] : [])"
+              vars.max_id: 152063
+      - if: "vars.family == 'mistral'"
+        then:
+          - title: "Mistral v0.1: <s> once, then [INST] user [/INST] and the assistant's reply ending in </s>; no generation prompt beyond [/INST]"
+            source: "vllm/renderers/hf.py:1130-1170"
+            set:
+              vars.words: "= lists.range(size(vars.msgs)).map(i, vars.msgs[i].role == 'assistant' ? vars.contents[i] + (vars.cont && i == size(vars.msgs) - 1 ? '' : ' </s>') : '[INST] ' + vars.contents[i] + ' [/INST]').join(' ').split(' ')"
+          - set:
+              vars.ids: "= [1] + vars.words.map(w, w == '[INST]' ? [733, 16289, 28793] : (w == '[/INST]' ? [733, 28748, 16289, 28793] : (w == '</s>' ? [2] : (w == '<##PROMPT_EMBEDS##>' ? [vars.placeholder_id] : [1000 + size(w)])))).flatten()"
+              vars.max_id: 31999
+      - if: "vars.family == 'llama3'"
+        then:
+          - title: "Llama-3: <|begin_of_text|>, <|start_header_id|>role<|end_header_id|> ... <|eot_id|>, then the assistant header as the generation prompt"
+            source: "vllm/renderers/hf.py:1130-1170"
+            set:
+              vars.words: "= lists.range(size(vars.msgs)).map(i, '<|start_header_id|> ' + vars.msgs[i].role + ' <|end_header_id|> ' + vars.contents[i] + (vars.cont && i == size(vars.msgs) - 1 ? '' : ' <|eot_id|>')).join(' ').split(' ')"
+          - set:
+              vars.ids: "= [128000] + vars.words.map(w, w == '<|start_header_id|>' ? 128006 : (w == '<|end_header_id|>' ? 128007 : (w == '<|eot_id|>' ? 128009 : (w == '<|image|>' ? 128011 : (w == '<|video|>' ? 128013 : (w == '<##PROMPT_EMBEDS##>' ? vars.placeholder_id : 1000 + size(w))))))) + (vars.agp && !vars.cont ? [128006, 78191, 128007] : [])"
+              vars.max_id: "= 128255 + size(state.added_tokens)"
       - return:
           prompt_token_ids: "= vars.ids"
-          max_token_id: "= 128255 + size(state.added_tokens)"
+          max_token_id: "= vars.max_id"
           multi_modal_data: "= vars.n_media > 0 ? dyn({'image': vars.media.map(ps, ps.map(p, has(p.image_url) ? p.image_url.url : (has(p.video_url) ? p.video_url.url : ''))).filter(l, size(l) > 0)}) : null"
           prompt_embeds: "= vars.n_embeds > 0 ? dyn(vars.embeds.map(ps, ps.map(p, p.data)).filter(l, size(l) > 0)) : null"
   - component: hf-renderer
@@ -598,36 +687,66 @@ interfaces:
   - component: base-renderer
     name: tokenize-prompt
     kind: function
-    summary: "_tokenize_singleton_prompt + _validate_tokens: tokenize text, then refuse prompts over max_model_len and out-of-vocabulary ids."
-    sources: ["vllm/renderers/base.py:672-697", "vllm/renderers/params.py:515-552"]
+    summary: "_tokenize_singleton_prompt + TokenizeParams._validate_tokens: tokenize text (a TokensPrompt keeps its ids), then refuse a prompt longer than max_input_tokens (max_total_tokens, which /tokenize and /detokenize leave unset)."
+    sources: ["vllm/renderers/base.py:628-697", "vllm/renderers/params.py:205-218", "vllm/renderers/params.py:515-552"]
     latency_ms: "= 1 + (has(input.prompt) && input.prompt != null ? size(input.prompt.split(' ')) : (has(input.prompt_token_ids) && input.prompt_token_ids != null ? size(input.prompt_token_ids) : 0)) * config['api-tokenize-us-per-token'] / 1000"
-    request: {type: object, properties: {prompt: {type: [string, "null"], default: null}, prompt_token_ids: {type: [array, "null"], items: {type: integer}, default: null}, max_token_id: {type: [integer, "null"], default: null}}}
-    errors: [{code: BadRequestError, status: 400}]
+    request: {type: object, properties: {prompt: {type: [string, "null"], default: null}, prompt_token_ids: {type: [array, "null"], items: {type: integer}, default: null}, max_token_id: {type: [integer, "null"], default: null}, max_total_tokens: {type: [integer, "null"], description: "TokenizeParams.max_total_tokens; absent means max_model_len (the generate requests' build_tok_params), null means no length check"}, add_special_tokens: {type: boolean, default: true}}}
+    errors: [{code: vllm-validation-error, status: 0, retryable: false}]
     behavior:
-      - title: "Tokenize text (ASSUMPTION: <|begin_of_text|> plus one token per word)"
+      - title: "Tokenize text (ASSUMPTION: the checkpoint's BOS when add_special_tokens -- <|begin_of_text|> for Llama-3, <s> for Mistral, none for Qwen -- plus one token per word: Llama-3's real ids for a few common words, 1000 + the word's length otherwise)"
         source: "vllm/renderers/base.py:628-643"
         set:
-          vars.ids: "= has(input.prompt) && input.prompt != null ? [128000] + input.prompt.split(' ').map(w, 1000 + size(w)) : input.prompt_token_ids"
-      - title: Token ids must be in vocabulary (128256 for Llama-3.1)
-        source: "vllm/renderers/base.py:420-455"
-        if: "vars.ids.exists(t, t < 0 || t > (has(input.max_token_id) && input.max_token_id != null ? input.max_token_id : 128255))"
-        then: [{fail: {code: BadRequestError, status: 400, message: Token id is out of vocabulary}}]
-      - title: _token_len_check -- the prompt alone exceeds the context
+          vars.ids: "= has(input.prompt) && input.prompt != null ? ((!has(input.add_special_tokens) || input.add_special_tokens) ? (config['model'].startsWith('Qwen/') ? [] : (config['model'].startsWith('mistralai/') ? [1] : [128000])) : []) + input.prompt.split(' ').map(w, w in {'Hello': 9906, 'world': 1917, 'The': 791, 'capital': 6864, 'of': 315, 'France': 9822, 'is': 374} ? {'Hello': 9906, 'world': 1917, 'The': 791, 'capital': 6864, 'of': 315, 'France': 9822, 'is': 374}[w] : 1000 + size(w)) : input.prompt_token_ids"
+          vars.max_in: "= !has(input.max_total_tokens) ? dyn(config['max-model-len']) : dyn(input.max_total_tokens)"
+      - title: "_token_len_check -- the prompt alone exceeds the context (skipped when max_input_tokens is None)"
         source: "vllm/renderers/params.py:515-537"
-        if: "size(vars.ids) > config['max-model-len']"
+        if: "vars.max_in != null && size(vars.ids) > vars.max_in"
         then:
-          - fail: {code: BadRequestError, status: 400, message: "= 'This model\\'s maximum context length is ' + string(config['max-model-len']) + ' tokens. However, your prompt contains ' + string(size(vars.ids)) + ' input tokens, which exceeds this limit even without any output tokens. Please reduce the length of the input prompt.'", data: {param: input_tokens}}
+          - fail: {code: vllm-validation-error, message: "= 'This model\\'s maximum context length is ' + string(vars.max_in) + ' tokens. However, your prompt contains ' + (size(vars.ids) == vars.max_in + 1 ? 'at least ' : '') + string(size(vars.ids)) + ' input tokens, which exceeds this limit even without any output tokens. Please reduce the length of the input prompt.'", data: {param: input_tokens, value: "= size(vars.ids)"}}
       - return: {prompt_token_ids: "= vars.ids"}
+  - component: base-renderer
+    name: validate-token-ids
+    kind: function
+    summary: "BaseRenderer.validate_token_ids: a negative id, or one above max(tokenizer.max_token_id, vocab_size - 1), is out of vocabulary (the InputProcessor calls it for every token prompt; the renderer's tokenization does not)."
+    sources: ["vllm/renderers/base.py:420-455", "vllm/v1/engine/input_processor.py:645-648"]
+    request: {type: object, properties: {token_ids: {type: array, items: {type: integer}}, max_token_id: {type: [integer, "null"], default: null, description: "max(tokenizer.max_token_id, model vocab_size - 1); null reads the served checkpoint's vocab_size"}, parameter: {type: [string, "null"], default: null}}, required: [token_ids]}
+    errors: [{code: vllm-validation-error, status: 0, retryable: false}]
+    behavior:
+      - if: "size(input.token_ids) == 0"
+        then: [{return: {ok: true}}]
+      - if: "!(has(input.max_token_id) && input.max_token_id != null)"
+        then:
+          - title: "model_config.get_vocab_size() of the served checkpoint (max(tokenizer.max_token_id, vocab_size - 1))"
+            source: "vllm/renderers/base.py:441-452"
+            call: hf-hub.download-config
+            input: {model: "= config['model']"}
+            as: hfc
+            on_error: continue
+      - set:
+          vars.max_id: "= has(input.max_token_id) && input.max_token_id != null ? input.max_token_id : (vars.hfc.ok && has(vars.hfc.value.vocab_size) ? vars.hfc.value.vocab_size - 1 : 128255)"
+          vars.lo: "= math.least(input.token_ids)"
+          vars.hi: "= math.greatest(input.token_ids)"
+      - title: "A negative id is out of vocabulary (min is checked first)"
+        source: "vllm/renderers/base.py:446-451"
+        if: "vars.lo < 0"
+        then: [{fail: {code: vllm-validation-error, message: "= 'Token id ' + string(vars.lo) + ' is out of vocabulary'", data: {param: "= has(input.parameter) ? input.parameter : null"}}}]
+      - title: "then the largest id against the tokenizer's and the model's vocabulary"
+        source: "vllm/renderers/base.py:452-455"
+        if: "vars.hi > vars.max_id"
+        then: [{fail: {code: vllm-validation-error, message: "= 'Token id ' + string(vars.hi) + ' is out of vocabulary'", data: {param: "= has(input.parameter) ? input.parameter : null"}}}]
+      - return: {ok: true}
   - component: base-renderer
     name: detokenize-prompt
     kind: function
-    summary: "Detokenize token ids (tokenize_prompt_async on a TokensPrompt with detokenization), after the vocabulary check."
+    summary: "tokenize_prompt_async on a TokensPrompt with needs_detokenization: decode the ids (special tokens kept); no vocabulary check on this path."
     sources: ["vllm/renderers/base.py:645-657"]
     request: {type: object, properties: {prompt_token_ids: {type: array, items: {type: integer}}}, required: [prompt_token_ids]}
-    errors: [{code: BadRequestError, status: 400}]
     behavior:
-      - if: "input.prompt_token_ids.exists(t, t < 0 || t >= 128256)"
-        then: [{source: "vllm/renderers/base.py:446-455", fail: {code: BadRequestError, status: 400, message: Token id is out of vocabulary}}]
-      - title: "tokenizer.decode (ASSUMPTION: the text is not simulated, only its length)"
+      - title: "tokenizer.decode, special tokens kept (ASSUMPTION: only the special tokens and the few words with known Llama-3 ids decode to text; other ids give a placeholder with their count)"
         source: "vllm/renderers/base.py:645-649"
-        return: {prompt: "= '<decoded ' + string(size(input.prompt_token_ids)) + ' tokens>'"}
+        set:
+          vars.inv: "= {'128000': '<|begin_of_text|>', '128009': '<|eot_id|>', '9906': 'Hello', '1917': 'world', '791': 'The', '6864': 'capital', '315': 'of', '9822': 'France', '374': 'is'}"
+      - if: "input.prompt_token_ids.all(t, string(t) in vars.inv)"
+        then:
+          - return: {prompt: "= input.prompt_token_ids.filter(t, t >= 128000).map(t, vars.inv[string(t)]).join('') + input.prompt_token_ids.filter(t, t < 128000).map(t, vars.inv[string(t)]).join(' ')"}
+      - return: {prompt: "= '<decoded ' + string(size(input.prompt_token_ids)) + ' tokens>'"}

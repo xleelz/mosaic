@@ -1,0 +1,517 @@
+# Fix round 5 (precision): CUDA graph mode resolution, the fused FlashInfer sampler, the V2
+# multimodal encoder step, and the configs they read.
+configs:
+  - {id: vllm-use-flashinfer-sampler, type: boolean, value: true, default: true, summary: "VLLM_USE_FLASHINFER_SAMPLER: unset means True, so the V2 sampler uses FlashInfer's top-k/top-p sampler on CUDA GPUs that support it (H100 does) whenever a batch is eligible; 0 forces the Triton + Gumbel path", sources: ["vllm/envs.py:875-882", "vllm/v1/sample/ops/topk_topp_sampler.py:77-130"], attributes: {key: VLLM_USE_FLASHINFER_SAMPLER}}
+  - {id: logprobs-mode, type: string, value: raw_logprobs, default: raw_logprobs, summary: "model_config.logprobs_mode: raw_logprobs (default), raw_logits, processed_logprobs or processed_logits; processed_* return logprobs after the sampling params and keep the fused sampler off for rows that return logprobs", sources: ["vllm/config/model.py:229", "vllm/v1/worker/gpu/sample/sampler.py:171-186"], attributes: {boundary: true, owner: config-platform, key: logprobs_mode}}
+  - {id: kv-cache-dtype, type: string, value: auto, default: auto, summary: "cache_config.cache_dtype (--kv-cache-dtype); auto keeps the model dtype", sources: ["vllm/config/cache.py:122"], attributes: {boundary: true, owner: attention, key: cache_dtype}}
+  - {id: compilation-mode, type: integer, value: 3, default: 3, summary: "compilation_config.mode (VLLM_COMPILE 3 at -O2: attention ops are the splitting ops, piecewise capture is available)", sources: ["vllm/config/compilation.py:432"], attributes: {boundary: true, owner: kernels-ops, key: compilation_config.mode}}
+  - {id: model-is-multimodal, type: boolean, value: false, default: false, summary: "model_config.is_multimodal_model: the checkpoint has a multimodal config, so the V2 runner builds an encoder runner and an encoder cache (supports_mm_inputs)", sources: ["vllm/config/model.py:1981-1982"], attributes: {boundary: true, owner: config-platform, key: is_multimodal_model}}
+
+  - {id: profiler-delay-iterations, type: integer, value: 0, default: 0, summary: "profiler_config.delay_iterations: worker steps after start_profile before the profiler starts (0 starts at once)", sources: ["vllm/config/profiler.py:156"], attributes: {boundary: true, owner: config-platform, key: profiler_config.delay_iterations}}
+  - {id: profiler-max-iterations, type: integer, value: 0, default: 0, summary: "profiler_config.max_iterations: recorded steps after which the profiler stops itself (0 means no limit)", sources: ["vllm/config/profiler.py:161"], attributes: {boundary: true, owner: config-platform, key: profiler_config.max_iterations}}
+
+components:
+  - id: worker-profiler
+    name: WorkerProfiler
+    kind: module
+    parent: gpu-worker-impl
+    layer: worker
+    summary: "vllm/profiler/wrapper.py WorkerProfiler: the per-worker profiler wrapper with delayed start and a maximum number of recorded steps; start/stop are idempotent, step() advances the counters each worker step."
+    sources: ["vllm/profiler/wrapper.py:36-200"]
+    state:
+      schema: {type: object, properties: {created: {type: boolean}, active: {type: boolean}, running: {type: boolean}, active_iteration_count: {type: integer}, profiling_for_iters: {type: integer}, delay_iters: {type: integer}, max_iters: {type: integer}, start_call_count: {type: integer}, stop_call_count: {type: integer}}}
+      initial: {created: false, active: false, running: false, active_iteration_count: 0, profiling_for_iters: 0, delay_iters: 0, max_iters: 0, default_delay_iters: 0, default_max_iters: 0, start_call_count: 0, stop_call_count: 0, output_name: ""}
+  - id: topk-topp-sampler
+    name: v1/sample/ops/topk_topp_sampler.py (FlashInfer path)
+    kind: module
+    parent: gpu-model-runner
+    layer: runner
+    summary: "FlashInfer's fused top-k/top-p sampling (flashinfer_sample) and its eligibility check (flashinfer_sampler_supported), which the V2 sampler uses instead of Triton top-k/top-p + Gumbel for eligible batches."
+    sources: ["vllm/v1/sample/ops/topk_topp_sampler.py:77-130", "vllm/v1/sample/ops/topk_topp_sampler.py:580-620"]
+  - id: encoder-cudagraph-manager
+    name: EncoderCudaGraphManager
+    kind: module
+    parent: gpu-model-runner
+    layer: runner
+    summary: "vllm/v1/worker/encoder_cudagraph.py: CUDA graphs for the vision encoder, one per token budget; items are greedily packed (smallest first, at most max_batch_size per batch) into the smallest fitting budget, and a batch that fits no budget runs eager."
+    sources: ["vllm/v1/worker/encoder_cudagraph.py:72-761"]
+    state:
+      schema: {type: object, properties: {token_budgets: {type: array}, max_batch_size: {type: integer}, budget_graphs: {type: array}, graph_hits: {type: integer}, graph_misses: {type: integer}}}
+      initial: {token_budgets: [], max_batch_size: 0, budget_graphs: [], graph_hits: 0, graph_misses: 0}
+  - id: mm-encoder-model-runner
+    name: MMEncoderModelRunner
+    kind: module
+    parent: gpu-worker
+    layer: runner
+    summary: "vllm/v1/worker/mm_encoder_model_runner.py: the encoder-only (E in EPD disaggregation) runner; it captures only encoder CUDA graphs and runs no language model."
+    sources: ["vllm/v1/worker/mm_encoder_model_runner.py:30-140"]
+  - id: encoder-runner
+    name: EncoderRunner (V2)
+    kind: module
+    parent: gpu-model-runner
+    layer: runner
+    summary: "vllm/v1/worker/gpu/mm/encoder_runner.py: picks a step's multimodal items whose encoder output is not cached yet, runs the vision encoder on them and stores the outputs in the encoder cache by mm hash."
+    sources: ["vllm/v1/worker/gpu/mm/encoder_runner.py:78-175"]
+
+interfaces:
+  - component: worker-profiler
+    name: create
+    kind: function
+    summary: "WorkerProfiler.__init__: takes the default delay and maximum iterations from profiler_config; nothing is active or running yet."
+    sources: ["vllm/profiler/wrapper.py:37-64"]
+    latency_ms: 0
+    request: {type: object, properties: {worker_name: {type: string}}}
+    response: {type: object, properties: {delay_iters: {type: integer}, max_iters: {type: integer}}}
+    behavior:
+      - set:
+          state.created: true
+          state.default_delay_iters: "= int(config['profiler-delay-iterations'])"
+          state.default_max_iters: "= int(config['profiler-max-iterations'])"
+          state.delay_iters: "= int(config['profiler-delay-iterations'])"
+          state.max_iters: "= int(config['profiler-max-iterations'])"
+          state.active: false
+          state.running: false
+          state.active_iteration_count: 0
+          state.profiling_for_iters: 0
+          state.output_name: "= has(input.worker_name) ? input.worker_name : ''"
+      - return: {delay_iters: "= state.delay_iters", max_iters: "= state.max_iters"}
+  - component: worker-profiler
+    name: start
+    kind: function
+    summary: "WorkerProfiler.start: ignored while active; validates the session's bounds, which override the defaults for this session; becomes active and starts the profiler at once unless a delay is set."
+    sources: ["vllm/profiler/wrapper.py:103-129", "vllm/config/profiler.py:41-49"]
+    latency_ms: 0
+    errors: [{code: value-error, status: 0, retryable: false}]
+    request: {type: object, properties: {delay_iterations: {type: ["integer", "null"], default: null}, max_iterations: {type: ["integer", "null"], default: null}}}
+    response: {type: object, properties: {active: {type: boolean}, running: {type: boolean}, ignored: {type: boolean}}}
+    behavior:
+      - if: "state.active"
+        then:
+          - title: start_profile while active is ignored (debug log)
+            source: "vllm/profiler/wrapper.py:111-116"
+            return: {active: true, running: "= state.running", ignored: true}
+      - if: "has(input.delay_iterations) && input.delay_iterations != null && input.delay_iterations < 0"
+        then:
+          - source: "vllm/config/profiler.py:46-47"
+            fail: {code: value-error, status: 0, message: "delay_iterations must be greater than or equal to 0"}
+      - if: "has(input.max_iterations) && input.max_iterations != null && input.max_iterations < 0"
+        then:
+          - source: "vllm/config/profiler.py:48-49"
+            fail: {code: value-error, status: 0, message: "max_iterations must be greater than or equal to 0"}
+      - source: "vllm/profiler/wrapper.py:118-126"
+        set:
+          state.delay_iters: "= has(input.delay_iterations) && input.delay_iterations != null ? input.delay_iterations : state.default_delay_iters"
+          state.max_iters: "= has(input.max_iterations) && input.max_iterations != null ? input.max_iterations : state.default_max_iters"
+          state.active: true
+      - if: "state.delay_iters == 0"
+        then:
+          - title: No delay, so the underlying profiler starts now (_call_start marks it running)
+            source: "vllm/profiler/wrapper.py:127-128"
+            set:
+              state.start_call_count: "= state.start_call_count + 1"
+              state.running: true
+      - return: {active: true, running: "= state.running", ignored: false}
+  - component: worker-profiler
+    name: step
+    kind: function
+    summary: "WorkerProfiler.step, once per worker step: counts active iterations, starts a delayed profiler on the delay-th one, counts recorded iterations while running, and stops itself (through stop(), resetting the counters) once more than max_iterations were recorded."
+    sources: ["vllm/profiler/wrapper.py:130-164"]
+    latency_ms: 0
+    response: {type: object, properties: {active: {type: boolean}, running: {type: boolean}, profiling_for_iters: {type: integer}}}
+    behavior:
+      - if: "!state.active"
+        then:
+          - return: {active: false, running: "= state.running", profiling_for_iters: "= state.profiling_for_iters"}
+      - set: {state.active_iteration_count: "= state.active_iteration_count + 1"}
+      - if: "!state.running && state.delay_iters > 0 && state.active_iteration_count == state.delay_iters"
+        then:
+          - title: Starting profiler after delay
+            source: "vllm/profiler/wrapper.py:139-145"
+            set:
+              state.start_call_count: "= state.start_call_count + 1"
+              state.running: true
+      - if: "state.running"
+        then:
+          - title: A recorded (non-warmup) step
+            source: "vllm/profiler/wrapper.py:147-150"
+            set: {state.profiling_for_iters: "= state.profiling_for_iters + 1"}
+      - if: "state.max_iters > 0 && state.running && state.profiling_for_iters > state.max_iters"
+        then:
+          - title: Max profiling iterations reached; stop through the public stop()
+            source: "vllm/profiler/wrapper.py:152-164"
+            call: worker-profiler.stop
+            input: {}
+      - return: {active: "= state.active", running: "= state.running", profiling_for_iters: "= state.profiling_for_iters"}
+  - component: worker-profiler
+    name: stop
+    kind: function
+    summary: "WorkerProfiler.stop: ignored when not active; otherwise resets active and both counters and stops the underlying profiler if it is running (it is marked not running even if stopping fails)."
+    sources: ["vllm/profiler/wrapper.py:178-192"]
+    latency_ms: 0
+    response: {type: object, properties: {active: {type: boolean}, running: {type: boolean}, ignored: {type: boolean}}}
+    behavior:
+      - if: "!state.active"
+        then:
+          - title: stop_profile while not active is ignored (debug log)
+            source: "vllm/profiler/wrapper.py:181-186"
+            return: {active: false, running: "= state.running", ignored: true}
+      - set:
+          state.active: false
+          state.active_iteration_count: 0
+          state.profiling_for_iters: 0
+      - if: "state.running"
+        then:
+          - source: "vllm/profiler/wrapper.py:191-192"
+            set:
+              state.stop_call_count: "= state.stop_call_count + 1"
+              state.running: false
+      - return: {active: false, running: false, ignored: false}
+  - component: cuda-graph-manager
+    name: resolve-cudagraph-mode
+    kind: function
+    summary: "CompilationConfig.resolve_cudagraph_mode_and_sizes: downgrades the configured cudagraph_mode to what the attention backends support. A FULL mixed mode needs ALWAYS: otherwise FULL_AND_PIECEWISE when attention is a splitting op (VLLM_COMPILE), else FULL_DECODE_ONLY, and NEVER raises; FULL decode graphs with NEVER fall to PIECEWISE or NONE; spec decode (query len > 1) needs UNIFORM_BATCH; without piecewise capture the piecewise half is dropped; a FULL graph left with NEVER support raises."
+    sources: ["vllm/config/compilation.py:1369-1486", "vllm/config/compilation.py:60-97", "vllm/config/compilation.py:1273-1276"]
+    latency_ms: 0
+    errors: [{code: value-error, status: 0, retryable: false}]
+    request:
+      type: object
+      required: [min_cg_support]
+      properties:
+        min_cg_support: {type: string, enum: [ALWAYS, UNIFORM_BATCH, UNIFORM_SINGLE_TOKEN_DECODE, NEVER]}
+        min_cg_attn_backend: {type: ["string", "null"], default: null}
+        uniform_decode_query_len: {type: integer, default: 1}
+    response: {type: object, properties: {cudagraph_mode: {type: string}, warnings: {type: array, items: {type: string}}}}
+    behavior:
+      - set:
+          vars.m: "= config['enforce-eager'] ? 'NONE' : config['cudagraph-mode']"
+      - if: "vars.m == null || vars.m == 'NONE'"
+        then:
+          - source: "vllm/config/compilation.py:1383-1385"
+            return: {cudagraph_mode: NONE, warnings: []}
+      - set:
+          vars.r: "= {'NEVER': 0, 'UNIFORM_SINGLE_TOKEN_DECODE': 1, 'UNIFORM_BATCH': 2, 'ALWAYS': 3}[input.min_cg_support]"
+          vars.be: "= has(input.min_cg_attn_backend) && input.min_cg_attn_backend != null ? input.min_cg_attn_backend : 'None'"
+          vars.sup: "= 'AttentionCGSupport.' + input.min_cg_support"
+          vars.dql: "= has(input.uniform_decode_query_len) ? input.uniform_decode_query_len : 1"
+          vars.w: []
+      - title: "Attention is among the splitting ops (set_splitting_ops_for_v1 under VLLM_COMPILE), and the compiled model has piecewise submodules"
+        source: "vllm/config/compilation.py:1160-1177"
+        set:
+          vars.split_attn: "= int(config['compilation-mode']) == 3"
+      - if: "(vars.m == 'FULL') && vars.r != 3"
+        then:
+          - set: {vars.msg: "= 'CUDAGraphMode.' + vars.m + ' is not supported with ' + vars.be + ' backend (support: ' + vars.sup + ')'"}
+          - if: "vars.r == 0"
+            then:
+              - title: No full CUDA graph support at all
+                source: "vllm/config/compilation.py:1398-1404"
+                fail: {code: value-error, status: 0, message: "= vars.msg + '; please try cudagraph_mode=PIECEWISE, and make sure compilation mode is VLLM_COMPILE'"}
+          - title: "FULL mixed batches need ALWAYS: fall back to FULL_AND_PIECEWISE (attention split out) or FULL_DECODE_ONLY, with a warning"
+            source: "vllm/config/compilation.py:1406-1413"
+            set:
+              vars.w: "= vars.w + [vars.msg + (vars.split_attn ? '; setting cudagraph_mode=FULL_AND_PIECEWISE' : '; setting cudagraph_mode=FULL_DECODE_ONLY')]"
+              vars.m: "= vars.split_attn ? 'FULL_AND_PIECEWISE' : 'FULL_DECODE_ONLY'"
+      - if: "vars.m in ['FULL', 'FULL_AND_PIECEWISE', 'FULL_DECODE_ONLY'] && vars.r == 0"
+        then:
+          - title: "FULL decode graphs with NEVER support: PIECEWISE when attention is compiled piecewise, else NONE"
+            source: "vllm/config/compilation.py:1416-1438"
+            set:
+              vars.w: "= vars.w + ['CUDAGraphMode.' + vars.m + ' is not supported with ' + vars.be + ' backend (support: ' + vars.sup + ')' + (vars.split_attn ? '; setting cudagraph_mode=PIECEWISE because attention is compiled piecewise' : '; setting cudagraph_mode=NONE because attention is not compiled piecewise')]"
+              vars.m: "= vars.split_attn ? 'PIECEWISE' : 'NONE'"
+      - if: "vars.m in ['FULL', 'FULL_AND_PIECEWISE', 'FULL_DECODE_ONLY'] && vars.dql > 1 && vars.r < 2"
+        then:
+          - title: "Spec decode with FULL decode graphs needs UNIFORM_BATCH: PIECEWISE or NONE"
+            source: "vllm/config/compilation.py:1440-1457"
+            set:
+              vars.w: "= vars.w + ['CUDAGraphMode.' + vars.m + ' is not supported with spec-decode for attention backend ' + vars.be + ' (support: ' + vars.sup + ')' + (vars.split_attn ? '; setting cudagraph_mode=PIECEWISE' : '; setting cudagraph_mode=NONE')]"
+              vars.m: "= vars.split_attn ? 'PIECEWISE' : 'NONE'"
+      - if: "!vars.split_attn && vars.m in ['PIECEWISE', 'FULL_AND_PIECEWISE']"
+        then:
+          - title: "No compiled submodule (and no breakable graphs): drop the piecewise half"
+            source: "vllm/config/compilation.py:1459-1473"
+            set:
+              vars.w: "= vars.w + ['Cudagraph mode CUDAGraphMode.' + vars.m + ' requires piecewise capture, but the loaded model provides neither a compiled submodule nor breakable CUDA graphs. Overriding to CUDAGraphMode.' + (vars.m == 'PIECEWISE' ? 'NONE' : 'FULL_DECODE_ONLY') + '.']"
+              vars.m: "= vars.m == 'PIECEWISE' ? 'NONE' : 'FULL_DECODE_ONLY'"
+      - if: "vars.m in ['FULL', 'FULL_AND_PIECEWISE', 'FULL_DECODE_ONLY'] && vars.r == 0"
+        then:
+          - source: "vllm/config/compilation.py:1477-1486"
+            fail: {code: value-error, status: 0, message: "= 'CUDAGraphMode.' + vars.m + ' is not supported with ' + vars.be + ' backend (support:' + vars.sup + ') ; please try cudagraph_mode=PIECEWISE, and make sure compilation mode is VLLM_COMPILE'"}
+      - return: {cudagraph_mode: "= vars.m", warnings: "= vars.w"}
+
+  - component: topk-topp-sampler
+    name: flashinfer-sample
+    kind: kernel
+    summary: "flashinfer_sample: FlashInfer rejection sampling from the softmax of the processed logits, top-p only (top_p_sampling_from_probs), top-k only (top_k_sampling_from_probs) or both (top_k_top_p_sampling_from_logits); no sort of the vocabulary."
+    sources: ["vllm/v1/sample/ops/topk_topp_sampler.py:580-620"]
+    latency_ms: "= has(input.num_rows) ? 0.015 + double(input.num_rows) * 0.0005 : 0.015"
+    request: {type: object, properties: {num_rows: {type: integer}, topk_enabled: {type: boolean}, topp_enabled: {type: boolean}}}
+    response: {type: object, properties: {kernel: {type: string}}}
+    behavior:
+      - if: "!input.topk_enabled && !input.topp_enabled"
+        then:
+          - source: "vllm/v1/sample/ops/topk_topp_sampler.py:598"
+            fail: {code: assertion-error, status: 0, message: ""}
+      - if: "!input.topk_enabled"
+        then:
+          - source: "vllm/v1/sample/ops/topk_topp_sampler.py:599-604"
+            return: {kernel: top_p_sampling_from_probs}
+      - if: "!input.topp_enabled"
+        then:
+          - source: "vllm/v1/sample/ops/topk_topp_sampler.py:605-611"
+            return: {kernel: top_k_sampling_from_probs}
+      - source: "vllm/v1/sample/ops/topk_topp_sampler.py:612-620"
+        return: {kernel: top_k_top_p_sampling_from_logits}
+
+  - component: encoder-runner
+    name: execute-mm-encoder
+    kind: function
+    summary: "ModelState.execute_mm_encoder (prepare_mm_inputs + the encoder forward): for each scheduled encoder input, skip items without data or already cached by mm hash, run the vision encoder on the rest, and store each output in the encoder cache under its mm hash."
+    sources: ["vllm/v1/worker/gpu/model_states/interface.py:189-203", "vllm/v1/worker/gpu/mm/encoder_runner.py:81-108", "vllm/v1/worker/gpu/mm/encoder_runner.py:150-175"]
+    latency_ms: 0
+    request:
+      type: object
+      required: [scheduled_encoder_inputs, mm_features]
+      properties:
+        scheduled_encoder_inputs: {type: object, description: "SchedulerOutput.scheduled_encoder_inputs: req_id -> the indices of its mm_features to encode this step"}
+        mm_features: {type: object, description: "req_id -> the request's mm_features (the encoder cache's record)"}
+        cached: {type: array, items: {type: string}, description: "mm hashes already in encoder_outputs"}
+        model_component: {type: string, default: qwen2-vl-for-conditional-generation, description: "the loaded model's component, whose embed_multimodal runs the vision tower"}
+    response: {type: object, properties: {mm_hashes: {type: array, items: {type: string}}}}
+    behavior:
+      - title: "prepare_mm_inputs: an item is encoded when it has data and its mm hash has no cached output (each hash once)"
+        source: "vllm/v1/worker/gpu/mm/encoder_runner.py:86-108"
+        set:
+          vars.todo: "= input.scheduled_encoder_inputs.map(rid, rid).sort().map(rid, input.scheduled_encoder_inputs[rid].filter(i, rid in input.mm_features && i < size(input.mm_features[rid])).map(i, input.mm_features[rid][i])).flatten().filter(f, (!has(f.data) || f.data != null) && !(f.identifier in input.cached)).map(f, f.identifier)"
+      - set:
+          vars.feats: "= input.scheduled_encoder_inputs.map(rid, rid).sort().map(rid, input.scheduled_encoder_inputs[rid].filter(i, rid in input.mm_features && i < size(input.mm_features[rid])).map(i, input.mm_features[rid][i])).flatten()"
+          vars.hashes: "= lists.range(size(vars.todo)).filter(i, !(vars.todo[i] in vars.todo.slice(0, i))).map(i, vars.todo[i])"
+      - if: "size(vars.hashes) == 0"
+        then:
+          - title: Every scheduled item is cached already; the encoder does not run
+            source: "vllm/v1/worker/gpu/model_states/interface.py:197"
+            return: {mm_hashes: []}
+      - if: "has(input.model_component) && input.model_component == 'qwen2-vl-for-conditional-generation'"
+        then:
+          - title: "The model's embed_multimodal runs the vision tower on the batched items (_execute_mm_encoder)"
+            source: "vllm/v1/worker/gpu/mm/encoder_runner.py:150-175"
+            call: "= input.model_component + '.embed-multimodal'"
+            targets: [qwen2-vl-for-conditional-generation.embed-multimodal]
+            input:
+              mm_kwargs: "= vars.hashes.map(h, vars.feats.filter(f, f.identifier == h)[0]).map(f, {'modality': has(f.modality) ? f.modality : 'image', 'kind': 'pixel_values', 'grid_thw': has(f.grid_thw) ? f.grid_thw : [1, 2 * int(math.ceil(math.sqrt(double(f.length)))), 2 * int(math.ceil(math.sqrt(double(f.length))))]})"
+      - title: Store each output in the encoder cache under its mm hash
+        source: "vllm/v1/worker/gpu/model_states/interface.py:198-203"
+        call: encoder-cache.update-encoder-outputs
+        input: {mm_hashes: "= vars.hashes"}
+      - return: {mm_hashes: "= vars.hashes"}
+  - component: encoder-cache
+    name: update-encoder-outputs
+    kind: function
+    summary: "encoder_cache.encoder_outputs.update(zip(mm_hashes, encoder_outputs)): records the newly computed encoder outputs by mm hash."
+    sources: ["vllm/v1/worker/gpu/model_states/interface.py:198-203"]
+    latency_ms: 0
+    request: {type: object, required: [mm_hashes], properties: {mm_hashes: {type: array, items: {type: string}}}}
+    response: {type: object, properties: {num_outputs: {type: integer}}}
+    behavior:
+      - set: {state.encoder_outputs: "= merge(state.encoder_outputs, input.mm_hashes.transformMapEntry(i, h, {h: {'computed': true}}))"}
+      - return: {num_outputs: "= size(state.encoder_outputs)"}
+  - component: encoder-cache
+    name: get-state
+    kind: function
+    summary: "Reads the encoder cache's records (the runner holds the EncoderCache object directly)."
+    sources: ["vllm/v1/worker/gpu/mm/encoder_cache.py:8-17"]
+    latency_ms: 0
+    response: {type: object, properties: {mm_features: {type: object}, cached: {type: array}}}
+    behavior:
+      - return: {mm_features: "= state.mm_features", cached: "= state.encoder_outputs.map(k, k)"}
+
+  # ---------------- encoder CUDA graphs (E-only runner) ----------------
+  - component: encoder-cudagraph-manager
+    name: init
+    kind: function
+    summary: "EncoderCudaGraphManager construction: the token budgets (sorted) and the largest number of items one graph replay takes."
+    sources: ["vllm/v1/worker/encoder_cudagraph.py:72-190"]
+    latency_ms: 0
+    request: {type: object, required: [token_budgets, max_batch_size], properties: {token_budgets: {type: array, items: {type: integer}}, max_batch_size: {type: integer}}}
+    response: {type: object, properties: {token_budgets: {type: array}}}
+    behavior:
+      - set:
+          state.token_budgets: "= input.token_budgets.sort()"
+          state.max_batch_size: "= input.max_batch_size"
+          state.budget_graphs: []
+          state.graph_hits: 0
+          state.graph_misses: 0
+      - return: {token_budgets: "= state.token_budgets"}
+  - component: encoder-cudagraph-manager
+    name: capture
+    kind: function
+    summary: "capture: one graph per non-zero token budget, largest first, on the default path."
+    sources: ["vllm/v1/worker/encoder_cudagraph.py:246-273"]
+    latency_ms: 0
+    response: {type: object, properties: {num_graphs: {type: integer}}}
+    behavior:
+      - source: "vllm/v1/worker/encoder_cudagraph.py:258-267"
+        set: {state.budget_graphs: "= state.token_budgets.filter(b, b != 0).sortBy(b, -b)"}
+      - return: {num_graphs: "= size(state.budget_graphs)"}
+  - component: encoder-cudagraph-manager
+    name: execute
+    kind: function
+    summary: "execute (_execute_local, one path): items sorted by output tokens are packed greedily; an item closes the current batch when the batch is full, it would overflow the largest budget, or merging would cost more budget than running it alone (and it alone outweighs the batch). Each batch replays the smallest fitting budget graph (a hit per item) or, fitting none, runs eager (a miss per item). Outputs come back in the original order."
+    sources: ["vllm/v1/worker/encoder_cudagraph.py:459-566", "vllm/v1/worker/encoder_cudagraph.py:403-457", "vllm/utils/math_utils.py:37-40"]
+    latency_ms: 0
+    request:
+      type: object
+      required: [items]
+      properties:
+        items: {type: array, items: {type: object, properties: {grid_thw: {type: array, items: {type: integer}}, output_tokens: {type: integer}}}}
+        spatial_merge_size: {type: integer, default: 2}
+    response: {type: object, properties: {output_tokens: {type: array}, batches: {type: array}, graph_hits: {type: integer}, graph_misses: {type: integer}}}
+    behavior:
+      - set:
+          vars.m: "= has(input.spatial_merge_size) ? input.spatial_merge_size : 2"
+      - title: "Each item's output tokens: t * (h / merge) * (w / merge) for an image grid"
+        source: "vllm/v1/worker/encoder_cudagraph.py:391-394"
+        set:
+          vars.tok: "= input.items.map(it, has(it.output_tokens) ? it.output_tokens : it.grid_thw[0] * (it.grid_thw[1] / vars.m) * (it.grid_thw[2] / vars.m))"
+          vars.maxb: "= state.token_budgets[size(state.token_budgets) - 1]"
+      - set:
+          vars.order: "= lists.range(size(vars.tok)).sortBy(i, vars.tok[i])"
+          vars.batches: []
+          vars.cur: []
+          vars.cur_tok: 0
+      - title: "Greedy packing, smallest item first"
+        source: "vllm/v1/worker/encoder_cudagraph.py:479-526"
+        foreach: "= vars.order"
+        as: i
+        steps:
+          - set:
+              vars.t: "= vars.tok[vars.i]"
+              vars.fits: "= size(vars.cur) < state.max_batch_size && vars.cur_tok + vars.tok[vars.i] <= vars.maxb"
+          - set:
+              vars.b_cur: "= vars.cur_tok == 0 ? 0 : state.token_budgets.filter(b, b >= vars.cur_tok)[0]"
+              vars.b_alone: "= state.token_budgets.exists(b, b >= vars.t) ? state.token_budgets.filter(b, b >= vars.t)[0] : 0"
+              vars.b_merged: "= state.token_budgets.exists(b, b >= vars.cur_tok + vars.t) ? state.token_budgets.filter(b, b >= vars.cur_tok + vars.t)[0] : 0"
+          - if: "size(vars.cur) > 0 && (!vars.fits || (vars.t > 0 && vars.b_cur + vars.b_alone < vars.b_merged && vars.b_alone >= vars.b_cur))"
+            then:
+              - set:
+                  vars.batches: "= vars.batches + [{'items': vars.cur, 'tokens': vars.cur_tok}]"
+                  vars.cur: []
+                  vars.cur_tok: 0
+          - set:
+              vars.cur: "= vars.cur + [vars.i]"
+              vars.cur_tok: "= vars.cur_tok + vars.t"
+      - when: "size(vars.cur) > 0"
+        set: {vars.batches: "= vars.batches + [{'items': vars.cur, 'tokens': vars.cur_tok}]"}
+      - title: "Each batch replays the smallest captured budget >= its tokens (graph_hits += items) or runs the encoder eagerly (graph_misses += items)"
+        source: "vllm/v1/worker/encoder_cudagraph.py:528-556"
+        set:
+          vars.plan: "= vars.batches.map(b, {'items': b.items, 'tokens': b.tokens, 'budget': state.budget_graphs.exists(g, g >= b.tokens) ? state.budget_graphs.filter(g, g >= b.tokens).sortBy(g, g)[0] : null})"
+      - set:
+          state.graph_hits: "= state.graph_hits + sum(vars.plan.filter(b, b.budget != null).map(b, size(b.items)))"
+          state.graph_misses: "= state.graph_misses + sum(vars.plan.filter(b, b.budget == null).map(b, size(b.items)))"
+      - return: {output_tokens: "= vars.tok", batches: "= vars.plan", graph_hits: "= state.graph_hits", graph_misses: "= state.graph_misses"}
+  - component: mm-encoder-model-runner
+    name: capture-model
+    kind: function
+    summary: "MMEncoderModelRunner.capture_model: 0 without an encoder CUDA graph manager; otherwise captures only the encoder graphs (no decoder manager), and locks the workspace unless profiling."
+    sources: ["vllm/v1/worker/mm_encoder_model_runner.py:77-100"]
+    latency_ms: 0
+    request: {type: object, properties: {profile_only: {type: boolean, default: false}, has_encoder_cudagraph: {type: boolean, default: true}}}
+    response: {type: object, properties: {num_graphs: {type: integer}, locked_workspace: {type: boolean}}}
+    behavior:
+      - if: "has(input.has_encoder_cudagraph) && !input.has_encoder_cudagraph"
+        then:
+          - source: "vllm/v1/worker/mm_encoder_model_runner.py:78-80"
+            return: {num_graphs: 0, locked_workspace: false}
+      - source: "vllm/v1/worker/mm_encoder_model_runner.py:86"
+        call: encoder-cudagraph-manager.capture
+        input: {}
+        as: cap
+      - if: "!(has(input.profile_only) && input.profile_only)"
+        then:
+          - title: Lock the workspace after a real capture
+            source: "vllm/v1/worker/mm_encoder_model_runner.py:89-90"
+            call: workspace-manager.lock
+            input: {locked: true}
+          - return: {num_graphs: "= vars.cap.value.num_graphs", locked_workspace: true}
+      - return: {num_graphs: "= vars.cap.value.num_graphs", locked_workspace: false}
+
+  # ---------------- V1 multimodal embedding gather ----------------
+  - component: gpu-model-runner-v1
+    name: gather-mm-embeddings
+    kind: function
+    summary: "GPUModelRunner._gather_mm_embeddings (V1): for each request, the multimodal features overlapping [num_computed + shift, + num_scheduled) contribute their cached encoder output slice and set is_mm_embed over their positions. A missing encoder output is skipped only for a feature starting at or past the processed boundary (the drafter's +1 look-ahead); any other miss raises RuntimeError('Encoder cache miss for <hash>.')."
+    sources: ["vllm/v1/worker/gpu_model_runner.py:3001-3111", "vllm/multimodal/utils.py:122-142"]
+    latency_ms: 0
+    errors: [{code: runtime-error, status: 0, retryable: false}]
+    request:
+      type: object
+      required: [reqs, total_num_scheduled_tokens]
+      properties:
+        reqs: {type: array, items: {type: object, properties: {req_id: {type: string}, num_computed_tokens: {type: integer}, num_scheduled_tokens: {type: integer}, mm_features: {type: array, items: {type: object, properties: {identifier: {type: string}, offset: {type: integer}, length: {type: integer}}}}}}}
+        cached: {type: array, default: [], items: {type: string}}
+        total_num_scheduled_tokens: {type: integer}
+        shift_computed_tokens: {type: integer, default: 0}
+    response: {type: object, properties: {mm_embeds: {type: array}, is_mm_embed: {type: array}}}
+    behavior:
+      - set:
+          vars.shift: "= has(input.shift_computed_tokens) ? input.shift_computed_tokens : 0"
+          vars.cached: "= has(input.cached) ? input.cached : []"
+          vars.embeds: []
+          vars.mask: "= lists.range(input.total_num_scheduled_tokens).map(i, false)"
+          vars.start: 0
+      - foreach: "= input.reqs"
+        as: r
+        steps:
+          - set:
+              vars.nct: "= vars.r.num_computed_tokens + vars.shift"
+              vars.n: "= vars.r.num_scheduled_tokens"
+          - title: "Features overlapping the window [num_computed, num_computed + num_scheduled)"
+            source: "vllm/v1/worker/gpu_model_runner.py:3024-3029"
+            foreach: "= vars.r.mm_features.filter(f, f.offset < vars.nct + vars.n && f.offset + f.length > vars.nct)"
+            as: f
+            steps:
+              - set:
+                  vars.si: "= vars.nct - vars.f.offset > 0 ? vars.nct - vars.f.offset : 0"
+                  vars.ei: "= vars.nct - vars.f.offset + vars.n < vars.f.length ? vars.nct - vars.f.offset + vars.n : vars.f.length"
+              - if: "!(vars.f.identifier in vars.cached)"
+                then:
+                  - if: "vars.f.offset >= vars.r.num_computed_tokens + vars.n"
+                    then:
+                      - title: "A feature at or past the processed boundary is reached only by the drafter's look-ahead: fall back to the token embedding"
+                        source: "vllm/v1/worker/gpu_model_runner.py:3053-3061"
+                        continue: true
+                  - source: "vllm/v1/worker/gpu_model_runner.py:3062"
+                    fail: {code: runtime-error, status: 0, message: "= 'Encoder cache miss for ' + vars.f.identifier + '.'"}
+              - set:
+                  vars.rsp: "= vars.start + vars.f.offset - vars.nct"
+              - source: "vllm/v1/worker/gpu_model_runner.py:3070-3083"
+                set:
+                  vars.mask: "= lists.range(size(vars.mask)).map(i, vars.mask[i] || (i >= vars.rsp + vars.si && i < vars.rsp + vars.ei))"
+                  vars.embeds: "= vars.embeds + [{'identifier': vars.f.identifier, 'start': vars.si, 'end': vars.ei}]"
+          - set: {vars.start: "= vars.start + vars.n"}
+      - return: {mm_embeds: "= vars.embeds", is_mm_embed: "= vars.mask"}
+
+  # ---------------- allocator split limit during profiling ----------------
+  - component: gpu-worker-impl
+    name: scoped-allocator-max-split
+    kind: function
+    summary: "_scoped_allocator_max_split: on the native CUDA/ROCm allocator, appends max_split_size_mb to the current allocator settings for the profiling pass (so a small allocation cannot be carved out of a freed multi-GiB block and pin its segment past empty_cache), and restores the original settings on exit; elsewhere it does nothing."
+    sources: ["vllm/v1/worker/gpu_worker.py:406-433", "vllm/v1/worker/gpu_worker.py:681-691"]
+    latency_ms: 0
+    request: {type: object, properties: {max_split_size_mb: {type: integer, default: 20}, original_settings: {type: string, default: "", description: "the allocator's settings string before the scope (PYTORCH_CUDA_ALLOC_CONF)"}, native_allocator: {type: boolean, default: true}}}
+    response: {type: object, properties: {settings_in_scope: {type: string}, settings_after: {type: string}}}
+    behavior:
+      - set: {vars.orig: "= has(input.original_settings) ? input.original_settings : ''"}
+      - if: "has(input.native_allocator) && !input.native_allocator"
+        then:
+          - title: "Not the native allocator (or not CUDA-alike): the scope changes nothing"
+            source: "vllm/v1/worker/gpu_worker.py:409-414"
+            return: {settings_in_scope: "= vars.orig", settings_after: "= vars.orig"}
+      - title: "The setter resets options it is not given, so the original settings are kept as a prefix"
+        source: "vllm/v1/worker/gpu_worker.py:424-430"
+        set:
+          vars.prefix: "= vars.orig.trim().endsWith(',') ? vars.orig.trim().substring(0, size(vars.orig.trim()) - 1) : vars.orig.trim()"
+      - set:
+          vars.scoped: "= (vars.prefix != '' ? vars.prefix + ',' : '') + 'max_split_size_mb:' + string(has(input.max_split_size_mb) ? input.max_split_size_mb : 20)"
+      - source: "vllm/v1/worker/gpu_worker.py:432-433"
+        return: {settings_in_scope: "= vars.scoped", settings_after: "= vars.orig"}

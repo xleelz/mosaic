@@ -63,6 +63,10 @@ interfaces:
             max_position_embeddings: "= state.model.max_position_embeddings"
             torch_dtype: "= state.model.torch_dtype"
             weights_bytes: "= state.model.weights_bytes"
+        as: ld
+      - title: "self.model is the module the loader built: forward, compute_logits and the multimodal encoder go to it from now on"
+        source: "vllm/v1/worker/gpu/model_runner.py:390-399"
+        set: {state.model_component: "= vars.ld.ok && has(vars.ld.value.component) ? vars.ld.value.component : ''"}
       - call: gpu-memory.snapshot
         as: m
       - set: {state.model_memory_usage: "= vars.m.value.weights_bytes"}
@@ -110,6 +114,7 @@ interfaces:
           head_size: "= state.model.head_size"
           dtype_bytes: "= state.model.dtype_bytes"
           use_mla: "= has(state.model.use_mla) && state.model.use_mla"
+          kv_cache_dtype: "= config['kv-cache-dtype']"
         as: spec
       - return: "= vars.spec.value"
   - component: gpu-model-runner
@@ -120,9 +125,8 @@ interfaces:
     latency_ms: 0
     request: {type: object, properties: {max_model_len: {type: integer}}}
     behavior:
-      - if: "input.max_model_len <= 0"
-        then: [{fail: {code: value-error, status: 0, message: "max_model_len must be positive"}}]
-      - set: {state.max_model_len: "= input.max_model_len"}
+      - source: "vllm/v1/worker/gpu/model_runner.py:363-365"
+        set: {state.max_model_len: "= input.max_model_len"}
   - component: gpu-model-runner
     name: profile-run
     kind: function
@@ -147,9 +151,55 @@ interfaces:
     latency_ms: 0
     response: {type: object, properties: {cudagraph_memory_bytes: {type: integer}}}
     behavior:
-      - title: Estimate from sampled captures (assumed constant for the 8B model)
-        source: "vllm/v1/worker/gpu/cudagraph_utils.py:979-988"
-        return: {cudagraph_memory_bytes: "= int(config['worker-runner-cudagraph-memory-bytes'])"}
+      - if: "config['enforce-eager'] || config['cudagraph-mode'] == 'NONE'"
+        then:
+          - title: "cudagraph_mode NONE: nothing will be captured, so 0, before any KV bootstrap or teardown"
+            source: "vllm/v1/worker/gpu/cudagraph_utils.py:889-890"
+            return: {cudagraph_memory_bytes: 0}
+      - title: "Bootstrap the smallest KV cache every graph can be captured against: min(max_num_reqs, max_cudagraph_capture_size) blocks"
+        source: "vllm/v1/worker/gpu/cudagraph_utils.py:990-1014"
+        call: gpu-model-runner.initialize-kv-cache
+        input:
+          num_blocks: "= int(config['max-cudagraph-capture-size']) > 0 && int(config['max-cudagraph-capture-size']) < int(config['max-num-seqs']) ? int(config['max-cudagraph-capture-size']) : (int(config['max-num-seqs']) < 512 ? int(config['max-num-seqs']) : 512)"
+          is_profiling: true
+      - call: cuda-graph-manager.needs-capture
+        input: {}
+        as: need
+      - if: "!vars.need.value.needs_capture"
+        then:
+          - title: "Nothing to capture after resolution: tear the profiling state down (finally) and return 0"
+            source: "vllm/v1/worker/gpu/cudagraph_utils.py:919-920"
+            call: gpu-model-runner.teardown-profiling-state
+            input: {}
+          - return: {cudagraph_memory_bytes: 0}
+      - title: "capture_model(profile_only=True) into a throwaway pool, FULL graphs sampled at the 2 largest"
+        source: "vllm/v1/worker/gpu/cudagraph_utils.py:942-948"
+        call: gpu-model-runner.capture-model
+        input: {profile_only: true, max_full_descs_to_capture: 2}
+        as: cap
+      - title: Release the profiling KV cache and graphs (finally), keeping the weights
+        source: "vllm/v1/worker/gpu/cudagraph_utils.py:957-971"
+        call: gpu-model-runner.teardown-profiling-state
+        input: {}
+      - title: "measured - sampled FULL cost + extrapolated FULL total (the pool size is a labeled assumption for the 8B model)"
+        source: "vllm/v1/worker/gpu/cudagraph_utils.py:950-956"
+        return: {cudagraph_memory_bytes: "= vars.cap.value.cuda_graph_memory_bytes"}
+  - component: gpu-model-runner
+    name: teardown-profiling-state
+    kind: function
+    summary: "_teardown_profiling_state: releases the profiling KV cache and captured graphs while keeping the weights, so the real initialize_kv_cache starts clean (the CUDA graph manager is dropped, num_gpu_blocks reset)."
+    sources: ["vllm/v1/worker/gpu/cudagraph_utils.py:1017-1053"]
+    latency_ms: 0
+    behavior:
+      - call: gpu-memory.free
+        input: {kind: kv_cache}
+      - call: gpu-memory.free
+        input: {kind: cudagraph}
+      - call: cuda-graph-manager.release
+        input: {}
+      - set:
+          state.kv_cache_initialized: false
+          state.num_blocks: 0
   - component: gpu-model-runner
     name: dummy-run
     kind: function
@@ -166,7 +216,10 @@ interfaces:
           uniform_token_count: "= input.uniform_decode ? 1 : 0"
           need_eager: "= has(input.is_profile) && input.is_profile"
         as: desc
-      - call: llama-for-causal-lm.forward
+      - title: "The loaded model's forward (the architecture load_model built: LlamaForCausalLM, MixtralForCausalLM)"
+        source: "vllm/v1/worker/gpu/model_runner.py:899-901"
+        call: "= (has(state.model_component) && state.model_component != '' ? state.model_component : (has(state.model.architecture) && state.model.architecture.startsWith('Mixtral') ? 'mixtral-for-causal-lm' : (has(state.model.architecture) && state.model.architecture.startsWith('Qwen2VL') ? 'qwen2-vl-for-conditional-generation' : 'llama-for-causal-lm'))) + '.forward'"
+        targets: [llama-for-causal-lm.forward, mixtral-for-causal-lm.forward, qwen2-vl-for-conditional-generation.forward]
         input:
           num_tokens: "= vars.desc.value.num_tokens"
           num_prefill_tokens: "= input.uniform_decode ? 0 : input.num_tokens"
@@ -178,7 +231,7 @@ interfaces:
     summary: "initialize_kv_cache: block tables sized by max_model_len, attention backends and metadata builders, the CUDA graph mode and sizes, the speculator's graphs, then the KV cache tensors and the KV connector."
     sources: ["vllm/v1/worker/gpu/model_runner.py:605-804"]
     latency_ms: 0
-    request: {type: object, required: [num_blocks], properties: {num_blocks: {type: integer, examples: [29065]}, allocation_pool: {type: ["string", "null"], default: null, description: "the CuMem pool tag the KV tensors are allocated in (kv_cache under sleep mode), or None"}}}
+    request: {type: object, required: [num_blocks], properties: {num_blocks: {type: integer, examples: [29065]}, allocation_pool: {type: ["string", "null"], default: null, description: "the CuMem pool tag the KV tensors are allocated in (kv_cache under sleep mode), or None"}, is_profiling: {type: boolean, default: false, description: "the minimal KV cache profile_cudagraph_memory bootstraps (no KV connector)"}}}
     response: {type: object, properties: {kv_cache_bytes: {type: integer}, cudagraph_mode: {type: string}}}
     behavior:
       - call: attn-utils.get-kv-cache-spec
@@ -187,11 +240,33 @@ interfaces:
           num_kv_heads: "= state.model.num_kv_heads"
           head_size: "= state.model.head_size"
           dtype_bytes: "= state.model.dtype_bytes"
+          kv_cache_dtype: "= config['kv-cache-dtype']"
         as: spec
-      - title: Resolve the CUDA graph mode and capture sizes
+      - title: "The attention groups' metadata builders report their CUDA graph support (FlashAttention: ALWAYS with FA3, UNIFORM_BATCH with FA2)"
+        source: "vllm/v1/worker/gpu/model_runner.py:672-690"
+        call: attention-metadata-builder.get-cudagraph-support
+        input:
+          backend: "= 'attention-backend' in config && config['attention-backend'] != null && config['attention-backend'] != '' ? config['attention-backend'] : 'FLASH_ATTN'"
+          fa_version: "= 'flash-attn-version' in config && config['flash-attn-version'] != null ? int(config['flash-attn-version']) : 3"
+        as: bsup
+      - title: The weakest support among the attention groups
+        source: "vllm/v1/worker/gpu/model_runner.py:672-690"
+        call: attn-utils.get-attn-cg-support
+        input:
+          attn_groups: "= [[{'backend': 'attention-backend' in config && config['attention-backend'] != null && config['attention-backend'] != '' ? config['attention-backend'] : 'FLASH_ATTN', 'layer_names': ['model.layers'], 'cg_support': vars.bsup.value.support}]]"
+        as: cgs
+      - title: Resolve the CUDA graph mode against that support (resolve_cudagraph_mode_and_sizes)
         source: "vllm/v1/worker/gpu/model_runner.py:735-744"
+        call: cuda-graph-manager.resolve-cudagraph-mode
+        input:
+          min_cg_support: "= vars.cgs.value.min_cg_support"
+          min_cg_attn_backend: "= vars.cgs.value.min_cg_attn_backend"
+          uniform_decode_query_len: "= 1 + int(config['num-speculative-tokens'])"
+        as: mode
+      - title: Build the CUDA graph manager with the resolved mode and capture sizes
+        source: "vllm/v1/worker/gpu/model_runner.py:745-753"
         call: cuda-graph-manager.init
-        input: {decode_query_len: "= 1 + int(config['num-speculative-tokens'])"}
+        input: {decode_query_len: "= 1 + int(config['num-speculative-tokens'])", cudagraph_mode: "= vars.mode.value.cudagraph_mode"}
         as: cg
       - title: Allocate the KV cache tensors
         source: "vllm/v1/worker/gpu/model_runner.py:773-787"
@@ -208,10 +283,11 @@ interfaces:
     summary: "capture_model: captures decoder (and encoder) CUDA graphs and the speculator's, then locks the workspace; returns the graph pool size. With cudagraph_mode NONE it warns and captures nothing."
     sources: ["vllm/v1/worker/gpu/model_runner.py:1053-1132"]
     latency_ms: 0
+    request: {type: object, properties: {profile_only: {type: boolean, default: false}, max_full_descs_to_capture: {type: ["integer", "null"], default: null, description: "profiling only: capture this many of the largest FULL graphs"}}}
     response: {type: object, properties: {cuda_graph_memory_bytes: {type: integer}}}
     behavior:
       - call: cuda-graph-manager.capture
-        input: {}
+        input: {max_full_descs_to_capture: "= has(input.max_full_descs_to_capture) ? input.max_full_descs_to_capture : null"}
         as: cap
       - if: "!vars.cap.value.captured"
         then:
@@ -246,7 +322,7 @@ interfaces:
     name: get-supported-tasks
     kind: function
     summary: "get_supported_tasks: the generation tasks when runner_type is generate, plus the pooler's tasks for pooling models (--runner pooling converts a *ForCausalLM with --convert auto -> embed)."
-    sources: ["vllm/v1/worker/gpu/model_runner.py:367-376", "vllm/model_executor/layers/pooler/special.py:29-56"]
+    sources: ["vllm/v1/worker/gpu/model_runner.py:367-376", "vllm/model_executor/layers/pooler/special.py:29-56", "vllm/v1/worker/gpu_model_runner.py:3151-3156"]
     latency_ms: 0
     response: {type: object, properties: {tasks: {type: array}}}
     behavior:
@@ -257,10 +333,21 @@ interfaces:
           vars.tasks: "= vars.runner_type == 'generate' ? ['generate'] : []"
       - if: "vars.runner_type == 'pooling'"
         then:
-          - title: "Pooling tasks come from the model's pooler (as_embedding_model: embed and token_embed; as_seq_cls_model: classify and token_classify), intersected with the runner's supported set, sorted"
-            source: "vllm/v1/worker/gpu/pool/pooling_runner.py:61-64"
+          - title: "The model's pooler decides its tasks: a pooler the model declares (an IdentityPooler such as Terratorch's supports only plugin), else the converted pooler (as_embedding_model: embed and token_embed; as_seq_cls_model: classify and token_classify)"
+            source: "vllm/model_executor/layers/pooler/special.py:153-155"
             set:
-              vars.tasks: "= vars.tasks + (vars.convert == 'classify' ? ['classify', 'token_classify'] : ['embed', 'token_embed'])"
+              vars.pooler: "= has(state.model.pooler_tasks) ? state.model.pooler_tasks : (has(state.model.architecture) && state.model.architecture.startsWith('Terratorch') ? ['plugin'] : (vars.convert == 'classify' ? ['classify', 'token_classify'] : ['embed', 'token_embed']))"
+          - if: "config['use-v2-model-runner']"
+            then:
+              - title: "V2: the pooler's tasks intersected with the runner's supported set (embed, classify, token_embed, token_classify, embed&token_classify), sorted"
+                source: "vllm/v1/worker/gpu/pool/pooling_runner.py:61-64"
+                set:
+                  vars.tasks: "= vars.tasks + vars.pooler.filter(t, t in ['embed', 'classify', 'token_embed', 'token_classify', 'embed&token_classify']).sort()"
+            else:
+              - title: "V1: every task the pooler supports"
+                source: "vllm/v1/worker/gpu_model_runner.py:3151-3156"
+                set:
+                  vars.tasks: "= vars.tasks + vars.pooler"
       - return: {tasks: "= vars.tasks"}
   - component: gpu-model-runner
     name: reset-mm-cache
@@ -424,6 +511,12 @@ interfaces:
                   state.free_slots: "= state.free_slots + [state.slots[vars.rid].slot]"
                   vars.freed: "= vars.freed + [state.slots[vars.rid].slot]"
               - set: {state.slots: "= omit(state.slots, vars.rid)"}
+              - if: "config['model-is-multimodal']"
+                then:
+                  - title: The encoder cache drops the request's multimodal features
+                    source: "vllm/v1/worker/gpu/model_runner.py:1145-1146"
+                    call: encoder-cache.add-request
+                    input: {req_id: "= vars.rid", mm_features: null}
       - return: {freed: "= vars.freed"}
   - component: gpu-model-runner
     name: add-requests
@@ -470,6 +563,12 @@ interfaces:
           - set:
               state.slots: "= merge(state.slots, {vars.r.req_id: {'slot': vars.slot, 'prefill_len': vars.plen, 'prompt_len': has(vars.r.prompt_len) ? vars.r.prompt_len : vars.plen, 'prompt_hash': vars.phash, 'token_ids': vars.ptoks, 'last_sampled': size(vars.ptoks) > 0 ? vars.ptoks[size(vars.ptoks) - 1] : -1}})"
               vars.assigned: "= merge(vars.assigned, {vars.r.req_id: vars.slot})"
+          - if: "config['model-is-multimodal']"
+            then:
+              - title: The encoder cache records the request's multimodal features
+                source: "vllm/v1/worker/gpu/model_runner.py:1213-1214"
+                call: encoder-cache.add-request
+                input: {req_id: "= vars.r.req_id", mm_features: "= has(vars.r.mm_features) && vars.r.mm_features != null ? vars.r.mm_features : []"}
           - title: Copy the request's block ids into the GPU block-table row (overwrite)
             source: "vllm/v1/worker/gpu/model_runner.py:1216-1218"
             call: block-tables.append-block-ids
@@ -532,6 +631,8 @@ interfaces:
             new_block_ids_to_zero: {type: array, items: {type: integer}}
             preempted_req_ids: {type: array, items: {type: string}}
             kv_connector_metadata: {type: ["object", "null"], default: null, description: "SchedulerOutput.kv_connector_metadata (with a KV transfer connector)"}
+            scheduled_encoder_inputs: {type: object, default: {}, description: "SchedulerOutput.scheduled_encoder_inputs: req_id -> indices of its mm_features to encode this step"}
+            free_encoder_mm_hashes: {type: array, default: [], items: {type: string}, description: "SchedulerOutput.free_encoder_mm_hashes: encoder outputs the scheduler no longer needs"}
     response:
       anyOf:
         - {$ref: ModelRunnerOutput}
@@ -549,6 +650,15 @@ interfaces:
         input: {req_ids: "= input.finished_req_ids + (has(input.preempted_req_ids) ? input.preempted_req_ids : [])"}
       - call: gpu-model-runner.add-requests
         input: {reqs: "= input.scheduled_new_reqs", num_scheduled: "= input.num_scheduled_tokens"}
+      - if: "config['model-is-multimodal'] && has(input.free_encoder_mm_hashes) && size(input.free_encoder_mm_hashes) > 0"
+        then:
+          - title: free_states drops the encoder outputs the scheduler freed
+            source: "vllm/v1/worker/gpu/model_runner.py:1166-1169"
+            foreach: "= input.free_encoder_mm_hashes"
+            as: h
+            steps:
+              - call: encoder-cache.free-encoder-cache
+                input: {mm_hash: "= vars.h"}
       - call: gpu-model-runner.update-requests
         input:
           cached: "= input.scheduled_cached_reqs"
@@ -571,7 +681,7 @@ interfaces:
         then:
           - title: A scheduled request the runner never added
             source: "vllm/v1/worker/gpu/model_runner.py:1298-1299"
-            fail: {code: key-error, status: 0, message: "= vars.req_ids.filter(id, !(id in state.slots))[0]"}
+            fail: {code: key-error, status: 0, message: "= \"'\" + vars.req_ids.filter(id, !(id in state.slots))[0] + \"'\""}
       - set:
           vars.nct: "= merge(input.scheduled_new_reqs.transformMapEntry(i, r, {r.req_id: r.num_computed_tokens}), input.scheduled_cached_reqs.req_ids.transformMapEntry(i, id, {id: input.scheduled_cached_reqs.num_computed_tokens[i]}))"
       - title: Gather the batch in decode-first order
@@ -629,7 +739,7 @@ interfaces:
         source: "vllm/v1/worker/gpu/model_runner.py:1915-1926"
         call: flash-attention-metadata-builder.build
         input:
-          fa_version: 3
+          fa_version: "= 'flash-attn-version' in config && config['flash-attn-version'] != null ? int(config['flash-attn-version']) : 3"
           fast_build: false
           batch_invariant: false
           sliding_window_configs: 1
@@ -646,6 +756,19 @@ interfaces:
             block_table: "= vars.bt.value.block_table"
             slot_mapping: "= lists.range(size(vars.batch)).map(i, lists.range(vars.batch[i].n).map(j, (vars.batch[i].nct + j) / int(config['block-size']) < size(vars.bt.value.block_table[i]) ? vars.bt.value.block_table[i][(vars.batch[i].nct + j) / int(config['block-size'])] * int(config['block-size']) + (vars.batch[i].nct + j) % int(config['block-size']) : -1)).flatten()"
             causal: true
+      - if: "config['model-is-multimodal'] && state.is_first_pp_rank && has(input.scheduled_encoder_inputs) && size(input.scheduled_encoder_inputs) > 0"
+        then:
+          - call: encoder-cache.get-state
+            input: {}
+            as: ec
+          - title: "prepare_inputs_embeds: run the vision encoder on this step's uncached items (first PP rank) before gathering the embeddings"
+            source: "vllm/v1/worker/gpu/model_runner.py:1939-1956"
+            call: encoder-runner.execute-mm-encoder
+            input:
+              scheduled_encoder_inputs: "= input.scheduled_encoder_inputs"
+              mm_features: "= vars.ec.value.mm_features"
+              cached: "= vars.ec.value.cached"
+              model_component: "= (has(state.model_component) && state.model_component != '' ? state.model_component : (has(state.model.architecture) && state.model.architecture.startsWith('Mixtral') ? 'mixtral-for-causal-lm' : (has(state.model.architecture) && state.model.architecture.startsWith('Qwen2VL') ? 'qwen2-vl-for-conditional-generation' : 'llama-for-causal-lm')))"
       - if: "state.model.uses_mrope || state.model.uses_prompt_embeds"
         then:
           - when: "state.model.uses_mrope"
@@ -686,11 +809,12 @@ interfaces:
               - title: PIECEWISE graphs through the compiled model
                 source: "vllm/v1/worker/gpu/model_runner.py:2034-2042"
                 call: cuda-graph-manager.run-pw-graph
-                input: "= vars.fwd"
+                input: "= merge(vars.fwd, {'model_component': (has(state.model_component) && state.model_component != '' ? state.model_component : (has(state.model.architecture) && state.model.architecture.startsWith('Mixtral') ? 'mixtral-for-causal-lm' : (has(state.model.architecture) && state.model.architecture.startsWith('Qwen2VL') ? 'qwen2-vl-for-conditional-generation' : 'llama-for-causal-lm')))})"
             else:
-              - title: Eager forward
+              - title: Eager forward of the loaded model
                 source: "vllm/v1/worker/gpu/model_runner.py:2043-2044"
-                call: llama-for-causal-lm.forward
+                call: "= (has(state.model_component) && state.model_component != '' ? state.model_component : (has(state.model.architecture) && state.model.architecture.startsWith('Mixtral') ? 'mixtral-for-causal-lm' : (has(state.model.architecture) && state.model.architecture.startsWith('Qwen2VL') ? 'qwen2-vl-for-conditional-generation' : 'llama-for-causal-lm'))) + '.forward'"
+                targets: [llama-for-causal-lm.forward, mixtral-for-causal-lm.forward, qwen2-vl-for-conditional-generation.forward]
                 input: "= vars.fwd"
               - title: Kernel-launch overhead of an eager step (assumption)
                 wait: "= int(config['worker-runner-eager-launch-overhead-ms'])"
@@ -817,7 +941,7 @@ interfaces:
       - title: Prompt logprobs for requests that asked for them
         source: "vllm/v1/worker/gpu/model_runner.py:2150-2159"
         call: prompt-logprobs-worker.compute-prompt-logprobs
-        input: {new_reqs: "= vars.ems.new_reqs"}
+        input: {new_reqs: "= vars.ems.new_reqs", model_component: "= (has(state.model_component) && state.model_component != '' ? state.model_component : (has(state.model.architecture) && state.model.architecture.startsWith('Mixtral') ? 'mixtral-for-causal-lm' : (has(state.model.architecture) && state.model.architecture.startsWith('Qwen2VL') ? 'qwen2-vl-for-conditional-generation' : 'llama-for-causal-lm')))"}
       - title: Post-update num_computed_tokens, last sampled tokens and output bin counts
         source: "vllm/v1/worker/gpu/model_runner.py:2217-2223"
         call: input-batch.post-update-kernel
@@ -885,7 +1009,10 @@ interfaces:
           - title: "Each rank samples only its owned requests, and the all-gather restores every request's tokens in batch order; the model's stand-in tokens are per request, so the gathered result equals sampling every row"
             source: "vllm/v1/worker/gpu/model_runner.py:1655-1675"
             set: {ctx.local_sampled_reqs: "= vars.shard.value.local_batch.req_ids"}
-      - call: llama-for-causal-lm.compute-logits
+      - title: The loaded model's compute_logits
+        source: "vllm/v1/worker/gpu/model_runner.py:1610-1615"
+        call: "= (has(state.model_component) && state.model_component != '' ? state.model_component : (has(state.model.architecture) && state.model.architecture.startsWith('Mixtral') ? 'mixtral-for-causal-lm' : (has(state.model.architecture) && state.model.architecture.startsWith('Qwen2VL') ? 'qwen2-vl-for-conditional-generation' : 'llama-for-causal-lm'))) + '.compute-logits'"
+        targets: [llama-for-causal-lm.compute-logits, mixtral-for-causal-lm.compute-logits, qwen2-vl-for-conditional-generation.compute-logits]
         input: {num_tokens: "= size(input.batch) + input.num_drafts"}
       - set: {vars.allowed: {}}
       - if: "input.grammar_output != null && has(input.grammar_output.structured_output_request_ids)"
@@ -976,8 +1103,8 @@ interfaces:
     summary: "get_kv_cache_spec: one full-attention spec per layer; page size = 2 (K and V) * block_size * kv heads per TP rank * head size * dtype bytes."
     sources: ["vllm/v1/worker/gpu/attn_utils.py:139-194"]
     latency_ms: 0
-    request: {type: object, properties: {num_hidden_layers: {type: integer}, num_kv_heads: {type: integer}, head_size: {type: integer}, dtype_bytes: {type: integer}, use_mla: {type: boolean, default: false}}}
-    response: {type: object, properties: {num_layers: {type: integer}, block_size: {type: integer}, num_kv_heads_per_rank: {type: integer}, page_size_bytes: {type: integer}, spec: {type: object}, cache_dtype_str: {type: string}, kv_quant_mode: {type: string}}}
+    request: {type: object, properties: {num_hidden_layers: {type: integer}, num_kv_heads: {type: integer}, head_size: {type: integer}, dtype_bytes: {type: integer}, use_mla: {type: boolean, default: false}, kv_cache_dtype: {type: string, default: auto, description: "cache_config.cache_dtype (--kv-cache-dtype)"}}}
+    response: {type: object, properties: {num_layers: {type: integer}, block_size: {type: integer}, num_kv_heads_per_rank: {type: integer}, page_size_bytes: {type: integer}, spec: {type: object}, cache_dtype_str: {type: string}, kv_quant_mode: {type: string}, kv_dtype_bytes: {type: integer}}}
     behavior:
       - if: "has(input.use_mla) && input.use_mla"
         then:
@@ -996,16 +1123,25 @@ interfaces:
               kv_quant_mode: "= vars.mla.value.kv_quant_mode"
       - set:
           vars.kvh: "= input.num_kv_heads >= int(config['tensor-parallel-size']) ? input.num_kv_heads / int(config['tensor-parallel-size']) : 1"
-      - title: "Each decoder layer reports a FullAttentionSpec (block_size, this rank's KV heads, head size, dtype)"
-        source: "vllm/v1/worker/gpu/attn_utils.py:142-152"
+          vars.cd: "= has(input.kv_cache_dtype) && input.kv_cache_dtype != null ? input.kv_cache_dtype : 'auto'"
+      - title: "The layer's KV dtype: auto keeps the model dtype; any other cache dtype maps through STR_DTYPE_TO_TORCH_DTYPE (fp8, fp8_e4m3, fp8_e5m2, int8 and the packed formats are 1-byte uint8/int8 storage)"
+        source: "vllm/model_executor/layers/attention/attention.py:323-325"
         set:
-          vars.spec: "= {'type': 'full_attention', 'block_size': int(config['block-size']), 'num_kv_heads': vars.kvh, 'head_size': input.head_size, 'dtype_bytes': input.dtype_bytes}"
-      - return:
+          vars.db: "= vars.cd == 'auto' ? input.dtype_bytes : (vars.cd in ['float32', 'float'] ? 4 : (vars.cd in ['half', 'float16', 'bfloat16'] ? 2 : 1))"
+      - title: "Each decoder layer reports a FullAttentionSpec (block_size, this rank's KV heads, head size, kv_cache_torch_dtype)"
+        source: "vllm/model_executor/layers/attention/attention.py:640-646"
+        set:
+          vars.spec: "= {'type': 'full_attention', 'block_size': int(config['block-size']), 'num_kv_heads': vars.kvh, 'head_size': input.head_size, 'dtype_bytes': vars.db, 'cache_dtype_str': vars.cd}"
+      - title: "page_size_bytes = 2 (K and V) * block_size * num_kv_heads * head_size * dtype size"
+        source: "vllm/v1/kv_cache_interface.py:544-553"
+        return:
           num_layers: "= input.num_hidden_layers"
           block_size: "= int(config['block-size'])"
           num_kv_heads_per_rank: "= vars.kvh"
-          page_size_bytes: "= 2 * int(config['block-size']) * vars.kvh * input.head_size * input.dtype_bytes"
+          page_size_bytes: "= 2 * int(config['block-size']) * vars.kvh * input.head_size * vars.db"
           spec: "= vars.spec"
+          cache_dtype_str: "= vars.cd"
+          kv_dtype_bytes: "= vars.db"
   - component: attn-utils
     name: init-kv-cache
     kind: function
@@ -1043,17 +1179,26 @@ interfaces:
     summary: "ModelCudaGraphManager construction: capture sizes [1, 2, 4] + 8..248 step 8 + 256..max step 16, max = min(max_num_seqs * decode_query_len * 2, 512) unless set; FULL descriptors for uniform decode, PIECEWISE for mixed batches (FULL_AND_PIECEWISE); none with enforce_eager or mode NONE."
     sources: ["vllm/v1/worker/gpu/cudagraph_utils.py:251-390", "vllm/config/vllm.py:2354-2363"]
     latency_ms: 0
-    request: {type: object, properties: {decode_query_len: {type: integer}}}
+    request: {type: object, properties: {decode_query_len: {type: integer}, cudagraph_mode: {type: ["string", "null"], default: null, description: "the mode resolve_cudagraph_mode_and_sizes returned; None reads compilation_config.cudagraph_mode"}}}
     response: {type: object, properties: {cudagraph_mode: {type: string}, max_capture_size: {type: integer}}}
     behavior:
       - set:
-          vars.mode: "= config['enforce-eager'] ? 'NONE' : config['cudagraph-mode']"
-          vars.max: "= int(config['max-cudagraph-capture-size']) > 0 ? int(config['max-cudagraph-capture-size']) : (int(config['max-num-seqs']) * input.decode_query_len * 2 < 512 ? int(config['max-num-seqs']) * input.decode_query_len * 2 : 512)"
+          vars.mode: "= config['enforce-eager'] ? 'NONE' : (has(input.cudagraph_mode) && input.cudagraph_mode != null ? input.cudagraph_mode : config['cudagraph-mode'])"
+      - call: gpu-memory.snapshot
+        input: {}
+        as: dev
+      - title: "The default ceiling: min(max_num_seqs * decode_query_len * 2, 512), or 1024 on the Blackwell (SM 10.x) family"
+        source: "vllm/config/vllm.py:2354-2363"
+        set:
+          vars.ceil: "= vars.dev.value.compute_capability.startsWith('10.') ? 1024 : 512"
+      - set:
+          vars.max: "= int(config['max-cudagraph-capture-size']) > 0 ? int(config['max-cudagraph-capture-size']) : (int(config['max-num-seqs']) * input.decode_query_len * 2 < vars.ceil ? int(config['max-num-seqs']) * input.decode_query_len * 2 : vars.ceil)"
       - set:
           state.mode: "= vars.mode"
           state.decode_query_len: "= input.decode_query_len"
           state.capture_sizes: "= vars.mode == 'NONE' ? [] : ([1, 2, 4] + lists.range(31).map(i, 8 * (i + 1)) + lists.range(49).map(i, 256 + 16 * i)).filter(s, s <= vars.max)"
           state.graphs_captured: false
+          state.full_graphs: {}
       - return: {cudagraph_mode: "= vars.mode", max_capture_size: "= vars.mode == 'NONE' ? 0 : vars.max"}
   - component: cuda-graph-manager
     name: dispatch
@@ -1092,15 +1237,93 @@ interfaces:
     summary: "Captures every descriptor (largest first) through dummy runs and records the graph pool's memory."
     sources: ["vllm/v1/worker/gpu/cudagraph_utils.py:419-510", "vllm/v1/worker/gpu/cudagraph_utils.py:606-665"]
     latency_ms: 0
-    response: {type: object, properties: {captured: {type: boolean}, bytes: {type: integer}, num_sizes: {type: integer}}}
+    request: {type: object, properties: {max_full_descs_to_capture: {type: ["integer", "null"], default: null, description: "profiling only: capture this many of the largest FULL graphs"}}}
+    response: {type: object, properties: {captured: {type: boolean}, bytes: {type: integer}, num_sizes: {type: integer}, num_full_captured: {type: integer}, num_piecewise_captured: {type: integer}}}
     behavior:
       - if: "!has(state.mode) || state.mode == 'NONE' || size(state.capture_sizes) == 0"
-        then: [{return: {captured: false, bytes: 0, num_sizes: 0}}]
-      - call: gpu-memory.allocate
+        then: [{return: {captured: false, bytes: 0, num_sizes: 0, num_full_captured: 0, num_piecewise_captured: 0}}]
+      - title: "Descriptors per mode, largest first: FULL decode graphs up to max_num_reqs * decode_query_len tokens (every size when the mixed mode is FULL too), PIECEWISE graphs at every size"
+        source: "vllm/v1/worker/gpu/cudagraph_utils.py:302-370"
+        set:
+          vars.dql: "= has(state.decode_query_len) ? state.decode_query_len : 1"
+          vars.desc_sizes: "= state.capture_sizes.sortBy(x, -x)"
+      - set:
+          vars.full: "= state.mode == 'FULL' ? vars.desc_sizes : (state.mode in ['FULL_AND_PIECEWISE', 'FULL_DECODE_ONLY'] ? vars.desc_sizes.filter(n, n <= int(config['max-num-seqs']) * vars.dql && n % vars.dql == 0) : [])"
+          vars.pw: "= state.mode in ['PIECEWISE', 'FULL_AND_PIECEWISE'] ? vars.desc_sizes : []"
+      - title: "Profiling captures only a sample of the largest FULL graphs (_max_full_descs_to_capture)"
+        source: "vllm/v1/worker/gpu/cudagraph_utils.py:445-453"
+        when: "has(input.max_full_descs_to_capture) && input.max_full_descs_to_capture != null && size(vars.full) > input.max_full_descs_to_capture"
+        set: {vars.full: "= vars.full.slice(0, input.max_full_descs_to_capture)"}
+      - title: "PIECEWISE first (larger activations), each a warmup then a capture through the compiled model's piecewise wrappers"
+        source: "vllm/v1/worker/gpu/cudagraph_utils.py:439-472"
+        set: {state.piecewise_captured: "= vars.pw"}
+      - title: "Then FULL: for each descriptor a warmup, then capture_pool points NCCL's graph allocator at the pool and torch.cuda.graph records the forward"
+        source: "vllm/v1/worker/gpu/cudagraph_utils.py:473-505"
+        foreach: "= vars.full"
+        as: n
+        max: 1000
+        steps:
+          - call: cuda-graph-manager.capture-pool
+            input: {pool: "= has(state.pool) && state.pool != null ? state.pool : 'global'"}
+          - call: cuda-graph-manager.capture-cuda-graph
+            input: {num_tokens: "= vars.n", num_reqs: "= state.mode == 'FULL' ? (vars.n < int(config['max-num-seqs']) ? vars.n : int(config['max-num-seqs'])) : vars.n / vars.dql"}
+      - title: The graph pool's memory (assumed constant for the 8B model)
+        source: "vllm/v1/worker/gpu/model_runner.py:1121-1124"
+        call: gpu-memory.allocate
         input: {kind: cudagraph, bytes: "= int(config['worker-runner-cudagraph-memory-bytes'])"}
         as: a
       - set: {state.graphs_captured: true}
-      - return: {captured: true, bytes: "= vars.a.value.bytes", num_sizes: "= size(state.capture_sizes)"}
+      - return: {captured: true, bytes: "= vars.a.value.bytes", num_sizes: "= size(state.capture_sizes)", num_full_captured: "= size(vars.full)", num_piecewise_captured: "= size(vars.pw)"}
+  - component: cuda-graph-manager
+    name: capture-pool
+    kind: function
+    summary: "capture_pool: yields the pool to capture into (the CuMem graph pool when sleep mode offloads graph memory) and first points NCCL's graph allocator at it (pynccl_allocator.set_graph_pool_id)."
+    sources: ["vllm/compilation/cudagraph_pool.py:33-45"]
+    latency_ms: 0
+    request: {type: object, properties: {pool: {type: ["string", "null"], default: null}}}
+    response: {type: object, properties: {graph_pool_id: {type: string}}}
+    behavior:
+      - title: "set_graph_pool_id(pool or the platform's graph pool handle)"
+        source: "vllm/compilation/cudagraph_pool.py:44-45"
+        set: {state.graph_pool_id: "= has(input.pool) && input.pool != null ? input.pool : 'global'"}
+      - return: {graph_pool_id: "= state.graph_pool_id"}
+  - component: cuda-graph-manager
+    name: capture-cuda-graph
+    kind: function
+    summary: "One FULL descriptor's capture: a fresh-attention-state forward recorded inside torch.cuda.graph(graph, pool), on the pool capture_pool set; the graph is stored under its descriptor."
+    sources: ["vllm/v1/worker/gpu/cudagraph_utils.py:476-505"]
+    latency_ms: 0
+    errors: [{code: assertion-error, status: 0, retryable: false}]
+    request: {type: object, required: [num_tokens], properties: {num_tokens: {type: integer}, num_reqs: {type: integer}}}
+    response: {type: object, properties: {num_tokens: {type: integer}, graph_pool_id: {type: ["string", "null"]}}}
+    behavior:
+      - set: {vars.key: "= string(input.num_tokens)"}
+      - if: "has(state.full_graphs) && vars.key in state.full_graphs"
+        then:
+          - source: "vllm/v1/worker/gpu/cudagraph_utils.py:481-483"
+            fail: {code: assertion-error, status: 0, message: "= 'Graph already captured for BatchExecutionDescriptor(cg_mode=<CUDAGraphMode.FULL: 2>, num_tokens=' + vars.key + ')'"}
+      - set: {state.full_graphs: "= merge(has(state.full_graphs) ? state.full_graphs : {}, {vars.key: has(state.graph_pool_id) ? state.graph_pool_id : null})"}
+      - return: {num_tokens: "= input.num_tokens", graph_pool_id: "= has(state.graph_pool_id) ? state.graph_pool_id : null"}
+  - component: cuda-graph-manager
+    name: needs-capture
+    kind: function
+    summary: "needs_capture: whether any capture descriptor is left (none with mode NONE or no capture sizes)."
+    sources: ["vllm/v1/worker/gpu/cudagraph_utils.py:408-409"]
+    latency_ms: 0
+    response: {type: object, properties: {needs_capture: {type: boolean}}}
+    behavior:
+      - return: {needs_capture: "= has(state.mode) && state.mode != 'NONE' && has(state.capture_sizes) && size(state.capture_sizes) > 0"}
+  - component: cuda-graph-manager
+    name: release
+    kind: function
+    summary: "Dropping the runner's CUDA graph manager (profiling teardown): its graphs and throwaway pool go with it."
+    sources: ["vllm/v1/worker/gpu/cudagraph_utils.py:1036-1037"]
+    latency_ms: 0
+    behavior:
+      - set:
+          state.graphs_captured: false
+          state.full_graphs: {}
+          state.piecewise_captured: []
   - component: cuda-graph-manager
     name: run-fullgraph
     kind: function
@@ -1118,10 +1341,13 @@ interfaces:
     summary: "run_pw_graph: calls the torch-compiled model whose piecewise CUDA graphs replay between attention ops."
     sources: ["vllm/v1/worker/gpu/cudagraph_utils.py:571-576"]
     latency_ms: 0
-    request: {type: object, properties: {num_tokens: {type: integer}, num_prefill_tokens: {type: integer}, num_decode_reqs: {type: integer}}}
+    request: {type: object, properties: {num_tokens: {type: integer}, num_prefill_tokens: {type: integer}, num_decode_reqs: {type: integer}, model_component: {type: string, default: llama-for-causal-lm, description: "the loaded model's component (its architecture)"}}}
     behavior:
-      - call: llama-for-causal-lm.forward
-        input: "= input"
+      - title: The compiled model is the loaded architecture's
+        source: "vllm/v1/worker/gpu/cudagraph_utils.py:571-576"
+        call: "= (has(input.model_component) ? input.model_component : 'llama-for-causal-lm') + '.forward'"
+        targets: [llama-for-causal-lm.forward, mixtral-for-causal-lm.forward, qwen2-vl-for-conditional-generation.forward]
+        input: {num_tokens: "= input.num_tokens", num_prefill_tokens: "= has(input.num_prefill_tokens) ? input.num_prefill_tokens : 0", num_decode_reqs: "= has(input.num_decode_reqs) ? input.num_decode_reqs : 0"}
       - title: Launch overhead left between piecewise graphs (assumption)
         wait: "= int(config['worker-runner-piecewise-launch-overhead-ms'])"
       - set: {ctx.last_cg_mode: PIECEWISE}

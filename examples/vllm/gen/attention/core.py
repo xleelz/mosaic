@@ -37,8 +37,13 @@ KV_DTYPES = ["auto", "float16", "bfloat16", "fp8", "fp8_e4m3", "fp8_e5m2", "fp8_
              "nvfp4_ds_mla", "turboquant_k8v4", "turboquant_4bit_nc", "turboquant_k3v4_nc",
              "turboquant_3bit_nc", "ultraquant_4bit", "int4_per_token_head", "int8_per_token_head",
              "fp8_per_token_head", "nvfp4", "nvfp4_4over6"]
+# is_quantized_kv_cache (kv_cache_interface.py:91-116): every get_kv_quant_mode result but NONE.
 QUANT = ("(input.kv_cache_dtype.startsWith('fp8') || input.kv_cache_dtype.endsWith('per_token_head')"
-         " || input.kv_cache_dtype.startsWith('nvfp4'))")
+         " || input.kv_cache_dtype.startsWith('nvfp4') || input.kv_cache_dtype.startsWith('turboquant_') || input.kv_cache_dtype == 'ultraquant_4bit')")
+# flash_attn_supports_kv_cache_dtype (fa_utils.py:282-312): never fp8_e5m2; FA3 on SM90, FA4 on SM90 with head 512
+# (or no head given), or FA4 on SM100. MAJOR, VER and HEAD are replaced by the caller's expressions.
+FA_KV_OK = ("(input.kv_cache_dtype != 'fp8_e5m2' && ((MAJOR == 9 && (VER == 3 || (VER == 4 && (HEAD == null || HEAD == 512))))"
+            " || (VER == 4 && MAJOR == 10)))")
 
 
 def err(code, summary):
@@ -127,7 +132,7 @@ def schemas():
              "layer_name": S("model.layers.0.self_attn.attn"),
              "attn_type": S("decoder", enum=["decoder", "encoder", "encoder_only", "encoder_decoder"]),
              "num_tokens": I(24), "num_heads": I(32), "num_kv_heads": I(8), "head_size": I(128),
-             "kv_cache_dtype": S("auto"), "fa_version": I(3), "dcp_world_size": I(1),
+             "kv_cache_dtype": S("auto"), "fa_version": I(3), "dcp_world_size": I(1), "device_capability_major": I(9),
              "has_output_scale": B(False), "has_output_block_scale": B(False),
              "has_alibi": B(False), "has_sinks": B(False), "profiling_run": B(False),
              "kv_quant_mode": S("none", enum=["none", "fp8_per_tensor", "int8_per_token_head", "fp8_per_token_head", "int4_per_token_head"]),
@@ -136,13 +141,13 @@ def schemas():
             "attn_type": S("decoder"), "num_tokens": I(24), "num_kv_heads": I(8), "head_size": I(128),
             "kv_cache_dtype": S("auto"), "kv_quant_mode": S("none"),
             "slot_mapping": {"type": "array", "items": {"type": "integer"}, "examples": [[32, 33, 34]]},
-            "device_capability_major": I(9)}}},
+            "device_capability_major": I(9), "device_capability_minor": I(0)}}},
         {"id": "AttnMergeRequest", "schema": {"type": "object", "properties": {
             "platform": S("cuda", enum=["cuda", "rocm", "cpu", "xpu"]), "cdna_version": I(3),
             "dtype": S("bfloat16"), "output_dtype": S("bfloat16"), "head_size": I(128), "num_tokens": I(24),
             "num_heads": I(32), "has_output_scale": B(False),
             "prefill_tokens_with_context": {"type": ["integer", "null"], "default": None},
-            "head_strides_match": B(True)}}},
+            "head_strides_match": B(True), "prefix_head_stride": I(128), "suffix_head_stride": I(128)}}},
     ]
 
 
@@ -263,19 +268,19 @@ def components():
              "kv_prefix": "", "head_size_rule": "list", "head_sizes": [], "min_capability": 0, "max_capability": 1000,
              "capability_majors": [], "sink_rule": "never", "mm_prefix_rule": "never", "per_head_quant_rule": "never",
              "block_multiple": 16, "is_mla": False, "is_sparse": False, "sliding_window": False, "batch_invariance": False,
-             "attn_types": ["decoder"], "pcp": False, "dcp": False, "combination_rule": "none"}
+             "attn_types": ["decoder"], "pcp": False, "dcp": False, "combination_rule": "none", "rswa": False, "non_causal": False}
         r.update(kw)
         return r
     FP8 = ["auto", "float16", "bfloat16", "fp8", "fp8_e4m3"]
     fa_row = row("FLASH_ATTN", kv_cache_dtypes=FP8, head_size_rule="fa", min_capability=80, sink_rule="fa", mm_prefix_rule="fa4",
-                 per_head_quant_rule="fa3", sliding_window=True, batch_invariance=True, attn_types=ALL_T, dcp=True, combination_rule="fa")
+                 per_head_quant_rule="fa3", sliding_window=True, batch_invariance=True, attn_types=ALL_T, dcp=True, combination_rule="fa", rswa=True, non_causal=True)
     tr_row = row("TRITON_ATTN", dtypes=["float16", "bfloat16", "float32"],
                  kv_cache_dtypes=FP8 + ["fp8_e5m2", "int4_per_token_head", "int8_per_token_head", "fp8_per_token_head"],
-                 head_size_rule="min32", sink_rule="always", mm_prefix_rule="always", sliding_window=True, batch_invariance=True, attn_types=ALL_T)
+                 head_size_rule="min32", sink_rule="always", mm_prefix_rule="always", sliding_window=True, batch_invariance=True, attn_types=ALL_T, rswa=True, non_causal=True)
     fi_row = row("FLASHINFER", kv_cache_dtypes=FP8 + ["fp8_e5m2", "nvfp4", "nvfp4_4over6"], head_sizes=[64, 128, 256, 512],
-                 min_capability=80, max_capability=121, sliding_window=True)
+                 min_capability=80, max_capability=121, sliding_window=True, non_causal=True)
     flex_row = row("FLEX_ATTENTION", dtypes=["float16", "bfloat16", "float32"], mm_prefix_rule="always", sliding_window=True,
-                   batch_invariance=True, attn_types=["decoder", "encoder_only"])
+                   batch_invariance=True, attn_types=["decoder", "encoder_only"], rswa=True, non_causal=True)
     tq_row = row("TURBOQUANT", kv_cache_dtypes=[], kv_none_ok=False, kv_prefix="turboquant_", head_size_rule="positive")
     mla = dict(is_mla=True, head_sizes=[320, 512, 576])
     backends = {
@@ -283,8 +288,8 @@ def components():
         "TRITON_FLASH_ATTN": dict(fa_row, name="TRITON_FLASH_ATTN"), "TRITON_FLASHINFER": dict(fi_row, name="TRITON_FLASHINFER"),
         "FLASH_ATTN_MLA": row("FLASH_ATTN_MLA", capability_majors=[9], batch_invariance=True, **mla),
         "FLASHMLA": row("FLASHMLA", kv_cache_dtypes=FP8, capability_majors=[9, 10], block_multiple=64, **mla),
-        "FLASHINFER_MLA": row("FLASHINFER_MLA", kv_cache_dtypes=FP8, capability_majors=[10], block_multiple=32, **mla),
-        "TRITON_MLA": row("TRITON_MLA", kv_cache_dtypes=FP8, is_mla=True, head_sizes=[], batch_invariance=True),
+        "FLASHINFER_MLA": row("FLASHINFER_MLA", kv_cache_dtypes=FP8, capability_majors=[10], block_multiple=32, non_causal=True, **mla),
+        "TRITON_MLA": row("TRITON_MLA", kv_cache_dtypes=FP8, is_mla=True, head_sizes=[], batch_invariance=True, non_causal=True),
         "CUTLASS_MLA": row("CUTLASS_MLA", kv_cache_dtypes=FP8, capability_majors=[10], block_multiple=128, **mla),
     }
     out.append(comp("attention-backend", "AttentionBackend", BK,
@@ -377,7 +382,7 @@ def selection_interfaces():
         [
             {"if": "input.kv_cache_dtype != null && !(input.kv_cache_dtype in " + str(KV_DTYPES).replace('"', "'") + ")",
              "then": [{"title": "Invalid kv_cache_dtype", "source": C(SEL, ln(SEL, r"assert kv_cache_dtype in valid_cache_dtypes")),
-                       "fail": {"code": "assertion-error", "message": "= 'Invalid kv_cache_dtype: ' + input.kv_cache_dtype"}}]},
+                       "fail": {"code": "assertion-error", "message": "= 'Invalid kv_cache_dtype: ' + input.kv_cache_dtype + \". Valid values are: (" + ", ".join(repr(x) for x in KV_DTYPES) + ")\""}}]},
             {"title": "Build the AttentionSelectorConfig", "detail": "block_size is passed only when the user set it (the fixtures don't, so None); use_dcp reads decode_context_parallel_size.",
              "source": C(SEL, ln(SEL, r"attn_selector_config = AttentionSelectorConfig\("), ln(SEL, r"use_rswa=\(") + 3),
              "set": {"vars.backend": "= 'attention-backend' in config ? config['attention-backend'] : null",
@@ -424,10 +429,11 @@ def selection_interfaces():
     sink_ok = f"({row}.sink_rule == 'always' || (input.fa_version != null && input.fa_version >= 3))"
     mm_ok = f"({row}.mm_prefix_rule == 'always' || input.fa4_supported)"
     phq_ok = f"({row}.per_head_quant_rule == 'fa3' && input.fa_version != null && input.fa_version >= 3)"
-    fakv = ("(input.kv_cache_dtype != 'fp8_e5m2' && ((input.fa_version == 3 && input.device_capability.major == 9)"
-            " || (input.fa_version == 4 && input.device_capability.major == 10)))")
+    fakv = FA_KV_OK.replace("MAJOR", "input.device_capability.major").replace("VER", "input.fa_version").replace("HEAD", "input.head_size")
+    # supports_kv_cache_dtype asks flash_attn_supports_kv_cache_dtype without a head size; supports_combination passes it.
+    fakv_nohead = FA_KV_OK.replace("MAJOR", "input.device_capability.major").replace("VER", "input.fa_version").replace("(HEAD == null || HEAD == 512)", "true")
     kv_ok = (f"(input.kv_cache_dtype == null ? {row}.kv_none_ok : ((input.kv_cache_dtype in {row}.kv_cache_dtypes || ({row}.kv_prefix != '' && input.kv_cache_dtype.startsWith({row}.kv_prefix)))"
-             f" && ({row}.name != 'FLASH_ATTN' || !{QUANT} || {fakv})))")
+             f" && ({row}.name != 'FLASH_ATTN' || !{QUANT} || {fakv_nohead})))")
     beh = [
         {"if": "!(input.backend in state.backends)",
          "then": [{"title": "Unknown backend name", "detail": "AttentionBackendEnum has no such member among the modeled backends (the CUDA priority lists).",
@@ -443,22 +449,27 @@ def selection_interfaces():
         chk(f"!input.use_mla && {row}.is_mla", "non-MLA not supported", r"\"non-MLA not supported\""),
         chk(f"input.has_sink && !{sink_ok}", "attention sinks not supported", r"attention sinks not supported"),
         chk(f"input.use_sparse && !{row}.is_sparse", "sparse not supported", r"\"sparse not supported\""),
+        chk(f"!input.use_sparse && {row}.is_sparse", "non-sparse not supported", r"\"non-sparse not supported\""),
         chk(f"input.use_per_head_quant_scales && !{phq_ok}", "per-head quant scales not supported", r"per-head quant scales not supported"),
         chk(f"{cap} < {row}.min_capability || {cap} > {row}.max_capability || (size({row}.capability_majors) > 0 && !(input.device_capability.major in {row}.capability_majors))", "compute capability not supported", r"compute capability not supported"),
         {"if": f"!(input.attn_type in {row}.attn_types)",
          "then": [{"title": "attention type not supported", "source": C(BK, ln(BK, r"attention type \{attn_type\} not supported", va)),
                    "set": {"vars.reasons": "= vars.reasons + ['attention type ' + input.attn_type + ' not supported']"}}]},
         chk(f"input.has_sliding_window && !{row}.sliding_window", "sliding window not supported", r"sliding window not supported"),
+        chk(f"input.use_rswa && !{row}.rswa", "R-SWA not supported", r"\"R-SWA not supported\""),
+        chk(f"input.use_non_causal && !{row}.non_causal", "non-causal attention not supported", r"\"non-causal attention not supported\""),
         chk(f"input.use_batch_invariant && !{row}.batch_invariance", "batch invariance not supported", r"batch invariance not supported"),
         chk(f"input.use_pcp && !{row}.pcp", "PCP not supported", r"PCP not supported"),
         chk(f"input.use_dcp && !{row}.dcp", "DCP not supported", r"DCP not supported"),
-        {"if": f"{row}.combination_rule == 'fa' && input.has_sink && {cap} < 90",
-         "then": [{"title": "FlashAttention combination: sinks need SM90+", "source": C(FA, ln(FA, r"sink not supported on compute capability < 9.0")),
-                   "set": {"vars.reasons": "= vars.reasons + ['sink not supported on compute capability < 9.0']"}}]},
-        {"if": f"{row}.combination_rule == 'fa' && input.kv_cache_dtype != null && {QUANT} && !(input.kv_cache_dtype != 'fp8_e5m2' && ((input.fa_version == 3 && input.device_capability.major == 9) || (input.fa_version == 4 && input.device_capability.major == 10)))",
-         "then": [{"title": "FlashAttention combination: FP8 KV needs FA3 on SM90 or FA4 on SM100",
-                   "source": C(FA, ln(FA, r"FP8 KV cache requires FA3 on SM90")),
-                   "set": {"vars.reasons": "= vars.reasons + ['FP8 KV cache requires FA3 on SM90, FA4 with head_size=512 on SM90, or FA4 on SM100']"}}]},
+        {"if": f"{row}.combination_rule == 'fa'",
+         "then": [{"title": "FlashAttention's supports_combination returns the first reason it finds", "source": Cfn(FA, "supports_combination"),
+                   "set": {"vars.comb": "= (input.has_sink && " + cap + " < 90) ? 'sink not supported on compute capability < 9.0'"
+                           " : ((input.use_mm_prefix && input.kv_cache_dtype != null && " + QUANT + " && " + cap + " == 90) ? 'SM90 FP8 KV with mm_prefix requires Triton'"
+                           " : ((input.kv_cache_dtype != null && " + QUANT + " && !" + fakv + ") ? 'FP8 KV cache requires FA3 on SM90, FA4 with head_size=512 on SM90, or FA4 on SM100'"
+                           " : ((input.use_mm_prefix && input.fa_version != 4) ? 'mm_prefix (PrefixLM bidirectional attention) requires FlashAttention v4, which does not resolve for this head_size' : '')))"}},
+                  {"if": "vars.comb != ''",
+                   "then": [{"title": "The combination reason is appended last", "source": C(BK, ln(BK, r"if combination_reason is not None:", va), ln(BK, r"invalid_reasons\.append\(combination_reason\)", va)),
+                             "set": {"vars.reasons": "= vars.reasons + [vars.comb]"}}]}]},
         {"return": {"invalid_reasons": "= vars.reasons"}},
     ]
     out.append(iface("attention-backend", "validate-configuration",

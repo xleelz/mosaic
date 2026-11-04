@@ -394,3 +394,154 @@ The test-hit skip (`LLM.beam_search`) is serving-api's.
 the drafts or null (engine-core's stub; judge X6 unaffected); `execute-model` with no tokens returns the
 KV connector's no-forward output (adds `kv_connector_output`); `gpu-memory.allocate` takes `pool`;
 `attn-utils.get-kv-cache-spec` takes `use_mla`; ngram/speculator `propose` take token rows.
+
+## Fix round 5 (precision)
+
+New parts: `gen/worker-runner/parts/65-round5.yaml` (configs, components, interfaces) and
+`88-scenarios-round5.yaml`. Round-5 tests: `build-oracle/round5/worker-runner.{yaml,md}` (4 of 6
+pass, 2 untranslatable).
+
+**Wrong claims fixed (judge3, oracle3, RESULTS round 4, worlds.md)**
+- *P3-1 greedy depends on the seed* (`sampler.apply-sampling-params`): the seed now enters only
+  rows with temperature != 0; at 0 the Gumbel kernel adds no noise (gumbel.py:182-198). `bench-p3-1`
+  passes. Regression `wr-r5-greedy-ignores-seed`.
+- *P3-1 FlashInfer claimed, not modeled* (`sampler.sample`): the fused sampler is now a step. It runs
+  only when some row uses top-k/top-p, no row is greedy or seeded, no returned logprobs need
+  processed logits, and FlashInfer is on (`VLLM_USE_FLASHINFER_SAMPLER`, not `return_sampling_mask`)
+  (sampler.py:304-341). New `topk-topp-sampler.flashinfer-sample`, configs
+  `vllm-use-flashinfer-sampler` and `logprobs-mode`. `logprob.compute-topk-scores` takes
+  `logprobs_mode` (logits modes skip the log-softmax, logprob.py:130-133). Scenarios
+  `wr-r5-fused-flashinfer-sampler`, `wr-r5-flashinfer-sampler-off`.
+- *judge3 #11, default params abort `sampler.sample`*: a null `logprobs` is now -1, not compared.
+- *P3-7 a/b, worlds.md "KV page size ignores fp8"* (`attn-utils.get-kv-cache-spec`): the page size
+  uses the layer's KV dtype: auto keeps the model dtype; every other `--kv-cache-dtype` maps through
+  STR_DTYPE_TO_TORCH_DTYPE (fp8 variants and int8 are 1 byte) (attention.py:323-325, 640-646,
+  torch_utils.py:33-55). The runner passes `config['kv-cache-dtype']` in both `get-kv-cache-spec` and
+  `initialize-kv-cache`. `bench-p3-7a-runner` and `bench-p3-7b-fp8` pass. Scenarios
+  `wr-r5-kv-fp8-page-size-and-blocks` (FP8 world, fp8 KV: 1 MiB blocks, 63,633), `wr-r5-kv-auto-keeps-model-dtype`.
+- *oracle3 profile-cudagraph-memory returns 0.5 GiB under NONE*: it now returns 0 first under NONE
+  (cudagraph_utils.py:889-890), then bootstraps a minimal KV cache (min(max_num_reqs, capture max) =
+  512 blocks, `initialize-kv-cache` with `is_profiling`), returns 0 after teardown if nothing needs
+  capture, else `capture-model(profile_only, max_full_descs_to_capture: 2)` and tears down
+  (`teardown-profiling-state`, `cuda-graph-manager.release`). Scenario
+  `wr-r5-profile-cudagraph-memory-bootstrap-and-teardown`.
+- *oracle3 no graph pool id*: `cuda-graph-manager.capture` captures per descriptor: PIECEWISE
+  first, then for each FULL descriptor `capture-pool` (sets NCCL's graph pool id,
+  cudagraph_pool.py:33-45) before `capture-cuda-graph` (torch.cuda.graph). Scenario
+  `wr-r5-full-capture-pool-before-graph`.
+- *oracle3 no cudagraph-mode fallback*: `initialize-kv-cache` now asks attention's
+  `attention-metadata-builder.get-cudagraph-support` (backend and FA version from config), takes the
+  weakest support through `attn-utils.get-attn-cg-support`, and resolves the mode in the new
+  `cuda-graph-manager.resolve-cudagraph-mode` (compilation.py:1369-1486: FULL mixed needs ALWAYS,
+  NEVER raises or falls to PIECEWISE/NONE, spec decode needs UNIFORM_BATCH, no piecewise capture
+  drops the piecewise half, warnings word for word). `cuda-graph-manager.init` takes the resolved
+  mode. The oracle scenario passes with `--max-events 400000` (its 10-prompt generate exceeds the
+  default 20,000 events; nothing in the model is wrong there). Scenarios `wr-r5-cudagraph-mode-*`.
+- *judge3 #12 Blackwell ceiling*: `cuda-graph-manager.init` reads the device's compute capability
+  (now in `gpu-memory.snapshot`) and uses 1024 on SM 10.x (config/vllm.py:2354-2363).
+  `wr-r5-blackwell-capture-ceiling`.
+- *RESULTS "get-supported-tasks ignores the model's pooler"*: pooling tasks come from the model's
+  pooler (`state.model.pooler_tasks`, a Terratorch architecture's IdentityPooler gives `plugin`,
+  else the converted pooler); V2 intersects them with its supported set, V1 keeps them all
+  (pooling_runner.py:61-64, gpu_model_runner.py:3151-3156). `wr-r5-supported-tasks-*`.
+- *worlds.md "the forward always runs Llama"*: every forward and compute_logits call (eager,
+  PIECEWISE through `run-pw-graph`, dummy runs, sampling, prompt logprobs) goes to the component
+  `base-model-loader.load-model` returned (`state.model_component`, set in `gpu-model-runner.load-model`;
+  in a seeded world that never loaded, the architecture picks `mixtral-for-causal-lm`,
+  `qwen2-vl-for-conditional-generation` or `llama-for-causal-lm`). The encoder step calls
+  `qwen2-vl-for-conditional-generation.embed-multimodal` on uncached items. `wr-r5-moe-forward-runs-mixtral`
+  drives both TP ranks in the MoE world; `fixture-smoke-*` (all four) pass on the merged working copies.
+  **Seams agreed:** models-layers owns `load-model`'s `component` and each model's `forward`,
+  `compute-logits`, `embed-multimodal` (ModelsForwardRequest: num_tokens, num_prefill_tokens,
+  num_decode_reqs); its world variants load the model on every rank and unload Llama. distributed owns
+  the TP all-reduce / EP collectives inside the forward: every TP rank must step together, which the
+  executor's fan-out (engine-core) does; driving one rank alone times out, as the code would.
+- *worlds.md "seed numbers are Llama's"*: four `variant_of` fixtures in `05-seed.yaml` give each
+  new world its own bytes per block and block count (MoE 1 MiB / 27,755 per rank; VL 896 KiB /
+  64,548; FP8 2 MiB / 31,816; FP8 + fp8 KV 1 MiB / 63,633). **Coordinator:** regenerate
+  `worlds.yaml` to include them (done by the coordinator).
+- *P3-8, worker side of encoder scheduling*: with a multimodal model the runner records
+  `mm_features` in the encoder cache at add, drops them at finish, frees `free_encoder_mm_hashes`
+  in `free_states`, and runs the new `encoder-runner.execute-mm-encoder` on
+  `scheduled_encoder_inputs` (only uncached mm hashes; results stored through
+  `encoder-cache.update-encoder-outputs`) (model_runner.py:1145-1169, 1213-1214, 1939-1956,
+  encoder_runner.py:86-108). `wr-r5-vl-encoder-runs-once-per-mm-hash` (VL world). P3-8 a-c still
+  fail: the scheduler doesn't send `scheduled_encoder_inputs` yet (scheduler-kv, engine-core).
+- *scheduling-kv #6 citation*: the bytes-per-block step of `determine-available-memory` now cites
+  kv_cache_utils.py:1622-1628 and says it is synthetic.
+- *Side note (oracle3)*: the runner passed `fa_version: 3` to the metadata builder whatever
+  `flash-attn-version` said; it now passes the configured version.
+
+**Error-path sweep** (most-used first; status 0 throughout, as Python exceptions):
+- `determine-available-memory` assertion: now names both free amounts as format_gib prints them
+  (gpu_worker.py:717-728). `wr-r5-memory-profiling-error-message`.
+- `worker-utils.request-memory`: the three ValueErrors now carry the device, the GiB figures and
+  the utilization exactly (utils.py:729-770).
+- `gpu-worker-impl.profile`: the RuntimeError has the example flags; the prefix and bound
+  ValueErrors are new; the trace name is the full `dp_pp_tp_dcp_ep_rank` suffix
+  (distributed/utils.py:708-718); the profiler is a real `WorkerProfiler`. `wr-r5-profile-*`.
+- `gpu-model-runner.execute-model` KeyError text is the repr `'<req_id>'`.
+- `gpu-model-runner.update-max-model-len` invented a "must be positive" ValueError; the code has
+  no check (model_runner.py:363-365). Removed.
+- `workspace-manager.get-simultaneous` locked message: caller info and MB with 2 decimals
+  (workspace.py:241-247).
+- Checked and unchanged: weight-transfer RuntimeErrors (gpu_worker.py:1150-1162, 1477-1594),
+  `init-worker`, `ensure-lora-enabled`, `get-model`, bad-words ValueErrors, `init-speculator`,
+  workspace init/current/lane errors, `add-requests` assertions.
+
+**New worlds.** FP8 world: KV dtype auto vs fp8 (page size, blocks); MoE world: forward/logits
+through Mixtral on both TP ranks; VL world: the encoder step and encoder cache. All four worlds have
+seed variants.
+
+**Breaking changes (callers):**
+- `cuda-graph-manager.init` takes `cudagraph_mode` (callers: my `initialize-kv-cache`; a caller that
+  omits it gets the config value as before).
+- `capture-model` / `capture` take `max_full_descs_to_capture`; `capture` returns
+  `num_full_captured`, `num_piecewise_captured`.
+- `profile-cudagraph-memory` now calls `initialize-kv-cache`, `capture-model` and teardown: a run
+  through `determine-available-memory` makes 2 `capture-model` calls (judge3 `bench-p3-6-a-b` asserts 1;
+  see measure notes).
+- `gpu-worker-impl.profile` trace name is `<prefix>_dp0_pp0_tp0_dcp0_ep0_rank0` (was
+  `<prefix>_dp0_pp0_tp0`); `wr-profile-start-stop` updated. No other fragment reads it.
+- An eligible unseeded top-k/top-p batch now samples through `topk-topp-sampler.flashinfer-sample`,
+  not `topk-topp-triton` + Gumbel (`wr-sample-top-p-only-large-batch` now sets
+  `vllm-use-flashinfer-sampler: false`).
+- The forward goes to the loaded component: in worlds where models-layers' variant unloads Llama,
+  any caller expecting `llama-for-causal-lm.forward` calls now sees the world's model instead.
+- `gpu-model-runner.update-max-model-len` no longer fails on 0 (`wr-admin-rpcs-...` updated).
+- `execute-model` KeyError message gains quotes (`wr-` scenario updated).
+- `gpu-memory.snapshot` returns `compute_capability`.
+
+**Cross-area requests:**
+- scheduler-kv / engine-core: send `scheduled_encoder_inputs` (req_id -> mm_feature indices) and
+  `free_encoder_mm_hashes` in SchedulerOutput, and `mm_features` in new requests; the worker consumes
+  them now.
+- models-layers: `logits-processor` head_dtype (round-5 test 6).
+- engine-core: the `gpu-worker-impl.profile` stub can add `delay_iterations` / `max_iterations`.
+- attention: P3-7 c (scale defaults, attention.py:185) and d (fp8_e5m2 with fp8 checkpoints,
+  attention.py:205-219) are attention's layer init.
+- config-platform: define `logprobs-mode`, `profiler-delay-iterations`, `profiler-max-iterations`
+  (I declare them as boundary configs).
+
+**Late items (coordinator).**
+- *distributed: is_moe when the groups are built*: `init-device` reads the checkpoint's expert count
+  (`hf-hub.download-config`; num_experts / moe_num_experts / n_routed_experts / num_local_experts > 0,
+  config/model.py:2276-2277) and passes `is_moe` and `enable_eplb` to
+  `parallel-state.ensure-model-parallel-initialized`, which builds the EP group
+  (`wr-r5-moe-init-device-builds-ep-group`).
+- *attention: fp8 page size, pinned fa_version*: both done above (fa_version from
+  `flash-attn-version`, else 3, the H100 default of fa_utils.py:99-107).
+- The in-build oracle scenarios of rounds 4 and 5 now also run inside the fragment as `wr-bo-*`
+  (build.py), so their interfaces count toward behavior coverage (96.6%, 1276/1321).
+
+**Verification.** Merged working copies, full gate: 1570/1570 scenarios pass; worker-runner has 0 hollow,
+0 racy, 0 unknown inputs, internal assertions 21.6% (gate 0.22), citations all ok, modeled 175/175. The
+gate still exits 1 on serving-api only (3 hollow, 30 seam-names). `fixture-smoke-*`: 4/4. The stage
+command (`mcheck --stage ... --accept`) fails because the last-good copies of config-platform and
+scheduler-kv lack the variant fixtures `worlds.yaml` now names (`config-platform-moe-host`,
+`scheduler-kv-vl-qwen2-vl-7b`); it accepts once they stage.
+Earlier measures, before -> after: judge3 P3-1, P3-7a-runner, P3-7b-fp8 and the 3 oracle3 worker-runner
+rows now pass; P3-6a fails only on the capture-model count (measure notes). Three others now fail
+(S3-4b, oracle-r3 video, oracle serving-engine mixed image) come from the multimodal processor
+path (`multi-modal-registry.create-processor`, `hf-hub.download-config`), serving-api/models-layers work
+in progress, not from this fragment.

@@ -100,6 +100,12 @@
           vars.salt: "= has(input.cache_salt) && input.cache_salt != null ? input.cache_salt : dyn(null)"
           vars.status: WAITING
           vars.grammar_id: "= has(input.grammar_id) ? input.grammar_id : dyn(null)"
+      - title: Prompt logprobs skip reading the prefix cache unless the request says otherwise
+        detail: "SamplingParams resolves skip_reading_prefix_cache=None to prompt_logprobs is not None or prompt_logprob_token_ids is not None, because cached prompt tokens have no logits; Request.get_skip_reading_prefix_cache returns it."
+        source: "vllm/sampling_params.py:622-629"
+        set:
+          vars.skip_read: "= has(vars.sp.skip_reading_prefix_cache) && vars.sp.skip_reading_prefix_cache != null ? vars.sp.skip_reading_prefix_cache : ((has(vars.sp.prompt_logprobs) && vars.sp.prompt_logprobs != null) || (has(vars.sp.prompt_logprob_token_ids) && vars.sp.prompt_logprob_token_ids != null))"
+          vars.mm: "= has(input.mm_features) && input.mm_features != null ? input.mm_features.map(f, {'identifier': f.identifier, 'offset': f.offset, 'length': f.length, 'num_embeds': has(f.num_embeds) ? f.num_embeds : f.length}) : []"
       - if: "has(vars.sp.structured_outputs) && vars.sp.structured_outputs != null && size(vars.sp.structured_outputs) > 0"
         then:
           - title: A structured-output request waits for its grammar
@@ -119,10 +125,11 @@
             as: h
           - set: {vars.hashes: "= vars.h.value.new_block_hashes"}
       - title: Enqueue in the waiting queue
-        detail: "FCFS appends to the deque; priority pushes onto the heap (ordering is applied at peek)."
-        source: "vllm/v1/core/sched/scheduler.py:2633-2635"
+        detail: "_enqueue_waiting_request: FCFS appends to the deque, priority pushes onto the heap (ordering is applied at peek); a request blocked on its grammar is also counted as deferred."
+        source: "vllm/v1/core/sched/scheduler.py:2457-2462"
         set:
           state.waiting: "= state.waiting + [input.request_id]"
+          state.deferred_waiting: "= vars.status == 'WAITING_FOR_STRUCTURED_OUTPUT_GRAMMAR' ? state.deferred_waiting + [input.request_id] : state.deferred_waiting"
           state.requests: >-
             = merge(state.requests, {input.request_id: {
               'request_id': input.request_id, 'status': vars.status,
@@ -142,6 +149,9 @@
               'kv_transfer_params': has(input.kv_transfer_params) ? input.kv_transfer_params : dyn(null),
               'num_preemptions': 0, 'num_cached_tokens': -1, 'is_prefill_chunk': true,
               'grammar_id': vars.grammar_id,
+              'skip_reading_prefix_cache': vars.skip_read, 'mm_features': vars.mm,
+              'num_in_flight_tokens': 0, 'num_stale_output_tokens': 0, 'drop_stale_output': false,
+              'events': config['disable-log-stats'] ? [] : [{'type': 'QUEUED', 'timestamp': double(now_us) / 1000000.0}],
               'client_index': has(input.client_index) ? input.client_index : 0}})
       - if: "config['kv-connector'] != ''"
         then:
@@ -162,31 +172,49 @@
     name: preempt-request
     kind: function
     latency_ms: 0
-    summary: "Preempt a RUNNING request: free its KV blocks, reset num_computed_tokens to 0 (recompute) and put it back at the front of the waiting queue."
+    summary: "Preempt a RUNNING request: free its KV blocks and encoder inputs, reset num_computed_tokens to 0 (recompute), mark its in-flight output stale, record a PREEMPTED event and put it back at the front of the waiting queue."
     sources: ["vllm/v1/core/sched/scheduler.py:1571-1614"]
     errors: [{code: assertion-error, status: 0, retryable: false}]
-    request: {type: object, required: [request_id], properties: {request_id: {type: string}}}
-    response: {type: object, properties: {request_id: {type: string}, num_preemptions: {type: integer}}}
+    request:
+      type: object
+      required: [request_id]
+      properties:
+        request_id: {type: string}
+        drop_stale_output: {type: boolean, default: false, description: "Drop (rather than deliver) the in-flight output: reset_prefix_cache passes True, because the same-step resume would deliver tokens out of order."}
+    response: {type: object, properties: {request_id: {type: string}, num_preemptions: {type: integer}, num_stale_output_tokens: {type: integer}}}
     behavior:
       - if: "!(input.request_id in state.requests) || state.requests[input.request_id].status != 'RUNNING'"
         then:
           - title: Only running requests can be preempted
             source: "vllm/v1/core/sched/scheduler.py:1584-1586"
             fail: {code: assertion-error, status: 0, message: "Only running requests can be preempted"}
+      - set: {vars.r: "= state.requests[input.request_id]"}
       - title: Free the request's KV blocks
         detail: "Its cached full blocks stay in the prefix cache (ref_cnt 0, evictable), so resuming can hit them."
         source: "vllm/v1/core/sched/scheduler.py:1589"
         call: kv-cache-manager.free
         input: {request_id: "= input.request_id"}
-      - title: Reset to PREEMPTED and prepend to waiting
-        detail: "The caller removes it from running (pop() for FCFS, del by index for priority); prepend_request puts it at the deque head (heap push for priority)."
+      - if: "has(vars.r.mm_features) && size(vars.r.mm_features) > 0"
+        then:
+          - title: Release the request's encoder-cache references
+            source: "vllm/v1/core/sched/scheduler.py:1590"
+            call: encoder-cache-manager.free
+            input: {request_id: "= input.request_id", mm_hashes: "= vars.r.mm_features.map(f, f.identifier)"}
+      - title: Mark the in-flight output stale
+        detail: "Async scheduling: the tokens of steps still in flight are delivered on return but must not touch the reset counters; num_in_flight_tokens already includes any undrained stale share, so it is assigned. An undrained drop-mode share stays dropped."
+        source: "vllm/v1/core/sched/scheduler.py:1596-1607"
+        set:
+          vars.in_flight: "= has(vars.r.num_in_flight_tokens) ? vars.r.num_in_flight_tokens : 0"
+          vars.drop: "= (has(input.drop_stale_output) && input.drop_stale_output) || (has(vars.r.drop_stale_output) && vars.r.drop_stale_output && has(vars.r.num_stale_output_tokens) && vars.r.num_stale_output_tokens > 0)"
+      - title: Reset to PREEMPTED, record the PREEMPTED event and prepend to waiting
+        detail: "The caller removes it from running (pop() for FCFS, del by index for priority); prepend_request puts it at the deque head (heap push for priority). The id goes out in the next SchedulerOutput.preempted_req_ids."
         source: "vllm/v1/core/sched/scheduler.py:1592-1614"
         set:
-          state.requests: "= merge(state.requests, {input.request_id: {'status': 'PREEMPTED', 'num_computed_tokens': 0, 'num_output_placeholders': 0, 'num_preemptions': state.requests[input.request_id].num_preemptions + 1}})"
+          state.requests: "= merge(state.requests, {input.request_id: {'status': 'PREEMPTED', 'num_computed_tokens': 0, 'num_output_placeholders': 0, 'spec_token_ids': [], 'num_stale_output_tokens': vars.in_flight, 'drop_stale_output': vars.drop, 'num_preemptions': vars.r.num_preemptions + 1, 'events': config['disable-log-stats'] ? (has(vars.r.events) ? vars.r.events : []) : (has(vars.r.events) ? vars.r.events : []) + [{'type': 'PREEMPTED', 'timestamp': double(now_us) / 1000000.0}]}})"
           state.running: "= state.running.filter(r, r != input.request_id)"
           state.waiting: "= [input.request_id] + state.waiting"
           state.preempted_req_ids: "= state.preempted_req_ids + [input.request_id]"
-      - return: {request_id: "= input.request_id", num_preemptions: "= state.requests[input.request_id].num_preemptions"}
+      - return: {request_id: "= input.request_id", num_preemptions: "= state.requests[input.request_id].num_preemptions", num_stale_output_tokens: "= vars.in_flight"}
 
   - component: scheduler
     name: free-request
@@ -217,6 +245,12 @@
               block_ids: ["= vars.tbl.value.block_ids"]
             as: cf
           - set: {vars.delay: "= vars.cf.value.delay_free_blocks", vars.params: "= vars.cf.value.kv_transfer_params"}
+      - if: "input.request_id in state.requests && has(state.requests[input.request_id].mm_features) && size(state.requests[input.request_id].mm_features) > 0"
+        then:
+          - title: Release the request's encoder-cache references
+            source: "vllm/v1/core/sched/scheduler.py:2734"
+            call: encoder-cache-manager.free
+            input: {request_id: "= input.request_id", mm_hashes: "= state.requests[input.request_id].mm_features.map(f, f.identifier)"}
       - set: {state.finished_req_ids: "= state.finished_req_ids + [input.request_id]"}
       - if: "vars.delay"
         then:
@@ -264,7 +298,11 @@
             then:
               - set: {state.running: "= state.running.filter(r, r != vars.rid)"}
             else:
-              - set: {state.waiting: "= state.waiting.filter(r, r != vars.rid)"}
+              - title: Remove it from the waiting queues and the deferred set
+                source: "vllm/v1/core/sched/scheduler.py:2694-2697"
+                set:
+                  state.waiting: "= state.waiting.filter(r, r != vars.rid)"
+                  state.deferred_waiting: "= state.deferred_waiting.filter(r, r != vars.rid)"
           - set: {state.requests: "= merge(state.requests, {vars.rid: {'status': vars.status}})"}
           - call: scheduler.free-request
             input: {request_id: "= vars.rid"}
@@ -286,14 +324,15 @@
     name: make-stats
     kind: function
     latency_ms: 0
-    summary: "SchedulerStats for the step: running and waiting counts, KV cache usage and the prefix-cache stats since the last call."
+    summary: "SchedulerStats for the step: running, waiting and deferred (skipped) waiting counts, KV cache usage and the prefix-cache stats since the last call."
     sources: ["vllm/v1/core/sched/scheduler.py:2915-2959"]
     request: {type: object, properties: {spec_decoding_stats: {type: [object, "null"], default: null}}}
     response:
       type: [object, "null"]
       properties:
         num_running_reqs: {type: integer}
-        num_waiting_reqs: {type: integer}
+        num_waiting_reqs: {type: integer, description: "Waiting requests minus the deferred ones (scheduler.py:2944-2947)."}
+        num_skipped_waiting_reqs: {type: integer, description: "Waiting requests a scheduling pass skipped and that are still deferred (scheduler.py:2948)."}
         kv_cache_usage: {type: number}
         prefix_cache_stats: {type: object}
         spec_decoding_stats: {type: [object, "null"]}
@@ -311,7 +350,8 @@
         source: "vllm/v1/core/sched/scheduler.py:2943-2959"
         return:
           num_running_reqs: "= size(state.running)"
-          num_waiting_reqs: "= size(state.waiting)"
+          num_waiting_reqs: "= size(state.waiting) - size(state.deferred_waiting.filter(r, r in state.waiting))"
+          num_skipped_waiting_reqs: "= size(state.deferred_waiting.filter(r, r in state.waiting))"
           kv_cache_usage: "= vars.usage.value.usage"
           prefix_cache_stats: "= vars.pcs.value"
           spec_decoding_stats: "= has(input.spec_decoding_stats) ? input.spec_decoding_stats : dyn(null)"
@@ -320,29 +360,50 @@
     name: reset-prefix-cache
     kind: function
     latency_ms: 0
-    summary: "Reset the prefix cache; with reset_running_requests every running request is preempted first so the reset can succeed."
-    sources: ["vllm/v1/core/sched/scheduler.py:2840-2883"]
+    summary: "Reset the prefix cache; with reset_running_requests every running request is preempted first (dropping its in-flight output) so the reset can succeed; with reset_connector the KV connector's cache is reset too."
+    sources: ["vllm/v1/core/sched/scheduler.py:2840-2883", "vllm/v1/core/sched/scheduler.py:2885-2906"]
     errors: [{code: runtime-error, status: 0, retryable: false}]
-    request: {type: object, properties: {reset_running_requests: {type: boolean, default: false}}}
+    request:
+      type: object
+      properties:
+        reset_running_requests: {type: boolean, default: false}
+        reset_connector: {type: boolean, default: false, description: "Also reset the KV connector's cache (reset_connector_cache); with no connector that counts as success."}
     response: {type: object, properties: {reset: {type: boolean}}}
     behavior:
       - if: "has(input.reset_running_requests) && input.reset_running_requests"
         then:
-          - title: Preempt every running request, last first
-            source: "vllm/v1/core/sched/scheduler.py:2850-2866"
+          - title: Preempt every running request, last first, dropping its stale in-flight output
+            detail: "The requests are preempted and resumed in the same step, so output still in flight would arrive out of order: drop_stale_output=True."
+            source: "vllm/v1/core/sched/scheduler.py:2850-2860"
             foreach: "= state.running.reverse()"
             as: rid
             steps:
               - call: scheduler.preempt-request
-                input: {request_id: "= vars.rid"}
+                input: {request_id: "= vars.rid", drop_stale_output: true}
+          - title: Forget which requests ran last step (they are flushed from the persistent batch)
+            source: "vllm/v1/core/sched/scheduler.py:2862-2866"
+            set: {state.prev_step_scheduled_req_ids: []}
       - call: kv-cache-manager.reset-prefix-cache
         as: r
       - if: "has(input.reset_running_requests) && input.reset_running_requests && !vars.r.value.reset"
         then:
           - title: Reset failed even after preempting everything
             source: "vllm/v1/core/sched/scheduler.py:2868-2874"
-            fail: {code: runtime-error, status: 0, message: "Failed to reset KV cache even when all the running requests are preempted and moved to the waiting queue."}
-      - return: {reset: "= vars.r.value.reset"}
+            fail: {code: runtime-error, status: 0, message: "Failed to reset KV cache even when all the running requests are preempted and moved to the waiting queue. This is likely due to the presence of running requests waiting for remote KV transfer, which is not supported yet."}
+      - set: {vars.ok: "= vars.r.value.reset"}
+      - if: "has(input.reset_connector) && input.reset_connector"
+        then:
+          - if: "config['kv-connector'] == ''"
+            then:
+              - title: No KV connector - nothing to reset, which counts as success
+                source: "vllm/v1/core/sched/scheduler.py:2886-2895"
+            else:
+              - title: Reset the connector's cache; False fails the whole reset
+                source: "vllm/v1/core/sched/scheduler.py:2897-2898"
+                call: kv-connector-base-v1.reset-cache
+                as: rc
+              - set: {vars.ok: "= vars.rc.value.reset != false && vars.ok"}
+      - return: {reset: "= vars.ok"}
 
   # ------------------------------------------------------------------ schedule()
   - component: scheduler
@@ -380,9 +441,16 @@
           vars.k: "= int(config['num-speculative-tokens'])"
           vars.lookahead: "= config['speculative-method'] != '' && config['speculative-method'] != 'ngram' ? int(config['num-speculative-tokens']) : 0"
       - title: Long-prefill cap only when another request could starve
-        source: "vllm/v1/core/sched/scheduler.py:640-645"
+        source: "vllm/v1/core/sched/scheduler.py:640-649"
         set:
           vars.long_thr: "= size(state.running) + size(state.waiting) > 1 ? int(config['long-prefill-token-threshold']) : 0"
+      - if: "vars.long_thr > 0 && config['long-prefill-token-threshold-adaptive']"
+        then:
+          - title: Adaptive cap - floor it at a fair share of the input budget
+            detail: "max(long_prefill_token_threshold, max_num_batched_tokens // (running + waiting)), so the cap never cuts a request below its share."
+            source: "vllm/v1/core/sched/scheduler.py:650-655"
+            set:
+              vars.long_thr: "= math.greatest(vars.long_thr, int(config['max-num-batched-tokens']) / (size(state.running) + size(state.waiting)))"
       - title: First, schedule the RUNNING requests
         source: "vllm/v1/core/sched/scheduler.py:657-659"
         foreach: "= lists.range(size(state.running))"
@@ -408,10 +476,18 @@
               vars.num_new: "= vars.long_thr > 0 && vars.long_thr < vars.num_new ? vars.long_thr : vars.num_new"
           - set:
               vars.num_new: "= math.least([vars.num_new, vars.token_budget, int(config['max-model-len']) - vars.req.num_computed_tokens - 1])"
+          - if: "has(vars.req.mm_features) && size(vars.req.mm_features) > 0"
+            then:
+              - title: Schedule the request's encoder inputs in this chunk
+                source: "vllm/v1/core/sched/scheduler.py:729-747"
+                call: scheduler.try-schedule-encoder-inputs
+                input: {request_id: "= vars.rid", mm_features: "= vars.req.mm_features", num_computed_tokens: "= vars.req.num_computed_tokens", num_new_tokens: "= vars.num_new", encoder_compute_budget: "= has(vars.enc_budget) ? vars.enc_budget : (has(state.max_num_encoder_input_tokens) ? state.max_num_encoder_input_tokens : 0)"}
+                as: tenc
+              - set: {vars.enc: "= vars.tenc.value", vars.num_new: "= vars.tenc.value.num_new_tokens"}
           - if: "vars.num_new <= 0"
             then:
-              - title: Nothing to schedule for this request; try the next
-                source: "vllm/v1/core/sched/scheduler.py:755-779"
+              - title: Nothing to schedule for this request (or the encoder budget or cache is exhausted); try the next
+                source: "vllm/v1/core/sched/scheduler.py:755-773"
                 set: {vars.req_index: "= vars.req_index + 1"}
               - continue: true
           - set: {vars.alloc_ok: false}
@@ -483,6 +559,15 @@
                 set:
                   vars.spec: "= vars.n_spec > 0 ? merge(vars.spec, {vars.rid: vars.req.spec_token_ids.slice(0, math.least(vars.n_spec, size(vars.req.spec_token_ids)))}) : vars.spec"
                   state.requests: "= merge(state.requests, {vars.rid: {'spec_token_ids': []}})"
+          - if: "has(vars.req.mm_features) && size(vars.req.mm_features) > 0 && size(vars.enc.encoder_inputs_to_schedule) > 0"
+            then:
+              - title: Encoder-related - record the scheduled inputs, spend the budget and reserve cache slots
+                source: "vllm/v1/core/sched/scheduler.py:878-887"
+                set:
+                  vars.enc_sched: "= merge(has(vars.enc_sched) ? vars.enc_sched : {}, {vars.rid: vars.enc.encoder_inputs_to_schedule})"
+                  vars.enc_budget: "= vars.enc.encoder_compute_budget"
+              - call: scheduler.allocate-encoder-inputs
+                input: {request_id: "= vars.rid", mm_features: "= vars.req.mm_features", input_ids: "= vars.enc.encoder_inputs_to_schedule", duplicate_input_ids: "= vars.enc.duplicate_encoder_inputs"}
       - title: Record the LoRAs of the scheduled running requests
         source: "vllm/v1/core/sched/scheduler.py:889-897"
         set:
@@ -540,6 +625,12 @@
                   - title: Grammar ready; promote to WAITING
                     source: "vllm/v1/core/sched/scheduler.py:3198-3199"
                     set: {state.requests: "= merge(state.requests, {vars.wid: {'status': 'WAITING'}})"}
+              - if: "has(state.requests[vars.wid].num_stale_output_tokens) && state.requests[vars.wid].num_stale_output_tokens > 0 && !state.requests[vars.wid].drop_stale_output"
+                then:
+                  - title: Deliverable stale output still in flight - resuming now could resample a position that output delivers; skip
+                    source: "vllm/v1/core/sched/scheduler.py:934-938"
+                    set: {vars.skipped: "= vars.skipped + [vars.wid]"}
+                  - continue: true
               - if: "config['enable-lora'] && has(state.requests[vars.wid].lora_request) && state.requests[vars.wid].lora_request != null && size(vars.loras) == int(config['max-loras']) && !(state.requests[vars.wid].lora_request.lora_int_id in vars.loras)"
                 then:
                   - title: Admitting it would exceed max_loras; skip this request this step
@@ -578,7 +669,7 @@
                   - title: Look up already-cached tokens
                     source: "vllm/v1/core/sched/scheduler.py:960-968"
                     call: kv-cache-manager.get-computed-blocks
-                    input: {request_id: "= vars.wid", block_hashes: "= vars.wreq.block_hashes", num_tokens: "= vars.num_tokens"}
+                    input: {request_id: "= vars.wid", block_hashes: "= vars.wreq.block_hashes", num_tokens: "= vars.num_tokens", skip_reading_prefix_cache: "= has(vars.wreq.skip_reading_prefix_cache) && vars.wreq.skip_reading_prefix_cache"}
                     as: hit
                   - set: {vars.hit_blocks: "= vars.hit.value.blocks", vars.num_hit: "= vars.hit.value.num_computed_tokens", vars.mamba_hit: "= vars.hit.value.mamba_block"}
                   - if: "config['kv-connector'] != ''"
@@ -595,6 +686,11 @@
                           block_hashes: "= vars.wreq.block_hashes"
                         as: ext
                       - set: {vars.num_ext: "= vars.ext.value.num_external_tokens", vars.load_async: "= vars.ext.value.load_async && vars.ext.value.num_external_tokens > 0"}
+                      - if: "has(vars.wreq.skip_reading_prefix_cache) && vars.wreq.skip_reading_prefix_cache"
+                        then:
+                          - title: A request that skips the prefix cache takes no external hit either
+                            source: "vllm/v1/core/sched/scheduler.py:983-984"
+                            set: {vars.num_ext: 0, vars.load_async: false}
               - title: Tokens to compute for this request
                 detail: "num_tokens (prompt plus any output a resumed request already has) minus local and external computed tokens; an async load schedules nothing now."
                 source: "vllm/v1/core/sched/scheduler.py:1125-1129"
@@ -602,7 +698,7 @@
                   vars.num_new: "= vars.load_async ? 0 : vars.num_tokens - vars.prior - vars.num_hit - vars.num_ext"
               - set:
                   vars.num_new: "= vars.long_thr > 0 && vars.long_thr < vars.num_new ? vars.long_thr : vars.num_new"
-              - if: "!vars.load_async && !config['enable-chunked-prefill'] && vars.num_new > vars.token_budget"
+              - if: "!vars.load_async && !config['enable-chunked-prefill'] && vars.num_new > vars.token_budget && !config['mm-encoder-only']"
                 then:
                   - title: Chunked prefill off and the prompt exceeds the remaining budget
                     source: "vllm/v1/core/sched/scheduler.py:1158-1167"
@@ -611,6 +707,19 @@
                 source: "vllm/v1/core/sched/scheduler.py:1169"
                 set:
                   vars.num_new: "= math.least(vars.num_new, vars.token_budget)"
+              - if: "has(vars.wreq.mm_features) && size(vars.wreq.mm_features) > 0"
+                then:
+                  - title: Schedule the request's encoder inputs in this chunk
+                    source: "vllm/v1/core/sched/scheduler.py:1195-1209"
+                    call: scheduler.try-schedule-encoder-inputs
+                    input: {request_id: "= vars.wid", mm_features: "= vars.wreq.mm_features", num_computed_tokens: "= vars.prior + vars.num_hit + vars.num_ext", num_new_tokens: "= vars.load_async ? 0 : vars.num_new", encoder_compute_budget: "= has(vars.enc_budget) ? vars.enc_budget : (has(state.max_num_encoder_input_tokens) ? state.max_num_encoder_input_tokens : 0)"}
+                    as: wtenc
+                  - set: {vars.wenc: "= vars.wtenc.value", vars.num_new: "= vars.wtenc.value.num_new_tokens"}
+                  - if: "vars.num_new == 0 && !vars.load_async"
+                    then:
+                      - title: The encoder budget or cache can't take the next item; stop admitting
+                        source: "vllm/v1/core/sched/scheduler.py:1217-1219"
+                        break: true
               - call: kv-cache-manager.allocate-slots
                 input:
                   request_id: "= vars.wid"
@@ -630,8 +739,14 @@
                 as: walloc
               - if: "!vars.walloc.value.allocated"
                 then:
+                  - if: "has(vars.wreq.mm_features) && size(vars.wreq.mm_features) > 0"
+                    then:
+                      - title: Untouch the request's encoder-cache references
+                        source: "vllm/v1/core/sched/scheduler.py:1275-1281"
+                        call: encoder-cache-manager.free
+                        input: {request_id: "= vars.wid", mm_hashes: "= vars.wreq.mm_features.map(f, f.identifier)"}
                   - title: Not enough KV blocks; stop admitting this step
-                    source: "vllm/v1/core/sched/scheduler.py:1275-1282"
+                    source: "vllm/v1/core/sched/scheduler.py:1272-1282"
                     break: true
               - if: "config['kv-connector'] != ''"
                 then:
@@ -654,7 +769,7 @@
                   - title: Record prefix-cache stats at admission
                     source: "vllm/v1/core/sched/scheduler.py:1314-1318"
                     call: kv-cache-manager.record-prefix-cache-stats
-                    input: {num_tokens: "= vars.num_tokens", num_hits: "= vars.num_hit", preempted: "= vars.wreq.num_preemptions > 0"}
+                    input: {num_tokens: "= vars.num_tokens", num_hits: "= vars.num_hit", preempted: "= vars.wreq.num_preemptions > 0", skip_reading_prefix_cache: "= has(vars.wreq.skip_reading_prefix_cache) && vars.wreq.skip_reading_prefix_cache"}
               - if: "vars.load_async"
                 then:
                   - title: Async KV load - wait in WAITING_FOR_REMOTE_KVS holding the blocks
@@ -665,9 +780,10 @@
                       vars.skipped: "= vars.skipped + [vars.wid]"
                   - continue: true
               - title: Move the request to RUNNING
-                detail: "A WAITING request is a new request; a PREEMPTED one is resumed."
+                detail: "A WAITING request is a new request; a PREEMPTED one is resumed. It leaves the deferred set and records a SCHEDULED event."
                 source: "vllm/v1/core/sched/scheduler.py:1343-1371"
                 set:
+                  state.deferred_waiting: "= state.deferred_waiting.filter(r, r != vars.wid)"
                   state.waiting: "= state.waiting.filter(r, r != vars.wid)"
                   state.running: "= state.running + [vars.wid]"
                   vars.sched_new: "= vars.wreq.status == 'WAITING' ? vars.sched_new + [vars.wid] : vars.sched_new"
@@ -675,12 +791,25 @@
                   vars.sched: "= merge(vars.sched, {vars.wid: vars.num_new})"
                   vars.new_blocks: "= merge(vars.new_blocks, {vars.wid: vars.walloc.value.block_ids})"
                   vars.token_budget: "= vars.token_budget - vars.num_new"
-                  state.requests: "= merge(state.requests, {vars.wid: {'status': 'RUNNING', 'num_computed_tokens': vars.prior + vars.num_hit + vars.num_ext, 'num_cached_tokens': vars.wreq.num_preemptions == 0 && vars.prior == 0 ? vars.num_hit + vars.num_ext : vars.wreq.num_cached_tokens}})"
+                  state.requests: "= merge(state.requests, {vars.wid: {'status': 'RUNNING', 'num_computed_tokens': vars.prior + vars.num_hit + vars.num_ext, 'num_cached_tokens': vars.wreq.num_preemptions == 0 && vars.prior == 0 ? vars.num_hit + vars.num_ext : vars.wreq.num_cached_tokens, 'events': config['disable-log-stats'] ? (has(vars.wreq.events) ? vars.wreq.events : []) : (has(vars.wreq.events) ? vars.wreq.events : []) + [{'type': 'SCHEDULED', 'timestamp': double(now_us) / 1000000.0}]}})"
+              - if: "has(vars.wreq.mm_features) && size(vars.wreq.mm_features) > 0 && size(vars.wenc.encoder_inputs_to_schedule) > 0"
+                then:
+                  - title: Encoder-related - record the scheduled inputs, spend the budget and reserve cache slots
+                    source: "vllm/v1/core/sched/scheduler.py:1380-1390"
+                    set:
+                      vars.enc_sched: "= merge(has(vars.enc_sched) ? vars.enc_sched : {}, {vars.wid: vars.wenc.encoder_inputs_to_schedule})"
+                      vars.enc_budget: "= vars.wenc.encoder_compute_budget"
+                  - call: scheduler.allocate-encoder-inputs
+                    input: {request_id: "= vars.wid", mm_features: "= vars.wreq.mm_features", input_ids: "= vars.wenc.encoder_inputs_to_schedule", duplicate_input_ids: "= vars.wenc.duplicate_encoder_inputs"}
               - if: "config['enable-lora'] && has(vars.wreq.lora_request) && vars.wreq.lora_request != null"
                 then:
                   - title: Count the admitted request's adapter against max_loras
                     source: "vllm/v1/core/sched/scheduler.py:1360-1361"
                     set: {vars.loras: "= vars.wreq.lora_request.lora_int_id in vars.loras ? vars.loras : vars.loras + [vars.wreq.lora_request.lora_int_id]"}
+          - if: "size(vars.skipped) > 0"
+            then:
+              - set:
+                  state.deferred_waiting: "= state.deferred_waiting + vars.skipped.filter(r, !(r in state.deferred_waiting) && r in state.waiting)"
       - title: Build the SchedulerOutput
         detail: "With the V2 model runner a resumed request is sent as a new request with its full block table; running requests carry only their new block ids."
         source: "vllm/v1/core/sched/scheduler.py:1404-1446"
@@ -706,6 +835,22 @@
             preempted_req_ids: "= state.preempted_req_ids"
             scheduled_spec_decode_tokens: "= vars.spec"
             num_spec_tokens_to_schedule: "= vars.k"
+            scheduled_encoder_inputs: "= has(vars.enc_sched) ? vars.enc_sched : {}"
+            free_encoder_mm_hashes: []
+      - if: "has(state.max_num_encoder_input_tokens) && state.max_num_encoder_input_tokens > 0"
+        then:
+          - title: Tell the workers which encoder outputs were evicted (a text-only model's zero-size cache never evicts)
+            source: "vllm/v1/core/sched/scheduler.py:1515"
+            call: encoder-cache-manager.get-freed-mm-hashes
+            as: freed_mm
+          - set: {vars.output: "= merge(vars.output, {'free_encoder_mm_hashes': vars.freed_mm.value.freed})"}
+      - if: "!config['use-v2-model-runner']"
+        then:
+          - title: MRV1 - a cached request not scheduled last step gets its full token ids; remember this step's ids
+            source: "vllm/v1/core/sched/scheduler.py:1449-1452"
+            set:
+              vars.output: "= merge(vars.output, {'scheduled_cached_reqs': merge(vars.output.scheduled_cached_reqs, {'all_token_ids_req_ids': (vars.sched_running + vars.as_resumed).filter(id, !(id in state.prev_step_scheduled_req_ids))})})"
+              state.prev_step_scheduled_req_ids: "= vars.sched.transformList(k, v, k)"
       - if: "config['kv-connector'] != ''"
         then:
           - title: Build this step's KV connector metadata and attach it to the SchedulerOutput
@@ -738,7 +883,7 @@
           - title: Async - placeholders for the sampled and draft tokens, and -1 draft slots for the next step
             source: "vllm/v1/core/sched/async_scheduler.py:25-57"
             set:
-              state.requests: "= merge(state.requests, {vars.sid: {'num_computed_tokens': vars.computed, 'is_prefill_chunk': vars.is_chunk, 'num_output_placeholders': vars.async_sched && !vars.is_chunk ? vars.r.num_output_placeholders + 1 + vars.n_spec_sched : vars.r.num_output_placeholders, 'spec_token_ids': vars.async_sched && !vars.is_chunk && vars.k > 0 ? lists.range(vars.k).map(i, -1) : vars.r.spec_token_ids}})"
+              state.requests: "= merge(state.requests, {vars.sid: {'num_computed_tokens': vars.computed, 'num_in_flight_tokens': (has(vars.r.num_in_flight_tokens) ? vars.r.num_in_flight_tokens : 0) + vars.n, 'is_prefill_chunk': vars.is_chunk, 'num_output_placeholders': vars.async_sched && !vars.is_chunk ? vars.r.num_output_placeholders + 1 + vars.n_spec_sched : vars.r.num_output_placeholders, 'spec_token_ids': vars.async_sched && !vars.is_chunk && vars.k > 0 ? lists.range(vars.k).map(i, -1) : vars.r.spec_token_ids}})"
       - title: Clear finished and preempted ids (they went out in this output)
         source: "vllm/v1/core/sched/scheduler.py:1644-1648"
         set:
@@ -785,15 +930,26 @@
         index: rid
         max: 1000
         steps:
+          - set: {vars.stale: false}
+          - if: "vars.rid in state.requests"
+            then:
+              - set:
+                  vars.stale: "= has(state.requests[vars.rid].num_stale_output_tokens) && state.requests[vars.rid].num_stale_output_tokens > 0"
+                  state.requests: "= merge(state.requests, {vars.rid: {'num_in_flight_tokens': (has(state.requests[vars.rid].num_in_flight_tokens) ? state.requests[vars.rid].num_in_flight_tokens : 0) - vars.n_sched, 'num_stale_output_tokens': has(state.requests[vars.rid].num_stale_output_tokens) && state.requests[vars.rid].num_stale_output_tokens > 0 ? math.greatest(state.requests[vars.rid].num_stale_output_tokens - vars.n_sched, 0) : 0}})"
           - if: "!(vars.rid in state.requests) || state.requests[vars.rid].status.startsWith('FINISHED')"
             then:
               - title: Finished or aborted while the model ran; skip
                 source: "vllm/v1/core/sched/scheduler.py:2091-2098"
                 continue: true
+          - if: "vars.stale && state.requests[vars.rid].drop_stale_output"
+            then:
+              - title: Drop-mode stale output (a same-step resume) is discarded entirely
+                source: "vllm/v1/core/sched/scheduler.py:2101-2103"
+                continue: true
           - set:
               vars.gen0: "= has(vars.mro.req_ids) && vars.rid in vars.mro.req_ids ? vars.mro.sampled_token_ids[lists.range(size(vars.mro.req_ids)).filter(i, vars.mro.req_ids[i] == vars.rid)[0]] : []"
               vars.drafts: "= has(input.scheduler_output.scheduled_spec_decode_tokens) && vars.rid in input.scheduler_output.scheduled_spec_decode_tokens ? input.scheduler_output.scheduled_spec_decode_tokens[vars.rid] : []"
-          - if: "size(vars.drafts) > 0 && size(vars.gen0) > 0"
+          - if: "size(vars.drafts) > 0 && size(vars.gen0) > 0 && !vars.stale"
             then:
               - title: Roll back the rejected draft tokens
                 detail: "accepted = sampled - 1 (the bonus/resampled token); num_computed_tokens and the output placeholders drop by the rejected count."
@@ -812,6 +968,12 @@
                   num_accepted_tokens: "= size(vars.drafts) - vars.rejected"
                 as: sds
               - set: {vars.spec_stats: "= vars.sds.value"}
+          - if: "has(state.requests[vars.rid].mm_features) && size(state.requests[vars.rid].mm_features) > 0"
+            then:
+              - title: Free encoder inputs only after the step has actually executed
+                source: "vllm/v1/core/sched/scheduler.py:2151-2153"
+                call: scheduler.free-encoder-inputs
+                input: {request_id: "= vars.rid"}
           - set:
               vars.req: "= state.requests[vars.rid]"
               vars.gen: "= has(vars.mro.req_ids) && vars.rid in vars.mro.req_ids ? vars.mro.sampled_token_ids[lists.range(size(vars.mro.req_ids)).filter(i, vars.mro.req_ids[i] == vars.rid)[0]] : []"
@@ -844,7 +1006,7 @@
                       - set: {vars.stopped: true, vars.status: "= vars.chk.value.status", vars.stop_reason: "= vars.chk.value.stop_reason"}
                       - break: true
               - set:
-                  state.requests: "= merge(state.requests, {vars.rid: {'output_token_ids': vars.req.output_token_ids + vars.kept, 'status': vars.status, 'num_output_placeholders': vars.async_sched ? math.greatest(vars.req.num_output_placeholders - size(vars.kept), 0) : vars.req.num_output_placeholders}})"
+                  state.requests: "= merge(state.requests, {vars.rid: {'output_token_ids': vars.req.output_token_ids + vars.kept, 'status': vars.status, 'num_output_placeholders': vars.async_sched && !vars.stale ? math.greatest(vars.req.num_output_placeholders - size(vars.kept), 0) : vars.req.num_output_placeholders}})"
               - if: "vars.req.grammar_id != null"
                 then:
                   - title: Advance the request's grammar
@@ -878,15 +1040,21 @@
                       request_id: "= vars.rid"
                       num_tokens: "= state.requests[vars.rid].num_computed_tokens - state.requests[vars.rid].num_output_placeholders"
                       block_hashes: "= state.requests[vars.rid].block_hashes"
+          - if: "size(vars.gen) == 0 && config['mm-encoder-only'] && state.requests[vars.rid].num_computed_tokens >= state.requests[vars.rid].num_prompt_tokens"
+            then:
+              - title: An encoder-only instance stops a request once its whole prompt is consumed (every item in it was encoded)
+                source: "vllm/v1/core/sched/scheduler.py:2174-2184"
+                set: {vars.stopped: true, vars.status: FINISHED_STOPPED}
           - set:
               vars.finish_reason: "= !vars.stopped ? dyn(null) : dyn(vars.status == 'FINISHED_STOPPED' ? 'stop' : (vars.status == 'FINISHED_LENGTH_CAPPED' ? 'length' : (vars.status == 'FINISHED_ABORTED' ? 'abort' : 'error')))"
           - if: "vars.stopped"
             then:
-              - title: Stopped - remove from running and free the request
+              - title: Stopped - remove from running (or, for a preempted request, from waiting and the deferred set) and free the request
                 source: "vllm/v1/core/sched/scheduler.py:2223-2244"
                 set:
                   state.running: "= state.running.filter(r, r != vars.rid)"
                   state.waiting: "= state.waiting.filter(r, r != vars.rid)"
+                  state.deferred_waiting: "= state.deferred_waiting.filter(r, r != vars.rid)"
                   state.requests: "= merge(state.requests, {vars.rid: {'status': vars.status}})"
               - call: scheduler.free-request
                 input: {request_id: "= vars.rid"}
@@ -899,7 +1067,10 @@
                 detail: "Partial prefill chunks sample nothing and emit nothing."
                 source: "vllm/v1/core/sched/scheduler.py:2261-2290"
                 set:
-                  vars.outputs: "= vars.outputs + [{'request_id': vars.rid, 'new_token_ids': vars.kept, 'finish_reason': vars.finish_reason, 'stop_reason': vars.stop_reason, 'num_cached_tokens': vars.req.num_cached_tokens, 'client_index': vars.req.client_index, 'kv_transfer_params': vars.ktp}]"
+                  vars.outputs: "= vars.outputs + [{'request_id': vars.rid, 'new_token_ids': vars.kept, 'finish_reason': vars.finish_reason, 'stop_reason': vars.stop_reason, 'num_cached_tokens': vars.req.num_cached_tokens, 'client_index': vars.req.client_index, 'kv_transfer_params': vars.ktp, 'events': has(vars.req.events) && size(vars.req.events) > 0 ? vars.req.events : dyn(null)}]"
+              - if: "vars.rid in state.requests && has(state.requests[vars.rid].events) && size(state.requests[vars.rid].events) > 0"
+                then:
+                  - set: {state.requests: "= merge(state.requests, {vars.rid: {'events': []}})"}
       - if: "size(state.grammar_compile_error_reqs) > 0"
         then:
           - title: Requests whose grammar failed to compile finish with an error

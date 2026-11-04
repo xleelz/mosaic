@@ -292,3 +292,76 @@ New parts: `gen/engine-core/parts/36-round4.yaml`, `37-round4-owner.yaml`, `51-r
   contracts. New boundary config `speculative-method`.
 - **World variant** `engine-core-tp4-llama-70b-host`: the merged tp4 world has four GPUs, so judge
   E1-tp4 passes now that the CLI forwards TP 4.
+
+## Fix round 5 (precision)
+
+New parts: `gen/engine-core/parts/38-round5.yaml` (metrics, DP coordinator, MoE waves, DPLB output release) and `52-round5-scenarios.yaml` (regressions). Round-5 tests come from `gen/engine-core/round5.py`. `gen/engine-core/owner5.py` copies the round's new owner contracts into `owner5.json`: `vllm-config.resolve-async-scheduling`, `hf-hub.download-config`, `sampling-params.verify` and `base-renderer.validate-token-ids`. `owner_contracts.json` refreshed `SchedKvRequest` (now with mm_features) and `scheduler.reset-prefix-cache` (reset_connector).
+
+**Claims fixed (judge3/oracle3/RESULTS).**
+- **Pause and sleep (L3-1b, L3-2a/b/c).** `pause-scheduler` returns a Future when work remains (core.py:2080-2103), and `handle-utility` defers the reply (1739-1745). The idle callback runs `finish-pause`, then (for a deferred sleep) `executor.sleep`, then sends the UtilityOutput (986-994). The clients await the call_id on the output socket (core_client.py:892-911, 966-968). Driven (pump) iterations now notify idle callbacks too. `pause-generation`/`sleep` clear the P0 mm cache first and return None (async_llm.py:975-977, 1155-1157).
+- **Metrics (L3-3a/b, Q3-5).** These are labeled Prometheus series: `name{model_name,engine[,finished_reason|reason|status]}`. PrometheusStatLogger.__init__ creates every child at 0 and sets the sleep gauge to awake (loggers.py:482-617, 806-861). record sets the running/waiting(+skipped)/KV gauges, adds the prefix-cache, token and preemption counters, and observes TTFT, ITL, e2e and the prompt/generation histograms (count and sum; buckets are left to a refinement). It also counts request_success per reason and watermark status (1138-1330). OutputProcessor now builds IterationStats (stats.py:505-641). `get-metrics-snapshot` returns the vllm:* samples. A world starts after AsyncLLM.__init__, so `stat-logger-manager.ensure-prometheus` creates the startup series on first access, unless --disable-log-stats.
+- **Admission texts (L3-7a):** the fixed QueueOverflowError/MaxQueuedTokensError messages (exceptions.py:156-182). Recording needs a logger manager.
+- **LLMEngine (L3-8d):** `log_stats` defaults to off, as for plain `LLM()` (llm.py:226-227). `from-engine-args` takes `disable_log_stats`.
+- **mm cache misses (oracle3):** `llm-engine.step` and `async-llm.output-handler` invalidate each `mm_cache_miss_hashes` in the P0 cache (llm_engine.py:341-346, async_llm.py:873-881).
+- **Batch queue (P3-4, P3-5c):** `engine-core.init` takes the resolved `async_scheduling` from `vllm-config.resolve-async-scheduling`. The queue is sized to max_concurrent_batches: PP+1 with async on V2, else PP (vllm/config/vllm.py:577-587). `step-fn` picks the step by queue size (core.py:241-243).
+- **DP/MoE (P3-2, P3-3).**
+  - `run-engine-core` picks DPEngineCoreProc for DP > 1 with an MoE model (core.py:1472-1482).
+  - The DP busy loop uses its own rank's EngineCoreProc and re-emits itself.
+  - AsyncLLM uses DPLBAsyncMPClient when DP > 1. Routing adds the KV-usage penalty and the local waiting count (core_client.py:1655-1682).
+  - FIRST_REQ goes to a new `dp-coordinator`, which broadcasts START_DP_WAVE (coordinator.py:355-374, 467-477). wave_complete/start_wave go back to the coordinator, which publishes to the front-end (380-465). Engines handle START_DP_WAVE (core.py:2284-2296).
+- **Other claims.**
+  - The DP-rank check now runs before the prompt checks (input_processor.py:389-401).
+  - `reset_prefix_cache` passes `reset_connector` (core.py:871-876).
+  - The engine's output socket answers the client that sends it requests: the offline LLM path no longer needs a seeded `client_kind`.
+  - AsyncLLM.shutdown no longer fails in-flight generate calls. The handler is cancelled in the same loop turn, so the queued EngineDeadError is never read (async_llm.py:305-308, core_client.py:1218-1221).
+- **Serving-api's requests.**
+  - process_inputs calls `sampling-params.verify` (input_processor.py:157-162), so the spec-decode min_p/logit_bias refusal works (P3-5ab). It also calls `base-renderer.validate-token-ids` after the length checks (645-647).
+  - Concurrent n>1 generates deadlocked because two waiters drove the busy loop at once. Now one driver at a time, and driven iterations never block.
+  - Completion outputs carry sample logprobs from `new_logprobs` (output_processor.py:784-785).
+- **Scheduler-kv's request:** the Request carries `mm_features` (identifier, modality, offset, length, num_embeds) to `scheduler.add-request` (request.py:244-270).
+
+**Precision sweep (error paths, most-used first).**
+- **Corrected:**
+  - the admission messages;
+  - `Engine core initialization failed. See root cause above. Failed core proc(s): {'EngineCore': 1}`;
+  - `Unsupported task: 'embed' Supported tasks: [...]` (core.py:520-529);
+  - `Engines returned different <m> results: [..]` (core_client.py:1274-1276);
+  - EngineGenerateError, now with an empty message (async_llm.py:820);
+  - deferred utility failures, as `Call to <method> method failed: <e>`;
+  - the order of checks in process_inputs: params, LoRA, DP rank, prompt length, token ids, min_tokens.
+- **Checked unchanged:** the remaining fail texts in the fragment (pause mode, LoRA, release_kv_cache_memory, external_req_id, prompt length, FT timeout, executor backend, RPC timeout).
+
+**Judge3/oracle3 now.**
+- **judge3:** these now pass: L3-1b, L3-2a/b/c, L3-3a/b, L3-7a, L3-8d-default, P3-2c-kv-penalty, P3-3b, P3-4c/d, P3-5ab/c, S3-2-a/c/e and S3-5. judge E3 also passes.
+- **Still failing:**
+  - L3-1d, L3-4, L3-5a and L3-8a belong to serving-api or config-platform.
+  - L3-8d-enabled: the judge's override equals the world default (see measure-notes).
+  - L3-5d: see measure-notes.
+  - P3-2a: dense DP ranks share one engine-core, executor and scheduler instance. Placing workers per DP rank needs instance groups across engine-core, scheduler-kv and worker-runner.
+  - P3-2b: the scenario drives the client task directly, so no coordinator is called.
+  - P3-2d: the X-data-parallel-rank header belongs to serving-api.
+  - P3-3a: models-layers.
+  - P3-3c: l1-l3 share dp0's scheduler, for the same instance reason.
+  - P3-8 and Q3-8b: the model Qwen2.5-VL is absent from the world; the scheduler side belongs to scheduler-kv.
+- **oracle3:**
+  - The mm-invalidate calls are right, but the scenario reads `state['lru-key-replicated-sender-cache']`. models-layers parents that P0 cache under the worker group, so the state is `@rank0`.
+  - `get-kv-cache-group-metadata` is still missing: it needs scheduler-kv to expose the single-type managers' (DCP-scaled) block sizes.
+  - The mp reducer is still missing: it needs serving-api's `maybe-register-config-serialize-by-value` interface.
+  - External launcher (MIN all-reduce, one engine per launcher rank): open, for the same instance reason.
+
+**New worlds.**
+- MoE: `model-is-moe` reads the checkpoint's expert count. The MoE DP engine choice, waves and coordinator are driven by Mixtral (r5 scenarios).
+- VL: mm_features now reach the scheduler.
+- FP8 KV page size: worker-runner's; engine-core consumes the blocks it reports.
+
+**Round-5 tests:** 6 of 6 pass (one vacuously: config-platform's EngineArgs offline rewrite isn't modeled).
+
+**Breaking changes (callers).**
+- `async-llm.pause-generation` and `async-llm.sleep` return null. Serving-api ignores the result.
+- `engine-core.sleep`/`pause-scheduler` return a `future` when pending, and the utility reply for both is null.
+- `stat-logger-manager.record` takes `{scheduler_stats, iteration_stats, mm_cache_stats, engine_idx}`. This replaces `num_outputs`/`finished`; the only callers are mine.
+- `prometheus-registry` rows are keyed by labeled series. `collect` returns `{series, name, value}`.
+- `reader.get-metrics-snapshot` returns a list (the stub already said array).
+- `llm-engine` starts with `log_stats: false`. Serving-api's `LLM.__init__` should pass `disable_log_stats: true` unless the caller set it.
+- EngineGenerateError's message is empty; the cause is in `data.cause`.
+- `async-mp-client.shutdown` and `mark-dead` take `handler_cancelled`.

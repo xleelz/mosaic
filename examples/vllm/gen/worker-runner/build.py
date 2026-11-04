@@ -189,6 +189,16 @@ def main():
         for k in lists:
             doc[k].extend(part.get(k) or [])
 
+    # The in-build oracle scenarios of rounds 4 and 5 (my own tests) also run in the gate, as wr-bo-*,
+    # so their interfaces count toward behavior coverage.
+    for rnd in ("round4", "round5"):
+        bo = os.path.join(ROOT, f"examples/vllm/build-oracle/{rnd}/worker-runner.yaml")
+        if os.path.exists(bo):
+            for sc in fix_on(yaml.safe_load(open(bo)) or {}).get("scenarios") or []:
+                sc = dict(sc)
+                sc["id"] = "wr-bo-" + sc["id"].replace("oracle-build-worker-runner-", "")
+                doc["scenarios"].append(sc)
+
     # Boundary config copies follow their owner's definition when the owner's fragment has one
     # (RECONCILE decision 1): same type, value, default and attributes, plus boundary/owner.
     owners = {}

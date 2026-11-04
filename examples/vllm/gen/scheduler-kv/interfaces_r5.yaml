@@ -1,0 +1,442 @@
+  # ===================================================== round 5: encoder-input scheduling
+  - component: scheduler
+    name: try-schedule-encoder-inputs
+    kind: function
+    latency_ms: 0
+    summary: "Pick the multimodal items whose placeholders overlap this step's token range and that need encoding, within the encoder compute budget and the encoder cache; cut num_new_tokens to just before an item that can't be scheduled."
+    description: >-
+      An item is scheduled when its placeholder range overlaps [num_computed_tokens,
+      num_computed_tokens + num_new_tokens + shift), it is not already cached (a cached one gains a
+      reference), and the compute budget and cache have room for its embeddings. The encoder runs
+      over a whole item (bidirectional attention), so an item that doesn't fit stops the chunk
+      right before its offset, or schedules nothing when the computed prefix is already past it.
+      Every placeholder is taken to be an embedding (is_embed None), so an overlapping item always
+      has embeddings in range.
+    sources: ["vllm/v1/core/sched/scheduler.py:1789-1966", "vllm/multimodal/utils.py:122-142"]
+    request:
+      type: object
+      required: [request_id, mm_features, num_computed_tokens, num_new_tokens, encoder_compute_budget]
+      properties:
+        request_id: {type: string, examples: [chatcmpl-abc123]}
+        mm_features: {type: array, items: {type: object, properties: {identifier: {type: string}, offset: {type: integer}, length: {type: integer}, num_embeds: {type: integer}}}}
+        num_computed_tokens: {type: integer, examples: [0]}
+        num_new_tokens: {type: integer, examples: [2048]}
+        encoder_compute_budget: {type: integer, examples: [2048]}
+        shift_computed_tokens: {type: integer, default: 0, description: "num_prefill_lookahead (multi-module MTP); 0 otherwise."}
+    response:
+      type: object
+      properties:
+        encoder_inputs_to_schedule: {type: array, items: {type: integer}}
+        num_new_tokens: {type: integer}
+        encoder_compute_budget: {type: integer}
+        duplicate_encoder_inputs: {type: array, items: {type: integer}}
+    behavior:
+      - set:
+          vars.nc: "= input.num_computed_tokens"
+          vars.nn: "= input.num_new_tokens"
+          vars.shift: "= has(input.shift_computed_tokens) ? input.shift_computed_tokens : 0"
+          vars.budget: "= input.encoder_compute_budget"
+          vars.to_sched: []
+          vars.dups: []
+          vars.hashes: {}
+          vars.embeds: 0
+      - if: "vars.nn == 0 || size(input.mm_features) == 0"
+        then:
+          - title: Nothing to schedule or no encoder inputs
+            source: "vllm/v1/core/sched/scheduler.py:1816-1817"
+            return: {encoder_inputs_to_schedule: [], num_new_tokens: "= vars.nn", encoder_compute_budget: "= vars.budget", duplicate_encoder_inputs: []}
+      - title: The items whose placeholders overlap [num_computed_tokens, window end)
+        detail: "get_mm_features_in_window bisects the offset-sorted features: lo is the first item ending after num_computed_tokens, hi the first starting at or after the window end."
+        source: "vllm/v1/core/sched/scheduler.py:1830-1837"
+        set:
+          vars.window_end: "= vars.nc + vars.nn + vars.shift"
+      - foreach: "= lists.range(size(input.mm_features)).filter(i, input.mm_features[i].offset + input.mm_features[i].length > vars.nc && input.mm_features[i].offset < vars.window_end)"
+        as: i
+        steps:
+          - set:
+              vars.f: "= input.mm_features[vars.i]"
+          - set:
+              vars.n_emb: "= has(vars.f.num_embeds) ? vars.f.num_embeds : vars.f.length"
+          - if: "config['disable-chunked-mm-input'] && vars.nc < vars.f.offset && vars.nc + vars.nn < vars.f.offset + vars.f.length"
+            then:
+              - title: Chunked MM input is off - roll the chunk back to just before the item
+                source: "vllm/v1/core/sched/scheduler.py:1866-1881"
+                set: {vars.nn: "= math.greatest(0, vars.f.offset - (vars.nc + vars.shift))"}
+              - break: true
+          - if: "vars.f.identifier in vars.hashes"
+            then:
+              - title: The same item was already scheduled in this step; it shares that encoder run
+                source: "vllm/v1/core/sched/scheduler.py:1884-1898"
+                set: {vars.dups: "= vars.dups + [vars.i]"}
+              - continue: true
+          - title: Already encoded and cached from an earlier step? The request takes a reference
+            source: "vllm/v1/core/sched/scheduler.py:1917-1920"
+            call: encoder-cache-manager.check-and-update-cache
+            input: {request_id: "= input.request_id", input_id: "= vars.i", mm_hash: "= vars.f.identifier"}
+            as: hit
+          - if: "vars.hit.value.cached"
+            then: [{continue: true}]
+          - call: encoder-cache-manager.can-allocate
+            input: {request_id: "= input.request_id", input_id: "= vars.i", num_embeds: "= vars.n_emb", encoder_compute_budget: "= vars.budget", num_embeds_to_schedule: "= vars.embeds"}
+            as: room
+          - if: "!vars.room.value.can_allocate"
+            then:
+              - title: Encoder budget or cache exhausted - schedule only the tokens before this item
+                detail: "When prefix caching already computed past the item's offset, no token can be scheduled this step."
+                source: "vllm/v1/core/sched/scheduler.py:1922-1941"
+                set: {vars.nn: "= vars.nc + vars.shift < vars.f.offset ? vars.f.offset - (vars.nc + vars.shift) : 0"}
+              - break: true
+          - title: Schedule the item's encoder run
+            source: "vllm/v1/core/sched/scheduler.py:1962-1966"
+            set:
+              vars.embeds: "= vars.embeds + vars.n_emb"
+              vars.budget: "= vars.budget - vars.n_emb"
+              vars.hashes: "= merge(vars.hashes, {vars.f.identifier: vars.n_emb})"
+              vars.to_sched: "= vars.to_sched + [vars.i]"
+      - return: {encoder_inputs_to_schedule: "= vars.to_sched", num_new_tokens: "= vars.nn", encoder_compute_budget: "= vars.budget", duplicate_encoder_inputs: "= vars.dups"}
+
+  - component: scheduler
+    name: allocate-encoder-inputs
+    kind: function
+    latency_ms: 0
+    summary: "Reserve encoder-cache slots for the items scheduled this step; duplicates of an item scheduled earlier in the step only take a reference."
+    sources: ["vllm/v1/core/sched/scheduler.py:1775-1787"]
+    request:
+      type: object
+      required: [request_id, mm_features, input_ids]
+      properties:
+        request_id: {type: string}
+        mm_features: {type: array, items: {type: object}}
+        input_ids: {type: array, items: {type: integer}}
+        duplicate_input_ids: {type: array, items: {type: integer}, default: []}
+    response: {type: object, properties: {allocated: {type: integer}}}
+    behavior:
+      - foreach: "= input.input_ids"
+        as: iid
+        steps:
+          - call: encoder-cache-manager.allocate
+            input: {request_id: "= input.request_id", input_id: "= vars.iid", mm_hash: "= input.mm_features[vars.iid].identifier", num_embeds: "= has(input.mm_features[vars.iid].num_embeds) ? input.mm_features[vars.iid].num_embeds : input.mm_features[vars.iid].length"}
+      - foreach: "= has(input.duplicate_input_ids) ? input.duplicate_input_ids : []"
+        as: did
+        steps:
+          - call: encoder-cache-manager.check-and-update-cache
+            input: {request_id: "= input.request_id", input_id: "= vars.did", mm_hash: "= input.mm_features[vars.did].identifier"}
+      - return: {allocated: "= size(input.input_ids)"}
+
+  - component: scheduler
+    name: free-encoder-inputs
+    kind: function
+    latency_ms: 0
+    summary: "After a step ran: drop the request's reference to every cached item whose placeholders are now all computed (and past the drafter's look-ahead)."
+    sources: ["vllm/v1/core/sched/scheduler.py:2512-2548"]
+    request:
+      type: object
+      required: [request_id]
+      properties:
+        request_id: {type: string}
+    response: {type: object, properties: {freed_input_ids: {type: array, items: {type: integer}}}}
+    behavior:
+      - set: {vars.r: "= state.requests[input.request_id]"}
+      - call: encoder-cache-manager.get-cached-input-ids
+        input: {request_id: "= input.request_id"}
+        as: ids
+      - set:
+          vars.frontier: "= vars.r.num_computed_tokens - vars.r.num_output_placeholders"
+          vars.freed: []
+      - title: Free each processed item once it is behind the computed frontier
+        detail: "start_pos + num_tokens + spec_lookahead <= num_computed_tokens - num_output_placeholders: the item is in the decoder KV cache and no rejection or drafter gather can reference it (spec_lookahead is num_prefill_lookahead, 0 here)."
+        source: "vllm/v1/core/sched/scheduler.py:2531-2543"
+        foreach: "= vars.ids.value.input_ids"
+        as: iid
+        steps:
+          - if: "vars.r.mm_features[vars.iid].offset + vars.r.mm_features[vars.iid].length <= vars.frontier"
+            then:
+              - call: encoder-cache-manager.free-encoder-input
+                input: {request_id: "= input.request_id", input_id: "= vars.iid", mm_hashes: "= vars.r.mm_features.map(f, f.identifier)"}
+              - set: {vars.freed: "= vars.freed + [vars.iid]"}
+      - return: {freed_input_ids: "= vars.freed"}
+
+  - component: encoder-cache-manager
+    name: get-cached-input-ids
+    kind: function
+    latency_ms: 0
+    summary: "The input ids of a request whose embeddings are cached (the request holds a reference)."
+    sources: ["vllm/v1/core/encoder_cache_manager.py:242-244"]
+    request: {type: object, required: [request_id], properties: {request_id: {type: string}}}
+    response: {type: object, properties: {input_ids: {type: array, items: {type: integer}}}}
+    behavior:
+      - return: {input_ids: "= input.request_id in state.request_cached_ids ? state.request_cached_ids[input.request_id] : []"}
+
+  - component: encoder-cache-manager
+    name: compute-mm-encoder-budget
+    kind: function
+    latency_ms: 0
+    summary: "The encoder compute budget and the encoder cache size, in tokens: each is max(the SchedulerConfig value, which defaults to max_num_batched_tokens, the largest multimodal item)."
+    sources: ["vllm/v1/core/encoder_cache_manager.py:316-361", "vllm/config/scheduler.py:303-304"]
+    errors: [{code: value-error, status: 0, retryable: false}]
+    request:
+      type: object
+      required: [mm_max_toks_per_item]
+      properties:
+        mm_max_toks_per_item: {type: object, description: "Modality -> the most placeholder tokens one item can take (the model's profiled maximum)", examples: [{image: 16384, video: 16384}]}
+        max_num_batched_tokens: {type: [integer, "null"], default: null, description: "null: the max-num-batched-tokens config"}
+    response: {type: object, properties: {encoder_compute_budget: {type: integer}, encoder_cache_size: {type: integer}}}
+    behavior:
+      - set:
+          vars.mnbt: "= has(input.max_num_batched_tokens) && input.max_num_batched_tokens != null ? input.max_num_batched_tokens : int(config['max-num-batched-tokens'])"
+      - if: "size(input.mm_max_toks_per_item) == 0"
+        then:
+          - title: Every non-text modality is disabled (limit_mm_per_prompt); no encoder cache
+            source: "vllm/v1/core/encoder_cache_manager.py:335-341"
+            return: {encoder_compute_budget: 0, encoder_cache_size: 0}
+      - set:
+          vars.max_item: "= math.greatest(input.mm_max_toks_per_item.transformList(k, v, v))"
+      - if: "config['disable-chunked-mm-input'] && vars.max_item > vars.mnbt"
+        then:
+          - title: An item larger than the batch can't be scheduled without chunking it
+            source: "vllm/v1/core/encoder_cache_manager.py:345-354"
+            fail: {code: value-error, status: 0, message: "= 'Chunked MM input disabled but max_tokens_per_mm_item (' + string(vars.max_item) + ') is larger than max_num_batched_tokens (' + string(vars.mnbt) + '). Please increase max_num_batched_tokens.'"}
+      - title: max(max_num_encoder_input_tokens or encoder_cache_size, the largest item); both default to max_num_batched_tokens
+        source: "vllm/v1/core/encoder_cache_manager.py:356-363"
+        return: {encoder_compute_budget: "= math.greatest(vars.mnbt, vars.max_item)", encoder_cache_size: "= math.greatest(vars.mnbt, vars.max_item)"}
+
+  - component: scheduler
+    name: init-encoder-cache
+    kind: function
+    latency_ms: 0
+    summary: "Scheduler.__init__'s multimodal part: size the encoder compute budget and create the encoder cache from the model's largest item (a text-only model gets 0 and 0)."
+    sources: ["vllm/v1/core/sched/scheduler.py:255-285"]
+    request:
+      type: object
+      properties:
+        mm_max_toks_per_item: {type: object, default: {}, description: "Empty for a text-only model (no MultiModalBudget)."}
+    response: {type: object, properties: {max_num_encoder_input_tokens: {type: integer}, encoder_cache_size: {type: integer}}}
+    behavior:
+      - set: {vars.budget: 0, vars.size: 0}
+      - if: "has(input.mm_max_toks_per_item) && size(input.mm_max_toks_per_item) > 0"
+        then:
+          - title: A multimodal model has a MultiModalBudget
+            source: "vllm/v1/core/sched/scheduler.py:257-260"
+            call: encoder-cache-manager.compute-mm-encoder-budget
+            input: {mm_max_toks_per_item: "= input.mm_max_toks_per_item"}
+            as: b
+          - set: {vars.budget: "= vars.b.value.encoder_compute_budget", vars.size: "= vars.b.value.encoder_cache_size"}
+      - title: Set the encoder compute budget
+        source: "vllm/v1/core/sched/scheduler.py:271-273"
+        set: {state.max_num_encoder_input_tokens: "= vars.budget"}
+      - title: Create the EncoderCacheManager with the cache size
+        source: "vllm/v1/core/sched/scheduler.py:274-285"
+        call: encoder-cache-manager.init
+        input: {cache_size: "= vars.size"}
+      - return: {max_num_encoder_input_tokens: "= vars.budget", encoder_cache_size: "= vars.size"}
+
+  # ===================================================== round 5: the P2P secondary tier
+  - component: p2p-secondary-tier-manager
+    name: init
+    kind: function
+    latency_ms: 0
+    summary: "Build a P2P tier: reject a backpressure detector and a non-positive unbound-store timeout, bind the control identity host:(port + DP index), and leave the hash seed unresolved."
+    sources: ["vllm/v1/kv_offload/tiering/p2p/manager.py:216-334"]
+    errors: [{code: value-error, status: 0, retryable: false}]
+    request:
+      type: object
+      required: [tier_id]
+      properties:
+        tier_id: {type: string, examples: [p2p-0]}
+        tier_type: {type: [string, "null"], default: p2p}
+        host: {type: [string, "null"], default: null, description: "Defaults to VLLM_P2P_SIDE_CHANNEL_HOST (localhost)."}
+        port: {type: [integer, "null"], default: null, description: "Defaults to VLLM_P2P_SIDE_CHANNEL_PORT (5710)."}
+        data_parallel_index: {type: integer, default: 0}
+        unbound_store_timeout_s: {default: 60.0}
+        backpressure_detector: {type: [string, "null"], default: null}
+    response: {type: object, properties: {tier_id: {type: string}, local_id: {type: string}}}
+    behavior:
+      - if: "has(input.backpressure_detector) && input.backpressure_detector != null"
+        then:
+          - title: The generic store-latency detector can't fail fast for P2P
+            source: "vllm/v1/kv_offload/tiering/p2p/manager.py:276-290"
+            fail: {code: value-error, status: 0, message: "Backpressure is not supported for the P2P secondary tier. The generic store-latency detector cannot fail fast in PD mode and rendezvous time makes store latency an unreliable pressure signal. Remove the 'backpressure' config from the p2p tier."}
+      - set:
+          vars.t: "= has(input.unbound_store_timeout_s) ? input.unbound_store_timeout_s : 60.0"
+      - if: "!(type(vars.t) == int || type(vars.t) == double) || double(vars.t) <= 0.0"
+        then:
+          - title: The unbound-store timeout must be a positive number
+            source: "vllm/v1/kv_offload/tiering/p2p/manager.py:295-303"
+            fail: {code: value-error, status: 0, message: "= 'unbound_store_timeout_s must be a positive number, got ' + (type(vars.t) == string ? \"'\" + vars.t + \"'\" : string(vars.t))"}
+      - title: Control identity host:(port + DP index); the seed is resolved on the first session
+        detail: "Block hashes chain from NONE_HASH, and the tier is built before init_none_hash runs, so the seed is only known later."
+        source: "vllm/v1/kv_offload/tiering/p2p/manager.py:306-333"
+        set:
+          vars.host: "= has(input.host) && input.host != null ? input.host : 'localhost'"
+          vars.port: "= (has(input.port) && input.port != null ? input.port : 5710) + (has(input.data_parallel_index) ? input.data_parallel_index : 0)"
+      - set:
+          state.tiers: "= merge(state.tiers, {input.tier_id: {'tier_type': has(input.tier_type) && input.tier_type != null ? input.tier_type : 'p2p', 'local_id': vars.host + ':' + string(vars.port), 'hash_seed': null, 'sessions': {}, 'kv_to_session': {}, 'failed_req_ids': [], 'unbound_stores': {}, 'unbound_store_timeout_s': double(vars.t)}})"
+      - return: {tier_id: "= input.tier_id", local_id: "= state.tiers[input.tier_id].local_id"}
+
+  - component: p2p-secondary-tier-manager
+    name: annotate-req-context
+    kind: function
+    latency_ms: 0
+    summary: "Parse a request's kv_transfer_params once: the consumer side (remote_prefiller, or remote_kv_source for symmetric P2P) gives a source {kv_request_id, peer_id host:port}; the producer side (remote_decoder) gives a dest {kv_request_id}."
+    sources: ["vllm/v1/kv_offload/tiering/p2p/manager.py:78-183"]
+    request: {type: object, properties: {kv_transfer_params: {type: [object, "null"], default: null}}}
+    response: {type: object, properties: {source: {type: [object, "null"]}, dest: {type: [object, "null"]}}}
+    behavior:
+      - set:
+          vars.kv: "= has(input.kv_transfer_params) && input.kv_transfer_params != null ? input.kv_transfer_params : {}"
+      - set:
+          vars.role: "= 'remote_prefiller' in vars.kv && vars.kv.remote_prefiller != null ? vars.kv.remote_prefiller : ('remote_kv_source' in vars.kv && vars.kv.remote_kv_source != null ? vars.kv.remote_kv_source : dyn(null))"
+          vars.probe: "= !('remote_prefiller' in vars.kv && vars.kv.remote_prefiller != null)"
+      - title: "Source: the sub-dict must carry remote_host, remote_port and kv_request_id"
+        source: "vllm/v1/kv_offload/tiering/p2p/manager.py:141-159"
+        set:
+          vars.source: "= vars.role != null && size(vars.role) > 0 && 'remote_host' in vars.role && vars.role.remote_host != null && vars.role.remote_host != '' && 'remote_port' in vars.role && vars.role.remote_port != null && vars.role.remote_port != 0 && 'kv_request_id' in vars.role && vars.role.kv_request_id != null && vars.role.kv_request_id != '' ? {'kv_request_id': vars.role.kv_request_id, 'peer_id': vars.role.remote_host + ':' + string(vars.role.remote_port), 'do_probe': vars.probe} : dyn(null)"
+      - title: "Dest: a remote_decoder sub-dict (its kv_request_id may be missing)"
+        source: "vllm/v1/kv_offload/tiering/p2p/manager.py:162-168"
+        set:
+          vars.dest: "= 'remote_decoder' in vars.kv && vars.kv.remote_decoder != null ? {'kv_request_id': 'kv_request_id' in vars.kv.remote_decoder && vars.kv.remote_decoder.kv_request_id != '' ? vars.kv.remote_decoder.kv_request_id : dyn(null)} : dyn(null)"
+      - return: {source: "= vars.source", dest: "= vars.dest"}
+
+  - component: p2p-secondary-tier-manager
+    name: on-request-finished
+    kind: function
+    latency_ms: 0
+    summary: "A request finished: the consumer side finishes it on the session to its producer (by peer id); the producer side finishes it on the session bound to its kv_request_id and unbinds it; an unbound id leaves its parked stores alone."
+    sources: ["vllm/v1/kv_offload/tiering/p2p/manager.py:445-479"]
+    request:
+      type: object
+      required: [tier_id]
+      properties:
+        tier_id: {type: string, examples: [p2p-0]}
+        kv_transfer_params: {type: [object, "null"], default: null}
+    response: {type: object, properties: {finished_on: {type: [string, "null"]}}}
+    behavior:
+      - call: p2p-secondary-tier-manager.annotate-req-context
+        input: {kv_transfer_params: "= has(input.kv_transfer_params) ? input.kv_transfer_params : dyn(null)"}
+        as: ctx
+      - set:
+          vars.t: "= state.tiers[input.tier_id]"
+          vars.kid: "= vars.ctx.value.source != null ? vars.ctx.value.source.kv_request_id : (vars.ctx.value.dest != null ? vars.ctx.value.dest.kv_request_id : dyn(null))"
+      - if: "vars.kid == null || vars.kid == ''"
+        then:
+          - title: Not a P2P request
+            source: "vllm/v1/kv_offload/tiering/p2p/manager.py:465-466"
+            return: {finished_on: null}
+      - set:
+          state.tiers: "= merge(state.tiers, {input.tier_id: {'failed_req_ids': vars.t.failed_req_ids.filter(r, r != vars.kid)}})"
+      - if: "vars.ctx.value.source != null"
+        then:
+          - if: "vars.ctx.value.source.peer_id in vars.t.sessions"
+            then:
+              - title: Consumer side - finish it on the session to the producer (cancel lookups and the inbound load)
+                source: "vllm/v1/kv_offload/tiering/p2p/manager.py:469-472"
+                set:
+                  state.tiers: "= merge(state.tiers, {input.tier_id: {'sessions': merge(vars.t.sessions, {vars.ctx.value.source.peer_id: {'finished': vars.t.sessions[vars.ctx.value.source.peer_id].finished + [vars.kid]}})}})"
+              - return: {finished_on: "= vars.ctx.value.source.peer_id"}
+          - return: {finished_on: null}
+      - if: "vars.kid in vars.t.kv_to_session && vars.t.kv_to_session[vars.kid] in vars.t.sessions"
+        then:
+          - title: Producer side - pop the session bound to the id and finish it there
+            source: "vllm/v1/kv_offload/tiering/p2p/manager.py:475-479"
+            set:
+              vars.peer: "= vars.t.kv_to_session[vars.kid]"
+          - set:
+              state.tiers: "= merge(omit(state.tiers, input.tier_id), {input.tier_id: merge(omit(state.tiers[input.tier_id], 'kv_to_session'), {'kv_to_session': omit(vars.t.kv_to_session, vars.kid), 'sessions': merge(vars.t.sessions, {vars.peer: {'finished': vars.t.sessions[vars.peer].finished + [vars.kid]}})})})"
+          - return: {finished_on: "= vars.peer"}
+      - title: No session bound yet - the parked stores wait for a fetch or the reaper
+        source: "vllm/v1/kv_offload/tiering/p2p/manager.py:453-458"
+        set:
+          state.tiers: "= merge(omit(state.tiers, input.tier_id), {input.tier_id: merge(omit(state.tiers[input.tier_id], 'kv_to_session'), {'kv_to_session': omit(vars.t.kv_to_session, vars.kid)})})"
+      - return: {finished_on: null}
+
+  - component: p2p-secondary-tier-manager
+    name: get-hash-seed
+    kind: function
+    latency_ms: 0
+    summary: "The seed NONE_HASH was derived from, resolved through get_none_hash_seed on first use and cached."
+    sources: ["vllm/v1/kv_offload/tiering/p2p/manager.py:689-693"]
+    request: {type: object, required: [tier_id], properties: {tier_id: {type: string, examples: [p2p-0]}}}
+    response: {type: object, properties: {seed: {type: string}}}
+    behavior:
+      - if: "state.tiers[input.tier_id].hash_seed == null"
+        then:
+          - title: Resolve the seed now (init_none_hash has run by the first session)
+            source: "vllm/v1/kv_offload/tiering/p2p/manager.py:691-692"
+            call: kv-cache-utils.get-none-hash-seed
+            as: s
+          - set: {state.tiers: "= merge(state.tiers, {input.tier_id: {'hash_seed': vars.s.value.seed}})"}
+      - return: {seed: "= state.tiers[input.tier_id].hash_seed"}
+
+  - component: p2p-secondary-tier-manager
+    name: get-or-create-session
+    kind: function
+    latency_ms: 0
+    summary: "Consumer side: reuse the session to peer_id, or open one outbound (capped at VLLM_P2P_MAX_PEERS) that advertises the local hash seed."
+    sources: ["vllm/v1/kv_offload/tiering/p2p/manager.py:695-746"]
+    request:
+      type: object
+      required: [tier_id, peer_id]
+      properties:
+        tier_id: {type: string, examples: [p2p-0]}
+        peer_id: {type: string, examples: ["10.0.0.1:8000"]}
+        max_peers: {type: integer, default: 128, description: "VLLM_P2P_MAX_PEERS (envs.py:237)."}
+    response: {type: object, properties: {peer_id: {type: [string, "null"]}, created: {type: boolean}, local_hash_seed: {type: [string, "null"]}}}
+    behavior:
+      - if: "input.peer_id in state.tiers[input.tier_id].sessions"
+        then:
+          - title: Reuse the existing session (a prior load or a peer-initiated inbound one)
+            source: "vllm/v1/kv_offload/tiering/p2p/manager.py:708-710"
+            return: {peer_id: "= input.peer_id", created: false, local_hash_seed: "= state.tiers[input.tier_id].sessions[input.peer_id].local_hash_seed"}
+      - if: "size(state.tiers[input.tier_id].sessions) >= (has(input.max_peers) ? input.max_peers : 128)"
+        then:
+          - title: Session limit reached; the outbound peer is rejected
+            source: "vllm/v1/kv_offload/tiering/p2p/manager.py:712-722"
+            return: {peer_id: null, created: false, local_hash_seed: null}
+      - call: p2p-secondary-tier-manager.get-hash-seed
+        input: {tier_id: "= input.tier_id"}
+        as: seed
+      - title: Connect and build a session that advertises the local hash seed
+        source: "vllm/v1/kv_offload/tiering/p2p/manager.py:724-746"
+        set:
+          state.tiers: "= merge(state.tiers, {input.tier_id: {'sessions': merge(state.tiers[input.tier_id].sessions, {input.peer_id: {'connected': true, 'local_hash_seed': vars.seed.value.seed, 'finished': []}})}})"
+      - return: {peer_id: "= input.peer_id", created: true, local_hash_seed: "= vars.seed.value.seed"}
+
+  # ===================================================== round 5: reading the waiting queue
+  - component: scheduler
+    name: iter-waiting
+    kind: function
+    latency_ms: 0
+    summary: "Iterate the waiting queue in policy order (list(scheduler.waiting)): FCFS in deque order; priority by popping a copy of the heap, so (priority, arrival_time, request_id) ascending."
+    sources: ["vllm/v1/core/sched/request_queue.py:126-128", "vllm/v1/core/sched/request_queue.py:193-197", "vllm/v1/request.py:357-367"]
+    request: {type: object}
+    response: {type: object, properties: {request_ids: {type: array, items: {type: string}}, priorities: {type: array, items: {type: integer}}}}
+    behavior:
+      - if: "config['scheduling-policy'] != 'priority'"
+        then:
+          - title: FCFS - the deque's own order
+            source: "vllm/v1/core/sched/request_queue.py:126-128"
+            return: {request_ids: "= state.waiting", priorities: "= state.waiting.map(id, state.requests[id].priority)"}
+      - title: Priority - a heap copy popped to empty; Request.__lt__ orders by priority, then arrival_time, then request_id
+        source: "vllm/v1/core/sched/request_queue.py:193-197"
+        set:
+          vars.rank: "= state.waiting.map(id, size(state.waiting.filter(o, state.requests[o].priority < state.requests[id].priority || (state.requests[o].priority == state.requests[id].priority && (state.requests[o].arrival_time < state.requests[id].arrival_time || (state.requests[o].arrival_time == state.requests[id].arrival_time && o < id))))))"
+      - set:
+          vars.ordered: "= lists.range(size(state.waiting)).map(k, state.waiting[vars.rank.indexOf(k)])"
+      - return: {request_ids: "= vars.ordered", priorities: "= vars.ordered.map(id, state.requests[id].priority)"}
+
+  # ===================================================== merge: the single-type managers' block sizes
+  - component: kv-cache-manager
+    name: get-group-block-sizes
+    kind: function
+    latency_ms: 0
+    summary: "kv_cache_manager.coordinator.single_type_managers, one per KV cache group: each manager's block_size is the spec's block size times the DCP world size when DCP shards the spec (every attention spec kind; a Mamba spec doesn't), and its spec kind and sliding window."
+    sources: ["vllm/v1/core/single_type_kv_cache_manager.py:100-108", "vllm/v1/kv_cache_interface.py:164-171", "vllm/v1/kv_cache_interface.py:510-512", "vllm/v1/core/sched/scheduler.py:210-211"]
+    request: {type: object, properties: {}}
+    response:
+      type: array
+      items: {type: object, properties: {kind: {type: string}, block_size: {type: integer}, sliding_window: {type: ["integer", "null"]}, dcp_world_size: {type: integer}}}
+    behavior:
+      - set: {vars.dcp: "= int(config['decode-context-parallel-size'])"}
+      - title: "self.dcp_world_size = dcp_world_size if kv_cache_spec.dcp_sharded else 1; self.block_size = kv_cache_spec.block_size * self.dcp_world_size (AttentionSpec sets dcp_sharded; KVCacheSpec defaults it off)"
+        source: "vllm/v1/core/single_type_kv_cache_manager.py:106-108"
+        return: "= state.kv_cache_groups.map(g, {'kind': g.kind, 'block_size': g.block_size * (g.kind == 'mamba' ? 1 : vars.dcp), 'sliding_window': has(g.sliding_window) ? g.sliding_window : null, 'dcp_world_size': g.kind == 'mamba' ? 1 : vars.dcp})"

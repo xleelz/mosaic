@@ -1,0 +1,138 @@
+# Round-5 in-build oracle for worker-runner: the tests in build-oracle/round5/worker-runner.json.
+# Run merged: check -f skeleton -f fixtures -f worlds -f <fragments> -f this file --scenario '^oracle-build-worker-runner-r5'
+schema_version: 1
+id: vllm
+scenarios:
+  - id: oracle-build-worker-runner-r5-1
+    name: "test_delayed_start_and_max_iters: delay 2 and max 2 start the profiler on the 2nd step and stop it once a 3rd step is recorded"
+    description: "tests/v1/worker/test_gpu_profiler.py:509. WorkerProfiler with delay_iterations=2, max_iterations=2 (vllm/profiler/wrapper.py:103-192): start() only activates; step 1 leaves it stopped, step 2 starts it (1 recorded), step 3 records 2, step 4 records 3 > 2 and stop() runs once."
+    fixtures: [full-tp1-llama-8b]
+    config: {profiler: torch, profiler-delay-iterations: 2, profiler-max-iterations: 2}
+    steps:
+      - {interface: worker-profiler.create, caller: gpu-worker-impl, input: {worker_name: dp0_pp0_tp0_dcp0_ep0_rank0}}
+      - {interface: worker-profiler.start, caller: gpu-worker-impl, input: {}, as: start}
+      - {interface: worker-profiler.step, caller: gpu-worker-impl, as: s1}
+      - {interface: worker-profiler.step, caller: gpu-worker-impl, as: s2}
+      - {interface: worker-profiler.step, caller: gpu-worker-impl, as: s3}
+      - {interface: worker-profiler.step, caller: gpu-worker-impl, as: s4}
+    expect:
+      - "steps.start.result.value.active && !steps.start.result.value.running"
+      - "!steps.s1.result.value.running && steps.s1.result.value.active"
+      - "steps.s2.result.value.profiling_for_iters == 1 && steps.s2.result.value.running && steps.s2.result.value.active"
+      - "steps.s3.result.value.profiling_for_iters == 2 && steps.s3.result.value.running"
+      - "!steps.s4.result.value.running && state['worker-profiler@rank0'].stop_call_count == 1"
+  - id: oracle-build-worker-runner-r5-1b
+    name: "test_delayed_start_and_max_iters through the RPC: profile(start) creates the profiler and each execute_model steps it"
+    description: "gpu_worker.py:1365-1421 and annotate_profile (gpu_worker.py:1180-1187): the same bounds, reached from collective_rpc profile and four empty execute_model steps."
+    fixtures: [full-tp1-llama-8b]
+    config: {profiler: torch, profiler-delay-iterations: 2, profiler-max-iterations: 2}
+    steps:
+      - {interface: gpu-worker-impl.profile, caller: engine-core, input: {is_start: true, profile_prefix: bench}, as: p}
+      - {interface: gpu-worker-impl.execute-model, caller: engine-core, input: {scheduled_new_reqs: [], scheduled_cached_reqs: {req_ids: []}, num_scheduled_tokens: {}, total_num_scheduled_tokens: 0, finished_req_ids: []}}
+      - {interface: gpu-worker-impl.execute-model, caller: engine-core, input: {scheduled_new_reqs: [], scheduled_cached_reqs: {req_ids: []}, num_scheduled_tokens: {}, total_num_scheduled_tokens: 0, finished_req_ids: []}}
+      - {interface: gpu-worker-impl.execute-model, caller: engine-core, input: {scheduled_new_reqs: [], scheduled_cached_reqs: {req_ids: []}, num_scheduled_tokens: {}, total_num_scheduled_tokens: 0, finished_req_ids: []}}
+      - {interface: gpu-worker-impl.execute-model, caller: engine-core, input: {scheduled_new_reqs: [], scheduled_cached_reqs: {req_ids: []}, num_scheduled_tokens: {}, total_num_scheduled_tokens: 0, finished_req_ids: []}}
+    expect:
+      - "steps.p.result.ok && steps.p.result.value.trace_name == 'bench_dp0_pp0_tp0_dcp0_ep0_rank0' && !steps.p.result.value.running"
+      - "calls['worker-profiler.step'] == 4 && state['worker-profiler@rank0'].start_call_count == 1 && state['worker-profiler@rank0'].stop_call_count == 1 && !state['worker-profiler@rank0'].running"
+
+  - id: oracle-build-worker-runner-r5-2
+    name: "test_sampling_params_trace_field_defaults_to_none: SamplingParams(max_tokens=10) has no trace_decode_token_ids"
+    description: "tests/v1/sample/test_trace_replay_params.py:15. The dataclass default is None (vllm/sampling_params.py:443); serving-api's sampling-params.post-init returns only the fields that are set, so None is an absent key."
+    fixtures: [full-tp1-llama-8b]
+    steps:
+      - {interface: sampling-params.post-init, caller: llm, input: {params: {max_tokens: 10}}, as: sp}
+    expect:
+      - "steps.sp.result.ok && steps.sp.result.value.max_tokens == 10"
+      - "!has(steps.sp.result.value.trace_decode_token_ids) || steps.sp.result.value.trace_decode_token_ids == null"
+
+  - id: oracle-build-worker-runner-r5-3
+    name: "test_draft_shift_raises_on_interior_miss: the drafter's +1 shift still raises on a miss inside the processed range"
+    description: "tests/v1/worker/test_gpu_model_runner_mm_gather.py:86. GPUModelRunner._gather_mm_embeddings (V1, gpu_model_runner.py:3001-3111) with one uncached image feature at offset 0, length 8, 8 tokens scheduled, shift 1: the feature starts inside the processed range, so the miss is RuntimeError('Encoder cache miss for h0.')."
+    fixtures: [full-tp1-llama-8b]
+    steps:
+      - interface: gpu-model-runner-v1.gather-mm-embeddings
+        caller: gpu-model-runner-v1
+        input:
+          reqs: [{req_id: req0, num_computed_tokens: 0, num_scheduled_tokens: 8, mm_features: [{identifier: h0, offset: 0, length: 8}]}]
+          cached: []
+          total_num_scheduled_tokens: 8
+          shift_computed_tokens: 1
+        as: g
+    expect:
+      - "!steps.g.result.ok && steps.g.result.error.code == 'runtime-error' && steps.g.result.error.message.contains('Encoder cache miss') && steps.g.result.error.message == 'Encoder cache miss for h0.'"
+  - id: oracle-build-worker-runner-r5-3b
+    name: "Siblings (test_draft_shift_uses_boundary_feature_when_cached / _tolerates_missing_boundary_feature / test_target_path_raises_on_encoder_cache_miss)"
+    description: "tests/v1/worker/test_gpu_model_runner_mm_gather.py:60-93: with shift 1 the boundary feature h1 (offset 8) is used when cached (8 positions marked) and skipped when not (7 marked); with no shift an interior miss still raises."
+    fixtures: [full-tp1-llama-8b]
+    steps:
+      - interface: gpu-model-runner-v1.gather-mm-embeddings
+        caller: gpu-model-runner-v1
+        input:
+          reqs: [{req_id: req0, num_computed_tokens: 0, num_scheduled_tokens: 8, mm_features: [{identifier: h0, offset: 0, length: 8}, {identifier: h1, offset: 8, length: 8}]}]
+          cached: [h0, h1]
+          total_num_scheduled_tokens: 8
+          shift_computed_tokens: 1
+        as: both
+      - interface: gpu-model-runner-v1.gather-mm-embeddings
+        caller: gpu-model-runner-v1
+        input:
+          reqs: [{req_id: req0, num_computed_tokens: 0, num_scheduled_tokens: 8, mm_features: [{identifier: h0, offset: 0, length: 8}, {identifier: h1, offset: 8, length: 8}]}]
+          cached: [h0]
+          total_num_scheduled_tokens: 8
+          shift_computed_tokens: 1
+        as: boundary_missing
+      - interface: gpu-model-runner-v1.gather-mm-embeddings
+        caller: gpu-model-runner-v1
+        input:
+          reqs: [{req_id: req0, num_computed_tokens: 0, num_scheduled_tokens: 8, mm_features: [{identifier: h0, offset: 0, length: 8}]}]
+          cached: []
+          total_num_scheduled_tokens: 8
+        as: target_miss
+    expect:
+      - "size(steps.both.result.value.mm_embeds) == 2 && steps.both.result.value.is_mm_embed[7] && size(steps.both.result.value.is_mm_embed.filter(b, b)) == 8"
+      - "size(steps.boundary_missing.result.value.mm_embeds) == 1 && !steps.boundary_missing.result.value.is_mm_embed[7] && size(steps.boundary_missing.result.value.is_mm_embed.filter(b, b)) == 7"
+      - "!steps.target_miss.result.ok && steps.target_miss.result.error.message == 'Encoder cache miss for h0.'"
+
+  - id: oracle-build-worker-runner-r5-4
+    name: "test_eonly_capture_preserves_outputs_across_replay_and_fallback (profile_only False): encoder-only capture, 4 graph hits and 1 eager fallback"
+    description: "tests/v1/cudagraph/test_encoder_cudagraph.py:772, profile_only=False. MMEncoderModelRunner.capture_model captures one graph per budget [16, 64] and locks the workspace (mm_encoder_model_runner.py:77-100); EncoderCudaGraphManager.execute packs [8x8, 4x4] as two batches (4 and 16 tokens: merging would need the 64 budget), 16x16 fits 64, 18x18 (81 tokens) runs eager, 4x4 fits 16 (encoder_cudagraph.py:459-566). A producer EC connector offloads each newly cached output (ec_connector.py:68-74). The tensor equality checks (graph output == eager output, earlier outputs unchanged) are numeric and not translated."
+    fixtures: [full-tp1-llama-8b]
+    steps:
+      - {interface: workspace-manager.init, caller: gpu-model-runner, input: {num_lanes: 1}}
+      - {interface: encoder-cudagraph-manager.init, caller: mm-encoder-model-runner, input: {token_budgets: [16, 64], max_batch_size: 4}}
+      - {interface: mm-encoder-model-runner.capture-model, caller: gpu-worker-impl, input: {profile_only: false}, as: cap}
+      - {interface: encoder-cudagraph-manager.execute, caller: encoder-runner, input: {items: [{grid_thw: [1, 8, 8]}, {grid_thw: [1, 4, 4]}]}, as: e1}
+      - {interface: encoder-cudagraph-manager.execute, caller: encoder-runner, input: {items: [{grid_thw: [1, 16, 16]}]}, as: e2}
+      - {interface: encoder-cudagraph-manager.execute, caller: encoder-runner, input: {items: [{grid_thw: [1, 18, 18]}]}, as: e3}
+      - {interface: encoder-cudagraph-manager.execute, caller: encoder-runner, input: {items: [{grid_thw: [1, 4, 4]}]}, as: e4}
+      - {interface: runner-ec-connector.maybe-get-output, caller: gpu-model-runner, input: {ec_connector_metadata: {}, is_producer: true, cached_before: [], cached_after: ["0", "1", "2", "3"]}, as: ec}
+    expect:
+      - "steps.cap.result.value.locked_workspace && calls['workspace-manager.lock'] == 1"
+      - "steps.e1.result.value.output_tokens == [16, 4] && size(steps.e1.result.value.batches) == 2 && steps.e3.result.value.output_tokens == [81]"
+      - "steps.ec.result.value.saved == ['0', '1', '2', '3']"
+      - "(steps.cap.result.value.num_graphs == 2 && size(state['encoder-cudagraph-manager@rank0'].budget_graphs) == 2) && (state['encoder-cudagraph-manager@rank0'].graph_hits == 4 && state['encoder-cudagraph-manager@rank0'].graph_misses == 1)"
+  - id: oracle-build-worker-runner-r5-4b
+    name: "test_eonly_capture_preserves_outputs_across_replay_and_fallback (profile_only True): no workspace lock"
+    description: "tests/v1/cudagraph/test_encoder_cudagraph.py:772, profile_only=True (mm_encoder_model_runner.py:89-90)."
+    fixtures: [full-tp1-llama-8b]
+    steps:
+      - {interface: workspace-manager.init, caller: gpu-model-runner, input: {num_lanes: 1}}
+      - {interface: encoder-cudagraph-manager.init, caller: mm-encoder-model-runner, input: {token_budgets: [16, 64], max_batch_size: 4}}
+      - {interface: mm-encoder-model-runner.capture-model, caller: gpu-worker-impl, input: {profile_only: true}, as: cap}
+    expect:
+      - "!steps.cap.result.value.locked_workspace && calls['workspace-manager.lock'] == 0 && steps.cap.result.value.num_graphs == 2"
+      - "!state['workspace-manager@rank0'].locked && size(state['encoder-cudagraph-manager@rank0'].budget_graphs) == 2"
+
+  - id: oracle-build-worker-runner-r5-5
+    name: "test_scoped_max_split_keeps_freed_large_blocks_releasable: the profiling scope sets max_split_size_mb:20 and restores the settings"
+    description: "tests/v1/worker/test_gpu_worker.py:107. Worker._scoped_allocator_max_split (gpu_worker.py:406-433). The settings handling is translated; the reserved-bytes assertions measure the CUDA caching allocator's block splitting inside torch, which the model does not simulate."
+    fixtures: [full-tp1-llama-8b]
+    steps:
+      - {interface: gpu-worker-impl.scoped-allocator-max-split, caller: gpu-worker-impl, input: {max_split_size_mb: 20, original_settings: ""}, as: plain}
+      - {interface: gpu-worker-impl.scoped-allocator-max-split, caller: gpu-worker-impl, input: {max_split_size_mb: 20, original_settings: "expandable_segments:False,"}, as: kept}
+      - {flow: wr-determine-available-memory, as: mem}
+    expect:
+      - "steps.plain.result.value.settings_in_scope == 'max_split_size_mb:20' && steps.plain.result.value.settings_after == ''"
+      - "steps.kept.result.value.settings_in_scope == 'expandable_segments:False,max_split_size_mb:20' && steps.kept.result.value.settings_after == 'expandable_segments:False,'"
+      - "steps.mem.result.ok && trace.exists(e, e.type == 'call.start' && e.interface == 'gpu-worker-impl.scoped-allocator-max-split' && e.input.max_split_size_mb == 20)"

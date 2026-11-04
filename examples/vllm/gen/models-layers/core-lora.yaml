@@ -26,6 +26,9 @@ components:
         registered: []
         active: []
         slots: []
+        is_moe: false
+        modules: {}
+        classification_head: null
   - id: peft-helper
     name: PEFTHelper
     kind: module
@@ -98,6 +101,7 @@ interfaces:
         then:
           - call: lru-cache-worker-lora-manager.load-adapter
             input: "= input"
+            as: lora
           - title: Remove an existing copy (in-place reload)
             source: "vllm/lora/worker_manager.py:306-308"
             call: lru-cache-lora-model-manager.remove-adapter
@@ -105,7 +109,7 @@ interfaces:
           - title: Evict the oldest when one more would exceed capacity (max_cpu_loras)
             source: "vllm/lora/worker_manager.py:310-314"
             call: lru-cache-lora-model-manager.add-adapter
-            input: {adapter_id: "= input.lora_int_id", evict_if_full: true}
+            input: {adapter_id: "= input.lora_int_id", evict_if_full: true, is_3d_lora_weight: "= vars.lora.value.is_3d_lora_weight", lora_modules: "= vars.lora.value.lora_modules"}
             as: added
           - set: {vars.loaded: "= vars.added.value.was_added"}
         else:
@@ -144,9 +148,26 @@ interfaces:
         source: "vllm/lora/worker_manager.py:125-127"
         call: peft-helper.validate-legal
         input: "= vars.peft.value"
-      - title: LoRAModel.from_local_checkpoint on CPU, then module-format validation
-        source: "vllm/lora/worker_manager.py:139-160"
-        return: {id: "= input.lora_int_id", rank: "= vars.peft.value.r"}
+      - title: "LoRAModel.from_local_checkpoint on CPU: the tensor index of adapter_model.safetensors (module -> lora_a layout, full modules_to_save weights)"
+        source: "vllm/lora/worker_manager.py:139-150"
+        call: local-disk.read-file
+        input: {path: "= input.lora_path + '/adapter_model.safetensors'"}
+        as: wts
+        on_error: continue
+      - set:
+          vars.idx: "= vars.wts.ok && has(vars.wts.value.json) ? vars.wts.value.json : {}"
+      - set:
+          vars.lora_modules: "= has(vars.idx.lora_modules) ? vars.idx.lora_modules : {}"
+          vars.mts_weights: "= has(vars.idx.modules_to_save) ? vars.idx.modules_to_save : {}"
+      - title: "lora.is_3d_lora_weight = lora_request.is_3d_lora_weight, then _validate_moe_lora_format"
+        source: "vllm/lora/worker_manager.py:151-156"
+        call: lru-cache-lora-model-manager.validate-moe-lora-format
+        input: {adapter_id: "= input.lora_int_id", is_3d_lora_weight: "= has(input.is_3d_lora_weight) && input.is_3d_lora_weight", lora_modules: "= vars.lora_modules"}
+      - title: "_validate_modules_to_save: full-module weights must match the classification head"
+        source: "vllm/lora/worker_manager.py:158-159"
+        call: lru-cache-lora-model-manager.validate-modules-to-save
+        input: {modules_to_save: "= has(vars.peft.value.modules_to_save) && vars.peft.value.modules_to_save != null ? vars.peft.value.modules_to_save : []", weights: "= vars.mts_weights"}
+      - return: {id: "= input.lora_int_id", rank: "= vars.peft.value.r", lora_modules: "= vars.lora_modules", is_3d_lora_weight: "= has(input.is_3d_lora_weight) && input.is_3d_lora_weight"}
 
   - component: lru-cache-worker-lora-manager
     name: set-active-adapters
@@ -192,8 +213,11 @@ interfaces:
     summary: "Register an adapter in the CPU cache (evicting the oldest first when the worker asked for it), or touch it when present."
     sources: ["vllm/lora/model_manager.py:1381-1391", "vllm/lora/model_manager.py:1407-1411"]
     tags: [writes]
-    request: {type: object, required: [adapter_id], properties: {adapter_id: {type: integer}, evict_if_full: {type: boolean}}}
+    request: {type: object, required: [adapter_id], properties: {adapter_id: {type: integer}, evict_if_full: {type: boolean}, is_3d_lora_weight: {type: boolean, default: false}, lora_modules: {type: object, default: {}, description: "the adapter's LoRA modules: name -> {lora_a_is_tensor} (a single fused 3D tensor rather than one per expert)"}}}
     response: {type: object, properties: {was_added: {type: boolean}, evicted: {type: integer}}}
+    errors:
+      - {code: value-error, status: 0, retryable: false}
+      - {code: runtime-error, status: 0, retryable: false}
     behavior:
       - title: Already registered - touch the LRU order
         source: "vllm/lora/model_manager.py:1387-1390"
@@ -221,6 +245,10 @@ interfaces:
             set:
               state.active: "= state.active.filter(i, i != vars.evicted)"
               state.slots: "= state.slots.map(s, s == vars.evicted ? null : s)"
+      - title: "_add_adapter: _validate_moe_lora_format before the adapter is cached"
+        source: "vllm/lora/model_manager.py:412-413"
+        call: lru-cache-lora-model-manager.validate-moe-lora-format
+        input: {adapter_id: "= input.adapter_id", is_3d_lora_weight: "= has(input.is_3d_lora_weight) && input.is_3d_lora_weight", lora_modules: "= has(input.lora_modules) ? input.lora_modules : {}"}
       - source: "vllm/lora/model_manager.py:412-416"
         set: {state.registered: "= state.registered + [input.adapter_id]"}
       - return: {was_added: true, evicted: "= vars.evicted"}

@@ -149,12 +149,13 @@ interfaces:
   - component: mixtral-for-causal-lm
     name: init
     kind: function
-    summary: "MixtralForCausalLM(vllm_config, prefix): build MixtralModel; attention checks head divisibility by TP."
-    sources: ["vllm/model_executor/models/mixtral.py:393-420"]
+    summary: "MixtralForCausalLM(vllm_config, prefix): build MixtralModel; attention checks head divisibility by TP; each MixtralMoE builds its FusedMoE with the parallel layout (TP flattened across DP and PCP) and the expert counts."
+    sources: ["vllm/model_executor/models/mixtral.py:393-420", "vllm/model_executor/models/mixtral.py:93-131"]
     tags: [writes]
-    request: {type: object, required: [hf_config, quant], properties: {hf_config: ModelsHfConfig, quant: {type: string}}}
+    request: {type: object, required: [hf_config, quant], properties: {hf_config: ModelsHfConfig, quant: {type: string}, kv_quant_method: {type: string, default: none}}}
     errors:
       - {code: assertion-error, status: 0, retryable: false}
+      - {code: value-error, status: 0, retryable: false}
     behavior:
       - set:
           vars.hf: "= input.hf_config"
@@ -163,14 +164,39 @@ interfaces:
         source: "vllm/model_executor/models/mixtral.py:158-171"
         if: "vars.hf.num_attention_heads % vars.tp != 0 || (vars.hf.num_key_value_heads >= vars.tp && vars.hf.num_key_value_heads % vars.tp != 0) || (vars.hf.num_key_value_heads < vars.tp && vars.tp % vars.hf.num_key_value_heads != 0)"
         then:
-          - fail: {code: assertion-error, status: 0, message: "assert self.total_num_heads % tp_size == 0"}
+          - fail: {code: assertion-error, status: 0, message: ""}
       - call: rotary-embedding.get-rope
         input: {head_size: "= vars.hf.hidden_size / vars.hf.num_attention_heads", max_position: "= vars.hf.max_position_embeddings", rope_parameters: "= has(vars.hf.rope_parameters) && vars.hf.rope_parameters != null ? vars.hf.rope_parameters : {}"}
         as: rope
-      - title: FusedMoEParallelConfig.make - EP when enable_expert_parallel and TP x DP > 1; then each rank owns whole experts and the MoE TP size is 1
-        source: "vllm/model_executor/layers/fused_moe/config.py:1189-1235"
-        set:
-          vars.use_ep: "= config['enable-expert-parallel'] && vars.tp > 1"
+      - title: "Each attention layer initializes its KV-cache scales and quant method"
+        source: "vllm/model_executor/layers/attention/attention.py:157-226"
+        call: attention-layer.init-kv-cache-quant
+        input: {kv_quant_method: "= has(input.kv_quant_method) ? input.kv_quant_method : 'none'"}
+      - title: "make_parallel_config -> FusedMoEParallelConfig.make(tp, pcp, dp): TP is flattened across DP and PCP, and EP (when enabled and that product > 1) gives each rank whole experts"
+        source: "vllm/model_executor/layers/fused_moe/layer.py:232-238"
+        call: fused-moe-parallel-config.make
+        input:
+          tp_size: "= vars.tp"
+          dp_size: "= int(config['data-parallel-size'])"
+          pcp_size: "= int(config['prefill-context-parallel-size'])"
+          tp_rank: "= self.startsWith('rank') ? int(self.substring(4)) % vars.tp : 0"
+          dp_rank: "= self.startsWith('rank') ? int(self.substring(4)) / vars.tp : 0"
+          enable_expert_parallel: "= config['enable-expert-parallel']"
+          enable_eplb: "= config['enable-eplb']"
+          all2all_backend: "= config['all2all-backend']"
+        as: par
+      - title: "process_weights_after_loading builds the unquantized MoE kernel, whose prepare/finalize maybe_make_prepare_finalize picks under the new interface: naive AllGather+ReduceScatter dispatch/combine for EP with DP > 1 and the allgather_reducescatter backend, none-DP otherwise"
+        source: "vllm/model_executor/layers/fused_moe/oracle/unquantized.py:517-526"
+        call: all2all-utils.maybe-make-prepare-finalize
+        input: {moe_parallel_config: "= vars.par.value", allow_new_interface: true, has_quant_config: true}
+        as: pf
+      - title: "determine_expert_counts: Mixtral has no shared experts"
+        source: "vllm/model_executor/layers/fused_moe/layer.py:248-255"
+        call: fused-moe-layer.determine-expert-counts
+        input: {num_experts: "= vars.hf.num_local_experts", num_redundant_experts: "= int(config['num-redundant-experts'])", fuse_shared_experts: false}
+        as: counts
+      - set:
+          vars.use_ep: "= vars.par.value.use_ep"
       - title: MixtralMoE sizes the experts - physical = logical + redundant, local = physical / EP size
         source: "vllm/model_executor/models/mixtral.py:93-131"
         set:
@@ -178,6 +204,7 @@ interfaces:
           state.tp_size: "= vars.tp"
           state.quant: "= input.quant"
           state.cfg:
+            prepare_finalize: "= vars.pf.value.prepare_finalize"
             hidden_size: "= vars.hf.hidden_size"
             num_heads: "= vars.hf.num_attention_heads"
             num_kv_heads: "= vars.hf.num_key_value_heads"
@@ -188,12 +215,13 @@ interfaces:
             num_experts: "= vars.hf.num_local_experts"
             top_k: "= vars.hf.num_experts_per_tok"
             bytes_per_weight: "= input.quant == 'unquantized' ? 2 : 1"
-            ep_size: "= vars.use_ep ? vars.tp : 1"
-            moe_tp: "= vars.use_ep ? 1 : vars.tp"
+            ep_size: "= vars.par.value.ep_size"
+            ep_rank: "= vars.par.value.ep_rank"
+            moe_tp: "= vars.par.value.tp_size"
             enable_eplb: "= config['enable-eplb']"
-            num_physical_experts: "= vars.hf.num_local_experts + int(config['num-redundant-experts'])"
+            num_physical_experts: "= vars.counts.value.global_num_experts"
             num_redundant_experts: "= config['num-redundant-experts']"
-            num_local_physical_experts: "= (vars.hf.num_local_experts + int(config['num-redundant-experts'])) / (vars.use_ep ? int(vars.tp) : 1)"
+            num_local_physical_experts: "= vars.counts.value.global_num_experts / vars.par.value.ep_size"
           state.eplb_registered: false
       - return: {initialized: true}
 
@@ -355,6 +383,7 @@ interfaces:
           ep_size: "= has(input.cfg.ep_size) ? input.cfg.ep_size : 1"
           moe_tp: "= has(input.cfg.moe_tp) ? input.cfg.moe_tp : input.tp"
           num_physical_experts: "= has(input.cfg.num_physical_experts) ? input.cfg.num_physical_experts : input.cfg.num_experts"
+          prepare_finalize: "= has(input.cfg.prepare_finalize) ? input.cfg.prepare_finalize : null"
         as: moe
       - return: {owner_ms: "= vars.moe.value.owner_ms"}
 
@@ -510,10 +539,34 @@ interfaces:
     sources: ["vllm/model_executor/layers/fused_moe/routed_experts.py:1346-1381"]
     request: ModelsMoeInput
     behavior:
+      - set: {vars.naive: "= has(input.prepare_finalize) && input.prepare_finalize == 'MoEPrepareAndFinalizeNaiveDPEP'"}
+      - title: "FusedMoEKernel._prepare: MoEPrepareAndFinalizeNaiveDPEP.prepare dispatches the hidden states, topk weights and ids over the EP group (get_ep_group().dispatch)"
+        source: "vllm/model_executor/layers/fused_moe/prepare_finalize/naive_dp_ep.py:181-187"
+        if: "vars.naive"
+        then:
+          - title: "AgRsAll2AllManager sizes the gather from get_forward_context().dp_metadata.get_chunk_sizes_across_dp_rank()"
+            source: "vllm/distributed/device_communicators/all2all.py:88-97"
+            call: forward-context.get-forward-context
+            as: fc
+          - set: {vars.chunks: "= vars.fc.value.dp_metadata != null ? vars.fc.value.dp_metadata.num_tokens_across_dp_cpu : null"}
+          - call: group-coordinator.dispatch
+            input: {num_tokens: "= input.num_tokens", hidden_size: "= input.hidden_size", top_k: "= input.top_k", dp_chunk_sizes: "= vars.chunks"}
+            as: d
+          - set: {vars.rows: "= vars.d.value.num_tokens"}
+        else:
+          - set: {vars.rows: "= input.num_tokens"}
       - source: "vllm/model_executor/layers/fused_moe/routed_experts.py:1374-1381"
         call: triton-experts.apply
-        input: "= input"
+        input: "= merge(input, {'num_tokens': vars.rows})"
         as: ex
+      - title: "FusedMoEKernel._finalize: MoEPrepareAndFinalizeNaiveDPEP.finalize combines the expert output back over the EP group (get_ep_group().combine_into_output, the in-place combine)"
+        source: "vllm/model_executor/layers/fused_moe/prepare_finalize/naive_dp_ep.py:210-245"
+        if: "vars.naive"
+        then:
+          - call: group-coordinator.combine
+            input: {num_tokens: "= vars.rows", hidden_size: "= input.hidden_size", dp_chunk_sizes: "= vars.chunks"}
+            as: c
+          - return: {owner_ms: "= vars.ex.value.owner_ms + vars.d.duration_ms + vars.c.duration_ms", dispatched_tokens: "= vars.rows", combined_tokens: "= vars.c.value.num_tokens"}
       - return: {owner_ms: "= vars.ex.value.owner_ms"}
 
   - component: triton-experts

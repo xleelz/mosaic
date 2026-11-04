@@ -1,0 +1,51 @@
+schema_version: 1
+id: vllm
+scenarios:
+  - id: bench-p4-2-abc-idle-worker-sigkill
+    name: "P4-2(a)(b)(c) VllmWorker-2 SIGKILLed while idle: monitor wakes, executor fails and shuts down, engine core dies"
+    fixtures: [full-tp4-llama-70b]
+    config: {model: meta-llama/Llama-3.1-8B-Instruct}
+    max_events: 200000
+    steps:
+      - {interface: async-llm.from-engine-args, caller: api-server, input: {model: meta-llama/Llama-3.1-8B-Instruct, served_model_name: llama-8b}, as: up}
+      - {at_ms: 9000, kill: {component: gpu-worker, instance: rank2}}
+      - {flow: engine-core-busy-loop, input: {iterations: 2}, as: loop}
+      - {interface: multiproc-executor.collective-rpc, caller: engine-core, input: {method: check_health, args: {}}, as: later}
+    expect:
+      # (a) the monitor wakes with no request in flight, names rank2, marks failed, shuts down
+      - "steps.up.result.ok"
+      - "trace.exists(e, e.type == 'call.end' && e.interface == 'multiproc-executor.monitor-workers' && e.output.handled == true && e.output.died_rank == 'rank2')"
+      - "state['multiproc-executor'].is_failed && state['multiproc-executor'].shutting_down"
+      # (b) idle survivors are shut down through the death pipe; none is stuck, so nothing is killed
+      - "trace.exists(e, e.type == 'call.end' && e.interface == 'multiproc-executor.shutdown' && e.output.shutdown == true && size(e.output.killed) == 0)"
+      - "['rank0','rank1','rank3'].all(r, trace.exists(e, e.type == 'call.start' && e.interface == 'gpu-worker-impl.shutdown' && e.instance == r))"
+      # (c) EXECUTOR_FAILED -> RuntimeError('Executor failed.'); a later collective_rpc also refuses
+      - "trace.exists(e, e.type == 'call.start' && e.interface == 'engine-core-proc.executor-fail-callback')"
+      - "!steps.loop.result.ok && steps.loop.result.error.message == 'Executor failed.'"
+      - "!steps.later.result.ok && steps.later.result.error.message == 'Executor failed.'"
+  - id: bench-p4-2-d-rank0-raises
+    name: "P4-2(d) execute_model raises on rank 0 (the output rank): RuntimeError Worker failed with error '<msg>'"
+    fixtures: [full-tp4-llama-70b]
+    config: {model: meta-llama/Llama-3.1-8B-Instruct}
+    faults:
+      - {target: gpu-worker-impl.execute-model, type: error, code: runtime-error, message: "boom on rank 0", instance: rank0}
+    steps:
+      - {interface: async-llm.add-request, caller: api-server, input: {request_id: chatcmpl-p42, prompt_token_ids: [128000, 9906, 11, 856, 836, 374], sampling_params: {max_tokens: 4, n: 1}}, as: add}
+      - {flow: engine-core-busy-loop, input: {iterations: 2}, as: loop}
+    expect:
+      - "!steps.loop.result.ok && steps.loop.result.error.code == 'runtime-error'"
+      - "steps.loop.result.error.message == \"Worker failed with error 'boom on rank 0', please check the stack trace above for the root cause\""
+  - id: bench-p4-2-e-rank2-raises
+    name: "P4-2(e) execute_model raises on rank 2 only: rank 2 only logs; rank 0 blocks in the TP collective; TimeoutError after 300 s"
+    fixtures: [full-tp4-llama-70b]
+    config: {model: meta-llama/Llama-3.1-8B-Instruct}
+    faults:
+      - {target: gpu-worker-impl.execute-model, type: error, code: runtime-error, message: "boom on rank 2", instance: rank2}
+    steps:
+      - {interface: async-llm.add-request, caller: api-server, input: {request_id: chatcmpl-p42, prompt_token_ids: [128000, 9906, 11, 856, 836, 374], sampling_params: {max_tokens: 4, n: 1}}, as: add}
+      - {flow: engine-core-busy-loop, input: {iterations: 2}, as: loop}
+    expect:
+      - "trace.exists(e, e.type == 'call.end' && e.interface == 'worker-proc.execute-worker-rpc' && e.instance == '' && has(e.output.replied) && e.output.replied == false && has(e.output.logged))"
+      - "!steps.loop.result.ok && steps.loop.result.error.code == 'timeout-error' && steps.loop.result.error.message == 'RPC call to execute_model timed out.'"
+      - "trace.exists(e, e.type == 'call.end' && e.interface == 'multiproc-executor.collective-rpc' && has(e.error) && e.error != null && e.error.code == 'timeout' && e.t >= 300000 && e.t < 300100)"
+      - "trace.exists(e, e.type == 'call.start' && e.interface == 'engine-core-proc.send-engine-dead')"

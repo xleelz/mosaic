@@ -28,7 +28,11 @@ components:
           engine_clock_offset: {type: object}
           xfer_stats: {type: object}
           registered_layers: {type: array}
-      initial: {remote_agents: [], invalid_remote_engines: [], recving: {}, failed_recv: [], invalid_block_ids: [], reqs_to_process: [], reqs_to_send: {}, read_notifs: [], bidirectional_kv_xfer: false, engine_clock_offset: {}, xfer_stats: {num_failed_transfers: [], num_failed_handshakes: [], num_kv_expired_reqs: [], num_notifications_after_expiry: []}, registered_layers: []}
+          engine_by_address: {type: object, description: "host:port -> the engine that last handshaked from it (_engine_by_address)"}
+          ready_requests: {type: array, description: "_ready_requests: {request_id, meta} queued by finished handshakes"}
+          recving_metadata: {type: object, description: "_recving_metadata: request id -> its remote engine"}
+          removed_agents: {type: array, description: "remote agents released through nixl_wrapper.remove_remote_agent"}
+      initial: {remote_agents: [], invalid_remote_engines: [], recving: {}, failed_recv: [], invalid_block_ids: [], reqs_to_process: [], reqs_to_send: {}, read_notifs: [], bidirectional_kv_xfer: false, engine_clock_offset: {}, xfer_stats: {num_failed_transfers: [], num_failed_handshakes: [], num_kv_expired_reqs: [], num_notifications_after_expiry: []}, registered_layers: [], engine_by_address: {}, ready_requests: [], recving_metadata: {}, removed_agents: []}
   - id: kv-output-aggregator
     name: KVOutputAggregator
     kind: module
@@ -94,10 +98,10 @@ interfaces:
   - component: nixl-pull-connector-worker
     name: start-load-kv
     kind: function
-    summary: "NixlPullConnectorWorker.start_load_kv: for each request to receive, handshake with an unknown remote engine (in the background; the READ starts on a later step) or start the READ; full local hits only notify the prefill node. Record reqs_in_batch, drop reqs_not_processed, and keep send leases."
-    sources: ["vllm/distributed/kv_transfer/kv_connector/v1/nixl/pull_worker.py:47-123", "vllm/distributed/kv_transfer/kv_connector/v1/nixl/pull_worker.py:125-175"]
+    summary: "NixlPullConnectorWorker.start_load_kv: track each request to receive that awaits KV or has local blocks, and read (or notify) it; then drain the requests whose handshakes have finished (_ready_requests). Record reqs_in_batch, drop reqs_not_processed, and keep send leases."
+    sources: ["vllm/distributed/kv_transfer/kv_connector/v1/nixl/pull_worker.py:47-123"]
     request: {type: object, properties: {metadata: {type: object}}}
-    response: {type: object, properties: {started: {type: integer}, handshakes: {type: integer}}}
+    response: {type: object, properties: {started: {type: integer}, handshakes: {type: integer}, drained: {type: integer}}}
     behavior:
       - set:
           vars.m: "= input.metadata"
@@ -107,69 +111,165 @@ interfaces:
         as: meta
         index: rid
         steps:
-          - set:
-              vars.awaits: "= vars.meta.awaiting_kvs || vars.meta.local_block_ids.exists(g, size(g) > 0)"
-          - if: "vars.meta.remote.engine_id in state.invalid_remote_engines"
+          - if: "vars.meta.awaiting_kvs || vars.meta.local_block_ids.exists(g, size(g) > 0)"
             then:
-              - title: A known-bad remote engine fails the receive at once
-                source: "vllm/distributed/kv_transfer/kv_connector/v1/nixl/pull_worker.py:139-143"
-                set: {state.failed_recv: "= state.failed_recv + [vars.rid]"}
-              - continue: true
-          - if: "!(vars.meta.remote.engine_id in state.remote_agents)"
-            then:
-              - title: First contact with this prefill engine; handshake (GET_META_MSG to its listener)
-                source: "vllm/distributed/kv_transfer/kv_connector/v1/nixl/pull_worker.py:144-147"
-                call: nixl-agent.handshake
-                input: {engine_id: "= vars.meta.remote.engine_id", host: "= vars.meta.remote.host", port: "= vars.meta.remote.port"}
-                as: hsres
-                on_error:
-                  - title: Handshake failure marks the request failed
-                    set:
-                      state.failed_recv: "= state.failed_recv + [vars.rid]"
-                      state.invalid_remote_engines: "= state.invalid_remote_engines + [vars.meta.remote.engine_id]"
-                      state.xfer_stats: "= merge(state.xfer_stats, {'num_failed_handshakes': state.xfer_stats.num_failed_handshakes + [1]})"
-                  - continue: true
-              - title: "The handshake records the remote agents and the measured clock offset (taken as 0: same-host perf_counter epochs assumed)"
-                source: "vllm/distributed/kv_transfer/kv_connector/v1/nixl/base_worker.py:1305-1316"
-                set:
-                  state.remote_agents: "= state.remote_agents + [vars.meta.remote.engine_id]"
-                  state.engine_clock_offset: "= merge(state.engine_clock_offset, {vars.meta.remote.engine_id: 0.0})"
-                  vars.hs: "= vars.hs + 1"
-          - set:
-              vars.expiry: "= has(vars.meta.remote.blocks_expiry_time) ? vars.meta.remote.blocks_expiry_time : null"
-              vars.offset: "= vars.meta.remote.engine_id in state.engine_clock_offset ? double(state.engine_clock_offset[vars.meta.remote.engine_id]) : 0.0"
-          - if: "state.bidirectional_kv_xfer && vars.expiry != null && size(vars.meta.local_block_ids) > 0 && double(now) / 1000.0 + 5.0 >= double(vars.expiry) - vars.offset"
-            then:
-              - title: "Turn-2 deadline gate: D's blocks expire within the 5 s safety margin, so decline the READ; count it as expired, and clean up like a failed transfer without counting a transport failure"
-                source: "vllm/distributed/kv_transfer/kv_connector/v1/nixl/pull_worker.py:125-163"
-                set:
-                  state.failed_recv: "= state.failed_recv + [vars.rid]"
-                  state.xfer_stats: "= merge(state.xfer_stats, {'num_kv_expired_reqs': state.xfer_stats.num_kv_expired_reqs + [1]})"
-              - continue: true
-          - if: "vars.awaits"
-            then:
-              - title: Non-blocking NIXL READ of the remote blocks into the local blocks
-                source: "vllm/distributed/kv_transfer/kv_connector/v1/nixl/pull_worker.py:166-175"
-                call: nixl-agent.read-blocks
-                input: {request_id: "= vars.rid", num_blocks: "= size(vars.meta.remote.block_ids)"}
-                as: rd
-                on_error: continue
-              - set:
-                  state.recving: "= merge(state.recving, {vars.rid: {'state': vars.rd.ok ? 'DONE' : 'ERR', 'local_block_ids': vars.meta.local_block_ids}})"
-                  state.xfer_stats: "= vars.rd.ok ? state.xfer_stats : merge(state.xfer_stats, {'num_failed_transfers': state.xfer_stats.num_failed_transfers + [1]})"
-                  vars.started: "= vars.started + 1"
-            else:
-              - title: Full local hit or aborted cleanup; notify the prefill node only
+              - title: "Full local hits and aborted cleanups only notify P and are not tracked; everything else is (_recving_metadata)"
                 source: "vllm/distributed/kv_transfer/kv_connector/v1/nixl/pull_worker.py:67-74"
-                call: nixl-agent.send-notif
-                input: {kind: READ_DONE, request_id: "= vars.meta.remote.request_id"}
+                set: {state.recving_metadata: "= merge(state.recving_metadata, {vars.rid: vars.meta.remote.engine_id})"}
+          - call: nixl-pull-connector-worker.read-blocks-for-req
+            input: {request_id: "= vars.rid", meta: "= vars.meta"}
+            as: rb
+          - set:
+              vars.started: "= vars.started + vars.rb.value.started"
+              vars.hs: "= vars.hs + vars.rb.value.handshakes"
+      - title: Start transfers for requests whose handshakes have now finished
+        source: "vllm/distributed/kv_transfer/kv_connector/v1/nixl/pull_worker.py:77-79"
+        set:
+          vars.ready: "= state.ready_requests"
+          state.ready_requests: []
+      - foreach: "= vars.ready"
+        as: entry
+        steps:
+          - call: nixl-pull-connector-worker.read-blocks-for-req
+            input: {request_id: "= vars.entry.request_id", meta: "= vars.entry.meta"}
+            as: rq
+          - set:
+              vars.started: "= vars.started + vars.rq.value.started"
       - title: Track requests in this batch, drop aborted ones, keep send leases
         source: "vllm/distributed/kv_transfer/kv_connector/v1/nixl/pull_worker.py:91-119"
         set:
           state.reqs_to_process: "= (state.reqs_to_process + (has(vars.m.reqs_in_batch) ? vars.m.reqs_in_batch : [])).filter(r, !(has(vars.m.reqs_not_processed) && r in vars.m.reqs_not_processed))"
       - set:
           state.reqs_to_send: "= merge(state.reqs_to_send, has(vars.m.reqs_to_send) ? vars.m.reqs_to_send.transformMapEntry(rid, exp, rid in state.reqs_to_process, {rid: exp}) : {})"
-      - return: {started: "= vars.started", handshakes: "= vars.hs"}
+      - return: {started: "= vars.started", handshakes: "= vars.hs", drained: "= size(vars.ready)"}
+
+  - component: nixl-pull-connector-worker
+    name: read-blocks-for-req
+    kind: function
+    summary: "_read_blocks_for_req: fail at once for a locally invalid engine; handshake with an unknown engine (modeled synchronously); decline an expired turn-2 read; then READ the remote blocks into the local ones, or, with no local blocks (full prefix hit, aborted cleanup), only notify P with '<remote_request_id>:<consumers>' and report the receive done when the request awaits KV."
+    sources: ["vllm/distributed/kv_transfer/kv_connector/v1/nixl/pull_worker.py:136-175", "vllm/distributed/kv_transfer/kv_connector/v1/nixl/pull_worker.py:393-468"]
+    request: {type: object, required: [request_id, meta], properties: {request_id: {type: string}, meta: {type: object}}}
+    response: {type: object, properties: {started: {type: integer}, handshakes: {type: integer}, notified: {type: boolean}}}
+    behavior:
+      - set:
+          vars.rid: "= input.request_id"
+          vars.meta: "= input.meta"
+          vars.hs: 0
+      - if: "vars.meta.remote.engine_id in state.invalid_remote_engines"
+        then:
+          - title: A known-bad remote engine fails the receive at once
+            source: "vllm/distributed/kv_transfer/kv_connector/v1/nixl/pull_worker.py:139-143"
+            set: {state.failed_recv: "= state.failed_recv + [vars.rid]"}
+          - return: {started: 0, handshakes: 0, notified: false}
+      - if: "!(vars.meta.remote.engine_id in state.remote_agents)"
+        then:
+          - title: "First contact with this prefill engine: handshake (GET_META_MSG to its listener); the code queues the request for a later step, the model reads once the handshake returns"
+            source: "vllm/distributed/kv_transfer/kv_connector/v1/nixl/pull_worker.py:144-147"
+            call: nixl-pull-connector-worker.ensure-handshake
+            input: {engine_id: "= vars.meta.remote.engine_id", host: "= has(vars.meta.remote.host) ? vars.meta.remote.host : ''", port: "= has(vars.meta.remote.port) ? vars.meta.remote.port : 0"}
+            as: hsres
+          - if: "!vars.hsres.value.ok"
+            then:
+              - title: Handshake failure marks the request failed and the engine invalid
+                source: "vllm/distributed/kv_transfer/kv_connector/v1/nixl/base_worker.py:1347-1358"
+                set:
+                  state.failed_recv: "= state.failed_recv + [vars.rid]"
+                  state.invalid_remote_engines: "= state.invalid_remote_engines + [vars.meta.remote.engine_id]"
+              - return: {started: 0, handshakes: 0, notified: false}
+          - set: {vars.hs: 1}
+      - set:
+          vars.expiry: "= has(vars.meta.remote.blocks_expiry_time) ? vars.meta.remote.blocks_expiry_time : null"
+          vars.offset: "= vars.meta.remote.engine_id in state.engine_clock_offset ? double(state.engine_clock_offset[vars.meta.remote.engine_id]) : 0.0"
+          vars.has_local: "= vars.meta.local_block_ids.exists(g, size(g) > 0)"
+      - if: "state.bidirectional_kv_xfer && vars.expiry != null && vars.has_local && double(now) / 1000.0 + 5.0 >= double(vars.expiry) - vars.offset"
+        then:
+          - title: "Turn-2 deadline gate: D's blocks expire within the 5 s safety margin, so decline the READ; count it as expired, and clean up like a failed transfer without counting a transport failure"
+            source: "vllm/distributed/kv_transfer/kv_connector/v1/nixl/pull_worker.py:125-163"
+            set:
+              state.failed_recv: "= state.failed_recv + [vars.rid]"
+              state.xfer_stats: "= merge(state.xfer_stats, {'num_kv_expired_reqs': state.xfer_stats.num_kv_expired_reqs + [1]})"
+          - return: {started: 0, handshakes: "= vars.hs", notified: false}
+      - if: "vars.has_local"
+        then:
+          - title: Non-blocking NIXL READ of the remote blocks into the local blocks
+            source: "vllm/distributed/kv_transfer/kv_connector/v1/nixl/pull_worker.py:166-175"
+            call: nixl-agent.read-blocks
+            input: {request_id: "= vars.rid", num_blocks: "= size(vars.meta.remote.block_ids)"}
+            as: rd
+            on_error: continue
+          - set:
+              state.recving: "= merge(state.recving, {vars.rid: {'state': vars.rd.ok ? 'DONE' : 'ERR', 'local_block_ids': vars.meta.local_block_ids}})"
+              state.xfer_stats: "= vars.rd.ok ? state.xfer_stats : merge(state.xfer_stats, {'num_failed_transfers': state.xfer_stats.num_failed_transfers + [1]})"
+          - return: {started: 1, handshakes: "= vars.hs", notified: false}
+      - title: "Full local hit or aborted cleanup: notify the prefill worker with '<remote_request_id>:<expected_consumers>' (1 consumer with equal TP)"
+        source: "vllm/distributed/kv_transfer/kv_connector/v1/nixl/pull_worker.py:440-462"
+        call: nixl-agent.send-notif
+        input: {kind: READ_DONE, request_id: "= vars.meta.remote.request_id", engine_id: "= vars.meta.remote.engine_id", notif_msg: "= vars.meta.remote.request_id + ':1'"}
+        on_error: continue
+      - if: "vars.meta.awaiting_kvs"
+        then:
+          - title: "A parked request is reported done even though nothing was read (an empty _recving_transfers entry)"
+            source: "vllm/distributed/kv_transfer/kv_connector/v1/nixl/pull_worker.py:463-468"
+            set:
+              state.recving: "= merge(state.recving, {vars.rid: {'state': 'DONE', 'local_block_ids': vars.meta.local_block_ids}})"
+      - return: {started: 0, handshakes: "= vars.hs", notified: true}
+
+  - component: nixl-pull-connector-worker
+    name: ensure-handshake
+    kind: function
+    summary: "_ensure_handshake and its done callback: nothing to do for a known engine; otherwise handshake (GET_META_MSG to the peer's listener, modeled as completing in the call), record its agents and clock offset, and remember which engine now serves host:port (_track_remote_engine_replacement, pull mode). A failure is counted once per handshake."
+    sources: ["vllm/distributed/kv_transfer/kv_connector/v1/nixl/base_worker.py:1268-1328", "vllm/distributed/kv_transfer/kv_connector/v1/nixl/base_worker.py:3585-3602"]
+    request: {type: object, required: [engine_id], properties: {engine_id: {type: string, examples: [engine-p0]}, host: {type: string, default: localhost}, port: {type: integer, default: 1234}}}
+    response: {type: object, properties: {ok: {type: boolean}, replaced: {type: [string, "null"]}}}
+    behavior:
+      - if: "input.engine_id in state.remote_agents"
+        then:
+          - title: Already handshaked
+            source: "vllm/distributed/kv_transfer/kv_connector/v1/nixl/base_worker.py:1290-1291"
+            return: {ok: true, replaced: null}
+      - call: nixl-agent.handshake
+        input: {engine_id: "= input.engine_id", host: "= input.host", port: "= input.port"}
+        as: h
+        on_error:
+          - title: "handshake_setup_failed: counted once per handshake"
+            source: "vllm/distributed/kv_transfer/kv_connector/v1/nixl/base_worker.py:1316-1324"
+            set:
+              state.xfer_stats: "= merge(state.xfer_stats, {'num_failed_handshakes': state.xfer_stats.num_failed_handshakes + [1]})"
+          - return: {ok: false, replaced: null}
+      - set:
+          vars.addr: "= input.host + ':' + string(input.port)"
+      - set:
+          vars.prev: "= vars.addr in state.engine_by_address ? state.engine_by_address[vars.addr] : null"
+      - title: "Record the agents and clock offset (0: same-host perf_counter epochs assumed), and the engine now serving host:port"
+        source: "vllm/distributed/kv_transfer/kv_connector/v1/nixl/base_worker.py:1307-1315"
+        set:
+          state.remote_agents: "= state.remote_agents + [input.engine_id]"
+          state.engine_clock_offset: "= merge(state.engine_clock_offset, {input.engine_id: 0.0})"
+          state.engine_by_address: "= merge(state.engine_by_address, {vars.addr: input.engine_id})"
+      - title: "\"Remote engine at host:port changed from <old> to <new>.\" when another engine served the address"
+        source: "vllm/distributed/kv_transfer/kv_connector/v1/nixl/base_worker.py:3594-3602"
+        return: {ok: true, replaced: "= vars.prev != null && vars.prev != input.engine_id ? vars.prev : null"}
+
+  - component: nixl-pull-connector-worker
+    name: background-nixl-handshake
+    kind: function
+    summary: "_background_nixl_handshake: ensure a handshake with the request's engine; when it has finished (or had already), queue the request on _ready_requests for the next start_load_kv to read; a failed handshake fails the request."
+    sources: ["vllm/distributed/kv_transfer/kv_connector/v1/nixl/base_worker.py:1330-1360"]
+    request: {type: object, required: [request_id, meta], properties: {request_id: {type: string}, meta: {type: object}}}
+    response: {type: object, properties: {queued: {type: boolean}}}
+    behavior:
+      - call: nixl-pull-connector-worker.ensure-handshake
+        input: {engine_id: "= input.meta.remote.engine_id", host: "= has(input.meta.remote.host) ? input.meta.remote.host : 'localhost'", port: "= has(input.meta.remote.port) ? input.meta.remote.port : 1234"}
+        as: h
+      - if: "!vars.h.value.ok"
+        then:
+          - title: "handshake_failed: the request goes to _failed_recv_reqs"
+            source: "vllm/distributed/kv_transfer/kv_connector/v1/nixl/base_worker.py:1349-1358"
+            set: {state.failed_recv: "= state.failed_recv + [input.request_id]"}
+          - return: {queued: false}
+      - source: "vllm/distributed/kv_transfer/kv_connector/v1/nixl/base_worker.py:1342-1352"
+        set: {state.ready_requests: "= state.ready_requests + [{'request_id': input.request_id, 'meta': input.meta}]"}
+      - return: {queued: true}
 
   - component: nixl-pull-connector-worker
     name: get-finished
@@ -193,7 +293,49 @@ interfaces:
           state.failed_recv: []
           state.reqs_to_send: "= omit(state.reqs_to_send, vars.sent)"
           state.read_notifs: "= state.read_notifs.filter(r, !(r in vars.sent))"
+      - title: Finished receives leave _recving_metadata
+        source: "vllm/distributed/kv_transfer/kv_connector/v1/nixl/base_worker.py:2903-2906"
+        set:
+          state.recving_metadata: "= state.recving_metadata.transformMapEntry(r, e, !(r in vars.done || r in vars.err), {r: e})"
+      - title: Release replaced peers once no tracked request still reads from them
+        source: "vllm/distributed/kv_transfer/kv_connector/v1/nixl/base_worker.py:2986"
+        call: nixl-pull-connector-worker.cleanup-remote-engines
       - return: {finished_sending: "= vars.sent", finished_recving: "= vars.done + vars.err", failed_recving: "= vars.err", invalid_block_ids: "= vars.invalid"}
+
+  - component: nixl-pull-connector-worker
+    name: cleanup-remote-engines
+    kind: function
+    summary: "_cleanup_remote_engines (pull mode, replaced-peer part): an engine that no address maps to any more was replaced; release it (dlist handles, remote agents, per-engine state) unless a request in _recving_metadata still names it. The locally-invalid probe and its backoff are not modeled."
+    sources: ["vllm/distributed/kv_transfer/kv_connector/v1/nixl/base_worker.py:3604-3651", "vllm/distributed/kv_transfer/kv_connector/v1/nixl/base_worker.py:3680-3726"]
+    request: {type: object, properties: {}}
+    response: {type: object, properties: {released: {type: array, items: {type: string}}}}
+    behavior:
+      - title: "replaced = _remote_agents.keys() - _engine_by_address.values()"
+        source: "vllm/distributed/kv_transfer/kv_connector/v1/nixl/base_worker.py:3614"
+        set:
+          vars.replaced: "= state.remote_agents.filter(e, !state.engine_by_address.exists(a, state.engine_by_address[a] == e))"
+      - title: Replaced peers can still serve queued requests
+        source: "vllm/distributed/kv_transfer/kv_connector/v1/nixl/base_worker.py:3637-3643"
+        set:
+          vars.busy: "= state.recving_metadata.map(r, state.recving_metadata[r])"
+      - set:
+          vars.release: "= vars.replaced.filter(e, !(e in vars.busy))"
+      - foreach: "= vars.release"
+        as: eng
+        steps:
+          - title: "_cleanup_remote_engine: nixl_wrapper.remove_remote_agent for each of its agents"
+            source: "vllm/distributed/kv_transfer/kv_connector/v1/nixl/base_worker.py:3697-3701"
+            call: nixl-agent.remove-remote-agent
+            input: {agent_name: "= vars.eng"}
+      - if: "size(vars.release) > 0"
+        then:
+          - source: "vllm/distributed/kv_transfer/kv_connector/v1/nixl/base_worker.py:3694-3726"
+            set:
+              state.remote_agents: "= state.remote_agents.filter(e, !(e in vars.release))"
+              state.engine_by_address: "= state.engine_by_address.transformMapEntry(a, e, !(e in vars.release), {a: e})"
+              state.engine_clock_offset: "= state.engine_clock_offset.transformMapEntry(k, v, !(k in vars.release), {k: v})"
+              state.removed_agents: "= state.removed_agents + vars.release"
+      - return: {released: "= vars.release"}
 
   - component: nixl-agent
     name: handshake
@@ -399,7 +541,7 @@ interfaces:
             then:
               - title: No peer address in the request id or the params
                 source: "vllm/distributed/kv_transfer/kv_connector/v1/moriio/moriio_connector.py:1140-1160"
-                fail: {code: value-error, status: 0, message: "= 'request ' + input.request_id + ': request_id has no embedded peer zmq_address and kv_transfer_params is missing remote_host / remote_notify_port'"}
+                fail: {code: value-error, status: 0, message: "= 'request \\'' + input.request_id + '\\': request_id has no embedded peer zmq_address and kv_transfer_params is missing remote_host / remote_notify_port (got remote_host=' + ('remote_host' in vars.p && vars.p.remote_host != null && vars.p.remote_host != '' ? '\\'' + vars.p.remote_host + '\\'' : '\\'\\'') + ', remote_notify_port=' + ('remote_notify_port' in vars.p && vars.p.remote_notify_port != null ? string(vars.p.remote_notify_port) : '0') + ')'"}
           - title: Notify the prefill node of the blocks to write (none on a full local hit)
             source: "vllm/distributed/kv_transfer/kv_connector/v1/moriio/moriio_connector.py:1162-1166"
             set:

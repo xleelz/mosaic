@@ -1,0 +1,242 @@
+# Round-5 regression scenarios: one per fixed judge3/oracle3 claim (FIXES5.md item 1) and the precision sweep.
+scenarios:
+  - id: engine-core-r5-pause-wait-replies-after-drain
+    name: "judge3 L3-2c: pause_generation(wait) replies only after the in-flight request finishes"
+    description: "PAUSED_NEW keeps stepping; pause_scheduler returns a Future that the idle callback completes, and the UTILITY reply goes out on the output socket then (core.py:2080-2103, 1739-1745)."
+    fixtures: [full-tp1-llama-8b]
+    max_events: 400000
+    max_iterations: 400000
+    steps:
+      - {flow: engine-core-busy-loop, as: loop, await: false, input: {iterations: 400}}
+      - {flow: async-llm-generate, as: gen, await: false, input: {request_id: chatcmpl-w1, prompt_token_ids: [128000, 9906, 11], sampling_params: {max_tokens: 6, n: 1, ignore_eos: true}}}
+      - {flow: async-llm-pause-generation, as: p, at_ms: 60, input: {mode: wait, clear_cache: false}}
+    expect:
+      - "steps.gen.result.ok && steps.gen.result.value.value.finish_reason == 'length'"
+      - "steps.p.result.ok && steps.p.result.value == null"
+      - "trace.exists(e, e.type == 'call.end' && e.interface == 'engine-core-proc.pause-scheduler' && e.output.pending)"
+      - "trace.filter(e, e.type == 'call.end' && e.interface == 'async-llm.pause-generation').all(p, trace.exists(g, g.type == 'call.end' && g.interface == 'async-llm.generate' && g.t <= p.t))"
+      - "trace.exists(e, e.type == 'call.start' && e.interface == 'scheduler.set-pause-state' && e.input.pause_state == 'PAUSED_NEW')"
+
+  - id: engine-core-r5-prometheus-labels-and-startup-series
+    name: "judge3 L3-3: request_success is labeled by finished_reason; every reason exists at 0 from startup; gauges, TTFT and e2e histograms are written; the sleep gauge starts awake"
+    fixtures: [full-tp1-llama-8b]
+    steps:
+      - {interface: prometheus-registry.collect, caller: api-server, as: before}
+      - {interface: stat-logger-manager.record, caller: engine-core, as: rec, input: {scheduler_stats: {num_running_reqs: 1, num_waiting_reqs: 2, num_skipped_waiting_reqs: 1, kv_cache_usage: 0.25, prefix_cache_stats: {queries: 100, hits: 96}}, iteration_stats: {num_prompt_tokens: 6, num_generation_tokens: 1, time_to_first_tokens_iter: [0.05], finished_requests: [{finish_reason: length, e2e_latency: 0.3, num_prompt_tokens: 6, num_generation_tokens: 16}]}}}
+    expect:
+      - "steps.before.result.value.exists(m, m.series == 'vllm:request_success{model_name=\"llama-8b\",engine=\"0\",finished_reason=\"stop\"}' && m.value == 0)"
+      - "steps.before.result.value.exists(m, m.series == 'vllm:engine_sleep_state{model_name=\"llama-8b\",engine=\"0\"}' && m.value.awake == 1)"
+      - "state['prometheus-registry'].metrics['vllm:request_success{model_name=\"llama-8b\",engine=\"0\",finished_reason=\"length\"}'] == 1"
+      - "state['prometheus-registry'].metrics['vllm:num_requests_waiting{model_name=\"llama-8b\",engine=\"0\"}'] == 3"
+      - "state['prometheus-registry'].metrics['vllm:prefix_cache_hits{model_name=\"llama-8b\",engine=\"0\"}'] == 96"
+      - "state['prometheus-registry'].metrics['vllm:time_to_first_token_seconds{model_name=\"llama-8b\",engine=\"0\"}'].count == 1"
+      - "state['prometheus-registry'].metrics['vllm:e2e_request_latency_seconds{model_name=\"llama-8b\",engine=\"0\"}'].sum == 0.3"
+
+  - id: engine-core-r5-disable-log-stats-registers-nothing
+    name: "judge3 L3-3c: with --disable-log-stats no StatLoggerManager exists, so the registry holds no vllm:* series"
+    fixtures: [full-tp1-llama-8b]
+    config: {disable-log-stats: true}
+    steps:
+      - {interface: prometheus-registry.collect, caller: api-server, as: c}
+    expect:
+      - "steps.c.result.ok && size(steps.c.result.value) == 0"
+
+  - id: engine-core-r5-offline-llm-stats-off-by-default
+    name: "judge3 L3-8d: a plain LLM() has stat logging off, so get_metrics asserts 'Stat logging disabled'"
+    fixtures: [full-tp1-llama-8b]
+    steps:
+      - {interface: llm-engine.get-metrics, caller: python-user, as: m}
+      - {interface: llm-engine.from-engine-args, caller: python-user, as: fe, input: {disable_log_stats: true}}
+    expect:
+      - "!steps.m.result.ok && steps.m.result.error.code == 'assertion-error' && steps.m.result.error.message == 'Stat logging disabled'"
+      - "steps.fe.result.ok && state['llm-engine'].log_stats == false"
+
+  - id: engine-core-r5-async-output-handler-invalidates-mm-misses
+    name: "oracle3: AsyncLLM's output handler, like LLMEngine.step, drops every mm_cache_miss_hashes entry from the P0 sender cache"
+    fixtures: [full-tp1-llama-8b]
+    state:
+      lru-key-replicated-sender-cache: {entries: {h1: {bytes: 10}, h2: {bytes: 20}}, order: [h1, h2], used: 30}
+    steps:
+      - {interface: async-llm.output-handler, caller: async-mp-client, as: oh, input: {outputs: {outputs: [{request_id: gone, new_token_ids: [], mm_cache_miss_hashes: [h2]}]}}}
+    expect:
+      - "steps.oh.result.ok"
+      - "trace.filter(e, e.type == 'call.start' && e.interface == 'lru-key-replicated-sender-cache.invalidate').map(e, e.input.mm_hash) == ['h2']"
+      - "trace.exists(e, e.type == 'call.end' && e.interface == 'lru-key-replicated-sender-cache.invalidate' && e.output.removed)"
+
+  - id: engine-core-r5-batch-queue-follows-resolved-async
+    name: "judge3 P3-4/P3-5: the batch queue is max_concurrent_batches (PP 2 + async on V2 = 3) and ngram turns async scheduling off (queue 1, step())"
+    fixtures: [full-tp1-llama-8b]
+    steps:
+      - {interface: engine-core.init, caller: engine-core-proc, as: ngram}
+    config: {speculative-method: ngram, num-speculative-tokens: 3}
+    expect:
+      - "steps.ngram.result.ok && steps.ngram.result.value.async_scheduling == false && steps.ngram.result.value.batch_queue_size == 1"
+      - "state['engine-core'].batch_queue_size == 1 && !state['engine-core'].async_scheduling"
+
+  - id: engine-core-r5-batch-queue-pp2
+    name: "judge3 P3-4: PP 2 with async scheduling on the V2 runner sizes the batch queue to 3"
+    fixtures: [full-tp4-llama-70b]
+    config: {tensor-parallel-size: 2, pipeline-parallel-size: 2}
+    steps:
+      - {interface: engine-core.init, caller: engine-core-proc, as: init}
+    expect:
+      - "steps.init.result.ok && steps.init.result.value.async_scheduling && steps.init.result.value.batch_queue_size == 3"
+      - "state['engine-core'].batch_queue_size == 3"
+
+  - id: engine-core-r5-dp-kv-penalty-and-local-count
+    name: "judge3 P3-2c: a waiting queue on a KV-bound engine is penalized, and the chosen engine counts the request as waiting"
+    fixtures: [full-tp1-llama-8b]
+    config: {data-parallel-size: 2}
+    state:
+      dp-lb-async-mp-client: {lb_engines: [[1, 0, 1.0], [0, 3, 0.0]]}
+    steps:
+      - {interface: dp-lb-async-mp-client.get-core-engine-for-request, caller: api-server, as: k1, input: {request_id: k1, prompt_token_ids: [1], sampling_params: {max_tokens: 1}}}
+      - {interface: dp-lb-async-mp-client.get-core-engine-for-request, caller: api-server, as: k2, input: {request_id: k2, prompt_token_ids: [1], sampling_params: {max_tokens: 1}}}
+    expect:
+      - "steps.k1.result.value.engine == 'dp1'"
+      - "state['dp-lb-async-mp-client'].lb_engines[1][0] >= 1"
+
+  - id: engine-core-r5-async-llm-uses-dp-client
+    name: "judge3 P3-2: with data_parallel_size 2 AsyncLLM sends ADD through DPLBAsyncMPClient, alternating ranks on an idle server"
+    fixtures: [full-tp1-llama-8b]
+    config: {data-parallel-size: 2}
+    topology: {engine-core-proc: [dp0, dp1]}
+    steps:
+      - {interface: async-llm.add-request, caller: api-server, as: a1, input: {request_id: r1, prompt_token_ids: [128000, 9906], sampling_params: {max_tokens: 2, n: 1}}}
+      - {interface: async-llm.add-request, caller: api-server, as: a2, input: {request_id: r2, prompt_token_ids: [128000, 9906], sampling_params: {max_tokens: 2, n: 1}}}
+    expect:
+      - "calls['dp-lb-async-mp-client.add-request-async'] == 2 && calls['async-mp-client.add-request-async'] == 0"
+      - "trace.filter(e, e.type == 'call.start' && e.interface == 'engine-core-proc.process-input-sockets').map(e, e.instance) == ['dp0', 'dp1']"
+
+  - id: engine-core-r5-moe-first-req-wakes-ranks
+    name: "judge3 P3-3: a MoE DP request to paused engines sends FIRST_REQ; the coordinator broadcasts START_DP_WAVE and the other ranks start their loops"
+    fixtures: [full-tp4-llama-70b]
+    config: {tensor-parallel-size: 1, data-parallel-size: 2, model: mistralai/Mixtral-8x7B-Instruct-v0.1}
+    topology: {engine-core-proc: [dp0, dp1], dp-engine-core-proc: [dp0, dp1]}
+    steps:
+      - {interface: dp-lb-async-mp-client.add-request-async, caller: api-server, as: add, input: {request_id: m1, prompt_token_ids: [1, 2], sampling_params: {max_tokens: 2, n: 1}}}
+      - {interface: engine-core-proc.process-input-queue, caller: engine-core, on: dp1, as: q1, input: {pump: true}}
+    expect:
+      - "steps.add.result.value.engine == 'dp0'"
+      - "trace.exists(e, e.type == 'call.start' && e.interface == 'dp-coordinator.handle-first-req' && e.input.engine_to_exclude == 0)"
+      - "trace.filter(e, e.type == 'call.start' && e.interface == 'engine-core-proc.process-input-sockets' && e.input.request_type == 'START_DP_WAVE').size() == 2"
+      - "state['dp-engine-core-proc@dp1'].engines_running && !state['dp-engine-core-proc@dp0'].engines_running"
+      - "state['dp-lb-async-mp-client'].engines_running"
+
+  - id: engine-core-r5-moe-dp-engine-is-dp-proc
+    name: "judge3 P3-3b: run_engine_core picks DPEngineCoreProc for a MoE model under DP, EngineCoreProc for a dense one"
+    fixtures: [full-tp4-llama-70b]
+    config: {tensor-parallel-size: 1, data-parallel-size: 2, model: mistralai/Mixtral-8x7B-Instruct-v0.1}
+    topology: {engine-core-proc: [dp0, dp1], dp-engine-core-proc: [dp0, dp1]}
+    steps:
+      - {interface: engine-core-proc.run-engine-core, caller: engine-core, on: dp0, as: e0, input: {iterations: 1}}
+    expect:
+      - "steps.e0.result.ok && state['engine-core-proc@dp0'].dp_moe"
+      - "trace.exists(e, e.type == 'call.start' && e.interface == 'dp-engine-core-proc.run-busy-loop' && e.instance == 'dp0') && calls['engine-core-proc.run-busy-loop'] == 0"
+
+  - id: engine-core-r5-coordinator-wave-complete
+    name: "The coordinator moves to the next wave on rank 0's wave_complete and tells the front-end engines paused"
+    fixtures: [full-tp1-llama-8b]
+    config: {data-parallel-size: 2}
+    state:
+      dp-coordinator: {current_wave: 3, engines_running: true, enable_wave_coordination: true}
+      dp-lb-async-mp-client: {engines_running: true, current_wave: 3}
+    steps:
+      - {interface: dp-coordinator.handle-engine-output, caller: engine-core, as: wc, input: {eng_index: 0, wave_complete: 3}}
+    expect:
+      - "steps.wc.result.value == {'current_wave': 4, 'engines_running': false}"
+      - "state['dp-lb-async-mp-client'].current_wave == 4 && !state['dp-lb-async-mp-client'].engines_running"
+
+  - id: engine-core-r5-dp-rank-checked-before-prompt
+    name: "judge3 P3-2 (precision): process_inputs checks data_parallel_rank before the prompt length"
+    fixtures: [full-tp1-llama-8b]
+    config: {data-parallel-size: 2, max-model-len: 2}
+    steps:
+      - {interface: input-processor.process-inputs, caller: api-server, as: bad, input: {request_id: x, prompt_token_ids: [1, 2, 3, 4], sampling_params: {max_tokens: 1}, data_parallel_rank: 7}}
+    expect:
+      - "!steps.bad.result.ok && steps.bad.result.error.message == 'data_parallel_rank 7 is out of range [0, 2).'"
+
+  - id: engine-core-r5-reset-prefix-cache-connector
+    name: "judge3 Q3: reset_prefix_cache passes reset_connector to the scheduler"
+    fixtures: [full-tp1-llama-8b]
+    steps:
+      - {interface: engine-core.reset-prefix-cache, caller: engine-core-proc, as: r, input: {reset_connector: true}}
+    expect:
+      - "trace.exists(e, e.type == 'call.start' && e.interface == 'scheduler.reset-prefix-cache' && e.input.reset_connector == true)"
+
+  - id: engine-core-r5-sync-client-gets-outputs
+    name: "judge3 L3-8 world note: the engine's output socket answers the SyncMPClient that sends it requests, so the offline path needs no seeded client_kind"
+    fixtures: [full-tp1-llama-8b]
+    steps:
+      - {interface: sync-mp-client.add-request, caller: llm-engine, as: add, input: {request_id: s1-00000001, prompt_token_ids: [128000, 9906], sampling_params: {max_tokens: 2, n: 1}}}
+      - {interface: sync-mp-client.get-output, caller: llm-engine, as: out}
+    expect:
+      - "state['engine-core-proc'].client_kind == 'sync'"
+      - "trace.exists(e, e.type == 'call.start' && e.interface == 'sync-mp-client.process-outputs-socket')"
+      - "!trace.exists(e, e.type == 'call.start' && e.interface == 'async-mp-client.process-outputs-socket')"
+
+  - id: engine-core-r5-completion-logprobs
+    name: "serving-api S3-6: requested sample logprobs reach the CompletionOutput with the cumulative logprob"
+    fixtures: [full-tp1-llama-8b]
+    steps:
+      - {interface: output-processor.add-request, caller: engine-core, as: add, input: {request: {request_id: lp-1, prompt_token_ids: [128000, 9906], sampling_params: {max_tokens: 2, logprobs: 2}}, has_queue: false}}
+      - {interface: output-processor.process-outputs, caller: engine-core, as: p, input: {outputs: [{request_id: lp-1, new_token_ids: [42], new_logprobs: {token_ids: [[42, 7, 9]], logprobs: [[-0.5, -1.5, -2.5]], ranks: [1]}}]}}
+    expect:
+      - "steps.p.result.value.request_outputs[0].completions[0].logprobs[0].map(x, x.token_id) == [42, 7, 9]"
+      - "steps.p.result.value.request_outputs[0].completions[0].cumulative_logprob == -0.5"
+      - "state['logprobs-processor'].requests['lp-1'].cumulative_logprob == -0.5"
+
+  - id: engine-core-r5-concurrent-parallel-sampling
+    name: "serving-api S3-5: two concurrent n=2 generates finish without blocking each other (one busy-loop driver at a time)"
+    fixtures: [full-tp1-llama-8b]
+    max_events: 400000
+    steps:
+      - {flow: async-llm-generate, as: g1, await: false, input: {request_id: cmpl-fan-0, prompt_token_ids: [128000, 9906], sampling_params: {max_tokens: 3, n: 2, temperature: 0.8}}}
+      - {flow: async-llm-generate, as: g2, input: {request_id: cmpl-fan-1, prompt_token_ids: [128000, 791], sampling_params: {max_tokens: 3, n: 2, temperature: 0.8}}}
+    expect:
+      - "steps.g1.result.ok && steps.g2.result.ok"
+      - "steps.g1.result.value.value.finished && steps.g2.result.value.value.finished"
+      - "trace.filter(e, e.type == 'call.start' && e.interface == 'scheduler.add-request').size() == 4"
+
+  - id: engine-core-r5-prompt-token-ids-validated
+    name: "serving-api S3-2 (d): process_inputs validates the prompt's token ids against the vocabulary"
+    fixtures: [full-tp1-llama-8b]
+    steps:
+      - {interface: input-processor.process-inputs, caller: api-server, as: bad, input: {request_id: v1, prompt_token_ids: [128000, 999999], sampling_params: {max_tokens: 1}}}
+    expect:
+      - "!steps.bad.result.ok && steps.bad.result.error.code == 'vllm-validation-error'"
+      - "trace.exists(e, e.type == 'call.start' && e.interface == 'base-renderer.validate-token-ids')"
+
+  - id: engine-core-r5-unsupported-pooling-task-text
+    name: "Precision sweep: an unsupported pooling task is refused with the code's ValueError text (repr of the task, then the supported pooling tasks)"
+    fixtures: [full-tp1-llama-8b]
+    steps:
+      - {interface: engine-core.add-request, caller: engine-core-proc, as: r, input: {request_id: p1, prompt_token_ids: [128000], sampling_params: {max_tokens: 1}, pooling_params: {task: embed}}}
+    expect:
+      - "!steps.r.result.ok && steps.r.result.error.code == 'value-error' && steps.r.result.error.message == \"Unsupported task: 'embed' Supported tasks: []\""
+      - "!trace.exists(e, e.type == 'call.start' && e.interface == 'scheduler.add-request')"
+
+  - id: engine-core-r5-external-launcher-min-memory
+    name: "oracle3 torchrun: with external_launcher every launcher rank's worker profiles, the budget is all-reduced with MIN, and the KV cache is sized from the smallest"
+    description: "ExecutorWithExternalLauncher (uniproc_executor.py:161-207): one engine per torchrun rank, each over its own worker, in lockstep; rank1 has 4 GiB taken by another process, so its budget is the minimum every rank uses."
+    fixtures: [full-tp4-llama-70b]
+    config: {distributed-executor-backend: external_launcher}
+    state:
+      gpu-memory@rank1: {other_process_bytes: 4294967296}
+    steps:
+      - {flow: engine-startup, as: up}
+    expect:
+      - "steps.up.result.ok && steps.up.result.value.executor_class == 'ExecutorWithExternalLauncher'"
+      - "trace.filter(e, e.type == 'call.start' && e.interface == 'gpu-worker-impl.determine-available-memory').size() == 4"
+      - "trace.exists(c, c.type == 'call.start' && c.interface == 'kv-cache-utils.get-kv-cache-configs' && size(c.input.available_memory) == 1 && trace.filter(e, e.type == 'call.end' && e.interface == 'gpu-worker-impl.determine-available-memory').all(e, int(e.output) >= c.input.available_memory[0]) && trace.exists(e, e.type == 'call.end' && e.interface == 'gpu-worker-impl.determine-available-memory' && int(e.output) == c.input.available_memory[0]))"
+
+  - id: engine-core-r5-kv-cache-group-metadata
+    name: "oracle3: get_kv_cache_group_metadata reports each manager's DCP-scaled block size (attention) and the unscaled Mamba one"
+    fixtures: [full-tp1-llama-8b]
+    config: {decode-context-parallel-size: 4}
+    state:
+      kv-cache-manager: {kv_cache_groups: [{block_size: 16, kind: full_attention}, {block_size: 16, kind: sliding_window, sliding_window: 4096}, {block_size: 528, kind: mamba}]}
+    steps:
+      - {interface: engine-core.get-kv-cache-group-metadata, caller: python-user, as: meta}
+    expect:
+      - "steps.meta.result.value == [{'group_idx': 0, 'kind': 'full_attention', 'block_size': 64, 'sliding_window': null}, {'group_idx': 1, 'kind': 'sliding_window', 'block_size': 64, 'sliding_window': 4096}, {'group_idx': 2, 'kind': 'mamba', 'block_size': 528, 'sliding_window': null}]"

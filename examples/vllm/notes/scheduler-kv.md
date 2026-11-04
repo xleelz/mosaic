@@ -312,3 +312,83 @@ Function-level reach (owner basis) 15% -> 37% (by-test-area report: 16% -> 33%).
   (scheduler.py:2975-2977) instead of its own copy of the arithmetic.
 - `add-request` passes the full `prompt_token_ids` to `kv-connector-base-v1.on-new-request`
   (distributed lifted the 64-item cap); segment prompts still pass `[]`.
+
+## Fix round 5 (precision)
+
+Generator: new `gen/scheduler-kv/interfaces_r5.yaml` and `round5.py` (scenarios `scheduler-kv-r5-*`,
+oracle copies in `build-oracle/round5/scheduler-kv.yaml`). Edits in `body.yaml`, `fixtures.py`,
+`interfaces_sched.yaml`, `interfaces_kv.yaml`, `interfaces_misc.yaml`, `interfaces_r4.yaml`.
+Also: the generator now matches the merged fragment's `on-new-request` input (no 64-token cap).
+
+### Round-4 wrong claims fixed (judge3 scheduling-kv §2, oracle3)
+- **make-stats ignores deferred requests** (Q3-7 d). New `scheduler.deferred_waiting`: skipped
+  waiting requests (grammar, remote KV, stale output, max_loras) join it, admission and finishing
+  remove it, a grammar-blocked request joins at add (scheduler.py:904-910, 1344, 2457-2462, 2694-2697).
+  `make-stats` returns `num_waiting_reqs = waiting - deferred` and `num_skipped_waiting_reqs`.
+- **prompt_logprobs don't skip the prefix cache** (Q3-4 a). `add-request` resolves
+  `skip_reading_prefix_cache` (sampling_params.py:622-629); `schedule` passes it to
+  `get-computed-blocks`, zeroes connector hits (scheduler.py:983-984), and
+  `record-prefix-cache-stats` skips the request and honors `disable-log-stats` (kv_cache_manager.py:253-256).
+- **schedule omits encoder scheduling** (Q3-8, P3-8). New `scheduler.try-schedule-encoder-inputs`,
+  `allocate-encoder-inputs`, `free-encoder-inputs`, `init-encoder-cache`, and
+  `encoder-cache-manager.get-cached-input-ids` / `compute-mm-encoder-budget`. Requests carry
+  `mm_features [{identifier, offset, length, num_embeds}]`. Both scheduling loops cut chunks at an
+  item that doesn't fit, `disable-chunked-mm-input` rolls back, the output has
+  `scheduled_encoder_inputs` and `free_encoder_mm_hashes`, items are freed after the step, and
+  preempt/finish/failed allocation free the request's references.
+- **adaptive long-prefill** (Q3-1 d): config `long-prefill-token-threshold-adaptive` (scheduler.py:650-655).
+- **stale output / reset** (Q3-6 d, W3, W5): `preempt-request` records `num_stale_output_tokens`
+  (= `num_in_flight_tokens`, now tracked per request), `drop_stale_output`, clears drafts and records
+  a PREEMPTED event; the waiting loop skips deliverable stale output (934-938);
+  `update-from-output` drains it and discards drop-mode output (2079-2103).
+  `reset-prefix-cache` preempts with `drop_stale_output`, clears `prev_step_scheduled_req_ids`, and takes
+  `reset_connector` (2885-2898). EngineCoreOutputs carry `events` (QUEUED, SCHEDULED, PREEMPTED), so the
+  output processor can count `vllm:num_preemptions`.
+- **P2P tier manager** (oracle3): new `p2p-secondary-tier-manager` (init, annotate-req-context,
+  on-request-finished, get-hash-seed, get-or-create-session); `create-secondary-tier` builds it.
+- Not done: the divergent-hit connector branch (oracle3 fix request 2), `kv_holding_waiting` as a
+  separate queue (the model keeps one waiting list; the deferred set and the stale skip cover the
+  observable cases).
+
+### Precision sweep (error paths, most-used first)
+Corrected to the code's text: the max-seq-len ValueError (format_gib rounding, the "(X GiB)" available
+memory, the estimate only when > 0, the CPU-backend hints), "No available memory ..." (full text),
+`BlockPool` bare assert (empty message), `reset_prefix_cache` RuntimeError (full text), the outlines
+regex messages (wrapper with double period and hint; the anchored-start message with its pattern), the
+`StructuredOutputOptions.X` suffix on invalid-type errors, the NUL message (`('\x00')`), the regex
+timeout's 200-character pattern cut, and `create-secondary-tier` rejecting an empty backpressure dict.
+Checked and already exact: peek errors, duplicate request id, preemption assert, `get-new-blocks`,
+`allocate-slots`, outlines json_object/grammar, JSON nesting.
+
+### Worlds
+- `vl-qwen2-vl-7b`: variant fixture `scheduler-kv-vl-qwen2-vl-7b` (variant_of) seeds the encoder budget
+  and cache at 16384 = max(8192, the 16384-token largest item, qwen2_vl.py:1079-1138; ASSUMPTION: the
+  HF preprocessor's default max_pixels 12845056; video gives the same at 999 videos per prompt).
+  `worlds.yaml` doesn't list it yet (other areas' stage runs use my last-good fragment); rerun
+  `assign_inventory.py --worlds` after this fragment is accepted. My scenario names the variant explicitly.
+- `fp8-llama-3-8b-kv-fp8`: `get-kv-cache-configs` already sizes from `bytes_per_block`; scenario shows
+  the fp8 page doubles the blocks. The page size itself is worker-runner's (`get-kv-cache-spec`).
+- The `scheduler-kv-seed` block count stays Llama-3.1-8B's; startup re-sizes it.
+
+### Breaking changes (callers)
+- `scheduler.preempt-request` takes `drop_stale_output`; preempted requests with undelivered output
+  are deferred. Scenarios that schedule repeatedly without `update-from-output` and then expect a
+  preempted request to resume (judge3 `bench-q3-2-c`, `bench-q3-3`) now see it deferred; see
+  `reconcile/round5/measure-notes.md`.
+- `make-stats.num_waiting_reqs` excludes deferred requests (engine-core's gauges should add
+  `num_skipped_waiting_reqs` for the total).
+- `SchedulerOutput` gains `scheduled_encoder_inputs`, `free_encoder_mm_hashes`, and (MRV1)
+  `scheduled_cached_reqs.all_token_ids_req_ids`; outputs gain `events`.
+
+### Cross-area needs
+- engine-core: pass `mm_features` (mm_hash, placeholder offset/length) and the sampling params'
+  `prompt_logprobs` to `scheduler.add-request`; call `scheduler.init-encoder-cache` at startup with the
+  model's `mm_max_toks_per_item` (models-layers' MultiModalBudget); count PREEMPTED `events` for
+  `vllm:num_preemptions`; forward `reset_connector`.
+- worker-runner: run the encoder for `scheduled_encoder_inputs` and drop `free_encoder_mm_hashes`;
+  fp8 page size in `get-kv-cache-spec`.
+- serving-api: echo+logprobs to `prompt_logprobs`, and the stream rejection (Q3-4 c, d).
+- config-platform: owns `mm-encoder-only` (my boundary copy).
+
+### Round-5 unit tests
+6/6 pass (`build-oracle/round5/scheduler-kv.md`).

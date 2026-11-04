@@ -204,7 +204,11 @@ interfaces:
       - title: process_weights_after_loading (quant repacking, attention scales)
         source: "vllm/model_executor/model_loader/base_loader.py:104-109"
         call: model-loader-utils.process-weights-after-loading
-        input: {quant: "= vars.init.value.quant"}
+        input:
+          quant: "= vars.init.value.quant"
+          kv_quant_method: "= vars.init.value.kv_quant_method"
+          checkpoint_kv_scales: "= has(vars.hf.kv_scales) && vars.hf.kv_scales != null ? vars.hf.kv_scales : (has(vars.hf.quantization_config) && vars.hf.quantization_config != null && has(vars.hf.quantization_config.kv_cache_scheme) && vars.hf.quantization_config.kv_cache_scheme != null ? {'k_scale': 'checkpoint', 'v_scale': 'checkpoint'} : {})"
+        as: post
       - return:
           model: "= input.model"
           arch: "= vars.init.value.arch"
@@ -213,6 +217,8 @@ interfaces:
           quant: "= vars.init.value.quant"
           loader: "= input.loader"
           weights_bytes_per_rank: "= vars.weights.value.weights_bytes_per_rank"
+          kv_quant_method: "= vars.init.value.kv_quant_method"
+          kv_scales: "= vars.post.value.kv_scales"
 
   - component: model-loader-utils
     name: initialize-model
@@ -225,7 +231,7 @@ interfaces:
       properties:
         model: {type: string}
         hf_config: ModelsHfConfig
-    response: {type: object, properties: {component: {type: string}, arch: {type: string}, model_cls: {type: string}, quant: {type: string}}}
+    response: {type: object, properties: {component: {type: string}, arch: {type: string}, model_cls: {type: string}, quant: {type: string}, kv_quant_method: {type: string}}}
     behavior:
       - title: get_model_architecture(model_config)
         source: "vllm/model_executor/model_loader/utils.py:84-85"
@@ -252,13 +258,30 @@ interfaces:
             input: {quantization: "= vars.qname", hf_quant_config: "= (has(input.hf_config.quantization_config) && input.hf_config.quantization_config != null) ? input.hf_config.quantization_config : {}"}
             as: qc
           - set: {vars.quant: "= vars.qc.value.method"}
+      - set: {vars.kvm: none, vars.hqc: "= (has(input.hf_config.quantization_config) && input.hf_config.quantization_config != null) ? input.hf_config.quantization_config : {}"}
+      - title: "The quant config's method for Attention layers: Fp8Config gives Fp8KVCacheMethod"
+        source: "vllm/model_executor/layers/quantization/fp8.py:206-207"
+        if: "vars.qname != '' && vars.qc.value.config_cls == 'Fp8Config'"
+        then:
+          - call: fp8-config.get-quant-method
+            input: {layer_kind: attention, prefix: "model.layers.0.self_attn.attn"}
+            as: kvq
+          - set: {vars.kvm: "= vars.kvq.value.quant_method"}
+      - title: "ModelOpt FP8 / NVFP4 configs give ModelOptKVCacheMethod when the checkpoint names a KV-cache algorithm"
+        source: "vllm/model_executor/layers/quantization/modelopt.py:1818-1820"
+        when: "vars.qname.startsWith('modelopt') && has(vars.hqc.kv_cache_quant_algo) && vars.hqc.kv_cache_quant_algo != null"
+        set: {vars.kvm: ModelOptKVCacheMethod}
+      - title: "CompressedTensorsConfig gives every Attention layer CompressedTensorsKVCacheMethod"
+        source: "vllm/model_executor/layers/quantization/compressed_tensors/compressed_tensors.py:213-214"
+        when: "vars.qname == 'compressed-tensors'"
+        set: {vars.kvm: CompressedTensorsKVCacheMethod}
       - title: new-style model class(vllm_config=..., prefix=...)
         source: "vllm/model_executor/model_loader/utils.py:90-97"
         when: "vars.arch.value.component != 'auto-weights-loader'"
         call: "= vars.arch.value.component + '.init'"
-        targets: [llama-for-causal-lm.init, mixtral-for-causal-lm.init]
-        input: {hf_config: "= input.hf_config", quant: "= vars.quant"}
-      - return: {component: "= vars.arch.value.component", arch: "= vars.arch.value.arch", model_cls: "= vars.arch.value.class_name", quant: "= vars.quant"}
+        targets: [llama-for-causal-lm.init, mixtral-for-causal-lm.init, qwen2-vl-for-conditional-generation.init]
+        input: {hf_config: "= input.hf_config", quant: "= vars.quant", kv_quant_method: "= vars.kvm"}
+      - return: {component: "= vars.arch.value.component", arch: "= vars.arch.value.arch", model_cls: "= vars.arch.value.class_name", quant: "= vars.quant", kv_quant_method: "= vars.kvm"}
 
   - component: model-loader-utils
     name: get-model-architecture
@@ -297,7 +320,13 @@ interfaces:
     kind: function
     summary: "process_weights_after_loading: every module with a QuantizeMethodBase repacks or quantizes its weights; attention layers set their scales."
     sources: ["vllm/model_executor/model_loader/utils.py:133-209"]
-    request: {type: object, properties: {quant: {type: string, examples: [unquantized]}}}
+    request:
+      type: object
+      properties:
+        quant: {type: string, examples: [unquantized]}
+        kv_quant_method: {type: string, default: none}
+        checkpoint_kv_scales: {type: object, default: {}}
+    response: {type: object, properties: {processed: {type: boolean}, kv_scales: {type: object}}}
     behavior:
       - title: Quant methods process weights after loading (e.g. FP8 transposes and requantizes)
         source: "vllm/model_executor/model_loader/utils.py:150-180"
@@ -305,9 +334,17 @@ interfaces:
         then:
           - call: fp8-linear-method.process-weights-after-loading
             input: {block: "= input.quant == 'fp8_block'"}
-      - title: Attention layers process their weights (KV-cache scales)
+      - title: "An attention layer's KV-cache quant method turns the loaded scale parameters into the cache's float scales"
+        source: "vllm/model_executor/model_loader/utils.py:151-180"
+        if: "has(input.kv_quant_method) && input.kv_quant_method != 'none'"
+        then:
+          - call: base-kv-cache-method.process-weights-after-loading
+            input: {kv_cache_dtype: "= config['kv-cache-dtype']", checkpoint_scales: "= has(input.checkpoint_kv_scales) ? input.checkpoint_kv_scales : {}"}
+            as: kv
+          - return: {processed: true, kv_scales: "= vars.kv.value"}
+      - title: "No KV-cache quant method: the scales stay at set_default_quant_scales' 1.0; deferred attention layers then process their own weights"
         source: "vllm/model_executor/model_loader/utils.py:192-200"
-        return: {processed: true}
+        return: {processed: true, kv_scales: {k_scale: 1.0, v_scale: 1.0, q_scale: 1.0, prob_scale: 1.0, warnings: []}}
 
   - component: default-model-loader
     name: load-weights
@@ -334,7 +371,7 @@ interfaces:
       - title: model.load_weights(self.get_all_weights(model_config, model))
         source: "vllm/model_executor/model_loader/default_loader.py:498"
         call: "= input.component + '.load-weights'"
-        targets: [llama-for-causal-lm.load-weights, mixtral-for-causal-lm.load-weights, auto-weights-loader.load-weights]
+        targets: [llama-for-causal-lm.load-weights, mixtral-for-causal-lm.load-weights, qwen2-vl-for-conditional-generation.load-weights, auto-weights-loader.load-weights]
         input: {model: "= input.model", hf_config: "= input.hf_config", quant: "= input.quant", weights_bytes: "= vars.files.value.weights_bytes", missing_params: "= vars.files.value.missing_params"}
         as: loaded
       - title: Strict check for unquantized models - every parameter must come from the checkpoint
@@ -401,7 +438,7 @@ interfaces:
       - title: initialize_single_dummy_weight for every local tensor
         source: "vllm/model_executor/model_loader/dummy_loader.py:35-48"
         call: "= input.component + '.load-weights'"
-        targets: [llama-for-causal-lm.load-weights, mixtral-for-causal-lm.load-weights, auto-weights-loader.load-weights]
+        targets: [llama-for-causal-lm.load-weights, mixtral-for-causal-lm.load-weights, qwen2-vl-for-conditional-generation.load-weights, auto-weights-loader.load-weights]
         input: {model: "= input.model", hf_config: "= input.hf_config", quant: "= input.quant", weights_bytes: "= input.hf_config.weights_bytes", missing_params: []}
         as: loaded
       - return: {weights_bytes_per_rank: "= vars.loaded.value.weights_bytes_per_rank"}
@@ -431,17 +468,20 @@ interfaces:
   - component: weight-utils
     name: get-quant-config
     kind: function
-    summary: "get_quant_config: build the QuantizationConfig from the checkpoint's quantization_config (or a quant config file, or an online shorthand)."
+    summary: "get_quant_config: build the QuantizationConfig from the checkpoint's quantization_config (composing the user's online QuantizationConfigArgs onto it), or for --quantization without a checkpoint config: fp8 falls back to online fp8_per_tensor (deprecated), an online shorthand builds OnlineQuantizationConfig, else a quant config file must exist."
     sources: ["vllm/model_executor/model_loader/weight_utils.py:192-395"]
     request:
       type: object
       required: [quantization]
       properties:
         quantization: {type: string, examples: [fp8]}
-        hf_quant_config: {type: object}
-    response: {type: object, properties: {config_cls: {type: string}, method: {type: string}}}
+        hf_quant_config: {type: object, default: {}}
+        online_args: {type: [object, "null"], default: null, description: "model_config.quantization_config (--quantization-config)"}
+        online_args_type: {type: string, default: QuantizationConfigArgs, description: "the Python type of online_args: QuantizationConfigArgs once ModelConfig normalized it, else dict"}
+    response: {type: object, properties: {config_cls: {type: string}, method: {type: string}, online_composed: {type: boolean}}}
     errors:
       - {code: value-error, status: 0, retryable: false}
+      - {code: assertion-error, status: 0, retryable: false}
     behavior:
       - title: Quantization method must be set
         source: "vllm/model_executor/model_loader/weight_utils.py:195-196"
@@ -452,22 +492,50 @@ interfaces:
         call: quantization.get-quantization-config
         input: {quantization: "= input.quantization"}
         as: cls
-      - title: The checkpoint's quantization_config -> quant_cls.from_config
+      - set:
+          vars.oa: "= has(input.online_args) ? input.online_args : null"
+          vars.oat: "= has(input.online_args_type) ? input.online_args_type : 'QuantizationConfigArgs'"
+          vars.hqc: "= has(input.hf_quant_config) && input.hf_quant_config != null ? input.hf_quant_config : {}"
+      - title: "The checkpoint's quantization_config -> make_checkpoint_config: quant_cls.from_config, then maybe_compose_online_quantization"
         source: "vllm/model_executor/model_loader/weight_utils.py:258-274"
-        if: "has(input.hf_quant_config) && size(input.hf_quant_config) > 0"
+        if: "size(vars.hqc) > 0"
         then:
+          - title: "ModelOpt classes take the online args into their config, which must be normalized"
+            source: "vllm/model_executor/model_loader/weight_utils.py:226-231"
+            if: "vars.cls.value.config_cls.startsWith('ModelOpt') && vars.oa != null && vars.oat != 'QuantizationConfigArgs'"
+            then:
+              - fail: {code: assertion-error, status: 0, message: ""}
           - if: "vars.cls.value.config_cls == 'Fp8Config'"
             then:
               - call: fp8-config.from-config
-                input: "= input.hf_quant_config"
+                input: "= vars.hqc"
                 as: fp8
-              - return: {config_cls: Fp8Config, method: "= vars.fp8.value.method"}
-          - return: {config_cls: "= vars.cls.value.config_cls", method: "= input.quantization"}
+              - set: {vars.method: "= vars.fp8.value.method"}
+            else:
+              - set: {vars.method: "= input.quantization"}
+          - title: "maybe_compose_online_quantization: user online args must be QuantizationConfigArgs (a raw dict is an AssertionError)"
+            source: "vllm/model_executor/model_loader/weight_utils.py:214-224"
+            if: "vars.oa != null && vars.oat != 'QuantizationConfigArgs'"
+            then:
+              - fail: {code: assertion-error, status: 0, message: ""}
+          - return: {config_cls: "= vars.cls.value.config_cls", method: "= vars.method", online_composed: "= vars.oa != null"}
+      - title: "Raw online quantization (quant_cls OnlineQuantizationConfig with args) reads no checkpoint config"
+        source: "vllm/model_executor/model_loader/weight_utils.py:314-321"
+        if: "vars.cls.value.config_cls == 'OnlineQuantizationConfig' && vars.oa != null"
+        then:
+          - return: {config_cls: OnlineQuantizationConfig, method: "= input.quantization", online_composed: false}
+      - title: "Fp8Config has no config files: --quantization fp8 on an unquantized checkpoint is online fp8_per_tensor (deprecated, with a warning)"
+        source: "vllm/model_executor/model_loader/weight_utils.py:347-357"
+        if: "input.quantization == 'fp8'"
+        then:
+          - title: "--quantization fp8 is deprecated for online quantization; use --quantization fp8_per_tensor instead."
+            source: "vllm/model_executor/model_loader/weight_utils.py:351-354"
+            return: {config_cls: OnlineQuantizationConfig, method: fp8_per_tensor, online_composed: false}
       - title: No checkpoint config - an online shorthand builds OnlineQuantizationConfig
-        source: "vllm/model_executor/model_loader/weight_utils.py:370-374"
+        source: "vllm/model_executor/model_loader/weight_utils.py:358-361"
         if: "vars.cls.value.online"
         then:
-          - return: {config_cls: OnlineQuantizationConfig, method: "= input.quantization"}
+          - return: {config_cls: OnlineQuantizationConfig, method: "= input.quantization", online_composed: false}
       - source: "vllm/model_executor/model_loader/weight_utils.py:375"
         fail: {code: value-error, status: 0, message: "= 'Cannot find the config file for ' + input.quantization"}
 
@@ -613,7 +681,7 @@ interfaces:
         as: init
       - when: "vars.init.value.component != 'auto-weights-loader'"
         call: "= vars.init.value.component + '.load-weights'"
-        targets: [llama-for-causal-lm.load-weights, mixtral-for-causal-lm.load-weights]
+        targets: [llama-for-causal-lm.load-weights, mixtral-for-causal-lm.load-weights, qwen2-vl-for-conditional-generation.load-weights]
         input: {model: "= input.model", hf_config: "= input.hf_config", quant: "= vars.init.value.quant", weights_bytes: "= input.hf_config.weights_bytes", missing_params: []}
       - set: {ctx.ipc_fallback: none}
       - return: {model: "= input.model", arch: "= vars.init.value.arch", model_cls: "= vars.init.value.model_cls", component: "= vars.init.value.component", quant: "= vars.init.value.quant", loader: ipc-model-loader, weights_bytes_per_rank: "= input.hf_config.weights_bytes / config['tensor-parallel-size']"}

@@ -244,7 +244,7 @@ def tail_interfaces():
     va, vb = fn(UQU, "ultraquant_unified_attention")
     beh = [
         {"if": "input.num_heads % input.num_kv_heads != 0",
-         "then": [{"title": "Hq must be a multiple of Hk", "source": C(UQU, ln(UQU, r"if Hq % Hk != 0:", va)), "fail": {"code": "value-error", "message": "Hq must be divisible by Hk"}}]},
+         "then": [{"title": "Hq must be a multiple of Hk", "source": C(UQU, ln(UQU, r"if Hq % Hk != 0:", va)), "fail": {"code": "value-error", "message": "= 'Hq=' + string(input.num_heads) + ' must be a multiple of Hk=' + string(input.num_kv_heads)"}}]},
         {"set": {"vars.use_3d": "= !input.force_2d && !input.is_prefill_like && input.max_seq_len_hint >= 1024"}},
         {"title": "use_3d = not force_2d and not prefill-like and max_seq_len_hint >= 1024", "source": C(UQU, ln(UQU, r"use_3d = \(not force_2d\)", va))},
         *[helper(UQU, n, "the kernels inline " + n) for n in ("_ultraquant_slot_addrs", "_ultraquant_qk", "_ultraquant_load_k_packed", "_ultraquant_pv", "_ultraquant_load_v_tile", "_ultraquant_fp4_decode_arith")],
@@ -469,7 +469,7 @@ def tail_interfaces():
     out.append(op_kernel("flashmla", "fwd-kvcache-mla-fp8", C(FMLA, ln(FMLA, r"torch.ops._flashmla_extension_C.fwd_kvcache_mla_fp8\(")), "FlashMLA dense FP8 decode kernel.", "_flashmla_extension_C::fwd_kvcache_mla_fp8"))
     unavailable = [{"if": "!input.flashmla_available",
                     "then": [{"title": "FlashMLA extension not built", "source": Cfn(FMLA, "_raise_flashmla_unavailable"),
-                              "fail": {"code": "runtime-error", "message": "vllm._flashmla_C is not available"}}]}]
+                              "fail": {"code": "runtime-error", "message": "vllm._flashmla_C is not available, likely was not compiled due to insufficient nvcc version or a supported arch was not in the list of target arches to compile for."}}]}]
     a, b = fn(FMLA, "get_mla_metadata_dense_fp8")
     out.append(iface("flashmla", "get-mla-metadata-dense-fp8", "get_mla_metadata_dense_fp8: FlashMLA FP8 scheduling metadata, or RuntimeError when the extension is missing.", [C(FMLA, a, b)],
                      unavailable + [{"title": "get_mla_decoding_metadata_dense_fp8", "source": C(FMLA, ln(FMLA, r"get_mla_decoding_metadata_dense_fp8\(", a)), "call": "flashmla.get-mla-decoding-metadata-dense-fp8", "input": SHAPE, "fill": True},

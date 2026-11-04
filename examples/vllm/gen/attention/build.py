@@ -18,6 +18,7 @@ import tail  # noqa: E402
 import round3  # noqa: E402
 import round4  # noqa: E402
 import round4b  # noqa: E402
+import round5  # noqa: E402
 
 OUT = os.path.join(lib.HERE, "..", "..")
 
@@ -41,11 +42,11 @@ SKIP_EXACT = {
 
 
 def main():
-    comps = core.boundary_components() + core.components() + tail.tail_components() + round3.components() + round4.boundary_components() + round4.components() + round4b.components()
+    comps = core.boundary_components() + core.components() + tail.tail_components() + round3.components() + round4.boundary_components() + round4.components() + round4b.components() + round5.components()
     ifaces = (core.boundary_interfaces() + core.selection_interfaces() + core2.fa_interfaces() + core2.fa_interface_module()
               + core2.merge_interfaces() + core2.triton_interfaces() + core3.dcp_interfaces() + core3.vit_interfaces()
               + core3.mla_prefill_interfaces() + core3.cpu_interfaces() + tail.tail_interfaces() + round3.interfaces()
-              + round4.interfaces() + round4b.interfaces())
+              + round4.interfaces() + round4b.interfaces() + round5.interfaces())
     # Every internal call with an explicit input is filled over the callee's request defaults.
     def fill(steps):
         for st in steps or []:
@@ -73,11 +74,13 @@ def main():
     md = ("{'num_actual_tokens': n, 'num_reqs': 1, 'max_query_len': n, 'max_seq_len': n, 'seq_lens': [n], 'block_table': [[0]],"
           " 'slot_mapping': lists.range(n), 'causal': true, 'causal_is_tensor': false, 'has_scheduler_metadata': false,"
           " 'max_num_splits': 0, 'max_dcp_context_kv_len': 0, 'num_decode_reqs': 0, 'num_prefill_reqs': 0, 'seq_threshold_3D': 16}")
+    # The impl's kv_cache_dtype is CacheConfig.cache_dtype, which the Attention layer passes to the backend impl.
+    KVQM = round4.QM.replace("D", "config['kv-cache-dtype']")
     defaults = {
         "flash-attention-impl.forward": ("{'attn_type': 'decoder', 'num_tokens': 1, 'num_heads': 32, 'num_kv_heads': 8, 'head_size': 128,"
-                                         " 'kv_cache_dtype': 'auto', 'fa_version': 3, 'dcp_world_size': 1, 'has_output_scale': false,"
+                                         " 'kv_cache_dtype': config['kv-cache-dtype'], 'fa_version': vars.fav.value.fa_version, 'dcp_world_size': 1, 'device_capability_major': 9, 'has_output_scale': false,"
                                          " 'has_output_block_scale': false, 'has_alibi': false, 'has_sinks': false, 'profiling_run': false,"
-                                         " 'kv_quant_mode': 'none', 'metadata': " + md + "}"),
+                                         " 'kv_quant_mode': " + KVQM + ", 'metadata': " + md + "}"),
         "flash-attention-metadata-builder.build": ("{'fast_build': false, 'fa_version': 3, 'use_full_cuda_graph': true, 'max_cudagraph_size': 512,"
                                                    " 'dcp_world_size': config['decode-context-parallel-size'], 'batch_invariant': false, 'sliding_window_configs': 1,"
                                                    " 'common': {'causal': true, 'causal_is_tensor': false, 'causal_tensor_dtype': 'int32', 'common_prefix_len': 0,"
@@ -86,7 +89,7 @@ def main():
         "attention-backend-utils.get-supported-kv-cache-layouts": "{'backend_layouts': []}",
         "attention-backend-utils.record-kv-cache-layout": "{'existing_layout': ''}",
         "flash-attention-impl.do-kv-cache-update": ("{'attn_type': 'decoder', 'num_tokens': n, 'num_kv_heads': 8, 'head_size': 128,"
-                                                    " 'kv_cache_dtype': 'auto', 'kv_quant_mode': 'none', 'slot_mapping': lists.range(n),"
+                                                    " 'kv_cache_dtype': config['kv-cache-dtype'], 'kv_quant_mode': " + KVQM + ", 'slot_mapping': lists.range(n),"
                                                     " 'device_capability_major': 9}"),
     }
     for i in ifaces:
@@ -98,22 +101,33 @@ def main():
                 guard = [{"if": "!has(input.common)",
                           "then": [{"title": "common_attn_metadata is a required argument of build()",
                                     "source": lib.Cfn(core.FA, "build", lib.ln(core.FA, r"^class FlashAttentionMetadataBuilder")),
-                                    "fail": {"code": "type-error", "message": "build() missing 1 required positional argument: 'common_attn_metadata'"}}]}]
+                                    "fail": {"code": "type-error", "message": "FlashAttentionMetadataBuilder.build() missing 1 required positional argument: 'common_attn_metadata'"}}]}]
                 i.setdefault("errors", []).append({"code": "type-error", "status": 0, "retryable": False, "summary": "called without common_attn_metadata"})
-            i["behavior"] = guard + [{"title": ("Arguments not passed by the caller take the code's defaults (FA3 on SM90, full CUDA graphs up to 512 tokens)" if key.endswith("build") else
+            fav = []
+            if key == "flash-attention-impl.forward":
+                fav = [{"title": "The impl's FlashAttention version, resolved at __init__ (get_flash_attn_version for this layer)",
+                        "source": lib.C(core.FA, lib.ln(core.FA, r"self\.vllm_flash_attn_version = get_flash_attn_version\(")),
+                        "call": "fa-utils.get-flash-attn-version",
+                        "input": {"head_size": "= has(input.head_size) ? input.head_size : 128", "requires_alibi": "= has(input.has_alibi) && input.has_alibi",
+                                  "has_sinks": "= has(input.has_sinks) && input.has_sinks"}, "as": "fav", "fill": True}]
+            i["behavior"] = guard + fav + [{"title": ("Arguments not passed by the caller take the code's defaults (FA3 on SM90, full CUDA graphs up to 512 tokens)" if key.endswith("build") else
                                        "Arguments not passed by the caller take their usual values (a one-request decode step)" if key.startswith("flash-attention-impl") else
                                        "Arguments the caller leaves out take the function's defaults (no sliding window, no indexer; no declared backend layouts; no layout resolved yet)"),
                               "set": {"vars.i": "= merge(" + defaults[key].replace("lists.range(n)", "lists.range(" + n + ")").replace(": n", ": " + n).replace("[n]", "[" + n + "]") + ", input)"}}] + rebind(i["behavior"])
     flows, scenarios = scen.flows_and_scenarios()
     f2, s2 = scen.tail_flows_and_scenarios()
     flows += f2 + round3.flows() + round4.flows()
-    scenarios += s2 + round3.scenarios() + round4.scenarios() + round4b.scenarios()
+    scenarios += s2 + round3.scenarios() + round4.scenarios() + round4b.scenarios() + round5.scenarios()
     with open(os.path.join(OUT, "build-oracle", "round3", "attention.yaml"), "w") as fh:
         fh.write("# Round-3 build-oracle scenarios for attention. Generated by examples/vllm/gen/attention/build.py.\n")
         yaml.safe_dump(round3.oracle_doc(), fh, sort_keys=False, width=200, allow_unicode=True)
     with open(os.path.join(OUT, "build-oracle", "round4", "attention.yaml"), "w") as fh:
         fh.write("# Round-4 build-oracle scenarios for attention. Generated by examples/vllm/gen/attention/build.py.\n")
         yaml.safe_dump(round4.oracle_doc(), fh, sort_keys=False, width=200, allow_unicode=True)
+    os.makedirs(os.path.join(OUT, "build-oracle", "round5"), exist_ok=True)
+    with open(os.path.join(OUT, "build-oracle", "round5", "attention.yaml"), "w") as fh:
+        fh.write("# Round-5 build-oracle scenarios for attention. Generated by examples/vllm/gen/attention/build.py.\n")
+        yaml.safe_dump(round5.oracle_doc(), fh, sort_keys=False, width=200, allow_unicode=True)
     seed = {"id": "attention-seed", "summary": "Attention's own state: empty backend-selection cache, the modeled backends' capabilities, an empty CPU MLA latent cache.",
             "state": {c["id"]: c["state"]["initial"] for c in comps if "state" in c}}
     doc = {"schema_version": 1, "id": "vllm", "fixtures": [seed], "components": comps, "interfaces": ifaces, "schemas": core.schemas(),

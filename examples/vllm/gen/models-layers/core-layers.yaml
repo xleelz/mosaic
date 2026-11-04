@@ -157,7 +157,7 @@ interfaces:
     request:
       type: object
       required: [hf_config, quant]
-      properties: {hf_config: ModelsHfConfig, quant: {type: string, examples: [unquantized]}}
+      properties: {hf_config: ModelsHfConfig, quant: {type: string, examples: [unquantized]}, kv_quant_method: {type: string, default: none}}
     errors:
       - {code: value-error, status: 0, retryable: false}
       - {code: assertion-error, status: 0, retryable: false}
@@ -174,12 +174,12 @@ interfaces:
         source: "vllm/model_executor/models/llama.py:143-145"
         if: "vars.hf.num_attention_heads % vars.tp != 0"
         then:
-          - fail: {code: assertion-error, status: 0, message: "assert self.total_num_heads % tp_size == 0"}
+          - fail: {code: assertion-error, status: 0, message: ""}
       - title: KV heads are partitioned (>= TP) or replicated (< TP)
         source: "vllm/model_executor/models/llama.py:146-155"
         if: "(vars.hf.num_key_value_heads >= vars.tp && vars.hf.num_key_value_heads % vars.tp != 0) || (vars.hf.num_key_value_heads < vars.tp && vars.tp % vars.hf.num_key_value_heads != 0)"
         then:
-          - fail: {code: assertion-error, status: 0, message: "KV heads do not partition or replicate evenly across TP ranks"}
+          - fail: {code: assertion-error, status: 0, message: ""}
       - title: _init_rotary_emb -> get_rope (neox style)
         source: "vllm/model_executor/models/llama.py:236-248"
         call: rotary-embedding.get-rope
@@ -188,6 +188,10 @@ interfaces:
           max_position: "= vars.hf.max_position_embeddings"
           rope_parameters: "= has(vars.hf.rope_parameters) && vars.hf.rope_parameters != null ? vars.hf.rope_parameters : {}"
         as: rope
+      - title: "LlamaAttention's Attention layer initializes its KV-cache scales and quant method"
+        source: "vllm/model_executor/layers/attention/attention.py:157-226"
+        call: attention-layer.init-kv-cache-quant
+        input: {kv_quant_method: "= has(input.kv_quant_method) ? input.kv_quant_method : 'none'"}
       - title: Parameters are created on this rank's GPU (column/row shards), still uninitialized
         source: "vllm/model_executor/models/llama.py:360-401"
         set:
@@ -383,11 +387,20 @@ interfaces:
         call: column-parallel-linear.forward
         input: {num_tokens: "= input.num_tokens", in_features: "= input.cfg.hidden_size", out_features: "= (vars.q_heads + 2 * vars.kv_heads) * input.cfg.head_dim", bytes_per_weight: "= vars.bpw", layer_repeat: "= input.layer_repeat", quant: "= input.quant", tp: "= input.tp", gather_output: false}
         as: qkv
-      - title: Rotary embedding on q and k
-        source: "vllm/model_executor/models/llama.py:231"
-        call: rotary-embedding.forward-cuda
-        input: {num_tokens: "= input.num_tokens", num_heads: "= vars.q_heads", num_kv_heads: "= vars.kv_heads", head_size: "= input.cfg.head_dim"}
-        as: rope
+      - set: {vars.rope_ms: 0}
+      - title: "Rotary embedding on q and k: M-RoPE (3 x N positions) when the config has mrope_section (Qwen2-VL's Qwen2Attention)"
+        source: "vllm/model_executor/models/qwen2.py:232"
+        if: "has(input.cfg.mrope_section) && input.cfg.mrope_section != null"
+        then:
+          - call: m-rotary-embedding.forward-cuda
+            input: {num_tokens: "= input.num_tokens", positions_ndim: 2}
+        else:
+          - title: Rotary embedding on q and k
+            source: "vllm/model_executor/models/llama.py:231"
+            call: rotary-embedding.forward-cuda
+            input: {num_tokens: "= input.num_tokens", num_heads: "= vars.q_heads", num_kv_heads: "= vars.kv_heads", head_size: "= input.cfg.head_dim"}
+            as: rope
+          - set: {vars.rope_ms: "= vars.rope.value.owner_ms"}
       - source: "vllm/model_executor/models/llama.py:232"
         call: attention-layer.forward
         input: {num_tokens: "= input.num_tokens", num_heads: "= vars.q_heads", num_kv_heads: "= vars.kv_heads", head_size: "= input.cfg.head_dim", attn_metadata: "= input.attn_metadata"}
@@ -397,7 +410,7 @@ interfaces:
         call: row-parallel-linear.forward
         input: {num_tokens: "= input.num_tokens", in_features: "= vars.q_heads * input.cfg.head_dim", out_features: "= input.cfg.hidden_size", bytes_per_weight: "= vars.bpw", layer_repeat: "= input.layer_repeat", quant: "= input.quant", tp: "= input.tp", reduce_results: true, collective_key: 1}
         as: o
-      - return: {owner_ms: "= vars.qkv.value.owner_ms + vars.rope.value.owner_ms + vars.attn.value.owner_ms + vars.o.value.owner_ms"}
+      - return: {owner_ms: "= vars.qkv.value.owner_ms + vars.rope_ms + vars.attn.value.owner_ms + vars.o.value.owner_ms"}
 
   - component: llama-mlp
     name: forward

@@ -1,0 +1,84 @@
+schema_version: 1
+id: vllm
+scenarios:
+  - id: bench-q4-8-a-partial-prefills-emit-nothing
+    name: "Q4-8 (a) A (5000 tokens, budget 2048): chunks 2048, 2048, 904; the two partial chunks emit no EngineCoreOutput, the third emits the first token"
+    fixtures: [full-tp1-llama-8b]
+    config: {max-num-batched-tokens: 2048, max-num-seqs: 128, async-scheduling: false}
+    steps:
+      - flow: scheduler-add-request
+        input: {request_id: A, prompt_segments: [{key: p5000, num_tokens: 5000}], sampling_params: {max_tokens: 4}}
+        as: add
+      - {flow: scheduler-schedule, input: {}, as: s1}
+      - flow: scheduler-update-from-output
+        input: {scheduler_output: "= steps.s1.result.value", model_runner_output: {req_ids: [A], sampled_token_ids: [[]]}}
+        as: u1
+      - {flow: scheduler-schedule, input: {}, as: s2}
+      - flow: scheduler-update-from-output
+        input: {scheduler_output: "= steps.s2.result.value", model_runner_output: {req_ids: [A], sampled_token_ids: [[]]}}
+        as: u2
+      - {flow: scheduler-schedule, input: {}, as: s3}
+      - flow: scheduler-update-from-output
+        input: {scheduler_output: "= steps.s3.result.value", model_runner_output: {req_ids: [A], sampled_token_ids: [[1001]]}}
+        as: u3
+    expect:
+      - "steps.s1.result.value.num_scheduled_tokens['A'] == 2048 && steps.s2.result.value.num_scheduled_tokens['A'] == 2048 && steps.s3.result.value.num_scheduled_tokens['A'] == 904"
+      - "size(steps.u1.result.value.outputs) == 0 && size(steps.u2.result.value.outputs) == 0 && size(steps.u3.result.value.outputs) == 1"
+  - id: bench-q4-8-ab-iteration-and-prompt-counters
+    name: "Q4-8 (a, b) A's first output: prompt_tokens +5000 at once and iteration_tokens observes 5001; B (4992 cached): prompt_tokens +5000, cached +4992, by_source local_cache_hit 4992 / local_compute 8, iteration 9"
+    fixtures: [full-tp1-llama-8b]
+    state:
+      output-processor:
+        external_req_ids: {A: [A-1], B: [B-1]}
+        request_states:
+          A-1: {external_req_id: A, has_queue: false, index: 0, is_prefilling: true, num_output_tokens: 0, output_kind: delta, output_text: "", parent: null, prompt_len: 5000, queue_id: A-1, stop: [], token_ids: []}
+          B-1: {external_req_id: B, has_queue: false, index: 0, is_prefilling: true, num_output_tokens: 0, output_kind: delta, output_text: "", parent: null, prompt_len: 5000, queue_id: B-1, stop: [], token_ids: []}
+    steps:
+      - interface: output-processor.process-outputs
+        caller: llm-engine
+        input: {outputs: [{request_id: A-1, new_token_ids: [1001], finish_reason: null, stop_reason: null, num_cached_tokens: 0, prefill_stats: {num_prompt_tokens: 5000, num_computed_tokens: 5000, num_cached_tokens: 0, num_local_cached_tokens: 0, num_external_cached_tokens: 0}}]}
+        as: pA
+      - {interface: stat-logger-manager.record-prometheus, caller: stat-logger-manager, input: {iteration_stats: "= steps.pA.result.value.iteration_stats"}, as: rA}
+      - interface: output-processor.process-outputs
+        caller: llm-engine
+        input: {outputs: [{request_id: B-1, new_token_ids: [1001], finish_reason: null, stop_reason: null, num_cached_tokens: 4992, prefill_stats: {num_prompt_tokens: 5000, num_computed_tokens: 8, num_cached_tokens: 4992, num_local_cached_tokens: 4992, num_external_cached_tokens: 0}}]}
+        as: pB
+      - {interface: stat-logger-manager.record-prometheus, caller: stat-logger-manager, input: {iteration_stats: "= steps.pB.result.value.iteration_stats"}, as: rB}
+    expect:
+      - "steps.pA.result.value.iteration_stats.num_prompt_tokens == 5000 && steps.pB.result.value.iteration_stats.num_prompt_tokens == 5000"
+      - "state['prometheus-registry'].metrics.exists(k, k.startsWith('vllm:prompt_tokens{') && state['prometheus-registry'].metrics[k] == 10000)"
+      - "state['prometheus-registry'].metrics.exists(k, k.startsWith('vllm:iteration_tokens_total'))"
+      - "state['prometheus-registry'].metrics.exists(k, k.startsWith('vllm:prompt_tokens_cached') && state['prometheus-registry'].metrics[k] == 4992)"
+      - "state['prometheus-registry'].metrics.exists(k, k.startsWith('vllm:prompt_tokens_by_source') && k.contains('local_cache_hit') && state['prometheus-registry'].metrics[k] == 4992)"
+  - id: bench-q4-8-c-preempted-recompute-not-prompt-work
+    name: "Q4-8 (c) D preempted during decode and resumed: its prefill stats are not re-set and the API side no longer counts it as prefilling, so prompt_tokens does not move"
+    fixtures: [full-tp1-llama-8b]
+    config: {async-scheduling: false}
+    state:
+      output-processor:
+        external_req_ids: {D: [D-1]}
+        request_states:
+          D-1: {external_req_id: D, has_queue: false, index: 0, is_prefilling: false, num_output_tokens: 3, output_kind: delta, output_text: " a b c", parent: null, prompt_len: 100, queue_id: D-1, stop: [], token_ids: [11, 12, 13]}
+    steps:
+      - flow: scheduler-add-request
+        input: {request_id: D-1, prompt_segments: [{key: d100, num_tokens: 100}], sampling_params: {max_tokens: 8}}
+        as: add
+      - {flow: scheduler-schedule, input: {}, as: s1}
+      - flow: scheduler-update-from-output
+        input: {scheduler_output: "= steps.s1.result.value", model_runner_output: {req_ids: [D-1], sampled_token_ids: [[11]]}}
+        as: u1
+      - {interface: scheduler.preempt-request, caller: engine-core, input: {request_id: D-1}, as: pre}
+      - {flow: scheduler-schedule, input: {}, as: s2}
+      - flow: scheduler-update-from-output
+        input: {scheduler_output: "= steps.s2.result.value", model_runner_output: {req_ids: [D-1], sampled_token_ids: [[12]]}}
+        as: u2
+      - interface: output-processor.process-outputs
+        caller: llm-engine
+        input: {outputs: "= steps.u2.result.value.outputs"}
+        as: p2
+      - {interface: stat-logger-manager.record-prometheus, caller: stat-logger-manager, input: {iteration_stats: "= steps.p2.result.value.iteration_stats"}, as: r2}
+    expect:
+      - "steps.u1.result.value.outputs[0].prefill_stats != null"
+      - "!has(steps.u2.result.value.outputs[0].prefill_stats) || steps.u2.result.value.outputs[0].prefill_stats == null"
+      - "steps.p2.result.value.iteration_stats.num_prompt_tokens == 0 && steps.p2.result.value.iteration_stats.num_generation_tokens == 1"
+      - "!state['prometheus-registry'].metrics.exists(k, k.startsWith('vllm:prompt_tokens{') && state['prometheus-registry'].metrics[k] > 0)"

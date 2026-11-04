@@ -98,6 +98,12 @@ cfg("trust-request-chat-template", "boolean", False, False, "--trust-request-cha
     [s(CLI, 95), s("vllm/renderers/online_renderer.py", 678, 697)], "trust_request_chat_template")
 cfg("enable-auto-tool-choice", "boolean", False, False, "--enable-auto-tool-choice: needed for tool_choice=auto with HF tokenizers",
     [s(CLI, 116), s("vllm/renderers/online_renderer.py", 257, 267)], "enable_auto_tool_choice")
+cfg("exclude-tools-when-tool-choice-none", "boolean", False, False, "--exclude-tools-when-tool-choice-none: with tool_choice none the tools are not rendered into the chat template",
+    [s(CLI, 119), s("vllm/renderers/online_renderer.py", 282, 287)], "exclude_tools_when_tool_choice_none")
+cfg("enable-request-id-headers", "boolean", False, False, "--enable-request-id-headers: XRequestIdMiddleware echoes X-Request-Id (or a new uuid hex) on every response",
+    [s(CLI, 357), s(E + "serve/middleware/register.py", 38, 41), s(E + "serve/middleware/x_request_id.py", 10, 35)], "enable_request_id_headers")
+cfg("vllm-max-completion-prompts", "integer", 1024, 1024, "VLLM_MAX_COMPLETION_PROMPTS: the most prompts one /v1/completions request may carry",
+    [s(ENVS, 1155, 1157), s(E + "openai/completion/protocol.py", 613, 641)], "VLLM_MAX_COMPLETION_PROMPTS")
 cfg("vllm-server-dev-mode", "boolean", False, False, "VLLM_SERVER_DEV_MODE: registers the dev and RL routes (sleep, cache resets, collective_rpc, pause, weight updates)",
     [s(ENVS, 1487), s(E + "launchers/api_server/routers.py", 40, 47)], "VLLM_SERVER_DEV_MODE")
 cfg("vllm-allow-runtime-lora-updating", "boolean", False, False, "VLLM_ALLOW_RUNTIME_LORA_UPDATING: registers /v1/load_lora_adapter and /v1/unload_lora_adapter",
@@ -131,9 +137,11 @@ configs[-1]["attributes"]["none_is"] = ""
 cfg("enable-prompt-embeds", "boolean", False, False, "--enable-prompt-embeds: prompt_embeds inputs (and chat content parts) are refused without it",
     ["vllm/config/model.py:319", "vllm/renderers/chat_utils.py:1062-1076"], "enable_prompt_embeds", "config-platform")
 cfg("enable-mm-embeds", "boolean", False, False, "--enable-mm-embeds: image_embeds content parts are refused without it",
-    ["vllm/config/multimodal.py:326", "vllm/renderers/chat_utils.py:1086-1095"], "enable_mm_embeds", "models-layers")
+    ["vllm/config/multimodal.py:326", "vllm/renderers/chat_utils.py:1286-1293"], "enable_mm_embeds", "models-layers")
+cfg("limit-mm-per-prompt", "object", {}, {}, "--limit-mm-per-prompt: per-modality item limit (unset modality: 999), read by the processor's validate_num_items",
+    ["vllm/config/multimodal.py:307"], "limit_mm_per_prompt", "models-layers")
 cfg("model-is-multimodal", "boolean", False, False, "ModelConfig.is_multimodal_model, resolved from the registry for the served architecture (LlamaForCausalLM: text-only)",
-    ["vllm/config/model.py:1981", "vllm/renderers/base.py:228-230"], "is_multimodal_model", "models-layers")
+    ["vllm/config/model.py:1981", "vllm/renderers/base.py:228-230"], "is_multimodal_model", "config-platform")
 cfg("trust-request-mm-kwargs", "boolean", False, False, "--trust-request-mm-kwargs: without it per-request media_io_kwargs / mm_processor_kwargs are refused",
     [s(CLI, 99), s(E + "generate/base/protocol.py", 72, 97)], "trust_request_mm_kwargs")
 cfg("media-io-video-num-frames", "integer", 32, 32, "--media-io-kwargs video.num_frames: frames sampled per video (the loader's default is 32)",
@@ -150,7 +158,8 @@ configs[-1]["attributes"]["none_is"] = ""
 # Schemas
 # ---------------------------------------------------------------------------
 HEADERS = obj({"Authorization": {"type": "string", "examples": ["Bearer token-abc123"]},
-               "X-Request-Id": {"type": "string", "examples": ["req-1"]}})
+               "X-Request-Id": {"type": "string", "examples": ["req-1"]},
+               "Content-Type": {"type": "string", "default": "application/json", "description": "validate_json_request reads it; JSON clients send application/json"}})
 schemas.append({"id": "ServingHttpHeaders", "summary": "The request headers the routes read (Authorization for --api-key, X-Request-Id for the request id).",
                 "schema": HEADERS})
 schemas.append({"id": "ServingErrorResponse", "summary": "ErrorResponse{error: ErrorInfo{message, type, param, code}} (serve/engine/protocol.py:79-87).",
@@ -193,11 +202,21 @@ schemas.append({"id": "ServingChatCompletionRequest",
                                "logprobs": {"type": ["boolean", "null"], "default": False},
                                "top_logprobs": {"type": ["integer", "null"], "default": 0},
                                "skip_special_tokens": {"type": ["boolean", "null"], "default": True},
+                               "logit_bias": {"type": ["object", "null"], "default": None},
+                               "allowed_token_ids": {"type": ["array", "null"], "items": INT, "default": None},
+                               "bad_words": {"type": ["array", "null"], "items": STR, "default": None},
+                               "stream_interval": {"type": ["integer", "null"], "default": None},
+                               "prompt_logprobs": {"type": ["integer", "null"], "default": None},
+                               "echo": {"type": "boolean", "default": False},
+                               "add_generation_prompt": {"type": "boolean", "default": True, "description": "ASSUMPTION: the field default is filled before check_generation_prompt, which in the code reads the raw data (an omitted flag is falsy there)"},
+                               "continue_final_message": {"type": "boolean", "default": False},
+                               "chat_template_kwargs": {"type": ["object", "null"], "default": None},
+                               "use_beam_search": {"type": "boolean", "default": False},
                                "request_id": {"type": ["string", "null"], "default": None},
                                "cache_salt": {"type": ["string", "null"], "default": None}}, ["messages"])})
 schemas.append({"id": "ServingCompletionRequest", "summary": "CompletionRequest body fields the model reads (openai/completion/protocol.py).",
                 "schema": obj({"model": {"type": "string", "examples": ["llama-8b"]},
-                               "prompt": {"type": ["string", "array"], "items": {"type": "string"}, "default": ["The capital of France is"]},
+                               "prompt": {"type": ["string", "array"], "items": {"type": ["string", "integer", "array"]}, "default": ["The capital of France is"]},
                                "max_tokens": {"type": ["integer", "null"], "examples": [16]},
                                "stream": {"type": "boolean", "default": False},
                                "stream_options": {"type": ["object", "null"], "default": None},
@@ -216,6 +235,12 @@ schemas.append({"id": "ServingCompletionRequest", "summary": "CompletionRequest 
                                "structured_outputs": {"type": ["object", "null"], "default": None},
                                "suffix": {"type": ["string", "null"], "default": None},
                                "echo": {"type": "boolean", "default": False},
+                               "logit_bias": {"type": ["object", "null"], "default": None},
+                               "allowed_token_ids": {"type": ["array", "null"], "items": INT, "default": None},
+                               "bad_words": {"type": ["array", "null"], "items": STR, "default": None},
+                               "stream_interval": {"type": ["integer", "null"], "default": None},
+                               "prompt_logprobs": {"type": ["integer", "null"], "default": None},
+                               "length_penalty": {"type": "number", "default": 1.0},
                                "use_beam_search": {"type": "boolean", "default": False}}, ["prompt"])})
 schemas.append({"id": "ServingResponsesRequest", "summary": "ResponsesRequest body fields the model reads (openai/responses/protocol.py: store defaults to true, background to false).",
                 "schema": obj({"model": {"type": "string", "examples": ["llama-8b"]},
@@ -561,16 +586,31 @@ APIU = E + "serve/utils/api_utils.py"
 HTTP_ERRORS = [{"code": "BadRequestError", "status": 400}, {"code": "NotFoundError", "status": 404},
                {"code": "InternalServerError", "status": 500}, {"code": "unauthorized", "status": 401},
                {"code": "Service Unavailable", "status": 503, "retryable": True},
-               {"code": "ConnectionRefusedError", "status": 0, "retryable": True}]
+               {"code": "ConnectionRefusedError", "status": 0, "retryable": True}, {"code": "Bad Request", "status": 400}]
+
+
+JSON_CT_CHECK = {
+    "title": "validate_json_request (a route dependency, after the middleware): a Content-Type other than application/json is a RequestValidationError (ASSUMPTION: a request without the header is a JSON client's)",
+    "source": s(APIU, 350, 356),
+    "if": "has(input.headers) && input.headers != null && 'Content-Type' in input.headers && input.headers['Content-Type'].lowerAscii().split(';')[0].trim() != 'application/json'",
+    "then": [{"title": "validation_exception_handler: '<n> validation error:' plus each error, type Bad Request, no param", "source": s(E + "serve/exception_handling/handlers/validation.py", 150, 180),
+              "fail": {"code": "Bad Request", "status": 400, "message": "1 validation error:\n  Unsupported Media Type: Only 'application/json' is allowed"}}]}
+REQUEST_ID_HEADER = {
+    "if": "config['enable-request-id-headers'] && type(vars.res.value) == map",
+    "then": [{"title": "XRequestIdMiddleware appends X-Request-Id to the response: the request's header, else uuid4().hex", "source": s(E + "serve/middleware/x_request_id.py", 25, 35),
+              "set": {"vars.out": "= merge(vars.res.value, {'headers': {'X-Request-Id': has(input.headers) && 'X-Request-Id' in input.headers ? input.headers['X-Request-Id'] : id('random-uuid', seq('random-uuid'))}})"}}]}
 
 
 def main_route(component, method, path, src, handler, handler_input, summary, body=None, load=True, cancel=True,
                pre=None, mapper="exception-handling.vllm-error-handler", examples_path=None, extra_errors=None, token_prefix="",
-               streams=False):
+               streams=False, json_ct=True, body_checks=None):
     beh = [{"call": "launcher.accept-connection"}] + list(pre or [])
     beh.append({"title": "ScalingMiddleware (outermost) refuses while elastic EP scales", "source": s(E + "serve/middleware/register.py", 43, 47),
                 "call": "scaling-middleware.call", "input": {"path": "= input.path"}})
     beh.append({"call": "authentication-middleware.call", "input": {"path": "= input.path", "headers": "= has(input.headers) ? input.headers : {}"}})
+    if json_ct and method == "POST":
+        beh.append(JSON_CT_CHECK)
+    beh.extend(body_checks or [])
     if load:
         beh.append({"title": "load_aware_call counts the request", "source": s(APIU, 110, 117),
                     "when": "config['enable-server-load-tracking']", "call": "server-load-metrics.increment"})
@@ -584,9 +624,12 @@ def main_route(component, method, path, src, handler, handler_input, summary, bo
     if load:
         on_error.append({"when": "config['enable-server-load-tracking']", "title": "load_aware_call decrements on an exception or error response",
                          "source": s(APIU, 118, 145), "call": "server-load-metrics.decrement"})
-    on_error.append({"call": mapper, "input": {"code": "= error.code", "status": "= error.status", "message": "= error.message",
-                                               "param": "= has(error.data) && error.data != null && 'param' in error.data ? error.data.param : null",
-                                               "value": "= has(error.data) && error.data != null && 'value' in error.data ? error.data.value : null"}})
+    mapper_input = {"code": "= error.code", "status": "= error.status", "message": "= error.message",
+                    "param": "= has(error.data) && error.data != null && 'param' in error.data ? error.data.param : (has(error.data) && error.data != null && 'parameter' in error.data ? error.data.parameter : null)",
+                    "value": "= has(error.data) && error.data != null && 'value' in error.data ? error.data.value : null"}
+    if mapper == "cohere-serving-chat-v2.error-response":
+        mapper_input["request_id"] = "= has(error.data) && error.data != null && 'request_id' in error.data ? error.data.request_id : (has(input.headers) && 'X-Request-Id' in input.headers ? input.headers['X-Request-Id'] : null)"
+    on_error.append({"call": mapper, "input": mapper_input})
     call = {"title": "with_cancellation: the handler races a client-disconnect listener" if cancel else summary,
             "source": s(APIU, 75, 91) if cancel else src, "call": handler, "input": handler_input, "as": "res", "on_error": on_error}
     if cancel:
@@ -605,7 +648,9 @@ def main_route(component, method, path, src, handler, handler_input, summary, bo
     if load:
         beh.append({"when": "config['enable-server-load-tracking']", "title": "The response's BackgroundTask decrements the counter",
                     "source": s(APIU, 124, 139), "call": "server-load-metrics.decrement"})
-    beh.append({"return": "= vars.res.value"})
+    beh.append({"set": {"vars.out": "= vars.res.value"}})
+    beh.append(REQUEST_ID_HEADER)
+    beh.append({"return": "= vars.out"})
     req = http_req(body, path=examples_path or path)
     extra = {"streams_when": "= " + STREAMING} if streams else {}
     iface(component, route_slug(method, path), "http", [src], summary, attributes={"method": method, "path": path},
@@ -652,9 +697,17 @@ for path, a, b, handler, summ in [("/v1/load_lora_adapter", 63, 74, "openai-serv
 TOK_R = E + "serve/tokenize/api_router.py"
 main_route("serving-tokenization", "POST", "/tokenize", s(TOK_R, 33, 58), "serving-tokenization.create-tokenize", {"body": "= input.body"},
            "POST /tokenize: token ids of a prompt or a chat conversation", load=False,
-           body=obj({"model": {"type": "string", "examples": ["llama-8b"]}, "prompt": {"type": "string", "examples": ["Hello world"]}, "messages": {"type": ["array", "null"], "items": {"type": "object"}, "default": None}}))
+           body=obj({"model": {"type": "string", "examples": ["llama-8b"]}, "prompt": {"type": "string", "examples": ["Hello world"]}, "messages": {"type": ["array", "null"], "items": {"type": "object"}, "default": None},
+                     "add_generation_prompt": {"type": "boolean", "default": True}, "continue_final_message": {"type": "boolean", "default": False},
+                     "add_special_tokens": {"type": ["boolean", "null"], "default": None, "description": "null: the request type's default (true for a prompt, false for messages)"}}))
 main_route("serving-tokenization", "POST", "/detokenize", s(TOK_R, 61, 83), "serving-tokenization.create-detokenize", {"body": "= input.body"},
            "POST /detokenize: text of token ids", load=False,
+           body_checks=[{"title": "DetokenizeRequest.tokens is list[Annotated[int, Field(ge=0, le=2**63 - 1)]]: a negative id fails field validation (RequestValidationError -> 400 Bad Request, param body.tokens.<i>)",
+                         "source": s(E + "serve/tokenize/protocol.py", 165, 169),
+                         "if": "has(input.body.tokens) && input.body.tokens.exists(t, t < 0)",
+                         "then": [{"set": {"vars.neg": "= lists.range(size(input.body.tokens)).filter(i, input.body.tokens[i] < 0)[0]"}},
+                                  {"fail": {"code": "Bad Request", "status": 400, "message": "= '1 validation error:\\n  {\\'type\\': \\'greater_than_equal\\', \\'loc\\': \\'body.tokens.' + string(vars.neg) + '\\', \\'msg\\': \\'Input should be greater than or equal to 0\\', \\'input\\': ' + string(input.body.tokens[vars.neg]) + ', \\'ctx\\': {\\'ge\\': 0}}'",
+                                            "data": {"param": "= 'body.tokens.' + string(vars.neg)"}}}]}],
            body=obj({"model": {"type": "string", "examples": ["llama-8b"]}, "tokens": {"type": "array", "items": {"type": "integer"}, "default": [128000, 1005, 1005]}}))
 ANT_R = E + "anthropic/api_router.py"
 ANT_BODY = obj({"model": {"type": "string", "examples": ["llama-8b"]}, "max_tokens": {"type": "integer", "examples": [16]},
@@ -670,7 +723,8 @@ COH_GATE = [{"title": "The Cohere routes are attached only with VLLM_ENABLE_COHE
              "if": "!config['vllm-enable-cohere-api']", "then": [{"fail": {"code": "Not Found", "status": 404, "message": "Not Found"}}]}]
 main_route("cohere-serving-chat-v2", "POST", "/cohere/v2/chat", s(COH, 118, 154), "openai-serving-chat.create-chat-completion",
            {"body": "= merge({'model': has(input.body.model) ? input.body.model : '', 'messages': input.body.messages}, has(input.body.max_tokens) && input.body.max_tokens != null ? dyn({'max_tokens': input.body.max_tokens}) : dyn({}))", "x_request_id": XRID},
-           "POST /cohere/v2/chat: Cohere v2 chat through the chat handler", body=ANT_BODY, pre=COH_GATE, mapper="exception-handling.create-error-response", streams=True)
+           "POST /cohere/v2/chat: Cohere v2 chat through the chat handler; every exception and ErrorResponse goes out in Cohere's {message} envelope", body=ANT_BODY, pre=COH_GATE, mapper="cohere-serving-chat-v2.error-response", streams=True,
+           extra_errors=[{"code": "CohereError", "status": 400}])
 main_route("cohere-serving-chat-v2", "POST", "/cohere/v2/chat/render", s(COH, 156, 206), "serving-render.render-chat-request",
            {"body": "= {'model': has(input.body.model) ? input.body.model : '', 'messages': input.body.messages}"},
            "POST /cohere/v2/chat/render: tokenize a Cohere v2 chat request without generating", body=ANT_BODY, pre=COH_GATE, load=False,

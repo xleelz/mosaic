@@ -14,11 +14,12 @@ import yaml  # noqa: E402
 import hand  # noqa: E402
 import hand2  # noqa: E402
 import hand3  # noqa: E402
+import hand4  # noqa: E402
 import ops  # noqa: E402
 import scen  # noqa: E402
 from common import HERE, findline  # noqa: E402
 
-scen.SCENARIOS = scen.SCENARIOS + hand3.SCENARIOS
+scen.SCENARIOS = scen.SCENARIOS + hand3.SCENARIOS + hand4.SCENARIOS
 
 ROOT = os.path.abspath(os.path.join(HERE, "..", ".."))
 
@@ -198,6 +199,8 @@ KEEP = {
     ("kernels-ops-vllm-backend-compile-cold", 1), ("kernels-ops-vllm-backend-compile-warm-restart", 1),
     ("kernels-ops-support-torch-compile-aot-warm-restart", 1), ("kernels-ops-post-grad-pass-manager-deployed", 3),
     ("kernels-ops-cuda-graph-wrapper-capture-then-replay", 2), ("kernels-ops-op-capture-toggle", 1),
+    # round 5: the MoE world's end-to-end forward is checked by the kernel paths its trace records
+    ("kernels-ops-moe-world-mixtral-forward", 1), ("kernels-ops-moe-world-mixtral-forward", 2),
 }
 _IFACE_LIT = _re.compile(r"'([a-z0-9-]+\.[a-z0-9-]+)'")
 _STATE = _re.compile(r"state\['([a-z0-9-]+)@rank0'\]")
@@ -256,7 +259,7 @@ def ordered(d):
 doc = {
     "schema_version": 1,
     "id": "vllm",
-    "configs": hand.configs() + hand3.CONFIGS,
+    "configs": hand.configs() + hand3.CONFIGS + hand4.CONFIGS,
     "schemas": schemas,
     "components": list(components.values()),
     "interfaces": [ordered(ifaces[i]) for i in sorted(ifaces)],

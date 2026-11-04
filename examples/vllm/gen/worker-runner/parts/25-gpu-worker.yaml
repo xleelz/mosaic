@@ -26,9 +26,17 @@ interfaces:
         source: "vllm/v1/worker/gpu_worker.py:507-515"
         call: parallel-state.init-distributed-environment
         input: {world_size: "= int(config['tensor-parallel-size'])", rank: "= input.rank", backend: nccl}
+      - title: "model_config.is_moe: get_num_experts() > 0 from the checkpoint's num_experts / moe_num_experts / n_routed_experts / num_local_experts, which initialize_model_parallel reads from the current config to build the EP group"
+        source: "vllm/config/model.py:2276-2277"
+        call: hf-hub.download-config
+        input: {model: "= config['model']"}
+        as: hf
+        on_error: continue
+      - set:
+          vars.is_moe: "= vars.hf.ok && ((has(vars.hf.value.num_local_experts) && vars.hf.value.num_local_experts > 0) || (has(vars.hf.value.num_experts) && vars.hf.value.num_experts > 0) || (has(vars.hf.value.n_routed_experts) && vars.hf.value.n_routed_experts > 0) || (has(vars.hf.value.moe_num_experts) && vars.hf.value.moe_num_experts > 0))"
       - source: "vllm/v1/worker/gpu_worker.py:1673-1678"
         call: parallel-state.ensure-model-parallel-initialized
-        input: {tensor_model_parallel_size: "= int(config['tensor-parallel-size'])", pipeline_model_parallel_size: 1}
+        input: {tensor_model_parallel_size: "= int(config['tensor-parallel-size'])", pipeline_model_parallel_size: 1, is_moe: "= vars.is_moe", enable_eplb: "= config['enable-eplb']"}
       - title: Snapshot free memory after NCCL init
         source: "vllm/v1/worker/gpu_worker.py:534"
         call: gpu-memory.snapshot
@@ -83,8 +91,8 @@ interfaces:
     request: {type: object}
     response: {type: integer, examples: [59745650279]}
     behavior:
-      - title: Bytes one KV block takes across all layers (page size * layers), for the block count
-        source: "vllm/v1/worker/gpu_worker.py:837-838"
+      - title: "Bytes one KV block takes across all layers (page size * layers), for the block count the engine core derives from this budget (synthetic: the Worker returns only the byte budget; the engine core divides it in get_kv_cache_configs)"
+        source: "vllm/v1/core/kv_cache_utils.py:1622-1628"
         call: gpu-model-runner.get-kv-cache-spec
         input: {}
         as: spec
@@ -100,6 +108,10 @@ interfaces:
               state.available_kv_cache_memory_bytes: "= int(config['kv-cache-memory-bytes'])"
               state.num_gpu_blocks: "= int(config['kv-cache-memory-bytes']) / state.bytes_per_block"
           - return: "= int(config['kv-cache-memory-bytes'])"
+      - title: "The profiling pass runs with the allocator's max_split_size_mb at 20, so workspace growth cannot pin a freed large segment"
+        source: "vllm/v1/worker/gpu_worker.py:681-691"
+        call: gpu-worker-impl.scoped-allocator-max-split
+        input: {max_split_size_mb: 20}
       - title: Profile a dummy forward of max_num_batched_tokens
         source: "vllm/v1/worker/gpu_worker.py:677-691"
         call: gpu-model-runner.profile-run
@@ -124,7 +136,7 @@ interfaces:
           - title: Free memory grew during profiling
             detail: "Another process sharing the GPU released memory while vLLM profiled (CUDA; ROCm falls back to torch reserved instead)."
             source: "vllm/v1/worker/gpu_worker.py:717-728"
-            fail: {code: assertion-error, status: 0, message: "Error in memory profiling. This happens when other processes sharing the same container release GPU memory while vLLM is profiling during initialization. To fix this, ensure consistent GPU memory allocation or isolate vLLM in its own container."}
+            fail: {code: assertion-error, status: 0, message: "= 'Error in memory profiling. Initial free memory ' + string(((state.init_free_memory * 100 + 536870912) / 1073741824) / 100) + '.' + (((state.init_free_memory * 100 + 536870912) / 1073741824) % 100 == 0 ? '0' : (((state.init_free_memory * 100 + 536870912) / 1073741824) % 10 == 0 ? string((((state.init_free_memory * 100 + 536870912) / 1073741824) % 100) / 10) : ((((state.init_free_memory * 100 + 536870912) / 1073741824) % 100) < 10 ? '0' : '') + string(((state.init_free_memory * 100 + 536870912) / 1073741824) % 100))) + ' GiB, current free memory ' + string(((vars.after.value.free_bytes * 100 + 536870912) / 1073741824) / 100) + '.' + (((vars.after.value.free_bytes * 100 + 536870912) / 1073741824) % 100 == 0 ? '0' : (((vars.after.value.free_bytes * 100 + 536870912) / 1073741824) % 10 == 0 ? string((((vars.after.value.free_bytes * 100 + 536870912) / 1073741824) % 100) / 10) : ((((vars.after.value.free_bytes * 100 + 536870912) / 1073741824) % 100) < 10 ? '0' : '') + string(((vars.after.value.free_bytes * 100 + 536870912) / 1073741824) % 100))) + ' GiB. This happens when other processes sharing the same container release GPU memory while vLLM is profiling during initialization. To fix this, ensure consistent GPU memory allocation or isolate vLLM in its own container.'"}
       - set:
           state.total_consumed: "= state.init_free_memory - vars.after.value.free_bytes"
           state.peak_activation_memory: "= vars.prof.value.peak_activation_bytes + vars.cg_applied"
@@ -263,11 +275,19 @@ interfaces:
             new_block_ids_to_zero: {type: array, items: {type: integer}}
             preempted_req_ids: {type: array, items: {type: string}}
             kv_connector_metadata: {type: ["object", "null"], default: null, description: "SchedulerOutput.kv_connector_metadata (with a KV transfer connector)"}
+            scheduled_encoder_inputs: {type: object, default: {}, description: "SchedulerOutput.scheduled_encoder_inputs: req_id -> indices of its mm_features to encode this step"}
+            free_encoder_mm_hashes: {type: array, default: [], items: {type: string}, description: "SchedulerOutput.free_encoder_mm_hashes"}
     response:
       anyOf:
         - {$ref: ModelRunnerOutput}
         - {type: "null"}
     behavior:
+      - if: "state.profiler_created"
+        then:
+          - title: "annotate_profile: the profiler steps once per execute_model (delayed start, max iterations)"
+            source: "vllm/v1/worker/gpu_worker.py:1180-1187"
+            call: worker-profiler.step
+            input: {}
       - title: Apply the multimodal receiver cache to new requests (WorkerWrapperBase)
         source: "vllm/v1/worker/worker_base.py:355-363"
         when: "size(input.scheduled_new_reqs) > 0 && input.scheduled_new_reqs.exists(r, has(r.mm_features) && size(r.mm_features) > 0)"
@@ -742,29 +762,61 @@ interfaces:
   - component: gpu-worker-impl
     name: profile
     kind: rpc
-    summary: "collective_rpc profile(is_start, prefix): RuntimeError unless profiler_config.profiler is set; start validates the prefix and creates the profiler once; stop without a start only warns."
-    sources: ["vllm/v1/worker/gpu_worker.py:1365-1421"]
+    summary: "collective_rpc profile(is_start, prefix, delay_iterations, max_iterations): RuntimeError unless profiler_config.profiler is set; start validates the prefix, names the trace <prefix>_dp<d>_pp<p>_tp<t>_dcp<c>_ep<e>_rank<r>, creates the WorkerProfiler on the first start and starts it with the session's bounds; stop without a profiler only warns."
+    sources: ["vllm/v1/worker/gpu_worker.py:1365-1421", "vllm/config/profiler.py:24-38", "vllm/distributed/utils.py:685-723"]
     latency_ms: 0
-    errors: [{code: runtime-error, status: 0, retryable: false}]
-    request: {type: object, properties: {is_start: {type: boolean, default: true}, profile_prefix: {type: string, examples: [bench]}}}
+    errors: [{code: runtime-error, status: 0, retryable: false}, {code: value-error, status: 0, retryable: false}]
+    request: {type: object, properties: {is_start: {type: boolean, default: true}, profile_prefix: {type: string, default: "", examples: [bench], description: "None (here empty) means no prefix"}, delay_iterations: {type: ["integer", "null"], default: null}, max_iterations: {type: ["integer", "null"], default: null}}}
     response: {type: object, properties: {running: {type: boolean}, trace_name: {type: string}}}
     behavior:
       - if: "!('profiler' in config) || config['profiler'] == ''"
         then:
           - title: Profiling is not enabled
             source: "vllm/v1/worker/gpu_worker.py:1374-1380"
-            fail: {code: runtime-error, status: 0, message: "Profiling is not enabled. Please set --profiler-config to enable profiling."}
+            fail: {code: runtime-error, status: 0, message: "Profiling is not enabled. Please set --profiler-config to enable profiling. Example: '--profiler-config.profiler=torch --profiler-config.torch_profiler_dir=YOUR_DIR_PATH_TO_DUMP_TRACE'"}
+      - set:
+          vars.prefix: "= has(input.profile_prefix) && input.profile_prefix != null && input.profile_prefix != '' ? input.profile_prefix : null"
+          vars.r: "= self == '' ? 0 : int(self.substring(4))"
       - if: "input.is_start"
         then:
-          - set: {vars.name: "= (has(input.profile_prefix) && input.profile_prefix != '' ? input.profile_prefix + '_' : '') + 'dp0_pp0_tp0'"}
-          - set: {state.profiler_running: true, state.trace_name: "= vars.name"}
-          - return: {running: true, trace_name: "= vars.name"}
-      - if: "!state.profiler_running"
+          - if: "vars.prefix != null && (size(vars.prefix) < 1 || size(vars.prefix) > 128 || !vars.prefix.matches('^[A-Za-z0-9][A-Za-z0-9._-]*$'))"
+            then:
+              - title: Invalid trace prefix
+                source: "vllm/config/profiler.py:28-37"
+                fail: {code: value-error, status: 0, message: "profile_prefix must be 1-128 ASCII characters, start with a letter or number, and contain only letters, numbers, '.', '_', or '-'"}
+          - title: "The rank suffix names every parallel dimension, then the global rank"
+            source: "vllm/distributed/utils.py:708-718"
+            set:
+              vars.suffix: "= 'dp0_pp' + string(vars.r / int(config['tensor-parallel-size'])) + '_tp' + string(vars.r % int(config['tensor-parallel-size'])) + '_dcp' + string(vars.r % int(config['decode-context-parallel-size'])) + '_ep' + string(vars.r % int(config['tensor-parallel-size'])) + '_rank' + string(vars.r)"
+          - source: "vllm/v1/worker/gpu_worker.py:1390-1394"
+            set: {vars.name: "= vars.prefix != null && vars.prefix != '' ? vars.prefix + '_' + vars.suffix : vars.suffix"}
+          - if: "!state.profiler_created"
+            then:
+              - title: The profiler wrapper is created on the first start only
+                source: "vllm/v1/worker/gpu_worker.py:1396-1401"
+                call: worker-profiler.create
+                input: {worker_name: "= vars.name"}
+              - set: {state.profiler_created: true}
+          - source: "vllm/v1/worker/gpu_worker.py:1403-1407"
+            call: worker-profiler.start
+            input: {delay_iterations: "= has(input.delay_iterations) ? input.delay_iterations : null", max_iterations: "= has(input.max_iterations) ? input.max_iterations : null"}
+            as: st
+          - set: {state.profiler_running: "= vars.st.value.running", state.trace_name: "= vars.name"}
+          - return: {running: "= vars.st.value.running", trace_name: "= vars.name"}
+      - if: "!state.profiler_created"
         then:
-          - title: Stop without a start only warns
-            source: "vllm/v1/worker/gpu_worker.py:1410-1412"
+          - title: "Profiler was not started, nothing to stop (warning)"
+            source: "vllm/v1/worker/gpu_worker.py:1409-1411"
             return: {running: false, trace_name: ""}
+      - source: "vllm/v1/worker/gpu_worker.py:1412-1413"
+        call: worker-profiler.stop
+        input: {}
       - set: {state.profiler_running: false}
+      - if: "config['profiler'] == 'proton'"
+        then:
+          - title: "Proton fixes its output name at construction, so the wrapper is recreated on the next start"
+            source: "vllm/v1/worker/gpu_worker.py:1414-1421"
+            set: {state.profiler_created: false}
       - return: {running: false, trace_name: "= state.trace_name"}
   - component: gpu-worker-impl
     name: check-health

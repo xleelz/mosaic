@@ -1,0 +1,146 @@
+# Oracle4 (blind) scenarios for the kernels-ops area.
+# test_replayssm_standard_decode_matches_reference has no scenario: it asserts only tensor numerics,
+# and the model has no ReplaySSM entity (see kernels-ops.md).
+schema_version: 1
+id: vllm
+scenarios:
+- id: oracle-kernels-ops-case-key-construction-with-dict
+  name: A CaseKey built from {intermediate 2048, numtokens 256} reads back both values
+  description: >-
+    tests/kernels/helion/test_case_key.py::TestCaseKey::test_construction_with_dict (line 19).
+    The model has CaseKey only inside the Helion config pick (vllm/kernels/helion/case_key.py:48,
+    vllm/kernels/helion/ops/silu_mul_fp8.py:87), so the key is built by registering silu_mul_fp8 on an
+    H100 and calling it with exactly the tuned shape (intermediate 2048, 256 tokens); the selected
+    CaseKey must carry intermediate == 2048 and numtokens == 256, with the sorted compact JSON form.
+  fixtures: [full-tp1-llama-8b]
+  steps:
+  - {flow: kernels-ops-helion-kernel, as: reg}
+  - flow: kernels-ops-helion-call
+    input: {op_name: silu_mul_fp8, intermediate_size: 2048, num_tokens: 256}
+    as: key
+  expect:
+  - "steps.reg.result.ok && steps.key.result.ok"
+  - "steps.key.result.value.intermediate == 2048"
+  - "steps.key.result.value.numtokens == 256"
+  - "steps.key.result.value.case_key == '{\"intermediate\":2048,\"numtokens\":256}'"
+  - "'silu_mul_fp8' in state['helion-kernel-wrapper@rank0'].registered && !state['helion-kernel-wrapper@rank0'].registered.silu_mul_fp8.disabled"
+
+- id: oracle-kernels-ops-nvfp4-gemm
+  name: 'nvfp4 GEMM: quantize A and B to FP4, then cutlass_scaled_fp4_mm (control path only)'
+  description: >-
+    tests/kernels/quantization/test_nvfp4_scaled_mm.py::test_nvfp4_gemm (line 57), shape (128, 128, 64)
+    with k = 2 * packed_k = 128. The test's only assertion is torch.testing.assert_close against a
+    dequantized matmul, which is below the model; this scenario only checks that the op chain
+    (ops.scaled_fp4_quant twice, then ops.cutlass_scaled_fp4_mm) reaches the _C kernels.
+  fixtures: [full-tp1-llama-8b]
+  steps:
+  - interface: custom-ops.scaled-fp4-quant
+    caller: gpu-worker
+    input: {num_tokens: 128, hidden_size: 128, dtype_bytes: 2}
+    as: qa
+  - interface: custom-ops.scaled-fp4-quant
+    caller: gpu-worker
+    input: {num_tokens: 128, hidden_size: 128, dtype_bytes: 2}
+    as: qb
+  - interface: custom-ops.cutlass-scaled-fp4-mm
+    caller: gpu-worker
+    input: {m: 128, n: 128, k: 128, dtype_bytes: 1}
+    as: mm
+  expect:
+  - "steps.qa.result.ok && steps.qb.result.ok && steps.mm.result.ok"
+  - "calls['torch-bindings.scaled-fp4-quant'] == 2 && calls['torch-bindings.cutlass-scaled-fp4-mm'] == 1"
+
+- id: oracle-kernels-ops-dynamic-scaled-int8-quant
+  name: 'scaled_int8_quant(x) with no scale: dynamic per-token, symmetric, no azp, on _C::dynamic_scaled_int8_quant (control path only)'
+  description: >-
+    tests/kernels/quantization/test_int8_quant.py::test_dynamic_scaled_int8_quant (line 46), with
+    num_tokens 7, hidden 1025, bf16. The test asserts scale and output numerics against
+    ref_dynamic_per_token_quant (below the model) and opchecks the op; this scenario checks the
+    dispatch it relies on (vllm/_custom_ops.py:1940-1949): no scale -> dynamic per-token,
+    symmetric -> azp None, CUDA -> torch.ops._C.dynamic_scaled_int8_quant, static op untouched.
+  fixtures: [full-tp1-llama-8b]
+  steps:
+  - interface: custom-ops.scaled-int8-quant
+    caller: gpu-worker
+    input: {num_tokens: 7, hidden_size: 1025, dtype_bytes: 2, has_scale: false, has_azp: false, symmetric: true}
+    as: q
+  - interface: custom-ops.scaled-int8-quant
+    caller: gpu-worker
+    input: {num_tokens: 4096, hidden_size: 8193, dtype_bytes: 4, has_scale: false, has_azp: false, symmetric: true}
+    as: qf
+  expect:
+  - "steps.q.result.ok && steps.q.result.value.kernel == 'dynamic_scaled_int8_quant' && !steps.q.result.value.has_azp"
+  - "steps.qf.result.ok && steps.qf.result.value.kernel == 'dynamic_scaled_int8_quant' && !steps.qf.result.value.has_azp"
+  - "calls['torch-bindings.dynamic-scaled-int8-quant'] == 2 && calls['torch-bindings.static-scaled-int8-quant'] == 0"
+
+- id: oracle-kernels-ops-ignore-torch-compile-decorator
+  name: '@ignore_torch_compile on B(A) stops B compiling; @support_torch_compile on C(B) compiles again'
+  description: >-
+    tests/compile/test_decorator.py::test_ignore_torch_compile_decorator (line 71), the
+    use_inductor_graph_partition=False case. VLLM_COMPILE, VLLM_DISABLE_COMPILE_CACHE=1 (and JIT, the
+    VLLM_USE_AOT_COMPILE default). A is @support_torch_compile, B(A) is @ignore_torch_compile, C(B) is
+    @support_torch_compile; each is built and run in turn. The test expects A to compile once
+    (num_graphs_seen 1), B to compile nothing (all counters 0, plain forward: decorators.py:528), and
+    C to compile again (num_graphs_seen 1), because _support_torch_compile resets IGNORE_COMPILE_KEY
+    to False on C (decorators.py:363) and each new module starts with compiled = False
+    (decorators.py:415).
+  fixtures: [full-tp1-llama-8b]
+  config:
+    compilation-mode: 3
+    vllm-disable-compile-cache: true
+    vllm-use-aot-compile: false
+  steps:
+  - interface: support-torch-compile.decorate
+    caller: gpu-worker
+    input: {cls: A, forward_params: [{name: x, annotation: torch.Tensor}]}
+    as: decA
+  - interface: support-torch-compile.init
+    caller: gpu-worker
+    input: {cls: A, enable_if: true}
+    as: initA
+  - interface: compilation-counter.clone
+    caller: gpu-worker
+    as: c0
+  - flow: kernels-ops-support-torch-compile
+    input: {num_layers: 1, num_tokens: 32, runtime_mode: NONE}
+    as: runA
+  - interface: compilation-counter.clone
+    caller: gpu-worker
+    as: c1
+  - interface: support-torch-compile.ignore-torch-compile
+    caller: gpu-worker
+    input: {cls: B}
+    as: ignB
+  - interface: support-torch-compile.init
+    caller: gpu-worker
+    input: {cls: B, enable_if: true}
+    as: initB
+  - flow: kernels-ops-support-torch-compile
+    input: {num_layers: 1, num_tokens: 32, runtime_mode: NONE}
+    as: runB
+  - interface: compilation-counter.clone
+    caller: gpu-worker
+    as: c2
+  - interface: support-torch-compile.decorate
+    caller: gpu-worker
+    input: {cls: C, forward_params: [{name: x, annotation: torch.Tensor}]}
+    as: decC
+  - interface: support-torch-compile.init
+    caller: gpu-worker
+    input: {cls: C, enable_if: true}
+    as: initC
+  - flow: kernels-ops-support-torch-compile
+    input: {num_layers: 1, num_tokens: 32, runtime_mode: NONE}
+    as: runC
+  - interface: compilation-counter.clone
+    caller: gpu-worker
+    as: c3
+  expect:
+  - "!steps.initA.result.value.do_not_compile && steps.initB.result.value.do_not_compile && !steps.initC.result.value.do_not_compile"
+  - "steps.runA.result.ok && steps.runA.result.value.path == 'jit-compiled'"
+  - "steps.c1.result.value.counters.num_graphs_seen - steps.c0.result.value.counters.num_graphs_seen == 1"
+  - "steps.runB.result.ok && steps.runB.result.value.path == 'eager'"
+  - "steps.c2.result.value.counters.num_graphs_seen == steps.c1.result.value.counters.num_graphs_seen && steps.c2.result.value.counters.num_backend_compilations == steps.c1.result.value.counters.num_backend_compilations"
+  - "steps.runC.result.ok && steps.runC.result.value.path == 'jit-compiled'"
+  - "steps.c3.result.value.counters.num_graphs_seen - steps.c2.result.value.counters.num_graphs_seen == 1"
+  - "state['support-torch-compile@rank0'].ignored['B'] && state['support-torch-compile@rank0'].num_compiles == 2"

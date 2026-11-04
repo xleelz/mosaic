@@ -28,6 +28,11 @@ fixtures:
           meta-llama/Llama-3.1-70B-Instruct: {architectures: [LlamaForCausalLM], num_hidden_layers: 80, num_attention_heads: 64, num_key_value_heads: 8, hidden_size: 8192, intermediate_size: 28672, vocab_size: 128256, max_position_embeddings: 131072, rope_theta: 500000.0, rope_scaling: {rope_type: llama3, factor: 8.0, low_freq_factor: 1.0, high_freq_factor: 4.0, original_max_position_embeddings: 8192}, torch_dtype: bfloat16, weights_bytes: 141107412992}
           mistralai/Mixtral-8x7B-Instruct-v0.1: {architectures: [MixtralForCausalLM], num_hidden_layers: 32, num_attention_heads: 32, num_key_value_heads: 8, hidden_size: 4096, intermediate_size: 14336, num_local_experts: 8, num_experts_per_tok: 2, vocab_size: 32000, max_position_embeddings: 32768, rope_theta: 1000000.0, torch_dtype: bfloat16, weights_bytes: 93405585408}
           RedHatAI/Meta-Llama-3.1-8B-Instruct-FP8: {architectures: [LlamaForCausalLM], num_hidden_layers: 32, num_attention_heads: 32, num_key_value_heads: 8, hidden_size: 4096, intermediate_size: 14336, vocab_size: 128256, max_position_embeddings: 131072, rope_theta: 500000.0, torch_dtype: bfloat16, quantization_config: {quant_method: fp8, activation_scheme: dynamic, weight_block_size: [128, 128]}, weights_bytes: 9081843712}
+        # generation_config.json of the checkpoints (ModelConfig.get_diff_sampling_param, vllm/config/model.py:1847-1901;
+        # vllm/transformers_utils/config.py try_get_generation_config): Llama-3.1 Instruct ships temperature 0.6, top_p 0.9.
+        generation_configs:
+          meta-llama/Llama-3.1-8B-Instruct: {bos_token_id: 128000, eos_token_id: [128001, 128008, 128009], do_sample: true, temperature: 0.6, top_p: 0.9}
+          meta-llama/Llama-3.1-70B-Instruct: {bos_token_id: 128000, eos_token_id: [128001, 128008, 128009], do_sample: true, temperature: 0.6, top_p: 0.9}
   - id: lora-adapter-on-disk
     summary: "tp1-llama-8b plus a rank-16 LoRA adapter for Llama-3.1-8B at /models/lora/sql-adapter."
     extends: [tp1-llama-8b]
@@ -55,3 +60,133 @@ fixtures:
     summary: "tp1-llama-8b with --no-enable-prefix-caching."
     extends: [tp1-llama-8b]
     config: {enable-prefix-caching: false}
+  # ---- model-type worlds (round 5): MoE, vision-language, FP8 checkpoint ----
+  # Code: vllm/config/model.py:2276-2277, vllm/transformers_utils/model_arch_config_convertor.py:189-198, vllm/config/parallel.py:189, vllm/model_executor/layers/fused_moe/config.py:1189-1235
+  - id: moe-mixtral-8x7b-tp2-ep
+    summary: "Two NVIDIA H100 80GB HBM3 (rank0, rank1) serving mistralai/Mixtral-8x7B-Instruct-v0.1 as mixtral-8x7b through `vllm serve --tensor-parallel-size 2 --enable-expert-parallel`: an MoE checkpoint (num_local_experts 8, num_experts_per_tok 2), so ModelConfig.is_moe is true (get_num_experts() > 0) and FusedMoEParallelConfig gives each rank 4 whole experts (use_ep, ep_size = TP x DP = 2, MoE tp_size 1). max_model_len derives from the checkpoint (32768)."
+    extends: [tp1-llama-8b]
+    topology: {gpu-worker: [rank0, rank1]}
+    config:
+      model: mistralai/Mixtral-8x7B-Instruct-v0.1
+      served-model-name: [mixtral-8x7b]
+      tensor-parallel-size: 2
+      enable-expert-parallel: true
+      max-model-len: 32768
+    state:
+      platforms: {host: {nvml_gpu_count: 2, device_count: 2}}
+      "gpu-memory@rank1": {total_bytes: 85899345920, weights_bytes: 0, kv_cache_bytes: 0, peak_activation_bytes: 0, non_torch_bytes: 1073741824, other_process_bytes: 0, cudagraph_bytes: 0, device_name: "NVIDIA H100 80GB HBM3", compute_capability: "9.0"}
+      # Mixtral-8x7B-Instruct-v0.1's generation_config.json has no sampling keys (get_diff_sampling_param gives {})
+      hf-hub:
+        generation_configs:
+          mistralai/Mixtral-8x7B-Instruct-v0.1: {bos_token_id: 1, eos_token_id: 2}
+      gpu-model-runner:
+        model: {name: mistralai/Mixtral-8x7B-Instruct-v0.1, architecture: MixtralForCausalLM, num_hidden_layers: 32, num_kv_heads: 8, num_attention_heads: 32, head_size: 128, dtype_bytes: 2, torch_dtype: bfloat16, vocab_size: 32000, hidden_size: 4096, max_position_embeddings: 32768, weights_bytes: 93405585408, eos_token_id: 2, is_hybrid: false, uses_mrope: false, uses_prompt_embeds: false}
+        max_model_len: 32768
+  # Code: vllm/config/model.py:817-868, vllm/config/model.py:1981-1982, vllm/config/multimodal.py:307, vllm/config/multimodal.py:695-708, vllm/config/multimodal.py:357, vllm/config/multimodal.py:369, vllm/config/scheduler.py:303-304, vllm/v1/core/encoder_cache_manager.py:356-361, vllm/assets/image.py:42-48
+  - id: vl-qwen2-vl-7b
+    summary: "One NVIDIA H100 80GB HBM3 (rank0) serving Qwen/Qwen2-VL-7B-Instruct as qwen2-vl-7b through `vllm serve` with no multimodal overrides: the checkpoint has a vision_config, so ModelConfig builds a MultiModalConfig (is_multimodal_model) with limit_mm_per_prompt {} (999 items per modality), the lru processor cache at 4 GiB, and the encoder budget defaulting to max_num_batched_tokens (raised to the largest item). M-RoPE positions (mrope_section 16/24/24). The vLLM stop_sign.jpg test image sits in the public-assets bucket; scenarios send it as a data: URL image_url part."
+    extends: [tp1-llama-8b]
+    config:
+      model: Qwen/Qwen2-VL-7B-Instruct
+      served-model-name: [qwen2-vl-7b]
+      max-model-len: 32768
+      model-is-multimodal: true
+      limit-mm-per-prompt: {}
+      mm-processor-cache-gb: 4
+      mm-processor-cache-type: lru
+    state:
+      hf-hub:
+        models:
+          Qwen/Qwen2-VL-7B-Instruct: {architectures: [Qwen2VLForConditionalGeneration], model_type: qwen2_vl, num_hidden_layers: 28, num_attention_heads: 28, num_key_value_heads: 4, hidden_size: 3584, intermediate_size: 18944, vocab_size: 152064, max_position_embeddings: 32768, rope_theta: 1000000.0, rope_scaling: {type: mrope, mrope_section: [16, 24, 24]}, image_token_id: 151655, video_token_id: 151656, vision_start_token_id: 151652, vision_end_token_id: 151653, eos_token_id: 151645, vision_config: {depth: 32, embed_dim: 1280, hidden_size: 3584, num_heads: 16, in_chans: 3, mlp_ratio: 4, patch_size: 14, spatial_merge_size: 2, temporal_patch_size: 2}, torch_dtype: bfloat16, weights_bytes: 16582751232}
+      gpu-model-runner:
+        model: {name: Qwen/Qwen2-VL-7B-Instruct, architecture: Qwen2VLForConditionalGeneration, num_hidden_layers: 28, num_kv_heads: 4, num_attention_heads: 28, head_size: 128, dtype_bytes: 2, torch_dtype: bfloat16, vocab_size: 152064, hidden_size: 3584, max_position_embeddings: 32768, weights_bytes: 16582751232, eos_token_id: 151645, is_hybrid: false, uses_mrope: true, uses_prompt_embeds: false}
+        max_model_len: 32768
+      vllm-public-assets-s3:
+        objects:
+          vision_model_images/stop_sign.jpg: {size: 59248, content_type: image/jpeg}
+  # Code: vllm/config/model.py:1370-1443, vllm/model_executor/layers/quantization/fp8.py:158-175, vllm/config/cache.py:122, vllm/utils/torch_utils.py:457-475, vllm/utils/torch_utils.py:512-530
+  - id: fp8-llama-3-8b
+    summary: "One NVIDIA H100 80GB HBM3 (rank0) serving the FP8 checkpoint neuralmagic/Meta-Llama-3-8B-Instruct-FP8-KV (the model vLLM's FP8 tests load) as llama-3-8b-fp8 through `vllm serve` with no --quantization and the default --kv-cache-dtype auto: ModelConfig._verify_quantization takes quant_method fp8 from the checkpoint's quantization_config (Fp8Config: is_checkpoint_fp8_serialized, static activation scales, lm_head unquantized), and auto keeps the KV cache in the model dtype (bfloat16), since only ModelOpt configs name a KV algorithm. max_model_len derives from the checkpoint (8192)."
+    extends: [tp1-llama-8b]
+    config:
+      model: neuralmagic/Meta-Llama-3-8B-Instruct-FP8-KV
+      served-model-name: [llama-3-8b-fp8]
+      max-model-len: 8192
+      quantization: null
+      kv-cache-dtype: auto
+    state:
+      hf-hub:
+        models:
+          neuralmagic/Meta-Llama-3-8B-Instruct-FP8-KV: {architectures: [LlamaForCausalLM], model_type: llama, num_hidden_layers: 32, num_attention_heads: 32, num_key_value_heads: 8, hidden_size: 4096, intermediate_size: 14336, vocab_size: 128256, max_position_embeddings: 8192, rope_theta: 500000.0, eos_token_id: 128009, torch_dtype: bfloat16, quantization_config: {quant_method: fp8, activation_scheme: static, kv_cache_scheme: static, ignored_layers: [lm_head]}, weights_bytes: 9081200640}
+        generation_configs:
+          neuralmagic/Meta-Llama-3-8B-Instruct-FP8-KV: {bos_token_id: 128000, eos_token_id: [128001, 128009], do_sample: true, temperature: 0.6, top_p: 0.9, max_length: 4096}
+      gpu-model-runner:
+        model: {name: neuralmagic/Meta-Llama-3-8B-Instruct-FP8-KV, architecture: LlamaForCausalLM, num_hidden_layers: 32, num_kv_heads: 8, num_attention_heads: 32, head_size: 128, dtype_bytes: 2, torch_dtype: bfloat16, vocab_size: 128256, hidden_size: 4096, max_position_embeddings: 8192, weights_bytes: 9081200640, eos_token_id: 128009, is_hybrid: false, uses_mrope: false, uses_prompt_embeds: false}
+        max_model_len: 8192
+  # Code: vllm/config/cache.py:122-126, vllm/utils/torch_utils.py:518-519
+  - id: fp8-llama-3-8b-kv-fp8
+    summary: "fp8-llama-3-8b with --kv-cache-dtype fp8: the KV cache is stored as fp8_e4m3 (1 byte per element), using the checkpoint's k/v scales."
+    extends: [fp8-llama-3-8b]
+    config: {kv-cache-dtype: fp8}
+
+scenarios:
+  - id: fixture-smoke-moe-mixtral-8x7b-tp2-ep
+    name: "The MoE world loads: vllm serve resolves an MoE TP 2 + EP config, rank0 loads Mixtral with 4 local experts, and a chat request is served"
+    fixtures: [full-moe-mixtral-8x7b-tp2-ep]
+    # config-platform-seed (merged after this world) describes a one-GPU host; until config-platform
+    # adds a variant_of for this world (reconcile/round5/worlds.md), the scenario restores two GPUs.
+    state: {platforms: {host: {nvml_gpu_count: 2, device_count: 2}}}
+    steps:
+      - {flow: config-create-engine-config, as: cfg, input: {model: "= config['model']"}}
+      - {flow: wr-load-model, as: load}
+      - {flow: serving-api-chat-completion, as: chat, input: {body: {model: mixtral-8x7b, max_tokens: 4}}}
+    expect:
+      - "steps.cfg.result.ok && steps.cfg.result.value.model_config.is_moe && steps.cfg.result.value.model_config.max_model_len == 32768"
+      - "steps.cfg.result.value.parallel_config.world_size == 2 && steps.cfg.result.value.parallel_config.enable_expert_parallel"
+      - "steps.load.result.ok && state['mixtral-for-causal-lm@rank0'].cfg.num_experts == 8 && state['mixtral-for-causal-lm@rank0'].cfg.top_k == 2 && state['mixtral-for-causal-lm@rank0'].cfg.ep_size == 2 && state['gpu-memory@rank0'].weights_bytes == 46702792704"
+      - "steps.chat.result.ok && steps.chat.result.value.model == 'mixtral-8x7b'"
+  - id: fixture-smoke-vl-qwen2-vl-7b
+    name: "The vision-language world loads: vllm serve builds a MultiModalConfig for Qwen2-VL, rank0 loads it, and a chat request with an image part reaches the engine"
+    fixtures: [full-vl-qwen2-vl-7b]
+    steps:
+      - {flow: config-create-engine-config, as: cfg, input: {model: "= config['model']"}}
+      - {flow: wr-load-model, as: load}
+      - flow: serving-api-chat-completion
+        as: chat
+        input:
+          body:
+            model: qwen2-vl-7b
+            max_tokens: 4
+            messages:
+              - role: user
+                content:
+                  - {type: image_url, image_url: {url: "data:image/jpeg;base64,/9j/4AAQ"}}
+                  - {type: text, text: "What is in this image?"}
+    expect:
+      - "steps.cfg.result.ok && steps.cfg.result.value.model_config.multimodal_config != null && steps.cfg.result.value.model_config.max_model_len == 32768"
+      - "steps.load.result.ok && state['gpu-memory@rank0'].weights_bytes == 16582751232"
+      - "steps.chat.result.ok && steps.chat.result.value.model == 'qwen2-vl-7b'"
+      - "trace.exists(e, e.type == 'call.start' && e.interface == 'async-llm.generate' && has(e.input.multi_modal_data))"
+  - id: fixture-smoke-fp8-llama-3-8b
+    name: "The FP8 world loads: the checkpoint's quant_method fp8 becomes ModelConfig.quantization, rank0 loads it, and a chat request is served"
+    fixtures: [full-fp8-llama-3-8b]
+    steps:
+      - {flow: config-create-engine-config, as: cfg, input: {model: "= config['model']"}}
+      - {flow: wr-load-model, as: load}
+      - {flow: serving-api-chat-completion, as: chat, input: {body: {model: llama-3-8b-fp8, max_tokens: 4}}}
+    expect:
+      - "steps.cfg.result.ok && steps.cfg.result.value.model_config.quantization == 'fp8' && steps.cfg.result.value.model_config.max_model_len == 8192"
+      - "config['kv-cache-dtype'] == 'auto'"
+      - "steps.load.result.ok && state['llama-for-causal-lm@rank0'].quant == 'fp8' && state['gpu-memory@rank0'].weights_bytes == 9081200640"
+      - "steps.chat.result.ok && steps.chat.result.value.model == 'llama-3-8b-fp8'"
+  - id: fixture-smoke-fp8-llama-3-8b-kv-fp8
+    name: "The FP8 world with --kv-cache-dtype fp8 loads and serves a chat request"
+    fixtures: [full-fp8-llama-3-8b-kv-fp8]
+    steps:
+      - {flow: config-create-engine-config, as: cfg, input: {model: "= config['model']"}}
+      - {flow: serving-api-chat-completion, as: chat, input: {body: {model: llama-3-8b-fp8, max_tokens: 4}}}
+    expect:
+      - "steps.cfg.result.ok && steps.cfg.result.value.model_config.quantization == 'fp8'"
+      - "config['kv-cache-dtype'] == 'fp8'"
+      - "steps.chat.result.ok && steps.chat.result.value.model == 'llama-3-8b-fp8'"
+      - "trace.exists(e, e.type == 'call.end' && e.interface == 'openai-serving-chat.post-v1-chat-completions')"

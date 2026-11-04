@@ -263,3 +263,93 @@ The top 25 rows of both reports are modeled or declined:
 - The pooler's sigmoid and softmax values are not computed; only the choice of activation is.
 - Null values in a scenario's step input are dropped, so `AudioSpec(target_channels=None)` is the `passthrough` flag.
 - 22 fail/if branches stay unexecuted (behavior coverage 97.5%). Most are guards for impossible types and platform paths.
+
+## Fix round 5 (precision)
+
+Generator: new `gen/models-layers/core-r5.yaml` and `scenarios_r5.py` (configs, world variants, flows,
+scenarios, and `patch()` adding optional fields to the shared schemas); fixes edited in `core-moe`,
+`core-layers`, `core-loader`, `core-lora`, `core-mm`. `build.py` registers `Qwen2VLForConditionalGeneration`
+as a modeled class and skips schema-ref requests in `with_defaults`.
+
+**Round-4 claims fixed**
+- judge3 P3-3(a) / wrong claim 6: `mixtral-for-causal-lm.init` now calls `fused-moe-parallel-config.make`
+  (`fused_moe/config.py:1096-1236`): TP is flattened across DP x PCP, EP gives ep_size = dp x pcp x tp and
+  MoE tp 1, no EP gives MoE tp = dp x pcp x tp. `bench-p3-3a` and `-no-ep` pass.
+- judge3 wrong claim 10 / P3-7(c): `attention-layer.init-kv-cache-quant` (set_default_quant_scales at 1.0;
+  `attention.py:157-226`) is called by every model's init, and `process-weights-after-loading` runs
+  `base-kv-cache-method.process-weights-after-loading` (`kv_cache.py:77-170`) when the checkpoint gives
+  attention a KV method. `bench-p3-7c` passes.
+- judge3 P3-7(d): fp8_e5m2 with an Fp8/ModelOpt/CT-with-scheme KV method fails with the code's message
+  while the model is built. The as-written scenario uses a bf16 checkpoint, where the code succeeds
+  (measure-notes).
+- `get-quant-config`: `--quantization fp8` without a checkpoint config is online `fp8_per_tensor` (was
+  "Cannot find the config file for fp8"); the online-args composition and its AssertionError.
+- oracle3: `fused-moe-layer.determine-expert-counts`; MoE LoRA format validation (worker load and manager
+  add, state `is_moe`/`modules`, config `enable-mixed-moe-lora-format`, request `is_3d_lora_weight`);
+  `turbo-quant-config.from-cache-dtype`; `trtllm-mxint4-experts.is-supported-config`.
+- judge3 S3-4(d) support: `multi-modal-registry.create-processor` takes `served_model_name` and
+  `is_multimodal_model` and checks multimodality first (`registry.py:157-159`).
+- judge3 S3-4(a) (coordinator relay): `base-processing-info.validate-num-items` now treats a `None`
+  supported limit as the allowed limit, so the `--limit-mm-per-prompt` hint appears only when
+  num_items <= that limit (Qwen2-VL with limit 1: no hint), and the error carries `data.param` = modality
+  (`context.py:608-626`). The round-3 `models-multimodal-limits` expectation was wrong and is corrected.
+
+**Error-path sweep.** Bare Python asserts carry an empty message: the Llama/Mixtral/Qwen2 head checks
+and the EPLB local-expert check now fail `assertion-error` with `""` (they quoted the source). Checked
+word for word: fp8 config errors, get_quant_config, create_processor, validate_num_items, LoRA
+modules_to_save and MoE format, media URL errors, TurboQuant, the multimodal merge count.
+
+**New worlds**
+- Variants (`attributes.variant_of`): `models-layers-moe-mixtral-8x7b-tp2-ep` (Mixtral loaded on rank0/1
+  with ep 2, 4 local experts; LoRA manager `is_moe` with a 2D experts wrapper), `models-layers-vl-qwen2-vl-7b`
+  (Qwen2-VL loaded), `models-layers-fp8-llama-3-8b` and `-kv-fp8` (the FP8 checkpoint loaded, Fp8KVCacheMethod).
+  Each sets `llama-for-causal-lm.loaded: false`. worlds.yaml must be regenerated to pick them up; my
+  scenarios list the variant explicitly meanwhile.
+- Qwen2-VL: `qwen2-vl-for-conditional-generation` (init, load-weights with the hf_to_vllm mapper,
+  embed-multimodal, embed-input-ids with the merge-count ValueError, get-mrope-input-positions,
+  get-placeholder-str, forward, compute-logits), `qwen2-vision-transformer` (init, forward roofline),
+  `qwen2-model.forward` (inputs_embeds path; the Llama layer stack with M-RoPE: `llama-attention.forward`
+  takes `m-rotary-embedding` when cfg has `mrope_section`), `qwen2-vl-processing-info`
+  (get-num-image-tokens via smart_resize, get-supported-mm-limits).
+- `model-is-multimodal` is defined here (config); `create-processor` derives it from the registry table
+  when not passed.
+- Remote images: `media-connector.fetch-image` (data/http/file URLs, allowed domains, 4xx -> 422), with
+  `vllm-public-assets-s3.get-object` for the public bucket and a `remote-media-host` external for others.
+
+**Seam for worker-runner (forward dispatch).** Call `= <component> + '.forward'` / `'.compute-logits'`
+with targets `llama-for-causal-lm`, `mixtral-for-causal-lm`, `qwen2-vl-for-conditional-generation`;
+the component is `base-model-loader.load-model`'s `component`, or `model-registry.resolve-model-cls
+{architectures: [state.model.architecture]}`'s `component` when the model is seeded. For Qwen2-VL:
+`embed-multimodal {mm_kwargs: [{modality, kind, grid_thw}]}` for scheduled encoder inputs,
+`embed-input-ids {num_tokens, mm_embeds, num_placeholders}`, then `forward` with `inputs_embeds: true`;
+`get-mrope-input-positions` when a request is added (uses_mrope). TP worlds must load on every rank
+(wr-load-model loads rank0 only; the Mixtral smoke's rank1 forward fails without the variant).
+
+**Breaking changes**
+- `validate-num-items`: message (no hint when supported is None) and `data.param`. Callers: serving-api's
+  renderer (which asked for it), `base-processing-info.parse-mm-data`.
+- `create-processor`: check order and served name in the message. Callers: serving-api renderer, my flow.
+- Head-divisibility assertion messages are now empty. Callers: none assert on them outside this area.
+- `mixtral-for-causal-lm.init`: ep_size/moe_tp now include DP and PCP. Callers: model-loader, judge3.
+- Loading with `quantization: fp8` on a bf16 checkpoint now succeeds (fp8_per_tensor). Callers: none.
+- `models-layers-*` variants unload Llama in the MoE/VL worlds: any flow that still forwards Llama there
+  (worker-runner's Qwen2-VL dispatch) fails until it dispatches by architecture.
+
+**Open**
+- worker-runner: dispatch for Qwen2-VL (the VL smoke with my variant forwards Llama and fails);
+  `embed-multimodal` / mrope calls; `get-supported-tasks` (terratorch).
+- coordinator: regenerate worlds.yaml so the four variants join the full worlds.
+- attention: TurboQuant `customize_spec` should use `turbo-quant-config.from-cache-dtype`'s
+  `slot_size_aligned`.
+- serving-api: call `media-connector.fetch-image` for http image_url parts, and pass
+  `served_model_name` to `create-processor`.
+- Python `round()` (banker's) vs CEL `math.round` in smart_resize at exact halves; video token counts
+  and the ViT data-parallel mode are not modeled.
+- kernels-ops round-5 needs (coordinator relay): `flashinfer-ssu-backend.init` (the ImportError,
+  `ssu_dispatch.py:336-347`) and `routed-experts.get-hidden-dim` / `narrow-expert-data-for-padding`
+  (`routed_experts.py:455-521`); scenarios `models-flashinfer-ssu-import-error`, `models-routed-experts-padding-narrow`.
+- Gate: the staged check passes and is accepted (citations 9085/9085). In the full gate, models-layers is
+  clean (hollow 0 unchecked, internal assertions 11.3%, unknown inputs 0, racy 0). The remaining failures
+  belong to other areas: the Mixtral smoke (needs my variant in worlds.yaml), worker-runner's
+  `wr-admin-rpcs-multimodal-and-kv-transfer` and a bad citation, worker-runner's and the fixtures' hollow
+  and internal-assertion shares, engine-core's racy count, and serving-api's seam names.

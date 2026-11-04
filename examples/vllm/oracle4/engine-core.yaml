@@ -1,0 +1,202 @@
+schema_version: 1
+id: vllm
+scenarios:
+- id: oracle-engine-core-delta-no-new-tokens-empty-logprobs
+  name: A DELTA output with no new tokens carries an empty logprobs list, not the whole history
+  description: >-
+    tests/v1/engine/test_output_processor.py::test_delta_output_without_new_tokens_returns_empty_logprobs
+    (line 54). RequestState._new_completion_output (vllm/v1/engine/output_processor.py:428)
+    slices the accumulated logprobs with logprobs[:0] when a DELTA output has no new token
+    ids, so the CompletionOutput's logprobs is an empty list of the same type instead of the
+    full accumulated history ([-0:]). Driven through the real OutputProcessor: a DELTA request
+    asking for logprobs gets one sampled token with its logprobs (one accumulated position),
+    then an engine step with no new token ids. Step `empty` delivers an empty LogprobsLists,
+    step `none` delivers no LogprobsLists at all (new_logprobs None, as the scheduler sends
+    when the step sampled nothing for the request); in both the code reads the accumulated
+    logprobs and returns logprobs[:0] == [].
+  fixtures: [full-tp1-llama-8b]
+  steps:
+  - interface: output-processor.add-request
+    caller: async-llm
+    input:
+      has_queue: false
+      index: 0
+      n: 1
+      parent_request_id: {$null: true}
+      request:
+        request_id: r1
+        prompt_token_ids: [128000, 9906, 11]
+        sampling_params: {output_kind: DELTA, logprobs: 1, stop: [], n: 1, max_tokens: 8, min_tokens: 0}
+    as: add
+  - interface: output-processor.process-outputs
+    caller: async-llm
+    input:
+      outputs:
+      - request_id: r1
+        new_token_ids: [1]
+        new_logprobs: {token_ids: [[1, 2]], logprobs: [[-0.5, -1.0]], ranks: [1]}
+        finish_reason: {$null: true}
+        stop_reason: {$null: true}
+    as: first
+  - interface: output-processor.process-outputs
+    caller: async-llm
+    input:
+      outputs:
+      - request_id: r1
+        new_token_ids: []
+        new_logprobs: {token_ids: [], logprobs: [], ranks: []}
+        finish_reason: {$null: true}
+        stop_reason: {$null: true}
+    as: empty
+  - interface: output-processor.process-outputs
+    caller: async-llm
+    input:
+      outputs:
+      - request_id: r1
+        new_token_ids: []
+        new_logprobs: {$null: true}
+        finish_reason: {$null: true}
+        stop_reason: {$null: true}
+    as: none
+  expect:
+  - "steps.first.result.ok && size(steps.first.result.value.request_outputs[0].completions[0].logprobs) == 1"
+  - "steps.empty.result.ok && size(steps.empty.result.value.request_outputs) == 1"
+  - "type(steps.empty.result.value.request_outputs[0].completions[0].logprobs) == list && size(steps.empty.result.value.request_outputs[0].completions[0].logprobs) == 0"
+  - "steps.none.result.ok && size(steps.none.result.value.request_outputs) == 1"
+  - "type(steps.none.result.value.request_outputs[0].completions[0].logprobs) == list && size(steps.none.result.value.request_outputs[0].completions[0].logprobs) == 0"
+  - "size(state['logprobs-processor'].requests['r1'].logprobs) == 1 && state['output-processor'].request_states['r1'].num_output_tokens == 1"
+
+- id: oracle-engine-core-parent-request-to-output-stream
+  name: Streaming parallel sampling returns each child's output, a finished child only once, and finishes with the last child
+  description: >-
+    tests/v1/engine/test_parallel_sampling.py::test_parent_request_to_output_stream (line 11).
+    ParentRequest.get_outputs (vllm/v1/engine/parallel_sampling.py:102) for a streaming (n=2,
+    CUMULATIVE) parent returns [the child's output] while running; a finished child leaves
+    child_requests and is returned once, never again; the parent is finished once no child
+    remains. Driven through OutputProcessor.process_outputs with two children of one parent
+    (request_states hold the parent_req, output_processor.py:359-366). In the full pipeline a
+    finished child's RequestState is dropped by _finish_request (output_processor.py:855),
+    so a repeated output for it produces no RequestOutput, which is the ([], ...) case.
+  fixtures: [full-tp1-llama-8b]
+  steps:
+  - interface: output-processor.add-request
+    caller: async-llm
+    input:
+      has_queue: false
+      index: 0
+      n: 2
+      parent_request_id: p
+      request:
+        request_id: c0
+        prompt_token_ids: [128000, 9906]
+        sampling_params: {output_kind: CUMULATIVE, n: 2, stop: [], max_tokens: 8, min_tokens: 0, logprobs: {$null: true}}
+    as: add0
+  - interface: output-processor.add-request
+    caller: async-llm
+    input:
+      has_queue: false
+      index: 1
+      n: 2
+      parent_request_id: p
+      request:
+        request_id: c1
+        prompt_token_ids: [128000, 9906]
+        sampling_params: {output_kind: CUMULATIVE, n: 2, stop: [], max_tokens: 8, min_tokens: 0, logprobs: {$null: true}}
+    as: add1
+  - interface: output-processor.process-outputs
+    caller: async-llm
+    input: {outputs: [{request_id: c0, new_token_ids: [11], new_logprobs: {$null: true}, finish_reason: {$null: true}, stop_reason: {$null: true}}]}
+    as: s0
+  - interface: output-processor.process-outputs
+    caller: async-llm
+    input: {outputs: [{request_id: c1, new_token_ids: [21], new_logprobs: {$null: true}, finish_reason: {$null: true}, stop_reason: {$null: true}}]}
+    as: s1
+  - interface: output-processor.process-outputs
+    caller: async-llm
+    input: {outputs: [{request_id: c1, new_token_ids: [22], new_logprobs: {$null: true}, finish_reason: length, stop_reason: {$null: true}}]}
+    as: s1fin
+  - interface: output-processor.process-outputs
+    caller: async-llm
+    input: {outputs: [{request_id: c0, new_token_ids: [12], new_logprobs: {$null: true}, finish_reason: {$null: true}, stop_reason: {$null: true}}]}
+    as: s0b
+  - interface: output-processor.process-outputs
+    caller: async-llm
+    input: {outputs: [{request_id: c1, new_token_ids: [23], new_logprobs: {$null: true}, finish_reason: length, stop_reason: {$null: true}}]}
+    as: s1again
+  - interface: output-processor.process-outputs
+    caller: async-llm
+    input: {outputs: [{request_id: c0, new_token_ids: [13], new_logprobs: {$null: true}, finish_reason: length, stop_reason: {$null: true}}]}
+    as: s0fin
+  - interface: output-processor.process-outputs
+    caller: async-llm
+    input: {outputs: [{request_id: c0, new_token_ids: [14], new_logprobs: {$null: true}, finish_reason: length, stop_reason: {$null: true}}, {request_id: c1, new_token_ids: [24], new_logprobs: {$null: true}, finish_reason: length, stop_reason: {$null: true}}]}
+    as: after
+  expect:
+  - "size(steps.s0.result.value.request_outputs) == 1 && steps.s0.result.value.request_outputs[0].completions.map(c, c.index) == [0] && !steps.s0.result.value.request_outputs[0].finished"
+  - "size(steps.s1.result.value.request_outputs) == 1 && steps.s1.result.value.request_outputs[0].completions.map(c, c.index) == [1] && !steps.s1.result.value.request_outputs[0].finished"
+  - "size(steps.s1fin.result.value.request_outputs) == 1 && steps.s1fin.result.value.request_outputs[0].completions.map(c, c.index) == [1] && !steps.s1fin.result.value.request_outputs[0].finished"
+  - "size(steps.s0b.result.value.request_outputs) == 1 && steps.s0b.result.value.request_outputs[0].completions.map(c, c.index) == [0] && !steps.s0b.result.value.request_outputs[0].finished"
+  - "size(steps.s1again.result.value.request_outputs) == 0"
+  - "size(steps.s0fin.result.value.request_outputs) == 1 && steps.s0fin.result.value.request_outputs[0].completions.map(c, c.index) == [0] && steps.s0fin.result.value.request_outputs[0].finished"
+  - "size(steps.after.result.value.request_outputs) == 0"
+  - "!('p' in state['output-processor'].parent_requests) && size(state['output-processor'].request_states) == 0"
+
+- id: oracle-engine-core-processor-error
+  name: An encoder/decoder prompt on a decoder-only model fails each request with EngineGenerateError; the engine stays healthy
+  description: >-
+    tests/v1/shutdown/test_processor_error.py::test_async_llm_processor_error (line 1).
+    AsyncLLM.add_request -> InputProcessor.process_inputs_async -> parse_dec_only_prompt
+    (vllm/renderers/inputs/preprocess.py:141) raises TypeError("Cannot pass encoder-decoder
+    prompt to decoder-only models"); AsyncLLM.generate (vllm/v1/engine/async_llm.py:806-820)
+    turns any non-client error into EngineGenerateError. The engine is not errored, and the
+    next ordinary request (max_tokens=5, DELTA) streams exactly 5 tokens. The three failing
+    generate calls run sequentially here (they fail before any await on the engine).
+  fixtures: [full-tp1-llama-8b]
+  config:
+    worker-runner-natural-output-tokens-base: 64
+    worker-runner-natural-output-tokens-spread: 1
+  steps:
+  - flow: engine-core-busy-loop
+    input: {iterations: 40}
+    as: loop
+    await: false
+  - flow: async-llm-generate
+    input:
+      request_id: request-0
+      encoder_prompt: Hello my name is
+      decoder_prompt: {$null: true}
+      prompt_token_ids: {$absent: true}
+      sampling_params: {n: 1, stop: [], max_tokens: {$null: true}}
+    at_ms: 0
+    as: e0
+  - flow: async-llm-generate
+    input:
+      request_id: request-1
+      encoder_prompt: Hello my name is
+      decoder_prompt: {$null: true}
+      prompt_token_ids: {$absent: true}
+      sampling_params: {n: 1, stop: [], max_tokens: {$null: true}}
+    as: e1
+  - flow: async-llm-generate
+    input:
+      request_id: request-2
+      encoder_prompt: Hello my name is
+      decoder_prompt: {$null: true}
+      prompt_token_ids: {$absent: true}
+      sampling_params: {n: 1, stop: [], max_tokens: {$null: true}}
+    as: e2
+  - interface: async-llm.errored
+    caller: api-server
+    as: err
+  - flow: async-llm-generate
+    input:
+      request_id: abc
+      prompt_token_ids: [128000, 9906, 11, 856, 836, 374]
+      sampling_params: {n: 1, stop: [], max_tokens: 5, output_kind: DELTA, temperature: 0}
+    as: ok
+  expect:
+  - "[steps.e0, steps.e1, steps.e2].all(s, !s.result.ok && s.result.error.code == 'engine-generate-error')"
+  - "steps.err.result.ok && !steps.err.result.value.errored"
+  - "steps.ok.result.ok && steps.ok.result.value.value.finished"
+  - "sum(steps.ok.result.value.items.map(i, size(i.token_ids))) == 5"
+  - "!state['output-processor'].request_states.exists(k, k.startsWith('request-')) && !trace.exists(e, e.type == 'call.start' && e.interface == 'output-processor.add-request' && e.input.request.request_id.startsWith('request-'))"

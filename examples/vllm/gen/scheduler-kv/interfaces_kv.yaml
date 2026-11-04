@@ -35,7 +35,10 @@ interfaces:
     response: {type: object, properties: {num_free_blocks: {type: integer}}}
     behavior:
       - if: "input.num_gpu_blocks <= 0"
-        then: [{fail: {code: assertion-error, status: 0, message: "num_gpu_blocks must be a positive int"}}]
+        then:
+          - title: "assert isinstance(num_gpu_blocks, int) and num_gpu_blocks > 0 (a bare assert: no message)"
+            source: "vllm/v1/core/block_pool.py:166"
+            fail: {code: assertion-error, status: 0, message: ""}
       - title: All blocks free; pop block 0 as the null block
         source: "vllm/v1/core/block_pool.py:172-189"
         set:
@@ -676,11 +679,14 @@ interfaces:
     latency_ms: 0
     summary: "Count one admitted request's prefix-cache queries (its tokens) and hits; preempted re-admissions count separately."
     sources: ["vllm/v1/core/kv_cache_manager.py:253-262", "vllm/v1/metrics/stats.py:138-155"]
-    request: {type: object, required: [num_tokens, num_hits], properties: {num_tokens: {type: integer}, num_hits: {type: integer}, preempted: {type: boolean}}}
+    request: {type: object, required: [num_tokens, num_hits], properties: {num_tokens: {type: integer}, num_hits: {type: integer}, preempted: {type: boolean}, skip_reading_prefix_cache: {type: boolean, default: false, description: "The request skipped the lookup (prompt logprobs); it is not counted."}}}
     response: {type: object}
     behavior:
-      - if: "!config['enable-prefix-caching']"
-        then: [{return: {recorded: false}}]
+      - if: "config['disable-log-stats'] || !config['enable-prefix-caching'] || (has(input.skip_reading_prefix_cache) && input.skip_reading_prefix_cache)"
+        then:
+          - title: Stats off, or the request skipped the cache lookup - not counted
+            source: "vllm/v1/core/kv_cache_manager.py:253-256"
+            return: {recorded: false}
       - if: "has(input.preempted) && input.preempted"
         then:
           - set:
@@ -802,14 +808,23 @@ interfaces:
             then:
               - title: No memory left for the KV cache
                 source: "vllm/v1/core/kv_cache_utils.py:1009-1017"
-                fail: {code: value-error, status: 0, message: "No available memory for the cache blocks. Try increasing `gpu_memory_utilization` when initializing the engine."}
+                fail: {code: value-error, status: 0, message: "No available memory for the cache blocks. Try increasing `gpu_memory_utilization` when initializing the engine (this flag also controls CPU memory reservation on the CPU backend, despite its name). See https://docs.vllm.ai/en/latest/configuration/conserving_memory/ for more details."}
           - set:
               vars.needed: "= (int(config['max-model-len']) + int(config['block-size']) - 1) / int(config['block-size']) * vars.bpb"
           - if: "vars.needed > vars.avail - vars.bpb"
             then:
+              - set:
+                  vars.check: "= vars.avail - vars.bpb"
+                  vars.need_gib: "= double(int(double(vars.needed) / 1073741824.0 * 100.0 + 0.5)) / 100.0"
+                  vars.avail_gib: "= double(int(double(vars.avail - vars.bpb) / 1073741824.0 * 100.0 + 0.5)) / 100.0"
+              - set:
+                  vars.est: "= math.least([(vars.check / vars.bpb) * int(config['block-size']), int(config['max-model-len'])])"
+                  vars.need_s: "= string(vars.need_gib).contains('.') ? string(vars.need_gib) : string(vars.need_gib) + '.0'"
+                  vars.avail_s: "= string(vars.avail_gib).contains('.') ? string(vars.avail_gib) : string(vars.avail_gib) + '.0'"
               - title: One max_model_len request does not fit
+                detail: "format_gib is round(bytes / GiB, 2); the estimated length is the binary search's answer, the largest length whose cdiv(len, block_size) blocks fit in the memory left after the null block (0 omits the sentence)."
                 source: "vllm/v1/core/kv_cache_utils.py:1019-1040"
-                fail: {code: value-error, status: 0, message: "= 'To serve at least one request with the model\\'s max seq len (' + string(int(config['max-model-len'])) + '), (' + string(vars.needed / 1073741824) + ' GiB KV cache is needed, which is larger than the available KV cache memory. Based on the available memory, the estimated maximum model length is ' + string((vars.avail - vars.bpb) / vars.bpb * int(config['block-size'])) + '. Try increasing `gpu_memory_utilization` or decreasing `max_model_len` when initializing the engine.'"}
+                fail: {code: value-error, status: 0, message: "= 'To serve at least one request with the model\\'s max seq len (' + string(int(config['max-model-len'])) + '), (' + vars.need_s + ' GiB KV cache is needed, which is larger than the available KV cache memory (' + vars.avail_s + ' GiB). ' + (vars.est > 0 ? 'Based on the available memory, the estimated maximum model length is ' + string(vars.est) + '. ' : '') + 'Try increasing `gpu_memory_utilization` (which also controls CPU memory on the CPU backend) or decreasing `max_model_len` when initializing the engine. See https://docs.vllm.ai/en/latest/configuration/conserving_memory/ for more details.'"}
       - set:
           vars.n: "= math.least(input.available_memory.map(m, m / vars.bpb))"
       - if: "'num-gpu-blocks-override' in config && config['num-gpu-blocks-override'] != null"

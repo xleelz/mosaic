@@ -154,7 +154,10 @@ def components():
           "TOKENSPEED_MLA": "UNIFORM_BATCH", "TURBOQUANT": "UNIFORM_BATCH", "ROCM_AITER_FA": "UNIFORM_BATCH", "ROCM_AITER_MLA": "UNIFORM_BATCH",
           "ROCM_AITER_MLA_SPARSE": "UNIFORM_BATCH", "B12X": "UNIFORM_BATCH", "GDN_ATTN": "UNIFORM_BATCH", "MAMBA": "UNIFORM_BATCH",
           "SHORT_CONV_ATTN": "UNIFORM_BATCH", "DEEPSEEK_SPARSE_SWA": "UNIFORM_BATCH", "HPC_ATTN": "UNIFORM_SINGLE_TOKEN_DECODE",
-          "LINEAR_ATTN": "UNIFORM_SINGLE_TOKEN_DECODE", "XPU_MLA_SPARSE": "NEVER"}
+          "LINEAR_ATTN": "UNIFORM_SINGLE_TOKEN_DECODE", "XPU_MLA_SPARSE": "NEVER",
+          # DeepSeek V4 (models-layers' files): the ROCm AITER sparse-MLA builder inherits DeepseekV4SparseMLAMetadataBuilder's
+          # UNIFORM_BATCH (sparse_mla.py:125); the FlashInfer varlen builder is ALWAYS (nvidia/flashinfer_sparse.py:186).
+          "ROCM_FLASHMLA_SPARSE_DSV4": "UNIFORM_BATCH", "FLASHINFER_MLA_SPARSE_DSV4": "ALWAYS"}
     out.append(comp("attention-metadata-builder", "AttentionMetadataBuilder", BK,
                     "Base of the metadata builders: the class-level CUDA-graph support (state: each builder class's _cudagraph_support).",
                     a=cls(BK, "AttentionMetadataBuilder")[0], b=cls(BK, "AttentionMetadataBuilder")[0],
@@ -257,6 +260,10 @@ def kv_spec_interfaces():
     ga, gb = fn(KVI, "get_kv_quant_mode")
     ka, kb = cls(KVI, "KVQuantMode")
     beh = [
+        {"if": "input.kv_cache_dtype.startsWith('turboquant_') && !(input.kv_cache_dtype in ['turboquant_k8v4', 'turboquant_4bit_nc', 'turboquant_k3v4_nc', 'turboquant_3bit_nc'])",
+         "then": [{"title": "turboquant_* is looked up by name (KVQuantMode[...upper()]): an unknown preset raises KeyError",
+                   "source": C(KVI, ln(KVI, r"return KVQuantMode\[kv_cache_dtype\.upper\(\)\]", ga)),
+                   "fail": {"code": "key-error", "message": "= \"'\" + input.kv_cache_dtype.upperAscii() + \"'\""}}]},
         {"title": "Map the kv_cache_dtype string to a KVQuantMode (nvfp4_ds_mla before the nvfp4 prefix; turboquant_* by name; any other fp8* is per-tensor)",
          "source": C(KVI, ga, gb), "set": {"vars.mode": "= " + QM.replace("D", "input.kv_cache_dtype")}},
         {"title": "The mode's family properties", "source": C(KVI, ln(KVI, r"def is_per_token_head", ka), kb),
@@ -267,7 +274,8 @@ def kv_spec_interfaces():
     out.append(iface("kv-quant-mode", "get-kv-quant-mode", "get_kv_quant_mode / is_quantized_kv_cache: the KVQuantMode of a kv_cache_dtype string, and its family flags.",
                      [C(KVI, ga, gb), C(KVI, ka, kb), Cfn(KVI, "is_quantized_kv_cache"), Cm(BK, "AttentionImpl", "kv_quant_mode")], beh,
                      request=obj({"kv_cache_dtype": S("auto")}),
-                     response=obj({"kv_quant_mode": {"type": "string"}, "is_quantized": {"type": "boolean"}})))
+                     response=obj({"kv_quant_mode": {"type": "string"}, "is_quantized": {"type": "boolean"}}),
+                     errors=[err("key-error", "an unknown turboquant_* preset")]))
     return out
 
 
@@ -276,16 +284,17 @@ def metadata_interfaces():
     md = obj({"query_start_loc": A([0, 3, 4, 6]), "seq_lens": A([10, 5, 2]), "num_actual_tokens": I(6)})
     out.append(iface("common-attention-metadata", "batch-size", "CommonAttentionMetadata.batch_size / naive_query_lens / compute_num_computed_tokens: rows, per-row query lengths (query_start_loc differences) and computed tokens (seq_lens - query lengths).",
                      [Cm(BK, "CommonAttentionMetadata", "batch_size"), Cm(BK, "CommonAttentionMetadata", "naive_query_lens"), Cm(BK, "CommonAttentionMetadata", "compute_num_computed_tokens")],
-                     [{"if": "size(input.query_start_loc) != size(input.seq_lens) + 1",
-                       "then": [{"title": "query_start_loc has batch_size + 1 entries", "source": Lin(BK, r"\"\"\"\(batch_size \+ 1,\), the start location"),
-                                 "fail": {"code": "value-error", "message": "query_start_loc must have batch_size + 1 entries"}}]},
-                      {"title": "Query lengths: neighbouring query_start_loc entries", "source": Cm(BK, "CommonAttentionMetadata", "naive_query_lens"),
-                       "set": {"vars.q": "= lists.range(size(input.seq_lens)).map(i, input.query_start_loc[i + 1] - input.query_start_loc[i])"}},
-                      {"title": "batch_size is seq_lens.shape[0]; computed tokens are seq_lens - query lengths", "source": Cm(BK, "CommonAttentionMetadata", "compute_num_computed_tokens"),
-                       "return": {"batch_size": "= size(input.seq_lens)", "query_lens": "= vars.q",
-                                  "num_computed_tokens": "= lists.range(size(input.seq_lens)).map(i, input.seq_lens[i] - vars.q[i])"}}],
+                     [{"title": "Query lengths: neighbouring query_start_loc entries", "source": Cm(BK, "CommonAttentionMetadata", "naive_query_lens"),
+                       "set": {"vars.q": "= lists.range(size(input.query_start_loc) - 1).map(i, input.query_start_loc[i + 1] - input.query_start_loc[i])"}},
+                      {"set": {"vars.ns": "= size(input.seq_lens)", "vars.nq": "= size(input.query_start_loc) - 1"}},
+                      {"if": "vars.nq != vars.ns && vars.nq != 1 && vars.ns != 1",
+                       "then": [{"title": "seq_lens - query_lens: torch can't broadcast tensors of different lengths", "source": C(BK, ln(BK, r"self\._num_computed_tokens_cache = self\.seq_lens - query_lens")),
+                                 "fail": {"code": "runtime-error", "message": "= 'The size of tensor a (' + string(vars.ns) + ') must match the size of tensor b (' + string(vars.nq) + ') at non-singleton dimension 0'"}}]},
+                      {"title": "batch_size is seq_lens.shape[0]; computed tokens are seq_lens - query lengths (a length-1 side broadcasts)", "source": Cm(BK, "CommonAttentionMetadata", "compute_num_computed_tokens"),
+                       "return": {"batch_size": "= vars.ns", "query_lens": "= vars.q",
+                                  "num_computed_tokens": "= lists.range(math.greatest(vars.ns, vars.nq)).map(i, input.seq_lens[vars.ns == 1 ? 0 : i] - vars.q[vars.nq == 1 ? 0 : i])"}}],
                      request=md, response=obj({"batch_size": {"type": "integer"}, "query_lens": ARR_I, "num_computed_tokens": ARR_I}),
-                     errors=[err("value-error", "malformed query_start_loc")]))
+                     errors=[err("runtime-error", "seq_lens and query_start_loc disagree on the batch size")]))
     ta, tb = m(BK, "CommonAttentionMetadata", "token_to_req_indices")
     beh = [
         {"set": {"vars.mapped": "= input.query_start_loc_cpu[size(input.query_start_loc_cpu) - 1]",
@@ -293,7 +302,7 @@ def metadata_interfaces():
         {"set": {"vars.out": "= vars.mapped > vars.n ? vars.mapped : vars.n"}},
         {"if": "input.buffer_size < vars.out",
          "then": [{"title": "The buffer must hold max(mapped, actual) tokens", "source": Lin(BK, r"assert buffer.shape\[0\] >= num_output_tokens"),
-                   "fail": {"code": "assertion-error", "message": "buffer too small for token_to_req_indices"}}]},
+                   "fail": {"code": "assertion-error", "message": ""}}]},
         {"title": "compute_token_to_req_indices on the device query_start_loc: tokens past the mapped count map to 0", "source": Cfn(MD, "compute_token_to_req_indices"),
          "call": "attention-ops-metadata.token-request-mapping-kernel", "input": {"num_tokens": "= vars.out", "num_seqs": "= size(input.query_start_loc) - 1"}},
         {"title": "Cached on the metadata and sliced to num_actual_tokens", "source": C(BK, ln(BK, r"self\._token_to_req_indices_cache = compute_token_to_req_indices", ta), tb),
@@ -350,10 +359,24 @@ def metadata_interfaces():
     fia, fib = m(FI, "FlashInferMetadataBuilder", "get_cudagraph_support")
     ea, eb = cls(BK, "AttentionCGSupport")
     lvl = "{'NEVER': 0, 'UNIFORM_SINGLE_TOKEN_DECODE': 1, 'UNIFORM_BATCH': 2, 'ALWAYS': 3}"
+    V4R = "vllm/models/deepseek_v4/amd/rocm.py"
+    SSWA = "vllm/v1/attention/backends/mla/sparse_swa.py"
+    r1a, r1b = m(V4R, "DeepseekV4ROCMAiterMLASparseMetadataBuilder", "get_cudagraph_support")
+    r2a, r2b = m(V4R, "DeepseekV4ROCMAiterSparseSWAMetadataBuilder", "get_cudagraph_support")
+    swa_a, swa_b = m(SSWA, "DeepseekSparseSWABackend", "get_builder_cls")
     beh = [
-        {"if": "input.backend == 'FLASH_ATTN'",
-         "then": [{"title": "FlashAttention: ALWAYS with FA3 (AOT scheduling), else UNIFORM_BATCH", "source": C(FA, ln(FA, r"_cudagraph_support = \("), ln(FA, r"_cudagraph_support = \(") + 4),
-                   "set": {"vars.s": "= input.fa_version == 3 ? 'ALWAYS' : 'UNIFORM_BATCH'"}}],
+        {"if": "(input.backend == 'ROCM_FLASHMLA_SPARSE_DSV4' || (input.backend == 'DEEPSEEK_SPARSE_SWA' && input.is_rocm)) && config['enable-adaptive-verification']",
+         "then": [{"title": "DeepSeek V4's ROCm AITER sparse-MLA and SWA builders (DEEPSEEK_SPARSE_SWA's builder on ROCm): adaptive verification replays varlen FULL decode graphs, so ALWAYS",
+                   "source": C(V4R, r1a, r1b), "detail": "Without speculative_config.enable_adaptive_verification both fall back to their parents' UNIFORM_BATCH.",
+                   "set": {"vars.s": "ALWAYS"}}],
+         "else": [{"if": "input.backend == 'FLASH_ATTN'",
+         "then": [{"if": "input.fa_version == null",
+                   "then": [{"title": "_cudagraph_support is fixed at class definition by get_flash_attn_version()", "source": C(FA, ln(FA, r"_cudagraph_support = \(") + 2),
+                             "call": "fa-utils.get-flash-attn-version", "input": {}, "as": "v"},
+                            {"set": {"vars.fa": "= vars.v.value.fa_version"}}],
+                   "else": [{"set": {"vars.fa": "= input.fa_version"}}]},
+                  {"title": "FlashAttention: ALWAYS with FA3 (AOT scheduling), else UNIFORM_BATCH", "source": C(FA, ln(FA, r"_cudagraph_support = \("), ln(FA, r"_cudagraph_support = \(") + 4),
+                   "set": {"vars.s": "= vars.fa == 3 ? 'ALWAYS' : 'UNIFORM_BATCH'"}}],
          "else": [{"if": "input.backend == 'FLASHINFER'",
                    "then": [{"if": "int(config['decode-context-parallel-size']) > 1",
                              "then": [{"title": "FlashInfer under DCP: XQA has no LSE and trtllm-gen can't graph varlen", "source": C(FI, ln(FI, r"if vllm_config\.parallel_config\.decode_context_parallel_size > 1:", fia)),
@@ -361,13 +384,15 @@ def metadata_interfaces():
                              "else": [{"title": "Uniform batches when every attention spec runs on TRT-LLM (or XQA) and the layer is causal or the arch is XQA", "source": C(FI, fia, fib),
                                        "set": {"vars.s": "= input.all_specs_trtllm && (!input.use_non_causal || input.is_xqa_arch) ? 'UNIFORM_BATCH' : 'UNIFORM_SINGLE_TOKEN_DECODE'"}}]}],
                    "else": [{"title": "The builder class's _cudagraph_support; a builder that sets none inherits NEVER", "source": C(BK, ga, gb),
-                             "set": {"vars.s": "= input.backend in state.cg_support ? state.cg_support[input.backend] : 'NEVER'"}}]}]},
+                             "set": {"vars.s": "= input.backend in state.cg_support ? state.cg_support[input.backend] : 'NEVER'"}}]}]}]},
         {"title": "AttentionCGSupport levels: ALWAYS 3 > UNIFORM_BATCH 2 > UNIFORM_SINGLE_TOKEN_DECODE 1 > NEVER 0", "source": C(BK, ea, eb),
          "return": {"support": "= vars.s", "level": "= " + lvl + "[vars.s]"}},
     ]
     out.append(iface("attention-metadata-builder", "get-cudagraph-support", "AttentionMetadataBuilder.get_cudagraph_support: the CUDA-graph support level of a backend's builder (FlashAttention and FlashInfer decide at run time).",
-                     [C(BK, ga, gb), C(FA, fa_, fb_), C(FI, fia, fib), C(BK, ea, eb), Lin(TA, r"_cudagraph_support: ClassVar\[AttentionCGSupport\] = AttentionCGSupport\.ALWAYS")], beh,
-                     request=obj({"backend": S("FLASH_ATTN"), "fa_version": I(3), "all_specs_trtllm": B(True), "use_non_causal": B(False), "is_xqa_arch": B(True)}),
+                     [C(BK, ga, gb), C(FA, fa_, fb_), C(FI, fia, fib), C(BK, ea, eb), Lin(TA, r"_cudagraph_support: ClassVar\[AttentionCGSupport\] = AttentionCGSupport\.ALWAYS"),
+                      C(V4R, r1a, r1b), C(V4R, r2a, r2b), C(SSWA, swa_a, swa_b)], beh,
+                     request=obj({"backend": S("FLASH_ATTN"), "fa_version": {"type": ["integer", "null"], "default": None}, "all_specs_trtllm": B(True), "use_non_causal": B(False),
+                                  "is_xqa_arch": B(True), "is_rocm": B(False)}),
                      response=obj({"support": {"type": "string"}, "level": {"type": "integer"}})))
     return out
 
@@ -403,7 +428,8 @@ def registry_interfaces():
                          [C(f, ra, rb)],
                          [{"if": "input.name in state.members",
                            "then": [{"title": "The name already exists", "source": C(f, ln(f, r"if name in cls\._member_map_:", ra)),
-                                     "fail": {"code": "value-error", "message": "= 'Backend ' + input.name + ' already exists in " + enum_cls + ".'"}}]},
+                                     "fail": {"code": "value-error", "message": (("= 'Backend ' + input.name + ' already exists in " + enum_cls + ". Use register_backend(" + enum_cls + ".' + input.name + \", '\" + input.value + \"') to override.\"")
+                                                                            if f == REG else ("= 'MLA prefill backend ' + input.name + ' already exists in " + enum_cls + ". Use register_mla_prefill_backend(" + enum_cls + ".' + input.name + \", '\" + input.value + \"') to override.\""))}}]},
                           {"if": "!input.name.matches('^[A-Za-z_][A-Za-z0-9_]*$') || input.name in " + str(RESERVED).replace('"', "'"),
                            "then": [{"title": "Not an identifier, or an attribute of the enum class", "source": C(f, ln(f, r"if not name\.isidentifier\(\) or hasattr\(cls, name\):", ra)),
                                      "fail": {"code": "value-error", "message": "= 'Invalid or reserved backend name: ' + input.name"}}]},
@@ -415,12 +441,13 @@ def registry_interfaces():
         out.append(iface(cid, "get-path", f"{enum_cls}.get_path: the override if registered, else the member's default path; an unregistered placeholder (CUSTOM) refuses.",
                          [C(f, pa, pb)],
                          [{"if": "!(input.name in state.members)",
-                           "then": [{"title": "Not a member", "source": C(f, ca, ca), "fail": {"code": "key-error", "message": "= input.name"}}]},
+                           "then": [{"title": "Not a member", "source": C(f, ca, ca), "fail": {"code": "key-error", "message": "= \"'\" + input.name + \"'\""}}]},
                           {"title": "The override wins over the default path", "source": C(f, ln(f, r"path = _\w+_OVERRIDES\.get\(self, self\.value\)", pa)),
                            "set": {"vars.path": "= input.name in state.overrides ? state.overrides[input.name] : state.members[input.name]"}},
                           {"if": "vars.path == null || vars.path == ''",
                            "then": [{"title": "Must be registered before use", "source": C(f, ln(f, r"if not path:", pa)),
-                                     "fail": {"code": "value-error", "message": "= 'Backend ' + input.name + ' must be registered before use.'"}}]},
+                                     "fail": {"code": "value-error", "message": (("= 'Backend ' + input.name + ' must be registered before use. Use register_backend(Backend.' + input.name + \", 'your.module.YourClass')\"")
+                                                                            if f == REG else ("= 'MLA prefill backend ' + input.name + ' must be registered before use. Use register_mla_prefill_backend(" + enum_cls + ".' + input.name + \", 'your.module.YourClass')\""))}}]},
                           {"return": {"path": "= input.include_classname ? vars.path : vars.path.substring(0, vars.path.lastIndexOf('.'))"}}],
                          request=obj({"name": S("FLASH_ATTN"), "include_classname": B(True)}), response=obj({"path": {"type": "string"}}),
                          errors=[err("key-error", "not a member"), err("value-error", "unregistered placeholder")]))
@@ -430,7 +457,8 @@ def registry_interfaces():
                            "call": f"{cid}.get-path", "input": {"name": "= input.name", "include_classname": True}, "as": "p"},
                           {"if": "!(vars.p.value.path in state.classes)",
                            "then": [{"title": "importlib can't import the module or find the class", "source": Cfn("vllm/utils/import_utils.py", "resolve_obj_by_qualname"),
-                                     "fail": {"code": "import-error", "message": "= 'cannot import ' + vars.p.value.path"}}]},
+                                     "detail": "ModuleNotFoundError (an ImportError) for a missing module; the scenarios only use missing modules.",
+                                     "fail": {"code": "import-error", "message": "= \"No module named '\" + vars.p.value.path.substring(0, vars.p.value.path.lastIndexOf('.')) + \"'\""}}]},
                           {"return": {"path": "= vars.p.value.path", "class_name": "= state.classes[vars.p.value.path].name", "cls": "= state.classes[vars.p.value.path]"}}],
                          request=obj({"name": S("FLASH_ATTN")}), response=obj({"path": {"type": "string"}, "class_name": {"type": ["string", "null"]}}),
                          errors=[err("import-error", "the class can't be imported")]))
@@ -452,7 +480,7 @@ def registry_interfaces():
                        "source": C(f, ln(f, r"if isinstance\(backend, str\):", rfa)),
                        "call": f"{cid}.register", "input": {"name": "= input.backend", "value": "= input.has_class_path ? input.class_path : ''"}}],
              "else": [{"if": "!(input.backend in state.members)",
-                       "then": [{"title": "An enum member is expected", "source": C(f, rfa, rfa), "fail": {"code": "key-error", "message": "= input.backend"}}]}]},
+                       "then": [{"title": "An enum member is expected", "source": C(f, rfa, rfa), "fail": {"code": "key-error", "message": "= \"'\" + input.backend + \"'\""}}]}]},
             {"if": "input.has_class_path",
              "then": [{"title": "Direct registration: the override is the given class path, and a no-op decorator is returned",
                        "source": C(f, ln(f, r"if class_path is not None:", rfa), ln(f, r"return lambda x: x", rfa)),
@@ -508,7 +536,7 @@ def registry_interfaces():
                    "call": "mla-prefill-backend-enum.get-class", "input": {"name": "= input.mla_prefill_backend"}, "as": "cls",
                    "on_error": [{"if": "error.code == 'import-error'",
                                  "then": [{"title": "An ImportError becomes the only reason", "source": C(PSEL, ln(PSEL, r"invalid_reasons = \[\"ImportError\"\]", sa)),
-                                           "fail": {"code": "value-error", "message": "= 'Selected MLA prefill backend ' + input.mla_prefill_backend + ' is not valid for this configuration. Reason: [ImportError]'"}}],
+                                           "fail": {"code": "value-error", "message": "= 'Selected MLA prefill backend ' + input.mla_prefill_backend + ' is not valid for this configuration. Reason: [\\'ImportError\\']'"}}],
                                  "else": [{"fail": "= {'code': error.code, 'status': error.status, 'message': error.message}"}]}]},
                   {"title": "Validate it on this device", "source": C(PSEL, ln(PSEL, r"invalid_reasons = backend_cls\.validate_configuration\(", sa)),
                    "call": "mla-prefill-backend.validate-configuration",
@@ -516,7 +544,7 @@ def registry_interfaces():
                              "dtype": "= vars.dtype", "mla_dimensions": "= vars.dims"}, "as": "v"},
                   {"if": "size(vars.v.value.invalid_reasons) > 0",
                    "then": [{"title": "The selected backend is invalid", "source": C(PSEL, ln(PSEL, r"if invalid_reasons:", sa)),
-                             "fail": {"code": "value-error", "message": "= 'Selected MLA prefill backend ' + input.mla_prefill_backend + ' is not valid for this configuration. Reason: ' + vars.v.value.invalid_reasons.join(', ')"}}]},
+                             "fail": {"code": "value-error", "message": "= 'Selected MLA prefill backend ' + input.mla_prefill_backend + ' is not valid for this configuration. Reason: [' + vars.v.value.invalid_reasons.map(r, \"'\" + r + \"'\").join(', ') + ']'"}}]},
                   {"return": {"backend": "= vars.cls.value.class_name", "auto": False}}]},
         {"if": "input.is_cpu",
          "then": [{"title": "CPU: current_platform is CpuPlatform, so its priority list (ZEN_CPU, CPU) answers", "source": C(PSEL, aa, ab),
@@ -593,7 +621,7 @@ def layer_interfaces():
         {"if": "input.enable_jit_warmup && vars.flat",
          "then": [{"if": "input.block_stride % input.row_width != 0",
                    "then": [{"title": "The block stride must be whole rows", "source": C(MLAA, ln(MLAA, r"assert self\.kv_cache\.stride\(0\) % row_width == 0", ba)),
-                             "fail": {"code": "assertion-error", "message": "kv_cache.stride(0) % row_width != 0"}}]},
+                             "fail": {"code": "assertion-error", "message": ""}}]},
                   {"title": "Register a JIT warm-up of the index-convert kernel at this block stride", "source": C(MLAA, ln(MLAA, r"_CONVERT_REQ_INDEX_TO_GLOBAL_INDEX_KERNEL\.register_warmup\(", ba), bb),
                    "return": {"flat": True, "warmup_block_stride_rows": "= input.block_stride / input.row_width"}}]},
         {"return": {"flat": "= vars.flat", "warmup_block_stride_rows": None}},
@@ -734,7 +762,7 @@ def sparse_interfaces():
     xa, xb = m(IG, "SparseMLAIndexGroup", "convert_logical_to_physical_topk")
     beh = [
         {"if": "!(input.group in state.groups)",
-         "then": [{"title": "No such group", "source": C(IG, xa, xa), "fail": {"code": "key-error", "message": "= input.group"}}]},
+         "then": [{"title": "No such group", "source": C(IG, xa, xa), "fail": {"code": "key-error", "message": "= \"'\" + input.group + \"'\""}}]},
         {"set": {"vars.g": "= state.groups[input.group]"}},
         {"if": "input.num_tokens > vars.g.workspace_rows",
          "then": [{"title": "A prefill-sized batch exceeds the shared workspace: every layer converts its own indices",
@@ -890,10 +918,15 @@ def rocm_interfaces():
     beh = [
         {"if": "input.indptr_len != input.num_queries + 1",
          "then": [{"title": "indptr has one entry per query plus one", "source": C(RAMS, ln(RAMS, r"assert indptr\.numel\(\) == num_queries \+ 1, \(", la)),
-                   "fail": {"code": "assertion-error", "message": "= 'expected indptr shape [' + string(input.num_queries + 1) + ']'"}}]},
-        {"if": "input.nope_head_dim <= 0 || input.rope_head_dim < 0 || input.head_dim != input.nope_head_dim + input.rope_head_dim",
-         "then": [{"title": "_validate_sparse_dims: head_dim = NoPE + RoPE, NoPE positive", "source": C(RAMS, va2, vb2),
-                   "fail": {"code": "assertion-error", "message": "= '_rocm_sparse_attn_prefill_ragged_triton expected head_dim=' + string(input.nope_head_dim + input.rope_head_dim) + ', got ' + string(input.head_dim)"}}]},
+                   "fail": {"code": "assertion-error", "message": "= 'expected indptr shape [' + string(input.num_queries + 1) + '], got torch.Size([' + string(input.indptr_len) + '])'"}}]},
+        {"title": "_validate_sparse_dims checks in order: a positive head_dim, a positive NoPE dimension, a non-negative RoPE dimension, then head_dim = NoPE + RoPE", "source": C(RAMS, va2, vb2),
+         "set": {"vars.op": "_rocm_sparse_attn_prefill_ragged_triton",
+                 "vars.bad": "= input.head_dim <= 0 ? 'expected a positive head_dim, got ' + string(input.head_dim) : (input.nope_head_dim <= 0 ? 'expected a positive NoPE dimension, got ' + string(input.nope_head_dim)"
+                             " : (input.rope_head_dim < 0 ? 'expected a non-negative RoPE dimension, got ' + string(input.rope_head_dim)"
+                             " : (input.head_dim != input.nope_head_dim + input.rope_head_dim ? 'expected head_dim=' + string(input.nope_head_dim + input.rope_head_dim) + ', got ' + string(input.head_dim) : '')))"}},
+        {"if": "vars.bad != ''",
+         "then": [{"title": "The first failing dimension check", "source": C(RAMS, va2, vb2),
+                   "fail": {"code": "assertion-error", "message": "= vars.op + ' ' + vars.bad"}}]},
         {"title": "Launch over (queries, heads / 16); BLOCK_K 16 for heads >= 256 dims, else 32. The kernel reads each KV row at _sparse_kv_row_offset(slot, stride) (int64)",
          "source": C(RAMS, ln(RAMS, r"_sparse_attn_prefill_ragged_kernel\[\(num_queries, triton\.cdiv\(num_heads, block_h\)\)\]\(", la)),
          "call": "rocm-aiter-mla-sparse-ops.sparse-attn-prefill-ragged-kernel", "input": {"num_tokens": "= input.num_queries", "num_heads": "= input.num_heads", "head_size": "= input.head_dim"}},
@@ -948,13 +981,15 @@ def scenarios():
                          "[steps.i4, steps.i8, steps.f8h].all(s, s.result.value.is_per_token_head) && steps.uq.result.value.is_ultraquant"]})
     S.append({"id": "attention-common-metadata", "name": "CommonAttentionMetadata: batch size, query lengths, computed tokens, token->request map, unpadding", "fixtures": FX,
               "steps": [step("common-attention-metadata.batch-size", {"query_start_loc": [0, 3, 4, 6], "seq_lens": [10, 5, 2]}, "b"),
-                        step("common-attention-metadata.batch-size", {"query_start_loc": [0, 3], "seq_lens": [10, 5]}, "bad"),
+                        step("common-attention-metadata.batch-size", {"query_start_loc": [0, 3, 4], "seq_lens": [10, 5, 2]}, "bad"),
+                        step("common-attention-metadata.batch-size", {"query_start_loc": [0, 3], "seq_lens": [10, 5]}, "bcast"),
                         step("common-attention-metadata.token-to-req-indices", {"query_start_loc": [0, 3, 4, 6], "query_start_loc_cpu": [0, 3, 4, 6], "num_actual_tokens": 8, "buffer_size": 8}, "t"),
                         step("common-attention-metadata.token-to-req-indices", {"query_start_loc_cpu": [0, 3, 4, 6], "num_actual_tokens": 8, "buffer_size": 4}, "small"),
                         step("common-attention-metadata.unpadded", {"query_start_loc": [0, 1, 2, 2, 2], "seq_lens": [7, 9, 0, 0], "slot_mapping": [6, 24, -1, -1], "num_actual_reqs": 2, "num_actual_tokens": 2}, "u"),
                         step("common-attention-metadata.unpadded", {"seq_lens": [7], "slot_mapping": [6], "num_actual_reqs": 4, "num_actual_tokens": 4}, "u2")],
               "expect": ["steps.b.result.value.batch_size == 3 && steps.b.result.value.query_lens == [3, 1, 2] && steps.b.result.value.num_computed_tokens == [7, 4, 0]",
-                         "!steps.bad.result.ok && steps.bad.result.error.code == 'value-error'",
+                         "!steps.bad.result.ok && steps.bad.result.error.code == 'runtime-error' && steps.bad.result.error.message == 'The size of tensor a (3) must match the size of tensor b (2) at non-singleton dimension 0'",
+                         "steps.bcast.result.value.num_computed_tokens == [7, 2]",
                          "steps.t.result.value.token_to_req == [0, 0, 0, 1, 2, 2, 0, 0]",
                          "!steps.small.result.ok && steps.small.result.error.code == 'assertion-error'",
                          "steps.u.result.value.seq_lens == [7, 9] && steps.u.result.value.slot_mapping == [6, 24] && steps.u.result.value.query_start_loc == [0, 1, 2]",
@@ -1062,7 +1097,7 @@ def scenarios():
                         {"flow": "attn-mla-prefill-select", "input": {"is_cpu": True, "mla_prefill_backend": "FLASHINFER", "has_model_config": False}, "as": "cpu"}],
               "expect": ["steps.fa.result.value.backend == 'FLASH_ATTN' && !steps.fa.result.value.auto",
                          "!steps.fi.result.ok && steps.fi.result.error.code == 'value-error' && steps.fi.result.error.message.contains('compute capability 9.0 not supported')",
-                         "!steps.zen.result.ok && steps.zen.result.error.message.endsWith('[ImportError]') && !steps.cust.result.ok",
+                         "!steps.zen.result.ok && steps.zen.result.error.message.endsWith(\"['ImportError']\") && !steps.cust.result.ok",
                          "!steps.dims.result.ok && steps.dims.result.error.message.contains('dtype float32 not supported') && steps.dims.result.error.message.contains('MLA dimensions')",
                          "steps.auto.result.value.auto && steps.cpu.result.value.auto",
                          "state['mla-prefill-backend-enum@rank0'].overrides['MISSING'] == 'missing.module.Backend'"]})

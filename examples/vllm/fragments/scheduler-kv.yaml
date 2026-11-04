@@ -72,6 +72,20 @@ configs:
     summary: "long_prefill_token_threshold: cap on one request's prefill chunk per step (0 = off; ignored when only one request is eligible)"
     sources: ["vllm/config/scheduler.py:79", "vllm/engine/arg_utils.py:600", "vllm/v1/core/sched/scheduler.py:643-650"]
     attributes: {key: long_prefill_token_threshold}
+  - id: long-prefill-token-threshold-adaptive
+    type: boolean
+    value: false
+    default: false
+    summary: "long_prefill_token_threshold_adaptive: floor the long-prefill cap at max_num_batched_tokens // (running + waiting), so it never cuts a request below its fair share of the budget"
+    sources: ["vllm/config/scheduler.py:86", "vllm/v1/core/sched/scheduler.py:142-144", "vllm/v1/core/sched/scheduler.py:650-655"]
+    attributes: {key: long_prefill_token_threshold_adaptive}
+  - id: disable-chunked-mm-input
+    type: boolean
+    value: false
+    default: false
+    summary: "disable_chunked_mm_input: never schedule part of a multimodal item; a chunk that would cut one is rolled back to just before it (forced on for encoder-decoder models)"
+    sources: ["vllm/config/scheduler.py:167", "vllm/config/scheduler.py:292-295", "vllm/v1/core/sched/scheduler.py:1866-1881"]
+    attributes: {key: disable_chunked_mm_input}
   - id: watermark
     type: number
     value: 0.0
@@ -117,6 +131,7 @@ configs:
   - {id: enable-lora, type: boolean, value: false, default: false, summary: enable_lora, sources: ["vllm/engine/arg_utils.py:676"], attributes: {key: enable_lora, boundary: true, owner: config-platform}}
   - {id: max-loras, type: integer, value: 1, default: 1, summary: "max_loras: GPU LoRA slots per batch. Deployed = default (LoRA itself is off unless --enable-lora).", sources: ["vllm/config/lora.py:35", "vllm/engine/arg_utils.py:677"], attributes: {key: max_loras, boundary: true, owner: models-layers}}
   - {id: disable-log-stats, type: boolean, value: false, default: false, summary: "disable_log_stats: false for vllm serve, so AsyncLLM/LLMEngine log_stats is true and the StatLoggerManager records each step. The offline LLM class overrides it to true unless the caller passes it (vllm/entrypoints/llm.py:226-227).", sources: ["vllm/engine/arg_utils.py:612", "vllm/v1/engine/async_llm.py:287"], attributes: {key: disable_log_stats, boundary: true, owner: engine-core}}
+  - {id: mm-encoder-only, type: boolean, value: false, default: false, summary: "MultiModalConfig.mm_encoder_only (--mm-encoder-only, or set for a dedicated EC producer): the instance runs only the multimodal encoder and publishes embeddings, so the scheduler finishes a request once its prompt is consumed, without sampling.", sources: ["vllm/config/vllm.py:567-574", "vllm/config/vllm.py:2778-2790", "vllm/v1/core/sched/scheduler.py:116"], attributes: {key: mm_encoder_only, boundary: true, owner: config-platform}}
   - {id: enable-kv-cache-events, type: boolean, value: false, default: false, summary: "kv_events_config.enable_kv_cache_events: off unless --kv-events-config enables it; then the scheduler's EventPublisherFactory builds a ZMQ publisher.", sources: ["vllm/config/kv_events.py:14", "vllm/engine/arg_utils.py:771"], attributes: {key: kv_events_config.enable_kv_cache_events, boundary: true, owner: distributed}}
   - {id: vllm-regex-compilation-timeout-s, type: integer, value: 5, default: 5, summary: "VLLM_REGEX_COMPILATION_TIMEOUT_S: seconds a regex compile may take (0 disables the guard)", sources: ["vllm/envs.py:1710-1711"], attributes: {boundary: true, owner: config-platform, key: VLLM_REGEX_COMPILATION_TIMEOUT_S}}
   - id: scheduler-kv-redos-compile-ms
@@ -172,7 +187,10 @@ components:
           num_waiting_for_streaming_input: {type: integer}
           finished_recving_kv_req_ids: {type: array, items: {type: string}}
           grammar_compile_error_reqs: {type: array, items: {type: string}, description: "Requests whose grammar failed to compile; update_from_output finishes them with FINISHED_ERROR (scheduler.py:252, 2302-2326)."}
-      initial: {requests: {}, waiting: [], running: [], finished_req_ids: [], preempted_req_ids: [], current_step: 0, pause_state: UNPAUSED, num_waiting_for_streaming_input: 0, finished_recving_kv_req_ids: [], grammar_compile_error_reqs: []}
+          deferred_waiting: {type: array, items: {type: string}, description: "Waiting requests a scheduling pass skipped (blocked on a grammar or remote KV, stale in-flight output, max_loras); SchedulerStats reports them as skipped, not waiting (scheduler.py:230, 904-910, 2944-2948)."}
+          prev_step_scheduled_req_ids: {type: array, items: {type: string}, description: "MRV1 only: the ids scheduled last step; a cached request not in it gets its all_token_ids again (scheduler.py:1449-1452, 1731-1733)."}
+          max_num_encoder_input_tokens: {type: integer, description: "Encoder compute budget per step: MultiModalBudget.encoder_compute_budget, 0 for a text-only model (scheduler.py:271-273)."}
+      initial: {requests: {}, waiting: [], running: [], finished_req_ids: [], preempted_req_ids: [], current_step: 0, pause_state: UNPAUSED, num_waiting_for_streaming_input: 0, finished_recving_kv_req_ids: [], grammar_compile_error_reqs: [], deferred_waiting: [], prev_step_scheduled_req_ids: [], max_num_encoder_input_tokens: 0}
   - id: fcfs-request-queue
     name: FCFSRequestQueue
     kind: module
@@ -639,6 +657,18 @@ components:
     state:
       schema: {type: object, properties: {tiers: {type: object}}}
       initial: {tiers: {}}
+  - id: p2p-secondary-tier-manager
+    name: P2PSecondaryTierManager
+    kind: module
+    parent: kv-offload
+    summary: "The P2P secondary tier: one session per remote peer (host:port) both loads blocks from and serves blocks to that peer over a ZMQ control connection; prefiller-side requests are bound to the session that fetched them; the NONE_HASH seed is resolved lazily and advertised in each session's handshake."
+    description: "Single-threaded: every public method runs on the scheduler thread (manager.py:209-213). state.tiers is keyed by tier id: local_id, hash_seed (null until the first session), sessions (peer id -> {connected, local_hash_seed, finished}), kv_to_session (kv_request_id -> peer id), failed_req_ids, unbound_stores, unbound_store_timeout_s. The NIXL data transport and the wire protocol are not modeled."
+    attributes: {single_writer: "The engine-core busy-loop thread is the only caller: other threads only put requests on the mutex-guarded input_queue, which the busy loop drains before each step (vllm/v1/engine/core.py:1574-1600)."}
+    capacity: {concurrency: 1}
+    sources: ["vllm/v1/kv_offload/tiering/p2p/manager.py:202-345"]
+    state:
+      schema: {type: object, properties: {tiers: {type: object}}}
+      initial: {tiers: {}}
   - id: zmq-transport
     name: ZmqTransport (P2P tier control plane)
     kind: module
@@ -678,6 +708,9 @@ schemas:
             stop_token_ids: {type: array, items: {type: integer}, examples: [[128001, 128008]]}
             ignore_eos: {type: boolean, examples: [false]}
             structured_outputs: {type: [object, "null"], description: "StructuredOutputsParams (json, regex, choice, grammar, json_object, structural_tag); a request with any constraint starts in WAITING_FOR_STRUCTURED_OUTPUT_GRAMMAR (request.py:116-117)."}
+            prompt_logprobs: {type: [integer, "null"], default: null, description: "Prompt logprobs requested; unless skip_reading_prefix_cache is set, it defaults the request to skip reading the prefix cache (sampling_params.py:622-629)."}
+            prompt_logprob_token_ids: {type: [array, "null"], default: null, items: {type: integer}}
+            skip_reading_prefix_cache: {type: [boolean, "null"], default: null, description: "None resolves to prompt_logprobs is not None or prompt_logprob_token_ids is not None (sampling_params.py:622-629)."}
         arrival_time: {type: [number, "null"], default: null, description: "Engine arrival time; null means now."}
         priority: {type: integer, examples: [0]}
         grammar_id: {type: [string, "null"], default: null, description: "Set when the request uses structured output (its compiled grammar)."}
@@ -692,6 +725,19 @@ schemas:
             lora_int_id: {type: integer, examples: [1]}
             lora_path: {type: string, examples: [/adapters/sql-lora]}
         client_index: {type: integer, examples: [0]}
+        mm_features:
+          type: array
+          default: []
+          description: "Request.mm_features sorted by offset: each multimodal item's identifier (mm_hash), its placeholder range (offset, length) and its embedding count (PlaceholderRange.get_num_embeds; the length when every placeholder is an embedding)."
+          items:
+            type: object
+            required: [identifier, offset, length]
+            properties:
+              identifier: {type: string, examples: [img-stop-sign]}
+              modality: {type: string, examples: [image]}
+              offset: {type: integer, examples: [8]}
+              length: {type: integer, examples: [800]}
+              num_embeds: {type: integer, examples: [800]}
   - id: SchedKvBlock
     summary: "A KV cache block as the prefix-cache lookup returns it."
     schema: {type: object, properties: {block_id: {type: integer}, ref_cnt: {type: integer}}}
@@ -712,6 +758,7 @@ schemas:
               num_cached_tokens: {type: integer}
               client_index: {type: integer}
               kv_transfer_params: {}
+              events: {type: [array, "null"], description: "EngineCoreEvents taken from the request (QUEUED, SCHEDULED, PREEMPTED with timestamps); null when none. The output processor's IterationStats counts PREEMPTED events as num_preempted_reqs (vllm/v1/metrics/stats.py:576-577).", items: {type: object, properties: {type: {type: string, enum: [QUEUED, SCHEDULED, PREEMPTED]}, timestamp: {type: number}}}}
         finished_req_ids: {type: array, items: {type: string}}
 
 interfaces:
@@ -751,7 +798,10 @@ interfaces:
     response: {type: object, properties: {num_free_blocks: {type: integer}}}
     behavior:
       - if: "input.num_gpu_blocks <= 0"
-        then: [{fail: {code: assertion-error, status: 0, message: "num_gpu_blocks must be a positive int"}}]
+        then:
+          - title: "assert isinstance(num_gpu_blocks, int) and num_gpu_blocks > 0 (a bare assert: no message)"
+            source: "vllm/v1/core/block_pool.py:166"
+            fail: {code: assertion-error, status: 0, message: ""}
       - title: All blocks free; pop block 0 as the null block
         source: "vllm/v1/core/block_pool.py:172-189"
         set:
@@ -1392,11 +1442,14 @@ interfaces:
     latency_ms: 0
     summary: "Count one admitted request's prefix-cache queries (its tokens) and hits; preempted re-admissions count separately."
     sources: ["vllm/v1/core/kv_cache_manager.py:253-262", "vllm/v1/metrics/stats.py:138-155"]
-    request: {type: object, required: [num_tokens, num_hits], properties: {num_tokens: {type: integer}, num_hits: {type: integer}, preempted: {type: boolean}}}
+    request: {type: object, required: [num_tokens, num_hits], properties: {num_tokens: {type: integer}, num_hits: {type: integer}, preempted: {type: boolean}, skip_reading_prefix_cache: {type: boolean, default: false, description: "The request skipped the lookup (prompt logprobs); it is not counted."}}}
     response: {type: object}
     behavior:
-      - if: "!config['enable-prefix-caching']"
-        then: [{return: {recorded: false}}]
+      - if: "config['disable-log-stats'] || !config['enable-prefix-caching'] || (has(input.skip_reading_prefix_cache) && input.skip_reading_prefix_cache)"
+        then:
+          - title: Stats off, or the request skipped the cache lookup - not counted
+            source: "vllm/v1/core/kv_cache_manager.py:253-256"
+            return: {recorded: false}
       - if: "has(input.preempted) && input.preempted"
         then:
           - set:
@@ -1518,14 +1571,23 @@ interfaces:
             then:
               - title: No memory left for the KV cache
                 source: "vllm/v1/core/kv_cache_utils.py:1009-1017"
-                fail: {code: value-error, status: 0, message: "No available memory for the cache blocks. Try increasing `gpu_memory_utilization` when initializing the engine."}
+                fail: {code: value-error, status: 0, message: "No available memory for the cache blocks. Try increasing `gpu_memory_utilization` when initializing the engine (this flag also controls CPU memory reservation on the CPU backend, despite its name). See https://docs.vllm.ai/en/latest/configuration/conserving_memory/ for more details."}
           - set:
               vars.needed: "= (int(config['max-model-len']) + int(config['block-size']) - 1) / int(config['block-size']) * vars.bpb"
           - if: "vars.needed > vars.avail - vars.bpb"
             then:
+              - set:
+                  vars.check: "= vars.avail - vars.bpb"
+                  vars.need_gib: "= double(int(double(vars.needed) / 1073741824.0 * 100.0 + 0.5)) / 100.0"
+                  vars.avail_gib: "= double(int(double(vars.avail - vars.bpb) / 1073741824.0 * 100.0 + 0.5)) / 100.0"
+              - set:
+                  vars.est: "= math.least([(vars.check / vars.bpb) * int(config['block-size']), int(config['max-model-len'])])"
+                  vars.need_s: "= string(vars.need_gib).contains('.') ? string(vars.need_gib) : string(vars.need_gib) + '.0'"
+                  vars.avail_s: "= string(vars.avail_gib).contains('.') ? string(vars.avail_gib) : string(vars.avail_gib) + '.0'"
               - title: One max_model_len request does not fit
+                detail: "format_gib is round(bytes / GiB, 2); the estimated length is the binary search's answer, the largest length whose cdiv(len, block_size) blocks fit in the memory left after the null block (0 omits the sentence)."
                 source: "vllm/v1/core/kv_cache_utils.py:1019-1040"
-                fail: {code: value-error, status: 0, message: "= 'To serve at least one request with the model\\'s max seq len (' + string(int(config['max-model-len'])) + '), (' + string(vars.needed / 1073741824) + ' GiB KV cache is needed, which is larger than the available KV cache memory. Based on the available memory, the estimated maximum model length is ' + string((vars.avail - vars.bpb) / vars.bpb * int(config['block-size'])) + '. Try increasing `gpu_memory_utilization` or decreasing `max_model_len` when initializing the engine.'"}
+                fail: {code: value-error, status: 0, message: "= 'To serve at least one request with the model\\'s max seq len (' + string(int(config['max-model-len'])) + '), (' + vars.need_s + ' GiB KV cache is needed, which is larger than the available KV cache memory (' + vars.avail_s + ' GiB). ' + (vars.est > 0 ? 'Based on the available memory, the estimated maximum model length is ' + string(vars.est) + '. ' : '') + 'Try increasing `gpu_memory_utilization` (which also controls CPU memory on the CPU backend) or decreasing `max_model_len` when initializing the engine. See https://docs.vllm.ai/en/latest/configuration/conserving_memory/ for more details.'"}
       - set:
           vars.n: "= math.least(input.available_memory.map(m, m / vars.bpb))"
       - if: "'num-gpu-blocks-override' in config && config['num-gpu-blocks-override'] != null"
@@ -1817,6 +1879,12 @@ interfaces:
           vars.salt: "= has(input.cache_salt) && input.cache_salt != null ? input.cache_salt : dyn(null)"
           vars.status: WAITING
           vars.grammar_id: "= has(input.grammar_id) ? input.grammar_id : dyn(null)"
+      - title: Prompt logprobs skip reading the prefix cache unless the request says otherwise
+        detail: "SamplingParams resolves skip_reading_prefix_cache=None to prompt_logprobs is not None or prompt_logprob_token_ids is not None, because cached prompt tokens have no logits; Request.get_skip_reading_prefix_cache returns it."
+        source: "vllm/sampling_params.py:622-629"
+        set:
+          vars.skip_read: "= has(vars.sp.skip_reading_prefix_cache) && vars.sp.skip_reading_prefix_cache != null ? vars.sp.skip_reading_prefix_cache : ((has(vars.sp.prompt_logprobs) && vars.sp.prompt_logprobs != null) || (has(vars.sp.prompt_logprob_token_ids) && vars.sp.prompt_logprob_token_ids != null))"
+          vars.mm: "= has(input.mm_features) && input.mm_features != null ? input.mm_features.map(f, {'identifier': f.identifier, 'offset': f.offset, 'length': f.length, 'num_embeds': has(f.num_embeds) ? f.num_embeds : f.length}) : []"
       - if: "has(vars.sp.structured_outputs) && vars.sp.structured_outputs != null && size(vars.sp.structured_outputs) > 0"
         then:
           - title: A structured-output request waits for its grammar
@@ -1836,10 +1904,11 @@ interfaces:
             as: h
           - set: {vars.hashes: "= vars.h.value.new_block_hashes"}
       - title: Enqueue in the waiting queue
-        detail: "FCFS appends to the deque; priority pushes onto the heap (ordering is applied at peek)."
-        source: "vllm/v1/core/sched/scheduler.py:2633-2635"
+        detail: "_enqueue_waiting_request: FCFS appends to the deque, priority pushes onto the heap (ordering is applied at peek); a request blocked on its grammar is also counted as deferred."
+        source: "vllm/v1/core/sched/scheduler.py:2457-2462"
         set:
           state.waiting: "= state.waiting + [input.request_id]"
+          state.deferred_waiting: "= vars.status == 'WAITING_FOR_STRUCTURED_OUTPUT_GRAMMAR' ? state.deferred_waiting + [input.request_id] : state.deferred_waiting"
           state.requests: >-
             = merge(state.requests, {input.request_id: {
               'request_id': input.request_id, 'status': vars.status,
@@ -1859,13 +1928,16 @@ interfaces:
               'kv_transfer_params': has(input.kv_transfer_params) ? input.kv_transfer_params : dyn(null),
               'num_preemptions': 0, 'num_cached_tokens': -1, 'is_prefill_chunk': true,
               'grammar_id': vars.grammar_id,
+              'skip_reading_prefix_cache': vars.skip_read, 'mm_features': vars.mm,
+              'num_in_flight_tokens': 0, 'num_stale_output_tokens': 0, 'drop_stale_output': false,
+              'events': config['disable-log-stats'] ? [] : [{'type': 'QUEUED', 'timestamp': double(now_us) / 1000000.0}],
               'client_index': has(input.client_index) ? input.client_index : 0}})
       - if: "config['kv-connector'] != ''"
         then:
           - title: Tell the KV connector about the new request; adopt any fields its hook changed
             source: "vllm/v1/core/sched/scheduler.py:2639-2645"
             call: kv-connector-base-v1.on-new-request
-            input: "= {'request_id': input.request_id, 'num_prompt_tokens': vars.num_prompt, 'max_tokens': state.requests[input.request_id].max_tokens, 'kv_transfer_params': state.requests[input.request_id].kv_transfer_params, 'prompt_token_ids': has(input.prompt_token_ids) && input.prompt_token_ids != null && size(input.prompt_token_ids) <= 64 && size(vars.segs) == size(input.prompt_token_ids) ? input.prompt_token_ids : []}"
+            input: "= {'request_id': input.request_id, 'num_prompt_tokens': vars.num_prompt, 'max_tokens': state.requests[input.request_id].max_tokens, 'kv_transfer_params': state.requests[input.request_id].kv_transfer_params, 'prompt_token_ids': has(input.prompt_token_ids) && input.prompt_token_ids != null && size(vars.segs) == size(input.prompt_token_ids) ? input.prompt_token_ids : []}"
             as: conn
           - if: "vars.conn.value.truncated"
             then:
@@ -1879,31 +1951,49 @@ interfaces:
     name: preempt-request
     kind: function
     latency_ms: 0
-    summary: "Preempt a RUNNING request: free its KV blocks, reset num_computed_tokens to 0 (recompute) and put it back at the front of the waiting queue."
+    summary: "Preempt a RUNNING request: free its KV blocks and encoder inputs, reset num_computed_tokens to 0 (recompute), mark its in-flight output stale, record a PREEMPTED event and put it back at the front of the waiting queue."
     sources: ["vllm/v1/core/sched/scheduler.py:1571-1614"]
     errors: [{code: assertion-error, status: 0, retryable: false}]
-    request: {type: object, required: [request_id], properties: {request_id: {type: string}}}
-    response: {type: object, properties: {request_id: {type: string}, num_preemptions: {type: integer}}}
+    request:
+      type: object
+      required: [request_id]
+      properties:
+        request_id: {type: string}
+        drop_stale_output: {type: boolean, default: false, description: "Drop (rather than deliver) the in-flight output: reset_prefix_cache passes True, because the same-step resume would deliver tokens out of order."}
+    response: {type: object, properties: {request_id: {type: string}, num_preemptions: {type: integer}, num_stale_output_tokens: {type: integer}}}
     behavior:
       - if: "!(input.request_id in state.requests) || state.requests[input.request_id].status != 'RUNNING'"
         then:
           - title: Only running requests can be preempted
             source: "vllm/v1/core/sched/scheduler.py:1584-1586"
             fail: {code: assertion-error, status: 0, message: "Only running requests can be preempted"}
+      - set: {vars.r: "= state.requests[input.request_id]"}
       - title: Free the request's KV blocks
         detail: "Its cached full blocks stay in the prefix cache (ref_cnt 0, evictable), so resuming can hit them."
         source: "vllm/v1/core/sched/scheduler.py:1589"
         call: kv-cache-manager.free
         input: {request_id: "= input.request_id"}
-      - title: Reset to PREEMPTED and prepend to waiting
-        detail: "The caller removes it from running (pop() for FCFS, del by index for priority); prepend_request puts it at the deque head (heap push for priority)."
+      - if: "has(vars.r.mm_features) && size(vars.r.mm_features) > 0"
+        then:
+          - title: Release the request's encoder-cache references
+            source: "vllm/v1/core/sched/scheduler.py:1590"
+            call: encoder-cache-manager.free
+            input: {request_id: "= input.request_id", mm_hashes: "= vars.r.mm_features.map(f, f.identifier)"}
+      - title: Mark the in-flight output stale
+        detail: "Async scheduling: the tokens of steps still in flight are delivered on return but must not touch the reset counters; num_in_flight_tokens already includes any undrained stale share, so it is assigned. An undrained drop-mode share stays dropped."
+        source: "vllm/v1/core/sched/scheduler.py:1596-1607"
+        set:
+          vars.in_flight: "= has(vars.r.num_in_flight_tokens) ? vars.r.num_in_flight_tokens : 0"
+          vars.drop: "= (has(input.drop_stale_output) && input.drop_stale_output) || (has(vars.r.drop_stale_output) && vars.r.drop_stale_output && has(vars.r.num_stale_output_tokens) && vars.r.num_stale_output_tokens > 0)"
+      - title: Reset to PREEMPTED, record the PREEMPTED event and prepend to waiting
+        detail: "The caller removes it from running (pop() for FCFS, del by index for priority); prepend_request puts it at the deque head (heap push for priority). The id goes out in the next SchedulerOutput.preempted_req_ids."
         source: "vllm/v1/core/sched/scheduler.py:1592-1614"
         set:
-          state.requests: "= merge(state.requests, {input.request_id: {'status': 'PREEMPTED', 'num_computed_tokens': 0, 'num_output_placeholders': 0, 'num_preemptions': state.requests[input.request_id].num_preemptions + 1}})"
+          state.requests: "= merge(state.requests, {input.request_id: {'status': 'PREEMPTED', 'num_computed_tokens': 0, 'num_output_placeholders': 0, 'spec_token_ids': [], 'num_stale_output_tokens': vars.in_flight, 'drop_stale_output': vars.drop, 'num_preemptions': vars.r.num_preemptions + 1, 'events': config['disable-log-stats'] ? (has(vars.r.events) ? vars.r.events : []) : (has(vars.r.events) ? vars.r.events : []) + [{'type': 'PREEMPTED', 'timestamp': double(now_us) / 1000000.0}]}})"
           state.running: "= state.running.filter(r, r != input.request_id)"
           state.waiting: "= [input.request_id] + state.waiting"
           state.preempted_req_ids: "= state.preempted_req_ids + [input.request_id]"
-      - return: {request_id: "= input.request_id", num_preemptions: "= state.requests[input.request_id].num_preemptions"}
+      - return: {request_id: "= input.request_id", num_preemptions: "= state.requests[input.request_id].num_preemptions", num_stale_output_tokens: "= vars.in_flight"}
 
   - component: scheduler
     name: free-request
@@ -1934,6 +2024,12 @@ interfaces:
               block_ids: ["= vars.tbl.value.block_ids"]
             as: cf
           - set: {vars.delay: "= vars.cf.value.delay_free_blocks", vars.params: "= vars.cf.value.kv_transfer_params"}
+      - if: "input.request_id in state.requests && has(state.requests[input.request_id].mm_features) && size(state.requests[input.request_id].mm_features) > 0"
+        then:
+          - title: Release the request's encoder-cache references
+            source: "vllm/v1/core/sched/scheduler.py:2734"
+            call: encoder-cache-manager.free
+            input: {request_id: "= input.request_id", mm_hashes: "= state.requests[input.request_id].mm_features.map(f, f.identifier)"}
       - set: {state.finished_req_ids: "= state.finished_req_ids + [input.request_id]"}
       - if: "vars.delay"
         then:
@@ -1981,7 +2077,11 @@ interfaces:
             then:
               - set: {state.running: "= state.running.filter(r, r != vars.rid)"}
             else:
-              - set: {state.waiting: "= state.waiting.filter(r, r != vars.rid)"}
+              - title: Remove it from the waiting queues and the deferred set
+                source: "vllm/v1/core/sched/scheduler.py:2694-2697"
+                set:
+                  state.waiting: "= state.waiting.filter(r, r != vars.rid)"
+                  state.deferred_waiting: "= state.deferred_waiting.filter(r, r != vars.rid)"
           - set: {state.requests: "= merge(state.requests, {vars.rid: {'status': vars.status}})"}
           - call: scheduler.free-request
             input: {request_id: "= vars.rid"}
@@ -2003,14 +2103,15 @@ interfaces:
     name: make-stats
     kind: function
     latency_ms: 0
-    summary: "SchedulerStats for the step: running and waiting counts, KV cache usage and the prefix-cache stats since the last call."
+    summary: "SchedulerStats for the step: running, waiting and deferred (skipped) waiting counts, KV cache usage and the prefix-cache stats since the last call."
     sources: ["vllm/v1/core/sched/scheduler.py:2915-2959"]
     request: {type: object, properties: {spec_decoding_stats: {type: [object, "null"], default: null}}}
     response:
       type: [object, "null"]
       properties:
         num_running_reqs: {type: integer}
-        num_waiting_reqs: {type: integer}
+        num_waiting_reqs: {type: integer, description: "Waiting requests minus the deferred ones (scheduler.py:2944-2947)."}
+        num_skipped_waiting_reqs: {type: integer, description: "Waiting requests a scheduling pass skipped and that are still deferred (scheduler.py:2948)."}
         kv_cache_usage: {type: number}
         prefix_cache_stats: {type: object}
         spec_decoding_stats: {type: [object, "null"]}
@@ -2028,7 +2129,8 @@ interfaces:
         source: "vllm/v1/core/sched/scheduler.py:2943-2959"
         return:
           num_running_reqs: "= size(state.running)"
-          num_waiting_reqs: "= size(state.waiting)"
+          num_waiting_reqs: "= size(state.waiting) - size(state.deferred_waiting.filter(r, r in state.waiting))"
+          num_skipped_waiting_reqs: "= size(state.deferred_waiting.filter(r, r in state.waiting))"
           kv_cache_usage: "= vars.usage.value.usage"
           prefix_cache_stats: "= vars.pcs.value"
           spec_decoding_stats: "= has(input.spec_decoding_stats) ? input.spec_decoding_stats : dyn(null)"
@@ -2037,29 +2139,50 @@ interfaces:
     name: reset-prefix-cache
     kind: function
     latency_ms: 0
-    summary: "Reset the prefix cache; with reset_running_requests every running request is preempted first so the reset can succeed."
-    sources: ["vllm/v1/core/sched/scheduler.py:2840-2883"]
+    summary: "Reset the prefix cache; with reset_running_requests every running request is preempted first (dropping its in-flight output) so the reset can succeed; with reset_connector the KV connector's cache is reset too."
+    sources: ["vllm/v1/core/sched/scheduler.py:2840-2883", "vllm/v1/core/sched/scheduler.py:2885-2906"]
     errors: [{code: runtime-error, status: 0, retryable: false}]
-    request: {type: object, properties: {reset_running_requests: {type: boolean, default: false}}}
+    request:
+      type: object
+      properties:
+        reset_running_requests: {type: boolean, default: false}
+        reset_connector: {type: boolean, default: false, description: "Also reset the KV connector's cache (reset_connector_cache); with no connector that counts as success."}
     response: {type: object, properties: {reset: {type: boolean}}}
     behavior:
       - if: "has(input.reset_running_requests) && input.reset_running_requests"
         then:
-          - title: Preempt every running request, last first
-            source: "vllm/v1/core/sched/scheduler.py:2850-2866"
+          - title: Preempt every running request, last first, dropping its stale in-flight output
+            detail: "The requests are preempted and resumed in the same step, so output still in flight would arrive out of order: drop_stale_output=True."
+            source: "vllm/v1/core/sched/scheduler.py:2850-2860"
             foreach: "= state.running.reverse()"
             as: rid
             steps:
               - call: scheduler.preempt-request
-                input: {request_id: "= vars.rid"}
+                input: {request_id: "= vars.rid", drop_stale_output: true}
+          - title: Forget which requests ran last step (they are flushed from the persistent batch)
+            source: "vllm/v1/core/sched/scheduler.py:2862-2866"
+            set: {state.prev_step_scheduled_req_ids: []}
       - call: kv-cache-manager.reset-prefix-cache
         as: r
       - if: "has(input.reset_running_requests) && input.reset_running_requests && !vars.r.value.reset"
         then:
           - title: Reset failed even after preempting everything
             source: "vllm/v1/core/sched/scheduler.py:2868-2874"
-            fail: {code: runtime-error, status: 0, message: "Failed to reset KV cache even when all the running requests are preempted and moved to the waiting queue."}
-      - return: {reset: "= vars.r.value.reset"}
+            fail: {code: runtime-error, status: 0, message: "Failed to reset KV cache even when all the running requests are preempted and moved to the waiting queue. This is likely due to the presence of running requests waiting for remote KV transfer, which is not supported yet."}
+      - set: {vars.ok: "= vars.r.value.reset"}
+      - if: "has(input.reset_connector) && input.reset_connector"
+        then:
+          - if: "config['kv-connector'] == ''"
+            then:
+              - title: No KV connector - nothing to reset, which counts as success
+                source: "vllm/v1/core/sched/scheduler.py:2886-2895"
+            else:
+              - title: Reset the connector's cache; False fails the whole reset
+                source: "vllm/v1/core/sched/scheduler.py:2897-2898"
+                call: kv-connector-base-v1.reset-cache
+                as: rc
+              - set: {vars.ok: "= vars.rc.value.reset != false && vars.ok"}
+      - return: {reset: "= vars.ok"}
 
   # ------------------------------------------------------------------ schedule()
   - component: scheduler
@@ -2097,9 +2220,16 @@ interfaces:
           vars.k: "= int(config['num-speculative-tokens'])"
           vars.lookahead: "= config['speculative-method'] != '' && config['speculative-method'] != 'ngram' ? int(config['num-speculative-tokens']) : 0"
       - title: Long-prefill cap only when another request could starve
-        source: "vllm/v1/core/sched/scheduler.py:640-645"
+        source: "vllm/v1/core/sched/scheduler.py:640-649"
         set:
           vars.long_thr: "= size(state.running) + size(state.waiting) > 1 ? int(config['long-prefill-token-threshold']) : 0"
+      - if: "vars.long_thr > 0 && config['long-prefill-token-threshold-adaptive']"
+        then:
+          - title: Adaptive cap - floor it at a fair share of the input budget
+            detail: "max(long_prefill_token_threshold, max_num_batched_tokens // (running + waiting)), so the cap never cuts a request below its share."
+            source: "vllm/v1/core/sched/scheduler.py:650-655"
+            set:
+              vars.long_thr: "= math.greatest(vars.long_thr, int(config['max-num-batched-tokens']) / (size(state.running) + size(state.waiting)))"
       - title: First, schedule the RUNNING requests
         source: "vllm/v1/core/sched/scheduler.py:657-659"
         foreach: "= lists.range(size(state.running))"
@@ -2125,10 +2255,18 @@ interfaces:
               vars.num_new: "= vars.long_thr > 0 && vars.long_thr < vars.num_new ? vars.long_thr : vars.num_new"
           - set:
               vars.num_new: "= math.least([vars.num_new, vars.token_budget, int(config['max-model-len']) - vars.req.num_computed_tokens - 1])"
+          - if: "has(vars.req.mm_features) && size(vars.req.mm_features) > 0"
+            then:
+              - title: Schedule the request's encoder inputs in this chunk
+                source: "vllm/v1/core/sched/scheduler.py:729-747"
+                call: scheduler.try-schedule-encoder-inputs
+                input: {request_id: "= vars.rid", mm_features: "= vars.req.mm_features", num_computed_tokens: "= vars.req.num_computed_tokens", num_new_tokens: "= vars.num_new", encoder_compute_budget: "= has(vars.enc_budget) ? vars.enc_budget : (has(state.max_num_encoder_input_tokens) ? state.max_num_encoder_input_tokens : 0)"}
+                as: tenc
+              - set: {vars.enc: "= vars.tenc.value", vars.num_new: "= vars.tenc.value.num_new_tokens"}
           - if: "vars.num_new <= 0"
             then:
-              - title: Nothing to schedule for this request; try the next
-                source: "vllm/v1/core/sched/scheduler.py:755-779"
+              - title: Nothing to schedule for this request (or the encoder budget or cache is exhausted); try the next
+                source: "vllm/v1/core/sched/scheduler.py:755-773"
                 set: {vars.req_index: "= vars.req_index + 1"}
               - continue: true
           - set: {vars.alloc_ok: false}
@@ -2200,6 +2338,15 @@ interfaces:
                 set:
                   vars.spec: "= vars.n_spec > 0 ? merge(vars.spec, {vars.rid: vars.req.spec_token_ids.slice(0, math.least(vars.n_spec, size(vars.req.spec_token_ids)))}) : vars.spec"
                   state.requests: "= merge(state.requests, {vars.rid: {'spec_token_ids': []}})"
+          - if: "has(vars.req.mm_features) && size(vars.req.mm_features) > 0 && size(vars.enc.encoder_inputs_to_schedule) > 0"
+            then:
+              - title: Encoder-related - record the scheduled inputs, spend the budget and reserve cache slots
+                source: "vllm/v1/core/sched/scheduler.py:878-887"
+                set:
+                  vars.enc_sched: "= merge(has(vars.enc_sched) ? vars.enc_sched : {}, {vars.rid: vars.enc.encoder_inputs_to_schedule})"
+                  vars.enc_budget: "= vars.enc.encoder_compute_budget"
+              - call: scheduler.allocate-encoder-inputs
+                input: {request_id: "= vars.rid", mm_features: "= vars.req.mm_features", input_ids: "= vars.enc.encoder_inputs_to_schedule", duplicate_input_ids: "= vars.enc.duplicate_encoder_inputs"}
       - title: Record the LoRAs of the scheduled running requests
         source: "vllm/v1/core/sched/scheduler.py:889-897"
         set:
@@ -2257,6 +2404,12 @@ interfaces:
                   - title: Grammar ready; promote to WAITING
                     source: "vllm/v1/core/sched/scheduler.py:3198-3199"
                     set: {state.requests: "= merge(state.requests, {vars.wid: {'status': 'WAITING'}})"}
+              - if: "has(state.requests[vars.wid].num_stale_output_tokens) && state.requests[vars.wid].num_stale_output_tokens > 0 && !state.requests[vars.wid].drop_stale_output"
+                then:
+                  - title: Deliverable stale output still in flight - resuming now could resample a position that output delivers; skip
+                    source: "vllm/v1/core/sched/scheduler.py:934-938"
+                    set: {vars.skipped: "= vars.skipped + [vars.wid]"}
+                  - continue: true
               - if: "config['enable-lora'] && has(state.requests[vars.wid].lora_request) && state.requests[vars.wid].lora_request != null && size(vars.loras) == int(config['max-loras']) && !(state.requests[vars.wid].lora_request.lora_int_id in vars.loras)"
                 then:
                   - title: Admitting it would exceed max_loras; skip this request this step
@@ -2295,7 +2448,7 @@ interfaces:
                   - title: Look up already-cached tokens
                     source: "vllm/v1/core/sched/scheduler.py:960-968"
                     call: kv-cache-manager.get-computed-blocks
-                    input: {request_id: "= vars.wid", block_hashes: "= vars.wreq.block_hashes", num_tokens: "= vars.num_tokens"}
+                    input: {request_id: "= vars.wid", block_hashes: "= vars.wreq.block_hashes", num_tokens: "= vars.num_tokens", skip_reading_prefix_cache: "= has(vars.wreq.skip_reading_prefix_cache) && vars.wreq.skip_reading_prefix_cache"}
                     as: hit
                   - set: {vars.hit_blocks: "= vars.hit.value.blocks", vars.num_hit: "= vars.hit.value.num_computed_tokens", vars.mamba_hit: "= vars.hit.value.mamba_block"}
                   - if: "config['kv-connector'] != ''"
@@ -2312,6 +2465,11 @@ interfaces:
                           block_hashes: "= vars.wreq.block_hashes"
                         as: ext
                       - set: {vars.num_ext: "= vars.ext.value.num_external_tokens", vars.load_async: "= vars.ext.value.load_async && vars.ext.value.num_external_tokens > 0"}
+                      - if: "has(vars.wreq.skip_reading_prefix_cache) && vars.wreq.skip_reading_prefix_cache"
+                        then:
+                          - title: A request that skips the prefix cache takes no external hit either
+                            source: "vllm/v1/core/sched/scheduler.py:983-984"
+                            set: {vars.num_ext: 0, vars.load_async: false}
               - title: Tokens to compute for this request
                 detail: "num_tokens (prompt plus any output a resumed request already has) minus local and external computed tokens; an async load schedules nothing now."
                 source: "vllm/v1/core/sched/scheduler.py:1125-1129"
@@ -2319,7 +2477,7 @@ interfaces:
                   vars.num_new: "= vars.load_async ? 0 : vars.num_tokens - vars.prior - vars.num_hit - vars.num_ext"
               - set:
                   vars.num_new: "= vars.long_thr > 0 && vars.long_thr < vars.num_new ? vars.long_thr : vars.num_new"
-              - if: "!vars.load_async && !config['enable-chunked-prefill'] && vars.num_new > vars.token_budget"
+              - if: "!vars.load_async && !config['enable-chunked-prefill'] && vars.num_new > vars.token_budget && !config['mm-encoder-only']"
                 then:
                   - title: Chunked prefill off and the prompt exceeds the remaining budget
                     source: "vllm/v1/core/sched/scheduler.py:1158-1167"
@@ -2328,6 +2486,19 @@ interfaces:
                 source: "vllm/v1/core/sched/scheduler.py:1169"
                 set:
                   vars.num_new: "= math.least(vars.num_new, vars.token_budget)"
+              - if: "has(vars.wreq.mm_features) && size(vars.wreq.mm_features) > 0"
+                then:
+                  - title: Schedule the request's encoder inputs in this chunk
+                    source: "vllm/v1/core/sched/scheduler.py:1195-1209"
+                    call: scheduler.try-schedule-encoder-inputs
+                    input: {request_id: "= vars.wid", mm_features: "= vars.wreq.mm_features", num_computed_tokens: "= vars.prior + vars.num_hit + vars.num_ext", num_new_tokens: "= vars.load_async ? 0 : vars.num_new", encoder_compute_budget: "= has(vars.enc_budget) ? vars.enc_budget : (has(state.max_num_encoder_input_tokens) ? state.max_num_encoder_input_tokens : 0)"}
+                    as: wtenc
+                  - set: {vars.wenc: "= vars.wtenc.value", vars.num_new: "= vars.wtenc.value.num_new_tokens"}
+                  - if: "vars.num_new == 0 && !vars.load_async"
+                    then:
+                      - title: The encoder budget or cache can't take the next item; stop admitting
+                        source: "vllm/v1/core/sched/scheduler.py:1217-1219"
+                        break: true
               - call: kv-cache-manager.allocate-slots
                 input:
                   request_id: "= vars.wid"
@@ -2347,8 +2518,14 @@ interfaces:
                 as: walloc
               - if: "!vars.walloc.value.allocated"
                 then:
+                  - if: "has(vars.wreq.mm_features) && size(vars.wreq.mm_features) > 0"
+                    then:
+                      - title: Untouch the request's encoder-cache references
+                        source: "vllm/v1/core/sched/scheduler.py:1275-1281"
+                        call: encoder-cache-manager.free
+                        input: {request_id: "= vars.wid", mm_hashes: "= vars.wreq.mm_features.map(f, f.identifier)"}
                   - title: Not enough KV blocks; stop admitting this step
-                    source: "vllm/v1/core/sched/scheduler.py:1275-1282"
+                    source: "vllm/v1/core/sched/scheduler.py:1272-1282"
                     break: true
               - if: "config['kv-connector'] != ''"
                 then:
@@ -2371,7 +2548,7 @@ interfaces:
                   - title: Record prefix-cache stats at admission
                     source: "vllm/v1/core/sched/scheduler.py:1314-1318"
                     call: kv-cache-manager.record-prefix-cache-stats
-                    input: {num_tokens: "= vars.num_tokens", num_hits: "= vars.num_hit", preempted: "= vars.wreq.num_preemptions > 0"}
+                    input: {num_tokens: "= vars.num_tokens", num_hits: "= vars.num_hit", preempted: "= vars.wreq.num_preemptions > 0", skip_reading_prefix_cache: "= has(vars.wreq.skip_reading_prefix_cache) && vars.wreq.skip_reading_prefix_cache"}
               - if: "vars.load_async"
                 then:
                   - title: Async KV load - wait in WAITING_FOR_REMOTE_KVS holding the blocks
@@ -2382,9 +2559,10 @@ interfaces:
                       vars.skipped: "= vars.skipped + [vars.wid]"
                   - continue: true
               - title: Move the request to RUNNING
-                detail: "A WAITING request is a new request; a PREEMPTED one is resumed."
+                detail: "A WAITING request is a new request; a PREEMPTED one is resumed. It leaves the deferred set and records a SCHEDULED event."
                 source: "vllm/v1/core/sched/scheduler.py:1343-1371"
                 set:
+                  state.deferred_waiting: "= state.deferred_waiting.filter(r, r != vars.wid)"
                   state.waiting: "= state.waiting.filter(r, r != vars.wid)"
                   state.running: "= state.running + [vars.wid]"
                   vars.sched_new: "= vars.wreq.status == 'WAITING' ? vars.sched_new + [vars.wid] : vars.sched_new"
@@ -2392,12 +2570,25 @@ interfaces:
                   vars.sched: "= merge(vars.sched, {vars.wid: vars.num_new})"
                   vars.new_blocks: "= merge(vars.new_blocks, {vars.wid: vars.walloc.value.block_ids})"
                   vars.token_budget: "= vars.token_budget - vars.num_new"
-                  state.requests: "= merge(state.requests, {vars.wid: {'status': 'RUNNING', 'num_computed_tokens': vars.prior + vars.num_hit + vars.num_ext, 'num_cached_tokens': vars.wreq.num_preemptions == 0 && vars.prior == 0 ? vars.num_hit + vars.num_ext : vars.wreq.num_cached_tokens}})"
+                  state.requests: "= merge(state.requests, {vars.wid: {'status': 'RUNNING', 'num_computed_tokens': vars.prior + vars.num_hit + vars.num_ext, 'num_cached_tokens': vars.wreq.num_preemptions == 0 && vars.prior == 0 ? vars.num_hit + vars.num_ext : vars.wreq.num_cached_tokens, 'events': config['disable-log-stats'] ? (has(vars.wreq.events) ? vars.wreq.events : []) : (has(vars.wreq.events) ? vars.wreq.events : []) + [{'type': 'SCHEDULED', 'timestamp': double(now_us) / 1000000.0}]}})"
+              - if: "has(vars.wreq.mm_features) && size(vars.wreq.mm_features) > 0 && size(vars.wenc.encoder_inputs_to_schedule) > 0"
+                then:
+                  - title: Encoder-related - record the scheduled inputs, spend the budget and reserve cache slots
+                    source: "vllm/v1/core/sched/scheduler.py:1380-1390"
+                    set:
+                      vars.enc_sched: "= merge(has(vars.enc_sched) ? vars.enc_sched : {}, {vars.wid: vars.wenc.encoder_inputs_to_schedule})"
+                      vars.enc_budget: "= vars.wenc.encoder_compute_budget"
+                  - call: scheduler.allocate-encoder-inputs
+                    input: {request_id: "= vars.wid", mm_features: "= vars.wreq.mm_features", input_ids: "= vars.wenc.encoder_inputs_to_schedule", duplicate_input_ids: "= vars.wenc.duplicate_encoder_inputs"}
               - if: "config['enable-lora'] && has(vars.wreq.lora_request) && vars.wreq.lora_request != null"
                 then:
                   - title: Count the admitted request's adapter against max_loras
                     source: "vllm/v1/core/sched/scheduler.py:1360-1361"
                     set: {vars.loras: "= vars.wreq.lora_request.lora_int_id in vars.loras ? vars.loras : vars.loras + [vars.wreq.lora_request.lora_int_id]"}
+          - if: "size(vars.skipped) > 0"
+            then:
+              - set:
+                  state.deferred_waiting: "= state.deferred_waiting + vars.skipped.filter(r, !(r in state.deferred_waiting) && r in state.waiting)"
       - title: Build the SchedulerOutput
         detail: "With the V2 model runner a resumed request is sent as a new request with its full block table; running requests carry only their new block ids."
         source: "vllm/v1/core/sched/scheduler.py:1404-1446"
@@ -2423,6 +2614,22 @@ interfaces:
             preempted_req_ids: "= state.preempted_req_ids"
             scheduled_spec_decode_tokens: "= vars.spec"
             num_spec_tokens_to_schedule: "= vars.k"
+            scheduled_encoder_inputs: "= has(vars.enc_sched) ? vars.enc_sched : {}"
+            free_encoder_mm_hashes: []
+      - if: "has(state.max_num_encoder_input_tokens) && state.max_num_encoder_input_tokens > 0"
+        then:
+          - title: Tell the workers which encoder outputs were evicted (a text-only model's zero-size cache never evicts)
+            source: "vllm/v1/core/sched/scheduler.py:1515"
+            call: encoder-cache-manager.get-freed-mm-hashes
+            as: freed_mm
+          - set: {vars.output: "= merge(vars.output, {'free_encoder_mm_hashes': vars.freed_mm.value.freed})"}
+      - if: "!config['use-v2-model-runner']"
+        then:
+          - title: MRV1 - a cached request not scheduled last step gets its full token ids; remember this step's ids
+            source: "vllm/v1/core/sched/scheduler.py:1449-1452"
+            set:
+              vars.output: "= merge(vars.output, {'scheduled_cached_reqs': merge(vars.output.scheduled_cached_reqs, {'all_token_ids_req_ids': (vars.sched_running + vars.as_resumed).filter(id, !(id in state.prev_step_scheduled_req_ids))})})"
+              state.prev_step_scheduled_req_ids: "= vars.sched.transformList(k, v, k)"
       - if: "config['kv-connector'] != ''"
         then:
           - title: Build this step's KV connector metadata and attach it to the SchedulerOutput
@@ -2455,7 +2662,7 @@ interfaces:
           - title: Async - placeholders for the sampled and draft tokens, and -1 draft slots for the next step
             source: "vllm/v1/core/sched/async_scheduler.py:25-57"
             set:
-              state.requests: "= merge(state.requests, {vars.sid: {'num_computed_tokens': vars.computed, 'is_prefill_chunk': vars.is_chunk, 'num_output_placeholders': vars.async_sched && !vars.is_chunk ? vars.r.num_output_placeholders + 1 + vars.n_spec_sched : vars.r.num_output_placeholders, 'spec_token_ids': vars.async_sched && !vars.is_chunk && vars.k > 0 ? lists.range(vars.k).map(i, -1) : vars.r.spec_token_ids}})"
+              state.requests: "= merge(state.requests, {vars.sid: {'num_computed_tokens': vars.computed, 'num_in_flight_tokens': (has(vars.r.num_in_flight_tokens) ? vars.r.num_in_flight_tokens : 0) + vars.n, 'is_prefill_chunk': vars.is_chunk, 'num_output_placeholders': vars.async_sched && !vars.is_chunk ? vars.r.num_output_placeholders + 1 + vars.n_spec_sched : vars.r.num_output_placeholders, 'spec_token_ids': vars.async_sched && !vars.is_chunk && vars.k > 0 ? lists.range(vars.k).map(i, -1) : vars.r.spec_token_ids}})"
       - title: Clear finished and preempted ids (they went out in this output)
         source: "vllm/v1/core/sched/scheduler.py:1644-1648"
         set:
@@ -2502,15 +2709,26 @@ interfaces:
         index: rid
         max: 1000
         steps:
+          - set: {vars.stale: false}
+          - if: "vars.rid in state.requests"
+            then:
+              - set:
+                  vars.stale: "= has(state.requests[vars.rid].num_stale_output_tokens) && state.requests[vars.rid].num_stale_output_tokens > 0"
+                  state.requests: "= merge(state.requests, {vars.rid: {'num_in_flight_tokens': (has(state.requests[vars.rid].num_in_flight_tokens) ? state.requests[vars.rid].num_in_flight_tokens : 0) - vars.n_sched, 'num_stale_output_tokens': has(state.requests[vars.rid].num_stale_output_tokens) && state.requests[vars.rid].num_stale_output_tokens > 0 ? math.greatest(state.requests[vars.rid].num_stale_output_tokens - vars.n_sched, 0) : 0}})"
           - if: "!(vars.rid in state.requests) || state.requests[vars.rid].status.startsWith('FINISHED')"
             then:
               - title: Finished or aborted while the model ran; skip
                 source: "vllm/v1/core/sched/scheduler.py:2091-2098"
                 continue: true
+          - if: "vars.stale && state.requests[vars.rid].drop_stale_output"
+            then:
+              - title: Drop-mode stale output (a same-step resume) is discarded entirely
+                source: "vllm/v1/core/sched/scheduler.py:2101-2103"
+                continue: true
           - set:
               vars.gen0: "= has(vars.mro.req_ids) && vars.rid in vars.mro.req_ids ? vars.mro.sampled_token_ids[lists.range(size(vars.mro.req_ids)).filter(i, vars.mro.req_ids[i] == vars.rid)[0]] : []"
               vars.drafts: "= has(input.scheduler_output.scheduled_spec_decode_tokens) && vars.rid in input.scheduler_output.scheduled_spec_decode_tokens ? input.scheduler_output.scheduled_spec_decode_tokens[vars.rid] : []"
-          - if: "size(vars.drafts) > 0 && size(vars.gen0) > 0"
+          - if: "size(vars.drafts) > 0 && size(vars.gen0) > 0 && !vars.stale"
             then:
               - title: Roll back the rejected draft tokens
                 detail: "accepted = sampled - 1 (the bonus/resampled token); num_computed_tokens and the output placeholders drop by the rejected count."
@@ -2529,6 +2747,12 @@ interfaces:
                   num_accepted_tokens: "= size(vars.drafts) - vars.rejected"
                 as: sds
               - set: {vars.spec_stats: "= vars.sds.value"}
+          - if: "has(state.requests[vars.rid].mm_features) && size(state.requests[vars.rid].mm_features) > 0"
+            then:
+              - title: Free encoder inputs only after the step has actually executed
+                source: "vllm/v1/core/sched/scheduler.py:2151-2153"
+                call: scheduler.free-encoder-inputs
+                input: {request_id: "= vars.rid"}
           - set:
               vars.req: "= state.requests[vars.rid]"
               vars.gen: "= has(vars.mro.req_ids) && vars.rid in vars.mro.req_ids ? vars.mro.sampled_token_ids[lists.range(size(vars.mro.req_ids)).filter(i, vars.mro.req_ids[i] == vars.rid)[0]] : []"
@@ -2561,7 +2785,7 @@ interfaces:
                       - set: {vars.stopped: true, vars.status: "= vars.chk.value.status", vars.stop_reason: "= vars.chk.value.stop_reason"}
                       - break: true
               - set:
-                  state.requests: "= merge(state.requests, {vars.rid: {'output_token_ids': vars.req.output_token_ids + vars.kept, 'status': vars.status, 'num_output_placeholders': vars.async_sched ? math.greatest(vars.req.num_output_placeholders - size(vars.kept), 0) : vars.req.num_output_placeholders}})"
+                  state.requests: "= merge(state.requests, {vars.rid: {'output_token_ids': vars.req.output_token_ids + vars.kept, 'status': vars.status, 'num_output_placeholders': vars.async_sched && !vars.stale ? math.greatest(vars.req.num_output_placeholders - size(vars.kept), 0) : vars.req.num_output_placeholders}})"
               - if: "vars.req.grammar_id != null"
                 then:
                   - title: Advance the request's grammar
@@ -2595,15 +2819,21 @@ interfaces:
                       request_id: "= vars.rid"
                       num_tokens: "= state.requests[vars.rid].num_computed_tokens - state.requests[vars.rid].num_output_placeholders"
                       block_hashes: "= state.requests[vars.rid].block_hashes"
+          - if: "size(vars.gen) == 0 && config['mm-encoder-only'] && state.requests[vars.rid].num_computed_tokens >= state.requests[vars.rid].num_prompt_tokens"
+            then:
+              - title: An encoder-only instance stops a request once its whole prompt is consumed (every item in it was encoded)
+                source: "vllm/v1/core/sched/scheduler.py:2174-2184"
+                set: {vars.stopped: true, vars.status: FINISHED_STOPPED}
           - set:
               vars.finish_reason: "= !vars.stopped ? dyn(null) : dyn(vars.status == 'FINISHED_STOPPED' ? 'stop' : (vars.status == 'FINISHED_LENGTH_CAPPED' ? 'length' : (vars.status == 'FINISHED_ABORTED' ? 'abort' : 'error')))"
           - if: "vars.stopped"
             then:
-              - title: Stopped - remove from running and free the request
+              - title: Stopped - remove from running (or, for a preempted request, from waiting and the deferred set) and free the request
                 source: "vllm/v1/core/sched/scheduler.py:2223-2244"
                 set:
                   state.running: "= state.running.filter(r, r != vars.rid)"
                   state.waiting: "= state.waiting.filter(r, r != vars.rid)"
+                  state.deferred_waiting: "= state.deferred_waiting.filter(r, r != vars.rid)"
                   state.requests: "= merge(state.requests, {vars.rid: {'status': vars.status}})"
               - call: scheduler.free-request
                 input: {request_id: "= vars.rid"}
@@ -2616,7 +2846,10 @@ interfaces:
                 detail: "Partial prefill chunks sample nothing and emit nothing."
                 source: "vllm/v1/core/sched/scheduler.py:2261-2290"
                 set:
-                  vars.outputs: "= vars.outputs + [{'request_id': vars.rid, 'new_token_ids': vars.kept, 'finish_reason': vars.finish_reason, 'stop_reason': vars.stop_reason, 'num_cached_tokens': vars.req.num_cached_tokens, 'client_index': vars.req.client_index, 'kv_transfer_params': vars.ktp}]"
+                  vars.outputs: "= vars.outputs + [{'request_id': vars.rid, 'new_token_ids': vars.kept, 'finish_reason': vars.finish_reason, 'stop_reason': vars.stop_reason, 'num_cached_tokens': vars.req.num_cached_tokens, 'client_index': vars.req.client_index, 'kv_transfer_params': vars.ktp, 'events': has(vars.req.events) && size(vars.req.events) > 0 ? vars.req.events : dyn(null)}]"
+              - if: "vars.rid in state.requests && has(state.requests[vars.rid].events) && size(state.requests[vars.rid].events) > 0"
+                then:
+                  - set: {state.requests: "= merge(state.requests, {vars.rid: {'events': []}})"}
       - if: "size(state.grammar_compile_error_reqs) > 0"
         then:
           - title: Requests whose grammar failed to compile finish with an error
@@ -2949,7 +3182,7 @@ interfaces:
         then:
           - title: Not a supported grammar type
             source: "vllm/v1/structured_output/backend_xgrammar.py:148-154"
-            fail: {code: value-error, status: 0, message: "grammar is not of valid supported types."}
+            fail: {code: value-error, status: 0, message: "= 'grammar is not of valid supported types. (StructuredOutputOptions.' + input.request_type.upperAscii() + ')'"}
       - if: "input.request_type == 'regex'"
         then:
           - title: Regexes compile under the ReDoS timeout guard
@@ -3027,22 +3260,22 @@ interfaces:
         then:
           - title: Backreferences are unsupported
             source: "vllm/v1/structured_output/backend_outlines.py:312-314"
-            fail: {code: vllm-validation-error, status: 400, message: "Regex uses unsupported feature for structured outputs: Backreferences are unsupported."}
+            fail: {code: vllm-validation-error, status: 400, message: "Regex uses unsupported feature for structured outputs: Backreferences are unsupported.. Only basic matching constructs are supported—lookarounds, backreferences, and unicode boundaries are not."}
       - if: "input.pattern.contains('(?=') || input.pattern.contains('(?!') || input.pattern.contains('(?<=') || input.pattern.contains('(?<!')"
         then:
           - title: Look-around assertions are unsupported
             source: "vllm/v1/structured_output/backend_outlines.py:316-318"
-            fail: {code: vllm-validation-error, status: 400, message: "Regex uses unsupported feature for structured outputs: Look-Around assertion are unsupported."}
+            fail: {code: vllm-validation-error, status: 400, message: "Regex uses unsupported feature for structured outputs: Look-Around assertion are unsupported.. Only basic matching constructs are supported—lookarounds, backreferences, and unicode boundaries are not."}
       - if: 'input.pattern.matches(r"\\[bB]")'
         then:
           - title: Unicode word boundaries are unsupported
             source: "vllm/v1/structured_output/backend_outlines.py:320-323"
-            fail: {code: vllm-validation-error, status: 400, message: "Regex uses unsupported feature for structured outputs: Unicode word boundaries are unsupported."}
+            fail: {code: vllm-validation-error, status: 400, message: "Regex uses unsupported feature for structured outputs: Unicode word boundaries are unsupported.. Only basic matching constructs are supported—lookarounds, backreferences, and unicode boundaries are not."}
       - if: 'input.pattern.matches(r"^\(*(\^|\$|\\A)")'
         then:
           - title: An anchor before any consuming token needs context
             source: "vllm/v1/structured_output/backend_outlines.py:358-366"
-            fail: {code: vllm-validation-error, status: 400, message: "Regex does not have a anchored universal start state"}
+            fail: {code: vllm-validation-error, status: 400, message: "= 'Regex does not have a anchored universal start stateThis means that the Regex uses anchors (^) or look-arounds in a way which requires context before any token is matched.structured outputs needs regexes that can match without needing that context. Try rewriting the pattern without using these constructs. Pattern:\\n' + input.pattern"}
       - return: {valid: true}
 
   - component: backend-outlines
@@ -3059,7 +3292,7 @@ interfaces:
         then:
           - title: Only JSON, regex and choice are supported by outlines
             source: "vllm/v1/structured_output/backend_outlines.py:59-100"
-            fail: {code: value-error, status: 0, message: "= 'Invalid request type for Outlines backend (' + input.request_type + ')'"}
+            fail: {code: value-error, status: 0, message: "= 'Invalid request type for Outlines backend (StructuredOutputOptions.' + input.request_type.upperAscii() + ')'"}
       - set: {state.grammars: "= merge(state.grammars, {input.grammar_id: {'request_type': input.request_type, 'spec': input.grammar_spec, 'terminated': false}})"}
       - return: {grammar_id: "= input.grammar_id"}
 
@@ -3089,7 +3322,7 @@ interfaces:
         on_error:
           - title: Timed out - cancel and raise ValueError
             source: "vllm/v1/structured_output/utils.py:87-95"
-            fail: {code: value-error, status: 0, message: "= 'Regex compilation timed out after ' + string(int(config['vllm-regex-compilation-timeout-s'])) + 's. The pattern may be too complex or contain constructs that cause exponential state-space explosion (e.g. nested quantifiers). Pattern: ' + input.pattern"}
+            fail: {code: value-error, status: 0, message: "= 'Regex compilation timed out after ' + string(int(config['vllm-regex-compilation-timeout-s'])) + 's. The pattern may be too complex or contain constructs that cause exponential state-space explosion (e.g. nested quantifiers). Pattern: ' + (size(input.pattern) > 200 ? input.pattern.substring(0, 200) : input.pattern)"}
       - return: {compiled: true}
 
   - component: xgrammar-compiler
@@ -3128,7 +3361,7 @@ interfaces:
             then:
               - title: NUL in a regex is refused before native code sees it
                 source: "vllm/v1/structured_output/backend_xgrammar.py:418-426"
-                fail: {code: value-error, status: 0, message: "structured_outputs.regex must not contain a NUL character"}
+                fail: {code: value-error, status: 0, message: "structured_outputs.regex must not contain a NUL character ('\\x00')"}
           - title: The regex must compile within the timeout
             source: "vllm/v1/structured_output/backend_xgrammar.py:427-435"
             call: structured-output-utils.compile-regex-with-timeout
@@ -5032,8 +5265,10 @@ interfaces:
       - call: secondary-tier-factory.get-tier-class
         input: {tier_config: "= input.tier_config"}
         as: cls
-      - set: {vars.bp: "= has(input.tier_config.backpressure) && input.tier_config.backpressure != null ? input.tier_config.backpressure : {}"}
-      - if: "size(vars.bp) > 0 && !('backpressure_cls' in vars.bp)"
+      - set:
+          vars.has_bp: "= has(input.tier_config.backpressure) && input.tier_config.backpressure != null"
+          vars.bp: "= has(input.tier_config.backpressure) && input.tier_config.backpressure != null ? input.tier_config.backpressure : {}"
+      - if: "vars.has_bp && (!('backpressure_cls' in vars.bp) || vars.bp.backpressure_cls == null)"
         then:
           - title: A backpressure config needs its detector class
             source: "vllm/v1/kv_offload/tiering/factory.py:76-82"
@@ -5048,7 +5283,16 @@ interfaces:
               tier_type: "= input.tier_config.type"
               custom_param: "= has(input.tier_config.custom_param) ? input.tier_config.custom_param : 0"
               primary_row_stride: "= has(input.primary_row_stride) ? input.primary_row_stride : 16"
-      - title: Other tier classes (fs, p2p, obj, kvcr) are resolved but their managers are not modeled
+      - if: "vars.cls.value.class_name == 'P2PSecondaryTierManager'"
+        then:
+          - title: tier_cls(offloading_spec, primary_kv_view, tier_type, **config)
+            source: "vllm/v1/kv_offload/tiering/factory.py:91-97"
+            call: p2p-secondary-tier-manager.init
+            input:
+              tier_id: "= input.tier_id"
+              tier_type: "= input.tier_config.type"
+              backpressure_detector: "= vars.has_bp ? vars.bp.backpressure_cls : dyn(null)"
+      - title: Other tier classes (fs, obj, kvcr) are resolved but their managers are not modeled
         source: "vllm/v1/kv_offload/tiering/factory.py:68-71"
         return: {tier_id: "= input.tier_id", tier_type: "= input.tier_config.type", class_name: "= vars.cls.value.class_name"}
 
@@ -6049,6 +6293,449 @@ interfaces:
         source: "vllm/v1/kv_cache_spec_registry.py:131-138"
         return: {manager: "= size(vars.hit) > 0 ? state.specs[vars.hit[0]].manager : dyn(null)"}
 
+  # ===================================================== round 5: encoder-input scheduling
+  - component: scheduler
+    name: try-schedule-encoder-inputs
+    kind: function
+    latency_ms: 0
+    summary: "Pick the multimodal items whose placeholders overlap this step's token range and that need encoding, within the encoder compute budget and the encoder cache; cut num_new_tokens to just before an item that can't be scheduled."
+    description: >-
+      An item is scheduled when its placeholder range overlaps [num_computed_tokens,
+      num_computed_tokens + num_new_tokens + shift), it is not already cached (a cached one gains a
+      reference), and the compute budget and cache have room for its embeddings. The encoder runs
+      over a whole item (bidirectional attention), so an item that doesn't fit stops the chunk
+      right before its offset, or schedules nothing when the computed prefix is already past it.
+      Every placeholder is taken to be an embedding (is_embed None), so an overlapping item always
+      has embeddings in range.
+    sources: ["vllm/v1/core/sched/scheduler.py:1789-1966", "vllm/multimodal/utils.py:122-142"]
+    request:
+      type: object
+      required: [request_id, mm_features, num_computed_tokens, num_new_tokens, encoder_compute_budget]
+      properties:
+        request_id: {type: string, examples: [chatcmpl-abc123]}
+        mm_features: {type: array, items: {type: object, properties: {identifier: {type: string}, offset: {type: integer}, length: {type: integer}, num_embeds: {type: integer}}}}
+        num_computed_tokens: {type: integer, examples: [0]}
+        num_new_tokens: {type: integer, examples: [2048]}
+        encoder_compute_budget: {type: integer, examples: [2048]}
+        shift_computed_tokens: {type: integer, default: 0, description: "num_prefill_lookahead (multi-module MTP); 0 otherwise."}
+    response:
+      type: object
+      properties:
+        encoder_inputs_to_schedule: {type: array, items: {type: integer}}
+        num_new_tokens: {type: integer}
+        encoder_compute_budget: {type: integer}
+        duplicate_encoder_inputs: {type: array, items: {type: integer}}
+    behavior:
+      - set:
+          vars.nc: "= input.num_computed_tokens"
+          vars.nn: "= input.num_new_tokens"
+          vars.shift: "= has(input.shift_computed_tokens) ? input.shift_computed_tokens : 0"
+          vars.budget: "= input.encoder_compute_budget"
+          vars.to_sched: []
+          vars.dups: []
+          vars.hashes: {}
+          vars.embeds: 0
+      - if: "vars.nn == 0 || size(input.mm_features) == 0"
+        then:
+          - title: Nothing to schedule or no encoder inputs
+            source: "vllm/v1/core/sched/scheduler.py:1816-1817"
+            return: {encoder_inputs_to_schedule: [], num_new_tokens: "= vars.nn", encoder_compute_budget: "= vars.budget", duplicate_encoder_inputs: []}
+      - title: The items whose placeholders overlap [num_computed_tokens, window end)
+        detail: "get_mm_features_in_window bisects the offset-sorted features: lo is the first item ending after num_computed_tokens, hi the first starting at or after the window end."
+        source: "vllm/v1/core/sched/scheduler.py:1830-1837"
+        set:
+          vars.window_end: "= vars.nc + vars.nn + vars.shift"
+      - foreach: "= lists.range(size(input.mm_features)).filter(i, input.mm_features[i].offset + input.mm_features[i].length > vars.nc && input.mm_features[i].offset < vars.window_end)"
+        as: i
+        steps:
+          - set:
+              vars.f: "= input.mm_features[vars.i]"
+          - set:
+              vars.n_emb: "= has(vars.f.num_embeds) ? vars.f.num_embeds : vars.f.length"
+          - if: "config['disable-chunked-mm-input'] && vars.nc < vars.f.offset && vars.nc + vars.nn < vars.f.offset + vars.f.length"
+            then:
+              - title: Chunked MM input is off - roll the chunk back to just before the item
+                source: "vllm/v1/core/sched/scheduler.py:1866-1881"
+                set: {vars.nn: "= math.greatest(0, vars.f.offset - (vars.nc + vars.shift))"}
+              - break: true
+          - if: "vars.f.identifier in vars.hashes"
+            then:
+              - title: The same item was already scheduled in this step; it shares that encoder run
+                source: "vllm/v1/core/sched/scheduler.py:1884-1898"
+                set: {vars.dups: "= vars.dups + [vars.i]"}
+              - continue: true
+          - title: Already encoded and cached from an earlier step? The request takes a reference
+            source: "vllm/v1/core/sched/scheduler.py:1917-1920"
+            call: encoder-cache-manager.check-and-update-cache
+            input: {request_id: "= input.request_id", input_id: "= vars.i", mm_hash: "= vars.f.identifier"}
+            as: hit
+          - if: "vars.hit.value.cached"
+            then: [{continue: true}]
+          - call: encoder-cache-manager.can-allocate
+            input: {request_id: "= input.request_id", input_id: "= vars.i", num_embeds: "= vars.n_emb", encoder_compute_budget: "= vars.budget", num_embeds_to_schedule: "= vars.embeds"}
+            as: room
+          - if: "!vars.room.value.can_allocate"
+            then:
+              - title: Encoder budget or cache exhausted - schedule only the tokens before this item
+                detail: "When prefix caching already computed past the item's offset, no token can be scheduled this step."
+                source: "vllm/v1/core/sched/scheduler.py:1922-1941"
+                set: {vars.nn: "= vars.nc + vars.shift < vars.f.offset ? vars.f.offset - (vars.nc + vars.shift) : 0"}
+              - break: true
+          - title: Schedule the item's encoder run
+            source: "vllm/v1/core/sched/scheduler.py:1962-1966"
+            set:
+              vars.embeds: "= vars.embeds + vars.n_emb"
+              vars.budget: "= vars.budget - vars.n_emb"
+              vars.hashes: "= merge(vars.hashes, {vars.f.identifier: vars.n_emb})"
+              vars.to_sched: "= vars.to_sched + [vars.i]"
+      - return: {encoder_inputs_to_schedule: "= vars.to_sched", num_new_tokens: "= vars.nn", encoder_compute_budget: "= vars.budget", duplicate_encoder_inputs: "= vars.dups"}
+
+  - component: scheduler
+    name: allocate-encoder-inputs
+    kind: function
+    latency_ms: 0
+    summary: "Reserve encoder-cache slots for the items scheduled this step; duplicates of an item scheduled earlier in the step only take a reference."
+    sources: ["vllm/v1/core/sched/scheduler.py:1775-1787"]
+    request:
+      type: object
+      required: [request_id, mm_features, input_ids]
+      properties:
+        request_id: {type: string}
+        mm_features: {type: array, items: {type: object}}
+        input_ids: {type: array, items: {type: integer}}
+        duplicate_input_ids: {type: array, items: {type: integer}, default: []}
+    response: {type: object, properties: {allocated: {type: integer}}}
+    behavior:
+      - foreach: "= input.input_ids"
+        as: iid
+        steps:
+          - call: encoder-cache-manager.allocate
+            input: {request_id: "= input.request_id", input_id: "= vars.iid", mm_hash: "= input.mm_features[vars.iid].identifier", num_embeds: "= has(input.mm_features[vars.iid].num_embeds) ? input.mm_features[vars.iid].num_embeds : input.mm_features[vars.iid].length"}
+      - foreach: "= has(input.duplicate_input_ids) ? input.duplicate_input_ids : []"
+        as: did
+        steps:
+          - call: encoder-cache-manager.check-and-update-cache
+            input: {request_id: "= input.request_id", input_id: "= vars.did", mm_hash: "= input.mm_features[vars.did].identifier"}
+      - return: {allocated: "= size(input.input_ids)"}
+
+  - component: scheduler
+    name: free-encoder-inputs
+    kind: function
+    latency_ms: 0
+    summary: "After a step ran: drop the request's reference to every cached item whose placeholders are now all computed (and past the drafter's look-ahead)."
+    sources: ["vllm/v1/core/sched/scheduler.py:2512-2548"]
+    request:
+      type: object
+      required: [request_id]
+      properties:
+        request_id: {type: string}
+    response: {type: object, properties: {freed_input_ids: {type: array, items: {type: integer}}}}
+    behavior:
+      - set: {vars.r: "= state.requests[input.request_id]"}
+      - call: encoder-cache-manager.get-cached-input-ids
+        input: {request_id: "= input.request_id"}
+        as: ids
+      - set:
+          vars.frontier: "= vars.r.num_computed_tokens - vars.r.num_output_placeholders"
+          vars.freed: []
+      - title: Free each processed item once it is behind the computed frontier
+        detail: "start_pos + num_tokens + spec_lookahead <= num_computed_tokens - num_output_placeholders: the item is in the decoder KV cache and no rejection or drafter gather can reference it (spec_lookahead is num_prefill_lookahead, 0 here)."
+        source: "vllm/v1/core/sched/scheduler.py:2531-2543"
+        foreach: "= vars.ids.value.input_ids"
+        as: iid
+        steps:
+          - if: "vars.r.mm_features[vars.iid].offset + vars.r.mm_features[vars.iid].length <= vars.frontier"
+            then:
+              - call: encoder-cache-manager.free-encoder-input
+                input: {request_id: "= input.request_id", input_id: "= vars.iid", mm_hashes: "= vars.r.mm_features.map(f, f.identifier)"}
+              - set: {vars.freed: "= vars.freed + [vars.iid]"}
+      - return: {freed_input_ids: "= vars.freed"}
+
+  - component: encoder-cache-manager
+    name: get-cached-input-ids
+    kind: function
+    latency_ms: 0
+    summary: "The input ids of a request whose embeddings are cached (the request holds a reference)."
+    sources: ["vllm/v1/core/encoder_cache_manager.py:242-244"]
+    request: {type: object, required: [request_id], properties: {request_id: {type: string}}}
+    response: {type: object, properties: {input_ids: {type: array, items: {type: integer}}}}
+    behavior:
+      - return: {input_ids: "= input.request_id in state.request_cached_ids ? state.request_cached_ids[input.request_id] : []"}
+
+  - component: encoder-cache-manager
+    name: compute-mm-encoder-budget
+    kind: function
+    latency_ms: 0
+    summary: "The encoder compute budget and the encoder cache size, in tokens: each is max(the SchedulerConfig value, which defaults to max_num_batched_tokens, the largest multimodal item)."
+    sources: ["vllm/v1/core/encoder_cache_manager.py:316-361", "vllm/config/scheduler.py:303-304"]
+    errors: [{code: value-error, status: 0, retryable: false}]
+    request:
+      type: object
+      required: [mm_max_toks_per_item]
+      properties:
+        mm_max_toks_per_item: {type: object, description: "Modality -> the most placeholder tokens one item can take (the model's profiled maximum)", examples: [{image: 16384, video: 16384}]}
+        max_num_batched_tokens: {type: [integer, "null"], default: null, description: "null: the max-num-batched-tokens config"}
+    response: {type: object, properties: {encoder_compute_budget: {type: integer}, encoder_cache_size: {type: integer}}}
+    behavior:
+      - set:
+          vars.mnbt: "= has(input.max_num_batched_tokens) && input.max_num_batched_tokens != null ? input.max_num_batched_tokens : int(config['max-num-batched-tokens'])"
+      - if: "size(input.mm_max_toks_per_item) == 0"
+        then:
+          - title: Every non-text modality is disabled (limit_mm_per_prompt); no encoder cache
+            source: "vllm/v1/core/encoder_cache_manager.py:335-341"
+            return: {encoder_compute_budget: 0, encoder_cache_size: 0}
+      - set:
+          vars.max_item: "= math.greatest(input.mm_max_toks_per_item.transformList(k, v, v))"
+      - if: "config['disable-chunked-mm-input'] && vars.max_item > vars.mnbt"
+        then:
+          - title: An item larger than the batch can't be scheduled without chunking it
+            source: "vllm/v1/core/encoder_cache_manager.py:345-354"
+            fail: {code: value-error, status: 0, message: "= 'Chunked MM input disabled but max_tokens_per_mm_item (' + string(vars.max_item) + ') is larger than max_num_batched_tokens (' + string(vars.mnbt) + '). Please increase max_num_batched_tokens.'"}
+      - title: max(max_num_encoder_input_tokens or encoder_cache_size, the largest item); both default to max_num_batched_tokens
+        source: "vllm/v1/core/encoder_cache_manager.py:356-363"
+        return: {encoder_compute_budget: "= math.greatest(vars.mnbt, vars.max_item)", encoder_cache_size: "= math.greatest(vars.mnbt, vars.max_item)"}
+
+  - component: scheduler
+    name: init-encoder-cache
+    kind: function
+    latency_ms: 0
+    summary: "Scheduler.__init__'s multimodal part: size the encoder compute budget and create the encoder cache from the model's largest item (a text-only model gets 0 and 0)."
+    sources: ["vllm/v1/core/sched/scheduler.py:255-285"]
+    request:
+      type: object
+      properties:
+        mm_max_toks_per_item: {type: object, default: {}, description: "Empty for a text-only model (no MultiModalBudget)."}
+    response: {type: object, properties: {max_num_encoder_input_tokens: {type: integer}, encoder_cache_size: {type: integer}}}
+    behavior:
+      - set: {vars.budget: 0, vars.size: 0}
+      - if: "has(input.mm_max_toks_per_item) && size(input.mm_max_toks_per_item) > 0"
+        then:
+          - title: A multimodal model has a MultiModalBudget
+            source: "vllm/v1/core/sched/scheduler.py:257-260"
+            call: encoder-cache-manager.compute-mm-encoder-budget
+            input: {mm_max_toks_per_item: "= input.mm_max_toks_per_item"}
+            as: b
+          - set: {vars.budget: "= vars.b.value.encoder_compute_budget", vars.size: "= vars.b.value.encoder_cache_size"}
+      - title: Set the encoder compute budget
+        source: "vllm/v1/core/sched/scheduler.py:271-273"
+        set: {state.max_num_encoder_input_tokens: "= vars.budget"}
+      - title: Create the EncoderCacheManager with the cache size
+        source: "vllm/v1/core/sched/scheduler.py:274-285"
+        call: encoder-cache-manager.init
+        input: {cache_size: "= vars.size"}
+      - return: {max_num_encoder_input_tokens: "= vars.budget", encoder_cache_size: "= vars.size"}
+
+  # ===================================================== round 5: the P2P secondary tier
+  - component: p2p-secondary-tier-manager
+    name: init
+    kind: function
+    latency_ms: 0
+    summary: "Build a P2P tier: reject a backpressure detector and a non-positive unbound-store timeout, bind the control identity host:(port + DP index), and leave the hash seed unresolved."
+    sources: ["vllm/v1/kv_offload/tiering/p2p/manager.py:216-334"]
+    errors: [{code: value-error, status: 0, retryable: false}]
+    request:
+      type: object
+      required: [tier_id]
+      properties:
+        tier_id: {type: string, examples: [p2p-0]}
+        tier_type: {type: [string, "null"], default: p2p}
+        host: {type: [string, "null"], default: null, description: "Defaults to VLLM_P2P_SIDE_CHANNEL_HOST (localhost)."}
+        port: {type: [integer, "null"], default: null, description: "Defaults to VLLM_P2P_SIDE_CHANNEL_PORT (5710)."}
+        data_parallel_index: {type: integer, default: 0}
+        unbound_store_timeout_s: {default: 60.0}
+        backpressure_detector: {type: [string, "null"], default: null}
+    response: {type: object, properties: {tier_id: {type: string}, local_id: {type: string}}}
+    behavior:
+      - if: "has(input.backpressure_detector) && input.backpressure_detector != null"
+        then:
+          - title: The generic store-latency detector can't fail fast for P2P
+            source: "vllm/v1/kv_offload/tiering/p2p/manager.py:276-290"
+            fail: {code: value-error, status: 0, message: "Backpressure is not supported for the P2P secondary tier. The generic store-latency detector cannot fail fast in PD mode and rendezvous time makes store latency an unreliable pressure signal. Remove the 'backpressure' config from the p2p tier."}
+      - set:
+          vars.t: "= has(input.unbound_store_timeout_s) ? input.unbound_store_timeout_s : 60.0"
+      - if: "!(type(vars.t) == int || type(vars.t) == double) || double(vars.t) <= 0.0"
+        then:
+          - title: The unbound-store timeout must be a positive number
+            source: "vllm/v1/kv_offload/tiering/p2p/manager.py:295-303"
+            fail: {code: value-error, status: 0, message: "= 'unbound_store_timeout_s must be a positive number, got ' + (type(vars.t) == string ? \"'\" + vars.t + \"'\" : string(vars.t))"}
+      - title: Control identity host:(port + DP index); the seed is resolved on the first session
+        detail: "Block hashes chain from NONE_HASH, and the tier is built before init_none_hash runs, so the seed is only known later."
+        source: "vllm/v1/kv_offload/tiering/p2p/manager.py:306-333"
+        set:
+          vars.host: "= has(input.host) && input.host != null ? input.host : 'localhost'"
+          vars.port: "= (has(input.port) && input.port != null ? input.port : 5710) + (has(input.data_parallel_index) ? input.data_parallel_index : 0)"
+      - set:
+          state.tiers: "= merge(state.tiers, {input.tier_id: {'tier_type': has(input.tier_type) && input.tier_type != null ? input.tier_type : 'p2p', 'local_id': vars.host + ':' + string(vars.port), 'hash_seed': null, 'sessions': {}, 'kv_to_session': {}, 'failed_req_ids': [], 'unbound_stores': {}, 'unbound_store_timeout_s': double(vars.t)}})"
+      - return: {tier_id: "= input.tier_id", local_id: "= state.tiers[input.tier_id].local_id"}
+
+  - component: p2p-secondary-tier-manager
+    name: annotate-req-context
+    kind: function
+    latency_ms: 0
+    summary: "Parse a request's kv_transfer_params once: the consumer side (remote_prefiller, or remote_kv_source for symmetric P2P) gives a source {kv_request_id, peer_id host:port}; the producer side (remote_decoder) gives a dest {kv_request_id}."
+    sources: ["vllm/v1/kv_offload/tiering/p2p/manager.py:78-183"]
+    request: {type: object, properties: {kv_transfer_params: {type: [object, "null"], default: null}}}
+    response: {type: object, properties: {source: {type: [object, "null"]}, dest: {type: [object, "null"]}}}
+    behavior:
+      - set:
+          vars.kv: "= has(input.kv_transfer_params) && input.kv_transfer_params != null ? input.kv_transfer_params : {}"
+      - set:
+          vars.role: "= 'remote_prefiller' in vars.kv && vars.kv.remote_prefiller != null ? vars.kv.remote_prefiller : ('remote_kv_source' in vars.kv && vars.kv.remote_kv_source != null ? vars.kv.remote_kv_source : dyn(null))"
+          vars.probe: "= !('remote_prefiller' in vars.kv && vars.kv.remote_prefiller != null)"
+      - title: "Source: the sub-dict must carry remote_host, remote_port and kv_request_id"
+        source: "vllm/v1/kv_offload/tiering/p2p/manager.py:141-159"
+        set:
+          vars.source: "= vars.role != null && size(vars.role) > 0 && 'remote_host' in vars.role && vars.role.remote_host != null && vars.role.remote_host != '' && 'remote_port' in vars.role && vars.role.remote_port != null && vars.role.remote_port != 0 && 'kv_request_id' in vars.role && vars.role.kv_request_id != null && vars.role.kv_request_id != '' ? {'kv_request_id': vars.role.kv_request_id, 'peer_id': vars.role.remote_host + ':' + string(vars.role.remote_port), 'do_probe': vars.probe} : dyn(null)"
+      - title: "Dest: a remote_decoder sub-dict (its kv_request_id may be missing)"
+        source: "vllm/v1/kv_offload/tiering/p2p/manager.py:162-168"
+        set:
+          vars.dest: "= 'remote_decoder' in vars.kv && vars.kv.remote_decoder != null ? {'kv_request_id': 'kv_request_id' in vars.kv.remote_decoder && vars.kv.remote_decoder.kv_request_id != '' ? vars.kv.remote_decoder.kv_request_id : dyn(null)} : dyn(null)"
+      - return: {source: "= vars.source", dest: "= vars.dest"}
+
+  - component: p2p-secondary-tier-manager
+    name: on-request-finished
+    kind: function
+    latency_ms: 0
+    summary: "A request finished: the consumer side finishes it on the session to its producer (by peer id); the producer side finishes it on the session bound to its kv_request_id and unbinds it; an unbound id leaves its parked stores alone."
+    sources: ["vllm/v1/kv_offload/tiering/p2p/manager.py:445-479"]
+    request:
+      type: object
+      required: [tier_id]
+      properties:
+        tier_id: {type: string, examples: [p2p-0]}
+        kv_transfer_params: {type: [object, "null"], default: null}
+    response: {type: object, properties: {finished_on: {type: [string, "null"]}}}
+    behavior:
+      - call: p2p-secondary-tier-manager.annotate-req-context
+        input: {kv_transfer_params: "= has(input.kv_transfer_params) ? input.kv_transfer_params : dyn(null)"}
+        as: ctx
+      - set:
+          vars.t: "= state.tiers[input.tier_id]"
+          vars.kid: "= vars.ctx.value.source != null ? vars.ctx.value.source.kv_request_id : (vars.ctx.value.dest != null ? vars.ctx.value.dest.kv_request_id : dyn(null))"
+      - if: "vars.kid == null || vars.kid == ''"
+        then:
+          - title: Not a P2P request
+            source: "vllm/v1/kv_offload/tiering/p2p/manager.py:465-466"
+            return: {finished_on: null}
+      - set:
+          state.tiers: "= merge(state.tiers, {input.tier_id: {'failed_req_ids': vars.t.failed_req_ids.filter(r, r != vars.kid)}})"
+      - if: "vars.ctx.value.source != null"
+        then:
+          - if: "vars.ctx.value.source.peer_id in vars.t.sessions"
+            then:
+              - title: Consumer side - finish it on the session to the producer (cancel lookups and the inbound load)
+                source: "vllm/v1/kv_offload/tiering/p2p/manager.py:469-472"
+                set:
+                  state.tiers: "= merge(state.tiers, {input.tier_id: {'sessions': merge(vars.t.sessions, {vars.ctx.value.source.peer_id: {'finished': vars.t.sessions[vars.ctx.value.source.peer_id].finished + [vars.kid]}})}})"
+              - return: {finished_on: "= vars.ctx.value.source.peer_id"}
+          - return: {finished_on: null}
+      - if: "vars.kid in vars.t.kv_to_session && vars.t.kv_to_session[vars.kid] in vars.t.sessions"
+        then:
+          - title: Producer side - pop the session bound to the id and finish it there
+            source: "vllm/v1/kv_offload/tiering/p2p/manager.py:475-479"
+            set:
+              vars.peer: "= vars.t.kv_to_session[vars.kid]"
+          - set:
+              state.tiers: "= merge(omit(state.tiers, input.tier_id), {input.tier_id: merge(omit(state.tiers[input.tier_id], 'kv_to_session'), {'kv_to_session': omit(vars.t.kv_to_session, vars.kid), 'sessions': merge(vars.t.sessions, {vars.peer: {'finished': vars.t.sessions[vars.peer].finished + [vars.kid]}})})})"
+          - return: {finished_on: "= vars.peer"}
+      - title: No session bound yet - the parked stores wait for a fetch or the reaper
+        source: "vllm/v1/kv_offload/tiering/p2p/manager.py:453-458"
+        set:
+          state.tiers: "= merge(omit(state.tiers, input.tier_id), {input.tier_id: merge(omit(state.tiers[input.tier_id], 'kv_to_session'), {'kv_to_session': omit(vars.t.kv_to_session, vars.kid)})})"
+      - return: {finished_on: null}
+
+  - component: p2p-secondary-tier-manager
+    name: get-hash-seed
+    kind: function
+    latency_ms: 0
+    summary: "The seed NONE_HASH was derived from, resolved through get_none_hash_seed on first use and cached."
+    sources: ["vllm/v1/kv_offload/tiering/p2p/manager.py:689-693"]
+    request: {type: object, required: [tier_id], properties: {tier_id: {type: string, examples: [p2p-0]}}}
+    response: {type: object, properties: {seed: {type: string}}}
+    behavior:
+      - if: "state.tiers[input.tier_id].hash_seed == null"
+        then:
+          - title: Resolve the seed now (init_none_hash has run by the first session)
+            source: "vllm/v1/kv_offload/tiering/p2p/manager.py:691-692"
+            call: kv-cache-utils.get-none-hash-seed
+            as: s
+          - set: {state.tiers: "= merge(state.tiers, {input.tier_id: {'hash_seed': vars.s.value.seed}})"}
+      - return: {seed: "= state.tiers[input.tier_id].hash_seed"}
+
+  - component: p2p-secondary-tier-manager
+    name: get-or-create-session
+    kind: function
+    latency_ms: 0
+    summary: "Consumer side: reuse the session to peer_id, or open one outbound (capped at VLLM_P2P_MAX_PEERS) that advertises the local hash seed."
+    sources: ["vllm/v1/kv_offload/tiering/p2p/manager.py:695-746"]
+    request:
+      type: object
+      required: [tier_id, peer_id]
+      properties:
+        tier_id: {type: string, examples: [p2p-0]}
+        peer_id: {type: string, examples: ["10.0.0.1:8000"]}
+        max_peers: {type: integer, default: 128, description: "VLLM_P2P_MAX_PEERS (envs.py:237)."}
+    response: {type: object, properties: {peer_id: {type: [string, "null"]}, created: {type: boolean}, local_hash_seed: {type: [string, "null"]}}}
+    behavior:
+      - if: "input.peer_id in state.tiers[input.tier_id].sessions"
+        then:
+          - title: Reuse the existing session (a prior load or a peer-initiated inbound one)
+            source: "vllm/v1/kv_offload/tiering/p2p/manager.py:708-710"
+            return: {peer_id: "= input.peer_id", created: false, local_hash_seed: "= state.tiers[input.tier_id].sessions[input.peer_id].local_hash_seed"}
+      - if: "size(state.tiers[input.tier_id].sessions) >= (has(input.max_peers) ? input.max_peers : 128)"
+        then:
+          - title: Session limit reached; the outbound peer is rejected
+            source: "vllm/v1/kv_offload/tiering/p2p/manager.py:712-722"
+            return: {peer_id: null, created: false, local_hash_seed: null}
+      - call: p2p-secondary-tier-manager.get-hash-seed
+        input: {tier_id: "= input.tier_id"}
+        as: seed
+      - title: Connect and build a session that advertises the local hash seed
+        source: "vllm/v1/kv_offload/tiering/p2p/manager.py:724-746"
+        set:
+          state.tiers: "= merge(state.tiers, {input.tier_id: {'sessions': merge(state.tiers[input.tier_id].sessions, {input.peer_id: {'connected': true, 'local_hash_seed': vars.seed.value.seed, 'finished': []}})}})"
+      - return: {peer_id: "= input.peer_id", created: true, local_hash_seed: "= vars.seed.value.seed"}
+
+  # ===================================================== round 5: reading the waiting queue
+  - component: scheduler
+    name: iter-waiting
+    kind: function
+    latency_ms: 0
+    summary: "Iterate the waiting queue in policy order (list(scheduler.waiting)): FCFS in deque order; priority by popping a copy of the heap, so (priority, arrival_time, request_id) ascending."
+    sources: ["vllm/v1/core/sched/request_queue.py:126-128", "vllm/v1/core/sched/request_queue.py:193-197", "vllm/v1/request.py:357-367"]
+    request: {type: object}
+    response: {type: object, properties: {request_ids: {type: array, items: {type: string}}, priorities: {type: array, items: {type: integer}}}}
+    behavior:
+      - if: "config['scheduling-policy'] != 'priority'"
+        then:
+          - title: FCFS - the deque's own order
+            source: "vllm/v1/core/sched/request_queue.py:126-128"
+            return: {request_ids: "= state.waiting", priorities: "= state.waiting.map(id, state.requests[id].priority)"}
+      - title: Priority - a heap copy popped to empty; Request.__lt__ orders by priority, then arrival_time, then request_id
+        source: "vllm/v1/core/sched/request_queue.py:193-197"
+        set:
+          vars.rank: "= state.waiting.map(id, size(state.waiting.filter(o, state.requests[o].priority < state.requests[id].priority || (state.requests[o].priority == state.requests[id].priority && (state.requests[o].arrival_time < state.requests[id].arrival_time || (state.requests[o].arrival_time == state.requests[id].arrival_time && o < id))))))"
+      - set:
+          vars.ordered: "= lists.range(size(state.waiting)).map(k, state.waiting[vars.rank.indexOf(k)])"
+      - return: {request_ids: "= vars.ordered", priorities: "= vars.ordered.map(id, state.requests[id].priority)"}
+
+  # ===================================================== merge: the single-type managers' block sizes
+  - component: kv-cache-manager
+    name: get-group-block-sizes
+    kind: function
+    latency_ms: 0
+    summary: "kv_cache_manager.coordinator.single_type_managers, one per KV cache group: each manager's block_size is the spec's block size times the DCP world size when DCP shards the spec (every attention spec kind; a Mamba spec doesn't), and its spec kind and sliding window."
+    sources: ["vllm/v1/core/single_type_kv_cache_manager.py:100-108", "vllm/v1/kv_cache_interface.py:164-171", "vllm/v1/kv_cache_interface.py:510-512", "vllm/v1/core/sched/scheduler.py:210-211"]
+    request: {type: object, properties: {}}
+    response:
+      type: array
+      items: {type: object, properties: {kind: {type: string}, block_size: {type: integer}, sliding_window: {type: ["integer", "null"]}, dcp_world_size: {type: integer}}}
+    behavior:
+      - set: {vars.dcp: "= int(config['decode-context-parallel-size'])"}
+      - title: "self.dcp_world_size = dcp_world_size if kv_cache_spec.dcp_sharded else 1; self.block_size = kv_cache_spec.block_size * self.dcp_world_size (AttentionSpec sets dcp_sharded; KVCacheSpec defaults it off)"
+        source: "vllm/v1/core/single_type_kv_cache_manager.py:106-108"
+        return: "= state.kv_cache_groups.map(g, {'kind': g.kind, 'block_size': g.block_size * (g.kind == 'mamba' ? 1 : vars.dcp), 'sliding_window': has(g.sliding_window) ? g.sliding_window : null, 'dcp_world_size': g.kind == 'mamba' ? 1 : vars.dcp})"
+
 flows:
   - id: scheduler-add-request
     name: Scheduler admits a request
@@ -6154,6 +6841,12 @@ fixtures:
       scheduler: {requests: {}, waiting: [], running: [], finished_req_ids: [], preempted_req_ids: [], current_step: 0, pause_state: UNPAUSED, num_waiting_for_streaming_input: 0, finished_recving_kv_req_ids: []}
       block-pool: {num_gpu_blocks: 28488, next_fresh: 1, free_front: [], free_tail: [], ref_cnt: {}, block_hash: {}, cached: {}, hash_tokens: {}, kv_event_queue: []}
       full-attention-manager: {req_to_blocks: {}, num_cached_block: {}}
+  - id: scheduler-kv-vl-qwen2-vl-7b
+    summary: "scheduler-kv state for the merged VL world: Scheduler.__init__ sized the encoder compute budget and the encoder cache from Qwen2-VL's largest item, max(max_num_batched_tokens 8192, 16384 image tokens at the processor's default max_pixels 12845056) = 16384 (what scheduler.init-encoder-cache computes)."
+    attributes: {variant_of: vl-qwen2-vl-7b}
+    state:
+      scheduler: {max_num_encoder_input_tokens: 16384}
+      encoder-cache-manager: {cache_size: 16384, num_free_slots: 16384, num_freeable_slots: 16384, cached: {}, num_embeds_by_hash: {}, request_cached_ids: {}, freeable: [], freed: []}
   - id: scheduler-kv-nearly-full
     summary: "tp1-llama-8b launched with --num-gpu-blocks-override 64: two decoding requests hold 62 of the 63 usable blocks (block 0 is the null block), one free block is left, and chatcmpl-wait-c waits."
     extends: [tp1-llama-8b]
@@ -12170,3 +12863,4029 @@ scenarios:
   expect:
   - steps.ev.result.value.evicted == ['old'] && steps.still.result.value.cached
   - trace.exists(e, e.type == 'call.end' && e.interface == 'encoder-cache-manager.check-and-update-cache')
+- id: scheduler-kv-r5-test-1
+  name: A prefiller-side finish for an id already bound to a session routes through _kv_to_session and pops the entry
+  fixtures:
+  - tp1-llama-8b
+  state:
+    p2p-secondary-tier-manager:
+      tiers:
+        p2p-0:
+          tier_type: p2p
+          local_id: localhost:5710
+          hash_seed: null
+          sessions:
+            some-peer:1:
+              connected: true
+              local_hash_seed: vllm-none-hash
+              finished: []
+          kv_to_session:
+            req-1: some-peer:1
+          failed_req_ids: []
+          unbound_stores: {}
+          unbound_store_timeout_s: 60.0
+  steps:
+  - interface: p2p-secondary-tier-manager.on-request-finished
+    caller: scheduler
+    as: f
+    input:
+      tier_id: p2p-0
+      kv_transfer_params:
+        remote_decoder:
+          kv_request_id: req-1
+  expect:
+  - steps.f.result.value.finished_on == 'some-peer:1'
+  - '// the fake session''s finishes and the manager''s map are what the test reads
+
+    state[''p2p-secondary-tier-manager''].tiers[''p2p-0''].sessions[''some-peer:1''].finished == [''req-1'']'
+  - '!(''req-1'' in state[''p2p-secondary-tier-manager''].tiers[''p2p-0''].kv_to_session)'
+  - trace.exists(e, e.type == 'call.end' && e.interface == 'p2p-secondary-tier-manager.on-request-finished')
+  description: tests/v1/kv_offload/tiering/p2p/test_manager.py:578 TestOnRequestFinished.test_prefiller_bound_id_routes_via_kv_to_session
+- id: scheduler-kv-r5-test-2
+  name: An encoder-only instance encodes the image and finishes the request in one step, with no sampled tokens
+  description: The EC producer makes the instance mm_encoder_only (vllm.py:2778-2790); the test gives the encoder cache 8 * 16 = 128 slots and the budget 128. The EC connector's has_cache_item is false, so the item is encoded locally.
+  fixtures:
+  - tp1-llama-8b
+  config:
+    max-num-seqs: 8
+    max-num-batched-tokens: 1024
+    mm-encoder-only: true
+    enable-prefix-caching: false
+    async-scheduling: false
+  state:
+    scheduler:
+      max_num_encoder_input_tokens: 128
+    encoder-cache-manager:
+      cache_size: 128
+      num_free_slots: 128
+      num_freeable_slots: 128
+      cached: {}
+      num_embeds_by_hash: {}
+      request_cached_ids: {}
+      freeable: []
+      freed: []
+  steps:
+  - flow: scheduler-add-request
+    as: a
+    input:
+      request_id: '0'
+      prompt_token_ids:
+      - 0
+      - 1
+      - 2
+      - 3
+      - 4
+      - 5
+      - 6
+      - 7
+      - 8
+      - 9
+      - 10
+      - 11
+      - 12
+      - 13
+      - 14
+      - 15
+      - 16
+      - 17
+      - 18
+      - 19
+      - 20
+      - 21
+      - 22
+      - 23
+      - 24
+      - 25
+      - 26
+      - 27
+      sampling_params:
+        max_tokens: 16
+      mm_features:
+      - identifier: img-hash-0
+        modality: image
+        offset: 8
+        length: 16
+  - flow: scheduler-schedule
+    as: s1
+    input: {}
+  - interface: scheduler.update-from-output
+    caller: engine-core
+    as: u1
+    input:
+      scheduler_output: = steps.s1.result.value
+      model_runner_output:
+        req_ids: = steps.s1.result.value.num_scheduled_tokens.transformList(k, v, k)
+        sampled_token_ids: = steps.s1.result.value.num_scheduled_tokens.transformList(k, v, [])
+  expect:
+  - steps.s1.result.value.scheduled_encoder_inputs['0'] == [0] && steps.s1.result.value.num_scheduled_tokens['0'] == 28
+  - steps.u1.result.value.outputs[0].finish_reason == 'stop' && steps.u1.result.value.outputs[0].new_token_ids == []
+  - trace.exists(e, e.type == 'call.end' && e.interface == 'scheduler.update-from-output')
+- id: scheduler-kv-r5-test-3
+  name: 'Sliding window (16) with EAGLE: two cached full blocks give a one-block hit (EAGLE drops the last)'
+  description: 'Priming (allocate 2 full blocks + 5 tokens, then free) is given as the cache it leaves: the two full blocks'' hashes cached in blocks 1 and 2. The eviction half of the test is -3b.'
+  fixtures:
+  - tp1-llama-8b
+  config:
+    block-size: 16
+  state:
+    block-pool:
+      num_gpu_blocks: 10
+      next_fresh: 4
+      free_front: []
+      free_tail:
+      - 3
+      - 2
+      - 1
+      ref_cnt: {}
+      block_hash:
+        '1': h0
+        '2': h1
+      cached:
+        h0: 1
+        h1: 2
+      hash_tokens: {}
+      kv_event_queue: []
+  steps:
+  - interface: sliding-window-manager.find-longest-cache-hit
+    caller: kv-cache-manager
+    as: hit
+    input:
+      block_hashes:
+      - h0
+      - h1
+      max_length: 36
+      sliding_window: 16
+      use_eagle: true
+  expect:
+  - size(steps.hit.result.value.block_ids) == 1 && steps.hit.result.value.hit_length == 16
+  - trace.exists(e, e.type == 'call.end' && e.interface == 'sliding-window-manager.find-longest-cache-hit')
+- id: scheduler-kv-r5-test-3b
+  name: 'Sliding window with EAGLE: with the first block evicted, [null, block 2] minus EAGLE''s dropped block is no hit'
+  fixtures:
+  - tp1-llama-8b
+  config:
+    block-size: 16
+  state:
+    block-pool:
+      num_gpu_blocks: 10
+      next_fresh: 4
+      free_front: []
+      free_tail:
+      - 3
+      - 2
+      - 1
+      ref_cnt: {}
+      block_hash:
+        '2': h1
+      cached:
+        h1: 2
+      hash_tokens: {}
+      kv_event_queue: []
+  steps:
+  - interface: sliding-window-manager.find-longest-cache-hit
+    caller: kv-cache-manager
+    as: hit
+    input:
+      block_hashes:
+      - h0
+      - h1
+      max_length: 36
+      sliding_window: 16
+      use_eagle: true
+  expect:
+  - size(steps.hit.result.value.block_ids) == 0 && steps.hit.result.value.hit_length == 0
+  - trace.exists(e, e.type == 'call.end' && e.interface == 'sliding-window-manager.find-longest-cache-hit')
+  description: tests/v1/core/test_prefix_caching.py:4255 test_eagle_with_sliding_window (after the first block is evicted)
+- id: scheduler-kv-r5-test-4
+  name: 'No MM input chunking (cold encoder cache): the 400 text tokens first, then the whole 800-token image; a 100-token batch can''t hold a 576-token item'
+  description: llava-1.5's image is 576 tokens, so the budget and cache are max(1024, 576) = 1024. The image is given 800 placeholder tokens, as in the test.
+  fixtures:
+  - tp1-llama-8b
+  config:
+    max-num-batched-tokens: 1024
+    disable-chunked-mm-input: true
+    max-model-len: 2048
+    enable-prefix-caching: false
+    async-scheduling: false
+  steps:
+  - interface: scheduler.init-encoder-cache
+    caller: engine-core
+    as: init
+    input:
+      mm_max_toks_per_item:
+        image: 576
+  - flow: scheduler-add-request
+    as: a
+    input:
+      request_id: '0'
+      prompt_token_ids:
+      - 0
+      - 1
+      - 2
+      - 3
+      - 4
+      - 5
+      - 6
+      - 7
+      - 8
+      - 9
+      - 10
+      - 11
+      - 12
+      - 13
+      - 14
+      - 15
+      - 16
+      - 17
+      - 18
+      - 19
+      - 20
+      - 21
+      - 22
+      - 23
+      - 24
+      - 25
+      - 26
+      - 27
+      - 28
+      - 29
+      - 30
+      - 31
+      - 32
+      - 33
+      - 34
+      - 35
+      - 36
+      - 37
+      - 38
+      - 39
+      - 40
+      - 41
+      - 42
+      - 43
+      - 44
+      - 45
+      - 46
+      - 47
+      - 48
+      - 49
+      - 50
+      - 51
+      - 52
+      - 53
+      - 54
+      - 55
+      - 56
+      - 57
+      - 58
+      - 59
+      - 60
+      - 61
+      - 62
+      - 63
+      - 64
+      - 65
+      - 66
+      - 67
+      - 68
+      - 69
+      - 70
+      - 71
+      - 72
+      - 73
+      - 74
+      - 75
+      - 76
+      - 77
+      - 78
+      - 79
+      - 80
+      - 81
+      - 82
+      - 83
+      - 84
+      - 85
+      - 86
+      - 87
+      - 88
+      - 89
+      - 90
+      - 91
+      - 92
+      - 93
+      - 94
+      - 95
+      - 96
+      - 97
+      - 98
+      - 99
+      - 100
+      - 101
+      - 102
+      - 103
+      - 104
+      - 105
+      - 106
+      - 107
+      - 108
+      - 109
+      - 110
+      - 111
+      - 112
+      - 113
+      - 114
+      - 115
+      - 116
+      - 117
+      - 118
+      - 119
+      - 120
+      - 121
+      - 122
+      - 123
+      - 124
+      - 125
+      - 126
+      - 127
+      - 128
+      - 129
+      - 130
+      - 131
+      - 132
+      - 133
+      - 134
+      - 135
+      - 136
+      - 137
+      - 138
+      - 139
+      - 140
+      - 141
+      - 142
+      - 143
+      - 144
+      - 145
+      - 146
+      - 147
+      - 148
+      - 149
+      - 150
+      - 151
+      - 152
+      - 153
+      - 154
+      - 155
+      - 156
+      - 157
+      - 158
+      - 159
+      - 160
+      - 161
+      - 162
+      - 163
+      - 164
+      - 165
+      - 166
+      - 167
+      - 168
+      - 169
+      - 170
+      - 171
+      - 172
+      - 173
+      - 174
+      - 175
+      - 176
+      - 177
+      - 178
+      - 179
+      - 180
+      - 181
+      - 182
+      - 183
+      - 184
+      - 185
+      - 186
+      - 187
+      - 188
+      - 189
+      - 190
+      - 191
+      - 192
+      - 193
+      - 194
+      - 195
+      - 196
+      - 197
+      - 198
+      - 199
+      - 200
+      - 201
+      - 202
+      - 203
+      - 204
+      - 205
+      - 206
+      - 207
+      - 208
+      - 209
+      - 210
+      - 211
+      - 212
+      - 213
+      - 214
+      - 215
+      - 216
+      - 217
+      - 218
+      - 219
+      - 220
+      - 221
+      - 222
+      - 223
+      - 224
+      - 225
+      - 226
+      - 227
+      - 228
+      - 229
+      - 230
+      - 231
+      - 232
+      - 233
+      - 234
+      - 235
+      - 236
+      - 237
+      - 238
+      - 239
+      - 240
+      - 241
+      - 242
+      - 243
+      - 244
+      - 245
+      - 246
+      - 247
+      - 248
+      - 249
+      - 250
+      - 251
+      - 252
+      - 253
+      - 254
+      - 255
+      - 256
+      - 257
+      - 258
+      - 259
+      - 260
+      - 261
+      - 262
+      - 263
+      - 264
+      - 265
+      - 266
+      - 267
+      - 268
+      - 269
+      - 270
+      - 271
+      - 272
+      - 273
+      - 274
+      - 275
+      - 276
+      - 277
+      - 278
+      - 279
+      - 280
+      - 281
+      - 282
+      - 283
+      - 284
+      - 285
+      - 286
+      - 287
+      - 288
+      - 289
+      - 290
+      - 291
+      - 292
+      - 293
+      - 294
+      - 295
+      - 296
+      - 297
+      - 298
+      - 299
+      - 300
+      - 301
+      - 302
+      - 303
+      - 304
+      - 305
+      - 306
+      - 307
+      - 308
+      - 309
+      - 310
+      - 311
+      - 312
+      - 313
+      - 314
+      - 315
+      - 316
+      - 317
+      - 318
+      - 319
+      - 320
+      - 321
+      - 322
+      - 323
+      - 324
+      - 325
+      - 326
+      - 327
+      - 328
+      - 329
+      - 330
+      - 331
+      - 332
+      - 333
+      - 334
+      - 335
+      - 336
+      - 337
+      - 338
+      - 339
+      - 340
+      - 341
+      - 342
+      - 343
+      - 344
+      - 345
+      - 346
+      - 347
+      - 348
+      - 349
+      - 350
+      - 351
+      - 352
+      - 353
+      - 354
+      - 355
+      - 356
+      - 357
+      - 358
+      - 359
+      - 360
+      - 361
+      - 362
+      - 363
+      - 364
+      - 365
+      - 366
+      - 367
+      - 368
+      - 369
+      - 370
+      - 371
+      - 372
+      - 373
+      - 374
+      - 375
+      - 376
+      - 377
+      - 378
+      - 379
+      - 380
+      - 381
+      - 382
+      - 383
+      - 384
+      - 385
+      - 386
+      - 387
+      - 388
+      - 389
+      - 390
+      - 391
+      - 392
+      - 393
+      - 394
+      - 395
+      - 396
+      - 397
+      - 398
+      - 399
+      - 400
+      - 401
+      - 402
+      - 403
+      - 404
+      - 405
+      - 406
+      - 407
+      - 408
+      - 409
+      - 410
+      - 411
+      - 412
+      - 413
+      - 414
+      - 415
+      - 416
+      - 417
+      - 418
+      - 419
+      - 420
+      - 421
+      - 422
+      - 423
+      - 424
+      - 425
+      - 426
+      - 427
+      - 428
+      - 429
+      - 430
+      - 431
+      - 432
+      - 433
+      - 434
+      - 435
+      - 436
+      - 437
+      - 438
+      - 439
+      - 440
+      - 441
+      - 442
+      - 443
+      - 444
+      - 445
+      - 446
+      - 447
+      - 448
+      - 449
+      - 450
+      - 451
+      - 452
+      - 453
+      - 454
+      - 455
+      - 456
+      - 457
+      - 458
+      - 459
+      - 460
+      - 461
+      - 462
+      - 463
+      - 464
+      - 465
+      - 466
+      - 467
+      - 468
+      - 469
+      - 470
+      - 471
+      - 472
+      - 473
+      - 474
+      - 475
+      - 476
+      - 477
+      - 478
+      - 479
+      - 480
+      - 481
+      - 482
+      - 483
+      - 484
+      - 485
+      - 486
+      - 487
+      - 488
+      - 489
+      - 490
+      - 491
+      - 492
+      - 493
+      - 494
+      - 495
+      - 496
+      - 497
+      - 498
+      - 499
+      - 500
+      - 501
+      - 502
+      - 503
+      - 504
+      - 505
+      - 506
+      - 507
+      - 508
+      - 509
+      - 510
+      - 511
+      - 512
+      - 513
+      - 514
+      - 515
+      - 516
+      - 517
+      - 518
+      - 519
+      - 520
+      - 521
+      - 522
+      - 523
+      - 524
+      - 525
+      - 526
+      - 527
+      - 528
+      - 529
+      - 530
+      - 531
+      - 532
+      - 533
+      - 534
+      - 535
+      - 536
+      - 537
+      - 538
+      - 539
+      - 540
+      - 541
+      - 542
+      - 543
+      - 544
+      - 545
+      - 546
+      - 547
+      - 548
+      - 549
+      - 550
+      - 551
+      - 552
+      - 553
+      - 554
+      - 555
+      - 556
+      - 557
+      - 558
+      - 559
+      - 560
+      - 561
+      - 562
+      - 563
+      - 564
+      - 565
+      - 566
+      - 567
+      - 568
+      - 569
+      - 570
+      - 571
+      - 572
+      - 573
+      - 574
+      - 575
+      - 576
+      - 577
+      - 578
+      - 579
+      - 580
+      - 581
+      - 582
+      - 583
+      - 584
+      - 585
+      - 586
+      - 587
+      - 588
+      - 589
+      - 590
+      - 591
+      - 592
+      - 593
+      - 594
+      - 595
+      - 596
+      - 597
+      - 598
+      - 599
+      - 600
+      - 601
+      - 602
+      - 603
+      - 604
+      - 605
+      - 606
+      - 607
+      - 608
+      - 609
+      - 610
+      - 611
+      - 612
+      - 613
+      - 614
+      - 615
+      - 616
+      - 617
+      - 618
+      - 619
+      - 620
+      - 621
+      - 622
+      - 623
+      - 624
+      - 625
+      - 626
+      - 627
+      - 628
+      - 629
+      - 630
+      - 631
+      - 632
+      - 633
+      - 634
+      - 635
+      - 636
+      - 637
+      - 638
+      - 639
+      - 640
+      - 641
+      - 642
+      - 643
+      - 644
+      - 645
+      - 646
+      - 647
+      - 648
+      - 649
+      - 650
+      - 651
+      - 652
+      - 653
+      - 654
+      - 655
+      - 656
+      - 657
+      - 658
+      - 659
+      - 660
+      - 661
+      - 662
+      - 663
+      - 664
+      - 665
+      - 666
+      - 667
+      - 668
+      - 669
+      - 670
+      - 671
+      - 672
+      - 673
+      - 674
+      - 675
+      - 676
+      - 677
+      - 678
+      - 679
+      - 680
+      - 681
+      - 682
+      - 683
+      - 684
+      - 685
+      - 686
+      - 687
+      - 688
+      - 689
+      - 690
+      - 691
+      - 692
+      - 693
+      - 694
+      - 695
+      - 696
+      - 697
+      - 698
+      - 699
+      - 700
+      - 701
+      - 702
+      - 703
+      - 704
+      - 705
+      - 706
+      - 707
+      - 708
+      - 709
+      - 710
+      - 711
+      - 712
+      - 713
+      - 714
+      - 715
+      - 716
+      - 717
+      - 718
+      - 719
+      - 720
+      - 721
+      - 722
+      - 723
+      - 724
+      - 725
+      - 726
+      - 727
+      - 728
+      - 729
+      - 730
+      - 731
+      - 732
+      - 733
+      - 734
+      - 735
+      - 736
+      - 737
+      - 738
+      - 739
+      - 740
+      - 741
+      - 742
+      - 743
+      - 744
+      - 745
+      - 746
+      - 747
+      - 748
+      - 749
+      - 750
+      - 751
+      - 752
+      - 753
+      - 754
+      - 755
+      - 756
+      - 757
+      - 758
+      - 759
+      - 760
+      - 761
+      - 762
+      - 763
+      - 764
+      - 765
+      - 766
+      - 767
+      - 768
+      - 769
+      - 770
+      - 771
+      - 772
+      - 773
+      - 774
+      - 775
+      - 776
+      - 777
+      - 778
+      - 779
+      - 780
+      - 781
+      - 782
+      - 783
+      - 784
+      - 785
+      - 786
+      - 787
+      - 788
+      - 789
+      - 790
+      - 791
+      - 792
+      - 793
+      - 794
+      - 795
+      - 796
+      - 797
+      - 798
+      - 799
+      - 800
+      - 801
+      - 802
+      - 803
+      - 804
+      - 805
+      - 806
+      - 807
+      - 808
+      - 809
+      - 810
+      - 811
+      - 812
+      - 813
+      - 814
+      - 815
+      - 816
+      - 817
+      - 818
+      - 819
+      - 820
+      - 821
+      - 822
+      - 823
+      - 824
+      - 825
+      - 826
+      - 827
+      - 828
+      - 829
+      - 830
+      - 831
+      - 832
+      - 833
+      - 834
+      - 835
+      - 836
+      - 837
+      - 838
+      - 839
+      - 840
+      - 841
+      - 842
+      - 843
+      - 844
+      - 845
+      - 846
+      - 847
+      - 848
+      - 849
+      - 850
+      - 851
+      - 852
+      - 853
+      - 854
+      - 855
+      - 856
+      - 857
+      - 858
+      - 859
+      - 860
+      - 861
+      - 862
+      - 863
+      - 864
+      - 865
+      - 866
+      - 867
+      - 868
+      - 869
+      - 870
+      - 871
+      - 872
+      - 873
+      - 874
+      - 875
+      - 876
+      - 877
+      - 878
+      - 879
+      - 880
+      - 881
+      - 882
+      - 883
+      - 884
+      - 885
+      - 886
+      - 887
+      - 888
+      - 889
+      - 890
+      - 891
+      - 892
+      - 893
+      - 894
+      - 895
+      - 896
+      - 897
+      - 898
+      - 899
+      - 900
+      - 901
+      - 902
+      - 903
+      - 904
+      - 905
+      - 906
+      - 907
+      - 908
+      - 909
+      - 910
+      - 911
+      - 912
+      - 913
+      - 914
+      - 915
+      - 916
+      - 917
+      - 918
+      - 919
+      - 920
+      - 921
+      - 922
+      - 923
+      - 924
+      - 925
+      - 926
+      - 927
+      - 928
+      - 929
+      - 930
+      - 931
+      - 932
+      - 933
+      - 934
+      - 935
+      - 936
+      - 937
+      - 938
+      - 939
+      - 940
+      - 941
+      - 942
+      - 943
+      - 944
+      - 945
+      - 946
+      - 947
+      - 948
+      - 949
+      - 950
+      - 951
+      - 952
+      - 953
+      - 954
+      - 955
+      - 956
+      - 957
+      - 958
+      - 959
+      - 960
+      - 961
+      - 962
+      - 963
+      - 964
+      - 965
+      - 966
+      - 967
+      - 968
+      - 969
+      - 970
+      - 971
+      - 972
+      - 973
+      - 974
+      - 975
+      - 976
+      - 977
+      - 978
+      - 979
+      - 980
+      - 981
+      - 982
+      - 983
+      - 984
+      - 985
+      - 986
+      - 987
+      - 988
+      - 989
+      - 990
+      - 991
+      - 992
+      - 993
+      - 994
+      - 995
+      - 996
+      - 997
+      - 998
+      - 999
+      - 1000
+      - 1001
+      - 1002
+      - 1003
+      - 1004
+      - 1005
+      - 1006
+      - 1007
+      - 1008
+      - 1009
+      - 1010
+      - 1011
+      - 1012
+      - 1013
+      - 1014
+      - 1015
+      - 1016
+      - 1017
+      - 1018
+      - 1019
+      - 1020
+      - 1021
+      - 1022
+      - 1023
+      - 1024
+      - 1025
+      - 1026
+      - 1027
+      - 1028
+      - 1029
+      - 1030
+      - 1031
+      - 1032
+      - 1033
+      - 1034
+      - 1035
+      - 1036
+      - 1037
+      - 1038
+      - 1039
+      - 1040
+      - 1041
+      - 1042
+      - 1043
+      - 1044
+      - 1045
+      - 1046
+      - 1047
+      - 1048
+      - 1049
+      - 1050
+      - 1051
+      - 1052
+      - 1053
+      - 1054
+      - 1055
+      - 1056
+      - 1057
+      - 1058
+      - 1059
+      - 1060
+      - 1061
+      - 1062
+      - 1063
+      - 1064
+      - 1065
+      - 1066
+      - 1067
+      - 1068
+      - 1069
+      - 1070
+      - 1071
+      - 1072
+      - 1073
+      - 1074
+      - 1075
+      - 1076
+      - 1077
+      - 1078
+      - 1079
+      - 1080
+      - 1081
+      - 1082
+      - 1083
+      - 1084
+      - 1085
+      - 1086
+      - 1087
+      - 1088
+      - 1089
+      - 1090
+      - 1091
+      - 1092
+      - 1093
+      - 1094
+      - 1095
+      - 1096
+      - 1097
+      - 1098
+      - 1099
+      - 1100
+      - 1101
+      - 1102
+      - 1103
+      - 1104
+      - 1105
+      - 1106
+      - 1107
+      - 1108
+      - 1109
+      - 1110
+      - 1111
+      - 1112
+      - 1113
+      - 1114
+      - 1115
+      - 1116
+      - 1117
+      - 1118
+      - 1119
+      - 1120
+      - 1121
+      - 1122
+      - 1123
+      - 1124
+      - 1125
+      - 1126
+      - 1127
+      - 1128
+      - 1129
+      - 1130
+      - 1131
+      - 1132
+      - 1133
+      - 1134
+      - 1135
+      - 1136
+      - 1137
+      - 1138
+      - 1139
+      - 1140
+      - 1141
+      - 1142
+      - 1143
+      - 1144
+      - 1145
+      - 1146
+      - 1147
+      - 1148
+      - 1149
+      - 1150
+      - 1151
+      - 1152
+      - 1153
+      - 1154
+      - 1155
+      - 1156
+      - 1157
+      - 1158
+      - 1159
+      - 1160
+      - 1161
+      - 1162
+      - 1163
+      - 1164
+      - 1165
+      - 1166
+      - 1167
+      - 1168
+      - 1169
+      - 1170
+      - 1171
+      - 1172
+      - 1173
+      - 1174
+      - 1175
+      - 1176
+      - 1177
+      - 1178
+      - 1179
+      - 1180
+      - 1181
+      - 1182
+      - 1183
+      - 1184
+      - 1185
+      - 1186
+      - 1187
+      - 1188
+      - 1189
+      - 1190
+      - 1191
+      - 1192
+      - 1193
+      - 1194
+      - 1195
+      - 1196
+      - 1197
+      - 1198
+      - 1199
+      sampling_params:
+        max_tokens: 16
+      mm_features:
+      - identifier: llava-img
+        modality: image
+        offset: 400
+        length: 800
+  - flow: scheduler-schedule
+    as: s1
+    input: {}
+  - interface: scheduler.update-from-output
+    caller: engine-core
+    as: u1
+    input:
+      scheduler_output: = steps.s1.result.value
+      model_runner_output:
+        req_ids: = steps.s1.result.value.num_scheduled_tokens.transformList(k, v, k)
+        sampled_token_ids: = steps.s1.result.value.num_scheduled_tokens.transformList(k, v, [])
+  - flow: scheduler-schedule
+    as: s2
+    input: {}
+  - interface: scheduler.get-request-counts
+    caller: engine-core
+    as: c2
+    input: {}
+  - interface: encoder-cache-manager.compute-mm-encoder-budget
+    caller: scheduler
+    as: small
+    input:
+      mm_max_toks_per_item:
+        image: 576
+      max_num_batched_tokens: 100
+  expect:
+  - size(steps.s1.result.value.scheduled_new_reqs) == 1 && size(steps.s1.result.value.scheduled_cached_reqs.req_ids) == 0 && size(steps.s1.result.value.finished_req_ids) == 0
+  - steps.s1.result.value.num_scheduled_tokens['0'] == 400
+  - steps.c2.result.value.num_running == 1 && size(steps.s2.result.value.scheduled_new_reqs) == 0 && size(steps.s2.result.value.scheduled_cached_reqs.req_ids) == 1 && size(steps.s2.result.value.finished_req_ids) == 0
+  - steps.s2.result.value.num_scheduled_tokens['0'] == 800
+  - steps.small.result.error.code == 'value-error'
+  - trace.exists(e, e.type == 'call.end' && e.interface == 'encoder-cache-manager.compute-mm-encoder-budget')
+- id: scheduler-kv-r5-test-4b
+  name: 'No MM input chunking (warm encoder cache): the 400 text tokens first, then the whole 800-token image; a 100-token batch can''t hold a 576-token item'
+  description: llava-1.5's image is 576 tokens, so the budget and cache are max(1024, 576) = 1024. The image is given 800 placeholder tokens, as in the test.
+  fixtures:
+  - tp1-llama-8b
+  config:
+    max-num-batched-tokens: 1024
+    disable-chunked-mm-input: true
+    max-model-len: 2048
+    enable-prefix-caching: false
+    async-scheduling: false
+  steps:
+  - interface: scheduler.init-encoder-cache
+    caller: engine-core
+    as: init
+    input:
+      mm_max_toks_per_item:
+        image: 576
+  - interface: encoder-cache-manager.allocate
+    caller: scheduler
+    as: prime
+    input:
+      request_id: cache-primer
+      input_id: 0
+      mm_hash: llava-img
+      num_embeds: 800
+  - interface: encoder-cache-manager.free
+    caller: scheduler
+    as: unprime
+    input:
+      request_id: cache-primer
+      mm_hashes:
+      - llava-img
+  - flow: scheduler-add-request
+    as: a
+    input:
+      request_id: '0'
+      prompt_token_ids:
+      - 0
+      - 1
+      - 2
+      - 3
+      - 4
+      - 5
+      - 6
+      - 7
+      - 8
+      - 9
+      - 10
+      - 11
+      - 12
+      - 13
+      - 14
+      - 15
+      - 16
+      - 17
+      - 18
+      - 19
+      - 20
+      - 21
+      - 22
+      - 23
+      - 24
+      - 25
+      - 26
+      - 27
+      - 28
+      - 29
+      - 30
+      - 31
+      - 32
+      - 33
+      - 34
+      - 35
+      - 36
+      - 37
+      - 38
+      - 39
+      - 40
+      - 41
+      - 42
+      - 43
+      - 44
+      - 45
+      - 46
+      - 47
+      - 48
+      - 49
+      - 50
+      - 51
+      - 52
+      - 53
+      - 54
+      - 55
+      - 56
+      - 57
+      - 58
+      - 59
+      - 60
+      - 61
+      - 62
+      - 63
+      - 64
+      - 65
+      - 66
+      - 67
+      - 68
+      - 69
+      - 70
+      - 71
+      - 72
+      - 73
+      - 74
+      - 75
+      - 76
+      - 77
+      - 78
+      - 79
+      - 80
+      - 81
+      - 82
+      - 83
+      - 84
+      - 85
+      - 86
+      - 87
+      - 88
+      - 89
+      - 90
+      - 91
+      - 92
+      - 93
+      - 94
+      - 95
+      - 96
+      - 97
+      - 98
+      - 99
+      - 100
+      - 101
+      - 102
+      - 103
+      - 104
+      - 105
+      - 106
+      - 107
+      - 108
+      - 109
+      - 110
+      - 111
+      - 112
+      - 113
+      - 114
+      - 115
+      - 116
+      - 117
+      - 118
+      - 119
+      - 120
+      - 121
+      - 122
+      - 123
+      - 124
+      - 125
+      - 126
+      - 127
+      - 128
+      - 129
+      - 130
+      - 131
+      - 132
+      - 133
+      - 134
+      - 135
+      - 136
+      - 137
+      - 138
+      - 139
+      - 140
+      - 141
+      - 142
+      - 143
+      - 144
+      - 145
+      - 146
+      - 147
+      - 148
+      - 149
+      - 150
+      - 151
+      - 152
+      - 153
+      - 154
+      - 155
+      - 156
+      - 157
+      - 158
+      - 159
+      - 160
+      - 161
+      - 162
+      - 163
+      - 164
+      - 165
+      - 166
+      - 167
+      - 168
+      - 169
+      - 170
+      - 171
+      - 172
+      - 173
+      - 174
+      - 175
+      - 176
+      - 177
+      - 178
+      - 179
+      - 180
+      - 181
+      - 182
+      - 183
+      - 184
+      - 185
+      - 186
+      - 187
+      - 188
+      - 189
+      - 190
+      - 191
+      - 192
+      - 193
+      - 194
+      - 195
+      - 196
+      - 197
+      - 198
+      - 199
+      - 200
+      - 201
+      - 202
+      - 203
+      - 204
+      - 205
+      - 206
+      - 207
+      - 208
+      - 209
+      - 210
+      - 211
+      - 212
+      - 213
+      - 214
+      - 215
+      - 216
+      - 217
+      - 218
+      - 219
+      - 220
+      - 221
+      - 222
+      - 223
+      - 224
+      - 225
+      - 226
+      - 227
+      - 228
+      - 229
+      - 230
+      - 231
+      - 232
+      - 233
+      - 234
+      - 235
+      - 236
+      - 237
+      - 238
+      - 239
+      - 240
+      - 241
+      - 242
+      - 243
+      - 244
+      - 245
+      - 246
+      - 247
+      - 248
+      - 249
+      - 250
+      - 251
+      - 252
+      - 253
+      - 254
+      - 255
+      - 256
+      - 257
+      - 258
+      - 259
+      - 260
+      - 261
+      - 262
+      - 263
+      - 264
+      - 265
+      - 266
+      - 267
+      - 268
+      - 269
+      - 270
+      - 271
+      - 272
+      - 273
+      - 274
+      - 275
+      - 276
+      - 277
+      - 278
+      - 279
+      - 280
+      - 281
+      - 282
+      - 283
+      - 284
+      - 285
+      - 286
+      - 287
+      - 288
+      - 289
+      - 290
+      - 291
+      - 292
+      - 293
+      - 294
+      - 295
+      - 296
+      - 297
+      - 298
+      - 299
+      - 300
+      - 301
+      - 302
+      - 303
+      - 304
+      - 305
+      - 306
+      - 307
+      - 308
+      - 309
+      - 310
+      - 311
+      - 312
+      - 313
+      - 314
+      - 315
+      - 316
+      - 317
+      - 318
+      - 319
+      - 320
+      - 321
+      - 322
+      - 323
+      - 324
+      - 325
+      - 326
+      - 327
+      - 328
+      - 329
+      - 330
+      - 331
+      - 332
+      - 333
+      - 334
+      - 335
+      - 336
+      - 337
+      - 338
+      - 339
+      - 340
+      - 341
+      - 342
+      - 343
+      - 344
+      - 345
+      - 346
+      - 347
+      - 348
+      - 349
+      - 350
+      - 351
+      - 352
+      - 353
+      - 354
+      - 355
+      - 356
+      - 357
+      - 358
+      - 359
+      - 360
+      - 361
+      - 362
+      - 363
+      - 364
+      - 365
+      - 366
+      - 367
+      - 368
+      - 369
+      - 370
+      - 371
+      - 372
+      - 373
+      - 374
+      - 375
+      - 376
+      - 377
+      - 378
+      - 379
+      - 380
+      - 381
+      - 382
+      - 383
+      - 384
+      - 385
+      - 386
+      - 387
+      - 388
+      - 389
+      - 390
+      - 391
+      - 392
+      - 393
+      - 394
+      - 395
+      - 396
+      - 397
+      - 398
+      - 399
+      - 400
+      - 401
+      - 402
+      - 403
+      - 404
+      - 405
+      - 406
+      - 407
+      - 408
+      - 409
+      - 410
+      - 411
+      - 412
+      - 413
+      - 414
+      - 415
+      - 416
+      - 417
+      - 418
+      - 419
+      - 420
+      - 421
+      - 422
+      - 423
+      - 424
+      - 425
+      - 426
+      - 427
+      - 428
+      - 429
+      - 430
+      - 431
+      - 432
+      - 433
+      - 434
+      - 435
+      - 436
+      - 437
+      - 438
+      - 439
+      - 440
+      - 441
+      - 442
+      - 443
+      - 444
+      - 445
+      - 446
+      - 447
+      - 448
+      - 449
+      - 450
+      - 451
+      - 452
+      - 453
+      - 454
+      - 455
+      - 456
+      - 457
+      - 458
+      - 459
+      - 460
+      - 461
+      - 462
+      - 463
+      - 464
+      - 465
+      - 466
+      - 467
+      - 468
+      - 469
+      - 470
+      - 471
+      - 472
+      - 473
+      - 474
+      - 475
+      - 476
+      - 477
+      - 478
+      - 479
+      - 480
+      - 481
+      - 482
+      - 483
+      - 484
+      - 485
+      - 486
+      - 487
+      - 488
+      - 489
+      - 490
+      - 491
+      - 492
+      - 493
+      - 494
+      - 495
+      - 496
+      - 497
+      - 498
+      - 499
+      - 500
+      - 501
+      - 502
+      - 503
+      - 504
+      - 505
+      - 506
+      - 507
+      - 508
+      - 509
+      - 510
+      - 511
+      - 512
+      - 513
+      - 514
+      - 515
+      - 516
+      - 517
+      - 518
+      - 519
+      - 520
+      - 521
+      - 522
+      - 523
+      - 524
+      - 525
+      - 526
+      - 527
+      - 528
+      - 529
+      - 530
+      - 531
+      - 532
+      - 533
+      - 534
+      - 535
+      - 536
+      - 537
+      - 538
+      - 539
+      - 540
+      - 541
+      - 542
+      - 543
+      - 544
+      - 545
+      - 546
+      - 547
+      - 548
+      - 549
+      - 550
+      - 551
+      - 552
+      - 553
+      - 554
+      - 555
+      - 556
+      - 557
+      - 558
+      - 559
+      - 560
+      - 561
+      - 562
+      - 563
+      - 564
+      - 565
+      - 566
+      - 567
+      - 568
+      - 569
+      - 570
+      - 571
+      - 572
+      - 573
+      - 574
+      - 575
+      - 576
+      - 577
+      - 578
+      - 579
+      - 580
+      - 581
+      - 582
+      - 583
+      - 584
+      - 585
+      - 586
+      - 587
+      - 588
+      - 589
+      - 590
+      - 591
+      - 592
+      - 593
+      - 594
+      - 595
+      - 596
+      - 597
+      - 598
+      - 599
+      - 600
+      - 601
+      - 602
+      - 603
+      - 604
+      - 605
+      - 606
+      - 607
+      - 608
+      - 609
+      - 610
+      - 611
+      - 612
+      - 613
+      - 614
+      - 615
+      - 616
+      - 617
+      - 618
+      - 619
+      - 620
+      - 621
+      - 622
+      - 623
+      - 624
+      - 625
+      - 626
+      - 627
+      - 628
+      - 629
+      - 630
+      - 631
+      - 632
+      - 633
+      - 634
+      - 635
+      - 636
+      - 637
+      - 638
+      - 639
+      - 640
+      - 641
+      - 642
+      - 643
+      - 644
+      - 645
+      - 646
+      - 647
+      - 648
+      - 649
+      - 650
+      - 651
+      - 652
+      - 653
+      - 654
+      - 655
+      - 656
+      - 657
+      - 658
+      - 659
+      - 660
+      - 661
+      - 662
+      - 663
+      - 664
+      - 665
+      - 666
+      - 667
+      - 668
+      - 669
+      - 670
+      - 671
+      - 672
+      - 673
+      - 674
+      - 675
+      - 676
+      - 677
+      - 678
+      - 679
+      - 680
+      - 681
+      - 682
+      - 683
+      - 684
+      - 685
+      - 686
+      - 687
+      - 688
+      - 689
+      - 690
+      - 691
+      - 692
+      - 693
+      - 694
+      - 695
+      - 696
+      - 697
+      - 698
+      - 699
+      - 700
+      - 701
+      - 702
+      - 703
+      - 704
+      - 705
+      - 706
+      - 707
+      - 708
+      - 709
+      - 710
+      - 711
+      - 712
+      - 713
+      - 714
+      - 715
+      - 716
+      - 717
+      - 718
+      - 719
+      - 720
+      - 721
+      - 722
+      - 723
+      - 724
+      - 725
+      - 726
+      - 727
+      - 728
+      - 729
+      - 730
+      - 731
+      - 732
+      - 733
+      - 734
+      - 735
+      - 736
+      - 737
+      - 738
+      - 739
+      - 740
+      - 741
+      - 742
+      - 743
+      - 744
+      - 745
+      - 746
+      - 747
+      - 748
+      - 749
+      - 750
+      - 751
+      - 752
+      - 753
+      - 754
+      - 755
+      - 756
+      - 757
+      - 758
+      - 759
+      - 760
+      - 761
+      - 762
+      - 763
+      - 764
+      - 765
+      - 766
+      - 767
+      - 768
+      - 769
+      - 770
+      - 771
+      - 772
+      - 773
+      - 774
+      - 775
+      - 776
+      - 777
+      - 778
+      - 779
+      - 780
+      - 781
+      - 782
+      - 783
+      - 784
+      - 785
+      - 786
+      - 787
+      - 788
+      - 789
+      - 790
+      - 791
+      - 792
+      - 793
+      - 794
+      - 795
+      - 796
+      - 797
+      - 798
+      - 799
+      - 800
+      - 801
+      - 802
+      - 803
+      - 804
+      - 805
+      - 806
+      - 807
+      - 808
+      - 809
+      - 810
+      - 811
+      - 812
+      - 813
+      - 814
+      - 815
+      - 816
+      - 817
+      - 818
+      - 819
+      - 820
+      - 821
+      - 822
+      - 823
+      - 824
+      - 825
+      - 826
+      - 827
+      - 828
+      - 829
+      - 830
+      - 831
+      - 832
+      - 833
+      - 834
+      - 835
+      - 836
+      - 837
+      - 838
+      - 839
+      - 840
+      - 841
+      - 842
+      - 843
+      - 844
+      - 845
+      - 846
+      - 847
+      - 848
+      - 849
+      - 850
+      - 851
+      - 852
+      - 853
+      - 854
+      - 855
+      - 856
+      - 857
+      - 858
+      - 859
+      - 860
+      - 861
+      - 862
+      - 863
+      - 864
+      - 865
+      - 866
+      - 867
+      - 868
+      - 869
+      - 870
+      - 871
+      - 872
+      - 873
+      - 874
+      - 875
+      - 876
+      - 877
+      - 878
+      - 879
+      - 880
+      - 881
+      - 882
+      - 883
+      - 884
+      - 885
+      - 886
+      - 887
+      - 888
+      - 889
+      - 890
+      - 891
+      - 892
+      - 893
+      - 894
+      - 895
+      - 896
+      - 897
+      - 898
+      - 899
+      - 900
+      - 901
+      - 902
+      - 903
+      - 904
+      - 905
+      - 906
+      - 907
+      - 908
+      - 909
+      - 910
+      - 911
+      - 912
+      - 913
+      - 914
+      - 915
+      - 916
+      - 917
+      - 918
+      - 919
+      - 920
+      - 921
+      - 922
+      - 923
+      - 924
+      - 925
+      - 926
+      - 927
+      - 928
+      - 929
+      - 930
+      - 931
+      - 932
+      - 933
+      - 934
+      - 935
+      - 936
+      - 937
+      - 938
+      - 939
+      - 940
+      - 941
+      - 942
+      - 943
+      - 944
+      - 945
+      - 946
+      - 947
+      - 948
+      - 949
+      - 950
+      - 951
+      - 952
+      - 953
+      - 954
+      - 955
+      - 956
+      - 957
+      - 958
+      - 959
+      - 960
+      - 961
+      - 962
+      - 963
+      - 964
+      - 965
+      - 966
+      - 967
+      - 968
+      - 969
+      - 970
+      - 971
+      - 972
+      - 973
+      - 974
+      - 975
+      - 976
+      - 977
+      - 978
+      - 979
+      - 980
+      - 981
+      - 982
+      - 983
+      - 984
+      - 985
+      - 986
+      - 987
+      - 988
+      - 989
+      - 990
+      - 991
+      - 992
+      - 993
+      - 994
+      - 995
+      - 996
+      - 997
+      - 998
+      - 999
+      - 1000
+      - 1001
+      - 1002
+      - 1003
+      - 1004
+      - 1005
+      - 1006
+      - 1007
+      - 1008
+      - 1009
+      - 1010
+      - 1011
+      - 1012
+      - 1013
+      - 1014
+      - 1015
+      - 1016
+      - 1017
+      - 1018
+      - 1019
+      - 1020
+      - 1021
+      - 1022
+      - 1023
+      - 1024
+      - 1025
+      - 1026
+      - 1027
+      - 1028
+      - 1029
+      - 1030
+      - 1031
+      - 1032
+      - 1033
+      - 1034
+      - 1035
+      - 1036
+      - 1037
+      - 1038
+      - 1039
+      - 1040
+      - 1041
+      - 1042
+      - 1043
+      - 1044
+      - 1045
+      - 1046
+      - 1047
+      - 1048
+      - 1049
+      - 1050
+      - 1051
+      - 1052
+      - 1053
+      - 1054
+      - 1055
+      - 1056
+      - 1057
+      - 1058
+      - 1059
+      - 1060
+      - 1061
+      - 1062
+      - 1063
+      - 1064
+      - 1065
+      - 1066
+      - 1067
+      - 1068
+      - 1069
+      - 1070
+      - 1071
+      - 1072
+      - 1073
+      - 1074
+      - 1075
+      - 1076
+      - 1077
+      - 1078
+      - 1079
+      - 1080
+      - 1081
+      - 1082
+      - 1083
+      - 1084
+      - 1085
+      - 1086
+      - 1087
+      - 1088
+      - 1089
+      - 1090
+      - 1091
+      - 1092
+      - 1093
+      - 1094
+      - 1095
+      - 1096
+      - 1097
+      - 1098
+      - 1099
+      - 1100
+      - 1101
+      - 1102
+      - 1103
+      - 1104
+      - 1105
+      - 1106
+      - 1107
+      - 1108
+      - 1109
+      - 1110
+      - 1111
+      - 1112
+      - 1113
+      - 1114
+      - 1115
+      - 1116
+      - 1117
+      - 1118
+      - 1119
+      - 1120
+      - 1121
+      - 1122
+      - 1123
+      - 1124
+      - 1125
+      - 1126
+      - 1127
+      - 1128
+      - 1129
+      - 1130
+      - 1131
+      - 1132
+      - 1133
+      - 1134
+      - 1135
+      - 1136
+      - 1137
+      - 1138
+      - 1139
+      - 1140
+      - 1141
+      - 1142
+      - 1143
+      - 1144
+      - 1145
+      - 1146
+      - 1147
+      - 1148
+      - 1149
+      - 1150
+      - 1151
+      - 1152
+      - 1153
+      - 1154
+      - 1155
+      - 1156
+      - 1157
+      - 1158
+      - 1159
+      - 1160
+      - 1161
+      - 1162
+      - 1163
+      - 1164
+      - 1165
+      - 1166
+      - 1167
+      - 1168
+      - 1169
+      - 1170
+      - 1171
+      - 1172
+      - 1173
+      - 1174
+      - 1175
+      - 1176
+      - 1177
+      - 1178
+      - 1179
+      - 1180
+      - 1181
+      - 1182
+      - 1183
+      - 1184
+      - 1185
+      - 1186
+      - 1187
+      - 1188
+      - 1189
+      - 1190
+      - 1191
+      - 1192
+      - 1193
+      - 1194
+      - 1195
+      - 1196
+      - 1197
+      - 1198
+      - 1199
+      sampling_params:
+        max_tokens: 16
+      mm_features:
+      - identifier: llava-img
+        modality: image
+        offset: 400
+        length: 800
+  - flow: scheduler-schedule
+    as: s1
+    input: {}
+  - interface: scheduler.update-from-output
+    caller: engine-core
+    as: u1
+    input:
+      scheduler_output: = steps.s1.result.value
+      model_runner_output:
+        req_ids: = steps.s1.result.value.num_scheduled_tokens.transformList(k, v, k)
+        sampled_token_ids: = steps.s1.result.value.num_scheduled_tokens.transformList(k, v, [])
+  - flow: scheduler-schedule
+    as: s2
+    input: {}
+  - interface: scheduler.get-request-counts
+    caller: engine-core
+    as: c2
+    input: {}
+  - interface: encoder-cache-manager.compute-mm-encoder-budget
+    caller: scheduler
+    as: small
+    input:
+      mm_max_toks_per_item:
+        image: 576
+      max_num_batched_tokens: 100
+  expect:
+  - size(steps.s1.result.value.scheduled_new_reqs) == 1 && size(steps.s1.result.value.scheduled_cached_reqs.req_ids) == 0 && size(steps.s1.result.value.finished_req_ids) == 0
+  - steps.s1.result.value.num_scheduled_tokens['0'] == 400
+  - steps.c2.result.value.num_running == 1 && size(steps.s2.result.value.scheduled_new_reqs) == 0 && size(steps.s2.result.value.scheduled_cached_reqs.req_ids) == 1 && size(steps.s2.result.value.finished_req_ids) == 0
+  - steps.s2.result.value.num_scheduled_tokens['0'] == 800
+  - steps.small.result.error.code == 'value-error'
+  - size(steps.s2.result.value.scheduled_encoder_inputs) == 0
+  - trace.exists(e, e.type == 'call.end' && e.interface == 'encoder-cache-manager.compute-mm-encoder-budget')
+- id: scheduler-kv-r5-test-5
+  name: 'Priority policy with max_num_seqs 1: the priority-0 request runs; the waiting queue iterates 1, 2, 0 (priorities 1, 2, 3)'
+  fixtures:
+  - tp1-llama-8b
+  config:
+    scheduling-policy: priority
+    max-num-seqs: 1
+    enable-prefix-caching: false
+    async-scheduling: false
+  steps:
+  - flow: scheduler-add-request
+    as: a0
+    input:
+      request_id: '0'
+      prompt_token_ids:
+      - 0
+      - 0
+      - 0
+      - 0
+      - 0
+      - 0
+      - 0
+      - 0
+      - 0
+      - 0
+      sampling_params:
+        max_tokens: 16
+      priority: 3
+      arrival_time: 1.0
+  - flow: scheduler-add-request
+    as: a1
+    input:
+      request_id: '1'
+      prompt_token_ids:
+      - 1
+      - 1
+      - 1
+      - 1
+      - 1
+      - 1
+      - 1
+      - 1
+      - 1
+      - 1
+      sampling_params:
+        max_tokens: 16
+      priority: 1
+      arrival_time: 2.0
+  - flow: scheduler-add-request
+    as: a2
+    input:
+      request_id: '2'
+      prompt_token_ids:
+      - 2
+      - 2
+      - 2
+      - 2
+      - 2
+      - 2
+      - 2
+      - 2
+      - 2
+      - 2
+      sampling_params:
+        max_tokens: 16
+      priority: 2
+      arrival_time: 3.0
+  - flow: scheduler-add-request
+    as: a3
+    input:
+      request_id: '3'
+      prompt_token_ids:
+      - 3
+      - 3
+      - 3
+      - 3
+      - 3
+      - 3
+      - 3
+      - 3
+      - 3
+      - 3
+      sampling_params:
+        max_tokens: 16
+      priority: 0
+      arrival_time: 4.0
+  - flow: scheduler-schedule
+    as: s1
+    input: {}
+  - interface: scheduler.iter-waiting
+    caller: engine-core
+    as: w
+    input: {}
+  expect:
+  - size(steps.s1.result.value.scheduled_new_reqs) == 1 && steps.s1.result.value.scheduled_new_reqs[0].req_id == '3'
+  - size(steps.w.result.value.request_ids) == 3
+  - steps.w.result.value.request_ids == ['1', '2', '0'] && steps.w.result.value.priorities == [1, 2, 3]
+  - trace.exists(e, e.type == 'call.end' && e.interface == 'scheduler.iter-waiting')
+  description: tests/v1/core/test_scheduler.py:3943 test_priority_scheduling_waiting_queue_order
+- id: scheduler-kv-r5-test-6
+  name: 'No memory leak: five 10-token requests run to max_tokens 10; afterwards nothing is held'
+  description: 'create_scheduler(enable_prefix_caching=True): 10,000 blocks of 16, sync scheduling; make_output samples token 0 for every running request.'
+  fixtures:
+  - tp1-llama-8b
+  config:
+    enable-prefix-caching: true
+    async-scheduling: false
+    block-size: 16
+  state:
+    block-pool:
+      num_gpu_blocks: 10000
+      next_fresh: 1
+      free_front: []
+      free_tail: []
+      ref_cnt: {}
+      block_hash: {}
+      cached: {}
+      hash_tokens: {}
+      kv_event_queue: []
+  max_events: 100000
+  steps:
+  - flow: scheduler-add-request
+    as: a0
+    input:
+      request_id: '0'
+      prompt_token_ids:
+      - 1
+      - 1
+      - 1
+      - 1
+      - 1
+      - 1
+      - 1
+      - 1
+      - 1
+      - 1
+      sampling_params:
+        max_tokens: 10
+  - flow: scheduler-schedule
+    as: s0
+    input: {}
+  - interface: scheduler.update-from-output
+    caller: engine-core
+    as: u0
+    input:
+      scheduler_output: = steps.s0.result.value
+      model_runner_output:
+        req_ids: = steps.s0.result.value.num_scheduled_tokens.transformList(k, v, k)
+        sampled_token_ids: = steps.s0.result.value.num_scheduled_tokens.transformList(k, v, [0])
+  - flow: scheduler-add-request
+    as: a1
+    input:
+      request_id: '1'
+      prompt_token_ids:
+      - 2
+      - 2
+      - 2
+      - 2
+      - 2
+      - 2
+      - 2
+      - 2
+      - 2
+      - 2
+      sampling_params:
+        max_tokens: 10
+  - flow: scheduler-schedule
+    as: s1
+    input: {}
+  - interface: scheduler.update-from-output
+    caller: engine-core
+    as: u1
+    input:
+      scheduler_output: = steps.s1.result.value
+      model_runner_output:
+        req_ids: = steps.s1.result.value.num_scheduled_tokens.transformList(k, v, k)
+        sampled_token_ids: = steps.s1.result.value.num_scheduled_tokens.transformList(k, v, [0])
+  - flow: scheduler-add-request
+    as: a2
+    input:
+      request_id: '2'
+      prompt_token_ids:
+      - 3
+      - 3
+      - 3
+      - 3
+      - 3
+      - 3
+      - 3
+      - 3
+      - 3
+      - 3
+      sampling_params:
+        max_tokens: 10
+  - flow: scheduler-schedule
+    as: s2
+    input: {}
+  - interface: scheduler.update-from-output
+    caller: engine-core
+    as: u2
+    input:
+      scheduler_output: = steps.s2.result.value
+      model_runner_output:
+        req_ids: = steps.s2.result.value.num_scheduled_tokens.transformList(k, v, k)
+        sampled_token_ids: = steps.s2.result.value.num_scheduled_tokens.transformList(k, v, [0])
+  - flow: scheduler-add-request
+    as: a3
+    input:
+      request_id: '3'
+      prompt_token_ids:
+      - 4
+      - 4
+      - 4
+      - 4
+      - 4
+      - 4
+      - 4
+      - 4
+      - 4
+      - 4
+      sampling_params:
+        max_tokens: 10
+  - flow: scheduler-schedule
+    as: s3
+    input: {}
+  - interface: scheduler.update-from-output
+    caller: engine-core
+    as: u3
+    input:
+      scheduler_output: = steps.s3.result.value
+      model_runner_output:
+        req_ids: = steps.s3.result.value.num_scheduled_tokens.transformList(k, v, k)
+        sampled_token_ids: = steps.s3.result.value.num_scheduled_tokens.transformList(k, v, [0])
+  - flow: scheduler-add-request
+    as: a4
+    input:
+      request_id: '4'
+      prompt_token_ids:
+      - 5
+      - 5
+      - 5
+      - 5
+      - 5
+      - 5
+      - 5
+      - 5
+      - 5
+      - 5
+      sampling_params:
+        max_tokens: 10
+  - flow: scheduler-schedule
+    as: s4
+    input: {}
+  - interface: scheduler.update-from-output
+    caller: engine-core
+    as: u4
+    input:
+      scheduler_output: = steps.s4.result.value
+      model_runner_output:
+        req_ids: = steps.s4.result.value.num_scheduled_tokens.transformList(k, v, k)
+        sampled_token_ids: = steps.s4.result.value.num_scheduled_tokens.transformList(k, v, [0])
+  - flow: scheduler-schedule
+    as: s5
+    input: {}
+  - interface: scheduler.update-from-output
+    caller: engine-core
+    as: u5
+    input:
+      scheduler_output: = steps.s5.result.value
+      model_runner_output:
+        req_ids: = steps.s5.result.value.num_scheduled_tokens.transformList(k, v, k)
+        sampled_token_ids: = steps.s5.result.value.num_scheduled_tokens.transformList(k, v, [0])
+  - flow: scheduler-schedule
+    as: s6
+    input: {}
+  - interface: scheduler.update-from-output
+    caller: engine-core
+    as: u6
+    input:
+      scheduler_output: = steps.s6.result.value
+      model_runner_output:
+        req_ids: = steps.s6.result.value.num_scheduled_tokens.transformList(k, v, k)
+        sampled_token_ids: = steps.s6.result.value.num_scheduled_tokens.transformList(k, v, [0])
+  - flow: scheduler-schedule
+    as: s7
+    input: {}
+  - interface: scheduler.update-from-output
+    caller: engine-core
+    as: u7
+    input:
+      scheduler_output: = steps.s7.result.value
+      model_runner_output:
+        req_ids: = steps.s7.result.value.num_scheduled_tokens.transformList(k, v, k)
+        sampled_token_ids: = steps.s7.result.value.num_scheduled_tokens.transformList(k, v, [0])
+  - flow: scheduler-schedule
+    as: s8
+    input: {}
+  - interface: scheduler.update-from-output
+    caller: engine-core
+    as: u8
+    input:
+      scheduler_output: = steps.s8.result.value
+      model_runner_output:
+        req_ids: = steps.s8.result.value.num_scheduled_tokens.transformList(k, v, k)
+        sampled_token_ids: = steps.s8.result.value.num_scheduled_tokens.transformList(k, v, [0])
+  - flow: scheduler-schedule
+    as: s9
+    input: {}
+  - interface: scheduler.update-from-output
+    caller: engine-core
+    as: u9
+    input:
+      scheduler_output: = steps.s9.result.value
+      model_runner_output:
+        req_ids: = steps.s9.result.value.num_scheduled_tokens.transformList(k, v, k)
+        sampled_token_ids: = steps.s9.result.value.num_scheduled_tokens.transformList(k, v, [0])
+  - flow: scheduler-schedule
+    as: s10
+    input: {}
+  - interface: scheduler.update-from-output
+    caller: engine-core
+    as: u10
+    input:
+      scheduler_output: = steps.s10.result.value
+      model_runner_output:
+        req_ids: = steps.s10.result.value.num_scheduled_tokens.transformList(k, v, k)
+        sampled_token_ids: = steps.s10.result.value.num_scheduled_tokens.transformList(k, v, [0])
+  - flow: scheduler-schedule
+    as: s11
+    input: {}
+  - interface: scheduler.update-from-output
+    caller: engine-core
+    as: u11
+    input:
+      scheduler_output: = steps.s11.result.value
+      model_runner_output:
+        req_ids: = steps.s11.result.value.num_scheduled_tokens.transformList(k, v, k)
+        sampled_token_ids: = steps.s11.result.value.num_scheduled_tokens.transformList(k, v, [0])
+  - flow: scheduler-schedule
+    as: s12
+    input: {}
+  - interface: scheduler.update-from-output
+    caller: engine-core
+    as: u12
+    input:
+      scheduler_output: = steps.s12.result.value
+      model_runner_output:
+        req_ids: = steps.s12.result.value.num_scheduled_tokens.transformList(k, v, k)
+        sampled_token_ids: = steps.s12.result.value.num_scheduled_tokens.transformList(k, v, [0])
+  - flow: scheduler-schedule
+    as: s13
+    input: {}
+  - interface: scheduler.update-from-output
+    caller: engine-core
+    as: u13
+    input:
+      scheduler_output: = steps.s13.result.value
+      model_runner_output:
+        req_ids: = steps.s13.result.value.num_scheduled_tokens.transformList(k, v, k)
+        sampled_token_ids: = steps.s13.result.value.num_scheduled_tokens.transformList(k, v, [0])
+  - flow: scheduler-schedule
+    as: s14
+    input: {}
+  - interface: scheduler.get-request-counts
+    caller: engine-core
+    as: c
+    input: {}
+  - interface: block-pool.get-num-free-blocks
+    caller: kv-cache-manager
+    as: free
+    input: {}
+  - interface: encoder-cache-manager.get-state
+    caller: scheduler
+    as: ecm
+    input: {}
+  expect:
+  - 'steps.s14.result.value.num_scheduled_tokens == {} && steps.c.result.value == {''num_running'': 0, ''num_waiting'': 0}'
+  - '// assert_scheduler_empty reads the scheduler''s and the managers'' internals (test_scheduler.py:3325-3364)
+
+    size(state.scheduler.requests) == 0 && size(state.scheduler.finished_req_ids) == 0'
+  - size(steps.ecm.result.value.freed) == 0 && size(steps.ecm.result.value.cached) == 0
+  - size(state['full-attention-manager'].req_to_blocks) == 0 && size(state['full-attention-manager'].num_cached_block) == 0
+  - steps.free.result.value.num_free_blocks == 9999 && size(state['block-pool'].ref_cnt) == 0
+  - trace.exists(e, e.type == 'call.end' && e.interface == 'encoder-cache-manager.get-state')
+- id: scheduler-kv-r5-stats-split-deferred-waiting
+  name: 'Judge3 Q3-7 (d): a request max_loras holds back is deferred; SchedulerStats count it as skipped, not waiting, until it is admitted'
+  description: skip_request adds the request to deferred_waiting (scheduler.py:904-910); make_stats reports num_waiting_reqs = waiting - deferred and num_skipped_waiting_reqs = deferred (2944-2948); admission discards it (1344).
+  fixtures: &id006
+  - tp1-llama-8b
+  config:
+    enable-lora: true
+    max-loras: 1
+    async-scheduling: false
+  steps:
+  - flow: scheduler-add-request
+    as: a1
+    input:
+      request_id: a
+      prompt_segments:
+      - key: doc-a
+        num_tokens: 40
+      sampling_params:
+        max_tokens: 2
+      lora_request:
+        lora_name: sql
+        lora_int_id: 1
+        lora_path: /models/lora/sql
+  - flow: scheduler-schedule
+    as: s1
+    input: {}
+  - interface: scheduler.update-from-output
+    caller: engine-core
+    as: u1
+    input:
+      scheduler_output: = steps.s1.result.value
+      model_runner_output:
+        req_ids: = steps.s1.result.value.num_scheduled_tokens.transformList(k, v, k)
+        sampled_token_ids: = steps.s1.result.value.num_scheduled_tokens.transformList(k, v, [7])
+  - flow: scheduler-add-request
+    as: a2
+    input:
+      request_id: b
+      prompt_segments:
+      - key: doc-b
+        num_tokens: 40
+      sampling_params:
+        max_tokens: 8
+      lora_request:
+        lora_name: chat
+        lora_int_id: 2
+        lora_path: /models/lora/chat
+  - flow: scheduler-schedule
+    as: s2
+    input: {}
+  - flow: scheduler-make-stats
+    as: st2
+    input: {}
+  - interface: scheduler.update-from-output
+    caller: engine-core
+    as: u2
+    input:
+      scheduler_output: = steps.s2.result.value
+      model_runner_output:
+        req_ids: = steps.s2.result.value.num_scheduled_tokens.transformList(k, v, k)
+        sampled_token_ids: = steps.s2.result.value.num_scheduled_tokens.transformList(k, v, [7])
+  - flow: scheduler-schedule
+    as: s3
+    input: {}
+  - flow: scheduler-make-stats
+    as: st3
+    input: {}
+  expect:
+  - 'steps.s2.result.value.num_scheduled_tokens == {''a'': 1}'
+  - steps.st2.result.value.num_waiting_reqs == 0 && steps.st2.result.value.num_skipped_waiting_reqs == 1
+  - 'steps.s3.result.value.num_scheduled_tokens == {''b'': 40}'
+  - steps.st3.result.value.num_waiting_reqs == 0 && steps.st3.result.value.num_skipped_waiting_reqs == 0
+  - trace.exists(e, e.type == 'call.end' && e.interface == 'scheduler.make-stats')
+- id: scheduler-kv-r5-grammar-wait-counts-as-deferred
+  name: A structured-output request waiting for its grammar is deferred from the moment it is added
+  description: _enqueue_waiting_request adds a request in a blocked waiting status (WAITING_FOR_STRUCTURED_OUTPUT_GRAMMAR) to deferred_waiting (scheduler.py:2436-2462).
+  fixtures: *id006
+  steps:
+  - flow: scheduler-add-request
+    as: a1
+    input:
+      request_id: g1
+      prompt_token_ids:
+      - 128000
+      - 9906
+      - 1917
+      sampling_params:
+        max_tokens: 4
+        structured_outputs:
+          json:
+            type: object
+  - flow: scheduler-make-stats
+    as: st
+    input: {}
+  expect:
+  - steps.a1.result.value.status == 'WAITING_FOR_STRUCTURED_OUTPUT_GRAMMAR'
+  - steps.st.result.value.num_waiting_reqs == 0 && steps.st.result.value.num_skipped_waiting_reqs == 1
+  - trace.exists(e, e.type == 'call.end' && e.interface == 'scheduler.make-stats')
+- id: scheduler-kv-r5-prompt-logprobs-skip-prefix-cache
+  name: 'Judge3 Q3-4 (a): a prompt_logprobs request recomputes a fully cached prompt and adds no prefix-cache queries'
+  description: skip_reading_prefix_cache defaults to prompt_logprobs is not None (sampling_params.py:622-629); get_computed_blocks returns no hit (kv_cache_manager.py:280-287) and record_prefix_cache_stats ignores the request (253-256).
+  fixtures: *id006
+  config:
+    async-scheduling: false
+  steps:
+  - flow: scheduler-add-request
+    as: a0
+    input:
+      request_id: r0
+      prompt_segments:
+      - key: doc-x
+        num_tokens: 100
+      sampling_params:
+        max_tokens: 4
+  - flow: scheduler-schedule
+    as: s0
+    input: {}
+  - flow: scheduler-finish-requests
+    as: f0
+    input:
+      request_ids:
+      - r0
+      finished_status: FINISHED_STOPPED
+  - flow: scheduler-make-stats
+    as: st0
+    input: {}
+  - flow: scheduler-add-request
+    as: a1
+    input:
+      request_id: r1
+      prompt_segments:
+      - key: doc-x
+        num_tokens: 100
+      sampling_params:
+        max_tokens: 4
+        prompt_logprobs: 1
+  - flow: scheduler-schedule
+    as: s1
+    input: {}
+  - flow: scheduler-make-stats
+    as: st1
+    input: {}
+  - flow: scheduler-add-request
+    as: a2
+    input:
+      request_id: r2
+      prompt_segments:
+      - key: doc-x
+        num_tokens: 100
+      sampling_params:
+        max_tokens: 4
+        prompt_logprobs: 1
+        skip_reading_prefix_cache: false
+  - flow: scheduler-schedule
+    as: s2
+    input: {}
+  - flow: scheduler-make-stats
+    as: st2
+    input: {}
+  expect:
+  - 'steps.s1.result.value.num_scheduled_tokens == {''r1'': 100}'
+  - steps.st1.result.value.prefix_cache_stats.queries == 0 && steps.st1.result.value.prefix_cache_stats.requests == 0
+  - '// an explicit skip_reading_prefix_cache=False keeps the lookup: 96 of 100 hit
+
+    steps.s2.result.value.num_scheduled_tokens == {''r2'': 4} && steps.st2.result.value.prefix_cache_stats.hits == 96'
+  - trace.exists(e, e.type == 'call.end' && e.interface == 'scheduler.make-stats')
+- id: scheduler-kv-r5-adaptive-long-prefill-floor
+  name: 'Judge3 Q3-1 (d): with long_prefill_token_threshold_adaptive the 512 cap is floored at 2048 // 2 = 1024 per request'
+  description: 'scheduler.py:650-655: max(long_prefill_token_threshold, input_budget // num_eligible_reqs).'
+  fixtures: *id006
+  config:
+    max-num-batched-tokens: 2048
+    long-prefill-token-threshold: 512
+    long-prefill-token-threshold-adaptive: true
+  steps:
+  - flow: scheduler-add-request
+    as: a1
+    input:
+      request_id: p1
+      prompt_segments:
+      - key: doc-p1
+        num_tokens: 3000
+      sampling_params:
+        max_tokens: 8
+  - flow: scheduler-add-request
+    as: a2
+    input:
+      request_id: p2
+      prompt_segments:
+      - key: doc-p2
+        num_tokens: 3000
+      sampling_params:
+        max_tokens: 8
+  - flow: scheduler-schedule
+    as: s1
+    input: {}
+  expect:
+  - 'steps.s1.result.value.num_scheduled_tokens == {''p1'': 1024, ''p2'': 1024}'
+  - trace.exists(e, e.type == 'call.end' && e.interface == 'scheduler.schedule')
+- id: scheduler-kv-r5-adaptive-long-prefill-off-by-default
+  name: Without the adaptive flag the 512 cap applies as is
+  fixtures: *id006
+  config:
+    max-num-batched-tokens: 2048
+    long-prefill-token-threshold: 512
+  steps:
+  - flow: scheduler-add-request
+    as: a1
+    input:
+      request_id: p1
+      prompt_segments:
+      - key: doc-p1
+        num_tokens: 3000
+      sampling_params:
+        max_tokens: 8
+  - flow: scheduler-add-request
+    as: a2
+    input:
+      request_id: p2
+      prompt_segments:
+      - key: doc-p2
+        num_tokens: 3000
+      sampling_params:
+        max_tokens: 8
+  - flow: scheduler-schedule
+    as: s1
+    input: {}
+  expect:
+  - 'steps.s1.result.value.num_scheduled_tokens == {''p1'': 512, ''p2'': 512}'
+  - trace.exists(e, e.type == 'call.end' && e.interface == 'scheduler.schedule')
+- id: scheduler-kv-r5-encoder-budget-stops-chunk-before-image
+  name: 'Judge3 Q3-8 (b, c): images 1 and 2 use 1600 of the 2048 encoder budget, so chunk 1 stops before image 3 (1608); step 2 frees them, encodes image 3 and completes the prefill (892)'
+  description: _try_schedule_encoder_inputs cuts num_new_tokens to start_pos - num_computed_tokens when can_allocate fails (scheduler.py:1922-1941); _free_encoder_inputs drops processed items after the step (2151-2153, 2531-2543); the third allocation evicts the oldest unreferenced entry (encoder_cache_manager.py:194-206).
+  fixtures: *id006
+  config:
+    max-num-batched-tokens: 2048
+    async-scheduling: false
+  state:
+    scheduler:
+      max_num_encoder_input_tokens: 2048
+    encoder-cache-manager:
+      cache_size: 2048
+      num_free_slots: 2048
+      num_freeable_slots: 2048
+      cached: {}
+      num_embeds_by_hash: {}
+      request_cached_ids: {}
+      freeable: []
+      freed: []
+  steps:
+  - flow: scheduler-add-request
+    as: a1
+    input:
+      request_id: p1
+      prompt_segments:
+      - key: p1-text0
+        num_tokens: 8
+      - key: p1-img0
+        num_tokens: 800
+      - key: p1-img1
+        num_tokens: 800
+      - key: p1-img2
+        num_tokens: 800
+      - key: p1-text1
+        num_tokens: 92
+      sampling_params:
+        max_tokens: 8
+      mm_features:
+      - identifier: p1-img0
+        modality: image
+        offset: 8
+        length: 800
+      - identifier: p1-img1
+        modality: image
+        offset: 808
+        length: 800
+      - identifier: p1-img2
+        modality: image
+        offset: 1608
+        length: 800
+  - flow: scheduler-schedule
+    as: s1
+    input: {}
+  - interface: scheduler.update-from-output
+    caller: engine-core
+    as: u1
+    input:
+      scheduler_output: = steps.s1.result.value
+      model_runner_output:
+        req_ids: = steps.s1.result.value.num_scheduled_tokens.transformList(k, v, k)
+        sampled_token_ids: = steps.s1.result.value.num_scheduled_tokens.transformList(k, v, [])
+  - flow: scheduler-schedule
+    as: s2
+    input: {}
+  expect:
+  - 'steps.s1.result.value.num_scheduled_tokens == {''p1'': 1608} && steps.s1.result.value.scheduled_encoder_inputs == {''p1'': [0, 1]}'
+  - 'steps.s2.result.value.num_scheduled_tokens == {''p1'': 892} && steps.s2.result.value.scheduled_encoder_inputs == {''p1'': [2]}'
+  - steps.s2.result.value.free_encoder_mm_hashes == ['p1-img0']
+  - trace.exists(e, e.type == 'call.end' && e.interface == 'encoder-cache-manager.can-allocate' && !e.output.can_allocate)
+  - trace.exists(e, e.type == 'call.end' && e.interface == 'scheduler.schedule')
+- id: scheduler-kv-r5-encoder-whole-item-then-reuse
+  name: 'Judge3 Q3-8 (d): by default chunk 1 (2048) encodes the whole image though only 548 placeholders are in it; chunk 2 (352) reuses the cached output'
+  fixtures: *id006
+  config:
+    max-num-batched-tokens: 2048
+    async-scheduling: false
+  state:
+    scheduler:
+      max_num_encoder_input_tokens: 2048
+    encoder-cache-manager:
+      cache_size: 2048
+      num_free_slots: 2048
+      num_freeable_slots: 2048
+      cached: {}
+      num_embeds_by_hash: {}
+      request_cached_ids: {}
+      freeable: []
+      freed: []
+  steps:
+  - flow: scheduler-add-request
+    as: a1
+    input:
+      request_id: p2
+      prompt_segments:
+      - key: p2-text0
+        num_tokens: 1500
+      - key: p2-img0
+        num_tokens: 800
+      - key: p2-text1
+        num_tokens: 100
+      sampling_params:
+        max_tokens: 8
+      mm_features: &id007
+      - identifier: p2-img0
+        modality: image
+        offset: 1500
+        length: 800
+  - flow: scheduler-schedule
+    as: s1
+    input: {}
+  - interface: scheduler.update-from-output
+    caller: engine-core
+    as: u1
+    input:
+      scheduler_output: = steps.s1.result.value
+      model_runner_output:
+        req_ids: = steps.s1.result.value.num_scheduled_tokens.transformList(k, v, k)
+        sampled_token_ids: = steps.s1.result.value.num_scheduled_tokens.transformList(k, v, [])
+  - flow: scheduler-schedule
+    as: s2
+    input: {}
+  expect:
+  - 'steps.s1.result.value.num_scheduled_tokens == {''p2'': 2048} && steps.s1.result.value.scheduled_encoder_inputs == {''p2'': [0]}'
+  - 'steps.s2.result.value.num_scheduled_tokens == {''p2'': 352} && steps.s2.result.value.scheduled_encoder_inputs == {}'
+  - trace.exists(e, e.type == 'call.end' && e.interface == 'encoder-cache-manager.check-and-update-cache' && e.output.cached)
+  - trace.exists(e, e.type == 'call.end' && e.interface == 'scheduler.schedule')
+- id: scheduler-kv-r5-encoder-no-chunked-mm-input-rolls-back
+  name: 'Judge3 Q3-8 (d): with --disable-chunked-mm-input chunk 1 rolls back to the 1500 text tokens, chunk 2 takes the whole image and the rest (900)'
+  description: scheduler.py:1866-1881.
+  fixtures: *id006
+  config:
+    max-num-batched-tokens: 2048
+    async-scheduling: false
+    disable-chunked-mm-input: true
+  state:
+    scheduler:
+      max_num_encoder_input_tokens: 2048
+    encoder-cache-manager:
+      cache_size: 2048
+      num_free_slots: 2048
+      num_freeable_slots: 2048
+      cached: {}
+      num_embeds_by_hash: {}
+      request_cached_ids: {}
+      freeable: []
+      freed: []
+  steps:
+  - flow: scheduler-add-request
+    as: a1
+    input:
+      request_id: p2
+      prompt_segments:
+      - key: p2-text0
+        num_tokens: 1500
+      - key: p2-img0
+        num_tokens: 800
+      - key: p2-text1
+        num_tokens: 100
+      sampling_params:
+        max_tokens: 8
+      mm_features: *id007
+  - flow: scheduler-schedule
+    as: s1
+    input: {}
+  - interface: scheduler.update-from-output
+    caller: engine-core
+    as: u1
+    input:
+      scheduler_output: = steps.s1.result.value
+      model_runner_output:
+        req_ids: = steps.s1.result.value.num_scheduled_tokens.transformList(k, v, k)
+        sampled_token_ids: = steps.s1.result.value.num_scheduled_tokens.transformList(k, v, [])
+  - flow: scheduler-schedule
+    as: s2
+    input: {}
+  expect:
+  - 'steps.s1.result.value.num_scheduled_tokens == {''p2'': 1500} && steps.s1.result.value.scheduled_encoder_inputs == {}'
+  - 'steps.s2.result.value.num_scheduled_tokens == {''p2'': 900} && steps.s2.result.value.scheduled_encoder_inputs == {''p2'': [0]}'
+  - trace.exists(e, e.type == 'call.end' && e.interface == 'scheduler.schedule')
+- id: scheduler-kv-r5-encoder-refs-freed-on-finish-and-preempt
+  name: 'Judge3 P3-8 (d) / W5: a finished request and a preempted request both release their encoder-cache references'
+  description: _free_request and _preempt_request call encoder_cache_manager.free (scheduler.py:2734, 1590).
+  fixtures: *id006
+  config:
+    max-num-batched-tokens: 2048
+    async-scheduling: false
+  state:
+    scheduler:
+      max_num_encoder_input_tokens: 2048
+    encoder-cache-manager:
+      cache_size: 2048
+      num_free_slots: 2048
+      num_freeable_slots: 2048
+      cached: {}
+      num_embeds_by_hash: {}
+      request_cached_ids: {}
+      freeable: []
+      freed: []
+  steps:
+  - flow: scheduler-add-request
+    as: a1
+    input:
+      request_id: m1
+      prompt_segments:
+      - key: m1-text
+        num_tokens: 8
+      - key: m1-img
+        num_tokens: 600
+      - key: m1-tail
+        num_tokens: 8
+      sampling_params:
+        max_tokens: 1
+      mm_features:
+      - identifier: m1-img
+        modality: image
+        offset: 8
+        length: 600
+  - flow: scheduler-add-request
+    as: a2
+    input:
+      request_id: m2
+      prompt_segments:
+      - key: m2-text
+        num_tokens: 8
+      - key: m2-img
+        num_tokens: 400
+      - key: m2-tail
+        num_tokens: 8
+      sampling_params:
+        max_tokens: 4
+      mm_features:
+      - identifier: m2-img
+        modality: image
+        offset: 8
+        length: 400
+  - flow: scheduler-schedule
+    as: s1
+    input: {}
+  - interface: encoder-cache-manager.get-state
+    caller: scheduler
+    as: before
+    input: {}
+  - interface: scheduler.preempt-request
+    caller: engine-core
+    as: pre
+    input:
+      request_id: m2
+  - flow: scheduler-finish-requests
+    as: f1
+    input:
+      request_ids:
+      - m1
+      finished_status: FINISHED_ABORTED
+  - interface: encoder-cache-manager.get-state
+    caller: scheduler
+    as: after
+    input: {}
+  expect:
+  - 'steps.s1.result.value.scheduled_encoder_inputs == {''m1'': [0], ''m2'': [0]} && steps.before.result.value.num_free_slots == 1048'
+  - steps.after.result.value.num_freeable_slots == 2048 && size(steps.after.result.value.request_cached_ids) == 0
+  - 'steps.after.result.value.cached == {''m1-img'': [], ''m2-img'': []}'
+  - trace.exists(e, e.type == 'call.end' && e.interface == 'encoder-cache-manager.get-state')
+- id: scheduler-kv-r5-preempted-stale-output-defers-resume
+  name: 'Judge3 W3/W5: under async scheduling a preempted request with output still in flight is skipped (deferred) until that output drains, which also delivers it with the PREEMPTED event'
+  description: _preempt_request marks num_in_flight_tokens stale and records PREEMPTED (scheduler.py:1596-1610); the waiting loop skips a request with deliverable stale output (934-938); update_from_output drains it in lockstep and still delivers the tokens (2079-2087); EngineCoreOutput takes the request's events (2276).
+  fixtures: *id006
+  config:
+    async-scheduling: true
+  steps:
+  - flow: scheduler-add-request
+    as: a1
+    input:
+      request_id: r1
+      prompt_token_ids:
+      - 128000
+      - 9906
+      - 1917
+      - 13
+      sampling_params:
+        max_tokens: 8
+  - flow: scheduler-schedule
+    as: s1
+    input: {}
+  - interface: scheduler.preempt-request
+    caller: engine-core
+    as: pre
+    input:
+      request_id: r1
+  - flow: scheduler-schedule
+    as: s2
+    input: {}
+  - flow: scheduler-make-stats
+    as: st2
+    input: {}
+  - interface: scheduler.update-from-output
+    caller: engine-core
+    as: u1
+    input:
+      scheduler_output: = steps.s1.result.value
+      model_runner_output:
+        req_ids: = steps.s1.result.value.num_scheduled_tokens.transformList(k, v, k)
+        sampled_token_ids: = steps.s1.result.value.num_scheduled_tokens.transformList(k, v, [42])
+  - flow: scheduler-schedule
+    as: s3
+    input: {}
+  expect:
+  - steps.pre.result.value.num_stale_output_tokens == 4
+  - steps.s2.result.value.num_scheduled_tokens == {} && steps.st2.result.value.num_skipped_waiting_reqs == 1
+  - steps.u1.result.value.outputs[0].new_token_ids == [42] && steps.u1.result.value.outputs[0].events.map(e, e.type) == ['QUEUED', 'SCHEDULED', 'PREEMPTED']
+  - 'steps.s3.result.value.num_scheduled_tokens == {''r1'': 5}'
+  - trace.exists(e, e.type == 'call.end' && e.interface == 'scheduler.schedule')
+- id: scheduler-kv-r5-reset-running-drops-stale-output
+  name: 'Judge3 Q3-6 (d): reset_prefix_cache(reset_running_requests) preempts with drop_stale_output, so the requests resume at once and the in-flight tokens are discarded'
+  description: scheduler.py:2850-2866 (drop_stale_output=True, prev_step_scheduled_req_ids cleared); update_from_output discards drop-mode stale output (2101-2103).
+  fixtures: *id006
+  config:
+    async-scheduling: true
+  steps:
+  - flow: scheduler-add-request
+    as: a1
+    input:
+      request_id: a
+      prompt_token_ids:
+      - 128000
+      - 9906
+      - 1917
+      - 13
+      sampling_params:
+        max_tokens: 8
+  - flow: scheduler-schedule
+    as: s1
+    input: {}
+  - interface: scheduler.reset-prefix-cache
+    caller: engine-core
+    as: r
+    input:
+      reset_running_requests: true
+  - flow: scheduler-schedule
+    as: s2
+    input: {}
+  - interface: scheduler.update-from-output
+    caller: engine-core
+    as: u1
+    input:
+      scheduler_output: = steps.s1.result.value
+      model_runner_output:
+        req_ids: = steps.s1.result.value.num_scheduled_tokens.transformList(k, v, k)
+        sampled_token_ids: = steps.s1.result.value.num_scheduled_tokens.transformList(k, v, [42])
+  expect:
+  - steps.r.result.value.reset
+  - 'steps.s2.result.value.num_scheduled_tokens == {''a'': 4}'
+  - steps.u1.result.value.outputs == []
+  - trace.exists(e, e.type == 'call.start' && e.interface == 'scheduler.preempt-request' && e.input.drop_stale_output)
+  - trace.exists(e, e.type == 'call.end' && e.interface == 'scheduler.update-from-output')
+- id: scheduler-kv-r5-reset-connector-without-connector
+  name: reset_connector with no KV connector configured counts as success
+  description: reset_connector_cache returns True when self.connector is None (scheduler.py:2885-2895).
+  fixtures: *id006
+  steps:
+  - interface: scheduler.reset-prefix-cache
+    caller: engine-core
+    as: r
+    input:
+      reset_connector: true
+  expect:
+  - steps.r.result.value.reset
+  - trace.exists(e, e.type == 'call.end' && e.interface == 'scheduler.reset-prefix-cache')
+- id: scheduler-kv-r5-reset-failure-message
+  name: 'Precision: the RuntimeError text when the reset still fails after preempting everything'
+  description: scheduler.py:2868-2874. A block still held by another owner (here a request waiting for remote KV, outside running) keeps the reset from succeeding.
+  fixtures: *id006
+  state:
+    block-pool:
+      ref_cnt:
+        '7': 1
+      next_fresh: 8
+  steps:
+  - interface: scheduler.reset-prefix-cache
+    caller: engine-core
+    as: r
+    input:
+      reset_running_requests: true
+  expect:
+  - steps.r.result.error.code == 'runtime-error' && steps.r.result.error.message == 'Failed to reset KV cache even when all the running requests are preempted and moved to the waiting queue. This is likely due to the presence of running requests waiting for remote KV transfer, which is not supported yet.'
+  - trace.exists(e, e.type == 'call.end' && e.interface == 'scheduler.reset-prefix-cache')
+- id: scheduler-kv-r5-p2p-tier-seed-resolved-lazily
+  name: 'Oracle3: the P2P tier is built with no seed; the first session resolves get_none_hash_seed (the default with PYTHONHASHSEED unset) and advertises it'
+  description: manager.py:306-314 (lazy), 689-693, 724-732 (local_hash_seed).
+  fixtures: *id006
+  steps:
+  - interface: secondary-tier-factory.create-secondary-tier
+    caller: engine-core
+    as: tier
+    input:
+      tier_id: p2p-0
+      tier_config:
+        type: p2p
+        module_path: null
+        backpressure: null
+  - interface: kv-cache-utils.init-none-hash
+    caller: engine-core
+    as: init
+    input:
+      hash_fn_name: sha256
+      pythonhashseed: null
+  - interface: p2p-secondary-tier-manager.get-or-create-session
+    caller: scheduler
+    as: sess
+    input:
+      tier_id: p2p-0
+      peer_id: 10.0.0.1:8000
+  - interface: p2p-secondary-tier-manager.get-hash-seed
+    caller: scheduler
+    as: seed
+    input:
+      tier_id: p2p-0
+  expect:
+  - steps.tier.result.value.class_name == 'P2PSecondaryTierManager'
+  - steps.sess.result.value.created && steps.sess.result.value.local_hash_seed == 'vllm-none-hash'
+  - steps.seed.result.value.seed == 'vllm-none-hash'
+  - trace.exists(e, e.type == 'call.end' && e.interface == 'p2p-secondary-tier-manager.get-hash-seed')
+- id: scheduler-kv-r5-p2p-tier-rejects-backpressure
+  name: 'Precision: a P2P tier with a backpressure config is rejected with the code''s message'
+  description: manager.py:276-290.
+  fixtures: *id006
+  steps:
+  - interface: secondary-tier-factory.create-secondary-tier
+    caller: engine-core
+    as: tier
+    input:
+      tier_id: p2p-0
+      tier_config:
+        type: p2p
+        module_path: null
+        backpressure:
+          backpressure_cls: EMABackpressureDetector
+  expect:
+  - steps.tier.result.error.code == 'value-error' && steps.tier.result.error.message.startsWith('Backpressure is not supported for the P2P secondary tier.')
+  - trace.exists(e, e.type == 'call.end' && e.interface == 'secondary-tier-factory.create-secondary-tier')
+- id: scheduler-kv-r5-p2p-consumer-finish-routes-by-peer
+  name: A consumer-side (remote_prefiller) finish routes to the session by peer id
+  description: 'test_manager.py: the consumer branch of on_request_finished (manager.py:469-473).'
+  fixtures: *id006
+  state:
+    p2p-secondary-tier-manager:
+      tiers:
+        p2p-0:
+          tier_type: p2p
+          local_id: localhost:5710
+          hash_seed: null
+          sessions:
+            10.0.0.1:8000:
+              connected: true
+              local_hash_seed: vllm-none-hash
+              finished: []
+          kv_to_session: {}
+          failed_req_ids:
+          - req-1
+          unbound_stores: {}
+          unbound_store_timeout_s: 60.0
+  steps:
+  - interface: p2p-secondary-tier-manager.on-request-finished
+    caller: scheduler
+    as: f
+    input:
+      tier_id: p2p-0
+      kv_transfer_params:
+        remote_prefiller:
+          kv_request_id: req-1
+          remote_host: 10.0.0.1
+          remote_port: 8000
+  expect:
+  - steps.f.result.value.finished_on == '10.0.0.1:8000'
+  - state['p2p-secondary-tier-manager'].tiers['p2p-0'].sessions['10.0.0.1:8000'].finished == ['req-1'] && state['p2p-secondary-tier-manager'].tiers['p2p-0'].failed_req_ids == []
+  - trace.exists(e, e.type == 'call.end' && e.interface == 'p2p-secondary-tier-manager.on-request-finished')
+- id: scheduler-kv-r5-vl-world-encoder-cache-sized
+  name: 'VL world: Qwen2-VL''s largest item (16384 tokens) raises the encoder budget and cache above max_num_batched_tokens (8192), and an image request is encoded in its first chunk'
+  description: compute_mm_encoder_budget (encoder_cache_manager.py:356-363) at scheduler init (scheduler.py:257-285). The largest item is the default max_pixels 12845056 / (28*28) = 16384 tokens (qwen2_vl.py:1079-1138). The world variant scheduler-kv-vl-qwen2-vl-7b seeds the result.
+  fixtures:
+  - full-vl-qwen2-vl-7b
+  config:
+    async-scheduling: false
+  steps:
+  - interface: scheduler.init-encoder-cache
+    caller: engine-core
+    as: init
+    input:
+      mm_max_toks_per_item:
+        image: 16384
+        video: 16384
+  - flow: scheduler-add-request
+    as: a1
+    input:
+      request_id: v1
+      prompt_segments:
+      - key: v1-sys
+        num_tokens: 14
+      - key: v1-img
+        num_tokens: 1196
+      - key: v1-q
+        num_tokens: 20
+      sampling_params:
+        max_tokens: 8
+      mm_features:
+      - identifier: v1-img
+        modality: image
+        offset: 14
+        length: 1196
+  - flow: scheduler-schedule
+    as: s1
+    input: {}
+  expect:
+  - 'steps.init.result.value == {''max_num_encoder_input_tokens'': 16384, ''encoder_cache_size'': 16384}'
+  - 'steps.s1.result.value.num_scheduled_tokens == {''v1'': 1230} && steps.s1.result.value.scheduled_encoder_inputs == {''v1'': [0]}'
+  - trace.exists(e, e.type == 'call.end' && e.interface == 'scheduler.schedule')
+- id: scheduler-kv-r5-vl-world-seeded-budget
+  name: 'VL world: the merged world starts with the encoder cache sized for Qwen2-VL (16384), the Llama default (0) left behind'
+  description: The variant fixture is named explicitly so the scenario doesn't depend on worlds.yaml listing it.
+  fixtures:
+  - full-vl-qwen2-vl-7b
+  - scheduler-kv-vl-qwen2-vl-7b
+  config:
+    async-scheduling: false
+  steps:
+  - flow: scheduler-add-request
+    as: a1
+    input:
+      request_id: v1
+      prompt_segments:
+      - key: v1-sys
+        num_tokens: 14
+      - key: v1-img
+        num_tokens: 1196
+      - key: v1-q
+        num_tokens: 20
+      sampling_params:
+        max_tokens: 8
+      mm_features:
+      - identifier: v1-img
+        modality: image
+        offset: 14
+        length: 1196
+  - flow: scheduler-schedule
+    as: s1
+    input: {}
+  - interface: encoder-cache-manager.get-state
+    caller: scheduler
+    as: ecm
+    input: {}
+  expect:
+  - 'steps.s1.result.value.scheduled_encoder_inputs == {''v1'': [0]}'
+  - steps.ecm.result.value.cache_size == 16384 && steps.ecm.result.value.num_free_slots == 16384 - 1196
+  - trace.exists(e, e.type == 'call.end' && e.interface == 'encoder-cache-manager.get-state')
+- id: scheduler-kv-r5-text-world-has-no-encoder-budget
+  name: 'Text-only Llama: no MultiModalBudget, so the encoder budget and cache are 0 and an image item could never be scheduled'
+  fixtures: *id006
+  steps:
+  - interface: scheduler.init-encoder-cache
+    caller: engine-core
+    as: init
+    input: {}
+  expect:
+  - 'steps.init.result.value == {''max_num_encoder_input_tokens'': 0, ''encoder_cache_size'': 0}'
+  - trace.exists(e, e.type == 'call.end' && e.interface == 'scheduler.init-encoder-cache')
+- id: scheduler-kv-r5-mm-budget-rejects-unchunkable-item
+  name: 'Precision: with --disable-chunked-mm-input an item larger than max_num_batched_tokens is a ValueError with the code''s message'
+  fixtures:
+  - full-vl-qwen2-vl-7b
+  config:
+    disable-chunked-mm-input: true
+  steps:
+  - interface: encoder-cache-manager.compute-mm-encoder-budget
+    caller: scheduler
+    as: b
+    input:
+      mm_max_toks_per_item:
+        image: 16384
+        video: 16384
+  expect:
+  - steps.b.result.error.code == 'value-error' && steps.b.result.error.message == 'Chunked MM input disabled but max_tokens_per_mm_item (16384) is larger than max_num_batched_tokens (8192). Please increase max_num_batched_tokens.'
+  - trace.exists(e, e.type == 'call.end' && e.interface == 'encoder-cache-manager.compute-mm-encoder-budget')
+- id: scheduler-kv-r5-fp8-kv-world-doubles-blocks
+  name: 'FP8 KV world: with --kv-cache-dtype fp8 a block takes half the bytes (1 byte per element), so the same memory holds twice the blocks'
+  description: 'get_kv_cache_configs: num_blocks = available_memory // (page_size_bytes * num_layers) (kv_cache_utils.py:1230-1260); the fp8 page is 2 * 16 * 8 * 128 * 1 bytes (cache.py:122-126, torch_utils.py:518-519). The page size comes from the worker''s get_kv_cache_spec (worker-runner).'
+  fixtures:
+  - full-fp8-llama-3-8b-kv-fp8
+  steps:
+  - interface: kv-cache-utils.get-kv-cache-configs
+    caller: engine-core
+    as: auto
+    input:
+      available_memory:
+      - 59742896128
+      bytes_per_block: 2097152
+  - interface: kv-cache-utils.get-kv-cache-configs
+    caller: engine-core
+    as: fp8
+    input:
+      available_memory:
+      - 59742896128
+      bytes_per_block: 1048576
+  expect:
+  - '// both counts leave out the null block
+
+    steps.fp8.result.value.num_blocks + 1 == 2 * (steps.auto.result.value.num_blocks + 1)'
+  - trace.exists(e, e.type == 'call.end' && e.interface == 'kv-cache-utils.get-kv-cache-configs')
+- id: scheduler-kv-r5-precision-max-seq-len-message
+  name: 'Precision: the max-seq-len ValueError word for word (format_gib rounding, the memory after the null block, the binary-searched estimate)'
+  description: kv_cache_utils.py:1019-1040, 2627-2647; mem_utils.py:30-31.
+  fixtures: *id006
+  config:
+    max-model-len: 131072
+  steps:
+  - interface: kv-cache-utils.get-kv-cache-configs
+    caller: engine-core
+    as: kvc
+    input:
+      available_memory:
+      - 8589934592
+      bytes_per_block: 2097152
+  expect:
+  - steps.kvc.result.error.code == 'value-error' && steps.kvc.result.error.message == 'To serve at least one request with the model\'s max seq len (131072), (16.0 GiB KV cache is needed, which is larger than the available KV cache memory (8.0 GiB). Based on the available memory, the estimated maximum model length is 65520. Try increasing `gpu_memory_utilization` (which also controls CPU memory on the CPU backend) or decreasing `max_model_len` when initializing the engine. See https://docs.vllm.ai/en/latest/configuration/conserving_memory/ for more details.'
+  - trace.exists(e, e.type == 'call.end' && e.interface == 'kv-cache-utils.get-kv-cache-configs')
+- id: scheduler-kv-r5-precision-no-memory-message
+  name: 'Precision: no memory left after the null block is the ''No available memory'' ValueError, word for word'
+  fixtures: *id006
+  steps:
+  - interface: kv-cache-utils.get-kv-cache-configs
+    caller: engine-core
+    as: kvc
+    input:
+      available_memory:
+      - 1048576
+      bytes_per_block: 2097152
+  expect:
+  - steps.kvc.result.error.code == 'value-error' && steps.kvc.result.error.message == 'No available memory for the cache blocks. Try increasing `gpu_memory_utilization` when initializing the engine (this flag also controls CPU memory reservation on the CPU backend, despite its name). See https://docs.vllm.ai/en/latest/configuration/conserving_memory/ for more details.'
+  - trace.exists(e, e.type == 'call.end' && e.interface == 'kv-cache-utils.get-kv-cache-configs')
+- id: scheduler-kv-r5-precision-block-pool-bare-assert
+  name: 'Precision: BlockPool(0) trips a bare assert (AssertionError with no message)'
+  description: block_pool.py:166.
+  fixtures: *id006
+  steps:
+  - interface: block-pool.init
+    caller: kv-cache-manager
+    as: bp
+    input:
+      num_gpu_blocks: 0
+  expect:
+  - steps.bp.result.error.code == 'assertion-error' && steps.bp.result.error.message == ''
+  - trace.exists(e, e.type == 'call.end' && e.interface == 'block-pool.init')
+- id: scheduler-kv-r5-precision-outlines-messages
+  name: 'Precision: the outlines backreference message (with the code''s double period and its hint) and the invalid request type (the enum''s str)'
+  description: backend_outlines.py:350-356 wraps the ValueError; 73-76 formats StructuredOutputOptions with !s.
+  fixtures: *id006
+  steps:
+  - interface: backend-outlines.validate-regex-is-buildable
+    caller: scheduler
+    as: br
+    input:
+      pattern: (a)\1
+  - interface: backend-outlines.compile-grammar
+    caller: scheduler
+    as: cg
+    input:
+      grammar_id: g1
+      request_type: grammar
+      grammar_spec: root ::= 'a'
+  - interface: xgrammar-backend.compile-grammar
+    caller: scheduler
+    as: xg
+    input:
+      grammar_id: g2
+      request_type: choice
+      grammar_spec: '["a"]'
+  expect:
+  - "steps.br.result.error.status == 400 && steps.br.result.error.message == 'Regex uses unsupported feature for structured outputs: Backreferences are unsupported.. Only basic matching constructs are supported\u2014lookarounds, backreferences, and unicode boundaries are not.'"
+  - steps.cg.result.error.message == 'Invalid request type for Outlines backend (StructuredOutputOptions.GRAMMAR)'
+  - steps.xg.result.error.message == 'grammar is not of valid supported types. (StructuredOutputOptions.CHOICE)'
+  - trace.exists(e, e.type == 'call.end' && e.interface == 'xgrammar-backend.compile-grammar')

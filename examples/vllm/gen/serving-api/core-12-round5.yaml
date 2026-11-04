@@ -1,0 +1,679 @@
+# Fix round 5 (precision): /metrics, the round-4 blind findings' regressions, the round-5 unit tests.
+configs:
+  - {id: vllm-max-audio-clip-filesize-mb, type: number, value: 25, default: 25, summary: "VLLM_MAX_AUDIO_CLIP_FILESIZE_MB: the largest audio file run-batch downloads or decodes (MiB)", sources: ["vllm/envs.py:1023-1025", "vllm/entrypoints/launchers/run_batch.py:77-78"], attributes: {key: VLLM_MAX_AUDIO_CLIP_FILESIZE_MB}}
+  - {id: shutdown-timeout, type: integer, value: 0, default: 0, summary: "shutdown_timeout (seconds): 0 makes the API server stop the engine client in abort mode, >0 in drain mode (owned by engine-core)", sources: ["vllm/config/vllm.py:443"], attributes: {key: shutdown_timeout, boundary: true, owner: engine-core}}
+components:
+  - {id: instrumentator-metrics, name: metrics instrumentator, kind: module, parent: api-server, layer: api, summary: "GET /metrics: prometheus_client's ASGI app mounted on the API server, exposing the process registry the PrometheusStatLogger writes vllm:* metrics into (text exposition format).", sources: ["vllm/entrypoints/serve/instrumentator/metrics.py:56-81", "vllm/entrypoints/serve/instrumentator/__init__.py:7-22"]}
+  - {id: deepseek-v3-reasoning-parser, name: DeepSeekV3ReasoningParser, kind: module, parent: api-server, layer: parsers, summary: "--reasoning-parser deepseek_v3: built per request with the effective chat_template_kwargs; thinking (or enable_thinking) delegates to DeepSeekR1ReasoningParser (<think>...</think>), otherwise to IdentityReasoningParser (all content).", sources: ["vllm/reasoning/deepseek_v3_reasoning_parser.py:20-60", "vllm/reasoning/basic_parsers.py:153-176", "vllm/reasoning/identity_reasoning_parser.py:67-72"]}
+  - {id: cohere-command-parser, name: CohereCommandParser, kind: module, parent: api-server, layer: parsers, summary: "The unified Cohere Command parser (cohere_command3 / cohere_command4): melody-based reasoning, citations and tool calls; adjust_request folds JSON schemas and tools into structural tags.", sources: ["vllm/parser/cohere_command.py:472-691"]}
+  - {id: online-derenderer, name: OnlineDerenderer, kind: module, parent: api-server, layer: api, summary: "renderers.online_derenderer: turns token-in/token-out generate chunks back into chat (or completion) responses; the stream path replays prior chunks through the parser and pins tool-call ids across chunks.", sources: ["vllm/renderers/online_derenderer.py:500-700"]}
+  - id: transformers-config-utils
+    name: vllm.transformers_utils.config (serialization)
+    kind: module
+    parent: api-server
+    layer: api
+    summary: "maybe_register_config_serialize_by_value: registers a multiprocessing reducer that pickles VllmConfig by value through cloudpickle (so custom trust_remote_code configs survive spawn), and, when the HF transformers_modules package is importable, registers it by value with cloudpickle (and Ray's vendored copy)."
+    sources: ["vllm/transformers_utils/config.py:1105-1177"]
+    state:
+      schema: {type: object, properties: {reducers: {type: array, items: {type: string}, description: "classes multiprocessing.reducer.register was called for in this process"}, pickle_by_value: {type: array, items: {type: string}}}}
+      initial: {reducers: [], pickle_by_value: []}
+  - id: harmony-parser
+    name: HarmonyParser
+    kind: module
+    parent: api-server
+    layer: parsers
+    summary: "The gpt-oss Harmony parser: one openai_harmony StreamableParser per HarmonyParser instance, routing analysis to reasoning, final/commentary to content and functions.* recipients to tool calls."
+    sources: ["vllm/parser/harmony.py:80-420"]
+    state:
+      schema: {type: object, properties: {parsers: {type: object, description: "per parser instance: the stream position (mode, header, channel, recipient) and the next tool-call index"}}}
+      initial: {parsers: {}}
+interfaces:
+  - component: transformers-config-utils
+    name: maybe-register-config-serialize-by-value
+    kind: function
+    summary: "maybe_register_config_serialize_by_value (called by AsyncLLM.__init__, EngineCoreProc startup and get_config with trust_remote_code): multiprocessing.reducer.register(VllmConfig, _reduce_config), then cloudpickle.register_pickle_by_value(transformers_modules) only when that module imports. Any exception is logged as a warning, not raised."
+    sources: ["vllm/transformers_utils/config.py:1105-1177"]
+    latency_ms: 0
+    request: {type: object, properties: {transformers_modules_available: {type: boolean, default: false, description: "ASSUMPTION: transformers_modules exists only after a trust_remote_code config with an AutoConfig class was loaded; the worlds' checkpoints are stock transformers configs"}}}
+    response: {type: object, properties: {reducers: {type: array, items: {type: string}}, pickle_by_value: {type: array, items: {type: string}}}}
+    behavior:
+      - set: {vars.tm: "= has(input.transformers_modules_available) && input.transformers_modules_available"}
+      - title: "multiprocessing.reducer.register(VllmConfig, _reduce_config): VllmConfig pickles as pickle.loads(cloudpickle.dumps(config))"
+        source: "vllm/transformers_utils/config.py:1144-1158"
+        set: {state.reducers: "= 'VllmConfig' in state.reducers ? state.reducers : state.reducers + ['VllmConfig']"}
+      - title: "With transformers_modules importable, cloudpickle (and ray.cloudpickle) pickle it by value"
+        source: "vllm/transformers_utils/config.py:1160-1168"
+        if: "vars.tm && !('transformers_modules' in state.pickle_by_value)"
+        then:
+          - set: {state.pickle_by_value: "= state.pickle_by_value + ['transformers_modules']"}
+      - return: {reducers: "= state.reducers", pickle_by_value: "= state.pickle_by_value"}
+  - component: deepseek-v3-reasoning-parser
+    name: extract-reasoning
+    kind: function
+    summary: "DeepSeekV3ReasoningParser.extract_reasoning: thinking -> the R1 split (drop a leading <think>; without </think> everything is reasoning and content is None; content after </think>, None when empty); not thinking -> (None, the whole output)."
+    sources: ["vllm/reasoning/deepseek_v3_reasoning_parser.py:25-37", "vllm/reasoning/basic_parsers.py:153-176", "vllm/reasoning/identity_reasoning_parser.py:67-72"]
+    request: {type: object, properties: {model_output: {type: string, examples: ["<think>Paris is the capital.</think>Paris"]}, chat_template_kwargs: {type: [object, "null"], default: null}, default_thinking: {type: boolean, default: false, description: "DeepSeekV3ReasoningWithThinkingParser (--reasoning-parser holo2): with neither thinking nor enable_thinking given, thinking is on"}}, required: [model_output]}
+    response: {type: object, properties: {reasoning: {type: [string, "null"]}, content: {type: [string, "null"]}}}
+    behavior:
+      - title: "thinking = bool(chat_template_kwargs.thinking) or bool(chat_template_kwargs.enable_thinking)"
+        source: "vllm/reasoning/deepseek_v3_reasoning_parser.py:28-31"
+        set:
+          vars.kw: "= has(input.chat_template_kwargs) && input.chat_template_kwargs != null ? input.chat_template_kwargs : {}"
+      - title: "DeepSeekV3ReasoningWithThinkingParser: neither key set (None) means thinking=True and enable_thinking=True"
+        source: "vllm/reasoning/deepseek_v3_reasoning_parser.py:85-96"
+        if: "has(input.default_thinking) && input.default_thinking && !('thinking' in vars.kw && vars.kw.thinking != null) && !('enable_thinking' in vars.kw && vars.kw.enable_thinking != null)"
+        then: [{set: {vars.kw: "= merge(vars.kw, {'thinking': true, 'enable_thinking': true})"}}]
+      - set:
+          vars.thinking: "= ('thinking' in vars.kw && vars.kw.thinking == true) || ('enable_thinking' in vars.kw && vars.kw.enable_thinking == true)"
+      - if: "!vars.thinking"
+        then:
+          - title: "IdentityReasoningParser: no reasoning, the whole output is content"
+            source: "vllm/reasoning/identity_reasoning_parser.py:67-72"
+            return: {reasoning: null, content: "= input.model_output"}
+      - title: "DeepSeekR1ReasoningParser (BaseThinkingReasoningParser.extract_reasoning): partition off a leading <think>"
+        source: "vllm/reasoning/basic_parsers.py:162-166"
+        set:
+          vars.out: "= input.model_output.contains('<think>') ? input.model_output.substring(input.model_output.indexOf('<think>') + 7) : input.model_output"
+      - if: "!vars.out.contains('</think>')"
+        then:
+          - title: "No </think>: the model is still reasoning, so all of it is reasoning and content is None"
+            source: "vllm/reasoning/basic_parsers.py:168-171"
+            return: {reasoning: "= vars.out", content: null}
+      - title: "reasoning before </think>, content after it (None when empty)"
+        source: "vllm/reasoning/basic_parsers.py:172-176"
+        return:
+          reasoning: "= vars.out.substring(0, vars.out.indexOf('</think>'))"
+          content: "= vars.out.substring(vars.out.indexOf('</think>') + 8) == '' ? dyn(null) : dyn(vars.out.substring(vars.out.indexOf('</think>') + 8))"
+  - component: instrumentator-metrics
+    name: get-metrics
+    kind: http
+    summary: "GET /metrics: no API key needed (not under /v1); the registry's samples as text/plain; version=0.0.4 (the Instrumentator excludes /metrics itself from its http_* metrics)."
+    sources: ["vllm/entrypoints/serve/instrumentator/metrics.py:56-81"]
+    attributes: {method: GET, path: /metrics}
+    request: {type: object, properties: {path: {type: string, examples: [/metrics]}, headers: {type: object}}}
+    response: {type: object, properties: {content_type: {type: string}, metrics: {type: [object, array]}}}
+    errors: [{code: unauthorized, status: 401}, {code: ConnectionRefusedError, status: 0, retryable: true}]
+    behavior:
+      - call: launcher.accept-connection
+      - call: scaling-middleware.call
+        input: {path: "= input.path"}
+      - title: "AuthenticationMiddleware guards only /v1, /v2, /inference and /cohere; /metrics answers without a key"
+        source: "vllm/entrypoints/serve/middleware/authenticate.py:11"
+        call: authentication-middleware.call
+        input: {path: "= input.path", headers: "= has(input.headers) ? input.headers : {}"}
+      - title: "make_asgi_app(registry): generate_latest over the vllm:* registry"
+        source: "vllm/entrypoints/serve/instrumentator/metrics.py:76-81"
+        call: prometheus-registry.collect
+        as: all
+      - title: "PrometheusResponse: Content-Type text/plain; version=0.0.4; charset=utf-8"
+        source: "vllm/entrypoints/serve/instrumentator/metrics.py:51-53"
+        return: {content_type: "text/plain; version=0.0.4; charset=utf-8", metrics: "= vars.all.value"}
+  - component: launcher
+    name: handle-shutdown-signal
+    kind: function
+    summary: "serve_http's SIGINT/SIGTERM handler: the first signal sets shutdown_event (a repeat is ignored); handle_shutdown then stops the engine client with vllm_config.shutdown_timeout (mode abort at 0, else drain), and only after it returns sets server.should_exit and cancels the server and watchdog tasks."
+    sources: ["vllm/entrypoints/launchers/launcher.py:249-290"]
+    request: {type: object, properties: {signal: {type: string, enum: [SIGTERM, SIGINT], default: SIGTERM}}}
+    response: {type: object, properties: {mode: {type: [string, "null"]}, timeout: {type: [integer, "null"]}, should_exit: {type: [boolean, "null"]}, ignored: {type: boolean}}}
+    behavior:
+      - title: "signal_handler: once shutdown_event is set, a second signal does nothing"
+        source: "vllm/entrypoints/launchers/launcher.py:251-255"
+        if: "has(state.shutdown_requested) && state.shutdown_requested"
+        then: [{return: {mode: null, timeout: null, should_exit: null, ignored: true}}]
+      - set: {state.shutdown_requested: true}
+      - title: "handle_shutdown: mode = abort when shutdown_timeout is 0, else drain; engine_client.shutdown(timeout) runs in an executor and is awaited"
+        source: "vllm/entrypoints/launchers/launcher.py:263-279"
+        set:
+          vars.timeout: "= config['shutdown-timeout']"
+          vars.mode: "= config['shutdown-timeout'] == 0 ? 'abort' : 'drain'"
+          vars.log: "= '[shutdown] API server: stopping engine client mode=' + (config['shutdown-timeout'] == 0 ? 'abort' : 'drain') + ' timeout=' + string(config['shutdown-timeout']) + 's'"
+      - call: async-llm.shutdown
+        input: {timeout: "= vars.timeout"}
+      - title: "Only after the engine client stopped: server.should_exit = True, and the server and watchdog tasks are cancelled"
+        source: "vllm/entrypoints/launchers/launcher.py:281-288"
+        set: {state.server_should_exit: true}
+      - return: {mode: "= vars.mode", timeout: "= vars.timeout", should_exit: true, ignored: false}
+  - component: cohere-command-parser
+    name: adjust-request
+    kind: function
+    summary: "CohereCommandParser.adjust_request: skip_special_tokens=False, then _apply_structural_tags: an existing structural tag (in structured_outputs or response_format) wins; else the JSON schema from response_format (json_object -> {type: object}, json_schema -> its schema), else from structured_outputs, plus the tools, are folded into one triggered_tags structural tag for the model architecture's tag style; response_format is then cleared."
+    sources: ["vllm/parser/cohere_command.py:504-563", "vllm/parser/cohere_command.py:230-283", "vllm/parser/cohere_command.py:286-422", "vllm/parser/cohere_command.py:94-118"]
+    request:
+      type: object
+      properties:
+        body: {type: object, description: "the ChatCompletionRequest"}
+        model_architecture: {type: [string, "null"], default: null, examples: [Cohere2ForCausalLM]}
+      required: [body]
+    errors: [{code: value-error, status: 0, retryable: false}]
+    behavior:
+      - title: "keep special tokens so melody can find the boundaries"
+        source: "vllm/parser/cohere_command.py:507-508"
+        set:
+          vars.body: "= merge(input.body, {'skip_special_tokens': false})"
+          vars.so: "= has(input.body.structured_outputs) ? input.body.structured_outputs : null"
+          vars.rf: "= has(input.body.response_format) ? input.body.response_format : null"
+          vars.tools: "= has(input.body.tools) ? input.body.tools : null"
+      - if: "(vars.so != null && 'structural_tag' in vars.so && vars.so.structural_tag != null) || (vars.rf != null && vars.rf.type == 'structural_tag')"
+        then: [{title: "An explicit structural tag is left as is", source: "vllm/parser/cohere_command.py:516-529", return: "= vars.body"}]
+      - title: "_schema_dict_from_chat_response_format: json_object -> {type: object}; json_schema -> the wrapper's schema (alias of json_schema), unwrapping a nested schema"
+        source: "vllm/parser/cohere_command.py:322-378"
+        set:
+          vars.schema: "= vars.rf == null ? null : (vars.rf.type == 'json_object' ? dyn({'type': 'object'}) : (vars.rf.type == 'json_schema' && has(vars.rf.json_schema) && vars.rf.json_schema != null ? ('schema' in vars.rf.json_schema && type(vars.rf.json_schema.schema) == map ? dyn(vars.rf.json_schema.schema) : ('json_schema' in vars.rf.json_schema && type(vars.rf.json_schema.json_schema) == map ? dyn(vars.rf.json_schema.json_schema) : dyn(vars.rf.json_schema))) : dyn(null)))"
+      - if: "vars.schema == null && vars.so != null"
+        then:
+          - title: "else _schema_dict_from_structured_outputs: json_object -> {type: object}; a json dict (unwrapping schema)"
+            source: "vllm/parser/cohere_command.py:380-422"
+            set:
+              vars.schema: "= 'json_object' in vars.so && vars.so.json_object == true ? dyn({'type': 'object'}) : ('json' in vars.so && type(vars.so.json) == map ? ('schema' in vars.so.json && type(vars.so.json.schema) == map ? dyn(vars.so.json.schema) : dyn(vars.so.json)) : dyn(null))"
+      - set:
+          vars.has_tools: "= vars.tools != null && (type(vars.tools) == string ? vars.tools.trim() != '' : size(vars.tools) > 0)"
+      - if: "vars.schema == null && !vars.has_tools"
+        then: [{title: "No schema and no tools: unchanged", source: "vllm/parser/cohere_command.py:541-542", return: "= vars.body"}]
+      - if: "!has(input.model_architecture) || input.model_architecture == null"
+        then: [{title: "No model config: the architecture is unknown, unchanged", source: "vllm/parser/cohere_command.py:543-544", return: "= vars.body"}]
+      - title: "MODEL_TO_TAG_STYLE: Cohere2ForCausalLM wraps JSON in <|START_RESPONSE|>; the vision and MoE models also in <|START_TEXT|>; tools in <|START_ACTION|>"
+        source: "vllm/parser/cohere_command.py:94-118"
+        set:
+          vars.json_tags: "= input.model_architecture == 'Cohere2ForCausalLM' ? [['<|START_RESPONSE|>', '<|END_RESPONSE|>']] : (input.model_architecture in ['Cohere2VisionForConditionalGeneration', 'Cohere2MoeForCausalLM'] ? [['<|START_RESPONSE|>', '<|END_RESPONSE|>'], ['<|START_TEXT|>', '<|END_TEXT|>']] : [])"
+      - if: "size(vars.json_tags) == 0"
+        then:
+          - title: "convert_schema_to_structural_tags returns None for an architecture without a tag style"
+            source: "vllm/parser/cohere_command.py:550-560"
+            fail: {code: value-error, message: "= 'Failed to build structural_tag guided decoding constraints from this request\\'s JSON schema and/or tools. The configured model architecture (\\'' + input.model_architecture + '\\') does not support Cohere command structural tags, or the schema cannot be expressed in that format.'"}
+      - title: "One json_schema tag per JSON wrapper; tools add a grammar tag on <|START_ACTION|> (ASSUMPTION: collect_tool_schema's grammar text is not simulated)"
+        source: "vllm/parser/cohere_command.py:249-283"
+        set:
+          vars.tags: "= (vars.schema != null ? vars.json_tags.map(t, {'begin': t[0], 'content': {'type': 'json_schema', 'json_schema': vars.schema}, 'end': t[1]}) : []) + (vars.has_tools ? [{'begin': '<|START_ACTION|>', 'content': {'type': 'grammar', 'grammar': 'tool-call grammar'}, 'end': '<|END_ACTION|>'}] : [])"
+      - set:
+          vars.tag: "= {'type': 'structural_tag', 'format': {'type': 'triggered_tags', 'triggers': vars.tags.map(t, t.begin), 'tags': vars.tags}}"
+      - title: "structured_outputs = StructuredOutputsParams(structural_tag=json.dumps(...)); a json_schema or json_object response_format is dropped"
+        source: "vllm/parser/cohere_command.py:561-563"
+        return: "= merge(vars.body, {'structured_outputs': {'structural_tag': string(vars.tag)}, 'structural_tag_obj': vars.tag, 'response_format': vars.rf != null && vars.rf.type in ['json_schema', 'json_object'] ? dyn(null) : dyn(vars.rf)})"
+  - component: run-batch
+    name: download-bytes-from-url
+    kind: function
+    summary: "download_bytes_from_url: a data: URL with base64 is size-checked from its encoded length before decoding (len(data.rstrip('=')) * 3 // 4 against VLLM_MAX_AUDIO_CLIP_FILESIZE_MB MiB); another data encoding or a missing comma is refused; http(s) honors allowed_media_domains; other schemes are refused."
+    sources: ["vllm/entrypoints/launchers/run_batch.py:461-531", "vllm/entrypoints/launchers/run_batch.py:77-86"]
+    request: {type: object, properties: {url: {type: string, examples: ["data:audio/wav;base64,AAAA"]}, allowed_media_domains: {type: [array, "null"], items: {type: string}, default: null}}, required: [url]}
+    errors: [{code: vllm-validation-error, status: 0, retryable: false}]
+    behavior:
+      - set:
+          vars.scheme: "= input.url.indexOf(':') > 0 ? input.url.substring(0, input.url.indexOf(':')).lowerAscii() : ''"
+          vars.limit: "= int(double(config['vllm-max-audio-clip-filesize-mb']) * 1048576.0)"
+      - if: "vars.scheme == 'data'"
+        then:
+          - if: "!input.url.contains(',')"
+            then: [{source: "vllm/entrypoints/launchers/run_batch.py:494-498", fail: {code: vllm-validation-error, message: "= 'Invalid data URL format: ' + input.url", data: {param: url}}}]
+          - set:
+              vars.header: "= input.url.substring(0, input.url.indexOf(','))"
+              vars.data: "= input.url.substring(input.url.indexOf(',') + 1)"
+          - if: "!vars.header.contains('base64')"
+            then: [{source: "vllm/entrypoints/launchers/run_batch.py:489-493", fail: {code: vllm-validation-error, message: "= 'Unsupported data URL encoding: ' + vars.header", data: {param: url}}}]
+          - set:
+              vars.size: "= size(vars.data.replace('=', '')) * 3 / 4"
+          - title: "The decoded size is estimated from the encoded length, so an oversized payload is refused before base64.b64decode"
+            source: "vllm/entrypoints/launchers/run_batch.py:485-487"
+            if: "vars.size > vars.limit"
+            then: [{source: "vllm/entrypoints/launchers/run_batch.py:81-86", fail: {code: vllm-validation-error, message: Maximum file size exceeded, data: {param: audio_filesize_mb, value: "= double(vars.size) / 1048576.0"}}}]
+          - title: "base64.b64decode(data)"
+            source: "vllm/entrypoints/launchers/run_batch.py:488"
+            return: {decoded: true, size_bytes: "= vars.size"}
+      - if: "vars.scheme in ['http', 'https']"
+        then:
+          - set:
+              vars.host: "= input.url.substring(vars.scheme.size() + 3).split('/')[0].split('@')[size(input.url.substring(vars.scheme.size() + 3).split('/')[0].split('@')) - 1].split(':')[0]"
+          - if: "has(input.allowed_media_domains) && input.allowed_media_domains != null && !(vars.host in input.allowed_media_domains)"
+            then: [{source: "vllm/entrypoints/launchers/run_batch.py:502-511", fail: {code: vllm-validation-error, message: "= 'The URL must be from one of the allowed domains: [' + input.allowed_media_domains.map(d, '\\'' + d + '\\'').join(', ') + ']. Input URL domain: ' + vars.host", data: {param: url, value: "= vars.host"}}}]
+          - title: "global_http_connection.async_get_bytes with max_bytes = the limit (ASSUMPTION: the body is not simulated)"
+            source: "vllm/entrypoints/launchers/run_batch.py:516-523"
+            return: {decoded: false, size_bytes: 0}
+      - source: "vllm/entrypoints/launchers/run_batch.py:525-531"
+        fail: {code: vllm-validation-error, message: "= 'Unsupported URL scheme: ' + vars.scheme + '. Supported schemes: http, https, data'", data: {param: url, value: "= vars.scheme"}}
+  - component: run-batch
+    name: transcription-wrapper
+    kind: function
+    summary: "make_transcription_wrapper(is_translation)(handler): download the batch request's file_url, then call the transcription (or translation) handler with the bytes; any exception becomes ErrorResponse 400 'Failed to process transcription: <exc>' and the handler is never called."
+    sources: ["vllm/entrypoints/launchers/run_batch.py:639-709"]
+    request: {type: object, properties: {body: {type: object, properties: {model: {type: string}, file_url: {type: string}, response_format: {type: string, default: json}}}, is_translation: {type: boolean, default: false}, allowed_media_domains: {type: [array, "null"], items: {type: string}, default: null}}, required: [body]}
+    response: {type: object, properties: {error: {type: object}, handled: {type: boolean}}}
+    behavior:
+      - set: {vars.op: "= has(input.is_translation) && input.is_translation ? 'translation' : 'transcription'"}
+      - source: "vllm/entrypoints/launchers/run_batch.py:668-672"
+        call: run-batch.download-bytes-from-url
+        input: {url: "= input.body.file_url", allowed_media_domains: "= has(input.allowed_media_domains) ? input.allowed_media_domains : null"}
+        as: dl
+        on_error:
+          - title: "except Exception: ErrorResponse(message='Failed to process <op>: ' + str(e), type BadRequestError, code 400); str(VLLMValidationError) carries its parameter and value"
+            source: "vllm/entrypoints/launchers/run_batch.py:697-705"
+            return: {handled: false, error: {message: "= 'Failed to process ' + vars.op + ': ' + error.message + (has(error.data) && error.data != null && 'param' in error.data && error.data.param != null ? ' (parameter=' + error.data.param + ('value' in error.data && error.data.value != null ? ', value=' + string(error.data.value) : '') + ')' : '')", type: BadRequestError, code: 400}}
+      - title: "TranscriptionRequest.model_validate(request_dict with file=UploadFile(bytes)), then handler_fn(audio_data, request) (ASSUMPTION: the ASR handler is not modeled; Llama serves no transcription)"
+        source: "vllm/entrypoints/launchers/run_batch.py:674-696"
+        return: {handled: true, error: null}
+  - component: online-derenderer
+    name: apply-chat-stream-delta
+    kind: function
+    summary: "_derender_chat_stream_parsed, after the current chunk's parse_delta: append the chunk's token ids to the state, pin every id-bearing DeltaToolCall to the id recorded for its index (or record a new one), add the role on the first chunk, and rewrite a finish to tool_calls once tools streamed (unless tool_choice names a function); returns the stream choice and the updated state."
+    sources: ["vllm/renderers/online_derenderer.py:588-692"]
+    request:
+      type: object
+      properties:
+        state: {type: [object, "null"], default: null, description: "DerenderStreamState: output_token_ids, output_chunk_lens, role_sent, tools_streamed, last_tool_call_ids"}
+        delta_message: {type: [object, "null"], default: null, description: "what the parser's parse_delta returned for this chunk"}
+        token_ids: {type: array, items: {type: integer}, default: []}
+        finish_reason: {type: [string, "null"], default: null}
+        index: {type: integer, default: 0}
+        tool_choice: {default: null}
+      required: []
+    behavior:
+      - set:
+          vars.st: "= merge({'output_token_ids': [], 'output_chunk_lens': [], 'role_sent': false, 'tools_streamed': false, 'last_tool_call_ids': []}, has(input.state) && input.state != null ? input.state : {})"
+          vars.dm: "= has(input.delta_message) && input.delta_message != null ? input.delta_message : {}"
+          vars.tids: "= has(input.token_ids) ? input.token_ids : []"
+      - set:
+          vars.ids: "= vars.st.last_tool_call_ids"
+          vars.calls: "= 'tool_calls' in vars.dm && vars.dm.tool_calls != null ? vars.dm.tool_calls : []"
+          vars.out_calls: []
+      - title: "Pin: an id-bearing call whose index already has a recorded id reuses it; a new index records its id"
+        source: "vllm/renderers/online_derenderer.py:648-659"
+        foreach: "= vars.calls"
+        as: tc
+        steps:
+          - if: "!('id' in vars.tc) || vars.tc.id == null"
+            then:
+              - set: {vars.out_calls: "= vars.out_calls + [vars.tc]"}
+              - continue: true
+          - if: "vars.tc.index < size(vars.ids)"
+            then:
+              - set: {vars.out_calls: "= vars.out_calls + [merge(vars.tc, {'id': vars.ids[vars.tc.index]})]"}
+            else:
+              - set:
+                  vars.ids: "= vars.ids + [vars.tc.id]"
+                  vars.out_calls: "= vars.out_calls + [vars.tc]"
+      - set:
+          vars.tools_streamed: "= vars.st.tools_streamed || size(vars.calls) > 0"
+          vars.delta: "= merge(size(vars.calls) > 0 ? merge(vars.dm, {'tool_calls': vars.out_calls}) : vars.dm, vars.st.role_sent ? {} : {'role': 'assistant'})"
+      - title: "A finish after streamed tools reports tool_calls, unless tool_choice names a function"
+        source: "vllm/renderers/online_derenderer.py:664-671"
+        set:
+          vars.finish: "= has(input.finish_reason) && input.finish_reason != null && vars.tools_streamed && !(has(input.tool_choice) && input.tool_choice != null && type(input.tool_choice) == map) ? dyn('tool_calls') : (has(input.finish_reason) ? dyn(input.finish_reason) : dyn(null))"
+      - title: "updated_state: the chunk's ids and length appended, role_sent, tools_streamed, last_tool_call_ids"
+        source: "vllm/renderers/online_derenderer.py:684-692"
+        return:
+          choice: {index: "= has(input.index) ? input.index : 0", delta: "= vars.delta", finish_reason: "= vars.finish"}
+          state:
+            output_token_ids: "= vars.st.output_token_ids + vars.tids"
+            output_chunk_lens: "= size(vars.tids) > 0 ? vars.st.output_chunk_lens + [size(vars.tids)] : vars.st.output_chunk_lens"
+            role_sent: true
+            tools_streamed: "= vars.tools_streamed"
+            last_tool_call_ids: "= vars.ids"
+  - component: qwen3-parser
+    name: stream-tool-call
+    kind: function
+    summary: "The Qwen3 ParserEngine over streamed chunks (CONTENT, no thinking): text before <tool_call> is content; inside a call, the name is sent once <function=NAME> is complete, and the arguments (_qwen3_arg_converter: every <parameter=K>V</parameter> as a JSON string, one wrapping newline trimmed) stream as the growing JSON with its closing brace held back until </function>."
+    sources: ["vllm/parser/qwen3.py:51-86", "vllm/parser/qwen3.py:88-140", "vllm/parser/engine/streaming_parser_engine.py:409-585"]
+    request: {type: object, properties: {chunks: {type: array, items: {type: string}}}, required: [chunks]}
+    response: {type: object, properties: {deltas: {type: array, items: {type: object}}}}
+    behavior:
+      - set:
+          vars.buf: ""
+          vars.deltas: []
+          vars.name_sent: false
+          vars.sent_args: ""
+          vars.in_call: false
+          vars.closed: false
+      - foreach: "= input.chunks"
+        as: chunk
+        steps:
+          - set: {vars.buf: "= vars.buf + vars.chunk"}
+          - if: "!vars.in_call && vars.buf.contains('<tool_call>')"
+            then:
+              - title: "TOOL_START: the text before the marker was content"
+                source: "vllm/parser/qwen3.py:104-120"
+                set:
+                  vars.deltas: "= vars.buf.substring(0, vars.buf.indexOf('<tool_call>')) != '' ? vars.deltas + [{'content': vars.buf.substring(0, vars.buf.indexOf('<tool_call>'))}] : vars.deltas"
+                  vars.buf: "= vars.buf.substring(vars.buf.indexOf('<tool_call>') + 11)"
+                  vars.in_call: true
+          - if: "!vars.in_call"
+            then:
+              - set: {vars.deltas: "= vars.deltas + [{'content': vars.buf}]", vars.buf: ""}
+              - continue: true
+          - if: "!vars.name_sent && vars.buf.contains('<function=') && vars.buf.substring(vars.buf.indexOf('<function=')).contains('>')"
+            then:
+              - title: "The function name, once <function=NAME> is complete"
+                source: "vllm/parser/qwen3.py:46-47"
+                set:
+                  vars.name: "= vars.buf.substring(vars.buf.indexOf('<function=') + 10, vars.buf.indexOf('<function=') + vars.buf.substring(vars.buf.indexOf('<function=')).indexOf('>'))"
+                  vars.name_sent: true
+              - set: {vars.deltas: "= vars.deltas + [{'tool_calls': [{'index': 0, 'function': {'name': vars.name}}]}]"}
+          - if: "vars.name_sent && !vars.closed"
+            then:
+              - title: "_qwen3_arg_converter over the complete <parameter=K>V</parameter> tags so far"
+                source: "vllm/parser/qwen3.py:51-86"
+                set:
+                  vars.segs: "= vars.buf.split('<parameter=').slice(1, size(vars.buf.split('<parameter='))).filter(p, p.contains('>') && p.contains('</parameter>'))"
+              - set:
+                  vars.kv: "= vars.segs.map(p, [p.substring(0, p.indexOf('>')), p.substring(p.indexOf('>') + 1, p.indexOf('</parameter>'))])"
+              - title: "_trim_wrapping_newlines: one leading and one trailing newline go"
+                source: "vllm/parser/qwen3.py:61-67"
+                set:
+                  vars.kv: "= vars.kv.map(e, [e[0], e[1].startsWith('\\n') ? e[1].substring(1) : e[1]]).map(e, [e[0], e[1].endsWith('\\n') ? e[1].substring(0, size(e[1]) - 1) : e[1]])"
+              - set:
+                  vars.json: "= '{' + vars.kv.map(e, '\"' + e[0] + '\": \"' + e[1] + '\"').join(', ') + '}'"
+                  vars.closed: "= vars.buf.contains('</function>')"
+              - set:
+                  vars.cur: "= vars.closed ? vars.json : vars.json.substring(0, size(vars.json) - 1)"
+              - title: "Arguments stream as the new suffix of the JSON text (the closing brace waits for </function>)"
+                source: "vllm/parser/engine/streaming_parser_engine.py:518-560"
+                if: "size(vars.segs) > 0 && size(vars.cur) > size(vars.sent_args) && vars.cur.startsWith(vars.sent_args)"
+                then:
+                  - set:
+                      vars.deltas: "= vars.deltas + [{'tool_calls': [{'index': 0, 'function': {'arguments': vars.cur.substring(size(vars.sent_args))}}]}]"
+                      vars.sent_args: "= vars.cur"
+      - return: {deltas: "= vars.deltas"}
+  - component: harmony-parser
+    name: parse-delta
+    kind: function
+    summary: "HarmonyParser.parse_delta (gpt-oss): feed the delta through the per-parser harmony stream state; text in an analysis message is reasoning, in final (or commentary with no recipient) content, and in a message to functions.<name> tool-call arguments: a new recipient opens a DeltaToolCall with the name at the next index, later text extends it; <|end|>/<|call|> complete the message; finished resets the tool index. Empty results are None."
+    sources: ["vllm/parser/harmony.py:237-330", "vllm/parser/harmony.py:60-77", "vllm/parser/harmony.py:331-372", "vllm/entrypoints/openai/parser/harmony_utils.py:64-65"]
+    request: {type: object, properties: {parser_id: {type: string, default: p0}, text: {type: string, description: "the decoded delta (encode_output's tokens, as text)"}, finished: {type: boolean, default: false}, include_reasoning: {type: boolean, default: true}}, required: [text]}
+    response: {type: object, properties: {delta: {type: [object, "null"]}}}
+    behavior:
+      - set:
+          vars.pid: "= has(input.parser_id) ? input.parser_id : 'p0'"
+      - set:
+          vars.ps: "= vars.pid in state.parsers ? state.parsers[vars.pid] : {'mode': 'header', 'header': '', 'channel': null, 'recipient': null, 'next_index': 0, 'prev_recipient': null}"
+          vars.rest: "= input.text"
+          vars.content: ""
+          vars.reasoning: ""
+          vars.tools: []
+          vars.markers: "= ['<|start|>', '<|channel|>', '<|constrain|>', '<|message|>', '<|end|>', '<|call|>', '<|return|>']"
+      - title: "process_chunk: token by token through the StreamableParser (header text, channel, constrain, message content, then end)"
+        source: "vllm/parser/harmony.py:331-372"
+        foreach: "= lists.range(64)"
+        as: step
+        steps:
+          - if: "vars.rest == ''"
+            then: [{break: true}]
+          - set:
+              vars.hits: "= vars.markers.filter(m, vars.rest.indexOf(m) >= 0)"
+          - set:
+              vars.at: "= size(vars.hits) == 0 ? size(vars.rest) : math.least(vars.hits.map(m, vars.rest.indexOf(m)))"
+          - set:
+              vars.text: "= vars.rest.substring(0, vars.at)"
+              vars.marker: "= size(vars.hits) == 0 ? '' : vars.hits.filter(m, vars.rest.indexOf(m) == vars.at)[0]"
+          - set:
+              vars.rest: "= vars.marker == '' ? '' : vars.rest.substring(vars.at + size(vars.marker))"
+          - if: "vars.text != ''"
+            then:
+              - if: "vars.ps.mode == 'header'"
+                then: [{set: {vars.ps: "= merge(vars.ps, {'header': vars.ps.header + vars.text})"}}]
+              - if: "vars.ps.mode == 'channel'"
+                then: [{set: {vars.ps: "= merge(vars.ps, {'channel': (vars.ps.channel == null ? '' : vars.ps.channel) + vars.text})"}}]
+              - if: "vars.ps.mode == 'message'"
+                then:
+                  - title: "_SegmentType: a functions.* recipient is a tool call; analysis is reasoning; final, or commentary with no recipient, is content"
+                    source: "vllm/parser/harmony.py:66-76"
+                    if: "vars.ps.recipient != null && vars.ps.recipient.startsWith('functions.')"
+                    then:
+                      - if: "vars.ps.prev_recipient != vars.ps.recipient"
+                        then:
+                          - title: "A new recipient: DeltaToolCall(id, name = recipient minus 'functions.', arguments, index = next index)"
+                            source: "vllm/parser/harmony.py:273-289"
+                            set:
+                              vars.tools: "= vars.tools + [{'index': vars.ps.next_index, 'name': vars.ps.recipient.substring(10), 'arguments': vars.text}]"
+                              vars.ps: "= merge(vars.ps, {'next_index': vars.ps.next_index + 1, 'prev_recipient': vars.ps.recipient})"
+                        else:
+                          - title: "The same recipient: extend this delta's call, or a new entry at index next-1 without a name"
+                            source: "vllm/parser/harmony.py:290-304"
+                            set:
+                              vars.tools: "= size(vars.tools) > 0 ? vars.tools.slice(0, size(vars.tools) - 1) + [merge(vars.tools[size(vars.tools) - 1], {'arguments': vars.tools[size(vars.tools) - 1].arguments + vars.text})] : [{'index': vars.ps.next_index - 1, 'name': null, 'arguments': vars.text}]"
+                    else:
+                      - if: "vars.ps.channel == 'analysis'"
+                        then: [{set: {vars.reasoning: "= vars.reasoning + vars.text"}}]
+                      - if: "vars.ps.channel == 'final' || (vars.ps.channel == 'commentary' && vars.ps.recipient == null)"
+                        then: [{set: {vars.content: "= vars.content + vars.text"}}]
+          - if: "vars.marker == '<|start|>'"
+            then: [{set: {vars.ps: "= merge(vars.ps, {'mode': 'header', 'header': '', 'channel': null, 'recipient': null})"}}]
+          - if: "vars.marker == '<|channel|>'"
+            then:
+              - title: "The header text names the recipient (to=functions.NAME)"
+                source: "vllm/parser/harmony.py:407-415"
+                set: {vars.ps: "= merge(vars.ps, {'mode': 'channel', 'channel': '', 'recipient': vars.ps.header.contains('to=') ? vars.ps.header.substring(vars.ps.header.indexOf('to=') + 3).split(' ')[0] : vars.ps.recipient})"}
+          - if: "vars.marker == '<|constrain|>'"
+            then: [{set: {vars.ps: "= merge(vars.ps, {'mode': 'constrain'})"}}]
+          - if: "vars.marker == '<|message|>'"
+            then: [{set: {vars.ps: "= merge(vars.ps, {'mode': 'message'})"}}]
+          - if: "vars.marker in ['<|end|>', '<|call|>', '<|return|>']"
+            then:
+              - title: "A completed message resets prev_recipient"
+                source: "vllm/parser/harmony.py:258-261"
+                set: {vars.ps: "= merge(vars.ps, {'mode': 'header', 'header': '', 'channel': null, 'recipient': null, 'prev_recipient': null})"}
+      - if: "has(input.finished) && input.finished"
+        then: [{source: "vllm/parser/harmony.py:306-307", set: {vars.ps: "= merge(vars.ps, {'next_index': 0})"}}]
+      - set: {state.parsers: "= merge(state.parsers, {vars.pid: vars.ps})"}
+      - if: "vars.content == '' && vars.reasoning == '' && size(vars.tools) == 0"
+        then: [{source: "vllm/parser/harmony.py:309-310", return: {delta: null}}]
+      - title: "DeltaMessage with only the non-empty parts; reasoning suppressed unless include_reasoning"
+        source: "vllm/parser/harmony.py:312-327"
+        return:
+          delta:
+            content: "= vars.content == '' ? null : vars.content"
+            reasoning: "= vars.reasoning == '' || (has(input.include_reasoning) && !input.include_reasoning) ? null : vars.reasoning"
+            tool_calls: "= vars.tools.map(t, {'index': t.index, 'function': {'name': t.name, 'arguments': t.arguments}})"
+scenarios:
+  - id: serving-api-r5-sampling-params-order-and-clamp
+    name: "SamplingParams: 0 < temperature < 0.01 is raised to 0.01; presence, then frequency, then repetition penalty are checked in that order; logit_bias keys convert and clamp, a non-integer key is refused with the key list"
+    fixtures: [full-tp1-llama-8b]
+    steps:
+      - {interface: sampling-params.post-init, caller: api-server, as: tiny, input: {params: {temperature: 0.005}}}
+      - {interface: sampling-params.post-init, caller: api-server, as: both, input: {params: {presence_penalty: 3.0, repetition_penalty: 0.0}}}
+      - {interface: sampling-params.post-init, caller: api-server, as: freq, input: {params: {frequency_penalty: -2.5, repetition_penalty: 0.0}}}
+      - {interface: sampling-params.post-init, caller: api-server, as: lb, input: {params: {logit_bias: {"9906": 500, "1917": -300, "5": 2}}}}
+      - {interface: sampling-params.post-init, caller: api-server, as: lbbad, input: {params: {logit_bias: {"abc": 5, "12": 1, "x1": 2}}}}
+      - {interface: sampling-params.post-init, caller: api-server, as: plp, input: {params: {prompt_logprobs: 2}}}
+    expect:
+      - "steps.tiny.result.value.temperature == 0.01"
+      - "steps.both.result.error.message == 'presence_penalty must be in [-2, 2], got 3.0.' || steps.both.result.error.message.startsWith('presence_penalty must be in [-2, 2], got 3')"
+      - "steps.freq.result.error.message.startsWith('frequency_penalty must be in [-2, 2], got -2.5')"
+      - "steps.lb.result.value.logit_bias == {'9906': 100.0, '1917': -100.0, '5': 2.0}"
+      - "steps.lbbad.result.error.message == \"logit_bias contains key(s) that cannot be converted to integer token IDs: ['abc', 'x1']\" && steps.lbbad.result.error.data.param == 'logit_bias'"
+      - "steps.plp.result.value.skip_reading_prefix_cache == true && steps.tiny.result.value.skip_reading_prefix_cache == false"
+  - id: serving-api-r5-sampling-params-verify-vocab
+    name: "SamplingParams.verify: logit_bias, stop_token_ids and allowed_token_ids against the served model's vocabulary (Llama 128256; Mixtral 32000 in the MoE world), and the spec-decode exclusions"
+    fixtures: [full-tp1-llama-8b]
+    steps:
+      - {interface: sampling-params.verify, caller: api-server, as: lb, input: {sampling_params: {logit_bias: {"200000": 10.0, "5": 1.0}}}}
+      - {interface: sampling-params.verify, caller: api-server, as: stop, input: {sampling_params: {stop_token_ids: [128256, 7]}}}
+      - {interface: sampling-params.verify, caller: api-server, as: empty, input: {sampling_params: {allowed_token_ids: []}}}
+      - {interface: sampling-params.verify, caller: api-server, as: allowed, input: {sampling_params: {allowed_token_ids: [5, -1]}}}
+      - {interface: sampling-params.verify, caller: api-server, as: ok, input: {sampling_params: {logit_bias: {"128255": 1.0}, stop_token_ids: [128255], allowed_token_ids: [0]}}}
+      - {interface: sampling-params.verify, caller: api-server, as: plp, input: {sampling_params: {prompt_logprobs: 21}}}
+    expect:
+      - "steps.lb.result.error.message == 'token_id(s) [200000] in logit_bias contain out-of-vocab token ids. Vocabulary size: 128256' && steps.lb.result.error.data.param == 'logit_bias' && steps.lb.result.error.data.value == '[200000]'"
+      - "steps.stop.result.error.message == 'token_id(s) [128256] in stop_token_ids contain out-of-vocab token ids. Vocabulary size: 128256' && steps.stop.result.error.data.param == 'stop_token_ids'"
+      - "steps.empty.result.error.message == 'allowed_token_ids is not None and empty!' && steps.allowed.result.error.message == 'allowed_token_ids contains out-of-vocab token id!'"
+      - "steps.ok.result.ok"
+      - "steps.plp.result.error.message == 'Requested prompt logprobs of 21, which is greater than max allowed: 20' && steps.plp.result.error.data.param == 'prompt_logprobs'"
+  - id: serving-api-r5-verify-moe-vocab-and-spec-decode
+    name: "MoE world: Mixtral's 32000-token vocabulary bounds logit_bias; with a speculative config, min_p and logit_bias are refused"
+    fixtures: [full-moe-mixtral-8x7b-tp2-ep]
+    steps:
+      - {interface: sampling-params.verify, caller: api-server, as: lb, input: {sampling_params: {logit_bias: {"32000": 1.0}}}}
+      - {interface: sampling-params.verify, caller: api-server, as: ok, input: {sampling_params: {logit_bias: {"31999": 1.0}}}}
+    expect:
+      - "steps.lb.result.error.message == 'token_id(s) [32000] in logit_bias contain out-of-vocab token ids. Vocabulary size: 32000'"
+      - "steps.ok.result.ok"
+  - id: serving-api-r5-verify-spec-decode
+    name: "With speculative decoding configured, SamplingParams.verify refuses min_p and logit_bias (no parameter); other requests pass"
+    fixtures: [full-tp1-llama-8b]
+    config: {speculative-method: eagle}
+    steps:
+      - {interface: sampling-params.verify, caller: api-server, as: minp, input: {sampling_params: {min_p: 0.1}}}
+      - {interface: sampling-params.verify, caller: api-server, as: lb, input: {sampling_params: {logit_bias: {"5": 1.0}}}}
+      - {interface: sampling-params.verify, caller: api-server, as: ok, input: {sampling_params: {temperature: 0.7}}}
+    expect:
+      - "steps.minp.result.error.message == 'The min_p and logit_bias sampling parameters are not yet supported with speculative decoding.' && steps.lb.result.error.code == 'vllm-validation-error'"
+      - "steps.ok.result.ok"
+  - id: serving-api-r5-tool-choice-defaults
+    name: "tools without tool_choice default to auto and are refused without --enable-auto-tool-choice; a named choice is described as function \"<name>\"; tool_choice none still renders the tools into the template"
+    fixtures: [full-tp1-llama-8b]
+    max_events: 200000
+    steps:
+      - {flow: serving-api-chat-completion, as: auto, input: {body: {messages: [{role: user, content: hi}], tools: [{type: function, function: {name: get_weather}}], tool_choice: {$absent: true}}}}
+      - {flow: serving-api-chat-completion, as: named, input: {body: {messages: [{role: user, content: hi}], tools: [{type: function, function: {name: get_weather}}], tool_choice: {type: function, function: {name: get_weather}}}}}
+      - {flow: serving-api-chat-completion, as: none, input: {body: {max_tokens: 2, messages: [{role: user, content: hi}], tools: [{type: function, function: {name: get_weather}}], tool_choice: none}}}
+      - {flow: serving-api-chat-completion, as: badfn, input: {body: {messages: [{role: user, content: hi}], tools: [{type: function, function: {name: get_weather}}], tool_choice: {type: function, function: x}}}}
+    expect:
+      - "steps.auto.result.error.status == 400 && steps.auto.result.error.message == '\"auto\" tool choice requires --enable-auto-tool-choice and --tool-call-parser to be set'"
+      - "steps.named.result.error.message == 'tool_choice=function \"get_weather\" requires --tool-call-parser to be set'"
+      - "steps.none.result.ok && trace.exists(e, e.type == 'call.start' && e.interface == 'hf-renderer.safe-apply-chat-template' && e.input.tools != null && e.input.tools[0].function.name == 'get_weather')"
+      - "steps.badfn.result.error.status == 400 && steps.badfn.result.error.message.startsWith('Invalid value for `function`: `x` in `tool_choice`!') && steps.badfn.result.error.data.param == 'tool_choice.function'"
+  - id: serving-api-r5-stream-validation-error-first
+    name: "A validation error raised by the engine client in a streamed chat is the first frame: 400 BadRequestError with its parameter, no role chunk, then [DONE]"
+    fixtures: [full-tp1-llama-8b]
+    max_events: 300000
+    steps:
+      - {flow: serving-api-chat-stream, as: s, input: {body: {messages: [{role: user, content: hi}], stream: true, logprobs: true, top_logprobs: 30}}}
+    expect:
+      - "steps.s.result.ok && size(steps.s.result.value.items) == 2"
+      - "steps.s.result.value.items[0].error.code == 400 && steps.s.result.value.items[0].error.type == 'BadRequestError' && steps.s.result.value.items[0].error.message.startsWith('Requested sample logprobs of 30, which is greater than max allowed: 20')"
+      - "!steps.s.result.value.items.exists(i, json(i).contains('assistant'))"
+      - "steps.s.result.value.items[1].data == '[DONE]'"
+  - id: serving-api-r5-completion-validators-and-prompts
+    name: "CompletionRequest validators: too many prompts, echo+logprobs with beam search, prompt_logprobs with stream, negative token ids; a token-id prompt is one TokensPrompt; echo prepends the prompt text"
+    fixtures: [full-tp1-llama-8b]
+    max_events: 400000
+    config: {vllm-max-completion-prompts: 2}
+    steps:
+      - {flow: serving-api-completion, as: many, input: {body: {prompt: [a, b, c]}}}
+      - {flow: serving-api-completion, as: beam_echo, input: {body: {prompt: Hello, use_beam_search: true, echo: true, logprobs: 1, n: 2}}}
+      - {flow: serving-api-completion, as: plp_stream, input: {body: {prompt: Hello, stream: true, prompt_logprobs: 1}}}
+      - {flow: serving-api-completion, as: neg, input: {body: {prompt: [128000, -1]}}}
+      - {flow: serving-api-completion, as: toks, input: {body: {prompt: [128000, 9906, 1917], max_tokens: 2}}}
+      - {flow: serving-api-completion, as: echo, input: {body: {prompt: Hello world, echo: true, max_tokens: 2}}}
+      - {flow: serving-api-completion, as: beam_stream, input: {body: {prompt: Hello, use_beam_search: true, stream: true}}}
+    expect:
+      - "steps.many.result.error.status == 400 && steps.many.result.error.message == 'prompt list length 3 exceeds the maximum allowed count of 2. To increase this limit, set the VLLM_MAX_COMPLETION_PROMPTS environment variable. (parameter=prompt)'"
+      - "steps.beam_echo.result.error.data.param == 'echo' && steps.plp_stream.result.error.message == '`prompt_logprobs` are not available when `stream=True`. (parameter=prompt_logprobs)'"
+      - "steps.neg.result.error.status == 400 && steps.neg.result.error.code == 'Bad Request'"
+      - "steps.toks.result.ok && trace.exists(e, e.type == 'call.start' && e.interface == 'async-llm.generate' && e.input.prompt_token_ids == [128000, 9906, 1917])"
+      - "steps.echo.result.ok && steps.echo.result.value.choices[0].text.startsWith('Hello world') && steps.echo.result.value.usage.completion_tokens <= 2"
+      - "steps.beam_stream.result.error.message == 'Streaming is not currently supported with beam search'"
+  - id: serving-api-r5-online-beam-search
+    name: "Online beam search: one one-token request per live beam per step under <request_id>-<uuid>-beam-<i>, with logprobs 2 x beam_width; without sample logprobs from the engine no beam extends"
+    fixtures: [full-tp1-llama-8b]
+    max_events: 400000
+    steps:
+      - {interface: generate-base-serving.beam-search, caller: api-server, as: bs, input: {prompt_token_ids: [128000, 791, 6864], request_id: cmpl-bs, params: {beam_width: 3, max_tokens: 4, temperature: 0.0}}}
+    expect:
+      - "steps.bs.result.ok && steps.bs.result.value.finished"
+      - "trace.filter(e, e.type == 'call.start' && e.interface == 'async-llm.generate').all(e, e.input.sampling_params.max_tokens == 1 && e.input.sampling_params.logprobs == 6 && e.input.request_id.startsWith('cmpl-bs-') && e.input.request_id.endsWith('-beam-0'))"
+      - "calls['async-llm.generate'] >= 1"
+  - id: serving-api-r5-tokenize-precision
+    name: "/tokenize does not check max_model_len, refuses continue_final_message with add_generation_prompt (no parameter), honors add_special_tokens; /detokenize refuses a negative id in pydantic; the FP8 world reports its 8192 max_model_len"
+    fixtures: [full-fp8-llama-3-8b]
+    steps:
+      - {interface: serving-tokenization.post-tokenize, caller: api-client, as: big, input: {path: /tokenize, body: {model: llama-3-8b-fp8, prompt: "a a a a a a a a a a"}}}
+      - {interface: serving-tokenization.post-tokenize, caller: api-client, as: both, input: {path: /tokenize, body: {model: llama-3-8b-fp8, prompt: {$absent: true}, messages: [{role: user, content: hi}], add_generation_prompt: true, continue_final_message: true}}}
+      - {interface: serving-tokenization.post-tokenize, caller: api-client, as: nobos, input: {path: /tokenize, body: {model: llama-3-8b-fp8, prompt: Hello world, add_special_tokens: false}}}
+      - {interface: serving-tokenization.post-detokenize, caller: api-client, as: neg, input: {path: /detokenize, body: {model: llama-3-8b-fp8, tokens: [5, -3]}}}
+    config: {max-model-len: 4}
+    expect:
+      - "steps.big.result.ok && steps.big.result.value.count == 11 && steps.big.result.value.max_model_len == 4"
+      - "steps.both.result.error.status == 400 && steps.both.result.error.message == 'Cannot set both `continue_final_message` and `add_generation_prompt` to True.' && steps.both.result.error.data.param == null"
+      - "steps.nobos.result.value.tokens == [9906, 1917]"
+      - "steps.neg.result.error.code == 'Bad Request' && steps.neg.result.error.data.param == 'body.tokens.1' && !trace.exists(e, e.type == 'call.start' && e.interface == 'base-renderer.detokenize-prompt')"
+  - id: serving-api-r5-fp8-world-limits
+    name: "FP8 world: /tokenize reports max_model_len 8192 and a completion asking for more tokens than that is refused by TokenizeParams"
+    fixtures: [full-fp8-llama-3-8b]
+    steps:
+      - {interface: serving-tokenization.post-tokenize, caller: api-client, as: tok, input: {path: /tokenize, body: {model: llama-3-8b-fp8, prompt: Hello world}}}
+      - {flow: serving-api-completion, as: long, input: {body: {model: llama-3-8b-fp8, prompt: Hello, max_tokens: 9000}}}
+    expect:
+      - "steps.tok.result.value.max_model_len == 8192 && steps.tok.result.value.tokens == [128000, 9906, 1917]"
+      - "steps.long.result.error.status == 400 && steps.long.result.error.message.startsWith('max_tokens=9000 cannot be greater than max_model_len=8192')"
+  - id: serving-api-r5-http-plumbing
+    name: "GET /metrics needs no key; a non-JSON Content-Type is 400 before the handler; --enable-request-id-headers echoes X-Request-Id"
+    fixtures: [full-tp1-llama-8b]
+    max_events: 300000
+    config: {api-key: [sk-a], enable-request-id-headers: true}
+    steps:
+      - {interface: instrumentator-metrics.get-metrics, caller: api-client, as: m, input: {path: /metrics, headers: {Authorization: {$absent: true}}}}
+      - {flow: serving-api-chat-completion, as: ct, input: {headers: {Authorization: Bearer sk-a, Content-Type: text/plain}, body: {messages: [{role: user, content: hi}]}}}
+      - {flow: serving-api-chat-completion, as: rid, input: {headers: {Authorization: Bearer sk-a, X-Request-Id: trace-42, Content-Type: "application/json; charset=utf-8"}, body: {max_tokens: 2, messages: [{role: user, content: hi}]}}}
+    expect:
+      - "steps.m.result.ok && steps.m.result.value.content_type == 'text/plain; version=0.0.4; charset=utf-8'"
+      - "steps.ct.result.error.status == 400 && steps.ct.result.error.code == 'Bad Request' && steps.ct.result.error.message == \"1 validation error:\\n  Unsupported Media Type: Only 'application/json' is allowed\" && calls['openai-serving-chat.create-chat-completion'] == 1"
+      - "steps.rid.result.ok && steps.rid.result.value.id == 'chatcmpl-trace-42' && steps.rid.result.value.headers['x-request-id'] == 'trace-42'"
+  - id: serving-api-r5-vl-world-multimodal
+    name: "VL world: the ChatML prompt carries Qwen2-VL's image tokens; image_embeds need --enable-mm-embeds; an audio part is over the model's 0 audio limit; a second image is over --limit-mm-per-prompt image=1"
+    fixtures: [full-vl-qwen2-vl-7b]
+    max_events: 300000
+    config: {limit-mm-per-prompt: {image: 1}}
+    steps:
+      - {interface: hf-renderer.render-messages, caller: api-server, as: one, input: {messages: [{role: user, content: [{type: image_url, image_url: {url: "data:image/jpeg;base64,AAAA"}}, {type: text, text: describe}]}]}}
+      - {interface: hf-renderer.render-messages, caller: api-server, as: emb, input: {messages: [{role: user, content: [{type: image_embeds, image_embeds: AAAA}]}]}}
+      - {interface: hf-renderer.render-messages, caller: api-server, as: audio, input: {messages: [{role: user, content: [{type: input_audio, input_audio: {data: AAAA, format: wav}}]}]}}
+      - {interface: hf-renderer.render-messages, caller: api-server, as: two, input: {messages: [{role: user, content: [{type: image_url, image_url: {url: "data:image/jpeg;base64,AAAA"}}, {type: image_url, image_url: {url: "data:image/jpeg;base64,BBBB"}}]}]}}
+    expect:
+      - "steps.one.result.ok && steps.one.result.value.prompt_token_ids[0] == 151644 && [151652, 151655, 151653].all(t, t in steps.one.result.value.prompt_token_ids) && steps.one.result.value.prompt_token_ids.slice(size(steps.one.result.value.prompt_token_ids) - 3, size(steps.one.result.value.prompt_token_ids)) == [151644, 77091, 198]"
+      - "steps.emb.result.error.message == 'You must set `--enable-mm-embeds` to input `image_embeds`' && steps.emb.result.error.data.param == 'image_embeds'"
+      - "steps.audio.result.error.message.startsWith('At most 0 audio(s) may be provided in one prompt.')"
+      - "steps.two.result.error.message.startsWith('At most 1 image(s) may be provided in one prompt.') && calls['base-processing-info.validate-num-items'] == 4"
+      - "trace.exists(e, e.type == 'call.start' && e.interface == 'multi-modal-registry.create-processor')"
+  - id: serving-api-r5-text-only-media
+    name: "An image on the text-only Llama world fails while the item is tracked: '<served name> is not a multimodal model' (400)"
+    fixtures: [full-tp1-llama-8b]
+    flow: serving-api-multimodal-chat
+    input: {body: {messages: [{role: user, content: [{type: image_url, image_url: {url: "http://example.com/a.jpg"}}, {type: text, text: describe}]}]}}
+    expect:
+      - "!result.ok && result.error.status == 400 && result.error.code == 'BadRequestError' && result.error.message == 'llama-8b is not a multimodal model'"
+      - "calls['async-llm.generate'] == 0"
+      - "trace.exists(e, e.type == 'call.start' && e.interface == 'multi-modal-registry.create-processor')"
+  - id: serving-api-r5-deepseek-v3-and-cohere-errors
+    name: "--reasoning-parser deepseek_v3 follows chat_template_kwargs.thinking; a failing Cohere chat answers in Cohere's envelope with the request id"
+    fixtures: [full-tp1-llama-8b]
+    max_events: 300000
+    steps:
+      - {interface: deepseek-v3-reasoning-parser.extract-reasoning, caller: api-server, as: r1, input: {model_output: "<think>a</think>b", chat_template_kwargs: {enable_thinking: true}}}
+      - {interface: deepseek-v3-reasoning-parser.extract-reasoning, caller: api-server, as: id, input: {model_output: "<think>a</think>b", chat_template_kwargs: {}}}
+      - {interface: deepseek-v3-reasoning-parser.extract-reasoning, caller: api-server, as: open, input: {model_output: "still thinking", chat_template_kwargs: {thinking: true}}}
+    expect:
+      - "steps.r1.result.value.reasoning == 'a' && steps.r1.result.value.content == 'b'"
+      - "steps.id.result.value.reasoning == null && steps.id.result.value.content == '<think>a</think>b'"
+      - "steps.open.result.value.reasoning == 'still thinking' && steps.open.result.value.content == null"
+  - id: serving-api-r5-cohere-chat-error-envelope
+    name: "A /cohere/v2/chat failure after the request metadata exists answers {message, id: chatcmpl-<id>}"
+    fixtures: [full-tp1-llama-8b]
+    config: {vllm-enable-cohere-api: true}
+    faults:
+      - {target: async-llm.generate, type: error, code: value-error, message: boom}
+    steps:
+      - {interface: cohere-serving-chat-v2.post-cohere-v2-chat, caller: api-client, as: chat, input: {path: /cohere/v2/chat, headers: {X-Request-Id: abc}, body: {model: llama-8b, max_tokens: 4, messages: [{role: user, content: hi}]}}}
+    expect:
+      - "steps.chat.result.error.status == 400 && steps.chat.result.error.data.body == {'message': 'boom', 'id': 'chatcmpl-abc'}"
+  - id: serving-api-r5-sigterm-and-cli-args
+    name: "SIGTERM on the API server stops the engine client (mode from shutdown_timeout) before server.should_exit; a second signal is ignored; vllm serve --max-model-len reaches create_engine_config"
+    fixtures: [full-tp1-llama-8b]
+    config: {shutdown-timeout: 30}
+    steps:
+      - {interface: launcher.handle-shutdown-signal, caller: operator, as: sig, input: {signal: SIGTERM}}
+      - {interface: launcher.handle-shutdown-signal, caller: operator, as: again, input: {signal: SIGINT}}
+      - {interface: api-server-entry.build-async-engine-client, caller: operator, as: cli, input: {args: {model_tag: meta-llama/Llama-3.1-8B-Instruct, max_model_len: 200000}}}
+    expect:
+      - "steps.sig.result.value.mode == 'drain' && steps.sig.result.value.timeout == 30 && state.launcher.server_should_exit"
+      - "trace.exists(e, e.type == 'call.start' && e.interface == 'async-llm.shutdown' && e.input.timeout == 30)"
+      - "steps.again.result.value.ignored && calls['async-llm.shutdown'] == 1"
+      - "trace.exists(e, e.type == 'call.start' && e.interface == 'engine-args.create-engine-config' && e.input.max_model_len == 200000) && !steps.cli.result.ok"
+  - id: serving-api-r5-offline-prompt-seq
+    name: "LLM prompts: [[]] is one empty TokensPrompt (refused by the engine), a token-id list is one prompt, a dict prompt's multi_modal_data reaches the engine request, a non-int list item is a TypeError"
+    fixtures: [full-tp1-llama-8b]
+    state: {engine-core-proc: {client_kind: sync}}
+    steps:
+      - {interface: llm.enqueue, caller: python-user, as: empty, input: {prompts: [[]]}}
+      - {interface: llm.enqueue, caller: python-user, as: ids, input: {prompts: [128000, 9906]}}
+      - {interface: llm.enqueue, caller: python-user, as: bad, input: {prompts: [[1, a]]}}
+    expect:
+      - "!steps.empty.result.ok && steps.empty.result.error.message == 'The decoder prompt cannot be empty'"
+      - "steps.ids.result.ok && size(steps.ids.result.value) == 1 && trace.exists(e, e.type == 'call.start' && e.interface == 'llm-engine.add-request' && e.input.prompt_token_ids == [128000, 9906])"
+      - "!steps.bad.result.ok && steps.bad.result.error.code == 'type-error' && steps.bad.result.error.message == 'Token prompt should be a list of integers'"

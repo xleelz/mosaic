@@ -1,0 +1,229 @@
+schema_version: 1
+id: vllm
+scenarios:
+  # tests/model_executor/test_flashinfer_autotune_warmup.py:55
+  - id: oracle-models-layers-flashinfer-autotune-deferred-moe
+    description: >-
+      tests/model_executor/test_flashinfer_autotune_warmup.py::test_flashinfer_autotune_token_counts_include_deferred_moe_limits.
+      kernel_warmup -> flashinfer_autotune: _flashinfer_autotune_token_counts returns
+      (max_num_batched_tokens, then each enabled deferred-MoE finalize limit > 0, capped and
+      de-duplicated), and _run_flashinfer_autotune_dummy_runs does one profile dummy run per count.
+      With max_num_batched_tokens 8192 and MoE layers deferring at 128, 128, (64 disabled), (-1),
+      the counts are (8192, 128): one dummy run at 8192 tokens and one at 128.
+    fixtures: [full-moe-mixtral-8x7b-tp2-ep]
+    config:
+      max-num-batched-tokens: 8192
+    steps:
+      - flow: wr-compile-or-warm-up
+        as: warm
+        on: rank0
+        at_ms: 0
+      - flow: wr-compile-or-warm-up
+        as: warm1
+        on: rank1
+        at_ms: 0
+    expect:
+      - "steps.warm.result.ok && steps.warm1.result.ok"
+      - "trace.exists(e, e.type == 'call.start' && e.interface == 'gpu-model-runner.dummy-run' && e.input.num_tokens == 8192 && has(e.input.is_profile) && e.input.is_profile == true)"
+      - "trace.exists(e, e.type == 'call.start' && e.interface == 'gpu-model-runner.dummy-run' && e.input.num_tokens == 128)"
+      - "!trace.exists(e, e.type == 'call.start' && e.interface == 'gpu-model-runner.dummy-run' && e.input.num_tokens == 64)"
+
+  # tests/models/multimodal/pooling/test_embedding_gemma2.py:59
+  - id: oracle-models-layers-embedding-gemma2-structure
+    description: >-
+      tests/models/multimodal/pooling/test_embedding_gemma2.py::test_structure. Loading
+      EmbeddingGemma2Model with --runner pooling builds its sliding layers as ENCODER_ONLY attention
+      with per_layer_sliding_window = config.sliding_window + 1 (_WINDOW_OFFSET), so the attention
+      impl's window tuple is (W-1, W-1) == (cfg_w, cfg_w) == (512, 512) on the sliding layers.
+    fixtures: [full-tp1-llama-8b]
+    config:
+      model: google/embeddinggemma-2
+      runner: pooling
+      max-model-len: 8192
+    state:
+      hf-hub:
+        models:
+          google/embeddinggemma-2: {architectures: [EmbeddingGemma2Model], model_type: embedding_gemma2, num_hidden_layers: 4, num_attention_heads: 8, num_key_value_heads: 1, hidden_size: 1152, vocab_size: 262144, max_position_embeddings: 8192, torch_dtype: bfloat16, weights_bytes: 600000000, text_config: {sliding_window: 512, layer_types: [sliding_attention, sliding_attention, sliding_attention, full_attention]}}
+    steps:
+      - interface: model-loader.get-model
+        caller: gpu-worker
+        as: load
+        at_ms: 0
+        input:
+          model: google/embeddinggemma-2
+          hf_config:
+            architectures: [EmbeddingGemma2Model]
+            model_type: embedding_gemma2
+            num_hidden_layers: 4
+            num_attention_heads: 8
+            num_key_value_heads: 1
+            hidden_size: 1152
+            vocab_size: 262144
+            max_position_embeddings: 8192
+            torch_dtype: bfloat16
+            weights_bytes: 600000000
+            text_config:
+              sliding_window: 512
+              layer_types: [sliding_attention, sliding_attention, sliding_attention, full_attention]
+    expect:
+      - "steps.load.result.ok"
+      - "has(steps.load.result.value.layers) && steps.load.result.value.layers.exists(l, l.attn_type == 'encoder_only' && l.sliding_window == [512, 512])"
+
+  # tests/models/language/pooling/test_classification.py:24
+  - id: oracle-models-layers-classification-models
+    description: >-
+      tests/models/language/pooling/test_classification.py::test_models (control flow only; the
+      logits closeness to HF is numeric and untranslatable). vllm_runner(model) with the default
+      --runner auto on Qwen2ForSequenceClassification resolves to the pooling runner
+      (ModelConfig._get_default_runner_type), and LLM.classify over the 8 example prompts returns
+      one classification output per prompt.
+    fixtures: [full-tp1-llama-8b]
+    config:
+      model: jason9693/Qwen2.5-1.5B-apeach
+      max-model-len: 512
+    state:
+      hf-hub:
+        models:
+          jason9693/Qwen2.5-1.5B-apeach: {architectures: [Qwen2ForSequenceClassification], model_type: qwen2, num_hidden_layers: 28, num_attention_heads: 12, num_key_value_heads: 2, hidden_size: 1536, intermediate_size: 8960, vocab_size: 151936, max_position_embeddings: 32768, rope_theta: 1000000.0, num_labels: 2, torch_dtype: float32, weights_bytes: 6174015488}
+      llm:
+        supported_tasks: [classify, token_classify]
+    steps:
+      - interface: engine-args.create-engine-config
+        caller: operator
+        as: cfg
+        at_ms: 0
+        input:
+          model: jason9693/Qwen2.5-1.5B-apeach
+          runner: auto
+          max_model_len: 512
+          enable_chunked_prefill: false
+          tensor_parallel_size: 1
+          pipeline_parallel_size: 1
+          data_parallel_size: 1
+          nnodes: 1
+          data_parallel_backend: mp
+          data_parallel_hybrid_lb: false
+          data_parallel_external_lb: false
+          distributed_executor_backend: null
+          speculative_config: null
+      - interface: llm.classify
+        caller: python-user
+        as: cls
+        at_ms: 1000
+        input:
+          prompts:
+            - "vLLM is a high-throughput and memory-efficient inference and serving engine for LLMs."
+            - "Briefly describe the major milestones in the development of artificial intelligence from 1950 to 2020."
+            - "Compare and contrast artificial intelligence with human intelligence in terms of processing information."
+            - "Describe the basic components of a neural network and how it can be trained."
+            - "Write a short story about a robot that dreams for the first time."
+            - "Analyze the impact of the COVID-19 pandemic on global economic structures and future business models."
+            - "Explain the cultural significance of the Mona Lisa painting, and how its perception might vary in Western versus Eastern societies."
+            - "Translate the following English sentence into Japanese, French, and Swahili: 'The early bird catches the worm.'"
+    expect:
+      - "steps.cfg.result.ok && steps.cfg.result.value.model_config.runner_type == 'pooling'"
+      - "steps.cls.result.ok"
+      - "steps.cls.result.value.num_outputs == 8"
+
+  # tests/model_executor/test_qwen_vl_triton_warmup.py:13
+  - id: oracle-models-layers-qwen-vl-vision-warmup
+    description: >-
+      tests/model_executor/test_qwen_vl_triton_warmup.py::test_vision_warmup_calls_only_position_and_rotary_paths.
+      compile_or_warm_up_model -> kernel_warmup -> qwen_vl_triton_warmup -> _warm_vision: for a
+      Qwen3-VL vision tower whose weights are on the runner's device, warm fast_pos_embed_interpolate
+      and the attention's apply_rotary_emb on the grids (1,16,16), (1,16,2), (1,2,16), (1,2,2)
+      (spatial_merge_size 2) without running the tower's forward; with the tower's weights on another
+      device (CPU offload) nothing is launched.
+    fixtures: [full-vl-qwen2-vl-7b]
+    state:
+      gpu-model-runner:
+        model: {name: Qwen/Qwen3-VL-8B-Instruct, architecture: Qwen3VLForConditionalGeneration, num_hidden_layers: 36, num_kv_heads: 8, num_attention_heads: 32, head_size: 128, dtype_bytes: 2, torch_dtype: bfloat16, vocab_size: 151936, hidden_size: 4096, max_position_embeddings: 262144, weights_bytes: 17500000000, eos_token_id: 151645, is_hybrid: false, uses_mrope: true, uses_prompt_embeds: false}
+    steps:
+      - flow: wr-compile-or-warm-up
+        as: warm
+        at_ms: 0
+    expect:
+      - "steps.warm.result.ok"
+      - "trace.filter(e, e.type == 'call.start' && e.interface.contains('pos-embed-interpolate')).size() == 4"
+      - "trace.filter(e, e.type == 'call.start' && e.interface.contains('apply-rotary-emb')).size() == 4"
+      - "!trace.exists(e, e.type == 'call.start' && e.interface.contains('vision-transformer.forward'))"
+
+  # tests/models/language/pooling/test_multi_vector_retrieval.py:17
+  - id: oracle-models-layers-multi-vector-token-embed
+    description: >-
+      tests/models/language/pooling/test_multi_vector_retrieval.py::test_embed_models (control flow
+      only; closeness to HF last_hidden_state is numeric). BAAI/bge-m3 with --runner pooling and
+      PoolerConfig(task='token_embed'): LLM.encode(prompts, pooling_task='token_embed') returns one
+      per-token embedding output per example prompt.
+    fixtures: [full-tp1-llama-8b]
+    config:
+      model: BAAI/bge-m3
+      runner: pooling
+    state:
+      llm:
+        supported_tasks: [token_embed]
+    steps:
+      - interface: llm.encode
+        caller: python-user
+        as: te
+        at_ms: 0
+        input:
+          pooling_task: token_embed
+          prompts:
+            - "vLLM is a high-throughput and memory-efficient inference and serving engine for LLMs."
+            - "Briefly describe the major milestones in the development of artificial intelligence from 1950 to 2020."
+            - "Compare and contrast artificial intelligence with human intelligence in terms of processing information."
+            - "Describe the basic components of a neural network and how it can be trained."
+            - "Write a short story about a robot that dreams for the first time."
+            - "Analyze the impact of the COVID-19 pandemic on global economic structures and future business models."
+            - "Explain the cultural significance of the Mona Lisa painting, and how its perception might vary in Western versus Eastern societies."
+            - "Translate the following English sentence into Japanese, French, and Swahili: 'The early bird catches the worm.'"
+    expect:
+      - "steps.te.result.ok"
+      - "steps.te.result.value.pooling_task == 'token_embed'"
+      - "steps.te.result.value.num_outputs == 8"
+
+  # tests/models/language/pooling_mteb_test/test_baai.py:109
+  - id: oracle-models-layers-baai-embed-mteb-config
+    description: >-
+      tests/models/language/pooling_mteb_test/test_baai.py::test_embed_models_mteb[BAAI/bge-base-en]
+      (the config assertions of mteb_test_embed_models; the MTEB score is numeric). With --runner
+      pooling on a BertModel checkpoint, ModelConfig resolves architecture BertModel, seq pooling CLS
+      (the model's default_seq_pooling_type), attn_type encoder_only, and neither prefix caching nor
+      chunked prefill is supported, so prefix caching defaults off.
+    fixtures: [full-tp1-llama-8b]
+    config:
+      model: BAAI/bge-base-en
+      runner: pooling
+    state:
+      hf-hub:
+        models:
+          BAAI/bge-base-en: {architectures: [BertModel], model_type: bert, num_hidden_layers: 12, num_attention_heads: 12, num_key_value_heads: 12, hidden_size: 768, intermediate_size: 3072, vocab_size: 30522, max_position_embeddings: 512, torch_dtype: float32, weights_bytes: 438000000}
+    steps:
+      - interface: engine-args.create-engine-config
+        caller: operator
+        as: cfg
+        at_ms: 0
+        input:
+          model: BAAI/bge-base-en
+          runner: pooling
+          max_model_len: null
+          enable_chunked_prefill: false
+          enable_prefix_caching: null
+          tensor_parallel_size: 1
+          pipeline_parallel_size: 1
+          data_parallel_size: 1
+          nnodes: 1
+          data_parallel_backend: mp
+          data_parallel_hybrid_lb: false
+          data_parallel_external_lb: false
+          distributed_executor_backend: null
+          speculative_config: null
+    expect:
+      - "steps.cfg.result.ok"
+      - "'BertModel' in steps.cfg.result.value.model_config.architectures"
+      - "steps.cfg.result.value.model_config.attn_type == 'encoder_only'"
+      - "trace.exists(e, e.type == 'call.end' && e.interface == 'model-config.post-init' && e.ok && e.output.seq_pooling_type == 'CLS')"
+      - "trace.exists(e, e.type == 'call.end' && e.interface == 'model-config.is-prefix-caching-supported' && e.ok && e.output.supported == false)"
+      - "trace.exists(e, e.type == 'call.end' && e.interface == 'model-config.is-chunked-prefill-supported' && e.ok && e.output.supported == false)"
+      - "steps.cfg.result.value.cache_config.enable_prefix_caching == false"

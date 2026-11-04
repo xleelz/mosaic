@@ -56,7 +56,7 @@ def fa_interfaces():
              {"set": {"vars.sched": "= vars.aot"}}]},
         {"if": f"{MD}.causal_is_tensor && {MD}.causal_tensor_dtype != 'int32'",
          "then": [{"title": "Per-request causal tensor must be int32", "source": C(FA, ln(FA, r"if isinstance\(causal, torch.Tensor\) and causal.dtype", ba)),
-                   "fail": {"code": "value-error", "message": "= 'Per-request causal tensor must be int32, got ' + " + MD + ".causal_tensor_dtype"}}]},
+                   "fail": {"code": "value-error", "message": "= 'Per-request causal tensor must be int32, got torch.' + " + MD + ".causal_tensor_dtype + '. Casting here would allocate a fresh tensor each build() and break FULL CUDA graph replay; allocate the buffer as int32.'"}}]},
         {"title": "FlashAttentionMetadata", "source": C(FA, ln(FA, r"attn_metadata = FlashAttentionMetadata\(", ba)),
          "return": {"num_actual_tokens": f"= {MD}.num_actual_tokens", "num_reqs": f"= {MD}.num_reqs",
                     "max_query_len": f"= {MD}.max_query_len", "max_seq_len": f"= {MD}.max_seq_len",
@@ -95,6 +95,13 @@ def fa_interfaces():
                    "source": C(FA, ln(FA, r"if self.dcp_world_size > 1:", fa_)),
                    "call": "flash-attention-impl.forward-with-dcp", "input": "= input", "as": "dcp"},
                   {"return": {"path": "dcp", "num_tokens": "= input.num_tokens", "via": "= has(vars.dcp.value.via) ? vars.dcp.value.via : 'none'"}}]},
+        {"set": {"vars.qkv": f"= {QUANT}"}},
+        {"if": "vars.qkv",
+         "then": [{"title": "Quantized KV: the cache is viewed as the platform's fp8 dtype (the attention layer already quantized the queries)",
+                   "source": C(FA, ln(FA, r"if is_quantized_kv_cache\(self\.kv_cache_dtype\):", fa_), ln(FA, r"value_cache = value_cache\.view\(current_platform\.fp8_dtype\(\)\)", fa_))}]},
+        {"title": "k/v descales are the layer's _k_scale/_v_scale expanded to (num_seqs, num_kv_heads); q_descale only when the impl takes quantized queries (not FA4's SM90 fp8-KV dequant path)",
+         "source": C(FA, ln(FA, r"descale_shape = \(", fa_), ln(FA, r"v_descale = layer\._v_scale\.expand\(descale_shape\)", fa_)),
+         "set": {"vars.q_descale": "= !(input.fa_version == 4 && input.device_capability_major == 9 && input.kv_cache_dtype in ['fp8', 'fp8_e4m3'])"}},
         {"if": "input.metadata.causal_is_tensor && input.fa_version != 4",
          "then": [{"title": "Per-sequence causal needs FA4", "source": C(FA, ln(FA, r"if self.vllm_flash_attn_version != 4:", fa_)),
                    "fail": {"code": "not-implemented-error", "message": "= 'Per-sequence causal requires FA4. Current version: FA' + string(input.fa_version)"}}]},
@@ -104,7 +111,8 @@ def fa_interfaces():
                                    "causal": "= input.metadata.causal", "has_scheduler_metadata": "= input.metadata.has_scheduler_metadata",
                                    "has_descale": True, "num_splits": "= input.metadata.max_num_splits",
                                    "has_alibi": "= input.has_alibi", "has_sinks": "= input.has_sinks"}, "as": "fa"},
-        {"return": {"path": "paged", "num_tokens": "= input.num_tokens", "fa_version": "= vars.fa.value.fa_version"}},
+        {"return": {"path": "paged", "num_tokens": "= input.num_tokens", "fa_version": "= vars.fa.value.fa_version", "kv_cache_dtype": "= input.kv_cache_dtype",
+                    "kv_cache_view": "= vars.qkv ? 'fp8' : 'model'", "q_descale": "= vars.q_descale"}},
     ]
     out.append(iface("flash-attention-impl", "forward",
                      "FlashAttentionImpl.forward: profiling, encoder, DCP and paged-decoder paths over the KV cache the block table addresses.",
@@ -146,15 +154,20 @@ def fa_interfaces():
         {"if": "input.attn_type == 'encoder_only' || input.attn_type == 'encoder'",
          "then": [{"title": "Encoder attention keeps no KV cache", "source": C(FA, ln(FA, r"if self.attn_type in \(AttentionType.ENCODER_ONLY, AttentionType.ENCODER\):", ka)),
                    "return": {"written_tokens": 0}}]},
+        {"title": "The op is given the impl's kv_cache_dtype (CacheConfig.cache_dtype) and the layer's _k_scale/_v_scale: an fp8 cache stores each K/V element as one scaled fp8 byte, otherwise in the model dtype",
+         "source": C(FA, ln(FA, r"            self\.kv_cache_dtype,", ka), ln(FA, r"            layer\._v_scale,", ka)),
+         "set": {"vars.fp8": "= input.kv_cache_dtype.startsWith('fp8')"}},
         {"title": "Scatter the new K/V into the paged cache at slot_mapping (reshape_and_cache_flash; padded slots are skipped by the op)",
          "source": C(FA, ln(FA, r"reshape_and_cache_flash\(", ka)),
          "call": "custom-ops.reshape-and-cache-flash", "input": {"num_tokens": "= size(input.slot_mapping)", "hidden_size": "= 2 * input.num_kv_heads * input.head_size", "dtype_bytes": 2}},
-        {"return": {"written_tokens": "= input.slot_mapping.filter(s, s >= 0).size()"}},
+        {"return": {"written_tokens": "= input.slot_mapping.filter(s, s >= 0).size()", "kv_cache_dtype": "= input.kv_cache_dtype",
+                    "cache_bytes_per_element": "= vars.fp8 ? 1 : 2", "scaled": "= vars.fp8"}},
     ]
     out.append(iface("flash-attention-impl", "do-kv-cache-update",
                      "FlashAttentionImpl.do_kv_cache_update: write this step's K/V into the KV cache blocks the scheduler assigned (via slot_mapping).",
                      [C(FA, ka, kb)], beh, request="AttnKvUpdateRequest",
-                     response={"type": "object", "properties": {"written_tokens": {"type": "integer"}}}))
+                     response={"type": "object", "properties": {"written_tokens": {"type": "integer"}, "kv_cache_dtype": {"type": "string"},
+                                                                "cache_bytes_per_element": {"type": "integer"}, "scaled": {"type": "boolean"}}}))
     return out
 
 
@@ -240,10 +253,10 @@ def merge_interfaces():
     beh = [
         {"if": "!input.head_strides_match",
          "then": [{"title": "Prefix and suffix outputs must share head strides", "source": C(MAS, ln(MAS, r"assert prefix_output.stride\(1\) == suffix_output.stride\(1\)", ma)),
-                   "fail": {"code": "assertion-error", "message": "merge_attn_states requires prefix_output and suffix_output to have matching head strides"}}]},
+                   "fail": {"code": "assertion-error", "message": "= 'merge_attn_states requires prefix_output and suffix_output to have matching head strides, got ' + string(input.prefix_head_stride) + ' and ' + string(input.suffix_head_stride)"}}]},
         {"if": "!(input.output_dtype in ['float32', 'float16', 'bfloat16']) && !input.has_output_scale",
          "then": [{"title": "A quantized output needs output_scale", "source": C(MAS, ln(MAS, r"if output.dtype not in \(torch.float32, torch.half, torch.bfloat16\):", ma)),
-                   "fail": {"code": "assertion-error", "message": "= 'output_scale is required when output is ' + input.output_dtype"}}]},
+                   "fail": {"code": "assertion-error", "message": "= 'output_scale is required when output is torch.' + input.output_dtype"}}]},
         {"set": {"vars.platform_ok": "= input.platform == 'cuda' || (input.platform == 'rocm' && input.cdna_version >= 3)",
                  "vars.dtype_ok": "= input.dtype in ['float32', 'float16', 'bfloat16']",
                  "vars.head_ok": "= input.dtype == 'float32' ? input.head_size % 4 == 0 : input.head_size % 8 == 0"}},
@@ -410,9 +423,9 @@ def triton_interfaces():
     # triton_reshape_and_cache_flash
     ra, rb = fn(TRC, "triton_reshape_and_cache_flash")
     beh = [
-        {"if": "input.kv_cache_dtype.startsWith('fp8') && input.device_capability_major * 10 < 89",
+        {"if": "!(input.kv_cache_dtype in ['auto', 'float16', 'bfloat16', 'float32', 'half', 'float'] || " + QUANT + ") || (input.kv_cache_dtype.startsWith('fp8') && input.device_capability_major * 10 + input.device_capability_minor < 89) || (input.kv_cache_dtype == 'bfloat16' && input.device_capability_major < 8)",
          "then": [{"title": "FP8 KV cache needs native fp8e4nv (SM89+)", "source": C(TRC, ln(TRC, r"assert _is_supported_kv_cache_dtype\(kv_cache_dtype\)", ra)),
-                   "fail": {"code": "assertion-error", "message": "= 'Triton reshape-and-cache cannot store kv_cache_dtype=' + input.kv_cache_dtype + ' on this device'"}}]},
+                   "fail": {"code": "assertion-error", "message": "= 'Triton reshape-and-cache cannot store kv_cache_dtype=' + input.kv_cache_dtype + ' on this device: an FP8 KV cache needs native fp8e4nv (SM89+). Use --kv-cache-dtype bfloat16 (or float16 on SM75).'"}}]},
         {"title": "TILE_SIZE heuristic: <= 2048, capped at 512 below SM90", "source": C(TRC, ln(TRC, r"TILE_SIZE = min\(2048", ra), ln(TRC, r"TILE_SIZE = min\(512, TILE_SIZE\)", ra)),
          "set": {"vars.tile": "= input.device_capability_major < 9 ? 512 : 2048"}},
         {"title": "Launch reshape_and_cache_kernel_flash, one program per slot_mapping entry", "source": C(TRC, ln(TRC, r"reshape_and_cache_kernel_flash\[grid\]\(", ra)),

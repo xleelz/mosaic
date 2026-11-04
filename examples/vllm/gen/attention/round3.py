@@ -29,7 +29,7 @@ def interfaces():
     tile = f"({heads} <= 8 ? 8 : ({heads} <= 32 ? 16 : 64))"
     beh = [
         {"if": "!input.has_decode", "then": [{"title": "forward_mqa needs decode metadata", "source": C(FIMLA, ln(FIMLA, r"assert attn_metadata.decode is not None", ma)),
-                                               "fail": {"code": "assertion-error", "message": "attn_metadata.decode is None"}}]},
+                                               "fail": {"code": "assertion-error", "message": ""}}]},
         {"title": "The kernel runs over the query's own head count (q.shape[-2]), which after a DCP query gather is larger than impl.num_heads",
          "source": C(FIMLA, ln(FIMLA, r"runtime_num_heads = q.shape\[-2\]", ma)), "set": {"vars.heads": f"= {heads}"}},
         {"if": "input.dcp_world_size > 1",

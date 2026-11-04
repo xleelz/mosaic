@@ -185,6 +185,118 @@ interfaces:
               vars.new_instances: "= vars.new_instances + [merge(vars.inst, {'beams': vars.kept, 'completed': vars.inst.completed + vars.ended})]"
       - return: {should_stop: false, instances: "= vars.new_instances"}
 
+  - component: generate-base-serving
+    name: beam-search
+    kind: function
+    summary: "BeamSearchOnlineMixin.beam_search, in the API process: one beam of the prompt tokens; then up to max_tokens steps, each sending every live beam to AsyncLLM.generate as a one-token request (logprobs 2 x beam_width, id <request_id>-<uuid>-beam-<i>); an error output ends the search with an error, an abort ends it; every logprobs entry of a beam's first position extends it (EOS completes it unless ignore_eos) and the beam_width best stay live; finally completed and live beams are ranked by the length-penalized score and the best beam_width are decoded into one RequestOutput."
+    description: "The length penalty exponent is computed for 0, 0.5, 1 and 2 (CEL has no general power); other values use 1."
+    sources: ["vllm/entrypoints/generate/beam_search/online.py:22-231", "vllm/entrypoints/generate/beam_search/utils.py:124-163"]
+    request:
+      type: object
+      required: [prompt_token_ids, request_id, params]
+      properties:
+        prompt_token_ids: {type: array, items: {type: integer}}
+        prompt: {type: [string, "null"], default: null}
+        request_id: {type: string, examples: [cmpl-bs]}
+        params:
+          type: object
+          description: BeamSearchParams
+          properties:
+            beam_width: {type: integer, examples: [3]}
+            max_tokens: {type: integer, examples: [8]}
+            ignore_eos: {type: boolean, default: false}
+            temperature: {type: number, default: 1.0}
+            length_penalty: {type: number, default: 1.0}
+            include_stop_str_in_output: {type: boolean, default: false}
+            skip_special_tokens: {type: boolean, default: true}
+        lora_request: {type: [object, "null"], default: null}
+        eos_token_id: {type: integer, default: 128009, description: "tokenizer.eos_token_id (Llama-3.1-Instruct: <|eot_id|>)"}
+    behavior:
+      - set:
+          vars.bw: "= input.params.beam_width"
+          vars.lp: "= has(input.params.length_penalty) ? double(input.params.length_penalty) : 1.0"
+          vars.eos: "= has(input.eos_token_id) ? input.eos_token_id : 128009"
+          vars.ignore_eos: "= has(input.params.ignore_eos) && input.params.ignore_eos"
+          vars.plen: "= size(input.prompt_token_ids)"
+      - title: "sampling_params = SamplingParams(logprobs=2 * beam_width, max_tokens=1, temperature, detokenize=False); all_beams = [the prompt]"
+        source: "vllm/entrypoints/generate/beam_search/online.py:60-77"
+        set:
+          vars.sp: "= {'logprobs': 2 * vars.bw, 'max_tokens': 1, 'temperature': has(input.params.temperature) ? double(input.params.temperature) : 1.0, 'detokenize': false, 'n': 1, 'output_kind': 'FINAL_ONLY'}"
+          vars.beams: "= [{'tokens': input.prompt_token_ids, 'cum_logprob': 0.0, 'finish_reason': null, 'stop_reason': null}]"
+          vars.completed: []
+          vars.error: false
+      - title: "for _ in range(max_tokens): one batch id per step, one request per live beam, gathered"
+        source: "vllm/entrypoints/generate/beam_search/online.py:79-103"
+        foreach: "= lists.range(input.params.max_tokens)"
+        as: step
+        max: 256
+        steps:
+          - set: {vars.batch_id: "= input.request_id + '-' + id('random-uuid', seq('random-uuid'))"}
+          - parallel: "= vars.beams"
+            as: beam
+            steps:
+              - set: {vars.first: null}
+              - call: async-llm.generate
+                input: "= merge({'request_id': vars.batch_id + '-beam-' + string(vars.index), 'prompt_token_ids': vars.beam.tokens, 'sampling_params': vars.sp}, has(input.lora_request) && input.lora_request != null ? {'lora_request': input.lora_request} : {})"
+                stream: true
+                as: g
+                on_item:
+                  - if: "vars.first == null"
+                    then: [{set: {vars.first: "= vars.item"}}]
+              - return: "= vars.first != null ? vars.first : vars.g.value"
+            join: {need: all}
+            as_result: outs
+          - set:
+              vars.res: "= vars.outs.results.sortBy(o, o.index).map(o, has(o.value.completions) && size(o.value.completions) > 0 ? o.value.completions[0] : {'finish_reason': o.value.finish_reason, 'logprobs': null, 'token_ids': o.value.token_ids})"
+          - if: "vars.res.exists(r, has(r.finish_reason) && r.finish_reason == 'error')"
+            then:
+              - title: "An error finish reason ends the search: one error output"
+                source: "vllm/entrypoints/generate/beam_search/online.py:105-126"
+                set: {vars.error: true}
+              - break: true
+          - if: "vars.res.exists(r, has(r.finish_reason) && r.finish_reason == 'abort')"
+            then:
+              - title: "An aborted beam request marks every beam aborted and stops"
+                source: "vllm/entrypoints/generate/beam_search/online.py:128-131"
+                set: {vars.beams: "= vars.beams.map(b, merge(b, {'finish_reason': 'abort'}))"}
+              - break: true
+          - title: "Every token of the beam's first logprobs position is a candidate; EOS completes it unless ignore_eos"
+            source: "vllm/entrypoints/generate/beam_search/online.py:133-166"
+            set:
+              vars.cands: "= lists.range(size(vars.beams)).map(i, has(vars.res[i].logprobs) && vars.res[i].logprobs != null && size(vars.res[i].logprobs) > 0 ? vars.res[i].logprobs[0].map(e, {'tokens': vars.beams[i].tokens + [e.token_id], 'cum_logprob': vars.beams[i].cum_logprob + double(e.logprob), 'finish_reason': null, 'stop_reason': null}) : []).flatten()"
+          - set:
+              vars.completed: "= vars.completed + vars.cands.filter(c, c.tokens[size(c.tokens) - 1] == vars.eos && !vars.ignore_eos).map(c, {'tokens': has(input.params.include_stop_str_in_output) && input.params.include_stop_str_in_output ? c.tokens : c.tokens.slice(0, size(c.tokens) - 1), 'cum_logprob': c.cum_logprob, 'finish_reason': 'stop', 'stop_reason': vars.eos})"
+              vars.live: "= vars.cands.filter(c, !(c.tokens[size(c.tokens) - 1] == vars.eos && !vars.ignore_eos))"
+          - title: "The beam_width best non-EOS candidates by cumulative logprob become the live beams"
+            source: "vllm/entrypoints/generate/beam_search/online.py:168-196"
+            set:
+              vars.beams: "= vars.live.sortBy(c, -c.cum_logprob).slice(0, int(math.least(size(vars.live), vars.bw)))"
+          - if: "size(vars.beams) == 0"
+            then: [{break: true}]
+      - if: "vars.error"
+        then:
+          - source: "vllm/entrypoints/generate/beam_search/online.py:107-125"
+            return: {request_id: "= input.request_id", finished: true, finish_reason: error, text: "", token_ids: [], final: {completions: [{index: 0, text: "", token_ids: [], finish_reason: error, stop_reason: null}]}}
+      - title: "completed + live beams ranked by the length-penalized score (sort_beams_key), the best beam_width decoded"
+        source: "vllm/entrypoints/generate/beam_search/online.py:198-210"
+        set:
+          vars.all: "= vars.completed + vars.beams"
+      - set:
+          vars.best: "= vars.all.sortBy(x, -(x.cum_logprob / (vars.lp == 0.0 ? 1.0 : (vars.lp == 0.5 ? math.sqrt(double(math.greatest((size(x.tokens) - (x.tokens[size(x.tokens) - 1] == vars.eos ? 1 : 0)), 1))) : (vars.lp == 2.0 ? double(math.greatest((size(x.tokens) - (x.tokens[size(x.tokens) - 1] == vars.eos ? 1 : 0)), 1) * math.greatest((size(x.tokens) - (x.tokens[size(x.tokens) - 1] == vars.eos ? 1 : 0)), 1)) : double(math.greatest((size(x.tokens) - (x.tokens[size(x.tokens) - 1] == vars.eos ? 1 : 0)), 1))))))).slice(0, int(math.least(size(vars.all), vars.bw)))"
+          vars.outs: []
+      - foreach: "= vars.best"
+        as: beam
+        steps:
+          - title: "beam.text = tokenizer.decode(the tokens after the prompt, without a final EOS)"
+            source: "vllm/entrypoints/generate/beam_search/online.py:200-210"
+            call: hf-tokenizer.decode
+            input: {ids: "= vars.beam.tokens.slice(vars.plen, size(vars.beam.tokens))", skip_special_tokens: "= !has(input.params.skip_special_tokens) || input.params.skip_special_tokens"}
+            as: dec
+          - set: {vars.outs: "= vars.outs + [{'index': vars.index, 'text': vars.dec.value.text, 'token_ids': vars.beam.tokens.slice(vars.plen, size(vars.beam.tokens)), 'cumulative_logprob': vars.beam.cum_logprob, 'finish_reason': vars.beam.finish_reason != null ? vars.beam.finish_reason : 'length', 'stop_reason': vars.beam.stop_reason}]"}
+      - title: "One finished RequestOutput with a CompletionOutput per best beam"
+        source: "vllm/entrypoints/generate/beam_search/online.py:212-231"
+        return: {request_id: "= input.request_id", finished: true, finish_reason: "= size(vars.outs) > 0 ? vars.outs[0].finish_reason : 'length'", text: "= size(vars.outs) > 0 ? vars.outs[0].text : ''", token_ids: "= size(vars.outs) > 0 ? vars.outs[0].token_ids : []", final: {completions: "= vars.outs"}}
+
 scenarios:
   - id: serving-api-offline-beam-search
     name: "Offline beam search runs one one-token request per live beam with 2 x beam_width logprobs, one output per prompt"

@@ -28,7 +28,7 @@ interfaces:
     kind: function
     summary: "LLM.generate: generative runners only; default sampling params; render and add every prompt, then step the engine until all finish."
     sources: ["vllm/entrypoints/llm.py:418-482"]
-    request: {type: object, properties: {prompts: {type: array, items: {type: [string, object]}, default: [The capital of France is]}, sampling_params: {type: [object, array, "null"], default: null}}, required: [prompts]}
+    request: {type: object, properties: {prompts: {type: [string, object, array], items: {type: [string, object, array, integer]}, default: [The capital of France is]}, sampling_params: {type: [object, array, "null"], default: null}}, required: [prompts]}
     errors: [{code: value-error, status: 0}, {code: vllm-validation-error, status: 0}]
     behavior:
       - if: "config['runner'] == 'pooling'"
@@ -77,7 +77,7 @@ interfaces:
     kind: function
     summary: "LLM.enqueue: add requests without running the engine; returns their ids."
     sources: ["vllm/entrypoints/llm.py:484-532"]
-    request: {type: object, properties: {prompts: {type: array, items: {type: string}, default: [The capital of France is]}}, required: [prompts]}
+    request: {type: object, properties: {prompts: {type: [string, object, array], items: {type: [string, object, array, integer]}, default: [The capital of France is]}}, required: [prompts]}
     errors: [{code: value-error, status: 0}]
     behavior:
       - if: "config['runner'] == 'pooling'"
@@ -183,23 +183,30 @@ interfaces:
     kind: function
     summary: "_add_completion_requests: per-prompt params must match the prompt count; render each prompt and add it (FINAL_ONLY); abort the added ones if one fails."
     sources: ["vllm/entrypoints/common/offline.py:304-338", "vllm/entrypoints/common/offline.py:539-586"]
-    request: {type: object, properties: {prompts: {type: array, items: {type: [string, object]}}, params: {}}, required: [prompts]}
-    errors: [{code: vllm-validation-error, status: 0}]
+    request: {type: object, properties: {prompts: {type: [string, object, array], items: {type: [string, object, array, integer]}}, params: {}}, required: [prompts]}
+    errors: [{code: vllm-validation-error, status: 0}, {code: type-error, status: 0}]
     behavior:
-      - if: "type(input.params) == list && size(input.params) != size(input.prompts)"
-        then: [{title: _params_to_seq length check, source: "vllm/entrypoints/common/offline.py:258-263", fail: {code: vllm-validation-error, message: "= 'The lengths of prompts (' + string(size(input.prompts)) + ') and params (' + string(size(input.params)) + ') must be the same.'"}}]
+      - title: "prompt_to_seq: a string, a dict or a non-empty list of ints is one prompt; any other list (including [] and [[]]) is the sequence itself"
+        source: "vllm/entrypoints/common/offline.py:317"
+        set:
+          vars.prompts: "= type(input.prompts) == string || type(input.prompts) == map || (type(input.prompts) == list && size(input.prompts) > 0 && input.prompts.all(x, type(x) == int)) ? [input.prompts] : input.prompts"
+      - if: "type(input.params) == list && size(input.params) != size(vars.prompts)"
+        then: [{title: _params_to_seq length check, source: "vllm/entrypoints/common/offline.py:258-263", fail: {code: vllm-validation-error, message: "= 'The lengths of prompts (' + string(size(vars.prompts)) + ') and params (' + string(size(input.params)) + ') must be the same.'"}}]
       - set: {vars.ids: []}
       - title: Render one prompt, add it, then the next (engine work can start on the first)
         source: "vllm/entrypoints/common/offline.py:552-561"
-        foreach: "= input.prompts"
+        foreach: "= vars.prompts"
         as: p
         index: i
-        max: 16
         steps:
-          - title: "A TokensPrompt ({prompt_token_ids}) skips tokenization (its ids are only validated); a text prompt is tokenized"
+          - title: "parse_dec_only_prompt: a list must hold only ints (a TokensPrompt); other types are a TypeError"
+            source: "vllm/renderers/inputs/preprocess.py:129-155"
+            if: "(type(vars.p) == list && !vars.p.all(x, type(x) == int)) || !(type(vars.p) in [string, list, map])"
+            then: [{fail: {code: type-error, message: "= type(vars.p) == list ? 'Token prompt should be a list of integers' : 'Prompt should be a string, list of tokens, or dictionary'"}}]
+          - title: "A TokensPrompt (a list of ids, or {prompt_token_ids}) skips tokenization; a text prompt is tokenized"
             source: "vllm/inputs/llm.py:111-127"
             call: base-renderer.tokenize-prompt
-            input: "= type(vars.p) == map && 'prompt_token_ids' in vars.p ? {'prompt_token_ids': vars.p.prompt_token_ids} : {'prompt': type(vars.p) == map ? vars.p.prompt : vars.p}"
+            input: "= type(vars.p) == list ? {'prompt_token_ids': vars.p} : (type(vars.p) == map && 'prompt_token_ids' in vars.p ? {'prompt_token_ids': vars.p.prompt_token_ids} : {'prompt': type(vars.p) == map ? vars.p.prompt : vars.p})"
             as: tok
             on_error:
               - when: "size(vars.ids) > 0"
@@ -208,10 +215,10 @@ interfaces:
                 call: llm-engine.abort-request
                 input: {request_ids: "= vars.ids", internal: true}
               - fail: "= error"
-          - title: request_id = next(request_counter); SamplingParams.output_kind = FINAL_ONLY
+          - title: "request_id = next(request_counter); SamplingParams.output_kind = FINAL_ONLY; a dict prompt's multi_modal_data rides on the engine input"
             source: "vllm/entrypoints/common/offline.py:574-586"
             call: llm-engine.add-request
-            input: {request_id: "= string(state.request_counter)", prompt_token_ids: "= vars.tok.value.prompt_token_ids", sampling_params: "= merge(type(input.params) == list ? input.params[vars.i] : input.params, {'output_kind': 'FINAL_ONLY'})"}
+            input: "= merge({'request_id': string(state.request_counter), 'prompt_token_ids': vars.tok.value.prompt_token_ids, 'sampling_params': merge(type(input.params) == list ? input.params[vars.i] : input.params, {'output_kind': 'FINAL_ONLY'})}, type(vars.p) == map && 'multi_modal_data' in vars.p && vars.p.multi_modal_data != null ? {'multi_modal_data': vars.p.multi_modal_data} : {})"
           - set:
               vars.ids: "= vars.ids + [string(state.request_counter)]"
               state.request_counter: "= state.request_counter + 1"

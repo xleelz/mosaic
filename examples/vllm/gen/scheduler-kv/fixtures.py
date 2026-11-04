@@ -172,8 +172,22 @@ def seed():
     return "\n".join(out)
 
 
+def vl_variant():
+    # Code: vllm/v1/core/sched/scheduler.py:257-285, vllm/v1/core/encoder_cache_manager.py:356-363,
+    # vllm/model_executor/models/qwen2_vl.py:1079-1138 (16384 = max_pixels 12845056 // (28 * 28)).
+    out = []
+    out.append("  - id: scheduler-kv-vl-qwen2-vl-7b")
+    out.append('    summary: "scheduler-kv state for the merged VL world: Scheduler.__init__ sized the encoder compute budget and the encoder cache from Qwen2-VL\'s largest item, max(max_num_batched_tokens 8192, 16384 image tokens at the processor\'s default max_pixels 12845056) = 16384 (what scheduler.init-encoder-cache computes)."')
+    out.append("    attributes: {variant_of: vl-qwen2-vl-7b}")
+    out.append("    state:")
+    out.append("      scheduler: {max_num_encoder_input_tokens: 16384}")
+    out.append("      encoder-cache-manager: {cache_size: 16384, num_free_slots: 16384, num_freeable_slots: 16384, cached: {}, num_embeds_by_hash: {}, request_cached_ids: {}, freeable: [], freed: []}")
+    return "\n".join(out)
+
+
 if __name__ == "__main__":
     print("fixtures:")
     print(seed())
+    print(vl_variant())
     print(nearly_full())
     print(prefix_warm())

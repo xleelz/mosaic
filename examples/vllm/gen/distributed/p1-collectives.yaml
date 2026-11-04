@@ -357,11 +357,11 @@ interfaces:
         source: "vllm/distributed/parallel_state.py:2392-2396"
         if: "vars.tp != input.tensor_model_parallel_size"
         then:
-          - fail: {code: assertion-error, status: 0, message: "= 'tensor parallel group already initialized, but of unexpected size. got: ' + string(vars.tp) + ' vs. wanted: ' + string(input.tensor_model_parallel_size)"}
+          - fail: {code: assertion-error, status: 0, message: "= 'tensor parallel group already initialized, but of unexpected size. got: get_tensor_model_parallel_world_size()=' + string(vars.tp) + ' vs. wanted: tensor_model_parallel_size=' + string(input.tensor_model_parallel_size)"}
       - if: "vars.pp != input.pipeline_model_parallel_size"
         then:
           - source: "vllm/distributed/parallel_state.py:2397-2402"
-            fail: {code: assertion-error, status: 0, message: "pipeline parallel group already initialized, but of unexpected size"}
+            fail: {code: assertion-error, status: 0, message: "= 'pipeline parallel group already initialized, but of unexpected size. got: pp_world_size=' + string(vars.pp) + ' vs. wanted: pipeline_model_parallel_size=' + string(input.pipeline_model_parallel_size)"}
       - return: {tp_world_size: "= vars.tp", pp_world_size: "= vars.pp", created: false}
 
   - component: parallel-state
@@ -375,8 +375,8 @@ interfaces:
       properties:
         tensor_model_parallel_size: {type: integer, examples: [1]}
         pipeline_model_parallel_size: {type: integer, default: 1}
-        data_parallel_size: {type: integer, default: 1}
-        is_moe: {type: boolean, default: false}
+        data_parallel_size: {type: [integer, "null"], default: null, description: "Read from the current config's parallel_config.data_parallel_size (config['data-parallel-size']) when null"}
+        is_moe: {type: boolean, default: false, description: "The current config's model_config.is_moe (the caller passes it)"}
         enable_eplb: {type: boolean, default: false}
     response: {type: object, properties: {groups: {type: array, items: {type: string}}}}
     errors:
@@ -388,30 +388,48 @@ interfaces:
         if: "!state.world_initialized"
         then:
           - fail: {code: assertion-error, status: 0, message: "torch.distributed is not initialized"}
+      - title: "data_parallel_size comes from get_current_vllm_config().parallel_config, not from the arguments"
+        source: "vllm/distributed/parallel_state.py:2093-2097"
+        set:
+          vars.dp: "= input.data_parallel_size != null ? input.data_parallel_size : config['data-parallel-size']"
       - set:
-          vars.block: "= input.tensor_model_parallel_size * input.pipeline_model_parallel_size * input.data_parallel_size"
+          vars.block: "= input.tensor_model_parallel_size * input.pipeline_model_parallel_size * vars.dp"
       - title: "all_ranks = arange(world_size).reshape(-1, DP, PP, PCP, TP)"
         detail: "torch reshape raises when world_size is not a multiple of DP x PP x TP."
         source: "vllm/distributed/parallel_state.py:2135-2141"
         if: "state.world_size % vars.block != 0"
         then:
-          - fail: {code: runtime-error, status: 0, message: "= 'shape \\'[-1, ' + string(input.data_parallel_size) + ', ' + string(input.pipeline_model_parallel_size) + ', 1, ' + string(input.tensor_model_parallel_size) + ']\\' is invalid for input of size ' + string(state.world_size)"}
+          - fail: {code: runtime-error, status: 0, message: "= 'shape \\'[-1, ' + string(vars.dp) + ', ' + string(input.pipeline_model_parallel_size) + ', 1, ' + string(input.tensor_model_parallel_size) + ']\\' is invalid for input of size ' + string(state.world_size)"}
       - title: TP groups are consecutive ranks; the TP group gets the shared-memory broadcaster
         source: "vllm/distributed/parallel_state.py:2143-2157"
         set:
-          vars.groups: "= {'tp': {'world_size': input.tensor_model_parallel_size, 'unique_name': 'tp:0', 'mq_broadcaster': true}, 'dcp': {'world_size': 1, 'unique_name': 'dcp:0'}, 'pcp': {'world_size': 1, 'unique_name': 'pcp:0'}, 'pp': {'world_size': input.pipeline_model_parallel_size, 'unique_name': 'pp:0'}, 'dp': {'world_size': input.data_parallel_size, 'unique_name': 'dp:0'}}"
+          vars.groups: "= {'tp': {'world_size': input.tensor_model_parallel_size, 'unique_name': 'tp:0', 'mq_broadcaster': true}, 'dcp': {'world_size': 1, 'unique_name': 'dcp:0'}, 'pcp': {'world_size': 1, 'unique_name': 'pcp:0'}, 'pp': {'world_size': input.pipeline_model_parallel_size, 'unique_name': 'pp:0'}, 'dp': {'world_size': vars.dp, 'unique_name': 'dp:0'}}"
       - title: EP group only for MoE models
-        detail: "Dense models get no EP group (_EP stays None); EP spans DP x PCP x TP."
-        source: "vllm/distributed/parallel_state.py:2289-2322"
+        detail: "Dense models get no EP group (_EP stays None); EP spans DP x PCP x TP (PCP is 1 here)."
+        source: "vllm/distributed/parallel_state.py:2289-2302"
         if: "input.is_moe"
         then:
+          - title: "ParallelConfig.use_all2all: DP > 1, sequence-parallel MoE (an all-to-all backend with EP, TP > 1 and DP > 1), or EP with PCP > 1"
+            source: "vllm/config/parallel.py:763-789"
+            set:
+              vars.seq_moe: "= config['all2all-backend'] in ['allgather_reducescatter', 'deepep_high_throughput', 'deepep_low_latency', 'deepep_v2', 'flashinfer_nvlink_one_sided', 'passthrough', 'mori_high_throughput', 'mori_low_latency', 'nixl_ep'] && config['enable-expert-parallel'] && input.tensor_model_parallel_size > 1 && vars.dp > 1"
           - set:
-              vars.groups: "= merge(vars.groups, {'ep': {'world_size': input.data_parallel_size * input.tensor_model_parallel_size, 'unique_name': 'ep:0'}})"
+              vars.use_all2all: "= vars.dp > 1 || vars.seq_moe"
+          - title: "The EP communicator builds an all2all manager only when use_all2all; naive and allgather_reducescatter both get AgRsAll2AllManager"
+            source: "vllm/distributed/device_communicators/cuda_communicator.py:202-260"
+            set: {vars.manager: null}
+          - if: "vars.use_all2all"
+            then:
+              - set:
+                  vars.manager: "= config['all2all-backend'] in ['naive', 'allgather_reducescatter'] ? 'AgRsAll2AllManager' : {'deepep_high_throughput': 'DeepEPHTAll2AllManager', 'deepep_low_latency': 'DeepEPLLAll2AllManager', 'mori_high_throughput': 'MoriAll2AllManager', 'mori_low_latency': 'MoriAll2AllManager', 'deepep_v2': 'DeepEPV2All2AllManager', 'moonep': 'MoonEPAll2AllManager', 'nixl_ep': 'NixlEPAll2AllManager', 'flashinfer_all2allv': 'FlashInferNVLinkTwoSidedManager', 'flashinfer_nvlink_two_sided': 'FlashInferNVLinkTwoSidedManager', 'flashinfer_nvlink_one_sided': 'FlashInferNVLinkOneSidedManager', 'passthrough': 'PassThroughAll2AllManager'}[config['all2all-backend']]"
+          - source: "vllm/distributed/parallel_state.py:2303-2322"
+            set:
+              vars.groups: "= merge(vars.groups, {'ep': {'world_size': vars.dp * input.tensor_model_parallel_size, 'unique_name': 'ep:0', 'use_all2all': vars.use_all2all, 'all2all_manager': vars.manager}})"
           - title: EPLB gets its own group with the EP ranks
             source: "vllm/distributed/parallel_state.py:2324-2346"
             when: "input.enable_eplb"
             set:
-              vars.groups: "= merge(vars.groups, {'eplb': {'world_size': input.data_parallel_size * input.tensor_model_parallel_size, 'unique_name': 'eplb:0'}})"
+              vars.groups: "= merge(vars.groups, {'eplb': {'world_size': vars.dp * input.tensor_model_parallel_size, 'unique_name': 'eplb:0'}})"
       - set:
           state.groups: "= merge(state.groups, vars.groups)"
           state.mp_initialized: true
@@ -717,7 +735,7 @@ interfaces:
         source: "vllm/distributed/parallel_state.py:757-759"
         if: "vars.dim < -2 || vars.dim >= 2"
         then:
-          - fail: {code: assertion-error, status: 0, message: "= 'Invalid dim (' + string(vars.dim) + ') for input tensor'"}
+          - fail: {code: assertion-error, status: 0, message: "= 'Invalid dim (' + string(vars.dim) + ') for input tensor with shape torch.Size([' + string(input.num_tokens) + ', ' + string(has(input.hidden_size) ? input.hidden_size : 4096) + '])'"}
       - call: parallel-state.all-gather
         input: "= input"
         as: out
@@ -741,7 +759,7 @@ interfaces:
       - if: "vars.dim < -2 || vars.dim >= 2"
         then:
           - source: "vllm/distributed/parallel_state.py:788-790"
-            fail: {code: assertion-error, status: 0, message: "= 'Invalid dim (' + string(vars.dim) + ') for input tensor'"}
+            fail: {code: assertion-error, status: 0, message: "= 'Invalid dim (' + string(vars.dim) + ') for input tensor with shape torch.Size([' + string(input.num_tokens) + ', ' + string(has(input.hidden_size) ? input.hidden_size : 4096) + '])'"}
       - call: parallel-state.reduce-scatter
         input: "= input"
         as: out
@@ -896,7 +914,7 @@ interfaces:
         source: "vllm/distributed/device_communicators/cuda_communicator.py:508-510"
         if: "vars.scattered % input.world_size != 0"
         then:
-          - fail: {code: assertion-error, status: 0, message: "= 'reduce_scatter dim of size ' + string(vars.scattered) + ' is not divisible by world size ' + string(input.world_size)"}
+          - fail: {code: assertion-error, status: 0, message: ""}
       - set:
           vars.target: "= config['vllm-use-nccl-symm-mem'] ? 'symm-mem-communicator.reduce-scatter' : 'pynccl-communicator.reduce-scatter'"
           vars.bytes: "= input.num_tokens * vars.hidden * 2"
@@ -1520,7 +1538,7 @@ interfaces:
           crashed:
             - title: The subprocess failed; the parent wraps it
               source: "vllm/distributed/device_communicators/all_reduce_utils.py:408-416"
-              fail: {code: runtime-error, status: 0, message: "Error happened when batch testing peer-to-peer access"}
+              fail: {code: runtime-error, status: 0, message: "= 'Error happened when batch testing peer-to-peer access from ' + (input.pairs == 1 ? '(0,)' : '(' + lists.range(input.pairs * input.pairs).map(i, string(i / input.pairs)).join(', ') + ')') + ' to ' + (input.pairs == 1 ? '(0,)' : '(' + lists.range(input.pairs * input.pairs).map(i, string(i % input.pairs)).join(', ') + ')') + ':\\n'"}
 
 flows:
   - id: distributed-tp-all-reduce
@@ -2087,7 +2105,7 @@ scenarios:
     fixtures: [tp4-llama-70b]
     input: {tensor_model_parallel_size: 2, pipeline_model_parallel_size: 1}
     expect:
-      - "!result.ok && result.error.code == 'assertion-error' && result.error.message.contains('got: 4 vs. wanted: 2')"
+      - "!result.ok && result.error.code == 'assertion-error' && result.error.message == 'tensor parallel group already initialized, but of unexpected size. got: get_tensor_model_parallel_world_size()=4 vs. wanted: tensor_model_parallel_size=2'"
   - id: distributed-mp-init-pp-mismatch
     flow: distributed-init-model-parallel
     fixtures: [tp4-llama-70b]

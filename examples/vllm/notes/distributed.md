@@ -308,3 +308,84 @@ None. Additions only: `DistKvRequest.max_tokens` (optional), the aggregator's ex
 - Dispatchers route `MultiConnector` (`get-num-new-matched-tokens`, `build-connector-meta`) and
   `HiSparseConnector` (`get-num-new-matched-tokens` = (0, False), `update-state-after-alloc`).
   MultiConnector's other hooks still fall back to the unmodeled-connector branch.
+
+## 16. Fix round 5 (FIXES5.md): precision
+
+### Round-4 wrong claims
+- `RESULTS.md` "Wrong claims to fix" names no distributed entity. `judge3/*.md` grades no step whose
+  component is distributed's (P3-3's EP finding is `mixtral-for-causal-lm.init`, models-layers).
+  `oracle3/distributed.md` has no distributed model-bug: its one model-bug (torchrun MIN all-reduce)
+  is engine-core's. Re-run unedited: oracle3/distributed 2 pass, 1 model-bug (engine-core), 1
+  untranslatable, as before.
+
+### Error-path sweep (all 110 `fail` steps of the fragment, against the cited code)
+Corrected, word for word (Python `str(exc)` semantics: an `assert` without a message is `''`, a
+KeyError prints the key's repr, an f-string `{x=}` prints `x=<value>`):
+- `parallel-state.ensure-model-parallel-initialized`: TP and PP mismatch texts carry
+  `get_tensor_model_parallel_world_size()=N` / `pp_world_size=N` (parallel_state.py:2392-2402).
+- `group-coordinator.all-gather` / `.reduce-scatter`: `... for input tensor with shape torch.Size([n, h])` (757-759, 788-790).
+- `cuda-communicator.reduce-scatter`, `nixl-pull-connector-scheduler.update-state-after-alloc`,
+  `example-connector.build-connector-meta`, `hisparse-connector.update-state-after-alloc`,
+  `single-writer-shm-ring-buffer.init`, `kv-cache-interface.page-size-bytes` (both),
+  `offloading-worker-metadata.aggregate`, `kv-connector-base-v1-worker.get-connector-metadata` and
+  `.wait-for-save`: bare asserts / `raise NotImplementedError`, so the message is empty (invented texts removed).
+- KeyError reprs: `kv-cache-layout.properties` (`'NHD'`), `ec-connector-base.save-caches`, the NIXL
+  handshake listener (`(0, 3)`, base_scheduler.py:376).
+- Truncated messages completed: MoRIIO `Unhandled message format: <repr>` and
+  `Invalid consumer_tp_size in release message: <n>` (moriio_engine.py:795, 847-849);
+  `BlockObjectStore.get_concatenated` (store.py:212-217); the P2P probe crash (all_reduce_utils.py:411-415);
+  MoRIIO's missing-peer ValueError with `!r` and the `(got ...)` tail (moriio_connector.py:1153-1160);
+  `EmbeddingCache` duplicate alloc `{key!r}`; `check_transferable`'s `Supported: [...]` list
+  (m2n_common.py:47-66, 259-263); offloading `tokens_per_block=N not divisible by ...` (config.py:91-96);
+  sharded RDT's order mismatch text (sharded_rdt_trainer.py:1393-1397), and an exhausted WeightSource
+  now raises `stop-iteration` from `next(groups)` (1391) instead of the mismatch.
+- Verified unchanged: the rest (codes, statuses and texts match; check order matches the code).
+- Not checkable against vLLM: collective/barrier/gather/store timeouts (`dist-backend-error`,
+  `dist-store-error`) come from torch/NCCL, not vLLM; their texts are the simulator's rendezvous
+  timeout. The hf3fs metadata server's bind failure is uvicorn's.
+
+### The new worlds
+- **MoE (`moe-mixtral-8x7b-tp2-ep`)**: `initialize-model-parallel` builds the EP group for MoE models
+  with `use_all2all` (ParallelConfig.use_all2all, config/parallel.py:763-789) and the all2all manager
+  the EP communicator builds per `--all2all-backend` (new config `all2all-backend`,
+  cuda_communicator.py:202-276). DP now comes from `config['data-parallel-size']` when the caller
+  passes none (the code reads the current config, parallel_state.py:2093-2097). New:
+  `parallel-state.get-ep-group`/`get-dp-group`/`get-pcp-group`, `group-coordinator.dispatch`/`combine`,
+  `ag-rs-all2all-manager` (dispatch = all_gatherv, combine = reduce_scatterv over the DP group,
+  all2all.py:67-173), `cuda-communicator.all-gatherv`/`reduce-scatterv`. **Code finding:** in this world
+  (TP 2, EP, DP 1) there is no all-to-all at all: use_all2all is false, no manager is built, the MoE
+  layer makes no prepare/finalize and reduces with the TP all-reduce; `dispatch` would assert.
+  `distributed-moe-ep-group-tp2-no-all2all` shows it; `distributed-moe-ep-dp2-dispatch-combine` drives
+  the real dispatch/combine with DP 2 in the same world.
+- VL and FP8 worlds: nothing in distributed depends on multimodality or FP8 weights. (The NIXL
+  compatibility hash already hashes `cache_dtype`.)
+
+### Round-5 unit tests: 6 of 6 pass (build-oracle/round5/distributed.md)
+New: `nixl-push-connector-scheduler` (request_finished), NIXL pull-worker peer replacement
+(`ensure-handshake`, `background-nixl-handshake`, `read-blocks-for-req`, `cleanup-remote-engines`),
+`mooncake-store-config` + `mooncake-distributed-store` + `mooncake-store-worker.init-store` +
+`mooncake-embedding-store-client.create`, `m2n-trainer-init-info.post-init`.
+
+### Breaking changes
+- `nixl-pull-connector-worker.start-load-kv`: the per-request body moved to `read-blocks-for-req`.
+  A request with no local blocks now only notifies (the code's `_read_blocks` notify path) even when
+  it awaits KV, and is then reported done; before, the model issued a READ. The response gains
+  `drained`. `get-finished` now also releases replaced peers. Callers: `kv-connector-base-v1.start-load-kv`
+  (mine); no other area calls it.
+- `parallel-state.initialize-model-parallel`: `data_parallel_size` defaults to null (= the config);
+  the EP group record gains `use_all2all` and `all2all_manager`. Callers: worker-runner's
+  `init-device` passes no DP (unchanged result at DP 1).
+- Error texts listed above; no other area's scenario asserts on them.
+- `nixl-agent.send-notif` request gains `engine_id` and `notif_msg` (optional).
+
+### Cross-area requests
+- **worker-runner:** `init-device` calls `ensure-model-parallel-initialized` without `is_moe`, so the
+  MoE world's workers build no EP group. Pass the model config's `is_moe` (model.py:1686-1690; your
+  stub already declares the field) and `data_parallel_size`.
+- **models-layers:** when `all2all-utils.maybe-make-prepare-finalize` picks the naive/AgRs
+  prepare/finalize, call `group-coordinator.dispatch` / `.combine` (seams, DistAll2AllResult).
+- **engine-core:** the external-launcher MIN all-reduce (oracle3) is still yours.
+
+### Simulator notes
+- None needed from the round-5 simulator fixes; `{$absent: true}` is used in the round-5 test 6 and a
+  regression scenario.

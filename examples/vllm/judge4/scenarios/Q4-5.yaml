@@ -1,0 +1,73 @@
+schema_version: 1
+id: vllm
+scenarios:
+  - id: bench-q4-5-abc-preempt-keeps-encoder-output
+    name: "Q4-5 (a, b, c) step 1 encodes I whole (refs {A}), it survives the step; preemption makes it freeable but cached; A resumes with a 2048 hit, no re-encode, 352 tokens"
+    fixtures: [full-vl-qwen2-vl-7b]
+    config: {async-scheduling: false, max-num-batched-tokens: 2048}
+    state:
+      encoder-cache-manager: {cache_size: 2048, cached: {}, freeable: [], freed: [], num_embeds_by_hash: {}, num_free_slots: 2048, num_freeable_slots: 2048, request_cached_ids: {}}
+      scheduler: {max_num_encoder_input_tokens: 2048}
+    steps:
+      - flow: scheduler-add-request
+        input:
+          request_id: A
+          priority: 0
+          mm_features: [{identifier: img-I, modality: image, offset: 1500, length: 800}]
+          prompt_segments: [{key: a-text, num_tokens: 1500}, {key: img-I, num_tokens: 800}, {key: a-tail, num_tokens: 100}]
+          sampling_params: {max_tokens: 4}
+        as: addA
+      - {flow: scheduler-schedule, input: {}, as: s1}
+      - flow: scheduler-update-from-output
+        input: {scheduler_output: "= steps.s1.result.value", model_runner_output: {req_ids: [A], sampled_token_ids: [[]]}}
+        as: u1
+      - {interface: encoder-cache-manager.get-state, caller: scheduler, input: {}, as: st1}
+      - {interface: scheduler.preempt-request, caller: engine-core, input: {request_id: A}, as: pre}
+      - {interface: encoder-cache-manager.get-state, caller: scheduler, input: {}, as: st2}
+      - {flow: scheduler-schedule, input: {}, as: s2}
+    expect:
+      - "steps.s1.result.value.num_scheduled_tokens == {'A': 2048} && steps.s1.result.value.scheduled_encoder_inputs == {'A': [0]}"
+      - "steps.st1.result.value.cached == {'img-I': ['A']} && steps.st1.result.value.num_free_slots == 1248"
+      - "steps.st2.result.value.cached == {'img-I': []} && steps.st2.result.value.num_freeable_slots == 2048 && steps.st2.result.value.num_free_slots == 1248"
+      - "steps.s2.result.value.free_encoder_mm_hashes == []"
+      - "steps.s2.result.value.num_scheduled_tokens == {'A': 352} && steps.s2.result.value.scheduled_encoder_inputs == {}"
+      - "steps.s2.result.value.scheduled_cached_reqs.resumed_req_ids == ['A'] || steps.s2.result.value.scheduled_new_reqs.exists(r, r.req_id == 'A' && r.num_computed_tokens == 2048)"
+      - "trace.exists(e, e.type == 'call.end' && e.interface == 'encoder-cache-manager.check-and-update-cache' && e.output.cached)"
+  - id: bench-q4-5-d-c-evicts-i
+    name: "Q4-5 (d) C's two 800-token images need 1600 with 1248 free: I (freeable) is evicted and listed in free_encoder_mm_hashes; A then can't re-encode I and schedules 0 tokens"
+    fixtures: [full-vl-qwen2-vl-7b]
+    config: {async-scheduling: false, max-num-batched-tokens: 2048, scheduling-policy: priority}
+    state:
+      encoder-cache-manager: {cache_size: 2048, cached: {}, freeable: [], freed: [], num_embeds_by_hash: {}, num_free_slots: 2048, num_freeable_slots: 2048, request_cached_ids: {}}
+      scheduler: {max_num_encoder_input_tokens: 2048}
+    steps:
+      - flow: scheduler-add-request
+        input:
+          request_id: A
+          priority: 0
+          mm_features: [{identifier: img-I, modality: image, offset: 1500, length: 800}]
+          prompt_segments: [{key: a-text, num_tokens: 1500}, {key: img-I, num_tokens: 800}, {key: a-tail, num_tokens: 100}]
+          sampling_params: {max_tokens: 4}
+        as: addA
+      - {flow: scheduler-schedule, input: {}, as: s1}
+      - flow: scheduler-update-from-output
+        input: {scheduler_output: "= steps.s1.result.value", model_runner_output: {req_ids: [A], sampled_token_ids: [[]]}}
+        as: u1
+      - {interface: encoder-cache-manager.get-state, caller: scheduler, input: {}, as: st1}
+      - {interface: scheduler.preempt-request, caller: engine-core, input: {request_id: A}, as: pre}
+      - {interface: encoder-cache-manager.get-state, caller: scheduler, input: {}, as: st2}
+      - flow: scheduler-add-request
+        input:
+          request_id: C
+          priority: -1
+          mm_features: [{identifier: img-C1, modality: image, offset: 8, length: 800}, {identifier: img-C2, modality: image, offset: 808, length: 800}]
+          prompt_segments: [{key: c-text, num_tokens: 8}, {key: img-C1, num_tokens: 800}, {key: img-C2, num_tokens: 800}, {key: c-tail, num_tokens: 8}]
+          sampling_params: {max_tokens: 4}
+        as: addC
+      - {flow: scheduler-schedule, input: {}, as: s2}
+      - {interface: encoder-cache-manager.get-state, caller: scheduler, input: {}, as: st3}
+    expect:
+      - "steps.s2.result.value.scheduled_encoder_inputs == {'C': [0, 1]}"
+      - "steps.s2.result.value.free_encoder_mm_hashes == ['img-I']"
+      - "!('img-I' in steps.st3.result.value.cached)"
+      - "!('A' in steps.s2.result.value.num_scheduled_tokens) || steps.s2.result.value.num_scheduled_tokens['A'] == 0"

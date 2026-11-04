@@ -1,0 +1,108 @@
+schema_version: 1
+id: vllm
+scenarios:
+- id: oracle-worker-runner-get-logprobs-and-prompt-logprobs
+  description: >-
+    tests/v1/sample/test_logprobs.py::test_get_logprobs_and_prompt_logprobs (SAMPLE_PROMPT and NONE
+    compositions, temperature 0). A request that asks for logprobs=2 and prompt_logprobs=1 gets one
+    sample-logprobs position per generated token (max_tokens 5), each holding num_logprobs entries
+    or num_logprobs + 1 when the sampled token is outside the top k, always including the sampled
+    token; and prompt logprobs for every prompt position, the first being None. A request that asks
+    for neither gets logprobs None and prompt_logprobs None. HF numeric comparisons are left out
+    (tensor numerics, below the model).
+  fixtures: [full-tp1-llama-8b]
+  steps:
+  - flow: serving-api-offline-generate
+    input:
+      prompts:
+      - prompt_token_ids: [128000, 4438, 2362, 527]
+      sampling_params: {temperature: 0, max_tokens: 5, logprobs: 2, prompt_logprobs: 1, seed: 1984}
+    as: lp
+  - flow: serving-api-offline-generate
+    input:
+      prompts:
+      - prompt_token_ids: [128000, 4438, 2362, 527]
+      sampling_params: {temperature: 0, max_tokens: 5, seed: 1984}
+    as: none
+  expect:
+  - "steps.lp.result.ok && size(steps.lp.result.value[0].completions[0].token_ids) == 5"
+  - "steps.lp.result.value[0].completions[0].logprobs != null"
+  - "size(steps.lp.result.value[0].completions[0].logprobs) == 5"
+  - "steps.lp.result.value[0].completions[0].logprobs.all(pos, size(pos) == 2 || size(pos) == 3)"
+  - "lists.range(5).all(i, steps.lp.result.value[0].completions[0].logprobs[i].exists(e, e.token_id == steps.lp.result.value[0].completions[0].token_ids[i]))"
+  - "steps.lp.result.value[0].completions[0].cumulative_logprob != null"
+  - "has(steps.lp.result.value[0].prompt_logprobs) && steps.lp.result.value[0].prompt_logprobs != null"
+  - "size(steps.lp.result.value[0].prompt_logprobs) == 4 && steps.lp.result.value[0].prompt_logprobs[0] == null"
+  - "steps.none.result.ok && steps.none.result.value[0].completions[0].logprobs == null"
+  - "!has(steps.none.result.value[0].prompt_logprobs) || steps.none.result.value[0].prompt_logprobs == null"
+  - "trace.exists(e, e.type == 'call.start' && e.interface == 'logprobs-processor.update-sample-logprobs')"
+
+- id: oracle-worker-runner-one-token-bad-word
+  description: >-
+    tests/samplers/test_no_bad_words.py::TestOneTokenBadWord::test_one_token_bad_word. Greedy
+    generation's first token is the target; regenerating the same prompt with that one-token bad
+    word must never emit it. The test passes the bad word as text ("mn") and
+    SamplingParams.update_from_tokenizer turns it into ids; tokenizer internals are below the model,
+    so the scenario passes the resulting ids (bad_words_token_ids) directly.
+  fixtures: [full-tp1-llama-8b]
+  steps:
+  - flow: serving-api-offline-generate
+    input:
+      prompts:
+      - prompt_token_ids: [128000, 4438, 2362, 527, 220]
+      sampling_params: {temperature: 0, max_tokens: 16}
+    as: plain
+  - flow: serving-api-offline-generate
+    input:
+      prompts:
+      - prompt_token_ids: [128000, 4438, 2362, 527, 220]
+      sampling_params:
+        temperature: 0
+        max_tokens: 16
+        bad_words_token_ids: "= [[steps.plain.result.value[0].completions[0].token_ids[0]]]"
+    as: banned
+  expect:
+  - "steps.plain.result.ok && size(steps.plain.result.value[0].completions[0].token_ids) > 0"
+  - "trace.exists(e, e.type == 'call.end' && e.interface == 'bad-words-state.apply' && size(e.output.masked) > 0)"
+  - "steps.banned.result.ok"
+  - "!(steps.plain.result.value[0].completions[0].token_ids[0] in steps.banned.result.value[0].completions[0].token_ids)"
+
+- id: oracle-worker-runner-prepare-attn-forwards-positions
+  description: >-
+    tests/v1/worker/test_mamba_hybrid_model_state.py::test_prepare_attn_forwards_positions.
+    MambaHybridModelState.prepare_attn must hand the input batch's positions to
+    build_attn_metadata. The test's mocked build_attn_metadata is replaced by reading the
+    attention-metadata build call's input in the trace of a real hybrid execute_model step.
+  fixtures: [full-tp1-llama-8b]
+  state:
+    gpu-model-runner:
+      model:
+        architecture: HybridTestModel
+        dtype_bytes: 2
+        head_size: 128
+        hidden_size: 4096
+        is_hybrid: true
+        num_hidden_layers: 32
+        num_kv_heads: 8
+        uses_mrope: false
+        uses_prompt_embeds: false
+        vocab_size: 128256
+  steps:
+  - flow: wr-execute-model
+    input:
+      finished_req_ids: []
+      num_scheduled_tokens: {chatcmpl-abc123: 8}
+      scheduled_cached_reqs: {new_block_ids: [], num_computed_tokens: [], req_ids: []}
+      scheduled_new_reqs:
+      - block_ids: [5]
+        num_computed_tokens: 0
+        prompt_token_ids: [1, 2, 3, 4, 5, 6, 7, 8]
+        req_id: chatcmpl-abc123
+      total_num_scheduled_tokens: 8
+    as: e
+  - flow: wr-sample-tokens
+    as: s
+  expect:
+  - "steps.e.result.ok && steps.s.result.ok"
+  - "trace.exists(e, e.type == 'call.start' && e.interface.endsWith('metadata-builder.build'))"
+  - "trace.exists(e, e.type == 'call.start' && e.interface.endsWith('metadata-builder.build') && has(e.input.positions) && e.input.positions == [0, 1, 2, 3, 4, 5, 6, 7])"

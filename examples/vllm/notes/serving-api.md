@@ -310,3 +310,66 @@ Test-hit skips: `vllm download-kernels` and `POST /v1/systemone` are now modeled
   the engine's RequestOutput carries no sample logprobs yet (engine-core / worker-runner), so in a
   merged run beams don't extend past the first step.
 - Judge V3 is a scenario to adapt (`reconcile/round4/measure-notes.md`).
+
+## 15. Fix round 5 (precision)
+
+### Round-4 wrong claims fixed (judge3, oracle3, RESULTS)
+
+- **SamplingParams** (`sampling-params.post-init`): logit_bias keys are converted with `from_optional`. A bad key is refused with its Python-repr key list, and each bias is clamped to ±100 (sampling_params.py:488-508). A 0<T<0.01 temperature is raised to 0.01 (557-565). `_verify_args` now runs in the code's order: presence, frequency, then repetition. prompt_logprobs is checked, and `skip_reading_prefix_cache` is set when prompt logprobs are requested (622-629).
+- **`sampling-params.verify`** now runs `_validate_logit_bias`, `_validate_stop_token_ids`, `_validate_allowed_token_ids` (against the served checkpoint's vocab_size from `hf-hub.download-config`), the prompt-logprobs limit and `_validate_spec_decode`, in the code's order. **Cross-area:** engine-core's `input-processor.process-inputs` must call it (input_processor.py:157). Until it does, S3-2 a/c/e and P3-5 a/b still generate.
+- **Defaulted tool_choice**: `validate-request` now returns the rewritten body, so tools without tool_choice reach the renderer as `auto` and get a 400. The named-choice message is `function "<name>"`. Tools are passed to the chat template, and `--exclude-tools-when-tool-choice-none` is modeled.
+- **Streamed errors**: the role chunk is sent only after the first RequestOutput. An exception goes through `create_error_response` (a VLLMValidationError is 400 BadRequestError with its param) as the first frame, followed by [DONE].
+- **/tokenize**: TokenizeParams `max_total_tokens=None`, so there is no length check. It honors add_generation_prompt, continue_final_message (and refuses both together), add_special_tokens and tools. /detokenize refuses a negative id in pydantic (`Bad Request`, param `body.tokens.<i>`).
+- **Token ids**: the vocabulary check moved from the renderer's tokenization (which the code doesn't do) to `base-renderer.validate-token-ids` (base.py:420-455, `Token id N is out of vocabulary`). **Cross-area:** engine-core's input processor calls it (input_processor.py:645-648).
+- **Completions**: added `openai-serving-completion.validate-request`, whose validators run last-defined first: prompt list length (VLLM_MAX_COMPLETION_PROMPTS), empty prompt, stream_options, echo+logprobs with beam search, prompt_logprobs with stream, and negative ids. A token-id prompt now becomes one TokensPrompt through `prompt_to_seq` and `parse_dec_only_prompt`. Echo prepends the prompt text. The request id falls back to the body's request_id.
+- **Online beam search**: `generate-base-serving.beam-search` (online.py) sends one max_tokens=1 request per beam per step, named `<id>-<uuid>-beam-<i>`, with logprobs 2·beam_width. The bare request id is used. **Cross-area:** engine-core's RequestOutput completions carry no `logprobs`, so beams never extend (S3-6-ab).
+- **Multimodal tracker**: `hf-renderer.render-messages` now tracks part by part. `image_embeds` needs --enable-mm-embeds. A text-only model raises `<served name> is not a multimodal model`. Every item calls models-layers' `base-processing-info.validate-num-items`. **Cross-area (models-layers):** that interface appends the `--limit-mm-per-prompt` hint when the supported limit is None (context.py:612-626 does not), and it drops `parameter=<modality>`. S3-4-a fails on both.
+- **`/metrics`**: `instrumentator-metrics.get-metrics` over `prometheus-registry.collect`.
+- **`--enable-request-id-headers`**: the X-Request-Id response header.
+- **`validate_json_request`**: a non-JSON Content-Type is a 400 on every POST route. ASSUMPTION: a missing header means a JSON client.
+- **Offline `prompt_to_seq`**: `[[]]` is one empty TokensPrompt. Dict prompts' multi_modal_data reaches `llm-engine.add-request`.
+- **Cohere chat errors** use Cohere's envelope. Its id is the request metadata's (`chatcmpl-<id>`) once create_chat_completion has set it, else the X-Request-Id header.
+- **DeepSeekV3 / holo2 reasoning parser**: `deepseek-v3-reasoning-parser`. A None content stays null.
+- **`launcher.handle-shutdown-signal`**: SIGTERM → `async-llm.shutdown(shutdown_timeout)`, then `server_should_exit`. **Cross-area:** bench-l3-5a drives engine-core's `engine-shutdown` flow, whose entry should be this handler.
+- **`build-async-engine-client`** forwards every CLI engine arg (max_model_len, memory and batching limits, quantization, EP, ...).
+
+### Error-path sweep
+Every interface named above was checked against the code for status, type, message text and check order. Also checked: check-model, get-max-tokens, preflight and authentication. The chat validators were reordered to pydantic's last-defined-first order. `VLLMValidationError` params coming from engine-core (`data.parameter`) are now read too.
+
+### New worlds
+- **VL**: ChatML ids with Qwen2-VL's vision tokens, the image/audio limits and image_embeds.
+- **MoE**: Mixtral's 32000-token vocabulary bounds logit_bias, and the prompt uses the [INST] template.
+- **FP8**: max_model_len 8192 in /tokenize and TokenizeParams.
+- The renderer and tokenizer now follow the served checkpoint's family: Llama-3, ChatML or Mistral. ASSUMPTION: a few common words use Llama-3's real ids (Hello 9906, world 1917, ...).
+
+### Breaking changes
+- Token-id vocabulary errors no longer come from the renderer. They come from `base-renderer.validate-token-ids`, which engine-core must call (affects S3-2-d).
+- The renderer's length error is now `vllm-validation-error`, so `str()` carries `(parameter=input_tokens, value=N)`.
+- Text-only media message: `llama-8b is not a multimodal model`.
+- Cohere errors carry `id` when an X-Request-Id or metadata exists. This breaks build-oracle round-4 `oracle-r4-serving-api-cohere-error-envelope`: the request schema's example header fills X-Request-Id there.
+- Own scenarios updated: edge-branches, multimodal-text-only, offline-render-failure, tokenize-detokenize, cohere-sources-and-errors.
+
+### Still open (cross-area)
+- engine-core: call `sampling-params.verify` and `base-renderer.validate-token-ids`; return completion `logprobs`; fix two concurrent n>1 generates cancelling each other (S3-5-ab); route `engine-shutdown` through `launcher.handle-shutdown-signal`.
+- models-layers: `validate-num-items` hint and parameter.
+- scheduler-kv: read `sampling_params.skip_reading_prefix_cache` (Q3-4).
+
+### Results (merged working copies, end of round)
+- judge3 serving: 24 of 29 scenarios pass (was 4). Still failing:
+  - S3-2-d: engine-core's validate-token-ids call;
+  - S3-4-a: models-layers' hint and param;
+  - S3-5-ab: engine-core's concurrent n>1 cancel;
+  - S3-6-ab: engine logprobs;
+  - S3-7-c: the scenario lacks the flag (see measure notes).
+- Also passing now: Q3-4, P3-5 ab-spec and L3-4a-cli.
+- oracle3 serving-api: 2 of 3 pass. The Cohere one is a measure note.
+- Round-5 unit tests: 6 of 6.
+- Gate: serving-api passes every lint. Two own scenarios fail because config-platform's in-progress `model-config.get-diff-sampling-param` returns {} (chat-completion-sampling-params, offline-admin).
+- The staged run fails at validation: worlds.yaml names `scheduler-kv-vl-qwen2-vl-7b`, which is missing from scheduler-kv's last-good copy.
+
+### Coordinator follow-ups
+- `render-messages` creates the processor once through models-layers' `multi-modal-registry.create-processor`. It passes served_model_name, and validate_num_items uses the processor's supported limits. Each remote or data image_url is fetched through `media-connector.fetch-image`.
+- `validate-token-ids` defaults to the served checkpoint's vocabulary.
+- `serving-api-multimodal-chat-mixed-parts` moved to the VL world.
+- Breaking (worlds): scenarios that force `model-is-multimodal` on a Llama checkpoint, or name a model missing from hf-hub, now fail in create-processor. Affected: S3-4 a and b (Qwen2.5-VL is not in hf-hub) and build-oracle r3 `video-num-frames-override` (LlamaForCausalLM has no processor).
+- VL-world chat 500s with HEAD's serving-api too, so it is another area's work.

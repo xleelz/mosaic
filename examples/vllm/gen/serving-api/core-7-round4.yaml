@@ -14,6 +14,13 @@ configs:
     summary: "VLLM_MAX_N_SEQUENCES: the most sequences (n) one request may ask for; read by SamplingParams._verify_args"
     sources: ["vllm/envs.py:1149-1151", "vllm/sampling_params.py:45-58"]
     attributes: {key: VLLM_MAX_N_SEQUENCES}
+  - id: speculative-method
+    type: string
+    value: ""
+    default: ""
+    summary: "speculative_config.method ('' = no speculative decoding); SamplingParams.verify refuses min_p and logit_bias under it (owned by config-platform)"
+    sources: ["vllm/config/speculative.py:399"]
+    attributes: {key: speculative_config.method, boundary: true, owner: config-platform, none_is: ""}
 components:
   - id: sampling-params
     name: SamplingParams
@@ -33,8 +40,8 @@ interfaces:
   - component: sampling-params
     name: post-init
     kind: function
-    summary: "SamplingParams.from_optional + __post_init__ + _verify_args: fill defaults, normalize stop, stop_token_ids and logprobs, refuse invalid values with VLLMValidationError, and reset top_p/top_k/min_p for greedy sampling."
-    sources: ["vllm/sampling_params.py:449-555", "vllm/sampling_params.py:556-630", "vllm/sampling_params.py:631-745"]
+    summary: "SamplingParams.from_optional + __post_init__ + _verify_args: convert and clamp logit_bias, fill defaults, raise a tiny temperature to 0.01, normalize stop, stop_token_ids and logprobs, refuse invalid values with VLLMValidationError (in the code's order), and reset top_p/top_k/min_p for greedy sampling."
+    sources: ["vllm/sampling_params.py:449-555", "vllm/sampling_params.py:556-630", "vllm/sampling_params.py:631-745", "vllm/sampling_params.py:45-58"]
     request:
       type: object
       properties:
@@ -42,14 +49,38 @@ interfaces:
       required: [params]
     errors: [{code: vllm-validation-error, status: 0, retryable: false}]
     behavior:
+      - set:
+          vars.lb_in: "= has(input.params.logit_bias) && input.params.logit_bias != null ? input.params.logit_bias : null"
+      - if: "vars.lb_in != null"
+        then:
+          - title: "from_optional: logit_bias keys become int token ids; a key int() cannot parse is collected for the error"
+            source: "vllm/sampling_params.py:488-508"
+            set:
+              vars.bad_keys: "= vars.lb_in.filter(k, !string(k).matches('^\\\\s*[-+]?[0-9]+\\\\s*$'))"
+          - if: "size(vars.bad_keys) > 0"
+            then:
+              - title: "VLLMValidationError(parameter='logit_bias', value=invalid_keys); the value is the Python repr of the key list"
+                source: "vllm/sampling_params.py:503-508"
+                fail: {code: vllm-validation-error, message: "= 'logit_bias contains key(s) that cannot be converted to integer token IDs: [' + vars.bad_keys.map(k, '\\'' + string(k) + '\\'').join(', ') + ']'", data: {param: logit_bias, value: "= '[' + vars.bad_keys.map(k, '\\'' + string(k) + '\\'').join(', ') + ']'"}}
+          - title: "Each bias is clamped to [-100, 100] (a float)"
+            source: "vllm/sampling_params.py:492-495"
+            set:
+              vars.lb: "= vars.lb_in.transformMap(k, v, math.least(100.0, math.greatest(-100.0, double(v))))"
       - title: "from_optional: None arguments take the dataclass defaults (n 1, temperature 1.0, top_p 1.0, top_k 0, min_p 0, max_tokens 16, min_tokens 0, no stop)"
-        source: "vllm/sampling_params.py:449-555"
+        source: "vllm/sampling_params.py:510-555"
         set:
-          vars.p: "= merge({'n': 1, 'presence_penalty': 0.0, 'frequency_penalty': 0.0, 'repetition_penalty': 1.0, 'temperature': 1.0, 'top_p': 1.0, 'top_k': 0, 'min_p': 0.0, 'seed': null, 'stop': [], 'stop_token_ids': [], 'ignore_eos': false, 'max_tokens': 16, 'min_tokens': 0, 'logprobs': null, 'include_stop_str_in_output': false, 'skip_special_tokens': true, 'detokenize': true}, input.params.filter(k, input.params[k] != null).transformMapEntry(i, k, {k: input.params[k]}))"
-      - title: "__post_init__: seed -1 means none; a single stop string becomes a list; stop_token_ids are de-duplicated in order; logprobs=True means 1"
+          vars.p: "= merge(merge({'n': 1, 'presence_penalty': 0.0, 'frequency_penalty': 0.0, 'repetition_penalty': 1.0, 'temperature': 1.0, 'top_p': 1.0, 'top_k': 0, 'min_p': 0.0, 'seed': null, 'stop': [], 'stop_token_ids': [], 'ignore_eos': false, 'max_tokens': 16, 'min_tokens': 0, 'logprobs': null, 'prompt_logprobs': null, 'include_stop_str_in_output': false, 'skip_special_tokens': true, 'detokenize': true}, input.params.filter(k, input.params[k] != null).transformMapEntry(i, k, {k: input.params[k]})), has(vars.lb) ? {'logit_bias': vars.lb} : {})"
+      - if: "double(vars.p.temperature) > 0.0 && double(vars.p.temperature) < 0.01"
+        then:
+          - title: "__post_init__: 0 < temperature < 0.01 is raised to 0.01 (with a warning: it may cause nan or inf)"
+            source: "vllm/sampling_params.py:557-565"
+            set:
+              vars.p: "= merge(vars.p, {'temperature': 0.01})"
+              vars.temperature_warning: "= 'temperature ' + string(input.params.temperature) + ' is less than 0.01, which may cause numerical errors nan or inf in tensors. We have maxed it out to 0.01.'"
+      - title: "__post_init__: seed -1 means none; a single stop string becomes a list; stop_token_ids are de-duplicated in order; logprobs/prompt_logprobs True mean 1"
         source: "vllm/sampling_params.py:567-592"
         set:
-          vars.p: "= merge(vars.p, {'seed': vars.p.seed == -1 ? dyn(null) : dyn(vars.p.seed), 'stop': type(vars.p.stop) == string ? [vars.p.stop] : vars.p.stop, 'stop_token_ids': lists.range(size(vars.p.stop_token_ids)).filter(i, vars.p.stop_token_ids.indexOf(vars.p.stop_token_ids[i]) == i).map(i, vars.p.stop_token_ids[i]), 'logprobs': type(vars.p.logprobs) == bool ? (vars.p.logprobs ? dyn(1) : dyn(null)) : vars.p.logprobs})"
+          vars.p: "= merge(vars.p, {'seed': vars.p.seed == -1 ? dyn(null) : dyn(vars.p.seed), 'stop': type(vars.p.stop) == string ? [vars.p.stop] : vars.p.stop, 'stop_token_ids': lists.range(size(vars.p.stop_token_ids)).filter(i, vars.p.stop_token_ids.indexOf(vars.p.stop_token_ids[i]) == i).map(i, vars.p.stop_token_ids[i]), 'logprobs': type(vars.p.logprobs) == bool ? (vars.p.logprobs ? dyn(1) : dyn(null)) : vars.p.logprobs, 'prompt_logprobs': type(vars.p.prompt_logprobs) == bool ? (vars.p.prompt_logprobs ? dyn(1) : dyn(null)) : vars.p.prompt_logprobs})"
       - title: "Characters held back for stop strings while streaming: max(len(stop)) - 1 unless the stop string is kept"
         source: "vllm/sampling_params.py:594-597"
         set:
@@ -58,70 +89,144 @@ interfaces:
         source: "vllm/sampling_params.py:45-58"
         if: "vars.p.n < 1 || vars.p.n > config['vllm-max-n-sequences']"
         then: [{fail: {code: vllm-validation-error, message: "= vars.p.n < 1 ? 'n must be at least 1, got ' + string(vars.p.n) + '.' : 'n must be at most ' + string(config[\"vllm-max-n-sequences\"]) + ', got ' + string(vars.p.n) + '. To increase this limit, set the VLLM_MAX_N_SEQUENCES environment variable.'"}}]
-      - title: "presence and frequency penalties must be in [-2, 2]; repetition_penalty must be positive"
-        source: "vllm/sampling_params.py:635-655"
-        if: "double(vars.p.presence_penalty) < -2.0 || double(vars.p.presence_penalty) > 2.0 || double(vars.p.frequency_penalty) < -2.0 || double(vars.p.frequency_penalty) > 2.0 || double(vars.p.repetition_penalty) <= 0.0"
-        then: [{fail: {code: vllm-validation-error, message: "= double(vars.p.repetition_penalty) <= 0.0 ? 'repetition_penalty must be greater than zero, got ' + string(vars.p.repetition_penalty) + '.' : (double(vars.p.presence_penalty) < -2.0 || double(vars.p.presence_penalty) > 2.0 ? 'presence_penalty must be in [-2, 2], got ' + string(vars.p.presence_penalty) + '.' : 'frequency_penalty must be in [-2, 2], got ' + string(vars.p.frequency_penalty) + '.')"}}]
-      - title: "temperature must be in [0, 2]"
-        source: "vllm/sampling_params.py:662-679"
+      - title: "presence_penalty must be in [-2, 2] (checked first)"
+        source: "vllm/sampling_params.py:635-638"
+        if: "double(vars.p.presence_penalty) < -2.0 || double(vars.p.presence_penalty) > 2.0"
+        then: [{fail: {code: vllm-validation-error, message: "= 'presence_penalty must be in [-2, 2], got ' + string(vars.p.presence_penalty) + '.'"}}]
+      - title: "then frequency_penalty in [-2, 2]"
+        source: "vllm/sampling_params.py:639-642"
+        if: "double(vars.p.frequency_penalty) < -2.0 || double(vars.p.frequency_penalty) > 2.0"
+        then: [{fail: {code: vllm-validation-error, message: "= 'frequency_penalty must be in [-2, 2], got ' + string(vars.p.frequency_penalty) + '.'"}}]
+      - title: "then repetition_penalty must be greater than zero"
+        source: "vllm/sampling_params.py:648-652"
+        if: "double(vars.p.repetition_penalty) <= 0.0"
+        then: [{fail: {code: vllm-validation-error, message: "= 'repetition_penalty must be greater than zero, got ' + string(vars.p.repetition_penalty) + '.'"}}]
+      - title: "temperature must be non-negative, then at most 2"
+        source: "vllm/sampling_params.py:653-670"
         if: "double(vars.p.temperature) < 0.0 || double(vars.p.temperature) > 2.0"
         then: [{fail: {code: vllm-validation-error, message: "= double(vars.p.temperature) < 0.0 ? 'temperature must be non-negative, got ' + string(vars.p.temperature) + '.' : 'temperature must be in [0, 2], got ' + string(vars.p.temperature) + '.'", data: {param: temperature, value: "= vars.p.temperature"}}}]
       - title: "top_p must be in (0, 1]"
-        source: "vllm/sampling_params.py:680-685"
+        source: "vllm/sampling_params.py:671-676"
         if: "double(vars.p.top_p) <= 0.0 || double(vars.p.top_p) > 1.0"
         then: [{fail: {code: vllm-validation-error, message: "= 'top_p must be in (0, 1], got ' + string(vars.p.top_p) + '.'", data: {param: top_p, value: "= vars.p.top_p"}}}]
-      - title: "top_k: 0 (or -1) disables, otherwise at least 1; min_p in [0, 1]"
-        source: "vllm/sampling_params.py:686-695"
-        if: "vars.p.top_k < -1 || double(vars.p.min_p) < 0.0 || double(vars.p.min_p) > 1.0"
-        then: [{fail: {code: vllm-validation-error, message: "= vars.p.top_k < -1 ? 'top_k must be 0 (disable), or at least 1, got ' + string(vars.p.top_k) + '.' : 'min_p must be in [0, 1], got ' + string(vars.p.min_p) + '.'"}}]
+      - title: "top_k: 0 (or -1) disables, otherwise at least 1 (no parameter)"
+        source: "vllm/sampling_params.py:677-682"
+        if: "vars.p.top_k < -1"
+        then: [{fail: {code: vllm-validation-error, message: "= 'top_k must be 0 (disable), or at least 1, got ' + string(vars.p.top_k) + '.'"}}]
+      - title: "min_p in [0, 1] (no parameter)"
+        source: "vllm/sampling_params.py:686-687"
+        if: "double(vars.p.min_p) < 0.0 || double(vars.p.min_p) > 1.0"
+        then: [{fail: {code: vllm-validation-error, message: "= 'min_p must be in [0, 1], got ' + string(vars.p.min_p) + '.'"}}]
       - title: "max_tokens must be at least 1"
-        source: "vllm/sampling_params.py:696-701"
+        source: "vllm/sampling_params.py:688-693"
         if: "vars.p.max_tokens != null && vars.p.max_tokens < 1"
         then: [{fail: {code: vllm-validation-error, message: "= 'max_tokens must be at least 1, got ' + string(vars.p.max_tokens) + '.'", data: {param: max_tokens, value: "= vars.p.max_tokens"}}}]
       - title: "min_tokens must be non-negative and at most max_tokens"
-        source: "vllm/sampling_params.py:702-710"
+        source: "vllm/sampling_params.py:694-702"
         if: "vars.p.min_tokens < 0 || (vars.p.max_tokens != null && vars.p.min_tokens > vars.p.max_tokens)"
         then: [{fail: {code: vllm-validation-error, message: "= vars.p.min_tokens < 0 ? 'min_tokens must be greater than or equal to 0, got ' + string(vars.p.min_tokens) + '.' : 'min_tokens must be less than or equal to max_tokens=' + string(vars.p.max_tokens) + ', got ' + string(vars.p.min_tokens) + '.'"}}]
+      - title: "stream_interval must be at least 1"
+        source: "vllm/sampling_params.py:703-708"
+        if: "has(vars.p.stream_interval) && vars.p.stream_interval != null && vars.p.stream_interval < 1"
+        then: [{fail: {code: vllm-validation-error, message: "= 'stream_interval must be at least 1, got ' + string(vars.p.stream_interval) + '.'", data: {param: stream_interval, value: "= vars.p.stream_interval"}}}]
       - title: "logprobs must be non-negative or -1"
-        source: "vllm/sampling_params.py:717-722"
+        source: "vllm/sampling_params.py:709-714"
         if: "vars.p.logprobs != null && vars.p.logprobs != -1 && vars.p.logprobs < 0"
         then: [{fail: {code: vllm-validation-error, message: "= 'logprobs must be non-negative or -1, got ' + string(vars.p.logprobs) + '.'", data: {param: logprobs, value: "= vars.p.logprobs"}}}]
+      - title: "prompt_logprobs must be non-negative or -1"
+        source: "vllm/sampling_params.py:715-725"
+        if: "vars.p.prompt_logprobs != null && vars.p.prompt_logprobs != -1 && vars.p.prompt_logprobs < 0"
+        then: [{fail: {code: vllm-validation-error, message: "= 'prompt_logprobs must be non-negative or -1, got ' + string(vars.p.prompt_logprobs) + '.'", data: {param: prompt_logprobs, value: "= vars.p.prompt_logprobs"}}}]
       - title: "stop cannot contain an empty string"
-        source: "vllm/sampling_params.py:739-740"
+        source: "vllm/sampling_params.py:731-733"
         if: "vars.p.stop.exists(s, s == '')"
         then: [{fail: {code: vllm-validation-error, message: stop cannot contain an empty string.}}]
+      - title: "stop strings need detokenize"
+        source: "vllm/sampling_params.py:734-738"
+        if: "size(vars.p.stop) > 0 && !vars.p.detokenize"
+        then: [{fail: {code: vllm-validation-error, message: stop strings are only supported when detokenize is True. Set detokenize=True to use stop.}}]
       - if: "double(vars.p.temperature) < 0.00001"
         then:
-          - title: "_verify_greedy_sampling: greedy sampling allows only n=1"
-            source: "vllm/sampling_params.py:766-770"
-            when: "vars.p.n > 1"
-            fail: {code: vllm-validation-error, message: "= 'n must be 1 when using greedy sampling, got ' + string(vars.p.n) + '.'"}
           - title: "Zero temperature is greedy: top_p, top_k and min_p reset"
             source: "vllm/sampling_params.py:612-617"
             set:
               vars.p: "= merge(vars.p, {'top_p': 1.0, 'top_k': 0, 'min_p': 0.0})"
+          - title: "_verify_greedy_sampling: greedy sampling allows only n=1"
+            source: "vllm/sampling_params.py:766-770"
+            when: "vars.p.n > 1"
+            fail: {code: vllm-validation-error, message: "= 'n must be 1 when using greedy sampling, got ' + string(vars.p.n) + '.'"}
+      - title: "skip_reading_prefix_cache: a request with prompt logprobs must not read the prefix cache (its prompt logprobs would be short)"
+        source: "vllm/sampling_params.py:622-629"
+        set:
+          vars.p: "= merge(vars.p, {'skip_reading_prefix_cache': vars.p.prompt_logprobs != null})"
       - title: "SamplingParams is a msgspec Struct with omit_defaults: unset (None) fields are not sent to the engine"
         source: "vllm/sampling_params.py:268-274"
         return: "= vars.p.filter(k, vars.p[k] != null).transformMapEntry(i, k, {k: vars.p[k]})"
   - component: sampling-params
     name: verify
     kind: function
-    summary: "SamplingParams.verify(model_config, ...): the checks that need the model config, run by the engine's InputProcessor: sample logprobs at most max_logprobs, and the structured-outputs request (backend auto: an unparseable JSON schema is refused)."
-    sources: ["vllm/sampling_params.py:901-945", "vllm/sampling_params.py:1218-1240", "vllm/sampling_params.py:1370-1440"]
+    summary: "SamplingParams.verify(model_config, speculative_config, ...): the checks that need the model config, run by the engine's InputProcessor, in order: logprobs and prompt logprobs against max_logprobs, logit_bias, stop_token_ids and allowed_token_ids against the model's vocabulary, the spec-decode exclusions, then the structured-outputs request."
+    sources: ["vllm/sampling_params.py:901-917", "vllm/sampling_params.py:919-1003", "vllm/sampling_params.py:1047-1194", "vllm/sampling_params.py:1370-1440"]
     request:
       type: object
       properties:
         sampling_params: {type: object}
+        vocab_size: {type: [integer, "null"], default: null, description: "model_config.get_vocab_size(); null reads the served checkpoint's config.json"}
       required: [sampling_params]
     errors: [{code: vllm-validation-error, status: 0, retryable: false}]
     behavior:
       - set:
           vars.sp: "= input.sampling_params"
-          vars.max_lp: "= config['max-logprobs'] == -1 ? 128256 : config['max-logprobs']"
+      - if: "has(input.vocab_size) && input.vocab_size != null"
+        then:
+          - set: {vars.vocab: "= input.vocab_size"}
+        else:
+          - title: "model_config.get_vocab_size(): hf_text_config.vocab_size of the served checkpoint"
+            source: "vllm/config/model.py:1616-1617"
+            call: hf-hub.download-config
+            input: {model: "= config['model']"}
+            as: hfc
+            on_error: continue
+          - set: {vars.vocab: "= vars.hfc.ok && has(vars.hfc.value.vocab_size) ? vars.hfc.value.vocab_size : 128256"}
+      - set:
+          vars.max_lp: "= config['max-logprobs'] == -1 ? vars.vocab : config['max-logprobs']"
       - title: "_validate_logprobs: the requested sample logprobs (-1 = the vocabulary) must not exceed max_logprobs"
         source: "vllm/sampling_params.py:919-933"
-        if: "has(vars.sp.logprobs) && vars.sp.logprobs != null && vars.sp.logprobs != 0 && (vars.sp.logprobs == -1 ? 128256 : vars.sp.logprobs) > vars.max_lp"
-        then: [{fail: {code: vllm-validation-error, message: "= 'Requested sample logprobs of ' + string(vars.sp.logprobs == -1 ? 128256 : vars.sp.logprobs) + ', which is greater than max allowed: ' + string(vars.max_lp)", data: {param: logprobs, value: "= vars.sp.logprobs"}}}]
+        if: "has(vars.sp.logprobs) && vars.sp.logprobs != null && vars.sp.logprobs != 0 && (vars.sp.logprobs == -1 ? vars.vocab : vars.sp.logprobs) > vars.max_lp"
+        then: [{fail: {code: vllm-validation-error, message: "= 'Requested sample logprobs of ' + string(vars.sp.logprobs == -1 ? vars.vocab : vars.sp.logprobs) + ', which is greater than max allowed: ' + string(vars.max_lp)", data: {param: logprobs, value: "= vars.sp.logprobs == -1 ? vars.vocab : vars.sp.logprobs"}}}]
+      - title: "_validate_logprobs: prompt logprobs likewise"
+        source: "vllm/sampling_params.py:969-979"
+        if: "has(vars.sp.prompt_logprobs) && vars.sp.prompt_logprobs != null && vars.sp.prompt_logprobs != 0 && (vars.sp.prompt_logprobs == -1 ? vars.vocab : vars.sp.prompt_logprobs) > vars.max_lp"
+        then: [{fail: {code: vllm-validation-error, message: "= 'Requested prompt logprobs of ' + string(vars.sp.prompt_logprobs == -1 ? vars.vocab : vars.sp.prompt_logprobs) + ', which is greater than max allowed: ' + string(vars.max_lp)", data: {param: prompt_logprobs, value: "= vars.sp.prompt_logprobs == -1 ? vars.vocab : vars.sp.prompt_logprobs"}}}]
+      - if: "has(vars.sp.logit_bias) && vars.sp.logit_bias != null && size(vars.sp.logit_bias) > 0"
+        then:
+          - set: {vars.bad: "= vars.sp.logit_bias.map(k, int(k)).filter(t, t < 0 || t >= vars.vocab)"}
+          - title: "_validate_logit_bias: every token id must be inside the vocabulary"
+            source: "vllm/sampling_params.py:1072-1090"
+            when: "size(vars.bad) > 0"
+            fail: {code: vllm-validation-error, message: "= 'token_id(s) ' + string(vars.bad).replace(',', ', ') + ' in logit_bias contain out-of-vocab token ids. Vocabulary size: ' + string(vars.vocab)", data: {param: logit_bias, value: "= string(vars.bad).replace(',', ', ')"}}
+      - if: "has(vars.sp.stop_token_ids) && vars.sp.stop_token_ids != null && size(vars.sp.stop_token_ids) > 0"
+        then:
+          - set: {vars.bad: "= vars.sp.stop_token_ids.filter(t, t < 0 || t >= vars.vocab)"}
+          - title: "_validate_stop_token_ids: every stop token id must be inside the vocabulary"
+            source: "vllm/sampling_params.py:1047-1070"
+            when: "size(vars.bad) > 0"
+            fail: {code: vllm-validation-error, message: "= 'token_id(s) ' + string(vars.bad).replace(',', ', ') + ' in stop_token_ids contain out-of-vocab token ids. Vocabulary size: ' + string(vars.vocab)", data: {param: stop_token_ids, value: "= string(vars.bad).replace(',', ', ')"}}
+      - if: "has(vars.sp.allowed_token_ids) && vars.sp.allowed_token_ids != null"
+        then:
+          - title: "_validate_allowed_token_ids: an empty list is refused"
+            source: "vllm/sampling_params.py:1151-1161"
+            when: "size(vars.sp.allowed_token_ids) == 0"
+            fail: {code: vllm-validation-error, message: "allowed_token_ids is not None and empty!", data: {param: allowed_token_ids, value: "[]"}}
+          - set: {vars.bad: "= vars.sp.allowed_token_ids.filter(t, t < 0 || t >= vars.vocab)"}
+          - title: "_validate_allowed_token_ids: every id must be inside the vocabulary"
+            source: "vllm/sampling_params.py:1163-1181"
+            when: "size(vars.bad) > 0"
+            fail: {code: vllm-validation-error, message: "allowed_token_ids contains out-of-vocab token id!", data: {param: allowed_token_ids, value: "= string(vars.bad).replace(',', ', ')"}}
+      - title: "_validate_spec_decode: with a speculative config, min_p and logit_bias are refused (no parameter)"
+        source: "vllm/sampling_params.py:1183-1194"
+        if: "config['speculative-method'] != '' && ((has(vars.sp.min_p) && double(vars.sp.min_p) > 0.00001) || (has(vars.sp.logit_bias) && vars.sp.logit_bias != null && size(vars.sp.logit_bias) > 0))"
+        then: [{fail: {code: vllm-validation-error, message: "The min_p and logit_bias sampling parameters are not yet supported with speculative decoding."}}]
       - if: "has(vars.sp.structured_outputs) && vars.sp.structured_outputs != null && has(vars.sp.structured_outputs.json) && type(vars.sp.structured_outputs.json) == string"
         then:
           - title: "_validate_structured_outputs, backend auto: xgrammar rejects a schema it cannot parse; the guidance fallback json.loads it and raises 'Invalid JSON grammar specification.' (ASSUMPTION: parseability is judged by balanced braces and brackets and no dangling ':' or ',')"
@@ -134,27 +239,108 @@ interfaces:
   - component: openai-serving-chat
     name: validate-request
     kind: function
-    summary: "ChatCompletionRequest model validators that run while the body is parsed: stream_options needs stream=true, and top_logprobs needs logprobs=true and must be non-negative or -1."
-    sources: ["vllm/entrypoints/openai/chat_completion/protocol.py:821-892"]
+    summary: "ChatCompletionRequest's mode=before model validators, which pydantic runs last-defined first: check_generation_prompt, check_tool_usage (which may default tool_choice to auto), check_structured_outputs_count, check_logprobs, then validate_stream_options. A VLLMValidationError is not a ValueError, so it reaches the app's handler raw (400 with its parameter)."
+    sources: ["vllm/entrypoints/openai/chat_completion/protocol.py:788-1031"]
     request: {type: object, properties: {body: {$ref: ServingChatCompletionRequest}}, required: [body]}
     errors: [{code: vllm-validation-error, status: 0, retryable: false}]
     behavior:
-      - title: "validate_stream_options: stream_options without stream=true is refused"
-        source: "vllm/entrypoints/openai/chat_completion/protocol.py:821-832"
-        if: "has(input.body.stream_options) && input.body.stream_options != null && size(input.body.stream_options) > 0 && !(has(input.body.stream) && input.body.stream == true)"
-        then: [{fail: {code: vllm-validation-error, message: "Stream options can only be defined when `stream=True`.", data: {param: stream_options}}}]
-      - title: "check_logprobs: top_logprobs below 0 (other than -1) is refused, and a positive top_logprobs needs logprobs=true"
-        source: "vllm/entrypoints/openai/chat_completion/protocol.py:876-890"
-        if: "has(input.body.top_logprobs) && input.body.top_logprobs != null"
-        then:
-          - if: "input.body.top_logprobs < 0 && input.body.top_logprobs != -1"
-            then: [{fail: {code: vllm-validation-error, message: "`top_logprobs` must be a positive value or -1.", data: {param: top_logprobs, value: "= input.body.top_logprobs"}}}]
-          - if: "(input.body.top_logprobs == -1 || input.body.top_logprobs > 0) && !(has(input.body.logprobs) && input.body.logprobs == true)"
-            then: [{fail: {code: vllm-validation-error, message: "when using `top_logprobs`, `logprobs` must be set to true.", data: {param: top_logprobs}}}]
-      - source: "vllm/entrypoints/openai/chat_completion/protocol.py:935-937"
+      - title: "check_generation_prompt: continue_final_message and add_generation_prompt are exclusive (no parameter)"
+        source: "vllm/entrypoints/openai/chat_completion/protocol.py:1021-1031"
+        if: "has(input.body.continue_final_message) && input.body.continue_final_message == true && has(input.body.add_generation_prompt) && input.body.add_generation_prompt == true"
+        then: [{fail: {code: vllm-validation-error, message: "Cannot set both `continue_final_message` and `add_generation_prompt` to True."}}]
+      - title: "check_tool_usage (mode=before) may rewrite the data: tools without tool_choice become tool_choice='auto' on the parsed request"
+        source: "vllm/entrypoints/openai/chat_completion/protocol.py:935-1019"
         call: openai-serving-chat.check-tool-usage
         input: {body: "= input.body"}
-      - return: {ok: true}
+        as: tu
+      - set:
+          vars.body: "= vars.tu.value.tool_choice != null ? merge(input.body, {'tool_choice': vars.tu.value.tool_choice}) : input.body"
+      - if: "has(vars.body.structured_outputs) && vars.body.structured_outputs != null"
+        then:
+          - set:
+              vars.so_count: "= size(['json', 'regex', 'choice'].filter(k, k in vars.body.structured_outputs && vars.body.structured_outputs[k] != null))"
+          - title: "check_structured_outputs_count: one kind of constraint only"
+            source: "vllm/entrypoints/openai/chat_completion/protocol.py:915-922"
+            when: "vars.so_count > 1"
+            fail: {code: vllm-validation-error, message: "You can only use one kind of constraints for structured outputs ('json', 'regex' or 'choice')."}
+          - title: "check_structured_outputs_count: constraints and a named tool choice are exclusive"
+            source: "vllm/entrypoints/openai/chat_completion/protocol.py:923-932"
+            when: "vars.so_count > 0 && has(vars.body.tool_choice) && vars.body.tool_choice != null && !(vars.body.tool_choice in ['none', 'auto', 'required'])"
+            fail: {code: vllm-validation-error, message: "You can only either use constraints for structured outputs or tools, not both."}
+      - if: "has(vars.body.prompt_logprobs) && vars.body.prompt_logprobs != null"
+        then:
+          - title: "check_logprobs: prompt_logprobs are not available while streaming"
+            source: "vllm/entrypoints/openai/chat_completion/protocol.py:866-871"
+            when: "has(vars.body.stream) && vars.body.stream == true && (vars.body.prompt_logprobs > 0 || vars.body.prompt_logprobs == -1)"
+            fail: {code: vllm-validation-error, message: "`prompt_logprobs` are not available when `stream=True`.", data: {param: prompt_logprobs}}
+          - title: "check_logprobs: prompt_logprobs must be positive or -1"
+            source: "vllm/entrypoints/openai/chat_completion/protocol.py:873-878"
+            when: "vars.body.prompt_logprobs < 0 && vars.body.prompt_logprobs != -1"
+            fail: {code: vllm-validation-error, message: "`prompt_logprobs` must be a positive value or -1.", data: {param: prompt_logprobs, value: "= vars.body.prompt_logprobs"}}
+      - title: "check_logprobs: top_logprobs below 0 (other than -1) is refused, and a positive top_logprobs needs logprobs=true"
+        source: "vllm/entrypoints/openai/chat_completion/protocol.py:879-890"
+        if: "has(vars.body.top_logprobs) && vars.body.top_logprobs != null"
+        then:
+          - if: "vars.body.top_logprobs < 0 && vars.body.top_logprobs != -1"
+            then: [{fail: {code: vllm-validation-error, message: "`top_logprobs` must be a positive value or -1.", data: {param: top_logprobs, value: "= vars.body.top_logprobs"}}}]
+          - if: "(vars.body.top_logprobs == -1 || vars.body.top_logprobs > 0) && !(has(vars.body.logprobs) && vars.body.logprobs == true)"
+            then: [{fail: {code: vllm-validation-error, message: "when using `top_logprobs`, `logprobs` must be set to true.", data: {param: top_logprobs}}}]
+      - title: "validate_stream_options: stream_options without stream=true is refused"
+        source: "vllm/entrypoints/openai/chat_completion/protocol.py:821-832"
+        if: "has(vars.body.stream_options) && vars.body.stream_options != null && size(vars.body.stream_options) > 0 && !(has(vars.body.stream) && vars.body.stream == true)"
+        then: [{fail: {code: vllm-validation-error, message: "Stream options can only be defined when `stream=True`.", data: {param: stream_options}}}]
+      - return: {ok: true, body: "= vars.body"}
+  - component: openai-serving-completion
+    name: validate-request
+    kind: function
+    summary: "CompletionRequest's mode=before model validators, last-defined first: validate_prompt_list_length, validate_prompt_and_prompt_embeds, validate_stream_options, check_logprobs, check_structured_outputs_count; then the pydantic field types (a prompt is token ids >= 0, lists of them, a string or a list of strings) and normalize_null_max_tokens."
+    sources: ["vllm/entrypoints/openai/completion/protocol.py:430-645", "vllm/entrypoints/openai/completion/protocol.py:47-58"]
+    request: {type: object, properties: {body: {$ref: ServingCompletionRequest}}, required: [body]}
+    errors: [{code: vllm-validation-error, status: 0, retryable: false}, {code: Bad Request, status: 400, retryable: false}]
+    behavior:
+      - set:
+          vars.p: "= has(input.body.prompt) ? input.body.prompt : null"
+      - title: "validate_prompt_list_length: a list of prompts (not one token-id list) may hold at most VLLM_MAX_COMPLETION_PROMPTS"
+        source: "vllm/entrypoints/openai/completion/protocol.py:612-632"
+        if: "vars.p != null && type(vars.p) == list && size(vars.p) > 0 && !vars.p.all(x, type(x) == int) && size(vars.p) > config['vllm-max-completion-prompts']"
+        then: [{fail: {code: vllm-validation-error, message: "= 'prompt list length ' + string(size(vars.p)) + ' exceeds the maximum allowed count of ' + string(config['vllm-max-completion-prompts']) + '. To increase this limit, set the VLLM_MAX_COMPLETION_PROMPTS environment variable.'", data: {param: prompt}}}]
+      - title: "validate_prompt_and_prompt_embeds: a missing or empty-string prompt needs prompt_embeds"
+        source: "vllm/entrypoints/openai/completion/protocol.py:591-610"
+        if: "(vars.p == null || (type(vars.p) == string && vars.p == '')) && !(has(input.body.prompt_embeds) && input.body.prompt_embeds != null && size(input.body.prompt_embeds) > 0)"
+        then: [{fail: {code: vllm-validation-error, message: "Either prompt or prompt_embeds must be provided and non-empty.", data: {param: prompt}}}]
+      - title: "validate_stream_options: stream_options need stream=true"
+        source: "vllm/entrypoints/openai/completion/protocol.py:578-589"
+        if: "has(input.body.stream_options) && input.body.stream_options != null && size(input.body.stream_options) > 0 && !(has(input.body.stream) && input.body.stream == true)"
+        then: [{fail: {code: vllm-validation-error, message: "Stream options can only be defined when `stream=True`.", data: {param: stream_options}}}]
+      - title: "check_logprobs: beam search computes no prompt logprobs, so echo with logprobs is refused"
+        source: "vllm/entrypoints/openai/completion/protocol.py:512-522"
+        if: "has(input.body.use_beam_search) && input.body.use_beam_search == true && has(input.body.echo) && input.body.echo == true && has(input.body.logprobs) && input.body.logprobs != null"
+        then: [{fail: {code: vllm-validation-error, message: "`echo` with `logprobs` is not supported with beam search because beam search does not compute prompt logprobs.", data: {param: echo}}}]
+      - if: "has(input.body.prompt_logprobs) && input.body.prompt_logprobs != null"
+        then:
+          - title: "check_logprobs: prompt_logprobs are not available while streaming"
+            source: "vllm/entrypoints/openai/completion/protocol.py:549-554"
+            when: "has(input.body.stream) && input.body.stream == true && (input.body.prompt_logprobs > 0 || input.body.prompt_logprobs == -1)"
+            fail: {code: vllm-validation-error, message: "`prompt_logprobs` are not available when `stream=True`.", data: {param: prompt_logprobs}}
+          - title: "check_logprobs: prompt_logprobs must be positive or -1"
+            source: "vllm/entrypoints/openai/completion/protocol.py:556-561"
+            when: "input.body.prompt_logprobs < 0 && input.body.prompt_logprobs != -1"
+            fail: {code: vllm-validation-error, message: "`prompt_logprobs` must be a positive value or -1.", data: {param: prompt_logprobs, value: "= input.body.prompt_logprobs"}}
+      - title: "check_logprobs: logprobs must be positive or -1"
+        source: "vllm/entrypoints/openai/completion/protocol.py:563-574"
+        if: "has(input.body.logprobs) && input.body.logprobs != null && input.body.logprobs < 0 && input.body.logprobs != -1"
+        then: [{fail: {code: vllm-validation-error, message: "`logprobs` must be a positive value or -1.", data: {param: logprobs, value: "= input.body.logprobs"}}}]
+      - title: "check_structured_outputs_count: one kind of constraint only"
+        source: "vllm/entrypoints/openai/completion/protocol.py:471-499"
+        if: "has(input.body.structured_outputs) && input.body.structured_outputs != null && size(['json', 'regex', 'choice'].filter(k, k in input.body.structured_outputs && input.body.structured_outputs[k] != null)) > 1"
+        then: [{fail: {code: vllm-validation-error, message: "You can only use one kind of constraints for structured outputs ('json', 'regex' or 'choice').", data: {param: structured_outputs}}}]
+      - title: "Field validation of prompt: token ids are Annotated[int, Field(ge=0)], so a negative id fails every union branch (RequestValidationError -> 400 Bad Request; ASSUMPTION: the message is cut to its count and first error)"
+        source: "vllm/entrypoints/openai/completion/protocol.py:51-57"
+        if: "vars.p != null && type(vars.p) == list && (vars.p.exists(x, type(x) == int && x < 0) || vars.p.exists(x, type(x) == list && x.exists(y, type(y) == int && y < 0)))"
+        then: [{fail: {code: Bad Request, status: 400, message: "validation errors:\n  body.prompt: Input should be greater than or equal to 0", data: {param: body.prompt}}}]
+      - title: "normalize_null_max_tokens: an absent or null max_tokens is the field default, 16"
+        source: "vllm/entrypoints/openai/completion/protocol.py:430-436"
+        return: {ok: true, body: "= merge(input.body, {'max_tokens': has(input.body.max_tokens) && input.body.max_tokens != null ? input.body.max_tokens : 16})"}
   - component: tokenize-params
     name: post-init
     kind: function

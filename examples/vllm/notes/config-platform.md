@@ -377,3 +377,82 @@ attention's stub) and `cpu-platform.get-mla-prefill-backend-cls` (cpu.py:182-194
 
 **Simulator notes.** Hashes are `sha256(json(...))` (vLLM: `json.dumps` with spaces, or `str(list)`), so only
 equality matches vLLM. IrOp provider uuids (kernels-ops' registry) are inputs to `ir-op-priority-config.compute-hash`.
+
+## Fix round 5 (precision)
+
+I edited `fragments/config-platform.yaml` directly (no generator).
+
+**Round-4 wrong claims fixed**
+- judge3 L3-4(a): `model-config.get-and-verify-max-len` builds the code's message word for word: the derived length prints as a
+  float when the config has RoPE parameters (`derived *= scaling_factor`, model.py:2585-2616), `model_max_length=None`, and the
+  caution text follows (model.py:2645-2665). RoPE parameters now come from `rope_scaling`/`rope_parameters` (legacy `type`,
+  legacy `mrope` -> default) or a plain `rope_theta` (transformers_utils/config.py:563-653), not a Llama default.
+- judge3 L3-4(c): `engine-args.add-cli-args` applies the argparse type `_compute_kwargs` registers: human_readable_int_or_auto for
+  --max-model-len, human_readable_int for the token budgets (arg_utils.py:389-405, argparse_utils.py:29-93).
+  `create-engine-config` accepts the CLI text.
+- judge3 L3-8(a): `model-config.get-diff-sampling-param` is now defined by its owner (model.py:1812-1901): generation config
+  ('auto' / 'vllm' / a directory), --override-generation-config, the eight keys, max_new_tokens -> max_tokens, and the override
+  warning text. New configs `generation-config`, `override-generation-config`.
+- judge3 P3-7(c): CacheConfig takes `cache_dtype` (the CacheDType literal) and logs the validator's info (cache.py:39-59, 350-367).
+- judge3 P3-4: new `vllm-config.max-concurrent-batches` (vllm.py:576-587); the resolved config carries `max_concurrent_batches`
+  (engine-core should size its batch queue from it).
+- oracle3 compose_draft_hf_overrides: `speculative-config.compose-draft-hf-overrides` (speculative.py:1083-1107), wired into
+  `create-speculative-config`; new config `hf-overrides`; a dict override patches the target's HF config (model.py:605-619).
+- oracle3 (minor): `observability-config.init` treats omitted fields as None; messages now match the validators.
+- oracle3 side finding: `plugins.load-general-plugins` can run a plugin that calls `model-registry.register-model` with the
+  entry point's `input`.
+
+**New worlds**
+- MoE: ModelConfig returns `num_experts` / `num_experts_per_tok` (model_arch_config_convertor.py:189-219, in the code's name
+  order); ParallelConfig returns `is_moe_model`, `all2all_backend`, `use_sequence_parallel_moe`, `use_all2all`
+  (parallel.py:533-539, 763-788). Variant fixture `config-platform-moe-host` (variant_of moe-mixtral-8x7b-tp2-ep) gives the host
+  two GPUs.
+- VL: `is_multimodal_model` and `vision_config` on the ModelConfig result.
+- FP8: new `vllm-config.get-quantization-config` (vllm.py:885-920): minimum capability per method, Fp8Config activation dtypes,
+  and Fp8Config.from_config/__init__ checks (fp8.py:95-175, base_config.py:182-189); resolved `quant_config`.
+  `kv_cache_dtype` flows from `config['kv-cache-dtype']` (boundary copy, owner attention) into `cache_config.cache_dtype`.
+- The flow `config-create-engine-config` reads `config['model']`, `quantization`, `kv-cache-dtype` and `hf-overrides`.
+
+**Error-path sweep** (all 103 `fail`s checked against their raise sites). Corrected to the code's text: Invalid repository ID
+(full multi-line text, quoted id), max_model_len positive (`Example:` suffix), Unknown quantization method (`Must be one of [...]`),
+deprecated quantization (the code passes `%s` as a second ValueError arg, so str() is the tuple repr), World size (the ray/nnodes
+hint), max_num_batched_tokens < max_model_len (middle sentence), --nnodes with non-mp backend (`; got ...` suffix), current-config
+AssertionError (full text), selected attention backend (reasons list repr), no valid attention backend (full
+AttentionSelectorConfig repr), no valid MLA prefill backend (`with MLAPrefillSelectorConfig(...)`), platform plugin conflicts (list
+repr), platforms getattr/setattr and envs getattr (quoted names), IO processor plugin missing (quotes, available list), VLLM_PORT
+(quotes, the URI hint's link), VLLM_WORKER_MULTIPROC_METHOD (quoted value and choices), QuantizationConfigArgs targets exclusivity
+(`got targets=...`), xpu device strings (the three code branches), mm_processor_kwargs device (repr), pydantic field errors
+(gpu_memory_utilization, cache_dtype, mm_hasher_algorithm, device_buffer_size, max_bytes) in pydantic's `1 validation error for
+<Class>` format, observability buckets (repr'd family, bounds list, known families). Order of checks: observability's boolean
+check now runs over every family before the per-family checks (mode='before').
+Left approximate: pydantic wraps validator ValueErrors as "Value error, <text>" (the model keeps the inner text); CEL prints a
+whole float like 0.0 as `0`, so pydantic `input_value=0.0` shows `0`; `console-scripts.vllm`'s argparse invalid-choice text depends
+on the Python version (and the file is serving-api's).
+
+**Breaking changes** (callers listed)
+- `model-config.get-diff-sampling-param` now returns the generation config, not schema examples: serving-api's chat, completion
+  and `llm.get-default-sampling-params` paths. In non-`full-*` worlds it returns {} until the coordinator moves the rows (below).
+- ModelConfig no longer assumes llama3 RoPE when the config has no rope keys; the experts lookup follows the code's name order.
+- Messages changed (above): scenarios asserting the old texts with `==` (none found outside this fragment; my own were updated).
+- `cuda-platform.get-attn-backend-cls`'s "no valid backend" message now carries the full selector repr (attention's scenarios
+  that match `contains('Reasons: {')` still pass).
+- New response fields only (additive) on ConfigVllmConfig: `quant_config`, `max_concurrent_batches`, `cache_config.cache_dtype`,
+  model_config expert/multimodal/dtype fields, parallel_config EP fields, compilation_config `cudagraph_mode`.
+
+**Coordinator: fixtures**
+- Move config-platform-seed's `hf-hub.generation_configs` rows into `fixtures.yaml` under `tp1-llama-8b` (Llama-3.1-8B and
+  -70B: temperature 0.6, top_p 0.9), `fp8-llama-3-8b` (same plus max_length 4096) and `moe-mixtral-8x7b-tp2-ep` (no sampling
+  keys), so plain worlds see them. Qwen2-VL's generation_config.json isn't seeded (values unverified).
+- `model-is-multimodal` is ModelConfig.is_multimodal_model (model.py:1981-1982, my path), but serving-api and worker-runner
+  name models-layers / serving-api as its owner and nobody defines it. I can define it if the coordinator assigns it to me.
+
+**Cross-area**
+- engine-core: size the batch queue from `max_concurrent_batches`; read the resolved `async_scheduling`; register the VllmConfig
+  reducer (oracle3 mp-reducer).
+- serving-api: `serve-subcommand.cmd` should accept the --max-model-len string (bench-l3-4c schema warning).
+- models-layers: `bench-p3-7d` (fp8_e5m2 with an fp8 checkpoint) is the Attention layer's check.
+
+**Round-5 tests:** 5 of 6 pass (two partial), 1 untranslatable (`build-oracle/round5/config-platform.md`).
+- Round-3 test 2 (`r3-config-platform-2-draft-model-engine-args-tp`): its seeded Qwen3-1.7B-FP8 quantization_config gained the
+  checkpoint's real `activation_scheme: dynamic` (and fmt/weight_block_size), because Fp8Config.from_config requires the key
+  (fp8.py:161, base_config.py:182-189). The scenario's steps and expectations are unchanged; it passes again.

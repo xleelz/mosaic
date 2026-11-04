@@ -1,0 +1,568 @@
+components:
+  - id: dp-coordinator
+    name: DPCoordinator
+    kind: service
+    parent: engine-core
+    layer: process
+    summary: "The DP coordinator process (data_parallel_size > 1 with internal LB, or MoE): collects the engines' request counts for the front-ends' load balancing and, for MoE models, coordinates request waves: a FIRST_REQ wakes every paused rank with START_DP_WAVE, rank 0's wave_complete moves to the next wave."
+    sources: ["vllm/v1/engine/coordinator.py:23-58", "vllm/v1/engine/coordinator.py:197-478"]
+    state:
+      schema: {type: object, properties: {current_wave: {type: integer}, engines_running: {type: boolean}, engine_counts: {type: array}, enable_wave_coordination: {type: ["boolean", "null"]}}}
+      initial: {current_wave: 0, engines_running: false, engine_counts: [], enable_wave_coordination: null}
+
+interfaces:
+  # ------------------------------------------------------------------ metrics (round 5): labeled Prometheus series
+  - component: stat-logger-manager
+    name: record
+    kind: function
+    latency_ms: 0
+    summary: "StatLoggerManager.record: every stat logger records the step's SchedulerStats and IterationStats for engine_idx (None means 0); the PrometheusStatLogger is one of them."
+    sources: ["vllm/v1/metrics/loggers.py:1421-1436"]
+    request:
+      type: object
+      properties:
+        scheduler_stats: {type: ["object", "null"], default: null, description: "SchedulerStats (stats.py:222-255)"}
+        iteration_stats: {type: ["object", "null"], default: null, description: "IterationStats: num_prompt_tokens, num_generation_tokens, num_preempted_reqs, time_to_first_tokens_iter, inter_token_latencies_iter, finished_requests"}
+        mm_cache_stats: {type: ["object", "null"], default: null}
+        engine_idx: {type: ["integer", "null"], default: null}
+    behavior:
+      - set: {vars.idx: "= has(input.engine_idx) && input.engine_idx != null ? input.engine_idx : 0"}
+      - call: stat-logger-manager.ensure-prometheus
+      - title: "for stat_logger in self.stat_loggers: stat_logger.record(scheduler_stats, iteration_stats, mm_cache_stats=..., engine_idx=engine_idx)"
+        source: "vllm/v1/metrics/loggers.py:1430-1436"
+        foreach: "= state.loggers.filter(l, l != 'PrometheusStatLogger')"
+        as: lg
+        steps:
+          - call: "= vars.lg == 'LoggingStatLogger' ? 'logging-stat-logger.record' : (vars.lg == 'AggregatedLoggingStatLogger' ? 'logging-stat-logger.record-aggregated' : 'per-engine-stat-logger-adapter.record')"
+            targets: [logging-stat-logger.record, logging-stat-logger.record-aggregated, per-engine-stat-logger-adapter.record]
+            input:
+              engine_idx: "= vars.idx"
+              iteration_stats: "= has(input.iteration_stats) ? input.iteration_stats : null"
+              scheduler_stats: "= has(input.scheduler_stats) ? input.scheduler_stats : null"
+      - if: "state.loggers.exists(l, l == 'PrometheusStatLogger')"
+        then:
+          - call: stat-logger-manager.record-prometheus
+            input:
+              engine_idx: "= vars.idx"
+              iteration_stats: "= has(input.iteration_stats) ? input.iteration_stats : null"
+              scheduler_stats: "= has(input.scheduler_stats) ? input.scheduler_stats : null"
+              mm_cache_stats: "= has(input.mm_cache_stats) ? input.mm_cache_stats : null"
+
+  - component: stat-logger-manager
+    name: record-prometheus
+    kind: function
+    latency_ms: 0
+    summary: "PrometheusStatLogger.record: from SchedulerStats set the running/waiting/KV-usage gauges and add the prefix-cache counters; from IterationStats add the token and preemption counters, observe TTFT and inter-token latency, and per finished request count vllm:request_success{finished_reason} and observe the e2e, prompt and generation histograms."
+    description: "Histograms are modeled by their _count and _sum (a row {count, sum}); bucket counts are left to a refinement."
+    sources: ["vllm/v1/metrics/loggers.py:1138-1330"]
+    request:
+      type: object
+      properties:
+        scheduler_stats: {type: ["object", "null"], default: null}
+        iteration_stats: {type: ["object", "null"], default: null}
+        mm_cache_stats: {type: ["object", "null"], default: null}
+        engine_idx: {type: integer, default: 0}
+    behavior:
+      - set:
+          vars.idx: "= has(input.engine_idx) ? input.engine_idx : 0"
+          vars.model: "= config['served-model-name'] != null && size(config['served-model-name']) > 0 ? config['served-model-name'][0] : config['model']"
+      - set:
+          vars.lbl: "= {'model_name': vars.model, 'engine': string(vars.idx)}"
+          vars.ln: [model_name, engine]
+      - if: "has(input.scheduler_stats) && input.scheduler_stats != null"
+        then:
+          - set: {vars.ss: "= input.scheduler_stats"}
+          - title: "gauge_scheduler_running / gauge_scheduler_waiting (num_waiting_reqs + num_skipped_waiting_reqs) / gauge_kv_cache_usage .set(...); a set to the value a gauge already holds changes nothing, so only changed gauges are written"
+            source: "vllm/v1/metrics/loggers.py:1147-1165"
+            set:
+              vars.g: "= [['vllm:num_requests_running', has(vars.ss.num_running_reqs) ? vars.ss.num_running_reqs : 0], ['vllm:num_requests_waiting', (has(vars.ss.num_waiting_reqs) ? vars.ss.num_waiting_reqs : 0) + (has(vars.ss.num_skipped_waiting_reqs) ? vars.ss.num_skipped_waiting_reqs : 0)], ['vllm:kv_cache_usage_perc', has(vars.ss.kv_cache_usage) ? vars.ss.kv_cache_usage : 0.0]]"
+              vars.last: "= has(state.last_gauges) ? state.last_gauges : {}"
+          - set:
+              vars.changed: "= vars.g.filter(x, !((x[0] + '@' + string(vars.idx)) in vars.last) || string(vars.last[x[0] + '@' + string(vars.idx)]) != string(x[1]))"
+          - if: "size(vars.changed) > 0"
+            then:
+              - set: {state.last_gauges: "= merge(vars.last, vars.changed.transformMapEntry(i, x, {x[0] + '@' + string(vars.idx): x[1]}))"}
+              - foreach: "= vars.changed"
+                as: x
+                steps:
+                  - call: prometheus-registry.set
+                    input: {name: "= vars.x[0]", labels: "= vars.lbl", label_names: "= vars.ln", value: "= vars.x[1]"}
+          - if: "has(vars.ss.prefix_cache_stats) && vars.ss.prefix_cache_stats != null && vars.ss.prefix_cache_stats.queries != 0"
+            then:
+              - title: "counter_prefix_cache_queries / _hits .inc(prefix_cache_stats.queries / .hits)"
+                source: "vllm/v1/metrics/loggers.py:1167-1172"
+                call: prometheus-registry.incr
+                input: {name: "vllm:prefix_cache_queries", labels: "= vars.lbl", label_names: "= vars.ln", value: "= vars.ss.prefix_cache_stats.queries"}
+              - call: prometheus-registry.incr
+                input: {name: "vllm:prefix_cache_hits", labels: "= vars.lbl", label_names: "= vars.ln", value: "= vars.ss.prefix_cache_stats.hits"}
+      - if: "has(input.mm_cache_stats) && input.mm_cache_stats != null"
+        then:
+          - title: "counter_mm_cache_queries / _hits"
+            source: "vllm/v1/metrics/loggers.py:1238-1240"
+            call: prometheus-registry.incr
+            input: {name: "vllm:mm_cache_queries", labels: "= vars.lbl", label_names: "= vars.ln", value: "= input.mm_cache_stats.queries"}
+          - call: prometheus-registry.incr
+            input: {name: "vllm:mm_cache_hits", labels: "= vars.lbl", label_names: "= vars.ln", value: "= input.mm_cache_stats.hits"}
+      - if: "!has(input.iteration_stats) || input.iteration_stats == null"
+        then:
+          - title: "if iteration_stats is None: return"
+            source: "vllm/v1/metrics/loggers.py:1242-1243"
+            return: {recorded: scheduler}
+      - set: {vars.it: "= input.iteration_stats"}
+      - if: "config['watermark-enabled']"
+        then:
+          - title: "With watermark_config: vllm:watermark_requests{status} counts each finished request once (watermarked, skipped, not_watermarked)"
+            source: "vllm/v1/metrics/loggers.py:1248-1258"
+            foreach: "= [['watermarked', has(vars.it.num_watermarked_reqs) ? vars.it.num_watermarked_reqs : 0], ['skipped', has(vars.it.num_watermark_skipped_reqs) ? vars.it.num_watermark_skipped_reqs : 0], ['not_watermarked', has(vars.it.num_not_watermarked_reqs) ? vars.it.num_not_watermarked_reqs : 0]]"
+            as: w
+            steps:
+              - call: prometheus-registry.incr
+                input: {name: "vllm:watermark_requests", labels: "= merge(vars.lbl, {'status': vars.w[0]})", label_names: [model_name, engine, status], value: "= vars.w[1]"}
+      - title: "num_preempted_reqs, prompt and generation token counters (an inc(0) leaves a counter unchanged, so zero deltas are not written)"
+        source: "vllm/v1/metrics/loggers.py:1259-1272"
+        foreach: "= [['vllm:num_preemptions', has(vars.it.num_preempted_reqs) ? vars.it.num_preempted_reqs : 0], ['vllm:prompt_tokens', has(vars.it.num_prompt_tokens) ? vars.it.num_prompt_tokens : 0], ['vllm:generation_tokens', has(vars.it.num_generation_tokens) ? vars.it.num_generation_tokens : 0]].filter(c, c[1] != 0)"
+        as: c
+        steps:
+          - call: prometheus-registry.incr
+            input: {name: "= vars.c[0]", labels: "= vars.lbl", label_names: "= vars.ln", value: "= vars.c[1]"}
+      - title: "histogram_time_to_first_token.observe(ttft) per request that produced its first token this step"
+        source: "vllm/v1/metrics/loggers.py:1284-1285"
+        foreach: "= has(vars.it.time_to_first_tokens_iter) ? vars.it.time_to_first_tokens_iter : []"
+        as: ttft
+        steps:
+          - call: prometheus-registry.incr
+            input: {name: "vllm:time_to_first_token_seconds", labels: "= vars.lbl", label_names: "= vars.ln", value: {count: 1, sum: "= vars.ttft"}}
+      - title: "histogram_inter_token_latency.observe(itl)"
+        source: "vllm/v1/metrics/loggers.py:1286-1287"
+        foreach: "= has(vars.it.inter_token_latencies_iter) ? vars.it.inter_token_latencies_iter : []"
+        as: itl
+        steps:
+          - call: prometheus-registry.incr
+            input: {name: "vllm:inter_token_latency_seconds", labels: "= vars.lbl", label_names: "= vars.ln", value: {count: 1, sum: "= vars.itl"}}
+      - title: "Per finished request: request_success[finish_reason].inc() and the request histograms"
+        source: "vllm/v1/metrics/loggers.py:1289-1330"
+        foreach: "= has(vars.it.finished_requests) ? vars.it.finished_requests : []"
+        as: fr
+        steps:
+          - call: prometheus-registry.incr
+            input: {name: "vllm:request_success", labels: "= merge(vars.lbl, {'finished_reason': vars.fr.finish_reason})", label_names: [model_name, engine, finished_reason], value: 1}
+          - title: "histogram_e2e_time_request.observe(e2e_latency)"
+            source: "vllm/v1/metrics/loggers.py:1293-1295"
+            call: prometheus-registry.incr
+            input: {name: "vllm:e2e_request_latency_seconds", labels: "= vars.lbl", label_names: "= vars.ln", value: {count: 1, sum: "= vars.fr.e2e_latency"}}
+          - title: "histogram_num_prompt_tokens_request / _generation_tokens_request"
+            source: "vllm/v1/metrics/loggers.py:1318-1323"
+            call: prometheus-registry.incr
+            input: {name: "vllm:request_prompt_tokens", labels: "= vars.lbl", label_names: "= vars.ln", value: {count: 1, sum: "= vars.fr.num_prompt_tokens"}}
+          - call: prometheus-registry.incr
+            input: {name: "vllm:request_generation_tokens", labels: "= vars.lbl", label_names: "= vars.ln", value: {count: 1, sum: "= vars.fr.num_generation_tokens"}}
+      - return: {recorded: iteration}
+
+  - component: stat-logger-manager
+    name: init-prometheus
+    kind: function
+    latency_ms: 0
+    summary: "PrometheusStatLogger.__init__: unregister old vllm collectors, then create a labeled child per engine (model_name = served_model_name, engine = index) of each gauge, counter and histogram, request_success per FinishReason, admission_rejections per reason, and set the sleep-state gauge to awake (record_sleep_state())."
+    description: "Children are created at 0, so /metrics and get_metrics_snapshot show the series before any request. The model creates the families its record() writes."
+    sources: ["vllm/v1/metrics/loggers.py:482-528", "vllm/v1/metrics/loggers.py:594-617", "vllm/v1/metrics/loggers.py:806-821", "vllm/v1/metrics/loggers.py:846-861", "vllm/v1/metrics/utils.py:11-19", "vllm/v1/engine/__init__.py:36-69"]
+    request: {type: object, properties: {engine_indexes: {type: array, items: {type: integer}, default: [0]}}}
+    behavior:
+      - set:
+          vars.engines: "= has(input.engine_indexes) ? input.engine_indexes : [0]"
+          vars.model: "= config['served-model-name'] != null && size(config['served-model-name']) > 0 ? config['served-model-name'][0] : config['model']"
+      - title: "unregister_vllm_metrics(): drop every vllm:* collector first"
+        source: "vllm/v1/metrics/prometheus.py:56-69"
+        call: prometheus-registry.clear
+      - set:
+          vars.per_engine: "= vars.engines.map(e, [['vllm:num_requests_running', 0], ['vllm:num_requests_waiting', 0], ['vllm:kv_cache_usage_perc', 0.0], ['vllm:prefix_cache_queries', 0], ['vllm:prefix_cache_hits', 0], ['vllm:num_preemptions', 0], ['vllm:prompt_tokens', 0], ['vllm:generation_tokens', 0], ['vllm:time_to_first_token_seconds', {'count': 0, 'sum': 0.0}], ['vllm:inter_token_latency_seconds', {'count': 0, 'sum': 0.0}], ['vllm:e2e_request_latency_seconds', {'count': 0, 'sum': 0.0}], ['vllm:request_prompt_tokens', {'count': 0, 'sum': 0.0}], ['vllm:request_generation_tokens', {'count': 0, 'sum': 0.0}]].map(m, {'name': m[0], 'labels': {'model_name': vars.model, 'engine': string(e)}, 'label_names': ['model_name', 'engine'], 'value': m[1]})).flatten()"
+          vars.success: "= vars.engines.map(e, ['stop', 'length', 'abort', 'error', 'repetition'].map(r, {'name': 'vllm:request_success', 'labels': {'model_name': vars.model, 'engine': string(e), 'finished_reason': r}, 'label_names': ['model_name', 'engine', 'finished_reason'], 'value': 0})).flatten()"
+          vars.admission: "= ['max_num_queued_reqs', 'max_num_queued_tokens'].map(r, {'name': 'vllm:admission_rejections', 'labels': {'model_name': vars.model, 'reason': r}, 'label_names': ['model_name', 'reason'], 'value': 0})"
+      - title: "metric.labels(...) creates each child at zero"
+        source: "vllm/v1/metrics/utils.py:11-19"
+        foreach: "= vars.per_engine + vars.success + vars.admission"
+        as: s
+        max: 200
+        steps:
+          - call: prometheus-registry.set
+            input: "= vars.s"
+      - set: {state.prometheus_engines: "= vars.engines", state.prometheus_ready: true}
+      - title: "Setting default values: self.record_sleep_state() (awake = 1)"
+        source: "vllm/v1/metrics/loggers.py:616-617"
+        call: stat-logger-manager.record-sleep-state
+        input: {sleep: 0, level: 0}
+      - return: {series: "= size(vars.per_engine) + size(vars.success) + size(vars.admission)"}
+
+  - component: stat-logger-manager
+    name: ensure-prometheus
+    kind: function
+    latency_ms: 0
+    summary: "Simulation device for the server's startup: a world starts after AsyncLLM.__init__ built its StatLoggerManager, so the first metrics access (with stats on) finds the series PrometheusStatLogger.__init__ created."
+    description: "With --disable-log-stats AsyncLLM builds no StatLoggerManager (async_llm.py:195-205), so nothing is registered."
+    sources: ["vllm/v1/engine/async_llm.py:195-205", "vllm/v1/metrics/loggers.py:1408-1419"]
+    behavior:
+      - if: "config['disable-log-stats'] || (has(state.prometheus_ready) && state.prometheus_ready)"
+        then: [{return: {ready: "= has(state.prometheus_ready) && state.prometheus_ready"}}]
+      - if: "size(state.loggers) == 0"
+        then:
+          - set: {state.loggers: "= ['LoggingStatLogger', 'PrometheusStatLogger']"}
+      - call: stat-logger-manager.init-prometheus
+        input: {engine_indexes: "= lists.range(int(config['data-parallel-size']))"}
+      - return: {ready: true}
+
+  - component: stat-logger-manager
+    name: record-admission-rejection
+    kind: function
+    latency_ms: 0
+    summary: "StatLoggerManager.record_admission_rejection: each aggregate logger counts it; the Prometheus logger increments vllm:admission_rejections{model_name, reason}."
+    sources: ["vllm/v1/metrics/loggers.py:1442-1445", "vllm/v1/metrics/loggers.py:1332-1333"]
+    request: {type: object, properties: {reason: {type: string, enum: [max_num_queued_reqs, max_num_queued_tokens]}}}
+    behavior:
+      - call: stat-logger-manager.ensure-prometheus
+      - call: prometheus-registry.incr
+        input:
+          name: "vllm:admission_rejections"
+          labels: {model_name: "= config['served-model-name'] != null && size(config['served-model-name']) > 0 ? config['served-model-name'][0] : config['model']", reason: "= input.reason"}
+          label_names: [model_name, reason]
+          value: 1
+      - set: {state.admission_rejections: "= merge(state.admission_rejections, {input.reason: (input.reason in state.admission_rejections ? state.admission_rejections[input.reason] : 0) + 1})"}
+
+  - component: stat-logger-manager
+    name: record-sleep-state
+    kind: function
+    latency_ms: 0
+    summary: "PrometheusStatLogger.record_sleep_state: per engine set the vllm:engine_sleep_state gauges awake (0 asleep, 1 awake), weights_offloaded (level 1) and discard_all (level 2)."
+    description: "The three sleep_state children are one row {awake, weights_offloaded, discard_all} per engine."
+    sources: ["vllm/v1/metrics/loggers.py:1438-1440", "vllm/v1/metrics/loggers.py:1335-1353"]
+    request: {type: object, properties: {sleep: {type: integer, default: 0}, level: {type: integer, default: 0}}}
+    behavior:
+      - if: "!(has(state.prometheus_ready) && state.prometheus_ready)"
+        then:
+          - call: stat-logger-manager.ensure-prometheus
+      - set: {state.sleep_state: "= {'awake': input.sleep == 1 ? 0 : 1, 'weights_offloaded': input.sleep == 1 && input.level == 1 ? 1 : 0, 'discard_all': input.sleep == 1 && input.level == 2 ? 1 : 0}"}
+      - foreach: "= has(state.prometheus_engines) ? state.prometheus_engines : [0]"
+        as: e
+        steps:
+          - call: prometheus-registry.set
+            input:
+              name: "vllm:engine_sleep_state"
+              labels: {model_name: "= config['served-model-name'] != null && size(config['served-model-name']) > 0 ? config['served-model-name'][0] : config['model']", engine: "= string(vars.e)"}
+              label_names: [model_name, engine]
+              value: "= state.sleep_state"
+
+  - component: prometheus-registry
+    name: incr
+    kind: io
+    latency_ms: 0
+    summary: "Counter.inc / Histogram.observe on one labeled child: the series key is name{label=\"value\",...} in label declaration order; a histogram row is {count, sum}."
+    request: {type: object, properties: {name: {type: string}, labels: {type: object, default: {}}, label_names: {type: array, items: {type: string}, default: []}, value: {}}}
+    sources: ["vllm/v1/metrics/loggers.py:1138-1330"]
+    store: {table: metrics, op: incr, key: "= input.name + (has(input.label_names) && size(input.label_names) > 0 ? '{' + input.label_names.map(k, k + '=\"' + string(input.labels[k]) + '\"').join(',') + '}' : '')", value: "= input.value"}
+
+  - component: prometheus-registry
+    name: set
+    kind: io
+    latency_ms: 0
+    summary: "Gauge.set, or creating a child at its initial value, on one labeled series."
+    request: {type: object, properties: {name: {type: string}, labels: {type: object, default: {}}, label_names: {type: array, items: {type: string}, default: []}, value: {}}}
+    sources: ["vllm/v1/metrics/loggers.py:1335-1353", "vllm/v1/metrics/utils.py:11-19"]
+    store: {table: metrics, op: put, key: "= input.name + (has(input.label_names) && size(input.label_names) > 0 ? '{' + input.label_names.map(k, k + '=\"' + string(input.labels[k]) + '\"').join(',') + '}' : '')", value: "= input.value"}
+
+  - component: prometheus-registry
+    name: clear
+    kind: function
+    latency_ms: 0
+    summary: "unregister_vllm_metrics: drop every vllm:* collector from the registry."
+    sources: ["vllm/v1/metrics/prometheus.py:56-69"]
+    behavior:
+      - set: {state.metrics: "= state.metrics.transformMap(k, v, !k.startsWith('vllm:'), v)"}
+
+  - component: prometheus-registry
+    name: collect
+    kind: function
+    latency_ms: 0
+    summary: "REGISTRY.collect(): every series as {series, name, value}, sorted by series key."
+    description: "A world starts after the server's AsyncLLM built its stat loggers, so with stats on the first read sees the startup series (ensure-prometheus)."
+    sources: ["vllm/v1/metrics/reader.py:88"]
+    response: {type: array, items: {type: object, properties: {series: {type: string}, name: {type: string}, value: {}}}}
+    behavior:
+      - call: stat-logger-manager.ensure-prometheus
+      - set: {vars.keys: "= state.metrics.transformList(k, v, k).sort()"}
+      - return: "= vars.keys.map(k, {'series': k, 'name': k.indexOf('{') >= 0 ? k.substring(0, k.indexOf('{')) : k, 'value': state.metrics[k]})"
+
+  - component: reader
+    name: get-metrics-snapshot
+    kind: function
+    latency_ms: 0
+    summary: "get_metrics_snapshot: collect the registry, keep only vllm:* metrics, one Counter/Gauge/Histogram per labeled sample (a histogram as count and sum)."
+    sources: ["vllm/v1/metrics/reader.py:70-130", "vllm/v1/metrics/reader.py:25-42", "vllm/v1/metrics/reader.py:11-21"]
+    response: {type: array, items: {type: object, properties: {name: {type: string}, labels: {type: string}, value: {}}}}
+    behavior:
+      - call: prometheus-registry.collect
+        as: all
+      - title: "if not metric.name.startswith('vllm:'): continue"
+        source: "vllm/v1/metrics/reader.py:88-90"
+        return: "= vars.all.value.filter(m, m.name.startsWith('vllm:')).map(m, {'name': m.name, 'labels': m.series.indexOf('{') >= 0 ? m.series.substring(m.series.indexOf('{')) : '', 'value': m.value})"
+
+  # ------------------------------------------------------------------ data parallel (round 5): MoE waves and the coordinator
+  - component: engine-core
+    name: model-is-moe
+    kind: function
+    latency_ms: 0
+    summary: "ModelConfig.is_moe for the served checkpoint: get_num_experts() > 0, from num_local_experts, num_experts or n_routed_experts in its config.json."
+    sources: ["vllm/config/model.py:2276-2277", "vllm/config/model.py:1680-1690"]
+    response: {type: boolean}
+    behavior:
+      - call: hf-hub.download-config
+        input: {model: "= config['model']"}
+        as: hf
+        on_error: continue
+      - if: "!vars.hf.ok"
+        then: [{return: false}]
+      - set: {vars.c: "= vars.hf.value"}
+      - return: "= (has(vars.c.num_local_experts) ? vars.c.num_local_experts : (has(vars.c.num_experts) ? vars.c.num_experts : (has(vars.c.n_routed_experts) ? vars.c.n_routed_experts : 0))) > 0"
+
+  - component: engine-core
+    name: get-kv-cache-group-metadata
+    kind: function
+    latency_ms: 0
+    summary: "EngineCore.get_kv_cache_group_metadata (for external KV event consumers such as Dynamo; no call sites in vLLM): per KV cache group, its index, its spec kind and the single-type manager's effective block_size (DCP-scaled for attention specs), plus the sliding window."
+    sources: ["vllm/v1/engine/core.py:481-506"]
+    response: {type: array, items: {type: object, properties: {group_idx: {type: integer}, kind: {type: string}, block_size: {type: integer}, sliding_window: {type: ["integer", "null"]}}}}
+    behavior:
+      - title: "zip(kv_cache_config.kv_cache_groups, kv_cache_manager.coordinator.single_type_managers): block_size is manager.block_size, not the spec's"
+        source: "vllm/v1/engine/core.py:490-505"
+        call: kv-cache-manager.get-group-block-sizes
+        as: m
+      - return: "= lists.range(size(vars.m.value)).map(i, {'group_idx': i, 'kind': vars.m.value[i].kind, 'block_size': vars.m.value[i].block_size, 'sliding_window': vars.m.value[i].sliding_window})"
+
+  # ------------------------------------------------------------------ external launcher (merge): one engine per torchrun rank
+  - component: executor-with-external-launcher
+    name: init-executor
+    kind: function
+    summary: "ExecutorWithExternalLauncher._init_executor: (V1 multiprocessing is already off: ParallelConfig sets VLLM_ENABLE_V1_MULTIPROCESSING=0) UniProcExecutor._init_executor on each launcher rank's own worker, rank and local rank from the env (RANK, LOCAL_RANK)."
+    sources: ["vllm/v1/executor/uniproc_executor.py:178-198", "vllm/v1/executor/uniproc_executor.py:52-75"]
+    response: {type: object, properties: {workers: {type: integer}}}
+    behavior:
+      - set: {vars.ranks: "= lists.range(int(config['tensor-parallel-size']) * int(config['pipeline-parallel-size'])).map(i, 'rank' + string(i))"}
+      - title: "Each torchrun process builds its executor's single worker over env:// with its own RANK"
+        source: "vllm/v1/executor/uniproc_executor.py:185-198"
+        parallel: "= vars.ranks"
+        as: rank
+        join: {need: all}
+        steps:
+          - call: gpu-worker-impl.init-device
+            on: "= vars.rank"
+          - call: gpu-worker-impl.load-model
+            on: "= vars.rank"
+      - return: {workers: "= size(vars.ranks)"}
+
+  - component: executor-with-external-launcher
+    name: collective-rpc
+    kind: function
+    summary: "UniProcExecutor.collective_rpc in every launcher's engine: each runs the method on its own worker. determine_available_memory is overridden: each rank's budget is all-reduced with ReduceOp.MIN over the world CPU group and the engine gets [min]."
+    sources: ["vllm/v1/executor/uniproc_executor.py:90-117", "vllm/v1/executor/uniproc_executor.py:199-207"]
+    request: {type: object, properties: {method: {type: string}, args: {type: object}, timeout_s: {type: ["integer", "null"], default: null}, unique_reply_rank: {type: ["integer", "null"], default: null}}}
+    response: {type: object, properties: {results: {type: array}}}
+    behavior:
+      - set: {vars.ranks: "= lists.range(int(config['tensor-parallel-size']) * int(config['pipeline-parallel-size'])).map(i, 'rank' + string(i))"}
+      - parallel: "= vars.ranks"
+        as: rank
+        as_result: replies
+        join: {need: all}
+        steps:
+          - call: "= 'gpu-worker-impl.' + input.method.replace('_', '-')"
+            targets: [gpu-worker-impl.execute-model, gpu-worker-impl.sample-tokens, gpu-worker-impl.execute-dummy-batch, gpu-worker-impl.take-draft-token-ids, gpu-worker-impl.sleep, gpu-worker-impl.wake-up, gpu-worker-impl.discard, gpu-worker-impl.profile, gpu-worker-impl.add-lora, gpu-worker-impl.remove-lora, gpu-worker-impl.pin-lora, gpu-worker-impl.list-loras, gpu-worker-impl.reset-mm-cache, gpu-worker-impl.reset-encoder-cache, gpu-worker-impl.save-sharded-state, gpu-worker-impl.determine-available-memory, gpu-worker-impl.get-kv-cache-spec, gpu-worker-impl.initialize-from-config, gpu-worker-impl.compile-or-warm-up-model, gpu-worker-impl.get-supported-tasks, gpu-worker-impl.synchronize-device, gpu-worker-impl.compute-weight-checksums, gpu-worker-impl.init-device, gpu-worker-impl.load-model, gpu-worker-impl.shutdown, gpu-worker-impl.handle-ft-command, gpu-worker-impl.checkpoint-prepare, gpu-worker-impl.checkpoint-restore, gpu-worker-impl.init-weight-transfer-engine, gpu-worker-impl.shutdown-weight-transfer-engine, gpu-worker-impl.start-weight-update, gpu-worker-impl.start-draft-weight-update, gpu-worker-impl.update-weights, gpu-worker-impl.finish-weight-update, gpu-worker-impl.apply-model]
+            input: "= has(input.args) && input.args != null ? input.args : {}"
+            on: "= vars.rank"
+            as: out
+          - return: "= vars.out.value"
+      - title: "determine_available_memory: dist.all_reduce(memory_tensor, group=get_world_group().cpu_group, op=ReduceOp.MIN); each engine returns [min]"
+        source: "vllm/v1/executor/uniproc_executor.py:199-207"
+        if: "input.method == 'determine_available_memory'"
+        then:
+          - set: {vars.vals: "= vars.replies.results.map(r, int(r.value))"}
+          - return: {results: "= [{'rank': 'rank0', 'value': vars.vals.filter(v, vars.vals.all(w, v <= w))[0]}]"}
+      - title: "This launcher's engine sees only its own worker's reply"
+        source: "vllm/v1/executor/uniproc_executor.py:110-117"
+        return: {results: "= vars.replies.results.filter(r, r.item == 'rank0').map(r, {'rank': r.item, 'value': r.value})"}
+
+  - component: executor-with-external-launcher
+    name: execute-model
+    kind: function
+    summary: "UniProcExecutor.execute_model in every launcher's engine at once: each worker runs the same scheduler output (TP collectives meet across the launchers); this engine reads its own worker's output."
+    sources: ["vllm/v1/executor/uniproc_executor.py:119-132"]
+    request: {type: object, properties: {scheduler_output: {$ref: SchedulerOutput}}}
+    response: {anyOf: [{$ref: ModelRunnerOutput}, {type: "null"}]}
+    behavior:
+      - set: {vars.ranks: "= lists.range(int(config['tensor-parallel-size']) * int(config['pipeline-parallel-size'])).map(i, 'rank' + string(i))"}
+      - source: "vllm/v1/executor/uniproc_executor.py:119-132"
+        parallel: "= vars.ranks"
+        as: rank
+        as_result: outs
+        join: {need: all}
+        steps:
+          - call: gpu-worker-impl.execute-model
+            input: "= input.scheduler_output"
+            on: "= vars.rank"
+            as: o
+          - return: "= vars.o.value"
+      - return: "= vars.outs.results.filter(r, r.item == 'rank0')[0].value"
+
+  - component: executor-with-external-launcher
+    name: sample-tokens
+    kind: function
+    summary: "UniProcExecutor.sample_tokens in every launcher's engine at once; this engine reads its own worker's output."
+    sources: ["vllm/v1/executor/uniproc_executor.py:134-142"]
+    request: {type: object, properties: {grammar_output: {type: ["object", "null"], default: null}}}
+    response: {anyOf: [{$ref: ModelRunnerOutput}, {type: "null"}]}
+    behavior:
+      - set: {vars.ranks: "= lists.range(int(config['tensor-parallel-size']) * int(config['pipeline-parallel-size'])).map(i, 'rank' + string(i))"}
+      - source: "vllm/v1/executor/uniproc_executor.py:134-142"
+        parallel: "= vars.ranks"
+        as: rank
+        as_result: outs
+        join: {need: all}
+        steps:
+          - call: gpu-worker-impl.sample-tokens
+            input: "= input"
+            on: "= vars.rank"
+            as: o
+          - return: "= vars.o.value"
+      - return: "= vars.outs.results.filter(r, r.item == 'rank0')[0].value"
+
+  - component: engine-core-proc
+    name: handle-start-dp-wave
+    kind: function
+    latency_ms: 0
+    summary: "START_DP_WAVE from the coordinator (DPEngineCoreProc._handle_client_request): unless this rank is the excluded one, move to the new wave and start the idle loop."
+    sources: ["vllm/v1/engine/core.py:2281-2298"]
+    request: {type: object, properties: {type: {type: string}, wave: {type: integer}, exclude_engine_index: {type: ["integer", "null"]}}}
+    behavior:
+      - call: dp-engine-core-proc.apply-start-dp-wave
+        on: "= self"
+        input: {wave: "= input.wave", exclude_engine_index: "= has(input.exclude_engine_index) ? input.exclude_engine_index : null"}
+        as: r
+      - return: "= vars.r.value"
+
+  - component: dp-engine-core-proc
+    name: apply-start-dp-wave
+    kind: function
+    latency_ms: 0
+    summary: "DPEngineCoreProc START_DP_WAVE: ignored while a pause holds (ignore_start_dp_wave); a rank other than the excluded one adopts a wave >= its own and sets engines_running."
+    sources: ["vllm/v1/engine/core.py:2284-2296"]
+    request: {type: object, properties: {wave: {type: integer}, exclude_engine_index: {type: ["integer", "null"]}}}
+    behavior:
+      - set: {vars.idx: "= self.startsWith('dp') ? int(self.substring(2)) : 0"}
+      - if: "has(state.ignore_start_dp_wave) && state.ignore_start_dp_wave"
+        then: [{return: {started: false}}]
+      - if: "(input.exclude_engine_index == null || input.exclude_engine_index != vars.idx) && input.wave >= state.current_wave"
+        then:
+          - set: {state.current_wave: "= input.wave", state.engines_running: true}
+          - return: {started: true}
+      - return: {started: false}
+
+  - component: dp-coordinator
+    name: wave-coordination
+    kind: function
+    latency_ms: 0
+    summary: "DPCoordinator.enable_wave_coordination: the engine manager starts the coordinator with enable_wave_coordination = model_config.is_moe (dense DP ranks are independent)."
+    sources: ["vllm/v1/engine/utils.py:1230-1236", "vllm/v1/engine/coordinator.py:151-163"]
+    response: {type: boolean}
+    behavior:
+      - if: "has(state.enable_wave_coordination) && state.enable_wave_coordination != null"
+        then: [{return: "= state.enable_wave_coordination"}]
+      - title: "Fixed at coordinator start from model_config.is_moe"
+        source: "vllm/v1/engine/utils.py:1234"
+        call: engine-core.model-is-moe
+        as: moe
+      - return: "= vars.moe.value"
+
+  - component: dp-coordinator
+    name: handle-first-req
+    kind: function
+    latency_ms: 0
+    summary: "A front-end's FIRST_REQ (a request sent while the engines are paused): with wave coordination, broadcast START_DP_WAVE for the current wave to the engines, excluding the one that got the request (none if its wave is stale)."
+    sources: ["vllm/v1/engine/coordinator.py:355-374", "vllm/v1/engine/coordinator.py:467-477"]
+    request: {type: object, properties: {engine_to_exclude: {type: ["integer", "null"]}, wave: {type: integer}}}
+    behavior:
+      - call: dp-coordinator.wave-coordination
+        as: wc
+      - if: "!vars.wc.value || state.engines_running"
+        then:
+          - title: "Waves off (dense model), or the engines already run: nothing to wake"
+            source: "vllm/v1/engine/coordinator.py:357-363"
+            return: {sent: false}
+      - set: {vars.exclude: "= input.wave < state.current_wave ? null : input.engine_to_exclude"}
+      - title: "_send_start_wave(publish_back, current_wave, engine_to_exclude): engines_running is only set from the engines' own notices"
+        source: "vllm/v1/engine/coordinator.py:364-374"
+        foreach: "= lists.range(int(config['data-parallel-size']))"
+        as: i
+        steps:
+          - call: engine-core-proc.process-input-sockets
+            on: "= 'dp' + string(vars.i)"
+            input: {request_type: START_DP_WAVE, wave: "= state.current_wave", exclude_engine_index: "= vars.exclude"}
+      - return: {sent: true, wave: "= state.current_wave", exclude: "= vars.exclude"}
+
+  - component: dp-coordinator
+    name: handle-engine-output
+    kind: function
+    latency_ms: 0
+    summary: "An engine's EngineCoreOutputs to the coordinator (client -1): request counts update the load-balancing stats; with wave coordination, rank 0's wave_complete moves to the next wave and pauses, a start_wave for a newer (or the paused current) wave restarts the others; a wave change is published to the front-ends."
+    sources: ["vllm/v1/engine/coordinator.py:380-465"]
+    request: {type: object, properties: {eng_index: {type: integer}, scheduler_stats: {type: ["object", "null"], default: null}, wave_complete: {type: ["integer", "null"], default: null}, start_wave: {type: ["integer", "null"], default: null}}}
+    behavior:
+      - set:
+          vars.n: "= int(config['data-parallel-size'])"
+          vars.changed: false
+      - if: "has(input.scheduler_stats) && input.scheduler_stats != null"
+        then:
+          - title: "stats[0], stats[1], stats[2] = waiting, running, kv_cache_usage of that engine"
+            source: "vllm/v1/engine/coordinator.py:418-428"
+            set: {state.engine_counts: "= lists.range(vars.n).map(i, i == input.eng_index ? [input.scheduler_stats.num_waiting_reqs, input.scheduler_stats.num_running_reqs, has(input.scheduler_stats.kv_cache_usage) ? input.scheduler_stats.kv_cache_usage : 0.0] : (size(state.engine_counts) > i ? state.engine_counts[i] : [0, 0, 0.0]))"}
+      - call: dp-coordinator.wave-coordination
+        as: wc
+      - if: "vars.wc.value && has(input.wave_complete) && input.wave_complete != null"
+        then:
+          - if: "state.current_wave <= input.wave_complete"
+            then:
+              - title: "Rank 0 finished the wave: move to wave + 1, engines paused"
+                source: "vllm/v1/engine/coordinator.py:432-444"
+                set: {state.current_wave: "= input.wave_complete + 1", state.engines_running: false, vars.changed: true}
+      - if: "vars.wc.value && !(has(input.wave_complete) && input.wave_complete != null) && has(input.start_wave) && input.start_wave != null && (input.start_wave > state.current_wave || (input.start_wave == state.current_wave && !state.engines_running))"
+        then:
+          - title: "An engine started a wave: adopt it and wake the other engines"
+            source: "vllm/v1/engine/coordinator.py:446-461"
+            set: {state.current_wave: "= input.start_wave", state.engines_running: true, vars.changed: true}
+          - foreach: "= lists.range(vars.n)"
+            as: i
+            steps:
+              - call: engine-core-proc.process-input-sockets
+                on: "= 'dp' + string(vars.i)"
+                input: {request_type: START_DP_WAVE, wave: "= input.start_wave", exclude_engine_index: "= input.eng_index"}
+      - if: "vars.changed"
+        then:
+          - title: "publish_front.send((None, current_wave, engines_running))"
+            source: "vllm/v1/engine/coordinator.py:463-465"
+            call: dp-lb-async-mp-client.run-engine-stats-update-task
+            input: {stats: {counts: null, wave: "= state.current_wave", running: "= state.engines_running"}}
+      - return: {current_wave: "= state.current_wave", engines_running: "= state.engines_running"}
+
+  - component: dp-lb-async-mp-client
+    name: process-engine-outputs
+    kind: function
+    latency_ms: 0
+    summary: "DPLBAsyncMPClient.process_engine_outputs: each finished request id leaves reqs_in_flight and releases one in-flight slot on its engine."
+    sources: ["vllm/v1/engine/core_client.py:1703-1710"]
+    request: {type: object, properties: {outputs: {$ref: EngineCoreOutputs}}}
+    behavior:
+      - set: {vars.fin: "= has(input.outputs.finished_requests) && input.outputs.finished_requests != null ? input.outputs.finished_requests : []"}
+      - if: "size(vars.fin) == 0 || size(state.reqs_in_flight) == 0"
+        then: [{return: {released: 0}}]
+      - set: {vars.known: "= vars.fin.filter(r, r in state.reqs_in_flight)"}
+      - foreach: "= vars.known"
+        as: rid
+        steps:
+          - set:
+              state.engine_inflight: "= merge(state.engine_inflight, {state.reqs_in_flight[vars.rid]: state.engine_inflight[state.reqs_in_flight[vars.rid]] - 1})"
+              state.reqs_in_flight: "= omit(state.reqs_in_flight, vars.rid)"
+      - return: {released: "= size(vars.known)"}

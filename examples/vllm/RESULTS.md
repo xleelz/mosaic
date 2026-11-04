@@ -345,6 +345,76 @@ override; a 30 s drain exceeds the event budget; Python float repr (0.0 prints a
 **Next.** A round that follows the blind findings and adds the missing worlds (MoE, VLM, FP8
 checkpoint) so these behaviors can be driven at all.
 
+## Round 5 (precision and new worlds, `FIXES5.md`) and its blind measure
+
+**The build.** 618 components, 2,464 interfaces, 269 flows, 1,573 scenarios, all passing; full gate
+exit 0 (citations 9,925/9,925; hollow, seam-names, racy, unknown-inputs and exemptions at 0; explore
+17/17); internal-assertions gate 0.218 -> 0.217. Four new worlds: MoE (Mixtral 8x7B, TP 2 with EP),
+vision-language (Qwen2-VL 7B), FP8 checkpoint, FP8 checkpoint with an FP8 KV cache; each serves a
+chat request end to end. Each area fixed its round-4 wrong claims with regressions and swept its
+error paths (about 650 `fail`s checked, about 180 messages corrected word for word). Round-5 unit
+tests: 57/57 after the merge.
+
+Earlier measures, round 4 -> round 5: judge3 48 -> 92 / 113, oracle3 10 -> 21 / 29, judge 38 -> 33 / 43,
+judge2 53 -> 52 / 58, oracle 19 -> 18, build-oracle r3 37 -> 36, r4 50 -> 49. Each drop is answered in
+`reconcile/round5/measure-notes.md` as an expectation wrong about the code, with citations (for
+example `capture_model` runs twice per rank because CUDA-graph memory is profiled first,
+`gpu_worker.py:700-704`; the blind serving and execution judges found the same).
+
+**The blind measure** (`BENCHMARK4.md`, `judge4/`, `oracle4/`; fresh agents, new cases and tests).
+
+| Measure | Round 4 (BENCHMARK3, oracle3) | Round 5 (BENCHMARK4, oracle4) |
+|---|---|---|
+| Test oracle | 6 / 36 (6 of 28 translatable) | **7 / 36** (7 of 27); 20 model bugs, 9 untranslatable |
+| Benchmark, steps | 65 / 154 (42%) | **38 / 136 (28%)**: serving 9/37, scheduling-kv 13/31, execution 8/35, lifecycle 8/33 |
+| Benchmark, whole cases | 3 / 32 | 2 / 32 (Q4-1, Q4-5) |
+| Expectations corrected | 25 | 12 (serving 3, execution 4, scheduling 4 plus the preamble's world, lifecycle 0) |
+
+The serving oracle agent split one sampled file into 16 method rows; it is counted as one entry
+(a model bug), so the oracle stays at 36 tests.
+
+**Reading.** Precision raised every measure the areas fixed against (judge3 nearly doubled), and
+the new worlds let MoE, VL and FP8 behavior run at all. The blind measure did not follow: the
+oracle moved by one test and benchmark steps fell from 42% to 28%. As in the other repos' latest rounds,
+the blind misses are **absent mechanisms**, not wrong details: pooling and scoring endpoints,
+offline logprobs, bad-words masking, EPLB rearrangement, warmup and autotune, request histograms,
+the startup handshake, multi-API-server mode, the Marlin FP8 path, and whole model families
+(EmbeddingGemma2, Qwen3-VL). Precision fixes what a measure names; the remaining distance is
+coverage of what no measure has named yet.
+
+**Wrong claims to fix** (judge4, oracle4, by owner):
+- *serving-api:* the error mapper passes status-bearing errors through (404 image URL: wrong type,
+  no param); `/invocations` routes by field presence and drops quotes; an over-long text prompt
+  reports the full count, not "at least N"; scoring ignores `items`, `data_1`/`data_2`, list
+  `text_1`, `truncate_prompt_tokens`, `max_tokens_per_doc`, counts texts not tokens, 500 on a long
+  prompt; SageMaker pooling and rerank routing; pooling ignores the task and its refusals;
+  `llm.encode` checks the raw runner and never checks `pooling_params` length; the renderer's
+  post-expansion truncation; `/server_info?config_format=yaml` is a 400 and its key filter.
+- *engine-core:* arrival stamped after rendering (TTFT, e2e) and ITL on the API clock; 10 request
+  histograms; HELLO/READY and `VLLM_ENGINE_READY_TIMEOUT_S`; `run_multi_api_server`; the
+  processor cache's `shm` type; DELTA logprobs `[]` not null; prompt parsing (TypeError for an
+  encoder/decoder prompt); text bad words via `update_from_tokenizer`; the startup error's
+  "Failed core proc(s)".
+- *worker-runner:* top-k and prompt logprobs never returned (with scheduler-kv and engine-core);
+  the bad-words mask; mamba `prepare_attn` positions; collective RPC waits on every rank (300 s
+  timeout instead of the immediate RuntimeError).
+- *scheduler-kv:* `defer_block_free` under async scheduling with a kv_consumer; block stride
+  alignment and the BLHNC layout; KV events default to zmq; the batched-DP-MoE 256 default and
+  `all2all_backend`; the stop check's `min_tokens` and repetition detection.
+- *models-layers:* kernel warmup and FlashInfer autotune, deferred-MoE config; Qwen-VL Triton warmup
+  and Qwen3-VL; EmbeddingGemma2; `default_seq_pooling_type` and `attn_type`.
+- *config-platform:* `--runner auto` to pooling; pooling type from the registry default (BERT is
+  encoder_only, CLS, prefix caching and chunked prefill off); head size from `head_dim` 0.
+- *kernels-ops:* the FP8 Marlin path on pre-Hopper GPUs; the torch-compile decorator's
+  `do_not_compile` and per-module compiled flag.
+- *attention:* local-attention virtual batches and the ChunkedLocalAttention builder; the
+  FLASHINFER_MLA error prefix and its startup refusal.
+- *distributed:* EPLB rearrangement and its communicator; the MoRIIO config's timeout check.
+
+**Worlds and simulator.** No Qwen3-30B-A3B world, no two-GPU VL world, no knobs for Ray, seed,
+EPLB or expert placement, no `api-server-count`; a config can't be unset; integers beyond int64
+arrive as strings; 8k-token prompts need `max_cel_cost` raised.
+
 ## Files
 
 - **Contracts and build:** `profile.yaml`, `skeleton.yaml`, `fixtures.yaml`, `worlds.yaml`,

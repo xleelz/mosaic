@@ -1,0 +1,14 @@
+# Round-5 unit tests: distributed
+
+Source: `build-oracle/round5/distributed.json`. Scenarios: `build-oracle/round5/distributed.yaml`, run with the merged model (`--scenario '^r5-distributed'`).
+
+| # | Test | Scenario | Verdict | Notes |
+|---|---|---|---|---|
+| 1 | `tests/distributed/test_events.py:57` test_multiple_events | `r5-distributed-1-multiple-events` | pass | Ten `zmq-event-publisher.publish` calls, then ten `publisher-thread` iterations: sequence numbers 0..9 in order (kv_events.py:389-394, 472-507). The SUB socket's `receive_one` is test code; the PUB side's numbering is what it observes. Already modeled; no model change. |
+| 2 | `tests/v1/kv_connector/unit/test_nixl_push_connector.py:1174` test_request_finished_empty_blocks_does_not_arm_lease | `r5-distributed-2-push-empty-blocks-no-lease` | pass | New `nixl-push-connector-scheduler.request-finished` (push_scheduler.py:207-294), reached through `kv-connector-base-v1.request-finished` for `NixlPushConnector`. `get_exchange_clipped_blocks` is the identity, as the test stubs it. |
+| 3 | `tests/v1/kv_connector/unit/test_nixl_connector.py:3042` TestPeerReplacement.test_waits_for_queued_notification | `r5-distributed-3-waits-for-queued-notification` | pass | New on `nixl-pull-connector-worker`: `ensure-handshake` (with `_track_remote_engine_replacement`), `background-nixl-handshake` (`_ready_requests`), `read-blocks-for-req` (the notify-only path sends `"<remote_request_id>:1"` and reports a parked request done), and `cleanup-remote-engines` (a replaced peer is released once `_recving_metadata` no longer names it), called from `get-finished`. `start-load-kv` now drains `_ready_requests`. |
+| 4 | `tests/v1/kv_connector/unit/test_mooncake_store_worker.py:5022` test_topology_forwards_non_default_tenant_id[kv, ec] | `r5-distributed-4-topology-forwards-tenant` | pass | Both parametrizations in one scenario. New `mooncake-store-config` (`load-from-config`, `parse-size`, `setup-mooncake-store`; mooncake_store.py), `mooncake-distributed-store.setup`, `mooncake-store-worker.init-store` and `mooncake-embedding-store-client.create`. The JSON file is a `local-disk` row; MOONCAKE_CONFIG_PATH is the config `mooncake-config-path`. |
+| 5 | `tests/distributed/test_weight_transfer_m2n.py:344` test_trainer_rank_must_be_a_trainer_rank | `r5-distributed-5-trainer-rank-in-trainer-portion` | pass | New `m2n-trainer-init-info.post-init` (m2n_trainer.py:93-113, nccl_common.py:32-68): rendezvous mode, then trainer ranks, mesh, and the trainer rank. |
+| 6 | `tests/distributed/test_kv_cache_events.py:108` test_block_removed_default_group_idx_is_none | `r5-distributed-6-block-removed-default-group-idx` | pass | `DistKvCacheEvent.group_idx` defaults to null (kv_events.py:116-134); the event goes through `kv-event-aggregator`. Schema-level evidence, as for the BlockStored twin in oracle3. |
+
+Passing: 6 of 6.

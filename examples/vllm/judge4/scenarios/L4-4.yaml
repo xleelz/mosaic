@@ -1,0 +1,86 @@
+schema_version: 1
+id: vllm
+scenarios:
+  - id: bench-l4-4a-version
+    name: "L4-4 (a): GET /version gives 200 {version: 0.32.0}; info routes are excluded from the HTTP instrumentator"
+    fixtures: [full-tp1-llama-8b]
+    steps:
+      - {interface: instrumentator-basic.get-version, caller: api-client, as: v, input: {path: /version}}
+      - {interface: instrumentator-metrics.get-metrics, caller: api-client, as: m, input: {path: /metrics}}
+    expect:
+      - "steps.v.result.ok && steps.v.result.value == {'version': '0.32.0'}"
+      # the instrumentator (http_requests_total etc.) exists and excludes /version
+      - "string(steps.m.result.value).contains('http_requests_total') && !string(steps.m.result.value).contains('handler=\"/version\"')"
+  - id: bench-l4-4b-load-untracked
+    name: "L4-4 (b): /load without --enable-server-load-tracking reports 0 with 2 streams in flight"
+    fixtures: [full-tp1-llama-8b]
+    max_events: 400000
+    steps:
+      - {flow: serving-api-chat-stream, as: s1, await: false, at_ms: 0, input: {headers: {X-Request-Id: s1}, body: {max_tokens: 16}}}
+      - {flow: serving-api-chat-stream, as: s2, await: false, at_ms: 1, input: {headers: {X-Request-Id: s2}, body: {max_tokens: 16}}}
+      - {interface: instrumentator-basic.get-load, caller: api-client, as: load, at_ms: 150, input: {path: /load}}
+    expect:
+      - "steps.load.result.ok && steps.load.result.value == {'server_load': 0}"
+      - "steps.s1.result.ok && steps.s2.result.ok"
+  - id: bench-l4-4b-load-tracked
+    name: "L4-4 (b): with --enable-server-load-tracking, /load is 2 mid-flight; a disconnect decrements once; 0 at the end"
+    fixtures: [full-tp1-llama-8b]
+    config: {enable-server-load-tracking: true}
+    max_events: 400000
+    steps:
+      - {flow: serving-api-chat-stream, as: s1, await: false, at_ms: 0, input: {headers: {X-Request-Id: s1}, body: {max_tokens: 16}}}
+      - {flow: serving-api-chat-stream, as: s2, await: false, at_ms: 1, input: {headers: {X-Request-Id: s2}, body: {max_tokens: 16}}}
+      - {interface: instrumentator-basic.get-load, caller: api-client, as: load, at_ms: 150, input: {path: /load}}
+      - {at_ms: 200, cancel: disconnect-chatcmpl-s2}
+      - {interface: instrumentator-basic.get-load, caller: api-client, as: load2, at_ms: 260, input: {path: /load}}
+      - {interface: instrumentator-basic.get-load, caller: api-client, as: load3, at_ms: 2000, input: {path: /load}}
+    expect:
+      - "steps.load.result.value == {'server_load': 2}"
+      - "steps.load2.result.value == {'server_load': 1}"
+      - "steps.load3.result.value == {'server_load': 0}"
+      - "calls['server-load-metrics.increment'] == 2 && calls['server-load-metrics.decrement'] == 2"
+  - id: bench-l4-4c-server-info
+    name: "L4-4 (c): /server_info is 404 without VLLM_SERVER_DEV_MODE"
+    fixtures: [full-tp1-llama-8b]
+    steps:
+      - {interface: server-info-router.get-server-info, caller: api-client, as: off, input: {path: /server_info}}
+    expect:
+      - "!steps.off.result.ok && steps.off.result.error.status == 404"
+  - id: bench-l4-4c-server-info-dev
+    name: "L4-4 (c): with VLLM_SERVER_DEV_MODE=1: text config, json config, VLLM_* env without *KEY*, yaml -> 400"
+    fixtures: [full-tp1-llama-8b]
+    config: {vllm-server-dev-mode: true, api-key: secret}
+    steps:
+      - {interface: server-info-router.get-server-info, caller: api-client, as: text, input: {path: /server_info, query: {config_format: text}}}
+      - {interface: server-info-router.get-server-info, caller: api-client, as: json, input: {path: /server_info, query: {config_format: json}}}
+      - {interface: server-info-router.get-server-info, caller: api-client, as: yaml, input: {path: /server_info, query: {config_format: yaml}}}
+    expect:
+      - "steps.text.result.ok && type(steps.text.result.value.vllm_config) == string && has(steps.text.result.value.system_env)"
+      - "steps.json.result.ok && type(steps.json.result.value.vllm_config) == map"
+      - "!('VLLM_API_KEY' in steps.text.result.value.vllm_env)"
+      - "!steps.yaml.result.ok && steps.yaml.result.error.status == 400 && steps.yaml.result.error.code == 'Bad Request'"
+  - id: bench-l4-4d-health-stuck-engine
+    name: "L4-4 (d): /health and GET/POST /ping give 200 while the engine core is alive but stuck in a step"
+    fixtures: [full-tp1-llama-8b]
+    max_events: 400000
+    faults:
+      - {target: engine-core.step-fn, type: hang, forever: true}
+    steps:
+      - {flow: serving-api-chat-completion, as: c, await: false, at_ms: 0, input: {headers: {X-Request-Id: h1}, body: {max_tokens: 16}}}
+      - {interface: instrumentator-health.get-health, caller: api-client, as: h, at_ms: 300, input: {path: /health}}
+      - {interface: sagemaker-router.get-ping, caller: api-client, as: gp, at_ms: 301, input: {path: /ping}}
+      - {interface: sagemaker-router.post-ping, caller: api-client, as: pp, at_ms: 302, input: {path: /ping}}
+    expect:
+      - "steps.h.result.ok && steps.h.result.value.status_code == 200"
+      - "steps.gp.result.value == steps.h.result.value && steps.pp.result.value == steps.h.result.value"
+      - "!trace.exists(e, e.type == 'call.start' && e.interface.startsWith('engine-core') && e.t >= 300000 && e.t <= 302000 && e.caller == 'async-llm.check-health')"
+  - id: bench-l4-4d-health-dead-engine
+    name: "L4-4 (d): a detected engine death gives 503 on /health and /ping"
+    fixtures: [full-tp1-llama-8b]
+    state:
+      async-mp-client: {engine_dead: true}
+    steps:
+      - {interface: instrumentator-health.get-health, caller: api-client, as: h, input: {path: /health}}
+      - {interface: sagemaker-router.get-ping, caller: api-client, as: gp, input: {path: /ping}}
+    expect:
+      - "steps.h.result.value.status_code == 503 && steps.gp.result.value.status_code == 503"

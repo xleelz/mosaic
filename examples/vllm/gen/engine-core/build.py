@@ -107,7 +107,7 @@ def delegate(comp, name, src, method, args, req, summary, result):
         d["behavior"].append({"title": "call_utility_consensus_async: every engine must return the same answer",
                               "source": "vllm/v1/engine/core_client.py:1271-1277",
                               "if": "vars.r.value.exists(x, x != vars.r.value[0])",
-                              "then": [{"fail": {"code": "runtime-error", "message": f"= 'Engines returned different {method} results'"}}]})
+                              "then": [{"fail": {"code": "runtime-error", "message": f"= 'Engines returned different {method} results: [' + vars.r.value.map(x, type(x) == bool ? (x ? 'True' : 'False') : (type(x) == string ? \"'\" + x + \"'\" : string(x))).join(', ') + ']'"}}]})
     d["behavior"].append({"return": result or "= vars.r.value"})
     return d
 

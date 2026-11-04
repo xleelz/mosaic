@@ -50,7 +50,7 @@ interfaces:
       - set:
           vars.needs: "= vars.base || vars.penalties || vars.logit_bias || vars.thinking || vars.bw.value.uses_bad_words || vars.custom_needs"
       - set:
-          state.slots: "= merge(state.slots, {string(input.slot): {'temperature': vars.t, 'top_p': vars.top_p, 'top_k': vars.top_k, 'min_p': vars.min_p, 'min_tokens': has(vars.sp.min_tokens) && vars.sp.min_tokens != null ? int(vars.sp.min_tokens) : 0, 'seeded': has(vars.sp.seed) && vars.sp.seed != null, 'seed': has(vars.sp.seed) && vars.sp.seed != null ? int(vars.sp.seed) : 0, 'logprobs': has(vars.sp.logprobs) ? vars.sp.logprobs : -1, 'penalties': vars.penalties, 'logit_bias': vars.logit_bias, 'thinking': vars.thinking, 'needs_processing': vars.needs}})"
+          state.slots: "= merge(state.slots, {string(input.slot): {'temperature': vars.t, 'top_p': vars.top_p, 'top_k': vars.top_k, 'min_p': vars.min_p, 'min_tokens': has(vars.sp.min_tokens) && vars.sp.min_tokens != null ? int(vars.sp.min_tokens) : 0, 'seeded': has(vars.sp.seed) && vars.sp.seed != null, 'seed': has(vars.sp.seed) && vars.sp.seed != null ? int(vars.sp.seed) : 0, 'logprobs': has(vars.sp.logprobs) && vars.sp.logprobs != null ? int(vars.sp.logprobs) : -1, 'penalties': vars.penalties, 'logit_bias': vars.logit_bias, 'thinking': vars.thinking, 'needs_processing': vars.needs}})"
       - return: {needs_processing: "= vars.needs"}
   - component: sampler
     name: sample
@@ -78,34 +78,48 @@ interfaces:
         input: {rows: "= input.rows", skip_top_k_top_p: true}
         as: asp
       - set: {vars.masked: "= vars.asp.value.masked"}
-      - if: "vars.p.exists(s, s.top_k < state.vocab_size || s.top_p < 1.0)"
+      - title: "The fused (FlashInfer) sampler is used only when some row uses top-k/top-p, no row is greedy or has an explicit seed, and no returned logprobs need post-processed logits; FlashInfer itself is off with return_sampling_mask or VLLM_USE_FLASHINFER_SAMPLER=0"
+        source: "vllm/v1/worker/gpu/sample/sampler.py:304-316"
+        set:
+          vars.fused: "= !config['return-sampling-mask'] && config['vllm-use-flashinfer-sampler'] && vars.p.exists(s, s.top_k < state.vocab_size || s.top_p < 1.0) && !(vars.p.exists(s, s.logprobs != null && s.logprobs >= 0) && config['logprobs-mode'] in ['processed_logprobs', 'processed_logits']) && !vars.p.exists(s, s.temperature == 0.0) && !vars.p.exists(s, s.seeded)"
+      - if: "vars.fused && !config['watermark-enabled']"
         then:
-          - title: Top-k / top-p truncation (Triton)
-            source: "vllm/v1/worker/gpu/sample/sampler.py:345"
-            call: topk-topp-triton.apply-top-k-top-p
+          - title: FlashInfer top-k/top-p sampling from the processed logits (statistically, not bitwise, equal to the Gumbel path)
+            source: "vllm/v1/worker/gpu/sample/sampler.py:337-341"
+            call: topk-topp-sampler.flashinfer-sample
             input:
-              batch_size: "= size(input.rows)"
+              num_rows: "= size(input.rows)"
               topk_enabled: "= vars.p.exists(s, s.top_k < state.vocab_size)"
               topp_enabled: "= vars.p.exists(s, s.top_p < 1.0)"
-      - if: "config['watermark-enabled']"
-        then:
-          - call: gpu-watermark-sampler.sample
-            input: {num_rows: "= size(input.rows)"}
         else:
-          - title: Gumbel-max sampling (argmax at temperature 0, per-request seeds)
-            source: "vllm/v1/worker/gpu/sample/sampler.py:346-355"
-            call: gumbel.gumbel-sample-kernel
-            input: {num_rows: "= size(input.rows)"}
+          - if: "vars.p.exists(s, s.top_k < state.vocab_size || s.top_p < 1.0)"
+            then:
+              - title: Top-k / top-p truncation (Triton)
+                source: "vllm/v1/worker/gpu/sample/sampler.py:345"
+                call: topk-topp-triton.apply-top-k-top-p
+                input:
+                  batch_size: "= size(input.rows)"
+                  topk_enabled: "= vars.p.exists(s, s.top_k < state.vocab_size)"
+                  topp_enabled: "= vars.p.exists(s, s.top_p < 1.0)"
+          - if: "config['watermark-enabled']"
+            then:
+              - call: gpu-watermark-sampler.sample
+                input: {num_rows: "= size(input.rows)"}
+            else:
+              - title: Gumbel-max sampling (argmax at temperature 0, per-request seeds)
+                source: "vllm/v1/worker/gpu/sample/sampler.py:346-355"
+                call: gumbel.gumbel-sample-kernel
+                input: {num_rows: "= size(input.rows)"}
       - if: "config['enable-trace-replay']"
         then:
           - call: trace-replay-state.apply-trace
             input: {num_rows: "= size(input.rows)"}
-      - if: "vars.p.exists(s, s.logprobs >= 0)"
+      - if: "vars.p.exists(s, s.logprobs != null && s.logprobs >= 0)"
         then:
-          - title: Top-k logprobs and the sampled token's rank
+          - title: "Top-k logprobs and the sampled token's rank, from the raw logits unless logprobs_mode is processed_*"
             source: "vllm/v1/worker/gpu/sample/sampler.py:171-186"
             call: logprob.compute-topk-scores
-            input: {num_rows: "= size(input.rows)", num_logprobs: "= vars.p.map(s, s.logprobs).sortBy(x, -x)[0]"}
+            input: {num_rows: "= size(input.rows)", num_logprobs: "= vars.p.map(s, s.logprobs != null ? s.logprobs : -1).sortBy(x, -x)[0]", logprobs_mode: "= config['logprobs-mode']"}
       - title: One token per request; unfinished prefill chunks sample none
         source: "vllm/v1/worker/gpu/sample/sampler.py:190-199"
         call: input-batch.get-num-sampled-and-rejected-kernel
@@ -194,10 +208,10 @@ interfaces:
         set:
           vars.eos: "= lists.range(size(input.rows)).map(i, vars.pos[i].map(s, s >= 0 && has(input.rows[i].prompt_len) && s - input.rows[i].prompt_len >= int(config['worker-runner-natural-output-tokens-base']) + (has(input.rows[i].prompt_hash) ? input.rows[i].prompt_hash : 0) % int(config['worker-runner-natural-output-tokens-spread']) - 1 && s - input.rows[i].prompt_len >= (has(vars.p[i].min_tokens) ? vars.p[i].min_tokens : 0)))"
       - title: Token values stand in for logits
-        detail: "A greedy row (temperature 0: plain argmax in the Gumbel kernel) or a seeded row gets a deterministic token from the request's prompt and the position, so identical requests produce identical outputs and a greedy target's verdict on a draft is reproducible; an unseeded random row gets a seeded-per-run random token."
+        detail: "A greedy row (temperature 0: plain argmax in the Gumbel kernel) or a seeded row gets a deterministic token from the request's prompt and the position (plus the seed for a seeded random row only: at temperature 0 the kernel skips the noise, so the seed has no effect, gumbel.py:182-198), so identical requests produce identical outputs and a greedy target's verdict on a draft is reproducible; an unseeded random row gets a seeded-per-run random token."
         source: "vllm/v1/worker/gpu/sample/gumbel.py:21-44"
         return:
-          tokens: "= lists.range(size(input.rows)).map(i, lists.range(size(vars.pos[i])).map(j, (has(input.rows[i].is_final) && !input.rows[i].is_final) ? -1 : (!has(input.rows[i].grammar) ? (vars.eos[i][j] ? (has(input.rows[i].eos_token_id) ? input.rows[i].eos_token_id : 128009) : ((vars.p[i].temperature == 0.0 || vars.p[i].seeded) ? ((has(input.rows[i].prompt_hash) ? input.rows[i].prompt_hash : 0) * 31 + (vars.pos[i][j] >= 0 ? vars.pos[i][j] : 0) * 7919 + (has(vars.p[i].seed) ? vars.p[i].seed % 1000003 : 0)) % 127900 + 100 : random(127900) + 100)) : ((vars.eos[i][j] && input.rows[i].grammar.stop) ? (has(input.rows[i].eos_token_id) ? input.rows[i].eos_token_id : 128009) : (input.rows[i].grammar.content ? ((vars.p[i].temperature == 0.0 || vars.p[i].seeded) ? ((has(input.rows[i].prompt_hash) ? input.rows[i].prompt_hash : 0) * 31 + (vars.pos[i][j] >= 0 ? vars.pos[i][j] : 0) * 7919 + (has(vars.p[i].seed) ? vars.p[i].seed % 1000003 : 0)) % 127900 + 100 : random(127900) + 100) : (input.rows[i].grammar.quote ? 1 : (input.rows[i].grammar.stop ? (has(input.rows[i].eos_token_id) ? input.rows[i].eos_token_id : 128009) : ((vars.p[i].temperature == 0.0 || vars.p[i].seeded) ? ((has(input.rows[i].prompt_hash) ? input.rows[i].prompt_hash : 0) * 31 + (vars.pos[i][j] >= 0 ? vars.pos[i][j] : 0) * 7919 + (has(vars.p[i].seed) ? vars.p[i].seed % 1000003 : 0)) % 127900 + 100 : random(127900) + 100))))))))"
+          tokens: "= lists.range(size(input.rows)).map(i, lists.range(size(vars.pos[i])).map(j, (has(input.rows[i].is_final) && !input.rows[i].is_final) ? -1 : (!has(input.rows[i].grammar) ? (vars.eos[i][j] ? (has(input.rows[i].eos_token_id) ? input.rows[i].eos_token_id : 128009) : ((vars.p[i].temperature == 0.0 || vars.p[i].seeded) ? ((has(input.rows[i].prompt_hash) ? input.rows[i].prompt_hash : 0) * 31 + (vars.pos[i][j] >= 0 ? vars.pos[i][j] : 0) * 7919 + (vars.p[i].temperature != 0.0 && has(vars.p[i].seed) ? vars.p[i].seed % 1000003 : 0)) % 127900 + 100 : random(127900) + 100)) : ((vars.eos[i][j] && input.rows[i].grammar.stop) ? (has(input.rows[i].eos_token_id) ? input.rows[i].eos_token_id : 128009) : (input.rows[i].grammar.content ? ((vars.p[i].temperature == 0.0 || vars.p[i].seeded) ? ((has(input.rows[i].prompt_hash) ? input.rows[i].prompt_hash : 0) * 31 + (vars.pos[i][j] >= 0 ? vars.pos[i][j] : 0) * 7919 + (vars.p[i].temperature != 0.0 && has(vars.p[i].seed) ? vars.p[i].seed % 1000003 : 0)) % 127900 + 100 : random(127900) + 100) : (input.rows[i].grammar.quote ? 1 : (input.rows[i].grammar.stop ? (has(input.rows[i].eos_token_id) ? input.rows[i].eos_token_id : 128009) : ((vars.p[i].temperature == 0.0 || vars.p[i].seeded) ? ((has(input.rows[i].prompt_hash) ? input.rows[i].prompt_hash : 0) * 31 + (vars.pos[i][j] >= 0 ? vars.pos[i][j] : 0) * 7919 + (vars.p[i].temperature != 0.0 && has(vars.p[i].seed) ? vars.p[i].seed % 1000003 : 0)) % 127900 + 100 : random(127900) + 100))))))))"
           greedy: "= vars.p.map(s, s.temperature == 0.0)"
           masked: "= vars.masked"
   - component: sampler
@@ -333,25 +347,36 @@ interfaces:
     summary: "compute_topk_scores: log-softmax of the top-k (and requested) token ids plus the sampled token's rank."
     sources: ["vllm/v1/worker/gpu/sample/logprob.py:111-190"]
     latency_ms: 0
-    request: {type: object, properties: {num_rows: {type: integer}, num_logprobs: {type: integer}, extra_token_ids: {type: integer, default: 0}}}
-    response: {type: object, properties: {num_logprobs: {type: integer}}}
+    request: {type: object, properties: {num_rows: {type: integer}, num_logprobs: {type: integer}, extra_token_ids: {type: integer, default: 0}, logprobs_mode: {type: string, default: raw_logprobs, enum: [raw_logprobs, raw_logits, processed_logprobs, processed_logits], description: "model_config.logprobs_mode: the sampler passes processed logits for processed_*, and logits_mode for *_logits"}}}
+    response: {type: object, properties: {num_logprobs: {type: integer}, scores: {type: string, description: "logprobs, or logits under a *_logits mode"}, from_processed: {type: boolean}}}
     behavior:
-      - call: logprob.topk-log-softmax-kernel
-        input: {num_rows: "= input.num_rows"}
+      - set:
+          vars.mode: "= has(input.logprobs_mode) && input.logprobs_mode != null ? input.logprobs_mode : 'raw_logprobs'"
+      - if: "vars.mode in ['raw_logits', 'processed_logits']"
+        then:
+          - title: "logits_mode: the scores are the gathered logits themselves, no log-softmax"
+            source: "vllm/v1/worker/gpu/sample/logprob.py:130-131"
+            set: {vars.scores: logits}
+        else:
+          - title: Log-softmax of the selected token ids
+            source: "vllm/v1/worker/gpu/sample/logprob.py:132-133"
+            call: logprob.topk-log-softmax-kernel
+            input: {num_rows: "= input.num_rows"}
+          - set: {vars.scores: logprobs}
       - call: logprob.ranks-kernel
         input: {num_rows: "= input.num_rows"}
       - if: "has(input.extra_token_ids) && input.extra_token_ids > 0"
         then:
           - call: logprob.fill-logprob-token-ids-kernel
             input: {num_rows: "= input.num_rows"}
-      - return: {num_logprobs: "= input.num_logprobs"}
+      - return: {num_logprobs: "= input.num_logprobs", scores: "= vars.scores", from_processed: "= vars.mode.startsWith('processed')"}
   - component: prompt-logprobs-worker
     name: compute-prompt-logprobs
     kind: function
     summary: "compute_prompt_logprobs: only for new requests whose sampling params ask for prompt_logprobs (computed over their prefill chunk)."
     sources: ["vllm/v1/worker/gpu/sample/prompt_logprob.py:120-230"]
     latency_ms: 0
-    request: {type: object, properties: {new_reqs: {type: object}}}
+    request: {type: object, properties: {new_reqs: {type: object}, model_component: {type: string, default: llama-for-causal-lm, description: "the loaded model's component"}}}
     response: {type: object, properties: {req_ids: {type: array}}}
     behavior:
       - set:
@@ -360,7 +385,10 @@ interfaces:
         then: [{return: {req_ids: []}}]
       - call: prompt-logprobs-worker.prompt-logprobs-token-ids-kernel
         input: {num_rows: "= size(vars.ids)"}
-      - call: llama-for-causal-lm.compute-logits
+      - title: The loaded model's compute_logits over the prompt positions
+        source: "vllm/v1/worker/gpu/sample/prompt_logprob.py:150-175"
+        call: "= (has(input.model_component) ? input.model_component : 'llama-for-causal-lm') + '.compute-logits'"
+        targets: [llama-for-causal-lm.compute-logits, mixtral-for-causal-lm.compute-logits, qwen2-vl-for-conditional-generation.compute-logits]
         input: {num_tokens: "= size(vars.ids)"}
       - return: {req_ids: "= vars.ids"}
   - component: structured-outputs-worker

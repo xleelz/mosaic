@@ -436,21 +436,41 @@ interfaces:
     summary: "One iteration of DPEngineCoreProc.run_busy_loop on one DP rank: process the input queue, step; when nothing ran but a wave is in progress, run a dummy batch; then all-reduce the unfinished flag, and when no rank has work, end the wave (rank 0 tells the coordinator, or each rank its front-end) and start the next."
     sources: ["vllm/v1/engine/core.py:2327-2409"]
     attributes: {single_writer: "each DP rank's engines_running, current_wave and step_counter are read and written only by that rank's busy-loop thread (vllm/v1/engine/core.py:2331-2393); other threads only put requests on the mutex-guarded input_queue, which the busy loop drains before each step (vllm/v1/engine/core.py:1574-1600)"}
-    request: {type: object, properties: {dp_rank: {type: integer, default: 0}, has_coordinator: {type: boolean, default: true}}}
+    request: {type: object, properties: {dp_rank: {type: integer, default: 0}, has_coordinator: {type: boolean, default: true}, iterations: {type: integer, default: 1, minimum: 1}}}
     response: {type: object}
     behavior:
       - set:
           vars.was_running: "= state.engines_running"
           vars.rank: "= has(input.dp_rank) ? input.dp_rank : 0"
           vars.coord: "= !has(input.has_coordinator) || input.has_coordinator"
-      - title: "1) Poll the input queue until there is work to do"
+          vars.more: "= has(input.iterations) && input.iterations > 1"
+      - if: "vars.more"
+        then:
+          - title: "while self._handle_shutdown(): the next pass of this rank's loop"
+            source: "vllm/v1/engine/core.py:2331"
+            emit: dp-engine-core-proc.run-busy-loop
+            after_ms: 1
+            input: {dp_rank: "= vars.rank", has_coordinator: "= vars.coord", iterations: "= input.iterations - 1"}
+      - title: "1) Poll this rank's input queue until there is work to do (DPEngineCoreProc is this rank's EngineCoreProc)"
         source: "vllm/v1/engine/core.py:2333-2334"
         call: engine-core-proc.process-input-queue
+        on: "= self"
         input: {pump: true}
-      - title: "2) Step the engine"
+        on_error:
+          - title: "A run whose topology names no engine-core-proc instances has one EngineCoreProc: use it"
+            when: "error.code == 'unknown_instance'"
+            call: engine-core-proc.process-input-queue
+            input: {pump: true}
+      - title: "2) Step this rank's engine"
         source: "vllm/v1/engine/core.py:2349"
         call: engine-core-proc.process-engine-step
+        on: "= self"
         as: st
+        on_error:
+          - title: "A run whose topology names no engine-core-proc instances has one EngineCoreProc: use it"
+            when: "error.code == 'unknown_instance'"
+            call: engine-core-proc.process-engine-step
+            as: st
       - call: scheduler.has-requests
         as: local
       - set: {vars.executed: "= vars.st.value.model_executed", vars.local_unfinished: "= vars.local.value"}
@@ -477,6 +497,10 @@ interfaces:
               - title: "Wave finished: notify (client -1 = the coordinator, else the colocated front-end) that the loop pauses"
                 source: "vllm/v1/engine/core.py:2374-2390"
                 set: {state.wave_complete: "= state.wave_complete + [state.current_wave]"}
+              - if: "vars.coord"
+                then:
+                  - call: dp-coordinator.handle-engine-output
+                    input: {eng_index: "= vars.rank", wave_complete: "= state.current_wave"}
           - title: "Increment the wave count and reset the step counter"
             source: "vllm/v1/engine/core.py:2391-2393"
             set: {state.current_wave: "= state.current_wave + 1", state.step_counter: 0}
@@ -485,7 +509,9 @@ interfaces:
         then:
           - title: "A wave started here: rank 0 tells the coordinator (start_wave)"
             source: "vllm/v1/engine/core.py:2394-2407"
-            return: {idle: false, engines_running: true, current_wave: "= state.current_wave", start_wave: "= state.current_wave", dummy: "= !vars.executed"}
+            call: dp-coordinator.handle-engine-output
+            input: {eng_index: "= vars.rank", start_wave: "= state.current_wave"}
+          - return: {idle: false, engines_running: true, current_wave: "= state.current_wave", start_wave: "= state.current_wave", dummy: "= !vars.executed"}
       - return: {idle: false, engines_running: true, current_wave: "= state.current_wave", dummy: "= !vars.executed"}
 
   - component: dp-engine-core-proc
@@ -521,6 +547,7 @@ interfaces:
       type: object
       properties:
         first_req: {type: ["integer", "null"], default: null, description: "FIRST_REQ target engine index"}
+        wave: {type: integer, default: 0, description: "with first_req: the client's current_wave the request was stamped with"}
         scale_elastic_ep: {type: ["integer", "null"], default: null, description: "SCALE_ELASTIC_EP new engine count"}
         stats: {type: ["object", "null"], default: null, properties: {counts: {type: ["array", "null"]}, wave: {type: integer}, running: {type: boolean}}}
     response: {type: object}
@@ -539,9 +566,11 @@ interfaces:
       - if: "has(input.first_req) && input.first_req != null"
         then:
           - title: "FIRST_REQ: a request went to a paused engine; engines_running and ask the coordinator to start the wave everywhere"
-            source: "vllm/v1/engine/core_client.py:1538-1547"
+            source: "vllm/v1/engine/core_client.py:1540-1549"
             set: {state.engines_running: true}
-          - return: {sent: ["= input.first_req", "= has(state.current_wave) ? state.current_wave : 0"]}
+          - call: dp-coordinator.handle-first-req
+            input: {engine_to_exclude: "= input.first_req", wave: "= has(input.wave) ? input.wave : 0"}
+          - return: {sent: ["= input.first_req", "= has(input.wave) ? input.wave : 0"]}
       - if: "!has(input.stats) || input.stats == null"
         then:
           - title: "No stats event to drain"

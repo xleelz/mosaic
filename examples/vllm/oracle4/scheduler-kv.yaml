@@ -1,0 +1,127 @@
+schema_version: 1
+id: vllm
+scenarios:
+- id: oracle-scheduler-kv-gate-enabled-for-async-consumer
+  name: Async scheduling plus a KV-consumer connector defers freeing a finished request's blocks
+  description: >-
+    tests/v1/core/test_deferred_block_free.py::test_gate_enabled_for_async_consumer (line 102).
+    Scheduler.__init__ (vllm/v1/core/sched/scheduler.py:185-192) sets defer_block_free when
+    max_concurrent_batches > 1 (async scheduling on the V1 runner without PP gives 2,
+    vllm/config/vllm.py:577-587) and kv_transfer_config.is_kv_consumer. The gate itself is a
+    private flag, so the scenario asserts what it does (scheduler.py:1551, 1631, 2046,
+    2762-2790): a request that stops on step 1's output while step 2 is still in flight keeps
+    its blocks out of the pool; they return only once the newest scheduled step's output has
+    been processed. Uses the real NixlConnector in the kv_consumer role instead of the test's
+    mock_kv connector (matched_tokens=0, synchronous).
+  fixtures: [full-tp1-llama-8b]
+  config:
+    async-scheduling: true
+    pipeline-parallel-size: 1
+    kv-connector: NixlConnector
+    kv-role: kv_consumer
+  steps:
+  - flow: scheduler-add-request
+    input:
+      request_id: r1
+      prompt_token_ids: [1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 17, 18, 19, 20, 21, 22, 23, 24, 25, 26, 27, 28, 29, 30, 31, 32, 33]
+      sampling_params: {max_tokens: 5, stop_token_ids: [42], ignore_eos: false}
+    as: add
+  - flow: scheduler-schedule
+    input: {}
+    as: s0
+  - flow: scheduler-schedule
+    input: {}
+    as: s1
+  - interface: block-pool.get-num-free-blocks
+    caller: kv-cache-manager
+    input: {}
+    as: free_inflight
+  - interface: scheduler.update-from-output
+    caller: engine-core
+    input:
+      scheduler_output: "= steps.s0.result.value"
+      model_runner_output:
+        req_ids: [r1]
+        sampled_token_ids: [[42]]
+    as: u0
+  - interface: block-pool.get-num-free-blocks
+    caller: kv-cache-manager
+    input: {}
+    as: free_after_u0
+  - interface: scheduler.update-from-output
+    caller: engine-core
+    input:
+      scheduler_output: "= steps.s1.result.value"
+      model_runner_output:
+        req_ids: [r1]
+        sampled_token_ids: [[7]]
+    as: u1
+  - interface: block-pool.get-num-free-blocks
+    caller: kv-cache-manager
+    input: {}
+    as: free_after_u1
+  expect:
+  - "steps.s0.result.value.num_scheduled_tokens['r1'] == 33 && steps.s1.result.value.num_scheduled_tokens['r1'] == 1"
+  - "steps.u0.result.ok && steps.u0.result.value.outputs.exists(o, o.request_id == 'r1' && o.finish_reason == 'stop')"
+  - "steps.free_inflight.result.value.num_free_blocks < steps.free_inflight.result.value.num_gpu_blocks"
+  - "steps.free_after_u0.result.value.num_free_blocks == steps.free_inflight.result.value.num_free_blocks"
+  - "steps.free_after_u1.result.value.num_free_blocks > steps.free_after_u0.result.value.num_free_blocks"
+  - "!('r1' in state.scheduler.requests) || state.scheduler.requests['r1'].status.startsWith('FINISHED')"
+
+- id: oracle-scheduler-kv-plamo3-structural-tag-compiles
+  name: A PLaMo3 structural tag compiles on the xgrammar backend (token acceptance is below the model)
+  description: >-
+    tests/v1/structured_output/test_backend_xgrammar_plamo3.py::test_plamo3_python_tokenizer_compiles_and_accepts_structural_tag
+    (line 58). XgrammarBackend.__post_init__ (vllm/v1/structured_output/backend_xgrammar.py)
+    builds the TokenizerInfo from the PLaMo3 tokenizer's own init_xgrammar() when
+    hf_config.model_type == 'plamo3'; compile_grammar(STRUCTURAL_TAG, ...) compiles the tag
+    from get_model_structural_tag('plamo3', tools, 'required'), and the matcher accepts the
+    tool-call token sequence. The model keeps only the control flow: the compile of a
+    structural tag succeeds and creates a matcher whose stop token is the tokenizer's EOS
+    (id 0 for the stand-in tokenizer, seeded on the backend). Whether the compiled grammar
+    accepts these exact tokens is xgrammar's FSM over a BYTE_FALLBACK vocabulary, which is
+    below the model's level (its matcher is a two-state stand-in).
+  fixtures: [full-tp1-llama-8b]
+  state:
+    xgrammar-backend: {tokenizer_eos_token_id: 0}
+  steps:
+  - interface: xgrammar-backend.compile-grammar
+    caller: structured-output-manager
+    input:
+      grammar_id: plamo3-tools
+      request_type: structural_tag
+      grammar_spec: '{"type":"structural_tag","format":{"type":"triggered_tags","triggers":["<|plamo:begin_tool_requests|>"]}}'
+      stop_token_ids: []
+    as: compiled
+  expect:
+  - "steps.compiled.result.ok && steps.compiled.result.value.override_stop_tokens == [0]"
+  - "state['xgrammar-grammar'].grammars['plamo3-tools'].fsm == 'start' && !state['xgrammar-grammar'].grammars['plamo3-tools'].terminated"
+
+- id: oracle-scheduler-kv-packed-alignment-hot-pages-stride
+  name: The packed block stride is rounded up to the lcm of the hot page size and every layer's stride alignment
+  description: >-
+    tests/v1/core/test_contiguous_kv_packing.py::test_packed_alignment_preserves_hot_pages_and_generic_stride
+    (line 83). _get_kv_cache_bytes_per_block (vllm/v1/core/kv_cache_utils.py:1520-1551), for a
+    block-outermost layout, takes the largest group's page sum and rounds it up to
+    lcm(HiSparseHotSpec page sizes, each layer's block_stride_alignment). An MLA layer
+    (block 64 x 1 head x 128 x uint8 = 8192 B, block_stride_alignment 1152) and a hot group
+    (page 5120 B) give stride lcm(1152, 5120) = 46080; every KV cache tensor of a 3-block
+    pool has block stride 46080 and size 3 x 46080. Driven through
+    kv-cache-utils.get-kv-cache-config-from-groups, which owns the bytes-per-block divisor
+    (_pool_bytes_per_block mirrors it). The test's layout is BLHNC; the model's enum has
+    only LBNHC and BLNHC, so BLNHC (also block-outermost, the same code path) is used.
+  fixtures: [full-tp1-llama-8b]
+  steps:
+  - interface: kv-cache-utils.get-kv-cache-config-from-groups
+    caller: engine-core
+    input:
+      available_memory: 138240
+      layout: BLNHC
+      kv_cache_groups:
+      - {layer_names: [attention], layer_pages: {attention: 8192}, block_stride_alignment: 1152}
+      - {layer_names: [hot], layer_pages: {hot: 5120}, hisparse_hot: true}
+    as: cfg
+  expect:
+  - "steps.cfg.result.ok && steps.cfg.result.value.bytes_per_block == 46080"
+  - "steps.cfg.result.value.num_blocks == 3"
+  - "steps.cfg.result.value.kv_cache_tensors.all(t, t.block_stride == 46080)"

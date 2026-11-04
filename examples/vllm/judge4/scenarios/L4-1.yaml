@@ -1,0 +1,53 @@
+schema_version: 1
+id: vllm
+scenarios:
+  - id: bench-l4-1-phase-timing
+    name: "L4-1: --max-num-seqs 1, chat A then B queued behind it, then streaming C disconnecting after 5 tokens"
+    fixtures: [full-tp1-llama-8b]
+    config: {max-num-seqs: 1}
+    max_events: 400000
+    max_iterations: 400000
+    steps:
+      - {flow: serving-api-chat-completion, as: a, await: false, at_ms: 0, input: {headers: {X-Request-Id: a}, body: {max_tokens: 16}}}
+      - {flow: serving-api-chat-completion, as: b, await: false, at_ms: 1, input: {headers: {X-Request-Id: b}, body: {max_tokens: 16}}}
+      - {interface: prometheus-registry.collect, caller: api-server, as: m1, at_ms: 700}
+      - {interface: prometheus-registry.collect, caller: api-server, as: m2, at_ms: 2000}
+      - {flow: serving-api-chat-stream, as: c, await: false, at_ms: 2001, input: {headers: {X-Request-Id: c}, body: {max_tokens: 16}}}
+      - {at_ms: 2340, cancel: disconnect-chatcmpl-c}
+      - {interface: prometheus-registry.collect, caller: api-server, as: m3, at_ms: 3500}
+    expect:
+      # (a) TTFT / e2e from arrival_time (wall clock, API process); B's TTFT includes A's run
+      - "steps.a.result.ok && steps.b.result.ok"
+      - "steps.m1.result.value.exists(m, m.series == 'vllm:time_to_first_token_seconds{model_name=\"llama-8b\",engine=\"0\"}' && m.value.count == 1)"
+      - "steps.m2.result.value.filter(m, m.name == 'vllm:time_to_first_token_seconds')[0].value.sum - steps.m1.result.value.filter(m, m.name == 'vllm:time_to_first_token_seconds')[0].value.sum > 0.6"
+      # (a) path: arrival is stamped before the chat template is applied (renderers/base.py:1296)
+      # A's handler starts rendering at t=16 ms and its last output is processed at about 654 ms, so the code's e2e is >= 0.63 s
+      - "steps.m1.result.value.filter(m, m.name == 'vllm:e2e_request_latency_seconds')[0].value.sum >= 0.63"
+      # (b) queue time histogram from engine-core QUEUED/SCHEDULED stamps
+      - "state['prometheus-registry'].metrics['vllm:request_queue_time_seconds{model_name=\"llama-8b\",engine=\"0\"}'].count == 2"
+      - "state['prometheus-registry'].metrics['vllm:request_prefill_time_seconds{model_name=\"llama-8b\",engine=\"0\"}'].count == 2"
+      # (c) decode / inference / TPOT; TTFT 1 and ITL 15 per request; labels
+      - "state['prometheus-registry'].metrics['vllm:request_decode_time_seconds{model_name=\"llama-8b\",engine=\"0\"}'].count == 2"
+      - "state['prometheus-registry'].metrics['vllm:request_inference_time_seconds{model_name=\"llama-8b\",engine=\"0\"}'].count == 2"
+      - "state['prometheus-registry'].metrics['vllm:request_time_per_output_token_seconds{model_name=\"llama-8b\",engine=\"0\"}'].count == 2"
+      - "steps.m2.result.value.filter(m, m.name == 'vllm:inter_token_latency_seconds')[0].value.count == 30"
+      - "steps.m2.result.value.filter(m, m.name == 'vllm:time_to_first_token_seconds')[0].value.count == 2"
+      # (e) C: abort(internal=True) records no finished stats
+      - "state['prometheus-registry'].metrics['vllm:request_success{model_name=\"llama-8b\",engine=\"0\",finished_reason=\"abort\"}'] == 0"
+      - "state['prometheus-registry'].metrics['vllm:e2e_request_latency_seconds{model_name=\"llama-8b\",engine=\"0\"}'].count == 2"
+      - "trace.exists(e, e.type == 'call.start' && e.interface == 'async-llm.abort' && e.input.internal == true)"
+      - "state['prometheus-registry'].metrics['vllm:time_to_first_token_seconds{model_name=\"llama-8b\",engine=\"0\"}'].count == 3"
+      - "steps.m3.result.value.filter(m, m.name == 'vllm:inter_token_latency_seconds')[0].value.count == 34"
+  - id: bench-l4-1d-bucket-families
+    name: "L4-1 (d): bucket families for the phase-time, TTFT and ITL histograms"
+    fixtures: [full-tp1-llama-8b]
+    steps:
+      - {interface: buckets.histogram-buckets, caller: operator, as: lat, input: {family: request_latency}}
+      - {interface: buckets.histogram-buckets, caller: operator, as: ttft, input: {family: time_to_first_token}}
+      - {interface: buckets.histogram-buckets, caller: operator, as: itl, input: {family: inter_token_latency}}
+    expect:
+      - "steps.lat.result.value == [0.3, 0.5, 0.8, 1.0, 1.5, 2.0, 2.5, 5.0, 10.0, 15.0, 20.0, 30.0, 40.0, 50.0, 60.0, 120.0, 240.0, 480.0, 960.0, 1920.0, 7680.0]"
+      - "size(steps.ttft.result.value) == 22 && steps.ttft.result.value[0] == 0.001 && steps.ttft.result.value[21] == 2560.0"
+      - "size(steps.itl.result.value) == 19 && steps.itl.result.value[0] == 0.01 && steps.itl.result.value[18] == 80.0"
+      # wiring: PrometheusStatLogger.__init__ draws the buckets from histogram_buckets (loggers.py:821-840)
+      - "trace.exists(e, e.type == 'call.start' && e.interface == 'buckets.histogram-buckets' && e.caller == 'stat-logger-manager.init-prometheus')"

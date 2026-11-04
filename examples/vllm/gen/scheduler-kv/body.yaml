@@ -72,6 +72,20 @@ configs:
     summary: "long_prefill_token_threshold: cap on one request's prefill chunk per step (0 = off; ignored when only one request is eligible)"
     sources: ["vllm/config/scheduler.py:79", "vllm/engine/arg_utils.py:600", "vllm/v1/core/sched/scheduler.py:643-650"]
     attributes: {key: long_prefill_token_threshold}
+  - id: long-prefill-token-threshold-adaptive
+    type: boolean
+    value: false
+    default: false
+    summary: "long_prefill_token_threshold_adaptive: floor the long-prefill cap at max_num_batched_tokens // (running + waiting), so it never cuts a request below its fair share of the budget"
+    sources: ["vllm/config/scheduler.py:86", "vllm/v1/core/sched/scheduler.py:142-144", "vllm/v1/core/sched/scheduler.py:650-655"]
+    attributes: {key: long_prefill_token_threshold_adaptive}
+  - id: disable-chunked-mm-input
+    type: boolean
+    value: false
+    default: false
+    summary: "disable_chunked_mm_input: never schedule part of a multimodal item; a chunk that would cut one is rolled back to just before it (forced on for encoder-decoder models)"
+    sources: ["vllm/config/scheduler.py:167", "vllm/config/scheduler.py:292-295", "vllm/v1/core/sched/scheduler.py:1866-1881"]
+    attributes: {key: disable_chunked_mm_input}
   - id: watermark
     type: number
     value: 0.0
@@ -117,6 +131,7 @@ configs:
   - {id: enable-lora, type: boolean, value: false, default: false, summary: enable_lora, sources: ["vllm/engine/arg_utils.py:676"], attributes: {key: enable_lora, boundary: true, owner: config-platform}}
   - {id: max-loras, type: integer, value: 1, default: 1, summary: "max_loras: GPU LoRA slots per batch. Deployed = default (LoRA itself is off unless --enable-lora).", sources: ["vllm/config/lora.py:35", "vllm/engine/arg_utils.py:677"], attributes: {key: max_loras, boundary: true, owner: models-layers}}
   - {id: disable-log-stats, type: boolean, value: false, default: false, summary: "disable_log_stats: false for vllm serve, so AsyncLLM/LLMEngine log_stats is true and the StatLoggerManager records each step. The offline LLM class overrides it to true unless the caller passes it (vllm/entrypoints/llm.py:226-227).", sources: ["vllm/engine/arg_utils.py:612", "vllm/v1/engine/async_llm.py:287"], attributes: {key: disable_log_stats, boundary: true, owner: engine-core}}
+  - {id: mm-encoder-only, type: boolean, value: false, default: false, summary: "MultiModalConfig.mm_encoder_only (--mm-encoder-only, or set for a dedicated EC producer): the instance runs only the multimodal encoder and publishes embeddings, so the scheduler finishes a request once its prompt is consumed, without sampling.", sources: ["vllm/config/vllm.py:567-574", "vllm/config/vllm.py:2778-2790", "vllm/v1/core/sched/scheduler.py:116"], attributes: {key: mm_encoder_only, boundary: true, owner: config-platform}}
   - {id: enable-kv-cache-events, type: boolean, value: false, default: false, summary: "kv_events_config.enable_kv_cache_events: off unless --kv-events-config enables it; then the scheduler's EventPublisherFactory builds a ZMQ publisher.", sources: ["vllm/config/kv_events.py:14", "vllm/engine/arg_utils.py:771"], attributes: {key: kv_events_config.enable_kv_cache_events, boundary: true, owner: distributed}}
   - {id: vllm-regex-compilation-timeout-s, type: integer, value: 5, default: 5, summary: "VLLM_REGEX_COMPILATION_TIMEOUT_S: seconds a regex compile may take (0 disables the guard)", sources: ["vllm/envs.py:1710-1711"], attributes: {boundary: true, owner: config-platform, key: VLLM_REGEX_COMPILATION_TIMEOUT_S}}
   - id: scheduler-kv-redos-compile-ms
@@ -172,7 +187,10 @@ components:
           num_waiting_for_streaming_input: {type: integer}
           finished_recving_kv_req_ids: {type: array, items: {type: string}}
           grammar_compile_error_reqs: {type: array, items: {type: string}, description: "Requests whose grammar failed to compile; update_from_output finishes them with FINISHED_ERROR (scheduler.py:252, 2302-2326)."}
-      initial: {requests: {}, waiting: [], running: [], finished_req_ids: [], preempted_req_ids: [], current_step: 0, pause_state: UNPAUSED, num_waiting_for_streaming_input: 0, finished_recving_kv_req_ids: [], grammar_compile_error_reqs: []}
+          deferred_waiting: {type: array, items: {type: string}, description: "Waiting requests a scheduling pass skipped (blocked on a grammar or remote KV, stale in-flight output, max_loras); SchedulerStats reports them as skipped, not waiting (scheduler.py:230, 904-910, 2944-2948)."}
+          prev_step_scheduled_req_ids: {type: array, items: {type: string}, description: "MRV1 only: the ids scheduled last step; a cached request not in it gets its all_token_ids again (scheduler.py:1449-1452, 1731-1733)."}
+          max_num_encoder_input_tokens: {type: integer, description: "Encoder compute budget per step: MultiModalBudget.encoder_compute_budget, 0 for a text-only model (scheduler.py:271-273)."}
+      initial: {requests: {}, waiting: [], running: [], finished_req_ids: [], preempted_req_ids: [], current_step: 0, pause_state: UNPAUSED, num_waiting_for_streaming_input: 0, finished_recving_kv_req_ids: [], grammar_compile_error_reqs: [], deferred_waiting: [], prev_step_scheduled_req_ids: [], max_num_encoder_input_tokens: 0}
   - id: fcfs-request-queue
     name: FCFSRequestQueue
     kind: module
@@ -639,6 +657,18 @@ components:
     state:
       schema: {type: object, properties: {tiers: {type: object}}}
       initial: {tiers: {}}
+  - id: p2p-secondary-tier-manager
+    name: P2PSecondaryTierManager
+    kind: module
+    parent: kv-offload
+    summary: "The P2P secondary tier: one session per remote peer (host:port) both loads blocks from and serves blocks to that peer over a ZMQ control connection; prefiller-side requests are bound to the session that fetched them; the NONE_HASH seed is resolved lazily and advertised in each session's handshake."
+    description: "Single-threaded: every public method runs on the scheduler thread (manager.py:209-213). state.tiers is keyed by tier id: local_id, hash_seed (null until the first session), sessions (peer id -> {connected, local_hash_seed, finished}), kv_to_session (kv_request_id -> peer id), failed_req_ids, unbound_stores, unbound_store_timeout_s. The NIXL data transport and the wire protocol are not modeled."
+    attributes: {single_writer: "The engine-core busy-loop thread is the only caller: other threads only put requests on the mutex-guarded input_queue, which the busy loop drains before each step (vllm/v1/engine/core.py:1574-1600)."}
+    capacity: {concurrency: 1}
+    sources: ["vllm/v1/kv_offload/tiering/p2p/manager.py:202-345"]
+    state:
+      schema: {type: object, properties: {tiers: {type: object}}}
+      initial: {tiers: {}}
   - id: zmq-transport
     name: ZmqTransport (P2P tier control plane)
     kind: module
@@ -678,6 +708,9 @@ schemas:
             stop_token_ids: {type: array, items: {type: integer}, examples: [[128001, 128008]]}
             ignore_eos: {type: boolean, examples: [false]}
             structured_outputs: {type: [object, "null"], description: "StructuredOutputsParams (json, regex, choice, grammar, json_object, structural_tag); a request with any constraint starts in WAITING_FOR_STRUCTURED_OUTPUT_GRAMMAR (request.py:116-117)."}
+            prompt_logprobs: {type: [integer, "null"], default: null, description: "Prompt logprobs requested; unless skip_reading_prefix_cache is set, it defaults the request to skip reading the prefix cache (sampling_params.py:622-629)."}
+            prompt_logprob_token_ids: {type: [array, "null"], default: null, items: {type: integer}}
+            skip_reading_prefix_cache: {type: [boolean, "null"], default: null, description: "None resolves to prompt_logprobs is not None or prompt_logprob_token_ids is not None (sampling_params.py:622-629)."}
         arrival_time: {type: [number, "null"], default: null, description: "Engine arrival time; null means now."}
         priority: {type: integer, examples: [0]}
         grammar_id: {type: [string, "null"], default: null, description: "Set when the request uses structured output (its compiled grammar)."}
@@ -692,6 +725,19 @@ schemas:
             lora_int_id: {type: integer, examples: [1]}
             lora_path: {type: string, examples: [/adapters/sql-lora]}
         client_index: {type: integer, examples: [0]}
+        mm_features:
+          type: array
+          default: []
+          description: "Request.mm_features sorted by offset: each multimodal item's identifier (mm_hash), its placeholder range (offset, length) and its embedding count (PlaceholderRange.get_num_embeds; the length when every placeholder is an embedding)."
+          items:
+            type: object
+            required: [identifier, offset, length]
+            properties:
+              identifier: {type: string, examples: [img-stop-sign]}
+              modality: {type: string, examples: [image]}
+              offset: {type: integer, examples: [8]}
+              length: {type: integer, examples: [800]}
+              num_embeds: {type: integer, examples: [800]}
   - id: SchedKvBlock
     summary: "A KV cache block as the prefix-cache lookup returns it."
     schema: {type: object, properties: {block_id: {type: integer}, ref_cnt: {type: integer}}}
@@ -712,4 +758,5 @@ schemas:
               num_cached_tokens: {type: integer}
               client_index: {type: integer}
               kv_transfer_params: {}
+              events: {type: [array, "null"], description: "EngineCoreEvents taken from the request (QUEUED, SCHEDULED, PREEMPTED with timestamps); null when none. The output processor's IterationStats counts PREEMPTED events as num_preempted_reqs (vllm/v1/metrics/stats.py:576-577).", items: {type: object, properties: {type: {type: string, enum: [QUEUED, SCHEDULED, PREEMPTED]}, timestamp: {type: number}}}}
         finished_req_ids: {type: array, items: {type: string}}

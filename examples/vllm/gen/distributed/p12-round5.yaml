@@ -1,0 +1,1272 @@
+# distributed area, part 12 (fix round 5, precision): the expert-parallel group's all-to-all
+# (GroupCoordinator.dispatch/combine, the AgRs all2all manager, all_gatherv/reduce_scatterv), the
+# NIXL push scheduler's request_finished, the shared Mooncake Store config and setup (KV and EC
+# clients), and the nccl_m2n trainer init-info validation. Scenarios here are the round-5
+# regressions; the round-5 unit tests are in build-oracle/round5/distributed.yaml.
+schema_version: 1
+id: vllm
+
+configs:
+  - id: all2all-backend
+    type: string
+    value: allgather_reducescatter
+    default: allgather_reducescatter
+    summary: "--all2all-backend (parallel_config.all2all_backend): the MoE all-to-all implementation the EP group's communicator builds when ParallelConfig.use_all2all; naive and allgather_reducescatter both use AgRsAll2AllManager"
+    sources: ["vllm/config/parallel.py:219", "vllm/engine/arg_utils.py:558"]
+    attributes: {key: all2all_backend}
+  - id: mooncake-config-path
+    type: string
+    value: null
+    default: null
+    summary: "MOONCAKE_CONFIG_PATH: the JSON file MooncakeStoreConfig.load_from_config reads (os.getenv; unset in every shared world)"
+    sources: ["vllm/distributed/mooncake_store.py:72-78"]
+    attributes: {key: MOONCAKE_CONFIG_PATH, env: true}
+
+components:
+  - id: ag-rs-all2all-manager
+    name: AgRsAll2AllManager
+    kind: module
+    layer: distributed
+    parent: cuda-communicator
+    summary: "The all2all manager of an EP communicator for the naive and allgather_reducescatter backends: dispatch all-gathers the tokens (and their top-k weights and ids) from every DP rank, combine reduce-scatters the expert outputs back."
+    sources: ["vllm/distributed/device_communicators/all2all.py:67-77"]
+  - id: nixl-push-connector-scheduler
+    name: NixlPushConnectorScheduler
+    kind: module
+    layer: kv-transfer
+    parent: engine-core
+    capacity: {concurrency: 1}   # the scheduler-role connector is driven only by the engine-core busy loop (scheduler.py)
+    summary: "Scheduler side of the NIXL push (WRITE) connector: on the prefill node a finished request's blocks are kept under a lease and handed to the workers, which push them once the decoder registers."
+    sources: ["vllm/distributed/kv_transfer/kv_connector/v1/nixl/push_scheduler.py:207-294"]
+    state:
+      schema:
+        type: object
+        properties:
+          engine_id: {type: string}
+          side_channel_host: {type: string}
+          side_channel_port: {type: integer}
+          transfer_tp_size: {type: integer}
+          reqs_need_recv: {type: object}
+          reqs_need_send: {type: object}
+          reqs_need_save: {type: object}
+          reqs_not_processed: {type: array}
+          push_registration_deadlines: {type: object}
+          finished_request_blocks: {type: object}
+          newly_finished_push_blocks: {type: object}
+          heartbeats: {type: array}
+      initial: {engine_id: engine-p0, side_channel_host: "10.0.0.1", side_channel_port: 5600, transfer_tp_size: 1, reqs_need_recv: {}, reqs_need_send: {}, reqs_need_save: {}, reqs_not_processed: [], push_registration_deadlines: {}, finished_request_blocks: {}, newly_finished_push_blocks: {}, heartbeats: []}
+  - id: mooncake-store-config
+    name: vllm.distributed.mooncake_store (module)
+    kind: module
+    layer: kv-transfer
+    parent: gpu-worker
+    summary: "Configuration and setup shared by the EC and KV Mooncake Store clients: MooncakeStoreConfig (read from the MOONCAKE_CONFIG_PATH JSON file and validated) and setup_mooncake_store, which forwards a non-default tenant_id to the native store."
+    sources: ["vllm/distributed/mooncake_store.py:20-49", "vllm/distributed/mooncake_store.py:126-143"]
+  - id: mooncake-distributed-store
+    name: MooncakeDistributedStore (native client)
+    kind: module
+    layer: kv-transfer
+    parent: gpu-worker
+    summary: "The mooncake.store.MooncakeDistributedStore object a client builds; the model records each setup() call (positional arguments and keyword arguments) and answers the configured return code."
+    sources: ["vllm/distributed/kv_transfer/kv_connector/v1/mooncake/store/worker.py:1418-1422"]
+    state:
+      schema: {type: object, properties: {setup_ret: {type: integer}, setup_calls: {type: array}}}
+      initial: {setup_ret: 0, setup_calls: []}
+  - id: mooncake-embedding-store-client
+    name: MooncakeEmbeddingStoreClient (factory)
+    kind: module
+    layer: ec-transfer
+    parent: gpu-worker
+    summary: "create_mooncake_embedding_store_client: the EC (cross-encoder cache) Mooncake Store client; RAM store only."
+    sources: ["vllm/distributed/ec_transfer/ec_connector/mooncake_store_embedding/store_client.py:87-123"]
+  - id: m2n-trainer-init-info
+    name: M2NTrainerInitInfo
+    kind: module
+    layer: weight-transfer
+    parent: gpu-worker
+    summary: "Trainer-side init info of the nccl_m2n weight transfer: the rendezvous mode and the rank layout (trainer ranks first, then the inference workers, and the destination mesh) are validated when the dataclass is built."
+    sources: ["vllm/distributed/weight_transfer/m2n_trainer.py:63-122"]
+
+interfaces:
+  - component: local-disk
+    name: read-file
+    kind: io
+    summary: Read a file from local disk (shared infrastructure); a missing file is FileNotFoundError.
+    attributes: {boundary: true, owner: shared}
+    request: {type: object, required: [path], properties: {path: {type: string}}}
+    errors:
+      - {code: file-not-found-error, status: 0, retryable: false}
+    store: {table: files, op: get, key: "= input.path", not_found: file-not-found-error}
+
+  # ---------------------------------------------------------------- EP group: get, dispatch, combine
+  - component: parallel-state
+    name: get-ep-group
+    kind: function
+    summary: "get_ep_group: the expert-parallel GroupCoordinator (MoE models only): its size, unique name, whether it uses all-to-all, and the all2all manager its communicator built."
+    sources: ["vllm/distributed/parallel_state.py:1654-1660"]
+    request: {type: object, properties: {}}
+    response: {type: object, properties: {world_size: {type: integer}, unique_name: {type: string}, use_all2all: {type: boolean}, all2all_manager: {type: [string, "null"]}, rank_in_group: {type: integer}}}
+    errors:
+      - {code: assertion-error, status: 0, retryable: false}
+    behavior:
+      - if: "!('ep' in state.groups)"
+        then:
+          - source: "vllm/distributed/parallel_state.py:1655-1659"
+            fail: {code: assertion-error, status: 0, message: "expert parallel group is not initialized. EP group is only created for MoE models with num_experts > 0. This function should only be called for MoE models."}
+      - set: {vars.g: "= state.groups.ep"}
+      - return:
+          world_size: "= vars.g.world_size"
+          unique_name: "= vars.g.unique_name"
+          use_all2all: "= has(vars.g.use_all2all) && vars.g.use_all2all"
+          all2all_manager: "= has(vars.g.all2all_manager) ? vars.g.all2all_manager : null"
+          rank_in_group: "= int(self.replace('rank', '')) % vars.g.world_size"
+
+  - component: parallel-state
+    name: get-dp-group
+    kind: function
+    summary: "get_dp_group: the data-parallel GroupCoordinator."
+    sources: ["vllm/distributed/parallel_state.py:1646-1648"]
+    request: {type: object, properties: {}}
+    response: {type: object, properties: {world_size: {type: integer}, unique_name: {type: string}, rank_in_group: {type: integer}}}
+    errors:
+      - {code: assertion-error, status: 0, retryable: false}
+    behavior:
+      - if: "!('dp' in state.groups)"
+        then:
+          - source: "vllm/distributed/parallel_state.py:1647"
+            fail: {code: assertion-error, status: 0, message: "data parallel group is not initialized"}
+      - return: {world_size: "= state.groups.dp.world_size", unique_name: "= state.groups.dp.unique_name", rank_in_group: "= int(self.replace('rank', '')) % state.groups.dp.world_size"}
+
+  - component: parallel-state
+    name: get-pcp-group
+    kind: function
+    summary: "get_pcp_group: the prefill-context-parallel GroupCoordinator."
+    sources: ["vllm/distributed/parallel_state.py:1678-1680"]
+    request: {type: object, properties: {}}
+    response: {type: object, properties: {world_size: {type: integer}, unique_name: {type: string}, rank_in_group: {type: integer}}}
+    errors:
+      - {code: assertion-error, status: 0, retryable: false}
+    behavior:
+      - if: "!('pcp' in state.groups)"
+        then:
+          - source: "vllm/distributed/parallel_state.py:1679"
+            fail: {code: assertion-error, status: 0, message: "prefill context parallel group is not initialized"}
+      - return: {world_size: "= state.groups.pcp.world_size", unique_name: "= state.groups.pcp.unique_name", rank_in_group: "= int(self.replace('rank', '')) % state.groups.pcp.world_size"}
+
+  - component: group-coordinator
+    name: dispatch
+    kind: function
+    summary: "GroupCoordinator.dispatch on the EP group (the MoE prepare step): the CUDA communicator hands it to its all2all manager, which must exist (the group must use all-to-all); without a device communicator the tensors pass through."
+    sources: ["vllm/distributed/parallel_state.py:1430-1450", "vllm/distributed/device_communicators/cuda_communicator.py:1025-1046"]
+    attributes: {seam: true, callers: [models-layers]}
+    request:
+      type: object
+      required: [num_tokens]
+      properties:
+        num_tokens: {type: integer, examples: [3], description: "rows of hidden_states on this rank"}
+        hidden_size: {type: integer, default: 4096}
+        top_k: {type: integer, default: 2}
+        is_sequence_parallel: {type: boolean, default: false}
+        dp_chunk_sizes: {type: [array, "null"], default: null, items: {type: integer}, description: "forward_context.dp_metadata.get_chunk_sizes_across_dp_rank()"}
+        has_device_communicator: {type: boolean, default: true}
+    response: DistAll2AllResult
+    errors:
+      - {code: assertion-error, status: 0, retryable: false}
+      - {code: dist-backend-error, status: 0, retryable: false}
+    behavior:
+      - if: "!(has(input.has_device_communicator) ? input.has_device_communicator : true)"
+        then:
+          - title: No device communicator; the inputs are returned unchanged
+            source: "vllm/distributed/parallel_state.py:1449-1450"
+            return: {num_tokens: "= input.num_tokens", sizes: "= [input.num_tokens]", comm_group: none, manager: none}
+      - call: parallel-state.get-ep-group
+        as: ep
+      - if: "vars.ep.value.all2all_manager == null"
+        then:
+          - title: "assert self.all2all_manager is not None (the EP group was built without all-to-all)"
+            source: "vllm/distributed/device_communicators/cuda_communicator.py:1039"
+            fail: {code: assertion-error, status: 0, message: ""}
+      - if: "vars.ep.value.all2all_manager == 'AgRsAll2AllManager'"
+        then:
+          - source: "vllm/distributed/device_communicators/cuda_communicator.py:1040-1046"
+            call: ag-rs-all2all-manager.dispatch
+            input: "= input"
+            as: d
+          - return: "= vars.d.value"
+      - title: "The other managers (DeepEP, MoRI, FlashInfer, NIXL EP, MoonEP, passthrough) dispatch inside their kernels; not modeled"
+        source: "vllm/distributed/device_communicators/cuda_communicator.py:1040-1046"
+        return: {num_tokens: "= input.num_tokens", sizes: "= [input.num_tokens]", comm_group: ep, manager: "= vars.ep.value.all2all_manager"}
+
+  - component: group-coordinator
+    name: combine
+    kind: function
+    summary: "GroupCoordinator.combine on the EP group (the MoE finalize step): the CUDA communicator hands it to its all2all manager, which must exist; without a device communicator the tensor passes through."
+    sources: ["vllm/distributed/parallel_state.py:1452-1458", "vllm/distributed/device_communicators/cuda_communicator.py:1048-1058"]
+    attributes: {seam: true, callers: [models-layers]}
+    request:
+      type: object
+      required: [num_tokens]
+      properties:
+        num_tokens: {type: integer, examples: [8], description: "rows of the expert output (the gathered tokens)"}
+        hidden_size: {type: integer, default: 4096}
+        is_sequence_parallel: {type: boolean, default: false}
+        dp_chunk_sizes: {type: [array, "null"], default: null, items: {type: integer}}
+        has_device_communicator: {type: boolean, default: true}
+    response: DistAll2AllResult
+    errors:
+      - {code: assertion-error, status: 0, retryable: false}
+      - {code: dist-backend-error, status: 0, retryable: false}
+    behavior:
+      - if: "!(has(input.has_device_communicator) ? input.has_device_communicator : true)"
+        then:
+          - source: "vllm/distributed/parallel_state.py:1455-1458"
+            return: {num_tokens: "= input.num_tokens", sizes: "= [input.num_tokens]", comm_group: none, manager: none}
+      - call: parallel-state.get-ep-group
+        as: ep
+      - if: "vars.ep.value.all2all_manager == null"
+        then:
+          - title: "assert self.all2all_manager is not None"
+            source: "vllm/distributed/device_communicators/cuda_communicator.py:1054"
+            fail: {code: assertion-error, status: 0, message: ""}
+      - if: "vars.ep.value.all2all_manager == 'AgRsAll2AllManager'"
+        then:
+          - source: "vllm/distributed/device_communicators/cuda_communicator.py:1055-1058"
+            call: ag-rs-all2all-manager.combine
+            input: "= input"
+            as: c
+          - return: "= vars.c.value"
+      - source: "vllm/distributed/device_communicators/cuda_communicator.py:1055-1058"
+        return: {num_tokens: "= input.num_tokens", sizes: "= [input.num_tokens]", comm_group: ep, manager: "= vars.ep.value.all2all_manager"}
+
+  - component: ag-rs-all2all-manager
+    name: dispatch
+    kind: function
+    summary: "AgRsAll2AllManager.dispatch: pick the group (EP when sequence parallel, else DP when DP > 1 (EP with PCP > 1 would use EP), else PCP), take the per-rank token counts (equal at DP 1, else the forward context's DP chunk sizes), check this rank's count, and all_gatherv the hidden states with their top-k weights and ids."
+    sources: ["vllm/distributed/device_communicators/all2all.py:128-161", "vllm/distributed/device_communicators/all2all.py:79-97"]
+    request:
+      type: object
+      required: [num_tokens]
+      properties:
+        num_tokens: {type: integer}
+        hidden_size: {type: integer, default: 4096}
+        top_k: {type: integer, default: 2}
+        is_sequence_parallel: {type: boolean, default: false}
+        dp_chunk_sizes: {type: [array, "null"], default: null, items: {type: integer}}
+    response: DistAll2AllResult
+    errors:
+      - {code: assertion-error, status: 0, retryable: false}
+      - {code: dist-backend-error, status: 0, retryable: false}
+    behavior:
+      - call: ag-rs-all2all-manager.comm-group
+        input: {is_sequence_parallel: "= (has(input.is_sequence_parallel) ? input.is_sequence_parallel : false)"}
+        as: g
+      - call: ag-rs-all2all-manager.get-sizes
+        input: {num_local_tokens: "= input.num_tokens", world_size: "= vars.g.value.world_size", dp_world_size: "= vars.g.value.dp_world_size", dp_chunk_sizes: "= (has(input.dp_chunk_sizes) ? input.dp_chunk_sizes : null)"}
+        as: sz
+      - if: "vars.sz.value.sizes[vars.g.value.rank_in_group] != input.num_tokens"
+        then:
+          - title: "assert sizes[dist_group.rank_in_group] == hidden_states.shape[0]"
+            source: "vllm/distributed/device_communicators/all2all.py:141"
+            fail: {code: assertion-error, status: 0, message: ""}
+      - title: "all_gatherv([hidden_states, topk_weights, topk_ids], dim=0, sizes)"
+        source: "vllm/distributed/device_communicators/all2all.py:143-161"
+        call: cuda-communicator.all-gatherv
+        input: {group_name: "= vars.g.value.unique_name", world_size: "= vars.g.value.world_size", rank_in_group: "= vars.g.value.rank_in_group", num_tokens: "= input.num_tokens", hidden_size: "= (has(input.hidden_size) ? input.hidden_size : 4096)", sizes: "= vars.sz.value.sizes", num_tensors: 3}
+        as: ag
+      - return: {num_tokens: "= vars.ag.value.num_tokens", sizes: "= vars.sz.value.sizes", comm_group: "= vars.g.value.name", manager: AgRsAll2AllManager}
+
+  - component: ag-rs-all2all-manager
+    name: combine
+    kind: function
+    summary: "AgRsAll2AllManager.combine: on the same group, reduce_scatterv the expert outputs so each rank keeps its own tokens (sizes from num_tokens // world_size at DP 1, else the DP chunk sizes)."
+    sources: ["vllm/distributed/device_communicators/all2all.py:163-173"]
+    request:
+      type: object
+      required: [num_tokens]
+      properties:
+        num_tokens: {type: integer}
+        hidden_size: {type: integer, default: 4096}
+        is_sequence_parallel: {type: boolean, default: false}
+        dp_chunk_sizes: {type: [array, "null"], default: null, items: {type: integer}}
+    response: DistAll2AllResult
+    errors:
+      - {code: assertion-error, status: 0, retryable: false}
+      - {code: dist-backend-error, status: 0, retryable: false}
+    behavior:
+      - call: ag-rs-all2all-manager.comm-group
+        input: {is_sequence_parallel: "= (has(input.is_sequence_parallel) ? input.is_sequence_parallel : false)"}
+        as: g
+      - call: ag-rs-all2all-manager.get-sizes
+        input: {num_local_tokens: "= input.num_tokens / vars.g.value.world_size", world_size: "= vars.g.value.world_size", dp_world_size: "= vars.g.value.dp_world_size", dp_chunk_sizes: "= (has(input.dp_chunk_sizes) ? input.dp_chunk_sizes : null)"}
+        as: sz
+      - source: "vllm/distributed/device_communicators/all2all.py:172"
+        call: cuda-communicator.reduce-scatterv
+        input: {group_name: "= vars.g.value.unique_name", world_size: "= vars.g.value.world_size", rank_in_group: "= vars.g.value.rank_in_group", num_tokens: "= input.num_tokens", hidden_size: "= (has(input.hidden_size) ? input.hidden_size : 4096)", sizes: "= vars.sz.value.sizes"}
+        as: rs
+      - return: {num_tokens: "= vars.rs.value.num_tokens", sizes: "= vars.sz.value.sizes", comm_group: "= vars.g.value.name", manager: AgRsAll2AllManager}
+
+  - component: ag-rs-all2all-manager
+    name: comm-group
+    kind: function
+    summary: "_get_comm_group: EP when sequence parallel; with DP > 1, EP if expert parallel and PCP > 1 (TP must then be 1), else DP; at DP 1 the PCP group. Returns the group with the DP world size the manager caches."
+    sources: ["vllm/distributed/device_communicators/all2all.py:76-87", "vllm/distributed/device_communicators/base_device_communicator.py:51-57"]
+    request: {type: object, properties: {is_sequence_parallel: {type: boolean, default: false}}}
+    response: {type: object, properties: {name: {type: string}, world_size: {type: integer}, unique_name: {type: string}, rank_in_group: {type: integer}, dp_world_size: {type: integer}}}
+    errors:
+      - {code: assertion-error, status: 0, retryable: false}
+    behavior:
+      - call: parallel-state.get-dp-group
+        as: dp
+      - call: parallel-state.get-pcp-group
+        as: pcp
+      - call: parallel-state.get-tp-group
+        as: tp
+      - if: "(has(input.is_sequence_parallel) ? input.is_sequence_parallel : false)"
+        then:
+          - source: "vllm/distributed/device_communicators/all2all.py:77-78"
+            set: {vars.name: ep}
+        else:
+          - if: "vars.dp.value.world_size > 1"
+            then:
+              - if: "config['enable-expert-parallel'] && vars.pcp.value.world_size > 1"
+                then:
+                  - if: "vars.tp.value.world_size != 1"
+                    then:
+                      - source: "vllm/distributed/device_communicators/all2all.py:81-83"
+                        fail: {code: assertion-error, status: 0, message: "DP+PCP with TP>1 requires sequence-parallel MoE inputs"}
+                  - set: {vars.name: ep}
+                else:
+                  - source: "vllm/distributed/device_communicators/all2all.py:85"
+                    set: {vars.name: dp}
+            else:
+              - source: "vllm/distributed/device_communicators/all2all.py:86"
+                set: {vars.name: pcp}
+      - if: "vars.name == 'ep'"
+        then:
+          - call: parallel-state.get-ep-group
+            as: ep
+          - return: {name: ep, world_size: "= vars.ep.value.world_size", unique_name: "= vars.ep.value.unique_name", rank_in_group: "= vars.ep.value.rank_in_group", dp_world_size: "= vars.dp.value.world_size"}
+      - set: {vars.grp: "= vars.name == 'dp' ? vars.dp.value : vars.pcp.value"}
+      - return: {name: "= vars.name", world_size: "= vars.grp.world_size", unique_name: "= vars.grp.unique_name", rank_in_group: "= vars.grp.rank_in_group", dp_world_size: "= vars.dp.value.world_size"}
+
+  - component: ag-rs-all2all-manager
+    name: get-sizes
+    kind: function
+    summary: "_get_sizes: at DP 1 every rank has num_local_tokens; otherwise the forward context's DP metadata gives each rank's chunk, one per rank of the group."
+    sources: ["vllm/distributed/device_communicators/all2all.py:89-97"]
+    request: {type: object, required: [num_local_tokens, world_size, dp_world_size], properties: {num_local_tokens: {type: integer}, world_size: {type: integer}, dp_world_size: {type: integer}, dp_chunk_sizes: {type: [array, "null"], default: null}}}
+    response: {type: object, properties: {sizes: {type: array, items: {type: integer}}}}
+    errors:
+      - {code: assertion-error, status: 0, retryable: false}
+    behavior:
+      - if: "input.dp_world_size == 1"
+        then:
+          - source: "vllm/distributed/device_communicators/all2all.py:90-91"
+            return: {sizes: "= lists.range(input.world_size).map(i, input.num_local_tokens)"}
+      - if: "(has(input.dp_chunk_sizes) ? input.dp_chunk_sizes : null) == null"
+        then:
+          - title: "assert dp_metadata is not None / sizes is not None"
+            source: "vllm/distributed/device_communicators/all2all.py:93-96"
+            fail: {code: assertion-error, status: 0, message: ""}
+      - if: "size((has(input.dp_chunk_sizes) ? input.dp_chunk_sizes : null)) != input.world_size"
+        then:
+          - title: "assert len(sizes) == comm_group.world_size"
+            source: "vllm/distributed/device_communicators/all2all.py:96"
+            fail: {code: assertion-error, status: 0, message: ""}
+      - return: {sizes: "= (has(input.dp_chunk_sizes) ? input.dp_chunk_sizes : null)"}
+
+  - component: cuda-communicator
+    name: all-gatherv
+    kind: function
+    summary: "CudaCommunicator.all_gatherv: dim 0 only; equal sizes drop to a plain all-gather; PyNccl gathers each tensor (this rank's rows must match sizes[rank]) into sum(sizes) rows, once every rank of the group has called."
+    sources: ["vllm/distributed/device_communicators/cuda_communicator.py:884-960"]
+    request:
+      type: object
+      required: [group_name, world_size, num_tokens]
+      properties:
+        group_name: {type: string, examples: ["dp:0"]}
+        world_size: {type: integer}
+        rank_in_group: {type: integer, default: 0}
+        num_tokens: {type: integer}
+        hidden_size: {type: integer, default: 4096}
+        sizes: {type: [array, "null"], default: null, items: {type: integer}}
+        dim: {type: integer, default: 0}
+        num_tensors: {type: integer, default: 1}
+    response: DistCollectiveResult
+    errors:
+      - {code: not-implemented-error, status: 0, retryable: false}
+      - {code: assertion-error, status: 0, retryable: false}
+      - {code: dist-backend-error, status: 0, retryable: false}
+    behavior:
+      - if: "(has(input.dim) ? input.dim : 0) != 0"
+        then:
+          - source: "vllm/distributed/device_communicators/cuda_communicator.py:890-891"
+            fail: {code: not-implemented-error, status: 0, message: "only dim 0 all-gatherv is supported"}
+      - title: "'sizes' is not needed if all inputs have the same shape"
+        source: "vllm/distributed/device_communicators/cuda_communicator.py:894-897"
+        set:
+          vars.in_sizes: "= has(input.sizes) ? input.sizes : null"
+      - set:
+          vars.sizes: "= vars.in_sizes != null && vars.in_sizes.all(s, s == vars.in_sizes[0]) ? null : vars.in_sizes"
+      - call: pynccl-communicator.status
+        as: pn
+      - if: "vars.pn.value.disabled"
+        then:
+          - title: "assert pynccl_comm is not None and not pynccl_comm.disabled"
+            source: "vllm/distributed/device_communicators/cuda_communicator.py:911-912"
+            fail: {code: assertion-error, status: 0, message: ""}
+      - if: "vars.sizes != null && size(vars.sizes) != input.world_size"
+        then:
+          - source: "vllm/distributed/device_communicators/cuda_communicator.py:924"
+            fail: {code: assertion-error, status: 0, message: ""}
+      - if: "vars.sizes != null && input.num_tokens != vars.sizes[(has(input.rank_in_group) ? input.rank_in_group : 0)]"
+        then:
+          - source: "vllm/distributed/device_communicators/cuda_communicator.py:925-927"
+            fail: {code: assertion-error, status: 0, message: "= string(input.num_tokens) + ' != ' + string(vars.sizes[(has(input.rank_in_group) ? input.rank_in_group : 0)])"}
+      - title: Every rank of the group calls the collective once
+        source: "vllm/distributed/device_communicators/cuda_communicator.py:934-937"
+        rendezvous: "= 'allgatherv:' + input.group_name"
+        count: "= input.world_size"
+        value: "= self"
+        timeout_ms: "= !('distributed-timeout-seconds' in config) || config['distributed-timeout-seconds'] == null ? 600000 : config['distributed-timeout-seconds'] * 1000"
+        latency_ms: "= (double(config['dist-nccl-base-us']) + double(input.num_tokens * (has(input.hidden_size) ? input.hidden_size : 4096) * 2 * (has(input.num_tensors) ? input.num_tensors : 1)) * double(input.world_size - 1) / (double(config['dist-nvlink-bus-gbps']) * 1000.0)) / 1000.0"
+        as: meet
+        on_error:
+          - fail: {code: dist-backend-error, status: 0, message: "= 'collective timed out: ' + string(error.data.arrived) + ' of ' + string(error.data.count) + ' ranks arrived'"}
+      - return:
+          backend: "= vars.sizes != null ? 'pynccl-allgatherv' : 'pynccl'"
+          bytes: "= input.num_tokens * (has(input.hidden_size) ? input.hidden_size : 4096) * 2 * (has(input.num_tensors) ? input.num_tensors : 1)"
+          world_size: "= input.world_size"
+          num_tokens: "= vars.sizes != null ? sum(vars.sizes) : input.num_tokens * input.world_size"
+
+  - component: cuda-communicator
+    name: reduce-scatterv
+    kind: function
+    summary: "CudaCommunicator.reduce_scatterv: PyNccl is required; equal sizes drop to an even split (rows must divide by the world size); otherwise the rows must sum to the sizes and this rank keeps sizes[rank_in_group]."
+    sources: ["vllm/distributed/device_communicators/cuda_communicator.py:533-536", "vllm/distributed/device_communicators/cuda_communicator.py:547-578"]
+    request:
+      type: object
+      required: [group_name, world_size, num_tokens]
+      properties:
+        group_name: {type: string, examples: ["dp:0"]}
+        world_size: {type: integer}
+        rank_in_group: {type: integer, default: 0}
+        num_tokens: {type: integer}
+        hidden_size: {type: integer, default: 4096}
+        sizes: {type: [array, "null"], default: null, items: {type: integer}}
+    response: DistCollectiveResult
+    errors:
+      - {code: assertion-error, status: 0, retryable: false}
+      - {code: dist-backend-error, status: 0, retryable: false}
+    behavior:
+      - call: pynccl-communicator.status
+        as: pn
+      - if: "vars.pn.value.disabled"
+        then:
+          - source: "vllm/distributed/device_communicators/cuda_communicator.py:556"
+            fail: {code: assertion-error, status: 0, message: "reduce_scatterv requires PyNccl"}
+      - source: "vllm/distributed/device_communicators/cuda_communicator.py:563-566"
+        set:
+          vars.in_sizes: "= has(input.sizes) ? input.sizes : null"
+      - set:
+          vars.sizes: "= vars.in_sizes != null && vars.in_sizes.all(s, s == vars.in_sizes[0]) ? null : vars.in_sizes"
+      - if: "vars.sizes != null"
+        then:
+          - if: "size(vars.sizes) != input.world_size"
+            then:
+              - source: "vllm/distributed/device_communicators/cuda_communicator.py:573"
+                fail: {code: assertion-error, status: 0, message: "= string(size(vars.sizes)) + ' == ' + string(input.world_size)"}
+          - if: "input.num_tokens != sum(vars.sizes)"
+            then:
+              - source: "vllm/distributed/device_communicators/cuda_communicator.py:574"
+                fail: {code: assertion-error, status: 0, message: ""}
+          - set: {vars.chunk: "= vars.sizes[(has(input.rank_in_group) ? input.rank_in_group : 0)]"}
+        else:
+          - if: "input.num_tokens % input.world_size != 0"
+            then:
+              - source: "vllm/distributed/device_communicators/cuda_communicator.py:577"
+                fail: {code: assertion-error, status: 0, message: ""}
+          - set: {vars.chunk: "= input.num_tokens / input.world_size"}
+      - title: Every rank of the group calls the collective once
+        source: "vllm/distributed/device_communicators/cuda_communicator.py:547-551"
+        rendezvous: "= 'reducescatterv:' + input.group_name"
+        count: "= input.world_size"
+        value: "= self"
+        timeout_ms: "= !('distributed-timeout-seconds' in config) || config['distributed-timeout-seconds'] == null ? 600000 : config['distributed-timeout-seconds'] * 1000"
+        latency_ms: "= (double(config['dist-nccl-base-us']) + double(input.num_tokens * (has(input.hidden_size) ? input.hidden_size : 4096) * 2) * double(input.world_size - 1) / double(input.world_size) / (double(config['dist-nvlink-bus-gbps']) * 1000.0)) / 1000.0"
+        as: meet
+        on_error:
+          - fail: {code: dist-backend-error, status: 0, message: "= 'collective timed out: ' + string(error.data.arrived) + ' of ' + string(error.data.count) + ' ranks arrived'"}
+      - return:
+          backend: "= vars.sizes != null ? 'pynccl-reducescatterv' : 'pynccl'"
+          bytes: "= input.num_tokens * (has(input.hidden_size) ? input.hidden_size : 4096) * 2"
+          world_size: "= input.world_size"
+          num_tokens: "= vars.chunk"
+
+  # ---------------------------------------------------------------- NIXL push scheduler
+  - component: nixl-push-connector-scheduler
+    name: request-finished
+    kind: function
+    summary: "NixlPushConnectorScheduler.request_finished: no params frees now; stop the heartbeat and drop any registration deadline; a request still marked do_remote_prefill was aborted before scheduling and registers an empty recv; a D-side request is a no-op; an unfinished P-side request is marked not processed. A finished P-side request with blocks keeps them under the lease and stashes them for the workers; with no blocks it frees now. Either way it returns the push parameters for the decoder."
+    sources: ["vllm/distributed/kv_transfer/kv_connector/v1/nixl/push_scheduler.py:207-294"]
+    request: DistKvRequest
+    response: DistKvFinished
+    behavior:
+      - set:
+          vars.p: "= has(input.kv_transfer_params) && input.kv_transfer_params != null ? input.kv_transfer_params : {}"
+      - if: "size(vars.p) == 0"
+        then:
+          - source: "vllm/distributed/kv_transfer/kv_connector/v1/nixl/push_scheduler.py:223-224"
+            return: {delay_free_blocks: false, kv_transfer_params: null}
+      - title: Stop the heartbeat and drop the pending registration deadline
+        source: "vllm/distributed/kv_transfer/kv_connector/v1/nixl/push_scheduler.py:226-231"
+        set:
+          vars.is_p: "= 'do_remote_decode' in vars.p && vars.p.do_remote_decode == true"
+          state.heartbeats: "= state.heartbeats.filter(r, r != input.request_id)"
+          state.push_registration_deadlines: "= state.push_registration_deadlines.transformMapEntry(k, v, k != input.request_id, {k: v})"
+      - if: "'do_remote_prefill' in vars.p && vars.p.do_remote_prefill == true"
+        then:
+          - title: Aborted before it was scheduled; register an empty recv so the worker notifies P to free its blocks
+            source: "vllm/distributed/kv_transfer/kv_connector/v1/nixl/push_scheduler.py:233-245"
+            set:
+              state.reqs_need_recv: "= merge(state.reqs_need_recv, {input.request_id: {'local_block_ids': [], 'remote_block_ids': [], 'park': false}})"
+          - return: {delay_free_blocks: false, kv_transfer_params: null}
+      - if: "!vars.is_p"
+        then:
+          - source: "vllm/distributed/kv_transfer/kv_connector/v1/nixl/push_scheduler.py:247-250"
+            return: {delay_free_blocks: false, kv_transfer_params: null}
+      - if: "!(input.status in ['FINISHED_LENGTH_CAPPED', 'FINISHED_STOPPED'])"
+        then:
+          - source: "vllm/distributed/kv_transfer/kv_connector/v1/nixl/push_scheduler.py:252-258"
+            set:
+              state.reqs_not_processed: "= state.reqs_not_processed + [input.request_id]"
+              state.reqs_need_save: "= state.reqs_need_save.transformMapEntry(k, v, k != input.request_id, {k: v})"
+          - return: {delay_free_blocks: false, kv_transfer_params: null}
+      - set:
+          vars.blocks: "= has(input.block_ids) ? input.block_ids : []"
+      - set:
+          vars.delay: "= vars.blocks.exists(g, size(g) > 0)"
+      - if: "vars.delay"
+        then:
+          - title: "Keep the blocks for the lease and stash them for the workers to match with D's registration (get_exchange_clipped_blocks is the identity without sliding-window or Mamba groups)"
+            source: "vllm/distributed/kv_transfer/kv_connector/v1/nixl/push_scheduler.py:262-279"
+            set:
+              state.reqs_need_send: "= merge(state.reqs_need_send, {input.request_id: now + config['nixl-kv-lease-duration'] * 1000})"
+              state.finished_request_blocks: "= merge(state.finished_request_blocks, {input.request_id: vars.blocks})"
+              state.newly_finished_push_blocks: "= merge(state.newly_finished_push_blocks, {input.request_id: vars.blocks})"
+      - source: "vllm/distributed/kv_transfer/kv_connector/v1/nixl/push_scheduler.py:281-294"
+        return:
+          delay_free_blocks: "= vars.delay"
+          kv_transfer_params:
+            do_remote_prefill: true
+            do_remote_decode: false
+            remote_block_ids: "= vars.blocks"
+            remote_engine_id: "= state.engine_id"
+            remote_request_id: "= input.request_id"
+            remote_host: "= state.side_channel_host"
+            remote_port: "= state.side_channel_port"
+            tp_size: "= state.transfer_tp_size"
+            dcp_size: 1
+            pp_size: "= config['pipeline-parallel-size']"
+            remote_num_tokens: "= vars.delay ? input.num_computed_tokens : 0"
+            transfer_mode: push
+
+  # ---------------------------------------------------------------- Mooncake Store config and setup
+  - component: mooncake-store-config
+    name: load-from-config
+    kind: function
+    summary: "MooncakeStoreConfig.load_from_config / from_file / __post_init__: read the JSON file named by MOONCAKE_CONFIG_PATH, take defaults for missing keys (rdma, embedded, 4 GiB segment and buffer, no offload, tenant 'default'), parse sizes ('4GB', '512 mb', bytes), normalize the tenant (stripped; empty or null is 'default'), and validate the mode and sizes."
+    sources: ["vllm/distributed/mooncake_store.py:40-78", "vllm/distributed/mooncake_store.py:80-123"]
+    request: {type: object, properties: {}}
+    response: DistMooncakeStoreConfig
+    errors:
+      - {code: value-error, status: 0, retryable: false}
+      - {code: type-error, status: 0, retryable: false}
+      - {code: file-not-found-error, status: 0, retryable: false}
+    behavior:
+      - if: "!('mooncake-config-path' in config) || config['mooncake-config-path'] == null || config['mooncake-config-path'] == ''"
+        then:
+          - source: "vllm/distributed/mooncake_store.py:74-77"
+            fail: {code: value-error, status: 0, message: "The environment variable 'MOONCAKE_CONFIG_PATH' is not set."}
+      - title: json.load(open(path))
+        source: "vllm/distributed/mooncake_store.py:52-53"
+        call: local-disk.read-file
+        input: {path: "= config['mooncake-config-path']"}
+        as: f
+      - set: {vars.c: "= vars.f.value.json"}
+      - title: "_normalize_tenant_id: None is the default; a non-string is a TypeError; stripped, empty is the default"
+        source: "vllm/distributed/mooncake_store.py:80-88"
+        set:
+          vars.t: "= 'tenant_id' in vars.c ? vars.c.tenant_id : 'default'"
+      - if: "vars.t != null && type(vars.t) != string"
+        then:
+          - fail: {code: type-error, status: 0, message: "= 'tenant_id must be a string or null, got ' + (type(vars.t) == int ? 'int' : (type(vars.t) == bool ? 'bool' : 'object')) + ': ' + string(vars.t)"}
+      - set:
+          vars.tenant: "= vars.t == null || vars.t.trim() == '' ? 'default' : vars.t.trim()"
+      - call: mooncake-store-config.parse-size
+        input: {value: "= 'global_segment_size' in vars.c ? vars.c.global_segment_size : 4294967296"}
+        as: gss
+      - call: mooncake-store-config.parse-size
+        input: {value: "= 'local_buffer_size' in vars.c ? vars.c.local_buffer_size : 4294967296"}
+        as: lbs
+      - set:
+          vars.cfg:
+            metadata_server: "= 'metadata_server' in vars.c ? vars.c.metadata_server : ''"
+            master_server_address: "= 'master_server_address' in vars.c ? vars.c.master_server_address : ''"
+            protocol: "= 'protocol' in vars.c ? vars.c.protocol : 'rdma'"
+            device_name: "= 'device_name' in vars.c ? vars.c.device_name : ''"
+            mode: "= 'mode' in vars.c ? vars.c.mode : 'embedded'"
+            global_segment_size: "= vars.gss.value.bytes"
+            local_buffer_size: "= vars.lbs.value.bytes"
+            enable_offload: "= 'enable_offload' in vars.c && vars.c.enable_offload == true"
+            tenant_id: "= vars.tenant"
+      - title: __post_init__ checks, in order
+        source: "vllm/distributed/mooncake_store.py:40-48"
+        if: "!(vars.cfg.mode in ['embedded', 'standalone-store'])"
+        then:
+          - fail: {code: value-error, status: 0, message: "= 'unknown Mooncake mode: \\'' + vars.cfg.mode + '\\''"}
+      - if: "vars.cfg.local_buffer_size <= 0"
+        then:
+          - source: "vllm/distributed/mooncake_store.py:43-44"
+            fail: {code: value-error, status: 0, message: "local_buffer_size must be > 0"}
+      - if: "vars.cfg.mode == 'embedded' && vars.cfg.global_segment_size == 0"
+        then:
+          - source: "vllm/distributed/mooncake_store.py:45-46"
+            fail: {code: value-error, status: 0, message: "embedded mode requires global_segment_size > 0"}
+      - if: "vars.cfg.mode == 'standalone-store' && vars.cfg.global_segment_size != 0"
+        then:
+          - source: "vllm/distributed/mooncake_store.py:47-48"
+            fail: {code: value-error, status: 0, message: "standalone-store mode requires global_segment_size == 0"}
+      - return: "= vars.cfg"
+
+  - component: mooncake-store-config
+    name: parse-size
+    kind: function
+    summary: "_parse_size: an int is bytes; a string is a number with an optional unit (gb, mb, kb, b; any case, spaces allowed), times 1024^n."
+    sources: ["vllm/distributed/mooncake_store.py:91-123"]
+    request: {type: object, required: [value], properties: {value: {}}}
+    response: {type: object, properties: {bytes: {type: integer}}}
+    errors:
+      - {code: value-error, status: 0, retryable: false}
+    behavior:
+      - if: "type(input.value) == int"
+        then:
+          - source: "vllm/distributed/mooncake_store.py:93-94"
+            return: {bytes: "= input.value"}
+      - set: {vars.c: "= string(input.value).trim().lowerAscii()"}
+      - if: "vars.c == ''"
+        then:
+          - source: "vllm/distributed/mooncake_store.py:101-103"
+            fail: {code: value-error, status: 0, message: "Size cannot be empty."}
+      - if: "!vars.c.matches('^\\\\s*([0-9.]+)\\\\s*(gb|mb|kb|b)?\\\\s*$')"
+        then:
+          - source: "vllm/distributed/mooncake_store.py:111-113"
+            fail: {code: value-error, status: 0, message: "= 'Invalid format: \\'' + string(input.value) + '\\''"}
+      - set:
+          vars.unit: "= vars.c.endsWith('gb') ? 'gb' : (vars.c.endsWith('mb') ? 'mb' : (vars.c.endsWith('kb') ? 'kb' : 'b'))"
+      - set:
+          vars.num: "= vars.c.endsWith(vars.unit) ? vars.c.substring(0, size(vars.c) - size(vars.unit)).trim() : vars.c"
+      - if: "!vars.num.matches('^[0-9]*\\\\.?[0-9]+$')"
+        then:
+          - source: "vllm/distributed/mooncake_store.py:119-122"
+            fail: {code: value-error, status: 0, message: "= 'Invalid numeric value \\'' + vars.num + '\\' in: \\'' + string(input.value) + '\\''"}
+      - source: "vllm/distributed/mooncake_store.py:105-123"
+        return: {bytes: "= int(double(vars.num) * double({'gb': 1073741824, 'mb': 1048576, 'kb': 1024, 'b': 1}[vars.unit]))"}
+
+  - component: mooncake-store-config
+    name: setup-mooncake-store
+    kind: function
+    summary: "setup_mooncake_store: call store.setup(local_hostname, metadata_server, global_segment_size, local_buffer_size, protocol, device_name, master_server_address), adding tenant_id as a keyword only when it isn't 'default'; a non-zero return fails."
+    sources: ["vllm/distributed/mooncake_store.py:126-143"]
+    request: {type: object, required: [config, local_hostname], properties: {config: DistMooncakeStoreConfig, local_hostname: {type: string}}}
+    response: {type: object, properties: {args: {type: array}, kwargs: {type: object}}}
+    errors:
+      - {code: runtime-error, status: 0, retryable: false}
+    behavior:
+      - title: "Only an explicit tenant is forwarded, so older Mooncake builds without the keyword keep working"
+        source: "vllm/distributed/mooncake_store.py:130-132"
+        set:
+          vars.kwargs: "= input.config.tenant_id != 'default' ? {'tenant_id': input.config.tenant_id} : {}"
+          vars.args: "= [(has(input.local_hostname) ? input.local_hostname : '127.0.0.1'), input.config.metadata_server, input.config.global_segment_size, input.config.local_buffer_size, input.config.protocol, input.config.device_name, input.config.master_server_address]"
+      - source: "vllm/distributed/mooncake_store.py:133-142"
+        call: mooncake-distributed-store.setup
+        input: {args: "= vars.args", kwargs: "= vars.kwargs"}
+        as: r
+      - if: "vars.r.value.ret != 0"
+        then:
+          - source: "vllm/distributed/mooncake_store.py:142-143"
+            fail: {code: runtime-error, status: 0, message: "Initialize MooncakeDistributedStore failed."}
+      - return: {args: "= vars.args", kwargs: "= vars.kwargs"}
+
+  - component: mooncake-distributed-store
+    name: setup
+    kind: function
+    summary: "MooncakeDistributedStore.setup (native): records the call and returns the configured code (0 = success)."
+    sources: ["vllm/distributed/mooncake_store.py:133-141"]
+    request: {type: object, properties: {args: {type: array}, kwargs: {type: object}}}
+    response: {type: object, properties: {ret: {type: integer}}}
+    behavior:
+      - set: {state.setup_calls: "= state.setup_calls + [{'args': input.args, 'kwargs': input.kwargs}]"}
+      - return: {ret: "= state.setup_ret"}
+
+  - component: mooncake-store-worker
+    name: init-store
+    kind: function
+    summary: "MooncakeStoreWorker.__init__ (the store part): load the Mooncake Store config, build a MooncakeDistributedStore with its own transfer engine, and set it up from this host's requester hostname (the tenant forwarded when non-default)."
+    sources: ["vllm/distributed/kv_transfer/kv_connector/v1/mooncake/store/worker.py:1413-1422", "vllm/distributed/kv_transfer/kv_connector/v1/mooncake/store/worker.py:1443-1452"]
+    request: {type: object, properties: {local_hostname: {type: string, default: "127.0.0.1", description: "rdma_utils.get_requester_local_hostname(get_ip())"}}}
+    response: {type: object, properties: {mode: {type: string}, tenant_id: {type: string}, setup_kwargs: {type: object}}}
+    errors:
+      - {code: value-error, status: 0, retryable: false}
+      - {code: type-error, status: 0, retryable: false}
+      - {code: file-not-found-error, status: 0, retryable: false}
+      - {code: runtime-error, status: 0, retryable: false}
+    behavior:
+      - source: "vllm/distributed/kv_transfer/kv_connector/v1/mooncake/store/worker.py:1413"
+        call: mooncake-store-config.load-from-config
+        as: cfg
+      - source: "vllm/distributed/kv_transfer/kv_connector/v1/mooncake/store/worker.py:1418-1422"
+        call: mooncake-store-config.setup-mooncake-store
+        input: {config: "= vars.cfg.value", local_hostname: "= (has(input.local_hostname) ? input.local_hostname : '127.0.0.1')"}
+        as: s
+      - return: {mode: "= vars.cfg.value.mode", tenant_id: "= vars.cfg.value.tenant_id", setup_kwargs: "= vars.s.value.kwargs"}
+
+  - component: mooncake-embedding-store-client
+    name: create
+    kind: function
+    summary: "create_mooncake_embedding_store_client: load the shared Mooncake Store config, refuse an SSD-offload config (the cross-encoder cache is a RAM store), and set the store up like the KV client (tenant forwarded when non-default)."
+    sources: ["vllm/distributed/ec_transfer/ec_connector/mooncake_store_embedding/store_client.py:87-123"]
+    request: {type: object, properties: {local_hostname: {type: string, default: "127.0.0.1"}, read_buffer_bytes: {type: integer, default: 134217728}}}
+    response: {type: object, properties: {mode: {type: string}, read_buffer_bytes: {type: integer}, setup_kwargs: {type: object}}}
+    errors:
+      - {code: value-error, status: 0, retryable: false}
+      - {code: type-error, status: 0, retryable: false}
+      - {code: file-not-found-error, status: 0, retryable: false}
+      - {code: runtime-error, status: 0, retryable: false}
+    behavior:
+      - source: "vllm/distributed/ec_transfer/ec_connector/mooncake_store_embedding/store_client.py:104"
+        call: mooncake-store-config.load-from-config
+        as: cfg
+      - if: "vars.cfg.value.enable_offload"
+        then:
+          - source: "vllm/distributed/ec_transfer/ec_connector/mooncake_store_embedding/store_client.py:105-108"
+            fail: {code: value-error, status: 0, message: "cross_encoder_cache supports a RAM Store; disable enable_offload"}
+      - source: "vllm/distributed/ec_transfer/ec_connector/mooncake_store_embedding/store_client.py:109-111"
+        call: mooncake-store-config.setup-mooncake-store
+        input: {config: "= vars.cfg.value", local_hostname: "= (has(input.local_hostname) ? input.local_hostname : '127.0.0.1')"}
+        as: s
+      - return: {mode: "= vars.cfg.value.mode", read_buffer_bytes: "= (has(input.read_buffer_bytes) ? input.read_buffer_bytes : 134217728)", setup_kwargs: "= vars.s.value.kwargs"}
+
+  # ---------------------------------------------------------------- nccl_m2n trainer init info
+  - component: m2n-trainer-init-info
+    name: post-init
+    kind: function
+    summary: "M2NTrainerInitInfo.__post_init__: first the rendezvous mode (a pre-shared 128-byte base64 unique id, or both master_address and master_port, not both), then 0 < num_trainer_ranks < world_size, a two-dim dst_mesh_dims covering the inference workers, and 0 <= rank < num_trainer_ranks."
+    sources: ["vllm/distributed/weight_transfer/m2n_trainer.py:93-122", "vllm/distributed/weight_transfer/nccl_common.py:32-68"]
+    request:
+      type: object
+      required: [world_size, rank]
+      properties:
+        master_address: {type: [string, "null"], default: null}
+        master_port: {type: [integer, "null"], default: null}
+        world_size: {type: integer, examples: [4]}
+        num_trainer_ranks: {type: integer, default: 1}
+        dst_mesh_dims: {type: [array, "null"], default: null, items: {type: integer}}
+        rank: {type: integer, examples: [0]}
+        nccl_unique_id_b64: {type: [string, "null"], default: null}
+    response: {type: object, properties: {destination_mesh_dims: {type: array, items: {type: integer}}, num_workers: {type: integer}}}
+    errors:
+      - {code: value-error, status: 0, retryable: false}
+    behavior:
+      - set:
+          vars.has_uid: "= (has(input.nccl_unique_id_b64) ? input.nccl_unique_id_b64 : null) != null && (has(input.nccl_unique_id_b64) ? input.nccl_unique_id_b64 : null) != ''"
+          vars.has_addr: "= (has(input.master_address) ? input.master_address : null) != null"
+          vars.has_port: "= (has(input.master_port) ? input.master_port : null) != null"
+      - title: "decode_nccl_unique_id(ctx='M2NTrainerInitInfo'), via the nccl_unique_id_bytes property"
+        source: "vllm/distributed/weight_transfer/nccl_common.py:44-47"
+        if: "vars.has_uid && (vars.has_addr || vars.has_port)"
+        then:
+          - fail: {code: value-error, status: 0, message: "M2NTrainerInitInfo: pass nccl_unique_id_b64 OR master_address/master_port, not both"}
+      - if: "!vars.has_uid && !(vars.has_addr && vars.has_port)"
+        then:
+          - source: "vllm/distributed/weight_transfer/nccl_common.py:48-54"
+            fail: {code: value-error, status: 0, message: "= 'M2NTrainerInitInfo: need nccl_unique_id_b64, or both master_address and master_port (got master_address=' + (vars.has_addr ? '\\'' + (has(input.master_address) ? input.master_address : null) + '\\'' : 'None') + ', master_port=' + (vars.has_port ? string((has(input.master_port) ? input.master_port : null)) : 'None') + ')'"}
+      - if: "vars.has_uid"
+        then:
+          - if: "size((has(input.nccl_unique_id_b64) ? input.nccl_unique_id_b64 : null)) % 4 != 0 || !(has(input.nccl_unique_id_b64) ? input.nccl_unique_id_b64 : null).matches('^[A-Za-z0-9+/]*={0,2}$')"
+            then:
+              - source: "vllm/distributed/weight_transfer/nccl_common.py:56-62"
+                fail: {code: value-error, status: 0, message: "M2NTrainerInitInfo: nccl_unique_id_b64 is not valid standard base64 (URL-safe base64 is not accepted)"}
+          - set:
+              vars.nbytes: "= size((has(input.nccl_unique_id_b64) ? input.nccl_unique_id_b64 : null)) / 4 * 3 - ((has(input.nccl_unique_id_b64) ? input.nccl_unique_id_b64 : null).endsWith('==') ? 2 : ((has(input.nccl_unique_id_b64) ? input.nccl_unique_id_b64 : null).endsWith('=') ? 1 : 0))"
+          - if: "vars.nbytes != 128"
+            then:
+              - source: "vllm/distributed/weight_transfer/nccl_common.py:63-67"
+                fail: {code: value-error, status: 0, message: "= 'M2NTrainerInitInfo: nccl_unique_id_b64 must decode to 128 bytes, got ' + string(vars.nbytes)"}
+      - if: "!(0 < (has(input.num_trainer_ranks) ? input.num_trainer_ranks : 1) && (has(input.num_trainer_ranks) ? input.num_trainer_ranks : 1) < input.world_size)"
+        then:
+          - source: "vllm/distributed/weight_transfer/m2n_trainer.py:96-100"
+            fail: {code: value-error, status: 0, message: "= '`num_trainer_ranks` (' + string((has(input.num_trainer_ranks) ? input.num_trainer_ranks : 1)) + ') must leave at least one worker in world_size ' + string(input.world_size)"}
+      - set: {vars.nw: "= input.world_size - (has(input.num_trainer_ranks) ? input.num_trainer_ranks : 1)"}
+      - if: "(has(input.dst_mesh_dims) ? input.dst_mesh_dims : null) != null && (size((has(input.dst_mesh_dims) ? input.dst_mesh_dims : null)) != 2 || (has(input.dst_mesh_dims) ? input.dst_mesh_dims : null)[0] * (has(input.dst_mesh_dims) ? input.dst_mesh_dims : null)[size((has(input.dst_mesh_dims) ? input.dst_mesh_dims : null)) - 1] != vars.nw)"
+        then:
+          - source: "vllm/distributed/weight_transfer/m2n_trainer.py:101-108"
+            fail: {code: value-error, status: 0, message: "= '`dst_mesh_dims` (' + (has(input.dst_mesh_dims) ? input.dst_mesh_dims : null).map(d, string(d)).join(', ') + (size((has(input.dst_mesh_dims) ? input.dst_mesh_dims : null)) == 1 ? ',' : '') + ') must be two dims covering the ' + string(vars.nw) + ' inference workers'"}
+      - if: "!(0 <= input.rank && input.rank < (has(input.num_trainer_ranks) ? input.num_trainer_ranks : 1))"
+        then:
+          - source: "vllm/distributed/weight_transfer/m2n_trainer.py:109-113"
+            fail: {code: value-error, status: 0, message: "= 'trainer `rank` (' + string(input.rank) + ') must be below `num_trainer_ranks` (' + string((has(input.num_trainer_ranks) ? input.num_trainer_ranks : 1)) + ')'"}
+      - source: "vllm/distributed/weight_transfer/m2n_trainer.py:86-91"
+        return: {destination_mesh_dims: "= (has(input.dst_mesh_dims) ? input.dst_mesh_dims : null) != null ? (has(input.dst_mesh_dims) ? input.dst_mesh_dims : null) : [vars.nw, 1]", num_workers: "= vars.nw"}
+
+schemas:
+  - id: DistAll2AllResult
+    summary: "What an MoE all-to-all step leaves on this rank: its token rows after the collective, the per-rank sizes used, the group and the manager."
+    schema:
+      type: object
+      properties:
+        num_tokens: {type: integer}
+        sizes: {type: array, items: {type: integer}}
+        comm_group: {type: string}
+        manager: {type: string}
+  - id: DistMooncakeStoreConfig
+    summary: "MooncakeStoreConfig (vllm/distributed/mooncake_store.py:20-38)."
+    schema:
+      type: object
+      properties:
+        metadata_server: {type: string}
+        master_server_address: {type: string}
+        protocol: {type: string}
+        device_name: {type: string}
+        mode: {type: string, enum: [embedded, standalone-store]}
+        global_segment_size: {type: integer}
+        local_buffer_size: {type: integer}
+        enable_offload: {type: boolean}
+        tenant_id: {type: string}
+
+flows:
+  - id: distributed-ep-dispatch
+    tags: ["feature:expert-parallel"]
+    name: MoE all-to-all dispatch on the EP group
+    description: "The seam group-coordinator.dispatch as the MoE prepare/finalize calls it (get_ep_group().dispatch)."
+    entry: {caller: gpu-worker, interface: group-coordinator.dispatch, input: {num_tokens: 3}}
+    sources: ["vllm/distributed/parallel_state.py:1430-1450"]
+  - id: distributed-ep-combine
+    tags: ["feature:expert-parallel"]
+    name: MoE all-to-all combine on the EP group
+    entry: {caller: gpu-worker, interface: group-coordinator.combine, input: {num_tokens: 8}}
+    sources: ["vllm/distributed/parallel_state.py:1452-1458"]
+  - id: distributed-nixl-push-request-finished
+    tags: ["feature:disaggregated-prefill"]
+    name: NIXL push scheduler request_finished
+    entry: {caller: scheduler, interface: nixl-push-connector-scheduler.request-finished, input: {request_id: req-p1, status: FINISHED_STOPPED, kv_transfer_params: {do_remote_prefill: false, do_remote_decode: true}, block_ids: [[1, 2, 3]], num_computed_tokens: 48}}
+    sources: ["vllm/distributed/kv_transfer/kv_connector/v1/nixl/push_scheduler.py:207-294"]
+  - id: distributed-mooncake-store-worker-init
+    name: Mooncake Store KV worker sets up its store
+    entry: {caller: gpu-worker, interface: mooncake-store-worker.init-store}
+    sources: ["vllm/distributed/kv_transfer/kv_connector/v1/mooncake/store/worker.py:1413-1422"]
+  - id: distributed-mooncake-embedding-client-create
+    name: Mooncake Store EC client creation
+    entry: {caller: gpu-worker, interface: mooncake-embedding-store-client.create}
+    sources: ["vllm/distributed/ec_transfer/ec_connector/mooncake_store_embedding/store_client.py:87-123"]
+  - id: distributed-m2n-trainer-init-info
+    name: nccl_m2n trainer init info validation
+    entry: {caller: python-user, interface: m2n-trainer-init-info.post-init, input: {master_address: "127.0.0.1", master_port: 1234, world_size: 4, num_trainer_ranks: 2, rank: 0}}
+    sources: ["vllm/distributed/weight_transfer/m2n_trainer.py:93-113"]
+
+scenarios:
+  # ---------------------------------------------------------------- EP in the MoE world
+  - id: distributed-moe-ep-group-tp2-no-all2all
+    name: "Mixtral TP 2 with expert parallelism: the EP group spans both ranks, but DP is 1, so it gets no all-to-all and dispatch has no manager"
+    description: >-
+      FusedMoEParallelConfig gives each rank 4 whole experts (use_ep, ep_size = TP x DP = 2), but
+      ParallelConfig.use_all2all is false at DP 1 (config/parallel.py:784-789): the EP communicator
+      builds no all2all manager (cuda_communicator.py:202), the MoE layer makes no prepare/finalize
+      (all2all_utils.py:195-222) and reduces its output with the TP all-reduce instead. Calling
+      dispatch anyway hits `assert self.all2all_manager is not None`.
+    fixtures: [full-moe-mixtral-8x7b-tp2-ep]
+    state:
+      "parallel-state@rank0": {mp_initialized: false, world_initialized: true, world_size: 2, groups: {}}
+      "parallel-state@rank1": {mp_initialized: false, world_initialized: true, world_size: 2, groups: {}}
+    steps:
+      - {interface: parallel-state.initialize-model-parallel, caller: gpu-worker, on: rank0, as: i0, input: {tensor_model_parallel_size: 2, pipeline_model_parallel_size: 1, is_moe: true}}
+      - {interface: parallel-state.initialize-model-parallel, caller: gpu-worker, on: rank1, as: i1, input: {tensor_model_parallel_size: 2, pipeline_model_parallel_size: 1, is_moe: true}}
+      - {interface: parallel-state.get-ep-group, caller: gpu-worker, on: rank1, as: ep}
+      - {flow: distributed-ep-dispatch, as: d, on: rank0}
+    expect:
+      - "steps.i0.result.ok && steps.i1.result.ok && 'ep' in steps.i0.result.value.groups"
+      - "steps.ep.result.value.world_size == 2 && steps.ep.result.value.rank_in_group == 1 && !steps.ep.result.value.use_all2all && steps.ep.result.value.all2all_manager == null"
+      - "state['parallel-state@rank0'].groups.dp.world_size == 1 && state['parallel-state@rank0'].groups.tp.world_size == 2"
+      - "!steps.d.result.ok && steps.d.result.error.code == 'assertion-error' && steps.d.result.error.message == ''"
+  - id: distributed-moe-dense-model-has-no-ep-group
+    name: A dense model gets no EP group, and get_ep_group says so
+    fixtures: [full-tp1-llama-8b]
+    state:
+      parallel-state: {mp_initialized: false, world_initialized: true, world_size: 1, groups: {}}
+    steps:
+      - {interface: parallel-state.initialize-model-parallel, caller: gpu-worker, as: i, input: {tensor_model_parallel_size: 1, pipeline_model_parallel_size: 1, is_moe: false}}
+      - {interface: parallel-state.get-ep-group, caller: gpu-worker, as: ep}
+    expect:
+      - "steps.i.result.ok && !('ep' in state['parallel-state@rank0'].groups)"
+      - "!steps.ep.result.ok && steps.ep.result.error.message == 'expert parallel group is not initialized. EP group is only created for MoE models with num_experts > 0. This function should only be called for MoE models.'"
+  - id: distributed-moe-ep-dp2-dispatch-combine
+    name: "Mixtral DP 2 with EP: the EP group uses AgRs all-to-all; dispatch all-gathers 3 + 5 tokens to 8 on both ranks, combine reduce-scatters them back"
+    description: >-
+      With data_parallel_size 2 (TP 1) the EP group has 2 ranks and use_all2all, so its
+      communicator builds AgRsAll2AllManager for the default allgather_reducescatter backend.
+      dispatch takes the DP group (all2all.py:84-85) and the DP chunk sizes [3, 5]
+      (all2all.py:89-97), checks this rank's rows and all_gatherv's to 8 rows; combine
+      reduce_scatterv's the 8 expert rows back to 3 on rank0 and 5 on rank1.
+    fixtures: [full-moe-mixtral-8x7b-tp2-ep]
+    config: {data-parallel-size: 2, tensor-parallel-size: 1}
+    state:
+      "parallel-state@rank0": {mp_initialized: false, world_initialized: true, world_size: 2, groups: {}}
+      "parallel-state@rank1": {mp_initialized: false, world_initialized: true, world_size: 2, groups: {}}
+    steps:
+      - {interface: parallel-state.initialize-model-parallel, caller: gpu-worker, on: rank0, as: i0, input: {tensor_model_parallel_size: 1, pipeline_model_parallel_size: 1, is_moe: true}}
+      - {interface: parallel-state.initialize-model-parallel, caller: gpu-worker, on: rank1, as: i1, input: {tensor_model_parallel_size: 1, pipeline_model_parallel_size: 1, is_moe: true}}
+      - {flow: distributed-ep-dispatch, as: d0, on: rank0, at_ms: 10, await: false, input: {num_tokens: 3, dp_chunk_sizes: [3, 5]}}
+      - {flow: distributed-ep-dispatch, as: d1, on: rank1, at_ms: 10, await: false, input: {num_tokens: 5, dp_chunk_sizes: [3, 5]}}
+      - {flow: distributed-ep-combine, as: c0, on: rank0, at_ms: 50, await: false, input: {num_tokens: 8, dp_chunk_sizes: [3, 5]}}
+      - {flow: distributed-ep-combine, as: c1, on: rank1, at_ms: 50, await: false, input: {num_tokens: 8, dp_chunk_sizes: [3, 5]}}
+    expect:
+      - "state['parallel-state@rank0'].groups.ep.use_all2all && state['parallel-state@rank0'].groups.ep.all2all_manager == 'AgRsAll2AllManager' && state['parallel-state@rank0'].groups.ep.world_size == 2"
+      - "steps.d0.result.value.num_tokens == 8 && steps.d1.result.value.num_tokens == 8 && steps.d0.result.value.comm_group == 'dp'"
+      - "steps.c0.result.value.num_tokens == 3 && steps.c1.result.value.num_tokens == 5"
+      - "trace.filter(e, e.type == 'call.start' && e.interface == 'cuda-communicator.all-gatherv').size() == 2"
+  - id: distributed-moe-ep-dispatch-wrong-local-size
+    name: A rank whose rows don't match its DP chunk size fails dispatch's size assertion before any collective
+    fixtures: [full-moe-mixtral-8x7b-tp2-ep]
+    config: {data-parallel-size: 2, tensor-parallel-size: 1}
+    state:
+      "parallel-state@rank0": {mp_initialized: true, world_initialized: true, world_size: 2, groups: {tp: {world_size: 1, unique_name: "tp:0"}, pcp: {world_size: 1, unique_name: "pcp:0"}, dp: {world_size: 2, unique_name: "dp:0"}, ep: {world_size: 2, unique_name: "ep:0", use_all2all: true, all2all_manager: AgRsAll2AllManager}}}
+    steps:
+      - {flow: distributed-ep-dispatch, as: d, input: {num_tokens: 4, dp_chunk_sizes: [3, 5]}}
+      - {flow: distributed-ep-dispatch, as: nometa, input: {num_tokens: 3}}
+    expect:
+      - "!steps.d.result.ok && steps.d.result.error.code == 'assertion-error'"
+      - "!steps.nometa.result.ok && steps.nometa.result.error.code == 'assertion-error'"
+      - "!trace.exists(e, e.type == 'call.start' && e.interface == 'cuda-communicator.all-gatherv')"
+  - id: distributed-moe-ep-no-device-communicator-passthrough
+    name: Without a device communicator, dispatch and combine return their inputs
+    fixtures: [full-moe-mixtral-8x7b-tp2-ep]
+    steps:
+      - {flow: distributed-ep-dispatch, as: d, input: {num_tokens: 3, has_device_communicator: false}}
+      - {flow: distributed-ep-combine, as: c, input: {num_tokens: 3, has_device_communicator: false}}
+    expect:
+      - "steps.d.result.value.num_tokens == 3 && steps.d.result.value.comm_group == 'none' && steps.c.result.value.num_tokens == 3"
+  - id: distributed-all-gatherv-checks
+    name: "all_gatherv: only dim 0; this rank's rows must equal sizes[rank]"
+    fixtures: [full-moe-mixtral-8x7b-tp2-ep]
+    steps:
+      - {interface: cuda-communicator.all-gatherv, caller: gpu-worker, as: dim1, input: {group_name: "dp:0", world_size: 2, num_tokens: 3, dim: 1}}
+      - {interface: cuda-communicator.all-gatherv, caller: gpu-worker, as: rows, input: {group_name: "dp:0", world_size: 2, num_tokens: 4, sizes: [3, 5]}}
+      - {interface: cuda-communicator.reduce-scatterv, caller: gpu-worker, as: rsn, input: {group_name: "dp:0", world_size: 2, num_tokens: 8, sizes: [3, 4, 1]}}
+      - {interface: cuda-communicator.reduce-scatterv, caller: gpu-worker, as: rsodd, input: {group_name: "dp:0", world_size: 2, num_tokens: 7}}
+    expect:
+      - "!steps.dim1.result.ok && steps.dim1.result.error.code == 'not-implemented-error' && steps.dim1.result.error.message == 'only dim 0 all-gatherv is supported'"
+      - "!steps.rows.result.ok && steps.rows.result.error.message == '4 != 3'"
+      - "!steps.rsn.result.ok && steps.rsn.result.error.message == '3 == 2'"
+      - "!steps.rsodd.result.ok && steps.rsodd.result.error.code == 'assertion-error'"
+  - id: distributed-ag-rs-comm-group-pcp-at-dp1
+    name: At DP 1 and not sequence parallel, the AgRs manager uses the PCP group; sequence parallel uses EP
+    fixtures: [full-moe-mixtral-8x7b-tp2-ep]
+    state:
+      "parallel-state@rank0": {groups: {tp: {world_size: 2, unique_name: "tp:0"}, pcp: {world_size: 1, unique_name: "pcp:0"}, dp: {world_size: 1, unique_name: "dp:0"}, ep: {world_size: 2, unique_name: "ep:0", use_all2all: true, all2all_manager: AgRsAll2AllManager}}}
+    steps:
+      - {interface: ag-rs-all2all-manager.comm-group, caller: gpu-worker, as: g}
+      - {interface: ag-rs-all2all-manager.comm-group, caller: gpu-worker, as: sp, input: {is_sequence_parallel: true}}
+      - {interface: ag-rs-all2all-manager.get-sizes, caller: gpu-worker, as: eq, input: {num_local_tokens: 4, world_size: 2, dp_world_size: 1}}
+    expect:
+      - "steps.g.result.value.name == 'pcp' && steps.sp.result.value.name == 'ep' && steps.sp.result.value.world_size == 2"
+      - "steps.eq.result.value.sizes == [4, 4]"
+  - id: distributed-ag-rs-comm-group-dp-pcp-tp-assert
+    name: DP with EP and PCP > 1 needs TP 1; with TP 2 the manager asserts
+    fixtures: [full-moe-mixtral-8x7b-tp2-ep]
+    state:
+      "parallel-state@rank0": {groups: {tp: {world_size: 2, unique_name: "tp:0"}, pcp: {world_size: 2, unique_name: "pcp:0"}, dp: {world_size: 2, unique_name: "dp:0"}, ep: {world_size: 8, unique_name: "ep:0", use_all2all: true, all2all_manager: AgRsAll2AllManager}}}
+    steps:
+      - {interface: ag-rs-all2all-manager.comm-group, caller: gpu-worker, as: g}
+    expect:
+      - "!steps.g.result.ok && steps.g.result.error.message == 'DP+PCP with TP>1 requires sequence-parallel MoE inputs'"
+  - id: distributed-moe-ep-tp2-dp2-sequence-parallel-all2all
+    name: "TP 2 x DP 2 with EP and the default backend is sequence-parallel MoE: the EP group (4 ranks) uses all-to-all"
+    fixtures: [full-tp4-llama-70b]
+    config: {data-parallel-size: 2, tensor-parallel-size: 2, enable-expert-parallel: true}
+    state:
+      parallel-state: {mp_initialized: false, world_initialized: true, world_size: 4, groups: {}}
+    steps:
+      - {interface: parallel-state.initialize-model-parallel, caller: gpu-worker, as: i, input: {tensor_model_parallel_size: 2, pipeline_model_parallel_size: 1, is_moe: true}}
+    expect:
+      - "steps.i.result.ok && state['parallel-state@rank0'].groups.ep.world_size == 4 && state['parallel-state@rank0'].groups.ep.use_all2all && state['parallel-state@rank0'].groups.ep.all2all_manager == 'AgRsAll2AllManager'"
+  - id: distributed-moe-ep-deepep-backend-manager
+    name: With --all2all-backend deepep_low_latency the DP-2 EP group builds the DeepEP low-latency manager, whose dispatch the model does not simulate
+    fixtures: [full-moe-mixtral-8x7b-tp2-ep]
+    config: {data-parallel-size: 2, tensor-parallel-size: 1, all2all-backend: deepep_low_latency}
+    state:
+      "parallel-state@rank0": {mp_initialized: false, world_initialized: true, world_size: 2, groups: {}}
+    steps:
+      - {interface: parallel-state.initialize-model-parallel, caller: gpu-worker, as: i, input: {tensor_model_parallel_size: 1, pipeline_model_parallel_size: 1, is_moe: true}}
+      - {flow: distributed-ep-dispatch, as: d, input: {num_tokens: 3}}
+      - {flow: distributed-ep-combine, as: c, input: {num_tokens: 3}}
+    expect:
+      - "state['parallel-state@rank0'].groups.ep.all2all_manager == 'DeepEPLLAll2AllManager'"
+      - "steps.d.result.value.manager == 'DeepEPLLAll2AllManager' && steps.c.result.value.manager == 'DeepEPLLAll2AllManager'"
+  - id: distributed-get-dp-pcp-group-uninitialized
+    name: get_dp_group and get_pcp_group assert before the groups exist
+    fixtures: [full-tp1-llama-8b]
+    state:
+      parallel-state: {groups: {dp: {$absent: true}}}
+    steps:
+      - {interface: parallel-state.get-dp-group, caller: gpu-worker, as: dp}
+      - {interface: parallel-state.get-pcp-group, caller: gpu-worker, as: pcp}
+    expect:
+      - "steps.dp.result.error.message == 'data parallel group is not initialized' && steps.pcp.result.error.message == 'prefill context parallel group is not initialized'"
+  - id: distributed-reduce-scatterv-pynccl-disabled
+    name: reduce_scatterv and all_gatherv require PyNccl
+    fixtures: [full-moe-mixtral-8x7b-tp2-ep]
+    state:
+      pynccl-communicator: {disabled: true}
+    steps:
+      - {interface: cuda-communicator.reduce-scatterv, caller: gpu-worker, as: rs, input: {group_name: "dp:0", world_size: 2, num_tokens: 8}}
+      - {interface: cuda-communicator.all-gatherv, caller: gpu-worker, as: ag, input: {group_name: "dp:0", world_size: 2, num_tokens: 4}}
+    expect:
+      - "!steps.rs.result.ok && steps.rs.result.error.message == 'reduce_scatterv requires PyNccl'"
+      - "!steps.ag.result.ok && steps.ag.result.error.code == 'assertion-error'"
+
+  # ---------------------------------------------------------------- precision regressions (round-5 sweep)
+  - id: distributed-r5-mp-init-pp-mismatch-message
+    name: "ensure_model_parallel_initialized: a PP mismatch names both sizes the way the f-string's = specifier prints them"
+    fixtures: [full-tp1-llama-8b]
+    state:
+      parallel-state: {mp_initialized: true, groups: {tp: {world_size: 1, unique_name: "tp:0"}, pp: {world_size: 1, unique_name: "pp:0"}}}
+    steps:
+      - {interface: parallel-state.ensure-model-parallel-initialized, caller: gpu-worker, as: e, input: {tensor_model_parallel_size: 1, pipeline_model_parallel_size: 2}}
+    expect:
+      - "!steps.e.result.ok && steps.e.result.error.message == 'pipeline parallel group already initialized, but of unexpected size. got: pp_world_size=1 vs. wanted: pipeline_model_parallel_size=2'"
+  - id: distributed-r5-invalid-dim-message
+    name: "GroupCoordinator.all_gather: an out-of-range dim names the tensor's shape"
+    fixtures: [full-tp4-llama-70b]
+    steps:
+      - {interface: group-coordinator.all-gather, caller: gpu-worker, as: g, input: {num_tokens: 16, world_size: 4, dim: 2}}
+      - {interface: group-coordinator.reduce-scatter, caller: gpu-worker, as: r, input: {num_tokens: 16, world_size: 4, dim: -3}}
+    expect:
+      - "steps.g.result.error.message == 'Invalid dim (2) for input tensor with shape torch.Size([16, 4096])'"
+      - "steps.r.result.error.message == 'Invalid dim (-3) for input tensor with shape torch.Size([16, 4096])'"
+  - id: distributed-r5-kv-cache-layout-keyerror-repr
+    name: An unknown KVCacheLayout name is a KeyError whose text is the quoted name
+    fixtures: [full-tp1-llama-8b]
+    steps:
+      - {interface: kv-cache-layout.properties, caller: gpu-worker, as: k, input: {layout: NHD}}
+    expect:
+      - "!steps.k.result.ok && steps.k.result.error.code == 'key-error' && steps.k.result.error.message == \"'NHD'\""
+  - id: distributed-r5-m2n-dtype-message
+    name: "check_transferable: an unsupported dtype lists the supported ones, sorted as strings"
+    fixtures: [full-tp1-llama-8b]
+    steps:
+      - {flow: distributed-m2n-check-transferable, as: c, input: {name: w, dtype: complex64, shape: [4]}}
+    expect:
+      - "steps.c.result.error.message == \"parameter 'w' has dtype torch.complex64, which nccl_m2n does not support. Supported: ['torch.bfloat16', 'torch.float16', 'torch.float32', 'torch.float64', 'torch.float8_e4m3fn', 'torch.float8_e5m2', 'torch.int32', 'torch.int64', 'torch.int8', 'torch.uint32', 'torch.uint64', 'torch.uint8']\""
+  - id: distributed-r5-moriio-release-and-binary-messages
+    name: "MoRIIO: a bad consumer_tp_size and an undecodable message name the offending value"
+    fixtures: [full-tp1-llama-8b]
+    steps:
+      - {interface: moriio-wrapper.handle-message, caller: gpu-worker, as: badtp, input: {kind: structured, type: release, transfer_id: xfer-3, consumer_tp_size: -1}}
+      - {interface: moriio-wrapper.handle-message, caller: gpu-worker, as: bin, input: {kind: binary, text: "b'\\xff\\xfe'"}}
+    expect:
+      - "steps.badtp.result.error.message == 'Invalid consumer_tp_size in release message: -1'"
+      - "steps.bin.result.error.message == \"Unhandled message format: b'\\\\xff\\\\xfe'\""
+  - id: distributed-r5-aux-store-evicted-message
+    name: "BlockObjectStore.get_concatenated: an evicted key reports the store's use and limit"
+    fixtures: [full-tp1-llama-8b]
+    state:
+      block-object-store: {objects: {"req-a/0": "aa"}, num_slots: 4}
+    steps:
+      - {interface: block-object-store.get-concatenated, caller: gpu-worker, as: g, input: {keys: ["req-a/0", "req-b/0"]}}
+    expect:
+      - "steps.g.result.error.message == 'auxiliary output object does not exist; the object may have been evicted (used=1, limit=4 objects). Increase aux_output_config.max_bytes when a KV cache hit requires it.'"
+  - id: distributed-r5-embedding-cache-duplicate-repr
+    name: "EmbeddingCache.alloc: a duplicate key is named with its repr"
+    fixtures: [full-tp1-llama-8b]
+    state:
+      ec-embedding-cache: {entries: {img1: {blocks: [0], refs: 1}}}
+    steps:
+      - {interface: ec-embedding-cache.alloc, caller: engine-core, as: a, input: {key: img1, n_blocks: 1}}
+    expect:
+      - "steps.a.result.error.message == \"EmbeddingCache: duplicate alloc for 'img1'\""
+  - id: distributed-r5-nixl-listener-keyerror-tuple
+    name: "The NIXL handshake listener's KeyError for a missing rank prints the (pp, tp) tuple"
+    fixtures: [full-tp1-llama-8b]
+    state:
+      nixl-pull-connector-scheduler: {listener_started: true, encoded_data: {"0,0": meta0}, handshake_inbox: [{msg: GET_META_MSG, pp_rank: 0, tp_rank: 3}]}
+    steps:
+      - {interface: nixl-pull-connector-scheduler.nixl-handshake-listener, caller: engine-core, as: l}
+    expect:
+      - "!steps.l.result.ok && steps.l.result.error.code == 'key-error' && steps.l.result.error.message == '(0, 3)'"
+      - "size(state['nixl-pull-connector-scheduler'].handshake_replies) == 0"
+  - id: distributed-r5-p2p-probe-crash-message
+    name: "gpu_p2p_access_check: a crashed probe names the device pairs it tested"
+    fixtures: [full-tp1-llama-8b]
+    choices: {all-reduce-utils.main.probe: crashed}
+    steps:
+      - {interface: all-reduce-utils.main, caller: gpu-worker, as: m, input: {pairs: 2}}
+    expect:
+      - "steps.m.result.error.message == 'Error happened when batch testing peer-to-peer access from (0, 0, 1, 1) to (0, 1, 0, 1):\\n'"
+
+  # ---------------------------------------------------------------- NIXL push scheduler
+  - id: distributed-nixl-push-request-finished-p-side
+    name: A finished P-side request keeps its blocks under the lease, stashes them for the workers and returns push params for the decoder
+    flow: distributed-nixl-push-request-finished
+    fixtures: [full-tp1-llama-8b]
+    config: {kv-connector: NixlPushConnector, kv-role: kv_both}
+    steps:
+      - {interface: kv-connector-base-v1.request-finished, caller: scheduler, as: f, input: {request_id: req-p1, status: FINISHED_STOPPED, kv_transfer_params: {do_remote_prefill: false, do_remote_decode: true}, block_ids: [[1, 2, 3]], num_computed_tokens: 48}}
+      - {interface: nixl-push-connector-scheduler.request-finished, caller: scheduler, as: run, input: {request_id: req-r, status: RUNNING, kv_transfer_params: {do_remote_decode: true}, block_ids: [[4]]}}
+      - {interface: nixl-push-connector-scheduler.request-finished, caller: scheduler, as: d, input: {request_id: req-d, status: FINISHED_STOPPED, kv_transfer_params: {do_remote_decode: false}, block_ids: [[5]]}}
+      - {interface: nixl-push-connector-scheduler.request-finished, caller: scheduler, as: ab, input: {request_id: req-ab, status: FINISHED_ABORTED, kv_transfer_params: {do_remote_prefill: true, remote_engine_id: e1}}}
+      - {interface: nixl-push-connector-scheduler.request-finished, caller: scheduler, as: none, input: {request_id: req-n, kv_transfer_params: null}}
+    expect:
+      - "steps.f.result.value.delay_free_blocks && steps.f.result.value.kv_transfer_params.transfer_mode == 'push' && steps.f.result.value.kv_transfer_params.remote_num_tokens == 48 && steps.f.result.value.kv_transfer_params.do_remote_prefill"
+      - "'req-p1' in state['nixl-push-connector-scheduler'].reqs_need_send && state['nixl-push-connector-scheduler'].finished_request_blocks['req-p1'] == [[1, 2, 3]]"
+      - "!steps.run.result.value.delay_free_blocks && steps.run.result.value.kv_transfer_params == null && 'req-r' in state['nixl-push-connector-scheduler'].reqs_not_processed"
+      - "steps.d.result.value.kv_transfer_params == null && steps.none.result.value.kv_transfer_params == null"
+      - "steps.ab.result.value.kv_transfer_params == null && 'req-ab' in state['nixl-push-connector-scheduler'].reqs_need_recv"
+
+  # ---------------------------------------------------------------- NIXL pull worker: peer replacement
+  - id: distributed-nixl-peer-replaced-released-after-reads
+    name: "A new engine at the same address replaces the old one; the old peer is released only once its tracked READ finished"
+    fixtures: [full-tp1-llama-8b]
+    state:
+      nixl-pull-connector-worker: {remote_agents: [old], engine_by_address: {"localhost:1234": old}}
+    steps:
+      - flow: distributed-nixl-start-load
+        as: l1
+        input: {metadata: {reqs_to_recv: {old-req: {local_block_ids: [[1]], awaiting_kvs: true, remote: {block_ids: [[2]], engine_id: old, request_id: old-prefill, host: localhost, port: 1234}}}}}
+      - {interface: nixl-pull-connector-worker.ensure-handshake, caller: gpu-worker, as: hs, input: {engine_id: new, host: localhost, port: 1234}}
+      - {flow: distributed-nixl-get-finished, as: f1}
+    expect:
+      - "steps.hs.result.value.ok && steps.hs.result.value.replaced == 'old'"
+      - "steps.f1.result.value.finished_recving == ['old-req']"
+      - "state['nixl-pull-connector-worker@rank0'].removed_agents == ['old'] && state['nixl-pull-connector-worker@rank0'].remote_agents == ['new']"
+  - id: distributed-nixl-peer-other-address-kept
+    name: A handshake from another address does not replace the old peer
+    fixtures: [full-tp1-llama-8b]
+    state:
+      nixl-pull-connector-worker: {remote_agents: [old], engine_by_address: {"localhost:1234": old}}
+    steps:
+      - {interface: nixl-pull-connector-worker.ensure-handshake, caller: gpu-worker, as: hs, input: {engine_id: healthy, host: other-host, port: 1234}}
+      - {interface: nixl-pull-connector-worker.ensure-handshake, caller: gpu-worker, as: again, input: {engine_id: healthy, host: other-host, port: 1234}}
+      - {flow: distributed-nixl-get-finished, as: f}
+    expect:
+      - "steps.hs.result.value.replaced == null && steps.again.result.value.ok"
+      - "state['nixl-pull-connector-worker@rank0'].remote_agents == ['old', 'healthy'] && size(state['nixl-pull-connector-worker@rank0'].removed_agents) == 0"
+      - "calls['nixl-agent.handshake'] == 1"
+  - id: distributed-nixl-background-handshake-failure
+    name: A failed background handshake fails the request and counts one failed handshake
+    fixtures: [full-tp1-llama-8b]
+    faults: [{target: nixl-agent.handshake, type: error, code: handshake-error}]
+    steps:
+      - {interface: nixl-pull-connector-worker.background-nixl-handshake, caller: gpu-worker, as: b, input: {request_id: r1, meta: {local_block_ids: [[1]], awaiting_kvs: true, remote: {block_ids: [[2]], engine_id: e9, request_id: p9, host: h, port: 1}}}}
+    expect:
+      - "!steps.b.result.value.queued && state['nixl-pull-connector-worker@rank0'].failed_recv == ['r1']"
+      - "state['nixl-pull-connector-worker@rank0'].xfer_stats.num_failed_handshakes == [1]"
+
+  # ---------------------------------------------------------------- Mooncake Store config
+  - id: distributed-mooncake-store-config-defaults-and-errors
+    name: "MooncakeStoreConfig: defaults for missing keys, size strings, and the validation errors in order"
+    fixtures: [full-tp1-llama-8b]
+    config: {mooncake-config-path: /etc/mooncake.json}
+    state:
+      local-disk:
+        files:
+          /etc/mooncake.json: {json: {metadata_server: "http://meta", master_server_address: "10.0.0.7:50051", global_segment_size: " 512 MB ", local_buffer_size: 1024}}
+    steps:
+      - {interface: mooncake-store-config.load-from-config, caller: gpu-worker, as: ok}
+      - {interface: mooncake-store-config.parse-size, caller: gpu-worker, as: bad, input: {value: "4 GiB"}}
+      - {interface: mooncake-store-config.parse-size, caller: gpu-worker, as: empty, input: {value: "  "}}
+      - {interface: mooncake-store-config.parse-size, caller: gpu-worker, as: num, input: {value: "1.2.3gb"}}
+      - {interface: mooncake-store-config.parse-size, caller: gpu-worker, as: frac, input: {value: "1.5KB"}}
+    expect:
+      - "steps.ok.result.value.global_segment_size == 536870912 && steps.ok.result.value.local_buffer_size == 1024 && steps.ok.result.value.protocol == 'rdma' && steps.ok.result.value.mode == 'embedded' && steps.ok.result.value.tenant_id == 'default'"
+      - "steps.bad.result.error.message == \"Invalid format: '4 GiB'\" && steps.empty.result.error.message == 'Size cannot be empty.'"
+      - "steps.num.result.error.message == \"Invalid numeric value '1.2.3' in: '1.2.3gb'\" && steps.frac.result.value.bytes == 1536"
+  - id: distributed-mooncake-store-config-validation
+    name: "MooncakeStoreConfig.__post_init__: an unknown mode, then segment rules per mode; no MOONCAKE_CONFIG_PATH"
+    fixtures: [full-tp1-llama-8b]
+    config: {mooncake-config-path: /etc/m1.json}
+    state:
+      local-disk:
+        files:
+          /etc/m1.json: {json: {mode: hybrid, local_buffer_size: 0}}
+    steps:
+      - {interface: mooncake-store-config.load-from-config, caller: gpu-worker, as: mode}
+    expect:
+      - "steps.mode.result.error.message == \"unknown Mooncake mode: 'hybrid'\""
+  - id: distributed-mooncake-store-config-standalone-segment
+    fixtures: [full-tp1-llama-8b]
+    config: {mooncake-config-path: /etc/m2.json}
+    state:
+      local-disk:
+        files:
+          /etc/m2.json: {json: {mode: standalone-store}}
+    steps:
+      - {interface: mooncake-store-config.load-from-config, caller: gpu-worker, as: s}
+    expect:
+      - "steps.s.result.error.message == 'standalone-store mode requires global_segment_size == 0'"
+  - id: distributed-mooncake-store-config-unset
+    fixtures: [full-tp1-llama-8b]
+    steps:
+      - {flow: distributed-mooncake-store-worker-init, as: w}
+    expect:
+      - "!steps.w.result.ok && steps.w.result.error.message == \"The environment variable 'MOONCAKE_CONFIG_PATH' is not set.\""
+      - "size(state['mooncake-distributed-store@rank0'].setup_calls) == 0"
+  - id: distributed-mooncake-store-setup-failure-and-offload-refusal
+    name: "A non-zero setup() return fails the KV worker; the EC client refuses enable_offload before setting up"
+    fixtures: [full-tp1-llama-8b]
+    config: {mooncake-config-path: /etc/m3.json}
+    state:
+      mooncake-distributed-store: {setup_ret: -1}
+      local-disk:
+        files:
+          /etc/m3.json: {json: {enable_offload: true, tenant_id: "  "}}
+    steps:
+      - {flow: distributed-mooncake-store-worker-init, as: kv}
+      - {flow: distributed-mooncake-embedding-client-create, as: ec}
+    expect:
+      - "steps.kv.result.error.message == 'Initialize MooncakeDistributedStore failed.' && state['mooncake-distributed-store@rank0'].setup_calls[0].kwargs == {}"
+      - "steps.ec.result.error.message == 'cross_encoder_cache supports a RAM Store; disable enable_offload' && size(state['mooncake-distributed-store@rank0'].setup_calls) == 1"
+  - id: distributed-mooncake-store-tenant-type-error
+    fixtures: [full-tp1-llama-8b]
+    config: {mooncake-config-path: /etc/m4.json}
+    state:
+      local-disk:
+        files:
+          /etc/m4.json: {json: {tenant_id: 7}}
+    steps:
+      - {interface: mooncake-store-config.load-from-config, caller: gpu-worker, as: t}
+    expect:
+      - "steps.t.result.error.code == 'type-error' && steps.t.result.error.message == 'tenant_id must be a string or null, got int: 7'"
+
+  # ---------------------------------------------------------------- M2N trainer init info
+  - id: distributed-m2n-trainer-init-info-checks
+    name: "M2NTrainerInitInfo: the rendezvous mode first, then trainer ranks, the destination mesh and the trainer rank"
+    flow: distributed-m2n-trainer-init-info
+    fixtures: [full-tp1-llama-8b]
+    steps:
+      - {flow: distributed-m2n-trainer-init-info, as: ok}
+      - {interface: m2n-trainer-init-info.post-init, caller: python-user, as: both, input: {master_address: "127.0.0.1", master_port: 1234, nccl_unique_id_b64: "AAAA", world_size: 4, rank: 0}}
+      - {interface: m2n-trainer-init-info.post-init, caller: python-user, as: noport, input: {master_address: "127.0.0.1", world_size: 4, rank: 0}}
+      - {interface: m2n-trainer-init-info.post-init, caller: python-user, as: short, input: {nccl_unique_id_b64: "AAAA", world_size: 4, rank: 0}}
+      - {interface: m2n-trainer-init-info.post-init, caller: python-user, as: urlsafe, input: {nccl_unique_id_b64: "AA-_", world_size: 4, rank: 0}}
+      - {interface: m2n-trainer-init-info.post-init, caller: python-user, as: ranks, input: {master_address: "127.0.0.1", master_port: 1234, world_size: 2, num_trainer_ranks: 2, rank: 0}}
+      - {interface: m2n-trainer-init-info.post-init, caller: python-user, as: mesh, input: {master_address: "127.0.0.1", master_port: 1234, world_size: 6, num_trainer_ranks: 2, dst_mesh_dims: [3, 1], rank: 0}}
+      - {interface: m2n-trainer-init-info.post-init, caller: python-user, as: rank, input: {master_address: "127.0.0.1", master_port: 1234, world_size: 4, num_trainer_ranks: 2, rank: 3}}
+    expect:
+      - "steps.ok.result.value.destination_mesh_dims == [2, 1]"
+      - "steps.both.result.error.message == 'M2NTrainerInitInfo: pass nccl_unique_id_b64 OR master_address/master_port, not both'"
+      - "steps.noport.result.error.message == \"M2NTrainerInitInfo: need nccl_unique_id_b64, or both master_address and master_port (got master_address='127.0.0.1', master_port=None)\""
+      - "steps.short.result.error.message == 'M2NTrainerInitInfo: nccl_unique_id_b64 must decode to 128 bytes, got 3'"
+      - "steps.urlsafe.result.error.message == 'M2NTrainerInitInfo: nccl_unique_id_b64 is not valid standard base64 (URL-safe base64 is not accepted)'"
+      - "steps.ranks.result.error.message == '`num_trainer_ranks` (2) must leave at least one worker in world_size 2'"
+      - "steps.mesh.result.error.message == '`dst_mesh_dims` (3, 1) must be two dims covering the 4 inference workers'"
+      - "steps.rank.result.error.message == 'trainer `rank` (3) must be below `num_trainer_ranks` (2)'"

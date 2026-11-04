@@ -64,6 +64,29 @@ interfaces:
             on: "= input.engine"
             input: {request_type: UTILITY, method: "= input.method", args: "= has(input.args) ? input.args : {}", client_index: 0}
             as: dres
+          - if: "has(vars.dres.value.deferred) && vars.dres.value.deferred != null"
+            then:
+              - title: "A deferred reply from one DP engine: await it like the single-engine case"
+                source: "vllm/v1/engine/core_client.py:1280-1291"
+                foreach: "= lists.range(800)"
+                as: tick
+                max: 800
+                steps:
+                  - if: "has(state.utility_results) && vars.dres.value.deferred in state.utility_results"
+                    then:
+                      - set:
+                          vars.duo: "= state.utility_results[vars.dres.value.deferred]"
+                          state.utility_results: "= omit(state.utility_results, vars.dres.value.deferred)"
+                      - if: "vars.duo.failure_message != null"
+                        then:
+                          - fail: {code: exception, message: "= vars.duo.failure_message"}
+                      - return: "= vars.duo.result"
+                  - call: engine-core-proc.drive-step
+                    on: "= input.engine"
+                    on_error: continue
+                  - wait: "= vars.tick < 400 ? 1 : 1000"
+              - title: "Still pending when the simulation's poll bound ran out"
+                return: null
           - if: "vars.dres.value.failure_message != null"
             then:
               - fail: {code: exception, message: "= vars.dres.value.failure_message"}
@@ -71,6 +94,34 @@ interfaces:
       - call: engine-core-proc.process-input-sockets
         input: {request_type: UTILITY, method: "= input.method", args: "= has(input.args) ? input.args : {}", client_index: 0}
         as: res
+      - if: "has(vars.res.value.deferred) && vars.res.value.deferred != null"
+        then:
+          - title: "The engine deferred the reply (a Future): await the call_id's future, which the output socket task resolves"
+            source: "vllm/v1/engine/core_client.py:1280-1291"
+            foreach: "= lists.range(800)"
+            as: tick
+            max: 800
+            steps:
+              - if: "has(state.utility_results) && vars.res.value.deferred in state.utility_results"
+                then:
+                  - set:
+                      vars.uo: "= state.utility_results[vars.res.value.deferred]"
+                      state.utility_results: "= omit(state.utility_results, vars.res.value.deferred)"
+                  - if: "vars.uo.failure_message != null"
+                    then:
+                      - title: "_process_utility_output: future.set_exception(Exception(failure_message))"
+                        source: "vllm/v1/engine/core_client.py:900-903"
+                        fail: {code: exception, message: "= vars.uo.failure_message"}
+                  - return: "= vars.uo.result"
+              - if: "state.engine_dead"
+                then:
+                  - fail: {code: engine-dead-error, status: 500, message: "EngineCore encountered an issue. See stack trace (above) for the root cause."}
+              - title: "The engine-core process keeps stepping while the caller waits"
+                call: engine-core-proc.drive-step
+                on_error: continue
+              - wait: "= vars.tick < 400 ? 1 : 1000"
+          - title: "Still pending when the simulation's poll bound ran out"
+            return: null
       - if: "vars.res.value.failure_message != null"
         then:
           - title: "_process_utility_output: future.set_exception(Exception(failure_message))"
@@ -100,12 +151,24 @@ interfaces:
             call: async-llm.output-handler
             input: {error: {code: engine-dead-error, message: "EngineCore encountered an issue. See stack trace (above) for the root cause.", status: 500}}
           - return: {dead: true}
+      - if: "has(input.outputs.utility_output) && input.outputs.utility_output != null && has(input.outputs.utility_output.call_id)"
+        then:
+          - title: "_process_utility_output: resolve the future of call_id with the result or the failure"
+            source: "vllm/v1/engine/core_client.py:892-911"
+            set: {state.utility_results: "= merge(has(state.utility_results) ? state.utility_results : {}, {input.outputs.utility_output.call_id: input.outputs.utility_output})"}
+          - return: {utility: true}
       - if: "has(input.outputs.utility_output) && input.outputs.utility_output != null"
         then:
           - title: "An FT status push refreshes the cached engine status"
             source: "vllm/v1/engine/core_client.py:1196-1203"
             set: {state.engine_status: "= merge(state.engine_status, {string(has(input.outputs.engine_index) ? input.outputs.engine_index : 0): input.outputs.utility_output})"}
           - return: {status: true}
+      - if: "int(config['data-parallel-size']) > 1"
+        then:
+          - title: "DPLBAsyncMPClient: the class's process_engine_outputs runs on every message first"
+            source: "vllm/v1/engine/core_client.py:1208-1213"
+            call: dp-lb-async-mp-client.process-engine-outputs
+            input: {outputs: "= input.outputs"}
       - title: "Outputs or stats go to the output handler"
         source: "vllm/v1/engine/core_client.py:1216-1217"
         call: async-llm.output-handler
@@ -142,7 +205,7 @@ interfaces:
             source: "vllm/v1/engine/core_client.py:1001-1008"
             fail: {code: engine-dead-error, status: 500, message: "EngineCore encountered an issue. See stack trace (above) for the root cause."}
       - call: engine-core-proc.process-input-sockets
-        input: {request_type: ADD, request: "= merge(input, {'client_index': 0})"}
+        input: {request_type: ADD, request: "= merge(input, {'client_index': 0})", client_kind: sync}
 
   - component: sync-mp-client
     name: abort-requests
@@ -153,7 +216,7 @@ interfaces:
       - if: "size(input.request_ids) == 0 || state.engine_dead"
         then: [{return: {sent: false}}]
       - call: engine-core-proc.process-input-sockets
-        input: {request_type: ABORT, request_ids: "= input.request_ids"}
+        input: {request_type: ABORT, request_ids: "= input.request_ids", client_kind: sync}
       - return: {sent: true}
 
   - component: sync-mp-client
@@ -168,8 +231,36 @@ interfaces:
         then:
           - fail: {code: engine-dead-error, status: 500, message: "EngineCore encountered an issue. See stack trace (above) for the root cause."}
       - call: engine-core-proc.process-input-sockets
-        input: {request_type: UTILITY, method: "= input.method", args: "= has(input.args) ? input.args : {}", client_index: 0}
+        input: {request_type: UTILITY, method: "= input.method", args: "= has(input.args) ? input.args : {}", client_index: 0, client_kind: sync}
         as: res
+      - if: "has(vars.res.value.deferred) && vars.res.value.deferred != null"
+        then:
+          - title: "The engine deferred the reply (a Future): await the call_id's future, which the output socket thread resolves"
+            source: "vllm/v1/engine/core_client.py:1010-1016"
+            foreach: "= lists.range(800)"
+            as: tick
+            max: 800
+            steps:
+              - if: "has(state.utility_results) && vars.res.value.deferred in state.utility_results"
+                then:
+                  - set:
+                      vars.uo: "= state.utility_results[vars.res.value.deferred]"
+                      state.utility_results: "= omit(state.utility_results, vars.res.value.deferred)"
+                  - if: "vars.uo.failure_message != null"
+                    then:
+                      - title: "_process_utility_output: future.set_exception(Exception(failure_message))"
+                        source: "vllm/v1/engine/core_client.py:900-903"
+                        fail: {code: exception, message: "= vars.uo.failure_message"}
+                  - return: "= vars.uo.result"
+              - if: "state.engine_dead"
+                then:
+                  - fail: {code: engine-dead-error, status: 500, message: "EngineCore encountered an issue. See stack trace (above) for the root cause."}
+              - title: "The engine-core process keeps stepping while the caller waits"
+                call: engine-core-proc.drive-step
+                on_error: continue
+              - wait: "= vars.tick < 400 ? 1 : 1000"
+          - title: "Still pending when the simulation's poll bound ran out"
+            return: null
       - if: "vars.res.value.failure_message != null"
         then:
           - fail: {code: exception, message: "= vars.res.value.failure_message"}
@@ -194,6 +285,12 @@ interfaces:
               state.engine_dead: true
               state.outputs_queue: "= state.outputs_queue + [{'error': {'code': 'engine-dead-error', 'status': 500, 'message': 'EngineCore encountered an issue. See stack trace (above) for the root cause.'}}]"
           - return: {dead: true}
+      - if: "has(input.outputs.utility_output) && input.outputs.utility_output != null && has(input.outputs.utility_output.call_id)"
+        then:
+          - title: "A UtilityOutput resolves its call's future instead of queueing"
+            source: "vllm/v1/engine/core_client.py:966-968"
+            set: {state.utility_results: "= merge(has(state.utility_results) ? state.utility_results : {}, {input.outputs.utility_output.call_id: input.outputs.utility_output})"}
+          - return: {dead: false}
       - title: "outputs_queue.put_nowait(outputs)"
         source: "vllm/v1/engine/core_client.py:969-970"
         set: {state.outputs_queue: "= state.outputs_queue + [{'outputs': input.outputs}]"}
@@ -237,7 +334,7 @@ interfaces:
   - component: dp-lb-async-mp-client
     name: get-core-engine-for-request
     kind: function
-    summary: "DPLBAsyncMPClient.get_core_engine_for_request: keep a streaming session's engine; honour data_parallel_rank; else scan the engines from eng_start_index and take the lowest score max(in-flight, waiting + running), then count the request locally and rotate the start index."
+    summary: "DPLBAsyncMPClient.get_core_engine_for_request: keep a streaming session's engine; honour data_parallel_rank; else scan the engines from eng_start_index and take the lowest score max(client_count x in-flight, waiting + running) plus, for a queue on a KV-bound engine, waiting x 6 x max(0, kv_cache_usage - 0.5); then count the request as waiting locally and rotate the start index."
     sources: ["vllm/v1/engine/core_client.py:1642-1697"]
     request: EngineCoreClientRequest
     response: {type: object, properties: {engine: {type: string}}}
@@ -252,8 +349,12 @@ interfaces:
       - set:
           vars.engines: "= lists.range(vars.n).map(i, 'dp' + string(i))"
           vars.order: "= lists.range(vars.n).map(i, (state.eng_start_index + i) % vars.n)"
+      - title: "score = max(client_count * inflight, waiting + running); a waiting queue adds waiting * 6.0 * max(0, kv_cache_usage - 0.5) (one API server: client_count 1)"
+        source: "vllm/v1/engine/core_client.py:1655-1679"
+        set:
+          vars.lb: "= lists.range(vars.n).map(i, size(state.lb_engines) > i ? state.lb_engines[i] : [0, 0, 0.0])"
       - set:
-          vars.score: "= vars.engines.transformMapEntry(i, e, {e: math.greatest([double(e in state.engine_inflight ? state.engine_inflight[e] : 0), double(size(state.lb_engines) > i ? state.lb_engines[i][0] + state.lb_engines[i][1] : 0)])})"
+          vars.score: "= vars.engines.transformMapEntry(i, e, {e: math.greatest([double(e in state.engine_inflight ? state.engine_inflight[e] : 0), double(vars.lb[i][0] + vars.lb[i][1])]) + (vars.lb[i][0] > 0 ? double(vars.lb[i][0]) * 6.0 * math.greatest([0.0, double(size(vars.lb[i]) > 2 ? vars.lb[i][2] : 0.0) - 0.5]) : 0.0)})"
       - set:
           vars.best: "= has(input.data_parallel_rank) && input.data_parallel_rank != null ? int(input.data_parallel_rank) : vars.order.filter(i, vars.order.all(j, vars.score[vars.engines[i]] <= vars.score[vars.engines[j]]))[0]"
       - title: "Record the chosen engine (for aborts) and its in-flight count; rotate the scan start"
@@ -264,6 +365,11 @@ interfaces:
           state.reqs_in_flight: "= merge(state.reqs_in_flight, {input.request_id: vars.engine})"
           state.engine_inflight: "= merge(state.engine_inflight, {vars.engine: (vars.engine in state.engine_inflight ? state.engine_inflight[vars.engine] : 0) + 1})"
           state.eng_start_index: "= has(input.data_parallel_rank) && input.data_parallel_rank != null ? state.eng_start_index : (state.eng_start_index + 1) % vars.n"
+      - if: "!(has(input.data_parallel_rank) && input.data_parallel_rank != null)"
+        then:
+          - title: "current_counts[eng_index][0] += client_count: count it as waiting until the next coordinator stats update"
+            source: "vllm/v1/engine/core_client.py:1680-1682"
+            set: {state.lb_engines: "= lists.range(vars.n).map(i, i == vars.best ? [vars.lb[i][0] + 1, vars.lb[i][1], size(vars.lb[i]) > 2 ? vars.lb[i][2] : 0.0] : vars.lb[i])"}
       - return: {engine: "= vars.engine"}
 
   - component: dp-lb-async-mp-client
@@ -278,11 +384,17 @@ interfaces:
       - call: dp-lb-async-mp-client.get-core-engine-for-request
         input: "= input"
         as: eng
-      - title: "_send_input(ADD, request, chosen_engine)"
-        source: "vllm/v1/engine/core_client.py:1590"
+      - title: "_send_input(ADD, request, chosen_engine), stamped with current_wave and client_index"
+        source: "vllm/v1/engine/core_client.py:1585-1590"
         call: engine-core-proc.process-input-sockets
         on: "= vars.eng.value.engine"
-        input: {request_type: ADD, request: "= merge(input, {'client_index': 0})"}
+        input: {request_type: ADD, request: "= merge(input, {'client_index': 0, 'current_wave': state.current_wave})"}
+      - if: "!state.engines_running"
+        then:
+          - title: "Engines paused: send FIRST_REQ (chosen engine) to the stats task, which wakes the other ranks through the coordinator"
+            source: "vllm/v1/engine/core_client.py:1591-1594"
+            call: dp-lb-async-mp-client.run-engine-stats-update-task
+            input: {first_req: "= int(vars.eng.value.engine.substring(2))", wave: "= state.current_wave"}
       - return: {engine: "= vars.eng.value.engine"}
 
   - component: dp-lb-async-mp-client

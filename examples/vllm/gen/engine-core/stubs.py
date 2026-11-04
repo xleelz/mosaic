@@ -185,7 +185,7 @@ BOUNDARY_COMPONENTS.append(_XC)
 # cache EngineCore uses on add-request and reset_mm_cache, and the P0 sender cache AsyncLLM clears.
 _M = json.load(open(os.path.join(os.path.dirname(os.path.abspath(__file__)), "owner_mm.json")))
 for _key in ("lru-key-replicated-receiver-cache.get-and-update-features", "lru-key-replicated-receiver-cache.clear-cache",
-             "lru-key-replicated-sender-cache.clear-cache"):
+             "lru-key-replicated-sender-cache.clear-cache", "lru-key-replicated-sender-cache.invalidate"):
     _c = copy.deepcopy(_M[_key])
     _comp, _name = _key.split(".", 1)
     STUBS.append(stub(_comp, _name, "models-layers", _c["sources"][0], request=_c["request"], response=_c["response"],
@@ -194,3 +194,22 @@ for _cid in ("lru-key-replicated-receiver-cache", "lru-key-replicated-sender-cac
     _cc = {k: v for k, v in _M["components"][_cid].items() if v is not None}
     _cc["attributes"] = {"boundary": True, "owner": "models-layers"}
     BOUNDARY_COMPONENTS.append(_cc)
+
+# Round 5: contracts copied by owner5.py into owner5.json (owner fragment named per entry).
+_R5 = json.load(open(os.path.join(os.path.dirname(os.path.abspath(__file__)), "owner5.json")))
+for _key, _c in sorted(_R5["ifaces"].items()):
+    _comp, _name = _key.split(".", 1)
+    _own = (_c.get("attributes") or {}).get("owner") or _c["owner"]
+    _s = stub(_comp, _name, _own, _c["sources"][0], request=copy.deepcopy(_c["request"]),
+              response=copy.deepcopy(_c["response"]), kind=_c["kind"], errors=_c["errors"],
+              summary=_c["summary"] if _c.get("store") else f"{_c['summary']} (owner {_c['owner']})")
+    if _c.get("store"):
+        _s["store"] = copy.deepcopy(_c["store"])  # shared infrastructure: the same store as every copy
+    STUBS.append(_s)
+_HAVE = {c["id"] for c in BOUNDARY_COMPONENTS}
+for _cid, _cc in sorted(_R5["components"].items()):
+    if _cid in _HAVE:
+        continue
+    _d = {k: v for k, v in _cc.items() if v is not None and k != "owner"}
+    _d["attributes"] = {"boundary": True, "owner": _cc["owner"]}
+    BOUNDARY_COMPONENTS.append(_d)

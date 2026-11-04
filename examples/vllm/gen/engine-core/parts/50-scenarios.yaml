@@ -78,8 +78,9 @@ scenarios:
       - {interface: async-llm.get-num-unfinished-requests, caller: api-server, as: n}
     expect:
       - "!steps.gen.result.ok && steps.gen.result.error.code == 'queue-overflow-error' && steps.gen.result.error.data.http_status == 503"
+      - "steps.gen.result.error.message == 'The engine is currently busy and cannot accept new requests. Please try again later or on a different instance.'"
       - "steps.n.result.value == 1"
-      - "state['prometheus-registry'].metrics['vllm:admission_rejections'] == 1"
+      - "state['prometheus-registry'].metrics['vllm:admission_rejections{model_name=\"llama-8b\",reason=\"max_num_queued_reqs\"}'] == 1"
 
   - id: engine-core-generate-queued-tokens-full
     name: max_num_queued_tokens rejects while prompts are still prefilling
@@ -90,7 +91,8 @@ scenarios:
     flow: async-llm-generate
     expect:
       - "!result.ok && result.error.code == 'max-queued-tokens-error'"
-      - "state['prometheus-registry'].metrics['vllm:admission_rejections'] == 1"
+      - "state['prometheus-registry'].metrics['vllm:admission_rejections{model_name=\"llama-8b\",reason=\"max_num_queued_tokens\"}'] == 1"
+      - "result.error.message == 'The engine has reached its prefill token backlog limit. Please try again later or on a different instance.'"
 
   - id: engine-core-generate-engine-dead
     name: generate on a dead engine raises EngineDeadError without an abort
@@ -409,20 +411,24 @@ scenarios:
       - {flow: async-llm-pause-generation, as: p, choices: *idle}
       - {interface: async-llm.is-paused, caller: api-server, as: paused}
     expect:
-      - "steps.p.result.ok && steps.p.result.value.pending == false"
+      - "steps.p.result.ok && steps.p.result.value == null"
+      - "trace.exists(e, e.type == 'call.end' && e.interface == 'engine-core-proc.pause-scheduler' && e.output.pending == false)"
       - "trace.exists(e, e.type == 'call.start' && e.interface == 'scheduler.set-pause-state' && e.input.pause_state == 'PAUSED_NEW')"
       - "calls['gpu-worker-impl.synchronize-device'] == 1 && calls['scheduler.reset-prefix-cache'] == 1"
       - "calls['scheduler.pause-state'] == 1"
 
   - id: engine-core-pause-keep-completes-when-idle
     name: pause_generation(keep) completes from the idle callback
-    description: "keep sets PAUSED_ALL without aborting; the engine still has work, so the pause registers an idle callback; the next idle iteration runs it (device sync, cache clear)."
+    description: "keep sets PAUSED_ALL without aborting; the engine still has work, so the pause registers an idle callback and the utility reply waits; the next idle iteration runs it (device sync, cache clear) and the deferred reply completes pause_generation."
     fixtures: [full-tp1-llama-8b]
     steps:
-      - {flow: async-llm-pause-generation, as: p, input: {mode: keep, clear_cache: false}, choices: *busy}
-      - {flow: engine-core-busy-loop, as: loop, input: {iterations: 1}, choices: *idle}
+      - {flow: async-llm-pause-generation, as: p, input: {mode: keep, clear_cache: false}, choices: *busy, await: false}
+      - {flow: engine-core-busy-loop, as: loop, input: {iterations: 1}, choices: *idle, at_ms: 5}
     expect:
-      - "steps.p.result.value.pending && calls['scheduler.finish-requests'] == 0"
+      - "steps.p.result.ok && steps.p.result.value == null && calls['scheduler.finish-requests'] == 0"
+      - "trace.exists(e, e.type == 'call.end' && e.interface == 'engine-core-proc.pause-scheduler' && e.output.pending)"
+      - "trace.filter(e, e.type == 'call.end' && e.interface == 'async-llm.pause-generation').all(e, e.t >= 5)"
+      - "trace.exists(e, e.type == 'call.start' && e.interface == 'engine-core-proc.process-output-sockets' && has(e.input.outputs.utility_output) && e.input.outputs.utility_output.failure_message == null)"
       - "trace.exists(e, e.type == 'call.start' && e.interface == 'scheduler.set-pause-state' && e.input.pause_state == 'PAUSED_ALL')"
       - "calls['scheduler.reset-prefix-cache'] == 0"
 
@@ -450,7 +456,7 @@ scenarios:
       - {interface: executor.is-sleeping, caller: engine-core, as: asleep}
       - {interface: async-llm.wake-up, caller: api-server, as: wake}
     expect:
-      - "steps.sl.result.ok && steps.sl.result.value.level == 1 && !steps.sl.result.value.pending"
+      - "steps.sl.result.ok && steps.sl.result.value == null && trace.exists(e, e.type == 'call.end' && e.interface == 'engine-core.sleep' && e.output.level == 1 && !e.output.pending)"
       - "steps.asleep.result.value == true"
       - "trace.filter(e, e.type == 'call.start' && e.interface == 'gpu-worker-impl.sleep').size() == 1 && trace.filter(e, e.type == 'call.start' && e.interface == 'gpu-worker-impl.wake-up').size() == 1"
       - "steps.wake.result.value == true"
@@ -462,18 +468,21 @@ scenarios:
     input: {level: 0}
     choices: *idle
     expect:
-      - "result.ok && result.value.level == 0"
+      - "result.ok && result.value == null && trace.exists(e, e.type == 'call.end' && e.interface == 'engine-core.sleep' && e.output.level == 0)"
       - "trace.filter(e, e.type == 'call.start' && e.interface == 'gpu-worker-impl.sleep').size() == 0 && trace.filter(e, e.type == 'call.start' && e.interface == 'scheduler.reset-prefix-cache').size() == 0"
 
   - id: engine-core-sleep-deferred-while-busy
     name: Sleep waits for in-flight requests when the pause can't finish yet
+    description: "Requests in flight: the pause is pending, so EngineCore.sleep returns a Future and the reply waits. Once the loop goes idle the pause callback finishes the pause, then sleeps the executor, and only then does the reply come (core.py:984-994)."
     fixtures: [full-tp1-llama-8b]
-    flow: async-llm-sleep
-    input: {level: 1}
-    choices: *busy
+    steps:
+      - {flow: async-llm-sleep, as: sl, input: {level: 1}, choices: *busy, await: false}
+      - {flow: engine-core-busy-loop, as: loop, input: {iterations: 1}, choices: *idle, at_ms: 5}
     expect:
-      - "result.ok && result.value.pending"
-      - "ctx.sleep_deferred && trace.filter(e, e.type == 'call.start' && e.interface == 'gpu-worker-impl.sleep').size() == 0"
+      - "steps.sl.result.ok && steps.sl.result.value == null"
+      - "ctx.sleep_deferred && trace.filter(e, e.type == 'call.start' && e.interface == 'gpu-worker-impl.sleep').size() == 1"
+      - "trace.filter(e, e.type == 'call.start' && e.interface == 'gpu-worker-impl.sleep').all(e, e.t >= 5)"
+      - "trace.filter(e, e.type == 'call.start' && e.interface == 'executor.sleep').all(s, trace.exists(f, f.type == 'call.end' && f.interface == 'engine-core.finish-pause' && f.t <= s.t))"
 
   - id: engine-core-sleep-twice-is-noop
     name: Sleeping executors don't sleep again
@@ -735,6 +744,7 @@ scenarios:
     flow: engine-startup
     expect:
       - "!result.ok && result.error.code == 'type-error' && result.error.message.contains('my_logger')"
+      - "state['transformers-config-utils'].reducers == ['VllmConfig']"   # registered first (async_llm.py:131-132), before the plugins load (146-147)
 
   - id: engine-core-startup-custom-prometheus-plugin
     name: A custom Prometheus logger plugin replaces the default one
@@ -863,6 +873,7 @@ scenarios:
     fixtures: [full-tp1-llama-8b]
     state:
       engine-core-proc: {client_kind: sync}
+      llm-engine: {log_stats: true}
       sync-mp-client: {engine_dead: false, outputs_queue: [{outputs: {outputs: [], scheduler_stats: {num_running_reqs: 0}}}]}
     steps:
       - {flow: llm-engine-step, as: st}
@@ -870,8 +881,9 @@ scenarios:
       - {interface: llm-engine.do-log-stats-with-interval, caller: python-user, as: l1}
       - {interface: llm-engine.do-log-stats, caller: python-user, as: l2}
     expect:
-      - "steps.m.result.ok && steps.m.result.value.count == 1"
-      - "state['prometheus-registry'].metrics['vllm:generation_tokens'] == 0"
+      - "steps.m.result.ok && steps.m.result.value.exists(m, m.name == 'vllm:request_success' && m.labels == '{model_name=\"llama-8b\",engine=\"0\",finished_reason=\"length\"}' && m.value == 0)"
+      - "steps.m.result.value.all(m, m.name.startsWith('vllm:'))"
+      - "state['prometheus-registry'].metrics['vllm:num_requests_running{model_name=\"llama-8b\",engine=\"0\"}'] == 0"
       - "steps.l1.result.value.logged == false && steps.l2.result.value.logged"
 
   - id: engine-core-llm-engine-metrics-disabled

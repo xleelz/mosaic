@@ -31,7 +31,7 @@ interfaces:
             fail: "= error"
           - title: Any other failure becomes EngineGenerateError
             source: "vllm/v1/engine/async_llm.py:806-820"
-            fail: {code: engine-generate-error, message: "= 'generate failed: ' + error.code"}
+            fail: {code: engine-generate-error, message: "", data: {cause: "= error.code"}}
       - set: {vars.rid: "= vars.add.value.request_id", vars.comp: {}, vars.ctext: {}, vars.n: 0}
       - title: "Drain the collector: get_nowait, else await q.get() (modeled as 1 ms polls)"
         detail: "The output_handler task fills the collector; generate pulls until a RequestOutput is finished. In the simulation the await is a poll: 1 ms for the first 400 polls, then 1 s (bounded at 800 polls, about 400 s)."
@@ -52,7 +52,7 @@ interfaces:
                 source: "vllm/v1/engine/async_llm.py:806-820"
                 call: async-llm.abort
                 input: {request_ids: ["= vars.rid"], internal: true}
-              - fail: {code: engine-generate-error, message: "= 'generate failed: ' + error.code"}
+              - fail: {code: engine-generate-error, message: "", data: {cause: "= error.code"}}
           - if: "vars.got.value.output != null"
             then:
               - title: "yield out: one RequestOutput per engine step to the caller (the streaming generator)"
@@ -182,9 +182,10 @@ interfaces:
         source: "vllm/v1/engine/async_llm.py:571-572"
         call: output-processor.add-request
         input: {request: "= input.request", parent_request_id: "= input.parent"}
-      - title: Add the EngineCoreRequest to the engine core (separate process)
+      - title: "Add the EngineCoreRequest to the engine core (separate process); with data_parallel_size > 1 the client is DPLBAsyncMPClient (internal load balancing over the DP ranks)"
         source: "vllm/v1/engine/async_llm.py:574-575"
-        call: async-mp-client.add-request-async
+        call: "= int(config['data-parallel-size']) > 1 ? 'dp-lb-async-mp-client.add-request-async' : 'async-mp-client.add-request-async'"
+        targets: [async-mp-client.add-request-async, dp-lb-async-mp-client.add-request-async]
         input: "= input.request"
 
   - component: async-llm
@@ -203,22 +204,28 @@ interfaces:
             as: cur
           - if: "vars.cur.value + input.n > config['max-num-queued-reqs']"
             then:
-              - call: stat-logger-manager.record-admission-rejection
+              - title: "_record_admission_rejection: only when the logger manager exists (log stats on)"
+                source: "vllm/v1/engine/async_llm.py:376-379"
+                when: "!config['disable-log-stats']"
+                call: stat-logger-manager.record-admission-rejection
                 input: {reason: max_num_queued_reqs}
-              - title: "Request queue full: QueueOverflowError (HTTP 503)"
-                source: "vllm/v1/engine/async_llm.py:343-360"
-                fail: {code: queue-overflow-error, message: "= 'queue full: ' + string(vars.cur.value) + ' unfinished, max ' + string(config['max-num-queued-reqs'])", retryable: true, data: {http_status: 503}}
+              - title: "Request queue full: QueueOverflowError (HTTP 503), a fixed message"
+                source: "vllm/exceptions.py:156-168"
+                fail: {code: queue-overflow-error, message: "The engine is currently busy and cannot accept new requests. Please try again later or on a different instance.", retryable: true, data: {http_status: 503}}
       - if: "(('max-num-queued-tokens' in config) && config['max-num-queued-tokens'] != null)"
         then:
           - call: output-processor.get-num-queued-tokens
             as: tok
           - if: "vars.tok.value >= config['max-num-queued-tokens']"
             then:
-              - call: stat-logger-manager.record-admission-rejection
+              - title: "_record_admission_rejection: only when the logger manager exists (log stats on)"
+                source: "vllm/v1/engine/async_llm.py:376-379"
+                when: "!config['disable-log-stats']"
+                call: stat-logger-manager.record-admission-rejection
                 input: {reason: max_num_queued_tokens}
-              - title: "Prefill token budget reached: MaxQueuedTokensError (HTTP 503)"
-                source: "vllm/v1/engine/async_llm.py:362-374"
-                fail: {code: max-queued-tokens-error, message: "= 'queued prefill tokens ' + string(vars.tok.value)", retryable: true, data: {http_status: 503}}
+              - title: "Prefill token budget reached: MaxQueuedTokensError (HTTP 503), a fixed message"
+                source: "vllm/exceptions.py:171-182"
+                fail: {code: max-queued-tokens-error, message: "The engine has reached its prefill token backlog limit. Please try again later or on a different instance.", retryable: true, data: {http_status: 503}}
       - return: {admitted: true}
 
   - component: async-llm
@@ -258,6 +265,13 @@ interfaces:
         call: output-processor.process-outputs
         input: {outputs: "= has(input.outputs.outputs) ? input.outputs.outputs : []", weight_version: "= has(input.outputs.weight_version) ? input.outputs.weight_version : null"}
         as: proc
+      - title: "Recover from P0/P1 cache drift: invalidate every mm_cache_miss_hashes entry in the renderer's mm processor cache, in order"
+        source: "vllm/v1/engine/async_llm.py:873-881"
+        foreach: "= (has(input.outputs.outputs) ? input.outputs.outputs : []).filter(o, has(o.mm_cache_miss_hashes) && o.mm_cache_miss_hashes != null).map(o, o.mm_cache_miss_hashes).flatten()"
+        as: mmh
+        steps:
+          - call: lru-key-replicated-sender-cache.invalidate
+            input: {mm_hash: "= vars.mmh"}
       - if: "size(vars.proc.value.reqs_to_abort) > 0"
         then:
           - title: "Abort requests that finished on a stop string the engine core didn't see"
@@ -269,7 +283,10 @@ interfaces:
           - title: "Record scheduler and iteration stats on the stat loggers"
             source: "vllm/v1/engine/async_llm.py:895-904"
             call: stat-logger-manager.record
-            input: {num_outputs: "= has(input.outputs.outputs) ? size(input.outputs.outputs) : 0", finished: "= vars.proc.value.finished"}
+            input:
+              scheduler_stats: "= has(input.outputs.scheduler_stats) ? input.outputs.scheduler_stats : null"
+              iteration_stats: "= vars.proc.value.iteration_stats"
+              engine_idx: "= has(input.outputs.engine_index) ? input.outputs.engine_index : 0"
       - return: {processed: "= has(input.outputs.outputs) ? size(input.outputs.outputs) : 0", reqs_to_abort: "= vars.proc.value.reqs_to_abort"}
 
   - component: async-llm
@@ -300,21 +317,9 @@ interfaces:
           vars.plen: "= has(input.prompt_token_ids) ? size(input.prompt_token_ids) : 0"
           vars.sp_in: "= has(input.sampling_params) && input.sampling_params != null ? input.sampling_params : {}"
           vars.backend: "= config['structured-outputs-backend']"
-      - if: "!(has(input.pooling_params) && input.pooling_params != null) && has(vars.sp_in.logprobs) && vars.sp_in.logprobs != null && vars.sp_in.logprobs != 0"
-        then:
-          - title: "_validate_params -> SamplingParams.verify -> _validate_logprobs: more sample logprobs than max_logprobs (-1 = the vocab size) is refused"
-            source: "vllm/v1/engine/input_processor.py:157-162"
-            set:
-              vars.max_lp: "= config['max-logprobs'] == -1 ? 128256 : config['max-logprobs']"
-              vars.lp: "= vars.sp_in.logprobs == -1 ? 128256 : vars.sp_in.logprobs"
-          - if: "vars.lp > vars.max_lp"
-            then:
-              - title: "VLLMValidationError(parameter='logprobs')"
-                source: "vllm/sampling_params.py:919-933"
-                fail: {code: vllm-validation-error, message: "= 'Requested sample logprobs of ' + string(vars.lp) + ', which is greater than max allowed: ' + string(vars.max_lp)", data: {parameter: logprobs, value: "= vars.lp"}}
       - if: "!(has(input.pooling_params) && input.pooling_params != null) && has(vars.sp_in.structured_outputs) && vars.sp_in.structured_outputs != null && vars.backend in ['auto', 'xgrammar']"
         then:
-          - title: "SamplingParams.verify -> _validate_structured_outputs: xgrammar (or auto, which tries xgrammar first) validates the constraint"
+          - title: "SamplingParams.verify -> _validate_structured_outputs: xgrammar (or auto, which tries xgrammar first) validates the constraint; the backend it settles on goes on the request (verify's own checks follow)"
             source: "vllm/sampling_params.py:1323-1340"
             call: xgrammar-backend.validate-xgrammar-grammar
             input: {structured_outputs: "= vars.sp_in.structured_outputs"}
@@ -326,22 +331,23 @@ interfaces:
                 source: "vllm/sampling_params.py:1393-1434"
                 set: {vars.xgr_rejected: true}
           - set:
-              vars.json_text: "= has(vars.sp_in.structured_outputs.json) && type(vars.sp_in.structured_outputs.json) == string ? vars.sp_in.structured_outputs.json : ''"
-          - title: "json.loads of a JSON-text schema: an unparseable one is 'Invalid JSON grammar specification.' on both the xgrammar path and auto's fallback"
-            detail: "Parsing is approximated by bracket balance and a value after every ':' (no JSON parser in CEL)."
-            source: "vllm/v1/structured_output/backend_xgrammar.py:448-453"
-            if: "vars.json_text != '' && (size(vars.json_text.split('{')) != size(vars.json_text.split('}')) || size(vars.json_text.split('[')) != size(vars.json_text.split(']')) || vars.json_text.trim().endsWith(':') || vars.json_text.trim().endsWith(','))"
-            then:
-              - title: "VLLMValidationError: Invalid JSON grammar specification."
-                source: "vllm/sampling_params.py:1404-1411"
-                fail: {code: vllm-validation-error, message: "Invalid JSON grammar specification."}
-          - set:
               vars.resolved_backend: "= vars.backend == 'xgrammar' || !(has(vars.xgr_rejected) && vars.xgr_rejected) ? 'xgrammar' : 'guidance'"
+      - if: "!(has(input.pooling_params) && input.pooling_params != null)"
+        then:
+          - title: "_validate_params -> SamplingParams.verify(model_config, speculative_config, ...): logprobs, logit_bias, stop and allowed token ids, the spec-decode exclusions, the structured-output request"
+            source: "vllm/v1/engine/input_processor.py:157-162"
+            call: sampling-params.verify
+            input: {sampling_params: "= vars.sp_in", vocab_size: null}
       - if: "has(input.lora_request) && input.lora_request != null && !config['enable-lora']"
         then:
           - title: "_validate_lora: a LoRA request while LoRA is not enabled"
             source: "vllm/v1/engine/input_processor.py:278-285"
             fail: {code: vllm-validation-error, message: "= 'Got lora_request ' + string(input.lora_request.lora_name) + ' but LoRA is not enabled!'"}
+      - if: "has(input.data_parallel_rank) && input.data_parallel_rank != null && (input.data_parallel_rank < 0 || input.data_parallel_rank >= int(config['data-parallel-size']))"
+        then:
+          - title: "After params and LoRA, before the prompt: data_parallel_rank must name one of the DP engines"
+            source: "vllm/v1/engine/input_processor.py:391-401"
+            fail: {code: vllm-validation-error, message: "= 'data_parallel_rank ' + string(input.data_parallel_rank) + ' is out of range [0, ' + string(config['data-parallel-size']) + ').'"}
       - if: "vars.plen == 0"
         then:
           - title: The decoder prompt cannot be empty
@@ -357,11 +363,12 @@ interfaces:
           - title: A generate prompt needs room for at least one output token
             source: "vllm/v1/engine/input_processor.py:592-601"
             fail: {code: vllm-validation-error, message: "= 'The decoder prompt (length ' + string(vars.plen) + ') plus the number of requested output tokens (at least 1) is longer than the maximum model length of ' + string(config['max-model-len']) + '.'"}
-      - if: "has(input.data_parallel_rank) && input.data_parallel_rank != null && (input.data_parallel_rank < 0 || input.data_parallel_rank >= int(config['data-parallel-size']))"
+      - if: "vars.plen > 0"
         then:
-          - title: "data_parallel_rank must name one of the DP engines"
-            source: "vllm/v1/engine/input_processor.py:391-401"
-            fail: {code: vllm-validation-error, message: "= 'data_parallel_rank ' + string(input.data_parallel_rank) + ' is out of range [0, ' + string(config['data-parallel-size']) + ').'"}
+          - title: "_validate_model_input, shared by generate and pooling: renderer.validate_token_ids(prompt_ids) refuses out-of-vocabulary ids"
+            source: "vllm/v1/engine/input_processor.py:645-647"
+            call: base-renderer.validate-token-ids
+            input: {token_ids: "= input.prompt_token_ids", max_token_id: null, parameter: null}
       - set:
           vars.max_tokens: "= has(vars.sp_in.max_tokens) && vars.sp_in.max_tokens != null ? vars.sp_in.max_tokens : config['max-model-len'] - vars.plen"
           vars.min_tokens: "= has(vars.sp_in.min_tokens) && vars.sp_in.min_tokens != null ? vars.sp_in.min_tokens : 0"
@@ -440,17 +447,27 @@ interfaces:
             source: "vllm/v1/engine/output_processor.py:624-627"
             return: {added: false}
       - set:
+          vars.sp: "= has(input.request.sampling_params) && input.request.sampling_params != null ? input.request.sampling_params : {}"
+      - set:
           vars.parent: "= has(input.parent_request_id) ? input.parent_request_id : null"
           vars.ext: "= has(input.request.external_req_id) ? input.request.external_req_id : input.request.request_id"
-          vars.kind: "= has(input.request.sampling_params.output_kind) && input.request.sampling_params.output_kind != null ? input.request.sampling_params.output_kind.lowerAscii() : 'cumulative'"
+          vars.kind: "= has(vars.sp.output_kind) && vars.sp.output_kind != null ? vars.sp.output_kind.lowerAscii() : 'cumulative'"
       - title: "BaseIncrementalDetokenizer.__init__: a str stop becomes a list; while stop strings are excluded from the output, hold back max(len(stop)) - 1 characters of streamed text"
         source: "vllm/v1/engine/detokenizer.py:69-93"
         set:
           vars.queue_id: "= vars.parent != null ? vars.parent : input.request.request_id"
-          vars.stop: "= !has(input.request.sampling_params.stop) || input.request.sampling_params.stop == null ? [] : (type(input.request.sampling_params.stop) == string ? [input.request.sampling_params.stop] : input.request.sampling_params.stop)"
-          vars.include_stop: "= has(input.request.sampling_params.include_stop_str_in_output) && input.request.sampling_params.include_stop_str_in_output == true"
+          vars.stop: "= !has(vars.sp.stop) || vars.sp.stop == null ? [] : (type(vars.sp.stop) == string ? [vars.sp.stop] : vars.sp.stop)"
+          vars.include_stop: "= has(vars.sp.include_stop_str_in_output) && vars.sp.include_stop_str_in_output == true"
+      - title: "RequestState.from_new_request: with do_remote_prefill, report the remote P worker's cache hits (kv_transfer_params.remote_prefill_cached_tokens, an int) as num_cached_tokens; RequestStateStats records the resolved watermark flags"
+        source: "vllm/v1/engine/output_processor.py:238-249"
+        set:
+          vars.kvtp: "= has(vars.sp.extra_args) && vars.sp.extra_args != null && has(vars.sp.extra_args.kv_transfer_params) ? vars.sp.extra_args.kv_transfer_params : {}"
+          vars.wm: "= has(vars.sp.watermarking) && vars.sp.watermarking == true"
+          vars.wm_skipped: "= has(vars.sp._watermarking_skipped) && vars.sp._watermarking_skipped == true"
       - set:
-          state.request_states: "= merge(state.request_states, {input.request.request_id: {'external_req_id': vars.ext, 'prompt_len': size(input.request.prompt_token_ids), 'is_prefilling': true, 'output_text': '', 'num_output_tokens': 0, 'token_ids': [], 'output_kind': vars.kind, 'stop': vars.stop, 'include_stop_str_in_output': vars.include_stop, 'min_tokens': has(input.request.sampling_params.min_tokens) && input.request.sampling_params.min_tokens != null ? input.request.sampling_params.min_tokens : 0, 'skip_special_tokens': !has(input.request.sampling_params.skip_special_tokens) || input.request.sampling_params.skip_special_tokens != false, 'stop_buffer_length': size(vars.stop) > 0 && !vars.include_stop ? math.greatest(vars.stop.map(x, size(x))) - 1 : 0, 'last_text_offset': 0, 'logprobs': has(input.request.sampling_params.logprobs) ? input.request.sampling_params.logprobs : null, 'parent': vars.parent, 'index': has(input.index) ? input.index : 0, 'queue_id': vars.queue_id, 'has_queue': has(input.has_queue) ? input.has_queue : true}})"
+          vars.remote_cached: "= vars.kvtp != null && has(vars.kvtp.do_remote_prefill) && vars.kvtp.do_remote_prefill == true && has(vars.kvtp.remote_prefill_cached_tokens) && type(vars.kvtp.remote_prefill_cached_tokens) == int ? dyn(vars.kvtp.remote_prefill_cached_tokens) : dyn(null)"
+      - set:
+          state.request_states: "= merge(state.request_states, {input.request.request_id: {'external_req_id': vars.ext, 'prompt_len': size(input.request.prompt_token_ids), 'is_prefilling': true, 'output_text': '', 'num_output_tokens': 0, 'token_ids': [], 'output_kind': vars.kind, 'stop': vars.stop, 'include_stop_str_in_output': vars.include_stop, 'min_tokens': has(vars.sp.min_tokens) && vars.sp.min_tokens != null ? vars.sp.min_tokens : 0, 'skip_special_tokens': !has(vars.sp.skip_special_tokens) || vars.sp.skip_special_tokens != false, 'stop_buffer_length': size(vars.stop) > 0 && !vars.include_stop ? math.greatest(vars.stop.map(x, size(x))) - 1 : 0, 'last_text_offset': 0, 'logprobs': has(vars.sp.logprobs) ? vars.sp.logprobs : null, 'parent': vars.parent, 'index': has(input.index) ? input.index : 0, 'queue_id': vars.queue_id, 'has_queue': has(input.has_queue) ? input.has_queue : true, 'arrival_ms': now, 'remote_prefill_cached_tokens': vars.remote_cached, 'is_watermarked': vars.wm, 'is_watermark_skipped': vars.wm_skipped}})"
           state.external_req_ids: "= merge(state.external_req_ids, {vars.ext: (vars.ext in state.external_req_ids ? state.external_req_ids[vars.ext] : []) + [input.request.request_id]})"
       - if: "vars.parent != null"
         then:
@@ -554,9 +571,9 @@ interfaces:
     summary: "OutputProcessor.process_outputs: per EngineCoreOutput, skip aborted ids, end prefill, detokenize and check stop strings, put the RequestOutput into the stream, and free finished requests."
     sources: ["vllm/v1/engine/output_processor.py:681-833", "vllm/v1/engine/__init__.py:199-244", "vllm/v1/engine/__init__.py:259-290", "vllm/outputs.py:51-106", "vllm/outputs.py:129-201", "vllm/v1/engine/__init__.py:48-69"]
     request: {type: object, properties: {outputs: {type: array, items: {$ref: EngineCoreOutput}}, weight_version: {type: ["string", "null"], default: null}}}
-    response: {type: object, properties: {reqs_to_abort: {type: array, items: {type: string}}, finished: {type: integer}, request_outputs: {type: array}}}
+    response: {type: object, properties: {reqs_to_abort: {type: array, items: {type: string}}, finished: {type: integer}, request_outputs: {type: array}, iteration_stats: {type: object}}}
     behavior:
-      - set: {vars.to_abort: [], vars.finished: 0, vars.request_outputs: [], vars.puts: []}
+      - set: {vars.to_abort: [], vars.finished: 0, vars.request_outputs: [], vars.puts: [], vars.it_gen: 0, vars.it_prompt: 0, vars.ttfts: [], vars.itls: [], vars.fin: [], vars.wm_counts: [0, 0, 0]}
       - foreach: "= input.outputs"
         as: out
         steps:
@@ -566,6 +583,13 @@ interfaces:
                 source: "vllm/v1/engine/output_processor.py:707-713"
                 continue: true
           - set: {vars.rs: "= state.request_states[vars.out.request_id]"}
+          - title: "_update_stats_from_output -> IterationStats.update_from_output: count the new tokens; the first output records the prompt tokens and the TTFT since arrival, later ones the inter-token latency"
+            source: "vllm/v1/metrics/stats.py:505-557"
+            set:
+              vars.it_gen: "= vars.it_gen + size(vars.out.new_token_ids)"
+              vars.it_prompt: "= vars.it_prompt + (vars.rs.is_prefilling ? vars.rs.prompt_len : 0)"
+              vars.ttfts: "= vars.rs.is_prefilling ? vars.ttfts + [double(now - (has(vars.rs.arrival_ms) ? vars.rs.arrival_ms : now)) / 1000.0] : vars.ttfts"
+              vars.itls: "= !vars.rs.is_prefilling && has(vars.rs.last_token_ms) ? vars.itls + [double(now - vars.rs.last_token_ms) / 1000.0] : vars.itls"
           - title: Detokenize the new token ids and check stop strings
             source: "vllm/v1/engine/output_processor.py:760-776"
             call: incremental-detokenizer.update
@@ -579,6 +603,15 @@ interfaces:
               min_tokens: "= has(vars.rs.min_tokens) ? vars.rs.min_tokens : 0"
               skip_special_tokens: "= !has(vars.rs.skip_special_tokens) || vars.rs.skip_special_tokens"
             as: det
+          - set: {vars.lp: null}
+          - if: "has(vars.rs.logprobs) && vars.rs.logprobs != null && has(vars.out.new_logprobs) && vars.out.new_logprobs != null"
+            then:
+              - title: "logprobs_processor.update_from_output: the sampled tokens' top-logprobs rows (new_logprobs) extend the request's logprobs and cumulative_logprob"
+                source: "vllm/v1/engine/output_processor.py:784-785"
+                call: logprobs-processor.update-sample-logprobs
+                input: {request_id: "= vars.out.request_id", num_logprobs: "= vars.rs.logprobs", logprobs_lists: "= vars.out.new_logprobs"}
+                as: lpu
+              - set: {vars.lp: "= vars.lpu.value"}
           - set:
               vars.reason: "= vars.det.value.stop_string != null ? 'stop' : (has(vars.out.finish_reason) ? vars.out.finish_reason : null)"
               vars.stop_reason: "= vars.det.value.stop_string != null ? vars.det.value.stop_string : (has(vars.out.stop_reason) ? vars.out.stop_reason : null)"
@@ -602,10 +635,10 @@ interfaces:
               vars.cum_text: "= vars.det.value.output_text.substring(0, vars.visible_len)"
               vars.delta_text: "= vars.last_off < vars.visible_len ? vars.det.value.output_text.substring(vars.last_off, vars.visible_len) : ''"
               vars.new_off: "= vars.last_off < vars.visible_len ? vars.visible_len : vars.last_off"
-              vars.num_cached: "= vars.rs.is_prefilling ? (has(vars.out.num_cached_tokens) && vars.out.num_cached_tokens != null ? vars.out.num_cached_tokens : 0) : (has(vars.rs.num_cached_tokens) ? vars.rs.num_cached_tokens : 0)"
+              vars.num_cached: "= vars.rs.is_prefilling ? (has(vars.rs.remote_prefill_cached_tokens) && vars.rs.remote_prefill_cached_tokens != null ? vars.rs.remote_prefill_cached_tokens : (has(vars.out.prefill_stats) && vars.out.prefill_stats != null ? vars.out.prefill_stats.num_local_cached_tokens + vars.out.prefill_stats.num_external_cached_tokens : (has(vars.out.num_cached_tokens) && vars.out.num_cached_tokens != null ? vars.out.num_cached_tokens : 0))) : (has(vars.rs.num_cached_tokens) ? vars.rs.num_cached_tokens : 0)"
           - set:
-              state.request_states: "= vars.out.request_id in state.request_states ? merge(state.request_states, {vars.out.request_id: merge(state.request_states[vars.out.request_id], {'is_prefilling': false, 'num_cached_tokens': vars.num_cached, 'output_text': vars.det.value.output_text, 'num_output_tokens': size(vars.all), 'token_ids': vars.all, 'last_text_offset': vars.kind == 'delta' ? vars.new_off : vars.last_off})}) : state.request_states"
-              vars.comp: "= {'index': vars.idx, 'token_ids': vars.kind == 'delta' ? vars.kept : vars.all, 'text': vars.kind == 'delta' ? vars.delta_text : vars.cum_text, 'finish_reason': vars.reason, 'stop_reason': vars.stop_reason}"
+              state.request_states: "= vars.out.request_id in state.request_states ? merge(state.request_states, {vars.out.request_id: merge(state.request_states[vars.out.request_id], {'is_prefilling': false, 'num_cached_tokens': vars.num_cached, 'output_text': vars.det.value.output_text, 'num_output_tokens': size(vars.all), 'token_ids': vars.all, 'last_text_offset': vars.kind == 'delta' ? vars.new_off : vars.last_off, 'last_token_ms': now})}) : state.request_states"
+              vars.comp: "= {'index': vars.idx, 'token_ids': vars.kind == 'delta' ? vars.kept : vars.all, 'text': vars.kind == 'delta' ? vars.delta_text : vars.cum_text, 'finish_reason': vars.reason, 'stop_reason': vars.stop_reason, 'logprobs': vars.lp == null ? dyn(null) : dyn(vars.kind == 'delta' ? vars.lp.logprobs.slice(int(math.greatest(size(vars.lp.logprobs) - size(vars.out.new_token_ids), 0)), size(vars.lp.logprobs)) : vars.lp.logprobs), 'cumulative_logprob': vars.lp == null ? dyn(null) : dyn(vars.lp.cumulative_logprob)}"
               vars.emit: "= vars.reason != null || vars.kind != 'final_only'"
               vars.finished_all: "= vars.reason != null"
               vars.comps: []
@@ -648,6 +681,8 @@ interfaces:
                   state.request_states: "= omit(state.request_states, vars.out.request_id)"
                   state.external_req_ids: "= state.external_req_ids.transformMap(k, v, v.exists(i, i != vars.out.request_id), v.filter(i, i != vars.out.request_id))"
                   vars.finished: "= vars.finished + 1"
+                  vars.fin: "= vars.fin + [{'finish_reason': vars.reason, 'request_id': vars.out.request_id, 'e2e_latency': double(now - (has(vars.rs.arrival_ms) ? vars.rs.arrival_ms : now)) / 1000.0, 'num_prompt_tokens': vars.rs.prompt_len, 'num_generation_tokens': size(vars.all)}]"
+                  vars.wm_counts: "= has(vars.rs.is_watermarked) && vars.rs.is_watermarked ? [vars.wm_counts[0] + 1, vars.wm_counts[1], vars.wm_counts[2]] : (has(vars.rs.is_watermark_skipped) && vars.rs.is_watermark_skipped ? [vars.wm_counts[0], vars.wm_counts[1] + 1, vars.wm_counts[2]] : [vars.wm_counts[0], vars.wm_counts[1], vars.wm_counts[2] + 1])"
                   vars.to_abort: "= (has(vars.out.finish_reason) && vars.out.finish_reason != null) ? vars.to_abort : vars.to_abort + [vars.out.request_id]"
       - title: "process_outputs is synchronous (no await between puts): every output of the step lands in the collectors before a generate() task can read"
         source: "vllm/v1/engine/async_llm.py:860-885"
@@ -656,7 +691,11 @@ interfaces:
         steps:
           - call: request-output-collector.put
             input: "= vars.pt"
-      - return: {reqs_to_abort: "= vars.to_abort", finished: "= vars.finished", request_outputs: "= vars.request_outputs"}
+      - return:
+          reqs_to_abort: "= vars.to_abort"
+          finished: "= vars.finished"
+          request_outputs: "= vars.request_outputs"
+          iteration_stats: {num_generation_tokens: "= vars.it_gen", num_prompt_tokens: "= vars.it_prompt", num_preempted_reqs: 0, time_to_first_tokens_iter: "= vars.ttfts", inter_token_latencies_iter: "= vars.itls", finished_requests: "= vars.fin", num_watermarked_reqs: "= vars.wm_counts[0]", num_watermark_skipped_reqs: "= vars.wm_counts[1]", num_not_watermarked_reqs: "= vars.wm_counts[2]"}
 
   # ------------------------------------------------------------------ RequestOutputCollector
   - component: request-output-collector

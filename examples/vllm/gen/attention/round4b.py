@@ -5,7 +5,7 @@ utils (decode/prefill split, DCP local lengths, per-layer parameters, KV-cache l
 worker-runner calls), the metadata-builder base hooks, the MLAAttentionImpl base methods, backend class
 descriptors, the ROCm AITER MLA and sparse-MLA forward routing, HiSparse group caches, UltraQuant slot size,
 and the test-hit ROCm kernels that were skipped."""
-from core import B, I, S, comp, err, iface
+from core import B, FA_KV_OK, I, QUANT, S, comp, err, iface
 from lib import C, Cfn, Cinv, cls, fn, kernel, ln, mark, LAT_META
 from round4 import A, ARR_I, Cm, FX, Lin, m, obj, step
 
@@ -70,7 +70,7 @@ def fa_init():
          "then": [{"title": "FA4's hd256 kernel needs seqused_k for local attention: encoder inputs with a window fall back to FA2",
                    "source": C(FA, ln(FA, r"if self\.fa4_hd256 and not uses_kv_cache and sliding_window is not None:", ia), ln(FA, r"self\.fa4_hd256 = False", ia)),
                    "set": {"vars.ver": 2, "vars.hd256": False}}]},
-        {"if": "input.kv_cache_dtype.startsWith('fp8') && !((vars.ver == 3 && input.device_capability_major == 9) || (vars.ver == 4 && input.device_capability_major == 10))",
+        {"if": QUANT + " && !" + FA_KV_OK.replace("MAJOR", "input.device_capability_major").replace("VER", "vars.v.value.fa_version").replace("HEAD", "input.head_size"),
          "then": [{"title": "A quantized KV cache this FA version can't read", "source": C(FA, ln(FA, r"if is_quantized_kv_cache\(", ia), ln(FA, r"\" kv-cache on this device\.\"", ia)),
                    "fail": {"code": "not-implemented-error", "message": "= 'FlashAttention does not support ' + input.kv_cache_dtype + ' kv-cache on this device.'"}}]},
         {"title": "Soft cap 0 means none; queries per KV head", "source": C(FA, ln(FA, r"if logits_soft_cap is None:", ia), ln(FA, r"self\.num_queries_per_kv = self\.num_heads // self\.num_kv_heads", ia)),
@@ -140,7 +140,7 @@ def utils_interfaces():
     beh = [
         {"if": "input.layers.exists(l, has(l.impl_matches) && !l.impl_matches)",
          "then": [{"title": "Every layer's impl must be (a variant of) the backend's impl class", "source": C(UT, ln(UT, r"assert impl is not None", pa)),
-                   "fail": {"code": "assertion-error", "message": "attention impl variant not found"}}]},
+                   "fail": {"code": "assertion-error", "message": ""}}]},
         {"title": "window_left from the impl's sliding window (or -1), the soft cap, the scale, and whether it has sinks", "source": C(UT, ln(UT, r"window_size = getattr\(impl, \"sliding_window\", None\)", pa), pb),
          "return": {"params": "= input.layers.map(l, {'name': l.name, 'window_left': has(l.sliding_window) && size(l.sliding_window) > 0 ? l.sliding_window[0] : -1, "
                               "'logits_soft_cap': has(l.logits_soft_cap) ? l.logits_soft_cap : null, 'sm_scale': l.scale, 'has_sinks': has(l.has_sinks) && l.has_sinks})"}},
@@ -163,7 +163,7 @@ def utils_interfaces():
          "set": {"vars.c": "= lists.range(size(vars.d) + 1).map(i, size(vars.d) - i).map(p, " + q(ENUM_ORDER) + ".filter(l, vars.d.all(x, l in x) && " + prio + " == p)).flatten()"}},
         {"if": "size(vars.c) == 0",
          "then": [{"title": "An empty intersection is a hard error", "source": C(UT, ln(UT, r"if not candidates:", ga), gb),
-                   "fail": {"code": "value-error", "message": "No KV cache layout satisfies every supported set"}}]},
+                   "fail": {"code": "value-error", "message": "= 'No KV cache layout satisfies every supported set: [' + vars.d.map(s, '[' + s.map(x, \"'\" + x + \"'\").join(', ') + ']').join(', ') + '].'"}}]},
         {"return": {"layouts": "= vars.c"}},
     ]
     out.append(iface("attention-backend-utils", "get-supported-kv-cache-layouts", "get_supported_kv_cache_layouts: the KV-cache layouts every backend of the worker supports, most preferred first; ValueError when none.",
@@ -178,7 +178,7 @@ def utils_interfaces():
         {"title": "Legacy names: NHD is LBNHC, HND is LBHNC", "source": C(CC, ln(CC, r"^_LAYOUT_COMPAT_ALIASES = \{"), ln(CC, r"^_LAYOUT_COMPAT_ALIASES = \{") + 3),
          "set": {"vars.l": "= input.kv_cache_layout == 'NHD' ? 'LBNHC' : (input.kv_cache_layout == 'HND' ? 'LBHNC' : input.kv_cache_layout)"}},
         {"if": "!(vars.l in " + q(ENUM_ORDER) + ")",
-         "then": [{"title": "Unknown layout name", "source": C(CC, la, lb), "fail": {"code": "value-error", "message": "= 'Unknown KV cache layout ' + input.kv_cache_layout"}}]},
+         "then": [{"title": "Unknown layout name", "source": C(CC, la, lb), "fail": {"code": "value-error", "message": "= \"Unknown KV cache layout '\" + vars.l + \"'. Valid layouts: " + "[" + ", ".join("'" + x + "'" for x in ENUM_ORDER) + "]" + "\""}}]},
         {"if": "input.existing_layout != '' && input.existing_layout != vars.l",
          "then": [{"title": "A layout already resolved can't change", "source": C(UT, ln(UT, r"if existing is not None and existing != layout\.name:", ra)),
                    "fail": {"code": "value-error", "message": "= 'KV cache layout is already resolved to ' + input.existing_layout + '; cannot change it to ' + vars.l + '.'"}}]},
@@ -233,9 +233,9 @@ def builder_base_interfaces():
                    "then": [{"title": "No AOT scheduler metadata: nothing to refresh", "source": C(FA, ln(FA, r"if metadata\.scheduler_metadata is None:", fua)), "return": {"refreshed": False}}]},
                   {"if": "input.dcp_world_size != 1",
                    "then": [{"title": "Draft refresh needs DCP 1", "source": C(FA, ln(FA, r"assert self\.dcp_world_size == 1", fua)),
-                             "fail": {"code": "assertion-error", "message": "dcp_world_size != 1"}}]},
+                             "fail": {"code": "assertion-error", "message": ""}}]},
                   {"title": "Recompute the AOT scheduler metadata in place (capture-safe)", "source": C(FA, fua, fub), "return": {"refreshed": True}}]},
-        {"title": "Base: builders that don't support draft refresh", "source": C(BK, ua, ub), "fail": {"code": "not-implemented-error", "message": "update_draft_decode_metadata"}},
+        {"title": "Base: builders that don't support draft refresh", "source": C(BK, ua, ub), "fail": {"code": "not-implemented-error", "message": ""}},
     ]
     out.append(iface("attention-metadata-builder", "update-draft-decode-metadata", "update_draft_decode_metadata: refresh draft-decode metadata in place inside a speculator's graph (FA recomputes AOT scheduling, Triton has nothing to do, the base raises).",
                      [C(BK, ua, ub), C(FA, fua, fub), C(TA, tua, tub)], beh,
@@ -258,7 +258,7 @@ def mla_impl_interfaces():
          "then": [{"call": "aiter-mla-impl.forward-mqa", "input": {"num_heads": "= input.num_heads", "num_tokens": "= input.num_decode_tokens"}, "as": "o"},
                   {"return": {"impl": "AiterMLAImpl", "output_shape": "= [input.num_decode_tokens, input.num_heads, 512]"}}]},
         {"if": "input.backend == ''",
-         "then": [{"title": "Abstract on the base class", "source": C(BK, fa_, fb_), "fail": {"code": "not-implemented-error", "message": "forward_mqa"}}]},
+         "then": [{"title": "Abstract on the base class", "source": C(BK, fa_, fb_), "fail": {"code": "not-implemented-error", "message": ""}}]},
         {"title": "Another concrete backend's forward_mqa (not simulated by this model)", "source": C(BK, fa_, fb_),
          "return": {"impl": "= input.backend", "output_shape": "= [input.num_decode_tokens, input.num_heads, 512]"}},
     ]
@@ -269,7 +269,7 @@ def mla_impl_interfaces():
     out.append(iface("mla-attention-impl", "forward-mha", "MLAAttentionImpl.forward_mha: MHA-style prefill; the base raises, and the MLA common impl (models-layers), AITER and AMX override it.",
                      [C(BK, ha, hb), Cm(RAM, "AiterMLAImpl", "forward_mha")],
                      [{"if": "!(input.backend in ['MLA_COMMON', 'ROCM_AITER_MLA', 'AMX_MLA'])",
-                       "then": [{"title": "Not overridden", "source": C(BK, ln(BK, r"raise NotImplementedError", ha), hb), "fail": {"code": "not-implemented-error", "message": "forward_mha"}}]},
+                       "then": [{"title": "Not overridden", "source": C(BK, ln(BK, r"raise NotImplementedError", ha), hb), "fail": {"code": "not-implemented-error", "message": ""}}]},
                       {"title": "The override runs the prefill", "source": Cm(RAM, "AiterMLAImpl", "forward_mha"), "return": {"impl": "= input.backend"}}],
                      request=obj({"backend": S("MLA_COMMON")}), response=obj({"impl": {"type": "string"}}), errors=[err("not-implemented-error", "not overridden")]))
     ka, kb = m(BK, "MLAAttentionImpl", "do_kv_cache_update")
@@ -301,23 +301,49 @@ def describe_interface():
         "TRITON_ATTN": {"name": "TRITON_ATTN", "builder": "TritonAttentionMetadataBuilder", "impl": "TritonAttentionImpl", "kernel_block_sizes": ["MultipleOf(16)"], "layouts": None},
         "FLASHINFER_MLA_SPARSE": {"name": "FLASHINFER_MLA_SPARSE", "builder": "FlashInferMLASparseTRTLLMMetadataBuilder", "impl": "FlashInferMLASparseImpl", "kernel_block_sizes": ["MultipleOf(32)"], "layouts": None},
         "FLASHMLA_SPARSE": {"name": "FLASHMLA_SPARSE", "builder": "FlashMLASparseMetadataBuilder", "impl": "FlashMLASparseImpl", "kernel_block_sizes": ["MultipleOf(64)"], "layouts": None},
-        "ROCM_AITER_MLA_SPARSE": {"name": "ROCM_AITER_MLA_SPARSE", "builder": "ROCMAiterMLASparseMetadataBuilder", "impl": "ROCMAiterMLASparseImpl", "kernel_block_sizes": ["1", "MultipleOf(16)"],
+        "ROCM_AITER_MLA_SPARSE": {"name": "ROCM_AITER_MLA_SPARSE", "builder": "ROCMAiterMLASparseMetadataBuilder", "impl": "ROCMAiterMLASparseImpl", "kernel_block_sizes": [1, "MultipleOf(16)"],
                                   "layouts": ["LBNHC", "LBHNC", "BLHNC"]},
     }
     srcs = [Cm(FA, "FlashAttentionBackend", "get_name"), C(TA, *cls(TA, "TritonAttentionBackend")), Cm(FIMS, "_FlashInferMLASparseBackendBase", "get_builder_cls"),
             C(RAMSB, *cls(RAMSB, "ROCMAiterMLASparseBackend")), C(BK, *cls(BK, "MultipleOf"))]
     import json
     table = json.dumps(rows).replace("null", "null").replace('"', "'")
+    IDX = "vllm/v1/attention/backends/mla/indexer.py"
+    DG = "vllm/utils/deep_gemm.py"
+    pga, pgb = fn(DG, "get_paged_mqa_page_sizes")
+    dsa, dsb = m(IDX, "DeepseekV32IndexerBackend", "get_supported_kernel_block_sizes")
+    gla, glb = m(IDX, "Glm5NextIndexerBackend", "get_supported_kernel_block_sizes")
+    kta, ktb = cls(IDX, "KpoolTailBackend")
+    pages = "(input.device_capability_family == 120 ? [64] : [32, 64])"
     beh = [
+        {"if": "input.backend in ['DEEPSEEK_V32_INDEXER', 'DeepseekV32IndexerBackend', 'Glm5NextIndexerBackend', 'KPOOL_TAIL', 'KpoolTailBackend']",
+         "then": [
+             {"if": "input.backend in ['KPOOL_TAIL', 'KpoolTailBackend']",
+              "then": [{"title": "KpoolTailBackend: storage-only GLM-5.3-Flash kpool tail cache, BLHNC layout, any block size", "source": C(IDX, kta, ktb),
+                        "return": {"name": "KPOOL_TAIL", "builder": "KpoolTailMetadataBuilder", "impl": "", "kernel_block_sizes": ["MultipleOf(1)"], "layouts": ["BLHNC"]}}]},
+             {"if": "input.backend == 'Glm5NextIndexerBackend'",
+              "then": [{"if": "input.kv_cache_spec != null",
+                        "then": [{"title": "With a spec (the worker's get_kv_cache_spec): index_kpool is the spec's tokens_per_state", "source": C(IDX, ln(IDX, r"if kv_cache_spec is not None:", gla), ln(IDX, r"index_kpool = int\(kv_cache_spec\.tokens_per_state\)", gla)),
+                                  "set": {"vars.kpool": "= int(input.kv_cache_spec.tokens_per_state)"}}],
+                        "else": [{"title": "Without one (platform block-size selection): hf_text_config.index_kpool of the current config", "source": C(IDX, ln(IDX, r"model_config = get_current_vllm_config\(\)\.model_config", gla), ln(IDX, r"index_kpool = model_config\.hf_text_config\.index_kpool", gla)),
+                                  "set": {"vars.kpool": "= input.index_kpool"}}]},
+                       {"title": "index_kpool times each DeepGEMM paged-MQA page size: (32, 64), only 64 on SM120 (the same on ROCm)", "source": C(DG, pga, pgb),
+                        "return": {"name": "DEEPSEEK_V32_INDEXER", "builder": "DeepseekV32IndexerMetadataBuilder", "impl": "",
+                                   "kernel_block_sizes": "= " + pages + ".map(n, vars.kpool * n)", "layouts": None}}]},
+             {"title": "DeepseekV32IndexerBackend: [1, MultipleOf(16)] on ROCm, else [64]", "source": C(IDX, dsa, dsb),
+              "return": {"name": "DEEPSEEK_V32_INDEXER", "builder": "DeepseekV32IndexerMetadataBuilder", "impl": "",
+                         "kernel_block_sizes": "= input.is_rocm ? [dyn(1), dyn('MultipleOf(16)')] : [dyn(64)]", "layouts": None}}]},
         {"if": "!(input.backend in " + table + ")",
-         "then": [{"title": "Not a described backend class", "source": C(BK, *cls(BK, "AttentionBackend")[:1]), "fail": {"code": "key-error", "message": "= input.backend"}}]},
-        {"title": "The class's static descriptors: get_name, get_builder_cls, get_impl_cls, kernel block sizes (MultipleOf(n): any multiple of n), supported KV layouts",
+         "then": [{"title": "Not a described backend class", "source": C(BK, *cls(BK, "AttentionBackend")[:1]), "fail": {"code": "key-error", "message": "= \"'\" + input.backend + \"'\""}}]},
+        {"title": "The class's static descriptors: get_name, get_builder_cls, get_impl_cls, kernel block sizes (ints, or MultipleOf(n): any multiple of n), supported KV layouts",
          "source": srcs[0], "set": {"vars.r": "= " + table + "[input.backend]"}},
         {"return": {"name": "= vars.r.name", "builder": "= vars.r.builder", "impl": "= vars.r.impl", "kernel_block_sizes": "= vars.r.kernel_block_sizes", "layouts": "= vars.r.layouts"}},
     ]
     # the FlashMLA sparse + FlashInfer sparse SM90 descriptors are cited by their supports-combination interfaces
-    return iface("attention-backend", "describe", "AttentionBackend class descriptors for the modeled backends: name, builder and impl classes, kernel block sizes and KV layouts.",
-                 srcs, beh, request=obj({"backend": S("FLASH_ATTN")}),
+    return iface("attention-backend", "describe", "AttentionBackend class descriptors for the modeled backends (by get_name, or by class name where two classes share one): name, builder and impl classes, kernel block sizes and KV layouts, including the MLA indexer backends.",
+                 srcs + [C(IDX, dsa, dsb), C(IDX, gla, glb), C(DG, pga, pgb)], beh,
+                 request=obj({"backend": S("FLASH_ATTN"), "is_rocm": B(False), "device_capability_family": I(90),
+                              "kv_cache_spec": {"type": ["object", "null"], "default": None}, "index_kpool": {"type": ["integer", "null"], "default": None}}),
                  response=obj({"name": {"type": "string"}, "builder": {"type": "string"}, "impl": {"type": "string"}}), errors=[err("key-error", "unknown backend")])
 
 
@@ -327,14 +353,14 @@ def rocm_impl_interfaces():
     beh = [
         {"if": "!input.has_decode || input.cache_numel == 0",
          "then": [{"title": "forward_mqa needs decode metadata and a cache", "source": C(RAM, ln(RAM, r"assert kv_c_and_k_pe_cache\.numel\(\) > 0", fa_), ln(RAM, r"assert attn_metadata\.decode is not None", fa_)),
-                   "fail": {"code": "assertion-error", "message": "no decode metadata or empty cache"}}]},
+                   "fail": {"code": "assertion-error", "message": ""}}]},
         {"if": "input.use_gluon_decode",
          "then": [{"title": "Small-head single-token decode on the Gluon kernel", "source": C(RAM, ln(RAM, r"if decode\.use_gluon_decode:", fa_), ln(RAM, r"return o, None", fa_)),
                    "return": {"path": "gluon-decode", "heads": "= input.num_heads", "returns_lse": False}}]},
         {"if": "input.use_gluon_verify",
          "then": [{"if": "input.num_reqs * input.qlen != input.num_tokens",
                    "then": [{"title": "The flattened verify block must be num_reqs x qlen rows", "source": C(RAM, ln(RAM, r"if num_reqs \* qlen != B:", fa_)),
-                             "fail": {"code": "value-error", "message": "verify block is not num_reqs x qlen"}}]},
+                             "fail": {"code": "value-error", "message": "= 'verify block ' + string(input.num_tokens) + ' rows is not a multiple of qlen ' + string(input.qlen)"}}]},
                   {"title": "Multi-token verify on Gluon's 4-D MTP entry", "source": C(RAM, ln(RAM, r"if decode\.use_gluon_verify:", fa_)),
                    "return": {"path": "gluon-verify", "heads": "= input.num_heads", "returns_lse": False}}]},
         {"if": "input.dcp_route == 'segmented'",
@@ -370,11 +396,11 @@ def rocm_impl_interfaces():
         {"if": "input.has_sinks",
          "then": [{"if": "!(input.q_dtype == input.kv_dtype && input.q_dtype in ['bfloat16', 'fp8'])",
                    "then": [{"title": "Sinks need BF16 or FP8 for both query and KV", "source": C(RAMSB, ln(RAMSB, r"ROCm AITER MLA attention sinks require query and KV to", la)),
-                             "fail": {"code": "value-error", "message": "ROCm AITER MLA attention sinks require query and KV to both use BF16 or both use FP8"}}]},
+                             "fail": {"code": "value-error", "message": "= 'ROCm AITER MLA attention sinks require query and KV to both use BF16 or both use FP8, got query=torch.' + (input.q_dtype == 'fp8' ? (input.on_gfx942 ? 'float8_e4m3fnuz' : 'float8_e4m3fn') : input.q_dtype) + ', KV=torch.' + (input.kv_dtype == 'fp8' ? (input.on_gfx942 ? 'float8_e4m3fnuz' : 'float8_e4m3fn') : input.kv_dtype)"}}]},
                   {"set": {"vars.buckets": "= input.q_dtype == 'bfloat16' ? [16, 32, 64, 128] : [16, 128]"}},
                   {"if": f"input.on_mi3xx && size(vars.buckets.filter(h, h >= {heads})) == 0",
                    "then": [{"title": "At most 128 padded heads with sinks", "source": C(RAMSB, ln(RAMSB, r"ROCm AITER MLA attention sinks support at most 128", la)),
-                             "fail": {"code": "value-error", "message": "ROCm AITER MLA attention sinks support at most 128 padded local heads; increase tensor_parallel_size"}}]},
+                             "fail": {"code": "value-error", "message": "= 'ROCm AITER MLA attention sinks support at most 128 padded local ' + (input.q_dtype == 'bfloat16' ? 'BF16' : 'FP8') + ' heads; increase tensor_parallel_size'"}}]},
                   {"title": "Pad the query to the next head bucket the return-LSE kernel has", "source": C(RAMSB, ln(RAMSB, r"supported_heads = next\(", la)),
                    "return": {"path": "asm-lse", "heads": f"= input.on_mi3xx ? vars.buckets.filter(h, h >= {heads})[0] : {heads}", "lse": True}}]},
         {"title": "AITER asm decode at the padded head count", "source": C(RAMSB, la, lb), "return": {"path": "asm", "heads": "= " + heads, "lse": False}},
@@ -391,7 +417,7 @@ def rocm_impl_interfaces():
                      [C(IG, ca, cb), Cm(IG, "HiSparseMLAIndexGroup", "register_layer")],
                      [{"if": "!(input.group in state.groups) || !state.groups[input.group].hisparse",
                        "then": [{"title": "Only HiSparse groups keep per-layer caches", "source": C(IG, cls(IG, "HiSparseMLAIndexGroup")[0], cls(IG, "HiSparseMLAIndexGroup")[0]),
-                                 "fail": {"code": "attribute-error", "message": "the group has no caches"}}]},
+                                 "fail": {"code": "attribute-error", "message": "= input.group in state.groups ? \"'SparseMLAIndexGroup' object has no attribute 'cache'\" : \"'\" + input.group + \"'\""}}]},
                       {"if": "input.layer_index >= state.groups[input.group].num_layers",
                        "then": [{"title": "One cache per registered layer", "source": C(IG, ca, cb), "fail": {"code": "index-error", "message": "list index out of range"}}]},
                       {"return": {"cache": "= input.group + ':' + string(input.layer_index)", "is_index_group_leader": "= input.layer_index == 0"}}],
