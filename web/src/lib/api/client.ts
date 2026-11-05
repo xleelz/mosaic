@@ -9,6 +9,7 @@ import type {
   Diff,
   Document,
   ErrorDetail,
+  Evidence,
   Graph,
   Health,
   Impact,
@@ -27,6 +28,7 @@ import type {
   SimulationRun,
   SourceFile,
   SourceOptions,
+  StoredTestReport,
   SystemUpdate,
   SystemVersion,
   TestReport,
@@ -58,7 +60,12 @@ export interface MosaicClient {
   listRuns(id: string, limit?: number): Promise<RunList>;
   runSimulation(id: string, req: SimulationRequest): Promise<SimulationRun>;
   getRun(runId: string): Promise<SimulationRun>;
-  runTests(id: string, rev?: RevSelector): Promise<TestReport>;
+  /** Runs every scenario without saving a trace per scenario, unless `keepTraces`; records the report. */
+  runTests(id: string, rev?: RevSelector, opts?: { keepTraces?: boolean }): Promise<TestReport>;
+  /** The last recorded report for this revision; rejects with a 404 ApiError when never run. */
+  getTestResults(id: string, rev?: RevSelector): Promise<StoredTestReport>;
+  /** How far to trust the model; rejects with a 404 ApiError when none is stored. */
+  getEvidence(id: string, rev?: RevSelector): Promise<Evidence>;
   /** Code commits, oldest first (docs/DESIGN.md §10). */
   listCommits(id: string): Promise<CommitList>;
   getCommit(id: string, sha: string): Promise<CommitDetail>;

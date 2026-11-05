@@ -75,8 +75,8 @@ export interface Playback {
   fanout: Map<number, number[]>;
   steps: StepMark[];
   spans: Map<number, SpanInfo>;
-  /** snapshots[i] is the state after applying events[0..i]. */
-  snapshots: Snapshot[];
+  /** Snapshots every CHECKPOINT_EVERY events; snapshotAt replays forward from the nearest. */
+  checkpoints: Snapshot[];
   initial: Snapshot;
   /** For each event index, the span whose behavior it belongs to (0 = none). */
   frameSpan: number[];
@@ -142,6 +142,11 @@ function setIn(root: JsonObject, segs: string[], value: JsonValue): JsonObject {
   }
   return out;
 }
+
+const CHECKPOINT_EVERY = 256;
+
+/** The last snapshot asked for, per playback. */
+const lastSnapshot = new WeakMap<Playback, { at: number; snap: Snapshot }>();
 
 export function buildPlayback(run: SimulationRun): Playback {
   const events = run.trace ?? [];
@@ -289,29 +294,32 @@ export function buildPlayback(run: SimulationRun): Playback {
     state: structuredClone(run.summary.initial_state ?? {}),
     vars: {},
   };
-  const snapshots: Snapshot[] = [];
-  let cur = initial;
+  const out: Playback = { run, events, lifelines, lanes, parallels, branchGroup, fanout, steps, spans, checkpoints: [], initial, frameSpan };
+  // The top-level maps are written in place here and copied only at a checkpoint: copying them
+  // for every `set` is quadratic in a large run, and holding a copy per event is what cost the memory.
+  const cur: Snapshot = { ctx: initial.ctx, state: { ...initial.state }, vars: {} };
   events.forEach((e, i) => {
-    const segs = e.type === "set" ? setSegs(e) : null;
-    if (segs) {
-      const scope = segs[0];
-      const rest = segs.slice(1);
-      const value: JsonValue = e.new === undefined ? null : e.new;
-      if (scope === "ctx") {
-        cur = { ...cur, ctx: setIn(cur.ctx, rest, value) };
-      } else if (scope === "state" && e.component) {
-        const key = stateKey(e, lanes[i].at);
-        cur = {
-          ...cur,
-          state: { ...cur.state, [key]: setIn(cur.state[key] ?? {}, rest, value) },
-        };
-      } else if (scope === "vars" && e.span) {
-        cur = { ...cur, vars: { ...cur.vars, [e.span]: setIn(cur.vars[e.span] ?? {}, rest, value) } };
-      }
-    }
-    snapshots.push(cur);
+    applyEvent(out, cur, e, i);
+    if ((i + 1) % CHECKPOINT_EVERY === 0) out.checkpoints.push({ ctx: cur.ctx, state: { ...cur.state }, vars: { ...cur.vars } });
   });
-  return { run, events, lifelines, lanes, parallels, branchGroup, fanout, steps, spans, snapshots, initial, frameSpan };
+  return out;
+}
+
+/** Applies one event to a snapshot being replayed, writing its top-level maps in place. */
+function applyEvent(p: Pick<Playback, "lanes">, cur: Snapshot, e: SimEvent, i: number) {
+  const segs = e.type === "set" ? setSegs(e) : null;
+  if (!segs) return;
+  const scope = segs[0];
+  const rest = segs.slice(1);
+  const value: JsonValue = e.new === undefined ? null : e.new;
+  if (scope === "ctx") {
+    cur.ctx = setIn(cur.ctx, rest, value);
+  } else if (scope === "state" && e.component) {
+    const key = stateKey(e, p.lanes[i].at);
+    cur.state[key] = setIn(cur.state[key] ?? {}, rest, value);
+  } else if (scope === "vars" && e.span) {
+    cur.vars[e.span] = setIn(cur.vars[e.span] ?? {}, rest, value);
+  }
 }
 
 /** The state key a `set` writes: "<component>@<instance>", or the component (§11.1). `lane` is the event's lane, when known. */
@@ -347,9 +355,73 @@ export function touchedState(p: Playback): Set<string> {
   return out;
 }
 
+export interface WrittenPaths {
+  /** Each written path, joined. */
+  written: Set<string>;
+  /** Every prefix of each written path, and the path itself. */
+  prefixes: Set<string>;
+}
+
+const joinSegs = (segs: readonly string[]) => segs.join("\u0000");
+
+function addWrite(out: Map<string, WrittenPaths>, component: string, segs: readonly string[]) {
+  let w = out.get(component);
+  if (!w) {
+    w = { written: new Set(), prefixes: new Set() };
+    out.set(component, w);
+  }
+  w.written.add(joinSegs(segs));
+  for (let i = 1; i <= segs.length; i++) w.prefixes.add(joinSegs(segs.slice(0, i)));
+}
+
+function addDiffs(out: Map<string, WrittenPaths>, component: string, a: JsonValue | undefined, b: JsonValue | undefined, segs: string[]) {
+  if (isPlainObject(a) && isPlainObject(b)) {
+    for (const k of new Set([...Object.keys(a), ...Object.keys(b)])) addDiffs(out, component, a[k], b[k], [...segs, k]);
+  } else if (!jsonEqual(a ?? null, b ?? null)) {
+    addWrite(out, component, segs);
+  }
+}
+
+/** What a run changed in component state, by state key: what a `set` wrote, and what ended up different. */
+export function runWrites(p: Playback): Map<string, WrittenPaths> {
+  const out = new Map<string, WrittenPaths>();
+  p.events.forEach((e, i) => {
+    const c = changedAt(e, p.lanes[i]?.at);
+    if (c?.scope === "state" && c.component) addWrite(out, c.component, c.segs);
+  });
+  const fin = p.run.summary.state ?? {};
+  const init = p.run.summary.initial_state ?? {};
+  for (const k of new Set([...Object.keys(fin), ...Object.keys(init)])) addDiffs(out, k, init[k] ?? {}, fin[k] ?? {}, []);
+  return out;
+}
+
+/** Whether a ledger leaf is, holds or sits inside something the run changed. */
+export function leafChanged(w: WrittenPaths, segs: readonly string[]): boolean {
+  if (w.prefixes.has(joinSegs(segs))) return true;
+  for (let i = 1; i < segs.length; i++) if (w.written.has(joinSegs(segs.slice(0, i)))) return true;
+  return false;
+}
+
+/** The state after applying events[0..cursor]: replayed from the nearest checkpoint, and cached for the next step. */
 export function snapshotAt(p: Playback, cursor: number): Snapshot {
-  if (cursor < 0 || p.snapshots.length === 0) return p.initial;
-  return p.snapshots[Math.min(cursor, p.snapshots.length - 1)];
+  const n = p.events.length;
+  if (cursor < 0 || n === 0) return p.initial;
+  const c = Math.min(cursor, n - 1);
+  const last = lastSnapshot.get(p);
+  if (last && last.at === c) return last.snap;
+  const k = Math.floor((c + 1) / CHECKPOINT_EVERY);
+  const base = k > 0 ? p.checkpoints[k - 1] : p.initial;
+  let from = k * CHECKPOINT_EVERY;
+  let seed = base;
+  // Stepping forward continues from the last answer rather than the checkpoint behind it.
+  if (last && last.at < c && last.at + 1 >= from) {
+    from = last.at + 1;
+    seed = last.snap;
+  }
+  const cur: Snapshot = { ctx: seed.ctx, state: { ...seed.state }, vars: { ...seed.vars } };
+  for (let i = from; i <= c; i++) applyEvent(p, cur, p.events[i], i);
+  lastSnapshot.set(p, { at: c, snap: cur });
+  return cur;
 }
 
 /** Spans open (started, not yet ended) at the cursor, outermost first. */

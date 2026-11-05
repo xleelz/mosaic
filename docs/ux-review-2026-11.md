@@ -666,3 +666,35 @@ a reader does the check, and a later "this claim looks wrong" action could feed 
 
 **Side effects of this review.** Six saved simulation runs were added through the UI (one Envoy, three vLLM, two
 on the largest model). Other sampling used `save=false`. No model, replay or setting changed.
+
+---
+
+## Status
+
+Built in November 2026 to [ux-plan-2026-11.md](ux-plan-2026-11.md), then checked together in Chromium on three models.
+
+**Shipped.**
+
+- Passport on the model cards, workspace header and Overview, read from stored evidence, with "Not benchmarked" when there's none.
+- "Schema OK", no green for self-checks, "virtual" durations and "generated" inputs.
+- Overview, and the new tabs. Old URLs still work.
+- Atlas map with a 40-box rule, semantic zoom, four lenses and absent-mechanism ghost rows.
+- Happy path first on Flows, scenario search, and scenarios indexed under each flow they touch.
+- Run at the top of Simulate, the searchable fault picker, and "If this fails" on the component panel.
+- Summary trace, jump keys, swimlanes by area, the run's mechanism warning, and run compare.
+- Windowed lists and sequence diagram, a bounded query cache, gzip through the proxy, and validate results kept per revision.
+- Evidence tab: per-area strips, mechanism filters, stored self-check reports with their caption, `save=false` by default, and "Not explored yet" in Race search.
+- The citation viewer's claim header and "what else cites this file".
+- Command palette and `?` sheet.
+- Per-area revision diff.
+
+**Not shipped.**
+
+- Pass or fail from stored reports on flow and scenario rows.
+- A dependency matrix, and a second tag level for big flow groups.
+- A field for `ASSUMPTION:`, and the "assumed" mark.
+- The "cited" and "cited, exercised" marks.
+- Starting a race search from the UI.
+- Drafts, which has only its slot, and family ties between models.
+
+**Still not checked.** Safari, real newcomers, screen readers, populated Race search, a failing Tests layout, and the commit views with data.

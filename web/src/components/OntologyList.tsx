@@ -5,53 +5,67 @@ import { FIXTURE_MODE } from "@/lib/api";
 import type { OntologySummary } from "@/lib/api/types";
 import { formatDate } from "@/lib/model/format";
 import { useQuery } from "@/lib/hooks";
-import { Badge, Empty, ErrorBox, Notice, Spinner } from "./ui";
+import { HomeSkeleton } from "./overview/Skeletons";
+import { latestOf, modelIdentity } from "./overview/identity";
+import { ModelPassport } from "./trust/ModelPassport";
+import { Badge, Empty, ErrorBox, Notice } from "./ui";
 
-const COUNT_ORDER: [string, string][] = [
-  ["component", "components"],
-  ["interface", "interfaces"],
-  ["link", "links"],
-  ["schema", "schemas"],
-  ["flow", "flows"],
-  ["scenario", "scenarios"],
+const COUNT_ORDER: [string, string, string][] = [
+  ["component", "component", "components"],
+  ["interface", "interface", "interfaces"],
+  ["link", "link", "links"],
+  ["schema", "schema", "schemas"],
+  ["flow", "flow", "flows"],
+  ["scenario", "scenario", "scenarios"],
 ];
 
-function OntologyCard({ o }: { o: OntologySummary }) {
+function ModelCard({ o }: { o: OntologySummary }) {
   const detail = useQuery(`detail:${o.id}`, (c) => c.getOntology(o.id));
+  const revisions = useQuery(`revisions:${o.id}`, (c) => c.listRevisions(o.id));
   const counts = detail.data?.counts;
+  const newest = latestOf(revisions.data?.revisions);
+  const identity = modelIdentity(o.name, o.id, newest?.message);
+  // A zero says nothing about the model here (a model with no links is common): leave it out.
+  const shownCounts = COUNT_ORDER.filter(([k]) => !counts || (counts[k] ?? 0) > 0);
   return (
-    <li>
-      <Link
-        href={`/o/${encodeURIComponent(o.id)}`}
-        className="group flex h-full flex-col rounded-lg border border-line bg-panel p-4 transition-colors hover:border-[#4d6b1f] hover:bg-[#121b15] focus-visible:border-accent"
-      >
-        <div className="flex items-start justify-between gap-3">
-          <div className="min-w-0">
-            <h2 className="truncate text-[15px] font-semibold text-ink group-hover:text-accent">{o.name || o.id}</h2>
-            <div className="font-mono text-[11px] text-faint">{o.id}</div>
-          </div>
-          <div className="flex shrink-0 flex-col items-end gap-1">
-            {o.latest_revision > 0 ? <Badge tone="accent">r{o.latest_revision} latest</Badge> : <Badge>no revisions</Badge>}
-            {detail.data?.draft_dirty && <Badge tone="warn" title="The draft has changes since the latest revision">draft changed</Badge>}
-          </div>
+    <li className="group relative flex h-full flex-col rounded-lg border border-line bg-panel p-4 transition-colors hover:border-[#4d6b1f] hover:bg-[#121b15] has-[a:focus-visible]:border-accent">
+      <div className="flex items-start justify-between gap-3">
+        <div className="min-w-0">
+          <h2 className="truncate text-[15px] font-semibold text-ink group-hover:text-accent" title={identity.staleNote}>
+            {/* The link covers the card; the passport chip sits above it. */}
+            <Link href={`/o/${encodeURIComponent(o.id)}`} className="after:absolute after:inset-0 after:rounded-lg">
+              {identity.title}
+            </Link>
+          </h2>
+          <div className="font-mono text-[11px] text-faint">{o.id}</div>
         </div>
-        <p className="mt-2 line-clamp-3 text-[13px] leading-snug text-muted">{o.description || "No description."}</p>
-        <dl className="mt-3 grid grid-cols-3 gap-px overflow-hidden rounded-md border border-line-soft bg-line-soft">
-          {COUNT_ORDER.map(([k, label]) => (
-            <div key={k} className="bg-panel-2 px-2 py-1.5 text-center">
-              <dd className="tnum text-[15px] font-semibold text-ink">{counts ? (counts[k] ?? 0) : "–"}</dd>
-              <dt className="text-[10.5px] text-faint">{label}</dt>
-            </div>
-          ))}
-        </dl>
-        <div className="mt-3 flex items-center justify-between text-[11px] text-faint">
-          <span>
-            {o.revision_count} revision{o.revision_count === 1 ? "" : "s"}
-          </span>
-          <span>updated {formatDate(o.updated_at)}</span>
+        <div className="flex shrink-0 flex-col items-end gap-1">
+          {o.latest_revision > 0 ? <Badge tone="accent">r{o.latest_revision} latest</Badge> : <Badge>no revisions</Badge>}
+          {detail.data?.draft_dirty && <Badge tone="warn" title="The draft has changes since the latest revision">draft changed</Badge>}
         </div>
-        {detail.error ? <div className="mt-2 text-[11px] text-bad">Counts unavailable</div> : null}
-      </Link>
+      </div>
+      {newest?.message && (
+        <p className="mt-1 truncate text-[12px] text-muted" title={newest.message}>
+          r{newest.number}: {newest.message}
+        </p>
+      )}
+      <ModelPassport id={o.id} className="mt-2 max-w-full self-start" />
+      <p className={o.description ? "mt-2 line-clamp-3 text-[13px] leading-snug text-muted" : "mt-2 text-[12.5px] italic leading-snug text-faint"}>{o.description || "Nobody has written a description."}</p>
+      <dl className="mt-3 flex flex-wrap gap-x-4 gap-y-1">
+        {shownCounts.map(([k, one, many]) => (
+          <div key={k} className="flex items-baseline gap-1">
+            <dd className="tnum text-[14px] font-semibold text-ink">{counts ? (counts[k] ?? 0) : "–"}</dd>
+            <dt className="text-[11px] text-faint">{counts?.[k] === 1 ? one : many}</dt>
+          </div>
+        ))}
+      </dl>
+      <div className="mt-auto flex items-center justify-between pt-3 text-[11px] text-faint">
+        <span>
+          {o.revision_count} revision{o.revision_count === 1 ? "" : "s"}
+        </span>
+        <span>updated {formatDate(o.updated_at)}</span>
+      </div>
+      {detail.error ? <div className="mt-2 text-[11px] text-bad">Counts unavailable</div> : null}
     </li>
   );
 }
@@ -60,11 +74,12 @@ export function OntologyList() {
   const list = useQuery("ontologies", (c) => c.listOntologies());
   return (
     <div className="mx-auto w-full max-w-[1280px] px-6 py-8">
-      <div className="mb-1 text-[11px] font-semibold uppercase tracking-[0.18em] text-accent">Ontologies</div>
+      <div className="mb-1 text-[11px] font-semibold uppercase tracking-[0.18em] text-accent">Models</div>
       <h1 className="text-[24px] font-bold tracking-tight text-ink">Systems you can explore and simulate</h1>
       <p className="mt-1 max-w-3xl text-muted">
-        Each ontology models a software system as components, interfaces, behaviors, flows and scenarios. Open one to
-        browse its architecture, inspect behaviors and run simulations with fake data, faults, retries and timeouts.
+        Each model describes a software system as components, interfaces, behaviors, flows and scenarios. Open one to
+        browse its map, inspect behaviors and run simulations with generated data, faults, retries and timeouts. Every
+        result is a claim by the model, not a fact about the real system.
       </p>
       {FIXTURE_MODE && (
         <div className="mt-4 max-w-3xl">
@@ -75,18 +90,19 @@ export function OntologyList() {
         </div>
       )}
       <div className="mt-6">
-        {list.loading && <Spinner label="Loading ontologies" />}
+        {list.loading && <HomeSkeleton />}
         {list.error ? <ErrorBox error={list.error} onRetry={list.reload} /> : null}
         {list.data && list.data.ontologies.length === 0 && (
           <Empty>
-            No ontologies yet. Create one with <code className="font-mono text-ink">mosaic ontology create</code> and{" "}
+            No models yet. Create one with <code className="font-mono text-ink">mosaic ontology create</code> and{" "}
             <code className="font-mono text-ink">mosaic apply</code>.
           </Empty>
         )}
+        {/* Every model is its own card: the data holds no family ties yet. A family would group here, as one card. */}
         {list.data && list.data.ontologies.length > 0 && (
           <ul className="grid grid-cols-1 gap-4 md:grid-cols-2 xl:grid-cols-3">
             {list.data.ontologies.map((o) => (
-              <OntologyCard key={o.id} o={o} />
+              <ModelCard key={o.id} o={o} />
             ))}
           </ul>
         )}

@@ -2,14 +2,21 @@
 
 import Link from "next/link";
 import { useEffect, useMemo, useRef, useState } from "react";
-import type { Component, Document, Graph, Interface, JsonValue, OntologyRef } from "@/lib/api/types";
+import type { Component, Document, EvidenceMechanism, Flow, Graph, Interface, JsonValue, MechanismFidelity, OntologyRef } from "@/lib/api/types";
 import { refRev } from "@/lib/model/hierarchy";
-import { nameOf } from "@/lib/model/docindex";
+import { componentMechanisms, componentScope, descendantCounts, faultScenarios, flowsThrough, groupMembers, nameOf, type DocIndex } from "@/lib/model/docindex";
 import { useDocIndex } from "@/lib/hooks";
+import { useEvidence } from "@/lib/evidence";
+import { countFidelity } from "@/components/trust/fidelity";
+import { FidelityMark, FidelityStrip } from "@/components/trust/marks";
+import { WindowedList } from "@/components/WindowedList";
+import { CompactScenarioRow, LazyDetails } from "./FlowsTab";
+import { useDocument, useWorkspace } from "./Workspace";
 import { ifaceId, latencyString } from "@/lib/model/format";
 import { resolveSchema, schemaFields, schemaRefId } from "@/lib/model/schema";
 import { StepList, StoreView } from "@/components/behavior/StepList";
 import { JsonView } from "@/components/json";
+import { ClaimScope } from "@/components/code/context";
 import { Badge, Button, SourceRef, cx } from "@/components/ui";
 
 function SchemaView({ doc, label, schema }: { doc: Document; label: string; schema: JsonValue | undefined }) {
@@ -95,8 +102,8 @@ function InterfaceCard({ doc, iface, onSelectInterface, flash }: { doc: Document
             timing pinned
           </Badge>
         )}
-        <span className="ml-auto text-[11px] text-faint" title="Simulated latency">
-          ⏲ {latencyString(iface.latency_ms)}
+        <span className="ml-auto text-[11px] text-faint" title="Simulated latency: virtual time, not a measurement">
+          ⏲ {latencyString(iface.latency_ms)} virtual
         </span>
       </header>
       <div className="space-y-3 px-3 py-2.5">
@@ -109,7 +116,9 @@ function InterfaceCard({ doc, iface, onSelectInterface, flash }: { doc: Document
         {iface.sources?.length ? (
           <div className="flex flex-wrap gap-x-3">
             {iface.sources.map((s, i) => (
-              <SourceRef key={i} source={s} />
+              <ClaimScope key={i} claim={iface.summary || iface.description || ifaceId(iface)}>
+                <SourceRef source={s} />
+              </ClaimScope>
             ))}
           </div>
         ) : null}
@@ -190,7 +199,7 @@ function RefinementSection({
       <div className="flex items-center gap-2">
         <h4 className="text-[11px] font-semibold uppercase tracking-[0.08em] text-accent">Refined by</h4>
         {onZoom && (
-          <Button size="sm" variant="primary" onClick={onZoom} className="ml-auto" title="Open the child ontology inline">
+          <Button size="sm" variant="primary" onClick={onZoom} className="ml-auto" title="Open the child model inline">
             ⤢ Zoom in
           </Button>
         )}
@@ -203,7 +212,7 @@ function RefinementSection({
               <span className="font-mono text-ink">{r.ontology}</span>
               <span className="text-faint">{r.revision ? `@ ${r.revision}` : "@ latest"}</span>
               <Link href={ontologyHref(r.ontology, rev)} className="ml-auto text-link hover:underline">
-                Open ontology →
+                Open model →
               </Link>
             </li>
           );
@@ -214,6 +223,219 @@ function RefinementSection({
 }
 
 const NONE: never[] = [];
+
+const sectionHeading = "text-[11px] font-semibold uppercase tracking-[0.08em] text-faint";
+
+const WEAKEST_FIRST: Record<MechanismFidelity, number> = { shell: 0, absent: 1, partial: 2, modeled: 3 };
+
+function MechanismRow({ m }: { m: EvidenceMechanism }) {
+  return (
+    <div className="pb-1 text-[12px]">
+      <div className="flex items-baseline gap-1.5">
+        <FidelityMark fidelity={m.fidelity} label={false} title={m.note} />
+        <span className="text-ink">{m.name}</span>
+      </div>
+      {m.note && <div className="pl-[18px] text-[11.5px] text-faint">{m.note}</div>}
+    </div>
+  );
+}
+
+/** How much of this component the model holds: from the mechanism list, never silent about having none. */
+function FidelitySection({ idx, id, rev }: { idx: DocIndex; id: string; rev: string }) {
+  const ws = useWorkspace();
+  const { evidence, loading } = useEvidence(ws.id, rev);
+  const list = evidence?.mechanisms;
+  const m = useMemo(() => (list ? componentMechanisms(idx, id, list.items) : null), [idx, id, list]);
+  if (evidence === undefined || loading) return null;
+  if (!list || !m) {
+    return (
+      <section aria-label="Fidelity" className="text-[12px] text-faint">
+        <h4 className={sectionHeading}>Fidelity</h4>
+        Not benchmarked: no mechanism list is stored for this model.
+      </section>
+    );
+  }
+  const weak = m.own.filter((x) => x.fidelity !== "modeled").sort((a, b) => WEAKEST_FIRST[a.fidelity] - WEAKEST_FIRST[b.fidelity]);
+  const stale = list.measured_on_revision !== evidence?.revision;
+  return (
+    <section aria-label="Fidelity" className="space-y-1.5">
+      <h4 className={sectionHeading}>Fidelity</h4>
+      {m.own.length + m.absent.length === 0 ? (
+        <div className="text-[12px] text-faint">The mechanism list doesn&apos;t cover this component, so it says nothing about it.</div>
+      ) : (
+        <FidelityStrip counts={countFidelity([...m.own, ...m.absent])} legend />
+      )}
+      {stale && <div className="text-[11.5px] text-faint">Listed on r{list.measured_on_revision}, not re-checked on this revision.</div>}
+      {weak.length > 0 && (
+        <LazyDetails summary={`${weak.length} on this component aren't fully modeled`} summaryClassName="text-[12px] text-link">
+          <div className="mt-1 max-h-[220px] overflow-y-auto">
+            <WindowedList items={weak} itemKey={(x) => x.id} estimate={40} render={(x) => <MechanismRow m={x} />} />
+          </div>
+        </LazyDetails>
+      )}
+      {m.absent.length > 0 && (
+        <LazyDetails
+          className="rounded border border-dashed border-line px-2 py-1"
+          summaryClassName="text-[12px] text-muted"
+          summary={`${m.absent.length} mechanisms in ${m.areas.join(", ")} aren't in this model`}
+        >
+          <div className="mt-1 max-h-[220px] overflow-y-auto">
+            <WindowedList items={m.absent} itemKey={(x) => x.id} estimate={40} render={(x) => <MechanismRow m={x} />} />
+          </div>
+        </LazyDetails>
+      )}
+    </section>
+  );
+}
+
+/** The gap to know about before running a failure here. */
+function FailureHandlingGaps({ idx, id, rev }: { idx: DocIndex; id: string; rev: string }) {
+  const ws = useWorkspace();
+  const { evidence } = useEvidence(ws.id, rev);
+  const items = evidence?.mechanisms?.items;
+  const gaps = useMemo(() => (items ? componentMechanisms(idx, id, items).absentFailureHandling : []), [idx, id, items]);
+  if (gaps.length === 0) return null;
+  return (
+    <LazyDetails
+      className="mb-1.5 rounded border border-dashed border-line px-2 py-1"
+      summaryClassName="text-[12px] text-ink"
+      summary={`Before you run: this area lists ${gaps.length} failure-handling ${gaps.length === 1 ? "mechanism" : "mechanisms"} as absent, so a run here can't show ${gaps.length === 1 ? "it" : "them"}.`}
+    >
+      <div className="mt-1 max-h-[200px] overflow-y-auto">
+        <WindowedList items={gaps} itemKey={(x) => x.id} estimate={40} render={(x) => <MechanismRow m={x} />} />
+      </div>
+    </LazyDetails>
+  );
+}
+
+interface ThroughRow {
+  flow: Flow;
+  how: "enters here" | "could reach (static)";
+}
+
+function FlowsThroughSection({ doc, idx, comp, members }: { doc: Document; idx: DocIndex; comp: Component; members: number }) {
+  const ws = useWorkspace();
+  const rows = useMemo<ThroughRow[]>(() => {
+    const t = flowsThrough(doc, idx, comp.id);
+    return [...t.enters.map((flow): ThroughRow => ({ flow, how: "enters here" })), ...t.reaches.map((flow): ThroughRow => ({ flow, how: "could reach (static)" }))];
+  }, [doc, idx, comp.id]);
+  return (
+    <section aria-label="Flows through here">
+      <h4 className={sectionHeading}>
+        Flows through here <span className="tnum font-normal">({rows.length})</span>
+      </h4>
+      {members > 0 && rows.length > 0 && <div className="text-[11.5px] text-faint">Counting its {members} members.</div>}
+      {rows.length === 0 ? (
+        <div className="text-[12px] text-faint">No flow enters here, or declares a call that could reach it.</div>
+      ) : (
+        <div className="mt-1 max-h-[220px] overflow-y-auto">
+          <WindowedList
+            items={rows}
+            itemKey={(r) => r.flow.id}
+            estimate={24}
+            render={(r) => (
+              <div className="flex items-baseline gap-2 py-0.5 text-[12.5px]">
+                <Link href={ws.href("flows", { flow: r.flow.id })} className="min-w-0 flex-1 truncate text-link hover:underline" title={r.flow.id}>
+                  {r.flow.name || <span className="font-mono text-[11.5px]">{r.flow.id}</span>}
+                </Link>
+                <span className="shrink-0 text-[11px] text-faint">{r.how}</span>
+              </div>
+            )}
+          />
+        </div>
+      )}
+    </section>
+  );
+}
+
+function IfThisFails({ doc, idx, comp, rev, hasInterfaces }: { doc: Document; idx: DocIndex; comp: Component; rev: string; hasInterfaces: boolean }) {
+  const ws = useWorkspace();
+  const list = useMemo(() => faultScenarios(idx, comp.id), [idx, comp.id]);
+  const tryFlow = useMemo(() => {
+    const t = flowsThrough(doc, idx, comp.id);
+    return t.reaches[0] ?? t.enters[0];
+  }, [doc, idx, comp.id]);
+  return (
+    <section aria-label="If this fails">
+      <h4 className={sectionHeading}>
+        If this fails <span className="tnum font-normal">({list.length})</span>
+      </h4>
+      <div className="mt-1">
+        <FailureHandlingGaps idx={idx} id={comp.id} rev={rev} />
+        {list.length === 0 ? (
+          <div className="text-[12px] text-faint">No scenario injects a fault here.</div>
+        ) : (
+          <div className="max-h-[280px] overflow-y-auto">
+            <WindowedList
+              items={list}
+              itemKey={(x) => x.scenario.id}
+              estimate={52}
+              rowClassName="pb-1"
+              render={(x) => (
+                <CompactScenarioRow
+                  s={x.scenario}
+                  note={x.faults
+                    .slice(0, 2)
+                    .map((f) => `${f.type} on ${f.target}${f.code ? ` (${f.code})` : ""}`)
+                    .join("; ")}
+                />
+              )}
+            />
+          </div>
+        )}
+        {tryFlow && hasInterfaces && (
+          <Link href={ws.href("simulate", { flow: tryFlow.id, fault: comp.id })} className="mt-1 inline-block text-[12px] text-link hover:underline">
+            Try a fault on this component →
+          </Link>
+        )}
+      </div>
+    </section>
+  );
+}
+
+function MembersSection({ idx, id, onSelect }: { idx: DocIndex; id: string; onSelect: (id: string) => void }) {
+  const counts = useMemo(() => descendantCounts(idx), [idx]);
+  const groups = useMemo(() => groupMembers(idx, id, counts), [idx, id, counts]);
+  const total = groups.reduce((n, g) => n + g.members.length, 0);
+  return (
+    <section aria-label="Members">
+      <h4 className={sectionHeading}>
+        Members <span className="tnum font-normal">({total})</span>
+      </h4>
+      <div className="mt-1 space-y-1">
+        {groups.map((g, i) => (
+          <LazyDetails
+            key={g.key}
+            defaultOpen={i === 0 || (i === 1 && g.key !== "rest") || total <= 12}
+            summaryClassName="text-[12px] text-ink"
+            summary={
+              <>
+                {g.label} <span className="tnum text-faint">· {g.members.length}</span>
+              </>
+            }
+          >
+            <div className="mt-0.5 max-h-[200px] overflow-y-auto">
+              <WindowedList
+                items={g.members}
+                itemKey={(c) => c.id}
+                estimate={22}
+                render={(c) => (
+                  <div className="flex items-baseline gap-2 py-px text-[12.5px]">
+                    <button type="button" onClick={() => onSelect(c.id)} className="min-w-0 truncate text-left text-link hover:underline" title={c.id}>
+                      {c.name || c.id}
+                    </button>
+                    {c.kind && <span className="shrink-0 text-[11px] text-faint">{c.kind}</span>}
+                    {(counts.get(c.id) ?? 0) > 0 && <span className="tnum ml-auto shrink-0 text-[11px] text-faint">{counts.get(c.id)} inside</span>}
+                  </div>
+                )}
+              />
+            </div>
+          </LazyDetails>
+        ))}
+      </div>
+    </section>
+  );
+}
 
 export function ComponentPanel({
   doc,
@@ -240,6 +462,10 @@ export function ComponentPanel({
   /** The workspace href of another ontology at a revision (defaults to /o/<id>?rev=). */
   ontologyHref?: (ontology: string, rev?: string) => string;
 }) {
+  const ws = useWorkspace();
+  const workspaceDoc = useDocument();
+  // A zoomed child model isn't the workspace's: its flows and runs belong to its own workspace.
+  const inWorkspace = workspaceDoc.data === doc;
   const idx = useDocIndex(doc);
   const comp: Component | undefined = idx.componentsById.get(componentId);
   const ifaces = idx.interfacesByComponent.get(componentId) ?? NONE;
@@ -247,6 +473,10 @@ export function ComponentPanel({
   const children = idx.childrenByParent.get(componentId) ?? NONE;
   const outgoing = useMemo(() => graph.edges.filter((e) => e.from === componentId), [graph, componentId]);
   const incoming = useMemo(() => graph.edges.filter((e) => e.to === componentId), [graph, componentId]);
+  const relations = useMemo(
+    () => [...outgoing.map((edge) => ({ dir: "out" as const, edge })), ...incoming.map((edge) => ({ dir: "in" as const, edge }))],
+    [outgoing, incoming],
+  );
   const scrollRef = useRef<HTMLDivElement>(null);
   const headingRef = useRef<HTMLHeadingElement>(null);
 
@@ -264,6 +494,7 @@ export function ComponentPanel({
 
   if (!comp) return <div className="p-4 text-muted">Unknown component {componentId}.</div>;
   const name = (id: string) => nameOf(idx, id);
+  const descendants = componentScope(idx, comp.id).size - 1;
 
   return (
     <div ref={scrollRef} className="h-full overflow-y-auto">
@@ -298,6 +529,15 @@ export function ComponentPanel({
             {comp.description && <p className="mt-1 text-[12.5px] text-muted">{comp.description}</p>}
           </div>
         )}
+        {inWorkspace ? (
+          <>
+            <FlowsThroughSection doc={doc} idx={idx} comp={comp} members={descendants} />
+            <IfThisFails doc={doc} idx={idx} comp={comp} rev={ws.rev} hasInterfaces={ifaces.length > 0} />
+            <FidelitySection idx={idx} id={comp.id} rev={ws.rev} />
+          </>
+        ) : (
+          <div className="text-[12px] text-faint">This is a refinement. Open it as its own workspace to see its flows, faults and fidelity.</div>
+        )}
         {comp.refined_by?.length ? (
           <RefinementSection refs={comp.refined_by} onZoom={onZoom ? () => onZoom(comp.id) : undefined} ontologyHref={ontologyHref ?? defaultOntologyHref} />
         ) : null}
@@ -312,47 +552,46 @@ export function ComponentPanel({
               </dd>
             </>
           )}
-          {children.length > 0 && (
-            <>
-              <dt className="text-faint">members</dt>
-              <dd className="flex flex-wrap gap-x-2">
-                {children.map((c) => (
-                  <button key={c.id} type="button" onClick={() => onSelect(c.id)} className="text-link hover:underline">
-                    {c.name || c.id}
-                  </button>
-                ))}
-              </dd>
-            </>
-          )}
           <dt className="text-faint">sources</dt>
           <dd className="flex flex-col">
-            {comp.sources?.length ? comp.sources.map((s, i) => <SourceRef key={i} source={s} />) : <span className="text-faint">none recorded</span>}
+            {comp.sources?.length ? comp.sources.map((s, i) => (
+                <ClaimScope key={i} claim={comp.summary || comp.description || comp.name || comp.id}>
+                  <SourceRef source={s} />
+                </ClaimScope>
+              )) : <span className="text-faint">none recorded</span>}
           </dd>
           {(outgoing.length > 0 || incoming.length > 0) && (
             <>
               <dt className="text-faint">relations</dt>
-              <dd className="space-y-0.5">
-                {outgoing.map((e) => (
-                  <div key={e.id} className="text-[12px]">
-                    <span className="text-faint">{e.derived ? e.kind : `${e.kind} (link)`} →</span>{" "}
-                    <button type="button" onClick={() => onSelect(e.to)} className="text-link hover:underline">
-                      {name(e.to)}
-                    </button>
-                    {e.label && <span className="text-faint"> · {e.label}</span>}
-                  </div>
-                ))}
-                {incoming.map((e) => (
-                  <div key={e.id} className="text-[12px]">
-                    <span className="text-faint">← {e.derived ? (e.kind === "emits" ? "emitted by" : "called by") : `${e.kind} (link) from`}</span>{" "}
-                    <button type="button" onClick={() => onSelect(e.from)} className="text-link hover:underline">
-                      {name(e.from)}
-                    </button>
-                  </div>
-                ))}
+              <dd className="max-h-[260px] overflow-y-auto">
+                <WindowedList
+                  items={relations}
+                  itemKey={(r) => `${r.dir}:${r.edge.id}`}
+                  estimate={20}
+                  render={({ dir, edge: e }) =>
+                    dir === "out" ? (
+                      <div className="py-px text-[12px]">
+                        <span className="text-faint">{e.derived ? e.kind : `${e.kind} (link)`} →</span>{" "}
+                        <button type="button" onClick={() => onSelect(e.to)} className="text-link hover:underline">
+                          {name(e.to)}
+                        </button>
+                        {e.label && <span className="text-faint"> · {e.label}</span>}
+                      </div>
+                    ) : (
+                      <div className="py-px text-[12px]">
+                        <span className="text-faint">← {e.derived ? (e.kind === "emits" ? "emitted by" : "called by") : `${e.kind} (link) from`}</span>{" "}
+                        <button type="button" onClick={() => onSelect(e.from)} className="text-link hover:underline">
+                          {name(e.from)}
+                        </button>
+                      </div>
+                    )
+                  }
+                />
               </dd>
             </>
           )}
         </dl>
+        {children.length > 0 && <MembersSection idx={idx} id={comp.id} onSelect={onSelect} />}
         {comp.attributes && Object.keys(comp.attributes).length > 0 && (
           <div>
             <h4 className="mb-1 text-[11px] font-semibold uppercase tracking-[0.08em] text-faint">Attributes</h4>
@@ -378,11 +617,14 @@ export function ComponentPanel({
           {ifaces.length === 0 ? (
             <div className="text-[12px] text-faint">This component provides no interfaces{children.length ? "; its members do." : "."}</div>
           ) : (
-            <div className="space-y-3">
-              {ifaces.map((i) => (
-                <InterfaceCard key={ifaceId(i)} doc={doc} iface={i} onSelectInterface={onSelectInterface} flash={focusInterface === ifaceId(i)} />
-              ))}
-            </div>
+            <WindowedList
+              items={ifaces as Interface[]}
+              itemKey={ifaceId}
+              estimate={260}
+              rowClassName="pb-3"
+              ensure={focusInterface ? ifaces.findIndex((i) => ifaceId(i) === focusInterface) : undefined}
+              render={(i) => <InterfaceCard doc={doc} iface={i} onSelectInterface={onSelectInterface} flash={focusInterface === ifaceId(i)} />}
+            />
           )}
         </div>
       </div>

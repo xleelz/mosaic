@@ -1047,6 +1047,61 @@ export interface TestReport {
   results: TestResult[];
 }
 
+/** A mechanism's fidelity as its enumerator read it (templates/MECHANISMS.md). */
+export type MechanismFidelity = "modeled" | "partial" | "shell" | "absent";
+
+/** What `check --mechanism-e2e` measured for a mechanism. */
+export type MechanismGateStatus = "ok" | "weak" | "shell" | "uncovered" | "missing" | "skipped";
+
+/** One mechanism enumerated from the code. */
+export interface EvidenceMechanism {
+  id: string;
+  area: string;
+  kind: string;
+  name: string;
+  trigger?: string;
+  observable?: string;
+  citations: string[];
+  interfaces: string[];
+  fidelity: MechanismFidelity;
+  note?: string;
+  gate_status?: MechanismGateStatus;
+}
+
+/** The last blind measure: fresh agents, on cases and tests the builders never saw. */
+export interface EvidenceBlind {
+  measured_on_revision: number;
+  measured_at?: string;
+  benchmark?: string;
+  steps_passed: number;
+  steps_total: number;
+  cases_passed: number;
+  cases_total: number;
+  oracle_passed: number;
+  oracle_total: number;
+  oracle_untranslatable?: number;
+}
+
+/**
+ * api.Evidence: GET /v1/ontologies/{id}/evidence?rev=. How far to trust a model: stored with a
+ * revision and inherited by later ones, so `measured_on_revision` can be older than the one viewed.
+ * A model with none answers 404, which the UI shows as "Not benchmarked", never as good news.
+ */
+export interface Evidence {
+  /** The revision viewed, 0 for the draft. */
+  revision: number;
+  /** "generated" (agents, from source) or "handwritten". */
+  built_by?: string;
+  source?: { repo?: string; commit?: string };
+  blind?: EvidenceBlind;
+  mechanisms?: { measured_on_revision: number; items: EvidenceMechanism[] };
+}
+
+/** api.StoredTestReport: GET /v1/ontologies/{id}/test-results?rev=; 404 when never run. */
+export interface StoredTestReport extends TestReport {
+  ran_at: string;
+}
+
 /** api.ErrorDetail. Codes: bad_request, not_found, conflict, invalid, unauthorized, internal. */
 export interface ErrorDetail {
   code: string;

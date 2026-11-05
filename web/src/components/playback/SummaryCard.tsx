@@ -3,8 +3,10 @@
 import { useState, type ReactNode } from "react";
 import type { JsonObject, SimulationRun } from "@/lib/api/types";
 import { formatDuration, formatMs, jsonInline } from "@/lib/model/format";
+import type { Jumps } from "@/lib/sim/beats";
+import { instanceCount, plural, runVerdict } from "@/lib/sim/wording";
 import { Cel, JsonView } from "@/components/json";
-import { cx } from "@/components/ui";
+import { Kbd, cx } from "@/components/ui";
 
 type Drawer = "result" | "assertions" | "warnings" | "calls" | "passes" | "steps" | "instances" | null;
 
@@ -44,7 +46,16 @@ function Tile({
   );
 }
 
-export function SummaryCard({ run }: { run: SimulationRun }) {
+/** A jump tile's hint: what it does, and its key. */
+function JumpHint({ k, children }: { k: string; children: ReactNode }) {
+  return (
+    <span className="inline-flex items-center gap-1">
+      {children} <Kbd>{k}</Kbd>
+    </span>
+  );
+}
+
+export function SummaryCard({ run, jumps, onJump }: { run: SimulationRun; jumps?: Jumps; onJump?: (target: "fault" | "error" | "state") => void }) {
   const s = run.summary;
   const [drawer, setDrawer] = useState<Drawer>(null);
   const toggle = (d: Drawer) => setDrawer((cur) => (cur === d ? null : d));
@@ -54,14 +65,9 @@ export function SummaryCard({ run }: { run: SimulationRun }) {
   const steps = s.steps ?? [];
   const passed = s.assertions.filter((a) => a.passed).length;
   const failed = s.assertions.length - passed;
-  const statusEl =
-    s.status === "ok" ? (
-      <span className="text-ok">✓ ok</span>
-    ) : s.status === "error" ? (
-      <span className="text-bad">✗ error</span>
-    ) : (
-      <span className="text-warn">⊘ {s.status}</span>
-    );
+  const verdict = runVerdict(s);
+  const instances = instanceCount(byInstance);
+  const statusEl = <span className={cx("text-[13px]", verdict.tone === "bad" ? "text-bad" : verdict.tone === "warn" ? "text-warn" : "text-ink")}>{verdict.text}</span>;
   const result = s.result.ok ? (
     <span className="truncate font-mono text-[13px] text-ink">{jsonInline(s.result.value ?? null, 46)}</span>
   ) : (
@@ -74,14 +80,14 @@ export function SummaryCard({ run }: { run: SimulationRun }) {
   return (
     <section aria-label="Run summary" className="rounded-lg border border-line bg-panel">
       <div className="flex flex-wrap gap-1.5 p-1.5">
-        <Tile label="Status" sub={s.abort ? s.abort : s.passed ? "expectations pass" : s.assertions.length ? "expectations fail" : "no expectations"}>
+        <Tile label="Outcome" sub={s.abort ? s.abort : s.assertions.length ? (s.passed ? "in simulation" : "not what the model expects") : "no expectations"} className="max-w-[340px]">
           {statusEl}
         </Tile>
-        <Tile label={s.result.ok ? "Result" : "Error"} sub={s.result.ok ? "entry call succeeded" : s.result.error?.message} onClick={() => toggle("result")} open={drawer === "result"} className="min-w-[180px] max-w-[320px] flex-1">
+        <Tile label={s.result.ok ? "Result" : "Error"} sub={s.result.ok ? "the entry call returned, in simulation" : s.result.error?.message} onClick={() => toggle("result")} open={drawer === "result"} className="min-w-[180px] max-w-[320px] flex-1">
           {result}
         </Tile>
         <Tile label="Duration" sub={`${s.events} events · seed ${s.seed}`}>
-          {formatDuration(s.duration_ms, s.duration_us)}
+          {formatDuration(s.duration_ms, s.duration_us)} virtual
         </Tile>
         {s.passes?.length ? (
           <Tile
@@ -90,22 +96,22 @@ export function SummaryCard({ run }: { run: SimulationRun }) {
             onClick={() => toggle("passes")}
             open={drawer === "passes"}
           >
-            <span className="text-ok">✓ {s.passes.filter((p) => p.result.ok).length}</span>
+            <span>✓ {s.passes.filter((p) => p.result.ok).length}</span>
             <span className={s.passes.some((p) => !p.result.ok) ? "text-bad" : "text-faint"}>✗ {s.passes.filter((p) => !p.result.ok).length}</span>
           </Tile>
         ) : null}
         {steps.length > 0 && (
           <Tile label="Steps" sub="multi-step scenario" onClick={() => toggle("steps")} open={drawer === "steps"}>
-            <span className="text-ok">✓ {steps.filter((x) => x.result.ok).length}</span>
+            <span>✓ {steps.filter((x) => x.result.ok).length}</span>
             <span className={steps.some((x) => !x.result.ok) ? "text-bad" : "text-faint"}>✗ {steps.filter((x) => !x.result.ok).length}</span>
           </Tile>
         )}
         <Tile label="Calls" sub={`${Object.keys(s.calls).length} interfaces`} onClick={() => toggle("calls")} open={drawer === "calls"}>
           {totalCalls}
         </Tile>
-        {instanceKeys.length > 0 && (
-          <Tile label="By instance" sub={`${new Set(instanceKeys.map((k) => k.slice(k.lastIndexOf("@") + 1))).size} instances`} onClick={() => toggle("instances")} open={drawer === "instances"}>
-            {instanceKeys.length}
+        {instances > 1 && (
+          <Tile label="Instances" sub={plural(instanceKeys.length, "instance call count")} onClick={() => toggle("instances")} open={drawer === "instances"}>
+            {instances}
           </Tile>
         )}
         {s.queued ? (
@@ -124,14 +130,24 @@ export function SummaryCard({ run }: { run: SimulationRun }) {
             {s.retries}
           </span>
         </Tile>
-        <Tile label="Faults">
+        <Tile label="Faults" sub={jumps && jumps.firstFault >= 0 ? <JumpHint k="f">first fault</JumpHint> : undefined} onClick={jumps && jumps.firstFault >= 0 ? () => onJump?.("fault") : undefined}>
           <span className={s.faults ? "text-[#f5b294]" : ""}>
             {s.faults ? "⚡ " : ""}
             {s.faults}
           </span>
         </Tile>
-        <Tile label="Assertions" onClick={() => toggle("assertions")} open={drawer === "assertions"} sub={s.assertions.length ? `${s.assertions.length} expectations` : "none"}>
-          <span className="text-ok">✓ {passed}</span>
+        {jumps && jumps.errors > 0 && (
+          <Tile label="Errors" sub={<JumpHint k="e">first error</JumpHint>} onClick={() => onJump?.("error")}>
+            <span className="text-bad">✗ {jumps.errors}</span>
+          </Tile>
+        )}
+        {jumps && jumps.stateChanges.length > 0 && (
+          <Tile label="State changes" sub={<JumpHint k="n">next</JumpHint>} onClick={() => onJump?.("state")}>
+            {jumps.stateChanges.length}
+          </Tile>
+        )}
+        <Tile label="Expectations" onClick={() => toggle("assertions")} open={drawer === "assertions"} sub={s.assertions.length ? "self-checks, not accuracy" : "none"}>
+          <span>✓ {passed}</span>
           <span className={failed ? "text-bad" : "text-faint"}>✗ {failed}</span>
         </Tile>
         <Tile label="Warnings" onClick={s.warnings.length ? () => toggle("warnings") : undefined} open={drawer === "warnings"}>
@@ -162,7 +178,7 @@ export function SummaryCard({ run }: { run: SimulationRun }) {
               <ul className="space-y-1">
                 {s.assertions.map((a, i) => (
                   <li key={i} className="flex items-baseline gap-2 text-[12px]">
-                    <span className={a.passed ? "text-ok" : "text-bad"} aria-label={a.passed ? "passed" : "failed"}>
+                    <span className={a.passed ? "text-muted" : "text-bad"} aria-label={a.passed ? "passed" : "failed"}>
                       {a.passed ? "✓" : "✗"}
                     </span>
                     <Cel>{a.expr}</Cel>
@@ -196,7 +212,7 @@ export function SummaryCard({ run }: { run: SimulationRun }) {
                     <td className="tnum py-0.5 text-muted">{formatMs(p.duration_ms)}</td>
                     <td className="py-0.5 font-mono text-[11.5px]">
                       {p.result.ok ? (
-                        <span className="text-ok">✓ {jsonInline(p.result.value ?? null, 60)}</span>
+                        <span className="text-ink">✓ {jsonInline(p.result.value ?? null, 60)}</span>
                       ) : (
                         <span className="text-bad" title={p.result.error?.message}>
                           ✗ {p.result.error?.status ? `${p.result.error.status} ` : ""}
@@ -233,7 +249,7 @@ export function SummaryCard({ run }: { run: SimulationRun }) {
                     <td className="py-0.5 text-muted">{p.status}</td>
                     <td className="py-0.5 font-mono text-[11.5px]">
                       {p.result.ok ? (
-                        <span className="text-ok">✓ {jsonInline(p.result.value ?? null, 60)}</span>
+                        <span className="text-ink">✓ {jsonInline(p.result.value ?? null, 60)}</span>
                       ) : (
                         <span className="text-bad" title={p.result.error?.message}>
                           ✗ {p.result.error?.status ? `${p.result.error.status} ` : ""}

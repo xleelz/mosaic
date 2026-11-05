@@ -2,14 +2,36 @@
 
 import Link from "next/link";
 import { usePathname, useRouter, useSearchParams } from "next/navigation";
-import { useCallback, useEffect, useMemo, useState } from "react";
+import { useCallback, useDeferredValue, useEffect, useMemo, useState, type ReactNode } from "react";
 import { getClient } from "@/lib/api";
-import type { Document, Flow, Plan, Scenario } from "@/lib/api/types";
+import type { ChoicePoint, Document, Flow, Plan, Scenario, SimulationRequest } from "@/lib/api/types";
 import { ifaceComponent, ifaceName, plural } from "@/lib/model/format";
-import { FLOW_GROUPINGS, defaultFlowGrouping, flowMatches, groupFlows, nameOf, type DocIndex, type FlowGrouping } from "@/lib/model/docindex";
+import {
+  FLOW_GROUPINGS,
+  SUBGROUP_OVER,
+  defaultFlowGrouping,
+  derivedFlowLine,
+  flowScenarioCount,
+  flowScenarios,
+  flowTitle,
+  groupFlows,
+  mainFlows,
+  nameOf,
+  rankFlows,
+  scenarioTitle,
+  searchFlows,
+  subgroupFlows,
+  touchLabel,
+  type DocIndex,
+  type FlowGrouping,
+  type FlowTouch,
+} from "@/lib/model/docindex";
 import { planQueue, useDocIndex, useQuery } from "@/lib/hooks";
 import { Cel, JsonView, Tpl } from "@/components/json";
-import { Badge, Button, Empty, ErrorBox, Label, Panel, ProgressiveList, Select, SourceRef, Spinner, cx, inputClass } from "@/components/ui";
+import { ClaimScope } from "@/components/code/context";
+import { WindowedList } from "@/components/WindowedList";
+import { ClaimMark } from "@/components/trust/marks";
+import { Badge, Button, Empty, ErrorBox, Label, Panel, Select, SourceRef, Spinner, cx, inputClass } from "@/components/ui";
 import { FlowsChanged } from "./FlowsChanged";
 import { useDocument, useWorkspace } from "./Workspace";
 
@@ -31,7 +53,7 @@ export function scenarioMechanisms(s: Scenario): { label: string; tone: "info" |
   if (s.faults?.length) out.push({ label: `⚡ ${plural(s.faults.length, "fault")}`, tone: "bad" });
   if (s.seed !== undefined) out.push({ label: `seed ${s.seed}`, tone: "neutral" });
   if (s.steps?.length) out.push({ label: plural(s.steps.length, "step"), tone: "info" });
-  if (s.fixtures?.length) out.push({ label: `fixtures: ${s.fixtures.join(", ")}`, tone: "violet" });
+  if (s.fixtures?.length) out.push({ label: `world setup (fixture): ${s.fixtures.join(", ")}`, tone: "violet" });
   if (s.topology && Object.keys(s.topology).length) out.push({ label: `topology: ${Object.keys(s.topology).join(", ")}`, tone: "violet" });
   if (s.config && Object.keys(s.config).length) out.push({ label: `config: ${Object.keys(s.config).join(", ")}`, tone: "violet" });
   if (s.clock?.epoch || s.clock?.epoch_ms) out.push({ label: `clock ${s.clock.epoch ?? s.clock.epoch_ms}`, tone: "neutral" });
@@ -39,7 +61,19 @@ export function scenarioMechanisms(s: Scenario): { label: string; tone: "info" |
   return out;
 }
 
-function ScenarioRow({ s, flow }: { s: Scenario; flow: Flow }) {
+/** A disclosure that doesn't render its content until first opened. */
+export function LazyDetails({ summary, defaultOpen, className, summaryClassName, children }: { summary: ReactNode; defaultOpen?: boolean; className?: string; summaryClassName?: string; children: ReactNode }) {
+  const [opened, setOpened] = useState(!!defaultOpen);
+  return (
+    <details className={className} open={defaultOpen || undefined} onToggle={(e) => e.currentTarget.open && setOpened(true)}>
+      <summary className={cx("cursor-pointer", summaryClassName)}>{summary}</summary>
+      {opened && children}
+    </details>
+  );
+}
+
+/** Starts a run and opens it. */
+export function RunButton({ request, label = "▶ Run", primary }: { request: Omit<SimulationRequest, "rev">; label?: string; primary?: boolean }) {
   const ws = useWorkspace();
   const router = useRouter();
   const [busy, setBusy] = useState(false);
@@ -48,7 +82,7 @@ function ScenarioRow({ s, flow }: { s: Scenario; flow: Flow }) {
     setBusy(true);
     setError(null);
     try {
-      const r = await getClient().runSimulation(ws.id, { rev: ws.rev, scenario: s.id });
+      const r = await getClient().runSimulation(ws.id, { ...request, rev: ws.rev });
       router.push(ws.href(`runs/${encodeURIComponent(r.id)}`));
     } catch (err) {
       setError(err);
@@ -56,14 +90,42 @@ function ScenarioRow({ s, flow }: { s: Scenario; flow: Flow }) {
     }
   };
   return (
-    <li className="rounded-md border border-line bg-panel-2/50 px-3 py-2.5">
+    <>
+      <Button size="sm" variant={primary ? "primary" : "default"} onClick={run} disabled={busy}>
+        {busy ? "Running…" : label}
+      </Button>
+      {error ? <ErrorBox error={error} className="mt-2 basis-full" /> : null}
+    </>
+  );
+}
+
+/** A scenario's title. With no name or description it says so, and the id stays an id. */
+export function ScenarioName({ s, className }: { s: Scenario; className?: string }) {
+  const t = scenarioTitle(s);
+  return t.from === "id" ? <span className={cx("font-normal italic text-muted", className)}>Unnamed scenario</span> : <span className={className}>{t.text}</span>;
+}
+
+function FlowName({ flow, className }: { flow: Flow; className?: string }) {
+  const t = flowTitle(flow);
+  return t.from === "id" ? <span className={cx("font-normal italic text-muted", className)}>Unnamed flow</span> : <span className={className}>{t.text}</span>;
+}
+
+function ScenarioRow({ s, flow, touch, primary }: { s: Scenario; flow: Flow; touch?: FlowTouch; primary?: boolean }) {
+  const ws = useWorkspace();
+  const how = touch ? touchLabel(touch) : "";
+  const title = scenarioTitle(s);
+  return (
+    <article className="rounded-md border border-line bg-panel-2/50 px-3 py-2.5">
       <div className="flex flex-wrap items-start gap-2">
         <div className="min-w-0 flex-1">
           <div className="flex flex-wrap items-baseline gap-2">
-            <h4 className="text-[13px] font-semibold text-ink">{s.name || s.id}</h4>
+            <h4 className="text-[13px] font-semibold text-ink">
+              <ScenarioName s={s} />
+            </h4>
             <span className="font-mono text-[11px] text-faint">{s.id}</span>
+            {how && <span className="text-[11px] text-muted">{how}</span>}
           </div>
-          {s.description && <p className="text-[12.5px] text-muted">{s.description}</p>}
+          {s.description && title.from !== "description" && <p className="text-[12.5px] text-muted">{s.description}</p>}
           <div className="mt-1 flex flex-wrap gap-1">
             {scenarioMechanisms(s).map((m) => (
               <Badge key={m.label} tone={m.tone}>
@@ -72,21 +134,30 @@ function ScenarioRow({ s, flow }: { s: Scenario; flow: Flow }) {
             ))}
           </div>
         </div>
-        <div className="flex shrink-0 gap-1.5">
+        <div className="flex shrink-0 flex-wrap gap-1.5">
           <Link
             href={ws.href("simulate", { flow: flow.id, scenario: s.id })}
             className="inline-flex h-7 items-center rounded-md border border-line bg-panel-2 px-2 text-xs font-medium text-ink hover:bg-panel-3"
           >
             Configure
           </Link>
-          <Button size="sm" variant="primary" onClick={run} disabled={busy}>
-            {busy ? "Running…" : "▶ Run"}
-          </Button>
+          <RunButton request={{ scenario: s.id }} primary={primary} />
         </div>
       </div>
-      {(s.input !== undefined || s.choices || s.state || s.faults?.length) && (
-        <details className="mt-1.5">
-          <summary className="cursor-pointer text-[11.5px] text-link">Overrides</summary>
+      {(s.input !== undefined || s.choices || s.state || s.faults?.length || s.expect?.length) && (
+        <LazyDetails className="mt-1.5" summary="Expectations and overrides" summaryClassName="text-[11.5px] text-link">
+          {s.expect?.length ? (
+            <ul className="mt-1 space-y-0.5">
+              {s.expect.map((e, i) => (
+                <li key={i} className="flex items-baseline gap-1.5">
+                  <span className="text-faint" aria-hidden>
+                    ▸
+                  </span>
+                  <Cel>{e}</Cel>
+                </li>
+              ))}
+            </ul>
+          ) : null}
           <dl className="mt-1 grid grid-cols-[64px_1fr] gap-x-3 gap-y-1 text-[12px]">
             {s.input !== undefined && (
               <>
@@ -98,7 +169,7 @@ function ScenarioRow({ s, flow }: { s: Scenario; flow: Flow }) {
             )}
             {s.choices && (
               <>
-                <dt className="text-faint">choices</dt>
+                <dt className="text-faint">decisions</dt>
                 <dd className="space-y-0.5">
                   {Object.entries(s.choices).map(([k, v]) => (
                     <div key={k}>
@@ -134,52 +205,88 @@ function ScenarioRow({ s, flow }: { s: Scenario; flow: Flow }) {
               </>
             ) : null}
           </dl>
-        </details>
+        </LazyDetails>
       )}
-      {s.expect?.length ? (
-        <div className="mt-2">
-          <div className="mb-0.5 text-[11px] text-faint">expect</div>
-          <ul className="space-y-0.5">
-            {s.expect.map((e, i) => (
-              <li key={i} className="flex items-baseline gap-1.5">
-                <span className="text-faint" aria-hidden>
-                  ▸
-                </span>
-                <Cel>{e}</Cel>
-              </li>
-            ))}
-          </ul>
-        </div>
-      ) : (
-        <div className="mt-1 text-[11.5px] text-faint">No expectations.</div>
-      )}
-      {error ? <ErrorBox error={error} className="mt-2" /> : null}
-    </li>
+    </article>
   );
 }
 
-function PlanView({ plan, idx }: { plan: Plan; idx: DocIndex }) {
-  const reach = groupByComponent(plan.interfaces);
+/** One line for a scenario: what search and the component panel list. */
+export function CompactScenarioRow({ s, note }: { s: Scenario; note?: ReactNode }) {
+  const title = scenarioTitle(s);
+  return (
+    <div className="flex items-start gap-2 rounded-md border border-line-soft bg-panel-2/40 px-2 py-1.5">
+      <div className="min-w-0 flex-1">
+        <div className="text-[12.5px] text-ink">
+          <ScenarioName s={s} />
+          {title.from === "id" && <span className="ml-1.5 font-mono text-[11px] text-faint">{s.id}</span>}
+        </div>
+        {note && <div className="text-[11.5px] text-muted">{note}</div>}
+      </div>
+      <RunButton request={{ scenario: s.id }} />
+    </div>
+  );
+}
+
+const faultableCap = 40;
+
+function FaultableChips({ plan }: { plan: Plan }) {
+  const [all, setAll] = useState(false);
+  const comps = useMemo(() => plan.faultable.filter((f) => !f.includes(".")), [plan]);
+  const shown = all ? comps : comps.slice(0, faultableCap);
+  return (
+    <>
+      <div className="flex flex-wrap gap-1">
+        {shown.map((c) => (
+          <span key={c} className="rounded border border-[#5c2a2a] bg-[#2a1517]/60 px-1.5 font-mono text-[11px] text-bad" title={`Every interface of ${c} can fail individually`}>
+            ⚡ {c}
+          </span>
+        ))}
+      </div>
+      {comps.length > faultableCap && (
+        <button type="button" className="mt-1 text-[11.5px] text-link hover:underline" onClick={() => setAll((a) => !a)}>
+          {all ? "show fewer" : `and ${comps.length - faultableCap} more`}
+        </button>
+      )}
+    </>
+  );
+}
+
+function ReachRow({ component, ids, entry, name }: { component: string; ids: string[]; entry: string; name: string }) {
+  return (
+    <div className="flex flex-wrap items-baseline gap-1.5 py-0.5 text-[12px]">
+      <span className="min-w-[150px] text-ink" title={component}>
+        {name}
+      </span>
+      {ids.map((id) => (
+        <span key={id} className={id === entry ? "rounded border border-[#4d6b1f] bg-[#1c2a10] px-1 font-mono text-[11px] text-accent" : "rounded border border-line bg-panel-2 px-1 font-mono text-[11px] text-muted"}>
+          {ifaceName(id)}
+          {id === entry ? " · entry" : ""}
+        </span>
+      ))}
+    </div>
+  );
+}
+
+/** The static plan: what a flow could reach, never proof that a run does. */
+function CouldReach({ plan, idx }: { plan: Plan; idx: DocIndex }) {
+  const reach = useMemo(() => Array.from(groupByComponent(plan.interfaces).entries()), [plan]);
   const faultComps = plan.faultable.filter((f) => !f.includes("."));
   const name = (id: string) => nameOf(idx, id);
   return (
-    <div className="grid grid-cols-1 gap-3 xl:grid-cols-2">
-      <Panel title={`Reachable · ${plural(plan.interfaces.length, "interface")}, ${plural(plan.components.length, "component")}`}>
-        <ul className="space-y-1 text-[12px]">
-          {Array.from(reach.entries()).map(([c, ids]) => (
-            <li key={c} className="flex flex-wrap items-baseline gap-1.5">
-              <span className="min-w-[150px] text-ink">{name(c)}</span>
-              {ids.map((id) => (
-                <span key={id} className={id === plan.entry ? "rounded border border-[#4d6b1f] bg-[#1c2a10] px-1 font-mono text-[11px] text-accent" : "rounded border border-line bg-panel-2 px-1 font-mono text-[11px] text-muted"}>
-                  {ifaceName(id)}
-                  {id === plan.entry ? " · entry" : ""}
-                </span>
-              ))}
-            </li>
-          ))}
-        </ul>
+    <LazyDetails
+      className="rounded-lg border border-line bg-panel"
+      summaryClassName="px-3 py-2 text-[12px] font-semibold uppercase tracking-[0.08em] text-muted"
+      summary={
+        <>
+          Could reach (static) · {plural(plan.interfaces.length, "interface")}, {plural(plan.components.length, "component")}
+        </>
+      }
+    >
+      <div className="space-y-3 border-t border-line-soft p-3">
+        <p className="text-[12px] text-faint">Everything the model&apos;s declared calls could reach from this flow&apos;s entry. A run takes one path through it; this list is not what happens.</p>
         {plan.unknown?.length ? (
-          <div className="mt-2 rounded border border-[#5c2a2a] bg-[#2a1517] px-2 py-1 text-[12px] text-bad">
+          <div className="rounded border border-[#5c2a2a] bg-[#2a1517] px-2 py-1 text-[12px] text-bad">
             ✗ Targets that are not interfaces:{" "}
             {plan.unknown.map((u, i) => (
               <span key={u}>
@@ -190,78 +297,92 @@ function PlanView({ plan, idx }: { plan: Plan; idx: DocIndex }) {
           </div>
         ) : null}
         {plan.dynamic?.length ? (
-          <div className="mt-2 rounded border border-[#5a4520] bg-[#221c10] px-2 py-1 text-[12px] text-warn">
+          <div className="rounded border border-[#5a4520] bg-[#221c10] px-2 py-1 text-[12px] text-warn">
             ⚠ Dynamic call sites without declared targets: {plan.dynamic.join("; ")}
           </div>
         ) : null}
-      </Panel>
-      <div className="flex flex-col gap-3">
-        <Panel title={`Choice points · ${plan.choices.length}`}>
-          {plan.choices.length === 0 ? (
-            <div className="text-[12px] text-faint">None reachable.</div>
-          ) : (
-            <table className="w-full text-[12px]">
-              <tbody>
-                {plan.choices.map((c) => (
-                  <tr key={c.key} className="border-t border-line-soft first:border-t-0 align-baseline">
-                    <td className="py-1 pr-3 font-mono text-[11.5px] text-ink">{c.key}</td>
-                    <td className="py-1">
-                      <span className="flex flex-wrap gap-1">
-                        {c.options.map((o) => (
-                          <span key={o} className={o === c.default ? "rounded border border-[#5a4520] bg-[#2a2213] px-1 font-mono text-[11px] text-warn" : "rounded border border-line px-1 font-mono text-[11px] text-muted"}>
-                            {o}
-                            {o === c.default ? " · default" : ""}
-                          </span>
-                        ))}
-                      </span>
-                      {c.title && <div className="text-[11.5px] text-faint">{c.title}</div>}
-                    </td>
-                  </tr>
-                ))}
-              </tbody>
-            </table>
-          )}
-        </Panel>
-        <Panel title={`Faultable targets · ${faultComps.length} components, ${plan.faultable.length - faultComps.length} interfaces`}>
-          <div className="flex flex-wrap gap-1">
-            {faultComps.map((c) => (
-              <span key={c} className="rounded border border-[#5c2a2a] bg-[#2a1517]/60 px-1.5 font-mono text-[11px] text-bad" title={plan.faultable.filter((f) => f.startsWith(`${c}.`)).join("\n")}>
-                ⚡ {c}
-              </span>
-            ))}
-          </div>
-          <div className="mt-1 text-[11px] text-faint">Each component&apos;s interfaces are also faultable individually; hover for the list.</div>
-        </Panel>
-        <Panel title={`Stateful components · ${plan.state.length}`}>
-          <ul className="space-y-1">
-            {plan.state.map((s) => (
-              <li key={s.component}>
-                <details>
-                  <summary className="cursor-pointer text-[12px] text-ink">
-                    {name(s.component)} <span className="font-mono text-[11px] text-faint">{Object.keys(s.initial ?? {}).join(", ")}</span>
-                  </summary>
+        <div className="max-h-[420px] overflow-y-auto">
+          <WindowedList
+            items={reach}
+            itemKey={([c]) => c}
+            estimate={26}
+            render={([c, ids]) => <ReachRow component={c} ids={ids} entry={plan.entry} name={name(c)} />}
+          />
+        </div>
+        <div>
+          <h4 className="mb-1 text-[11px] font-semibold uppercase tracking-[0.08em] text-faint">
+            Faultable targets · {faultComps.length} components, {plan.faultable.length - faultComps.length} interfaces
+          </h4>
+          <FaultableChips plan={plan} />
+        </div>
+        <div>
+          <h4 className="mb-1 text-[11px] font-semibold uppercase tracking-[0.08em] text-faint">Stateful components · {plan.state.length}</h4>
+          <div className="max-h-[320px] overflow-y-auto">
+            <WindowedList
+              items={plan.state}
+              itemKey={(s) => s.component}
+              estimate={24}
+              render={(s) => (
+                <LazyDetails
+                  summaryClassName="text-[12px] text-ink"
+                  summary={
+                    <>
+                      {name(s.component)} <span className="font-mono text-[11px] text-faint">{Object.keys(s.initial ?? {}).join(", ")}</span>
+                    </>
+                  }
+                >
                   <JsonView value={s.initial ?? {}} className="mt-1" maxHeight={160} />
-                </details>
-              </li>
-            ))}
-          </ul>
-        </Panel>
+                </LazyDetails>
+              )}
+            />
+          </div>
+        </div>
       </div>
+    </LazyDetails>
+  );
+}
+
+function DecisionRow({ c }: { c: ChoicePoint }) {
+  return (
+    <div className="border-t border-line-soft py-1 first:border-t-0">
+      <span className="font-mono text-[11.5px] text-ink">{c.key}</span>
+      {c.title && <span className="ml-2 text-[11.5px] text-faint">{c.title}</span>}
+      <span className="mt-0.5 flex flex-wrap gap-1">
+        {c.options.map((o) => (
+          <span key={o} className={o === c.default ? "rounded border border-[#5a4520] bg-[#2a2213] px-1 font-mono text-[11px] text-warn" : "rounded border border-line px-1 font-mono text-[11px] text-muted"}>
+            {o}
+            {o === c.default ? " · default" : ""}
+          </span>
+        ))}
+      </span>
     </div>
   );
 }
 
-/** At or below this many flows, the tab lists every flow expanded, with its plan, as one page. */
+/** Choice points: what the model doesn't compute, so a person or a scenario picks. */
+function OpenDecisions({ plan }: { plan: Plan }) {
+  if (plan.choices.length === 0) return null;
+  return (
+    <Panel title={`Open decisions · ${plan.choices.length}`} actions={<ClaimMark kind="open-decision" />}>
+      <div className="max-h-[360px] overflow-y-auto">
+        <WindowedList items={plan.choices} itemKey={(c) => c.key} estimate={46} render={(c) => <DecisionRow c={c} />} />
+      </div>
+    </Panel>
+  );
+}
+
+/** At or below this many flows, the tab lists every flow expanded as one page. */
 export const SMALL_FLOWS = 30;
 
 function FlowHeader({ flow, idx, heading }: { flow: Flow; idx: DocIndex; heading: boolean }) {
   const name = (id: string) => nameOf(idx, id);
+  const derived = derivedFlowLine(flow, idx);
   return (
     <div className="rounded-lg border border-line bg-panel p-4">
       {heading && (
         <div className="flex flex-wrap items-baseline gap-2">
           <h2 id={`flow-${flow.id}`} className="text-[17px] font-semibold text-ink">
-            {flow.name || flow.id}
+            <FlowName flow={flow} />
           </h2>
           <span className="font-mono text-[11px] text-faint">{flow.id}</span>
           {flow.tags?.map((t) => (
@@ -271,9 +392,13 @@ function FlowHeader({ flow, idx, heading }: { flow: Flow; idx: DocIndex; heading
         </div>
       )}
       {!heading && <SimulateLink flow={flow} className="float-right ml-3" />}
-      {flow.description && <p className={cx("max-w-4xl text-muted", heading && "mt-1")}>{flow.description}</p>}
+      {flow.description ? (
+        <p className={cx("max-w-4xl text-muted", heading && "mt-1")}>{flow.description}</p>
+      ) : (
+        <p className={cx("max-w-4xl text-[12.5px] text-faint", heading && "mt-1")}>No description in the model.{derived ? ` From its entry: ${derived}` : ""}</p>
+      )}
       {flow.entry ? (
-        <div className={cx("flex flex-wrap items-center gap-2 text-[12.5px]", (heading || flow.description) && "mt-2")}>
+        <div className="mt-2 flex flex-wrap items-baseline gap-2 text-[12.5px]">
           <span className="text-faint">entry</span>
           <span className="text-ink">{name(flow.entry.caller)}</span>
           <span className="text-faint">→</span>
@@ -284,8 +409,8 @@ function FlowHeader({ flow, idx, heading }: { flow: Flow; idx: DocIndex; heading
             </span>
           )}
           {flow.entry.input !== undefined && (
-            <span className="flex items-center gap-1">
-              <span className="text-faint">input</span> <Tpl value={flow.entry.input} />
+            <span className="flex items-baseline gap-1">
+              <span className="shrink-0 text-faint">generated input, with</span> <Tpl value={flow.entry.input} />
             </span>
           )}
         </div>
@@ -295,7 +420,9 @@ function FlowHeader({ flow, idx, heading }: { flow: Flow; idx: DocIndex; heading
       {flow.sources?.length ? (
         <div className="mt-1 flex flex-wrap gap-x-3">
           {flow.sources.map((s, i) => (
-            <SourceRef key={i} source={s} />
+            <ClaimScope key={i} claim={flow.description || flow.name || flow.id}>
+              <SourceRef source={s} />
+            </ClaimScope>
           ))}
         </div>
       ) : null}
@@ -307,7 +434,11 @@ function FlowHeader({ flow, idx, heading }: { flow: Flow; idx: DocIndex; heading
               <div>
                 <span className="font-medium text-ink">{st.title}</span> <span className="text-faint">· {name(st.component)}</span>
                 {st.detail && <div className="text-muted">{st.detail}</div>}
-                {st.source && <SourceRef source={st.source} />}
+                {st.source && (
+                  <ClaimScope claim={st.detail ? `${st.title}: ${st.detail}` : st.title}>
+                    <SourceRef source={st.source} />
+                  </ClaimScope>
+                )}
               </div>
             </li>
           ))}
@@ -322,40 +453,97 @@ function SimulateLink({ flow, className }: { flow: Flow; className?: string }) {
   return (
     <Link
       href={ws.href("simulate", { flow: flow.id })}
-      className={cx("inline-flex h-7 items-center rounded-md border border-accent bg-accent px-2.5 text-xs font-semibold text-accent-ink hover:bg-[#d9ff9a]", className)}
+      className={cx("inline-flex h-7 items-center rounded-md border border-line bg-panel-2 px-2.5 text-xs font-medium text-ink hover:bg-panel-3", className)}
     >
-      Simulate this flow
+      Configure a run
     </Link>
   );
 }
 
-/** A flow's plan and scenarios. Mounting it fetches the plan (through the shared plan queue). */
-function FlowBody({ flow, idx }: { flow: Flow; idx: DocIndex }) {
-  const ws = useWorkspace();
-  const plan = useQuery(flow.entry ? `plan:${ws.id}:${ws.dataRev}:${flow.id}` : null, (c) => planQueue(() => c.getPlan(ws.id, flow.id, ws.rev)));
-  const scenarios = idx.scenariosByFlow.get(flow.id) ?? [];
+function ScenarioGroup({ title, hint, touches, flow, open }: { title: string; hint?: string; touches: FlowTouch[]; flow: Flow; open?: boolean }) {
+  if (touches.length === 0) return null;
+  return (
+    <LazyDetails
+      defaultOpen={open}
+      className="rounded-md"
+      summaryClassName="py-1 text-[12.5px] font-medium text-ink"
+      summary={
+        <>
+          {title} <span className="tnum text-faint">· {touches.length}</span>
+          {hint && <span className="ml-2 text-[11.5px] font-normal text-faint">{hint}</span>}
+        </>
+      }
+    >
+      <WindowedList
+        items={touches}
+        itemKey={(t) => t.scenario.id}
+        estimate={96}
+        rowClassName="pb-2"
+        className="pt-1"
+        render={(t) => <ScenarioRow s={t.scenario} flow={flow} touch={t} />}
+      />
+    </LazyDetails>
+  );
+}
+
+/** What a flow's page leads with: what happens, then how it fails, then everything else. */
+function WhatHappens({ flow, idx }: { flow: Flow; idx: DocIndex }) {
+  const touches = idx.touchesByFlow.get(flow.id);
+  const sc = useMemo(() => flowScenarios(touches ?? []), [touches]);
+  const failures = sc.faults.length + sc.expectedErrors.length;
   return (
     <>
-      {plan.loading && <Spinner label="Loading plan" />}
-      {plan.error ? <ErrorBox error={plan.error} onRetry={plan.reload} /> : null}
-      {plan.data && <PlanView plan={plan.data} idx={idx} />}
-      <Panel title={`Scenarios · ${scenarios.length}`}>
-        {scenarios.length === 0 ? (
-          <Empty>No scenarios for this flow yet.</Empty>
+      <Panel title="What happens">
+        {sc.happy ? (
+          <>
+            <ScenarioRow s={sc.happy.touch.scenario} flow={flow} touch={sc.happy.touch} primary />
+            <p className="mt-1.5 text-[11.5px] text-faint">Picked by rule, not declared by the model: {sc.happy.why}.</p>
+          </>
+        ) : flow.entry ? (
+          <div className="flex flex-wrap items-center gap-3">
+            <p className="min-w-0 flex-1 text-[12.5px] text-muted">
+              {touches?.length ? "Every scenario here is a failure or a refusal, so none shows the normal path." : "No scenario's steps touch this flow."} A run with the flow&apos;s defaults and generated input shows what the model does.
+            </p>
+            <RunButton request={{ flow: flow.id }} primary label="▶ Run with defaults" />
+          </div>
         ) : (
-          <ProgressiveList
-            items={scenarios}
-            step={60}
-            className="grid grid-cols-1 gap-2 2xl:grid-cols-2"
-            render={(s: Scenario) => <ScenarioRow key={s.id} s={s} flow={flow} />}
-          />
+          <p className="text-[12.5px] text-muted">No scenario touches this flow, and without an entry it can&apos;t run by itself.</p>
         )}
       </Panel>
+      {touches?.length && touches.length > (sc.happy ? 1 : 0) ? (
+        <Panel title={`Other scenarios · ${touches.length - (sc.happy ? 1 : 0)}`}>
+          <div className="space-y-1">
+            {failures > 0 && (
+              <>
+                <ScenarioGroup title="Injected faults" hint="what happens when a part fails" touches={sc.faults} flow={flow} open />
+                <ScenarioGroup title="Refusals and expected errors" hint="the model fails by itself" touches={sc.expectedErrors} flow={flow} open={sc.faults.length === 0} />
+              </>
+            )}
+            <ScenarioGroup title="Also start with this flow" touches={sc.starts} flow={flow} open={failures === 0} />
+            <ScenarioGroup title="Reach this flow from another step" touches={sc.uses} flow={flow} open={failures === 0 && sc.starts.length === 0} />
+          </div>
+        </Panel>
+      ) : null}
     </>
   );
 }
 
-/** One flow, fully expanded: what the tab shows for every flow of a small ontology. */
+/** A flow's scenarios and plan. Mounting it fetches the plan (through the shared plan queue). */
+function FlowBody({ flow, idx }: { flow: Flow; idx: DocIndex }) {
+  const ws = useWorkspace();
+  const plan = useQuery(flow.entry ? `plan:${ws.id}:${ws.dataRev}:${flow.id}` : null, (c) => planQueue(() => c.getPlan(ws.id, flow.id, ws.rev)));
+  return (
+    <>
+      <WhatHappens flow={flow} idx={idx} />
+      {plan.loading && <Spinner label="Loading what it could reach" />}
+      {plan.error ? <ErrorBox error={plan.error} onRetry={plan.reload} /> : null}
+      {plan.data && <CouldReach plan={plan.data} idx={idx} />}
+      {plan.data && <OpenDecisions plan={plan.data} />}
+    </>
+  );
+}
+
+/** One flow, fully expanded: what the tab shows for every flow of a small model. */
 function FlowSection({ flow, idx }: { flow: Flow; idx: DocIndex }) {
   return (
     <section className="space-y-3" aria-labelledby={`flow-${flow.id}`}>
@@ -366,10 +554,10 @@ function FlowSection({ flow, idx }: { flow: Flow; idx: DocIndex }) {
 }
 
 /** A collapsed flow row; expanding it renders (and fetches) the detail. */
-function FlowRow({ flow, idx, open, onToggle, section }: { flow: Flow; idx: DocIndex; open: boolean; onToggle: () => void; section?: string }) {
-  const count = idx.scenariosByFlow.get(flow.id)?.length ?? 0;
+function FlowRow({ flow, idx, open, onToggle, section, reason, hits }: { flow: Flow; idx: DocIndex; open: boolean; onToggle: () => void; section?: string; reason?: string; hits?: Scenario[] }) {
+  const count = flowScenarioCount(flow, idx);
   return (
-    <li id={`flow-${flow.id}`} data-flow-row={flow.id} className={cx("scroll-mt-2 rounded-lg border bg-panel", open ? "border-[#3a4a57]" : "border-line")}>
+    <div id={`flow-${flow.id}`} data-flow-row={flow.id} className={cx("scroll-mt-2 rounded-lg border bg-panel", open ? "border-[#3a4a57]" : "border-line")}>
       <h3>
         <button
           type="button"
@@ -380,24 +568,39 @@ function FlowRow({ flow, idx, open, onToggle, section }: { flow: Flow; idx: DocI
           <span className="w-3 shrink-0 text-faint" aria-hidden>
             {open ? "▾" : "▸"}
           </span>
-          <span className="text-[13.5px] font-semibold text-ink">{flow.name || flow.id}</span>
+          <span className="text-[13.5px] font-semibold text-ink">
+            <FlowName flow={flow} />
+          </span>
           <span className="font-mono text-[11px] text-faint">{flow.id}</span>
           {section && <span className="text-[11px] text-faint">in {section}</span>}
+          {reason && <span className="text-[11px] text-faint">{reason}</span>}
           <span className="flex flex-wrap gap-1">
             {flow.tags?.map((t) => (
               <Badge key={t}>#{t}</Badge>
             ))}
           </span>
-          <span className="tnum ml-auto text-[11.5px] text-muted">{plural(count, "scenario")}</span>
+          {reason ? null : count > 0 ? (
+            <span className="tnum ml-auto text-[11.5px] text-muted">{plural(count, "scenario")}</span>
+          ) : (
+            <span className="ml-auto text-[11.5px] text-faint" title="No scenario names this flow, or calls its entry in a step. Runs may still pass through it.">
+              not in any scenario
+            </span>
+          )}
         </button>
       </h3>
+      {hits?.length ? (
+        <div className="border-t border-line-soft px-3 py-1 text-[11.5px] text-muted">
+          Scenario match: {hits.slice(0, 3).map((s) => scenarioTitle(s).text).join("; ")}
+          {hits.length > 3 ? `; and ${hits.length - 3} more` : ""}
+        </div>
+      ) : null}
       {open && (
         <div className="space-y-3 border-t border-line-soft p-3">
           <FlowHeader flow={flow} idx={idx} heading={false} />
           <FlowBody flow={flow} idx={idx} />
         </div>
       )}
-    </li>
+    </div>
   );
 }
 
@@ -424,15 +627,56 @@ function FlowsList() {
   return <FlowBrowser doc={doc.data} idx={idx} />;
 }
 
+/** Scenarios a search found, with where they sit. Includes scenarios that touch no flow. */
+function ScenarioHits({ scenarios, idx }: { scenarios: Scenario[]; idx: DocIndex }) {
+  if (scenarios.length === 0) return null;
+  return (
+    <Panel title={`Scenarios · ${scenarios.length}`}>
+      <div className="max-h-[320px] overflow-y-auto">
+        <WindowedList
+          items={scenarios}
+          itemKey={(s) => s.id}
+          estimate={52}
+          rowClassName="pb-1"
+          render={(s) => {
+            const flows = idx.flowsOfScenario.get(s.id) ?? [];
+            return (
+              <CompactScenarioRow
+                s={s}
+                note={flows.length ? `touches ${flows.slice(0, 3).map((f) => idx.flowsById.get(f)?.name || f).join(", ")}${flows.length > 3 ? ` and ${flows.length - 3} more` : ""}` : "calls interfaces directly; no flow involved"}
+              />
+            );
+          }}
+        />
+      </div>
+    </Panel>
+  );
+}
+
 function SmallFlows({ doc, idx }: { doc: Document; idx: DocIndex }) {
   const flowParam = useSearchParams().get("flow");
+  const [query, setQuery] = useState("");
+  const deferred = useDeferredValue(query);
+  const found = useMemo(() => searchFlows(doc.flows, idx, deferred), [doc.flows, idx, deferred]);
   useEffect(() => {
     const target = flowParam || hashFlow();
     if (target) document.getElementById(`flow-${target}`)?.scrollIntoView({ block: "start" });
   }, [flowParam]);
   return (
     <div className="mx-auto max-w-[1400px] space-y-8 p-4">
-      {doc.flows.map((f) => (
+      <div className="space-y-3">
+        <input
+          type="search"
+          value={query}
+          onChange={(e) => setQuery(e.target.value)}
+          placeholder={`Search ${plural(doc.flows.length, "flow")} and ${plural(doc.scenarios.length, "scenario")}`}
+          aria-label="Search flows and scenarios"
+          className={cx(inputClass, "w-full max-w-md text-[12.5px]")}
+        />
+        {deferred.trim() ? <ScenarioHits scenarios={found.scenarios} idx={idx} /> : null}
+        {deferred.trim() && found.scenarios.length === 0 && found.flows.length === 0 ? <Empty>No flows or scenarios match.</Empty> : null}
+      </div>
+      {found.flows.map((f) => (
         <FlowSection key={f.id} flow={f} idx={idx} />
       ))}
     </div>
@@ -440,6 +684,16 @@ function SmallFlows({ doc, idx }: { doc: Document; idx: DocIndex }) {
 }
 
 const ALL = "*";
+const MAIN = "main";
+const SUB_ALL = "";
+
+interface HeadRow {
+  head: string;
+  label: string;
+  count: number;
+}
+type BrowserRow = Flow | HeadRow;
+const isHead = (r: BrowserRow): r is HeadRow => "head" in r;
 
 /** Sections in a rail, then the chosen section's flows as collapsed rows. */
 function FlowBrowser({ doc, idx }: { doc: Document; idx: DocIndex }) {
@@ -447,34 +701,42 @@ function FlowBrowser({ doc, idx }: { doc: Document; idx: DocIndex }) {
   const router = useRouter();
   const pathname = usePathname();
   const [query, setQuery] = useState("");
+  const deferred = useDeferredValue(query);
+  const q = deferred.trim();
 
   const groupParam = search.get("group") as FlowGrouping | null;
   const auto = useMemo(() => defaultFlowGrouping(doc.flows, idx), [doc.flows, idx]);
   const grouping: FlowGrouping = groupParam && FLOW_GROUPINGS.some((g) => g.value === groupParam) ? groupParam : auto;
   const groups = useMemo(() => groupFlows(doc.flows, idx, grouping), [doc.flows, idx, grouping]);
-  const matching = useMemo(() => (query.trim() ? groupFlows(doc.flows.filter((f) => flowMatches(f, query)), idx, grouping) : groups), [query, doc.flows, idx, grouping, groups]);
-  const matchCount = useMemo(() => new Map(matching.map((g) => [g.key, g.flows.length])), [matching]);
-  const totalMatches = query.trim() ? doc.flows.filter((f) => flowMatches(f, query)).length : doc.flows.length;
+  const mains = useMemo(() => mainFlows(doc.flows, idx), [doc.flows, idx]);
+  const reasons = useMemo(() => new Map(mains.map((m) => [m.flow.id, m.reason])), [mains]);
+  const found = useMemo(() => searchFlows(doc.flows, idx, q), [doc.flows, idx, q]);
+  const foundIds = useMemo(() => new Set(found.flows.map((f) => f.id)), [found]);
+  const matchCount = useMemo(() => new Map(groupFlows(found.flows, idx, grouping).map((g) => [g.key, g.flows.length])), [found, idx, grouping]);
+  const totalMatches = found.flows.length;
 
   const flowId = search.get("flow");
   const sectionParam = search.get("section");
+  const subParam = search.get("sub") ?? SUB_ALL;
   const section =
-    sectionParam && (sectionParam === ALL || groups.some((g) => g.key === sectionParam))
+    sectionParam && sectionParam !== MAIN && (sectionParam === ALL || groups.some((g) => g.key === sectionParam))
       ? sectionParam
-      : flowId && idx.flowsById.has(flowId)
+      : flowId && idx.flowsById.has(flowId) && !reasons.has(flowId)
         ? (groups.find((g) => g.flows.some((f) => f.id === flowId))?.key ?? groups[0].key)
-        : query.trim()
+        : q
           ? ALL
-          : groups[0].key;
+          : mains.length
+            ? MAIN
+            : groups[0].key;
 
   const navigate = useCallback(
     (patch: Record<string, string | null>, replace = false) => {
-      const q = new URLSearchParams(search.toString());
+      const u = new URLSearchParams(search.toString());
       for (const [k, v] of Object.entries(patch)) {
-        if (v) q.set(k, v);
-        else q.delete(k);
+        if (v) u.set(k, v);
+        else u.delete(k);
       }
-      const url = `${pathname}?${q.toString()}`;
+      const url = `${pathname}?${u.toString()}`;
       if (replace) router.replace(url, { scroll: false });
       else router.push(url, { scroll: false });
     },
@@ -493,25 +755,53 @@ function FlowBrowser({ doc, idx }: { doc: Document; idx: DocIndex }) {
     for (const g of groups) for (const f of g.flows) if (!m.has(f.id)) m.set(f.id, g.label);
     return m;
   }, [groups]);
-  const inSection = section === ALL ? doc.flows : (groups.find((g) => g.key === section)?.flows ?? []);
-  const shown = query.trim() ? inSection.filter((f) => flowMatches(f, query)) : inSection;
-  const openIndex = flowId ? shown.findIndex((f) => f.id === flowId) : -1;
+
+  const inSection = useMemo(() => {
+    if (section === MAIN) return mains.map((m) => m.flow);
+    return rankFlows(section === ALL ? doc.flows : (groups.find((g) => g.key === section)?.flows ?? []), idx);
+  }, [section, mains, doc.flows, groups, idx]);
+  // A second level only for a real section: "All flows" has the rail itself as its level.
+  const subgroups = useMemo(
+    () => (section !== MAIN && section !== ALL && inSection.length > SUBGROUP_OVER ? subgroupFlows(inSection, idx, grouping) : []),
+    [section, inSection, idx, grouping],
+  );
+  const sub = subgroups.some((g) => g.key === subParam) ? subParam : SUB_ALL;
+
+  const shown = useMemo(() => {
+    const pool = sub ? (subgroups.find((g) => g.key === sub)?.flows ?? []) : inSection;
+    return q ? pool.filter((f) => foundIds.has(f.id)) : pool;
+  }, [sub, subgroups, inSection, q, foundIds]);
+
+  const rows = useMemo<BrowserRow[]>(() => {
+    if (sub || !subgroups.length) return shown;
+    const inShown = new Set(shown.map((f) => f.id));
+    const out: BrowserRow[] = [];
+    for (const g of subgroups) {
+      const list = g.flows.filter((f) => inShown.has(f.id));
+      if (!list.length) continue;
+      out.push({ head: g.key, label: g.label, count: list.length });
+      out.push(...list);
+    }
+    return out;
+  }, [sub, subgroups, shown]);
+  const openIndex = flowId ? rows.findIndex((r) => !isHead(r) && r.id === flowId) : -1;
 
   // Bring a linked or newly opened flow into view.
   useEffect(() => {
     if (flowId) document.getElementById(`flow-${flowId}`)?.scrollIntoView({ block: "nearest" });
   }, [flowId, section]);
 
-  const rail = (key: string, label: string, n: number, total: number) => (
-    <li key={key}>
+  const rail = (key: string, label: string, n: number, total: number, depth = 0, active = section === key && !sub, onClick?: () => void) => (
+    <li key={`${depth}:${key}`}>
       <button
         type="button"
-        onClick={() => navigate({ section: key, flow: null })}
-        aria-current={section === key ? "true" : undefined}
+        onClick={onClick ?? (() => navigate({ section: key, sub: null, flow: null }))}
+        aria-current={active ? "true" : undefined}
         disabled={n === 0}
         className={cx(
           "flex w-full items-baseline gap-2 rounded-md px-2 py-1 text-left text-[12.5px] disabled:opacity-40",
-          section === key ? "bg-[#1c2a10] text-accent" : "text-muted hover:bg-panel-2 hover:text-ink",
+          depth > 0 && "pl-5 text-[12px]",
+          active ? "bg-[#1c2a10] text-accent" : "text-muted hover:bg-panel-2 hover:text-ink",
         )}
       >
         <span className="min-w-0 flex-1 truncate" title={label}>
@@ -522,6 +812,8 @@ function FlowBrowser({ doc, idx }: { doc: Document; idx: DocIndex }) {
     </li>
   );
 
+  const heading = section === MAIN ? "Main flows" : section === ALL ? "All flows" : sub ? `${sectionLabel.get(section)} / ${subgroups.find((g) => g.key === sub)?.label}` : sectionLabel.get(section);
+
   return (
     <div className="flex h-full min-h-0">
       <nav aria-label="Flow sections" className="flex w-[260px] shrink-0 flex-col border-r border-line bg-panel/40">
@@ -530,13 +822,14 @@ function FlowBrowser({ doc, idx }: { doc: Document; idx: DocIndex }) {
             type="search"
             value={query}
             onChange={(e) => setQuery(e.target.value)}
-            placeholder={`Search ${doc.flows.length} flows: name, id, tag`}
-            aria-label="Search flows"
+            placeholder="Search flows and scenarios"
+            title={`${doc.flows.length} flows and ${doc.scenarios.length} scenarios`}
+            aria-label="Search flows and scenarios"
             className={cx(inputClass, "w-full text-[12.5px]")}
           />
           <div className="flex items-center gap-1.5">
             <Label htmlFor="flow-grouping">Group by</Label>
-            <Select id="flow-grouping" value={grouping} onChange={(e) => navigate({ group: e.target.value, section: null }, true)} className="h-7 min-w-0 flex-1 text-[12px]">
+            <Select id="flow-grouping" value={grouping} onChange={(e) => navigate({ group: e.target.value, section: null, sub: null }, true)} className="h-7 min-w-0 flex-1 text-[12px]">
               {FLOW_GROUPINGS.map((g) => (
                 <option key={g.value} value={g.value}>
                   {g.label}
@@ -547,42 +840,69 @@ function FlowBrowser({ doc, idx }: { doc: Document; idx: DocIndex }) {
           </div>
         </div>
         <ul className="min-h-0 flex-1 space-y-px overflow-y-auto p-1.5">
+          {mains.length > 0 && !q && rail(MAIN, "Main flows (derived)", mains.length, mains.length)}
           {rail(ALL, "All flows", totalMatches, doc.flows.length)}
           <li className="mx-2 my-1 border-t border-line-soft" aria-hidden />
-          {groups.map((g) => rail(g.key, g.label, matchCount.get(g.key) ?? 0, g.flows.length))}
+          {groups.flatMap((g) => {
+            const row = rail(g.key, g.label, matchCount.get(g.key) ?? 0, g.flows.length);
+            if (g.key !== section || !subgroups.length) return [row];
+            return [
+              row,
+              ...subgroups.map((sg) => {
+                const n = q ? sg.flows.filter((f) => foundIds.has(f.id)).length : sg.flows.length;
+                return rail(sg.key, sg.label, n, sg.flows.length, 1, sub === sg.key, () => navigate({ section: g.key, sub: sg.key, flow: null }));
+              }),
+            ];
+          })}
         </ul>
       </nav>
       <div className="min-w-0 flex-1 overflow-y-auto">
         <div className="mx-auto max-w-[1400px] space-y-3 p-4">
           <div className="flex flex-wrap items-baseline gap-2">
-            <h2 className="text-[17px] font-semibold text-ink">{section === ALL ? "All flows" : sectionLabel.get(section)}</h2>
-            <span className="text-[12px] text-faint">
-              {query.trim() ? `${shown.length} of ${inSection.length} match “${query.trim()}”` : plural(inSection.length, "flow")}
-            </span>
-            {query.trim() && section !== ALL && shown.length < totalMatches && (
-              <button type="button" className="text-[12px] text-link hover:underline" onClick={() => navigate({ section: ALL })}>
+            <h2 className="text-[17px] font-semibold text-ink">{heading}</h2>
+            <span className="text-[12px] text-faint">{q ? `${shown.length} of ${inSection.length} match “${q}”` : plural(shown.length, "flow")}</span>
+            {q && section !== ALL && shown.length < totalMatches && (
+              <button type="button" className="text-[12px] text-link hover:underline" onClick={() => navigate({ section: ALL, sub: null })}>
                 show all {totalMatches} matches
               </button>
             )}
           </div>
-          {shown.length === 0 ? (
-            <Empty>No flows match.</Empty>
+          {section === MAIN ? (
+            <p className="text-[12px] text-faint">Derived, not declared by the model: flows entered from outside it (a client or external caller) first, then those the most scenarios touch.</p>
           ) : (
-            <ProgressiveList
-              key={`${grouping}:${section}:${query}`}
-              items={shown}
+            <p className="text-[12px] text-faint">Ordered by the same derived rule: entered from outside the model first, then by scenarios touching them.</p>
+          )}
+          {q ? <ScenarioHits scenarios={found.scenarios} idx={idx} /> : null}
+          {shown.length === 0 ? (
+            found.scenarios.length ? null : <Empty>No flows or scenarios match.</Empty>
+          ) : (
+            <WindowedList
+              key={`${grouping}:${section}:${sub}:${q}`}
+              items={rows}
+              itemKey={(r) => (isHead(r) ? `head:${r.head}` : r.id)}
               ensure={openIndex}
-              className="space-y-1.5"
-              render={(f: Flow) => (
-                <FlowRow
-                  key={f.id}
-                  flow={f}
-                  idx={idx}
-                  open={f.id === flowId}
-                  section={section === ALL ? sectionOf.get(f.id) : undefined}
-                  onToggle={() => navigate({ flow: f.id === flowId ? null : f.id, section })}
-                />
-              )}
+              estimate={42}
+              rowClassName="pb-1.5"
+              render={(r) =>
+                isHead(r) ? (
+                  <h3 className="flex items-baseline gap-2 pb-0.5 pt-2 text-[12px] font-semibold uppercase tracking-[0.08em] text-muted">
+                    <button type="button" className="hover:underline" onClick={() => navigate({ sub: r.head })}>
+                      {r.label}
+                    </button>
+                    <span className="tnum font-normal text-faint">{r.count}</span>
+                  </h3>
+                ) : (
+                  <FlowRow
+                    flow={r}
+                    idx={idx}
+                    open={r.id === flowId}
+                    section={section === ALL || section === MAIN ? sectionOf.get(r.id) : undefined}
+                    reason={section === MAIN ? reasons.get(r.id) : undefined}
+                    hits={q ? found.viaScenario.get(r.id) : undefined}
+                    onToggle={() => navigate({ flow: r.id === flowId ? null : r.id, section, sub: sub || null })}
+                  />
+                )
+              }
             />
           )}
         </div>

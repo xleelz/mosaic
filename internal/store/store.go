@@ -2,9 +2,9 @@
 //
 // Everything lives in one database, `mosaic`:
 //
-//   - branch main holds the registry: `ontologies` and `commits` (committed
-//     on every change) and `simulation_runs` (left in the working set, never
-//     committed);
+//   - branch main holds the registry: `ontologies`, `commits` and `evidence`
+//     (committed on every change) and `simulation_runs` and `test_reports`
+//     (left in the working set, never committed);
 //   - branch ontology-base holds the empty `entities` and `meta` tables;
 //   - branch ont/<id> holds one ontology. Its working set is the draft, and
 //     revision N is a commit tagged ont/<id>/r<N>. Sessions reach the branch as
@@ -144,6 +144,12 @@ const (
 		"subject TEXT NOT NULL, author VARCHAR(512) NOT NULL, date DATETIME(6) NOT NULL, files JSON NOT NULL, " +
 		"repo VARCHAR(1024) NOT NULL, seq BIGINT NOT NULL, url VARCHAR(2048) NOT NULL DEFAULT '', " +
 		"PRIMARY KEY (ontology_id, sha))"
+	ddlEvidence = "CREATE TABLE IF NOT EXISTS evidence (" +
+		"ontology_id VARCHAR(64) NOT NULL, revision INT NOT NULL, spec LONGTEXT NOT NULL, updated_at DATETIME(6) NOT NULL, " +
+		"PRIMARY KEY (ontology_id, revision))"
+	ddlTestReports = "CREATE TABLE IF NOT EXISTS test_reports (" +
+		"ontology_id VARCHAR(64) NOT NULL, revision VARCHAR(16) NOT NULL, report LONGTEXT NOT NULL, ran_at DATETIME(6) NOT NULL, " +
+		"PRIMARY KEY (ontology_id, revision))"
 )
 
 // init creates the database, the ontology-base branch and the registry
@@ -165,7 +171,7 @@ func (s *Store) init(ctx context.Context) error {
 			}
 		}
 		if err := s.withConn(ctx, Database+"/"+BaseBranch, func(b *sql.Conn) error {
-			for _, q := range []string{"DROP TABLE IF EXISTS simulation_runs", "DROP TABLE IF EXISTS ontologies", "DROP TABLE IF EXISTS commits", ddlEntities, ddlMeta} {
+			for _, q := range []string{"DROP TABLE IF EXISTS simulation_runs", "DROP TABLE IF EXISTS ontologies", "DROP TABLE IF EXISTS commits", "DROP TABLE IF EXISTS evidence", "DROP TABLE IF EXISTS test_reports", ddlEntities, ddlMeta} {
 				if _, err := b.ExecContext(ctx, q); err != nil {
 					return err
 				}
@@ -174,7 +180,7 @@ func (s *Store) init(ctx context.Context) error {
 		}); err != nil {
 			return err
 		}
-		for _, q := range []string{ddlOntologies, ddlRuns, ddlCommits} {
+		for _, q := range []string{ddlOntologies, ddlRuns, ddlCommits, ddlEvidence, ddlTestReports} {
 			if _, err := c.ExecContext(ctx, q); err != nil {
 				return err
 			}

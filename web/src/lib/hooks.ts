@@ -2,14 +2,26 @@
 
 import { useCallback, useEffect, useMemo, useRef, useSyncExternalStore } from "react";
 import { getClient, type MosaicClient } from "@/lib/api";
-import type { Document } from "@/lib/api/types";
+import type { Document, Validation } from "@/lib/api/types";
 import { docIndex, type DocIndex } from "@/lib/model/docindex";
+import { QueryCache } from "@/lib/querycache";
+import { readValidation, writeValidation } from "@/lib/validationcache";
 
 // A small keyed query cache: reads are shared across tabs and remounts, and a
 // reload drops the key. No external dependency needed for a read-mostly UI.
+//
+// It's a bounded LRU (lib/querycache.ts), so it doesn't grow with every run
+// opened. What a mounted view uses, or a fetch in flight, is never evicted.
 
 type Entry = { promise: Promise<unknown>; data?: unknown; error?: unknown; done: boolean };
-const cache = new Map<string, Entry>();
+
+/** A whole document, trace, graph or list of runs can be megabytes; everything else is small. */
+const HEAVY = /^(doc|runs?|graph|source|diff|commit):/;
+const cache = new QueryCache<Entry>({
+  maxWeight: 512,
+  // About 16 heavy entries, or fewer of them and some hundreds of plans.
+  weightOf: (key) => (HEAVY.test(key) ? 32 : 1),
+});
 const listeners = new Set<() => void>();
 let version = 0;
 
@@ -29,11 +41,13 @@ function start(key: string, fn: (c: MosaicClient) => Promise<unknown>): Entry {
     (data) => {
       entry.data = data;
       entry.done = true;
+      cache.evict();
       notify();
     },
     (error) => {
       entry.error = error;
       entry.done = true;
+      cache.evict();
       notify();
     },
   );
@@ -57,7 +71,11 @@ export function useQuery<T>(key: string | null, fn: (c: MosaicClient) => Promise
   useSyncExternalStore(subscribe, () => version, () => 0);
 
   useEffect(() => {
-    if (key && !cache.has(key)) start(key, (c) => fnRef.current(c));
+    if (!key) return;
+    const unpin = cache.pin(key);
+    if (cache.has(key)) cache.touch(key);
+    else start(key, (c) => fnRef.current(c));
+    return unpin;
   }, [key]);
 
   const reload = useCallback(() => {
@@ -82,6 +100,11 @@ export function useQuery<T>(key: string | null, fn: (c: MosaicClient) => Promise
  */
 export function useQueries<T>(items: { key: string; fn: (c: MosaicClient) => Promise<T> }[]): QueryState<T>[] {
   useSyncExternalStore(subscribe, () => version, () => 0);
+  const keys = items.map((it) => it.key).join("\n");
+  useEffect(() => {
+    const unpins = keys ? keys.split("\n").map((k) => cache.pin(k)) : [];
+    return () => unpins.forEach((u) => u());
+  }, [keys]);
   useEffect(() => {
     for (const it of items) if (!cache.has(it.key)) start(it.key, it.fn);
   });
@@ -103,8 +126,36 @@ export function useQueries<T>(items: { key: string; fn: (c: MosaicClient) => Pro
 
 /** Drops every cached key that starts with prefix. */
 export function invalidate(prefix: string) {
-  for (const k of Array.from(cache.keys())) if (k.startsWith(prefix)) cache.delete(k);
+  for (const k of cache.keys()) if (k.startsWith(prefix)) cache.delete(k);
   notify();
+}
+
+function localStore(): Storage | null {
+  try {
+    return window.localStorage;
+  } catch {
+    return null;
+  }
+}
+
+/**
+ * The validate result of a revision. Validating the largest model takes
+ * seconds and a revision is frozen, so it's kept across page loads per revision
+ * hash (lib/validationcache.ts). Pass the resolved revision: "draft", which is
+ * always fetched, or the number with its hash. Without a hash yet, it waits.
+ */
+export function useValidation(id: string, rev: string | null, hash: string | undefined): QueryState<Validation> {
+  const draft = rev === "draft";
+  return useQuery<Validation>(!rev ? null : draft ? `validate:${id}:draft` : hash ? `validate:${id}:${rev}:${hash}` : null, async (c) => {
+    const store = !draft && hash ? localStore() : null;
+    if (store && rev && hash) {
+      const kept = readValidation<Validation>(store, id, rev, hash, Date.now());
+      if (kept) return kept;
+    }
+    const result = await c.validate(id, rev ?? undefined);
+    if (store && rev && hash) writeValidation(store, id, rev, hash, result, Date.now());
+    return result;
+  });
 }
 
 /**

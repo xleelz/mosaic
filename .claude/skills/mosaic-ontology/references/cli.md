@@ -12,6 +12,7 @@ These commands are specified in docs/DESIGN.md §7. The output shapes come from 
 - [Validation, revisions and diffs](#validation-revisions-and-diffs)
 - [Graph and plan](#graph-and-plan)
 - [Simulation and tests](#simulation-and-tests)
+- [Evidence](#evidence)
 - [Cited source files](#cited-source-files)
 - [Version and self-update](#version-and-self-update)
 - [Errors](#errors)
@@ -156,6 +157,26 @@ mosaic test <ont> [--rev R] [--format text|json]
   if any scenario fails.
 
 How to read summaries and traces is covered in mosaic-simulation.
+
+## Evidence
+
+```
+mosaic evidence build --mechanisms DIR [--mechanisms-json FILE] --blind FILE
+                      [--built-by generated|handwritten] [--source-repo R] [--source-commit SHA] [-o FILE]
+mosaic evidence put <ont> -f FILE [--rev R] [--format json|text]
+mosaic evidence get <ont> [--rev R] [--format json|text]
+```
+
+- Evidence says how far to trust a model: how it was built, its last blind measure and its mechanism
+  list. It's stored per revision. A revision with none inherits from the newest earlier revision that
+  has one, so read each `measured_on_revision`; `revision` is the one viewed (0 for the draft).
+- `build` runs locally. It merges `DIR/<area>.json` (see mosaic-generate's `templates/MECHANISMS.md`),
+  adds `gate_status` per mechanism id from `--mechanisms-json`, and validates the result.
+- `put` defaults to the latest revision and replaces that revision's record, so include everything
+  still true. It refuses the draft. A `measured_on_revision` of 0 means the revision it's stored on.
+- `get` exits 1 when none is stored: treat that as "not benchmarked", never as good news.
+- `mosaic test` also records its report per revision, for the web UI's
+  `GET /ontologies/{id}/test-results`.
 
 ## Cited source files
 

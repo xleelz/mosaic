@@ -25,7 +25,7 @@ import {
   type Viewport,
 } from "@xyflow/react";
 import { memo, useCallback, useEffect, useMemo, useState, type CSSProperties } from "react";
-import type { Graph, GraphEdge } from "@/lib/api/types";
+import type { Graph, GraphEdge, GraphNode } from "@/lib/api/types";
 import { categoricalScale, type ColorScale } from "@/lib/model/colors";
 import type { ChangeKind } from "@/lib/model/impact";
 import type { ActiveEdge } from "@/lib/sim/playback";
@@ -33,7 +33,7 @@ import { Button, cx } from "@/components/ui";
 import { collapseGraph, containers, DIFF_COLORS, parentMap, type DiffStatus } from "./graphview";
 import { HEADER_H, isAncestor, layoutGraph, type MapLayout } from "./layout";
 
-export type ColorBy = "layer" | "kind";
+export type ColorBy = "layer" | "kind" | "area";
 
 export interface MapHighlight {
   /** The component the current event happens on. */
@@ -79,7 +79,7 @@ function ZoomButton({ onZoom, label }: { onZoom: () => void; label: string }) {
       type="button"
       className="nodrag nopan inline-flex h-[18px] items-center justify-center gap-0.5 rounded border border-[#4d6b1f] bg-[#1c2a10] px-1 text-[10.5px] leading-none text-accent hover:border-accent"
       aria-label={`Zoom into ${label}'s refinement`}
-      title="Refined: zoom into the child ontology"
+      title="Refined: zoom into the child model"
       onClick={(ev) => {
         ev.stopPropagation();
         onZoom();
@@ -503,16 +503,20 @@ interface MapProps {
   /** §16.6: refined components get a zoom button that calls this. */
   refined?: Set<string>;
   onZoom?: (id: string) => void;
+  /** Component id -> its area, for coloring by area. */
+  areaOf?: ReadonlyMap<string, string>;
 }
 
 /** Maps with more components than this start with their top-level groups collapsed. */
 export const COLLAPSE_ABOVE = 120;
 
-export function useColorScale(graph: Graph | undefined, colorBy: ColorBy): ColorScale {
-  return useMemo(
-    () => categoricalScale((graph?.nodes ?? []).map((n) => (colorBy === "layer" ? n.layer : n.kind))),
-    [graph, colorBy],
-  );
+function colorGroup(n: GraphNode, colorBy: ColorBy, areaOf?: ReadonlyMap<string, string>): string | undefined {
+  if (colorBy === "area") return areaOf?.get(n.id);
+  return colorBy === "layer" ? n.layer : n.kind;
+}
+
+export function useColorScale(graph: Graph | undefined, colorBy: ColorBy, areaOf?: ReadonlyMap<string, string>): ColorScale {
+  return useMemo(() => categoricalScale((graph?.nodes ?? []).map((n) => colorGroup(n, colorBy, areaOf))), [graph, colorBy, areaOf]);
 }
 
 function MapInner({
@@ -534,10 +538,11 @@ function MapInner({
   instanceGroups,
   refined,
   onZoom,
+  areaOf,
 }: MapProps) {
   const [layout, setLayout] = useState<{ graph: Graph; layout: MapLayout } | null>(null);
   const [layoutError, setLayoutError] = useState<string | null>(null);
-  const scale = useColorScale(layoutOf ?? fullGraph, colorBy);
+  const scale = useColorScale(layoutOf ?? fullGraph, colorBy, areaOf);
   const rf = useReactFlow();
 
   // Collapsing: start with the top-level groups of a large map collapsed.
@@ -624,7 +629,7 @@ function MapInner({
           label: n.name,
           kind: n.kind,
           layer: n.layer,
-          color: scale.color(colorBy === "layer" ? n.layer : n.kind),
+          color: scale.color(colorGroup(n, colorBy, areaOf)),
           ifaces: n.interfaces.length,
           stateful: n.stateful,
           container,
@@ -639,7 +644,7 @@ function MapInner({
         },
       };
     });
-  }, [ready, graph, drawn, highlight, scale, colorBy, selected, diff, hidden, collapsible, groupIds, toggle, instanceGroups, refined, onZoom]);
+  }, [ready, graph, drawn, highlight, scale, colorBy, areaOf, selected, diff, hidden, collapsible, groupIds, toggle, instanceGroups, refined, onZoom]);
 
   const edges: MapEdge[] = useMemo(() => {
     if (!ready) return [];

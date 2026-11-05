@@ -3,13 +3,21 @@
 import { useCallback, useEffect, useLayoutEffect, useMemo, useRef, useState, type ReactNode } from "react";
 import type { Document, Graph, SimulationRun } from "@/lib/api/types";
 import { buildPlayback, activeFor, eventTone, laneComponent, openSpans } from "@/lib/sim/playback";
+import { areaResolver, deriveBeats, isNoise, jumpTargets, NOISE_ABOVE, nextStateChange, openingCursor, stepTarget, beatIndexAt, weakBeats, weakByInterface, type Beat } from "@/lib/sim/beats";
+import { stateChanges } from "@/lib/sim/compare";
+import { buildLaneView, groupsByDefault, laneAreas } from "@/lib/sim/lanes";
+import { plural } from "@/lib/sim/wording";
+import { docIndex } from "@/lib/model/docindex";
 import { ArchitectureMap, COLLAPSE_ABOVE, useColorScale, type MapHighlight } from "@/components/map/ArchitectureMap";
 import { runGraph } from "@/lib/model/rungraph";
-import { Panel, cx } from "@/components/ui";
+import { Kbd, Panel, cx } from "@/components/ui";
 import { Inspector } from "./Inspector";
 import { SequenceDiagram } from "./SequenceDiagram";
 import { StateLedger } from "./StateLedger";
+import { MechanismWarning } from "./MechanismWarning";
 import { SummaryCard } from "./SummaryCard";
+import { SummaryTrace } from "./SummaryTrace";
+import { useRunMechanisms } from "./useRunMechanisms";
 import { Transport } from "./Transport";
 
 // Dwell time per event type at 1×, so playback lingers on what matters.
@@ -60,6 +68,29 @@ function isTyping(el: EventTarget | null, key: string): boolean {
  * "embedded" is the inline playback in Simulate and Exploration: a grid.
  */
 export type PlaybackLayout = "page" | "embedded";
+
+/** The summary by default on the run page. The sequence diagram stays one view, on demand. */
+type RunViewMode = "summary" | "both" | "sequence";
+
+const VIEW_MODES: { mode: RunViewMode; label: string }[] = [
+  { mode: "summary", label: "Summary" },
+  { mode: "both", label: "Side by side" },
+  { mode: "sequence", label: "Sequence" },
+];
+
+/** Above this many lanes the map shows little but a moving dot, so it starts hidden. */
+const MAP_HIDDEN_ABOVE_LANES = 30;
+
+const NO_AREAS: ReadonlyMap<string, string> = new Map();
+
+/** A small on/off pill for a view option. */
+function Toggle({ on, onClick, title, children }: { on: boolean; onClick: () => void; title: string; children: ReactNode }) {
+  return (
+    <button type="button" aria-pressed={on} title={title} onClick={onClick} className={cx("rounded border border-line px-1.5 py-0.5 text-[10.5px] leading-none", on ? "bg-panel-3 text-ink" : "text-faint hover:text-ink")}>
+      {children}
+    </button>
+  );
+}
 
 /** A floating panel's state: collapsed to a tab or bar, shown at its normal size, or expanded over its neighbours. */
 type FloatState = "hidden" | "open" | "expanded";
@@ -138,6 +169,7 @@ export function Playback({
   onCursorChange,
   layout = "embedded",
   className,
+  actions,
 }: {
   run: SimulationRun;
   doc?: Document;
@@ -146,17 +178,59 @@ export function Playback({
   onCursorChange?: (seq: number) => void;
   layout?: PlaybackLayout;
   className?: string;
+  /** Extra controls on the run page's bar, such as "Compare with...". */
+  actions?: ReactNode;
 }) {
   const playback = useMemo(() => buildPlayback(run), [run]);
-  const n = playback.events.length;
-  const [cursor, setCursorRaw] = useState(() => Math.min(Math.max(0, initialCursor ?? 0), Math.max(0, n - 1)));
+  const events = playback.events;
+  const n = events.length;
+  const area = doc ? docIndex(doc).area : NO_AREAS;
+  const beats = useMemo(() => deriveBeats(events, { areaOf: areaResolver(area) }), [events, area]);
+  const jumps = useMemo(() => jumpTargets(events), [events]);
+  // A run with a fault or an error opens on it: that's what its reader came for.
+  const [cursor, setCursorRaw] = useState(() => Math.min(Math.max(0, initialCursor ?? openingCursor(jumps)), Math.max(0, n - 1)));
   const [playing, setPlaying] = useState(false);
   const [speed, setSpeed] = useState(1);
-  const [mapOpen, setMapOpen] = useState(true);
+  const manyLanes = playback.lifelines.length > MAP_HIDDEN_ABOVE_LANES;
+  const [mapOpen, setMapOpen] = useState(!manyLanes);
   const page = layout === "page";
+  const [viewMode, setViewMode] = useState<RunViewMode>(page ? "summary" : "sequence");
+  // Bumped by a deliberate jump: the views center on the cursor, rather than just keep it in view.
+  const [centerKey, setCenterKey] = useState(0);
   const [side, setSide] = useFloatState("mosaic.run.inspector", "open");
-  const [mapState, setMapState] = useFloatState("mosaic.run.map", "open");
+  // Its own key above the threshold: the small-run key already holds "open" in existing browsers.
+  const [mapState, setMapState] = useFloatState(manyLanes ? "mosaic.run.map.many-lanes" : "mosaic.run.map", manyLanes ? "hidden" : "open");
   const colorScale = useColorScale(graph, "layer");
+
+  // set and note hide by default above NOISE_ABOVE events.
+  const [noiseChoice, setNoiseChoice] = useState<boolean | null>(null);
+  const hideNoise = noiseChoice ?? n > NOISE_ABOVE;
+  const noiseCount = useMemo(() => events.reduce((c, e) => c + (isNoise(e) ? 1 : 0), 0), [events]);
+
+  // Swimlanes by area, each expandable. A model with no areas keeps its component lanes.
+  const [groupChoice, setGroupChoice] = useState<boolean | null>(null);
+  const [expanded, setExpanded] = useState<ReadonlySet<string>>(() => new Set());
+  const canGroup = laneAreas(playback.lifelines, area).length >= 2;
+  const grouped = canGroup && (groupChoice ?? groupsByDefault(playback.lifelines, area));
+  const laneView = useMemo(() => buildLaneView(playback.lifelines, area, grouped, expanded), [playback, area, grouped, expanded]);
+  const toggleArea = useCallback((a: string) => {
+    setExpanded((cur) => {
+      const next = new Set(cur);
+      if (!next.delete(a)) next.add(a);
+      return next;
+    });
+  }, []);
+
+  // Where this run passed through mechanisms the model doesn't fully do. Silent with no evidence.
+  const weakMechanisms = useRunMechanisms(run);
+  const weakIfaces = useMemo(() => weakByInterface(weakMechanisms), [weakMechanisms]);
+  const weakByBeat = useMemo(() => weakBeats(events, beats, weakIfaces), [events, beats, weakIfaces]);
+  const stateLeft = useMemo(() => stateChanges(run.summary.initial_state, run.summary.state), [run]);
+  const [initialBeat] = useState(() => {
+    if (jumps.firstFault < 0 && jumps.firstError < 0) return undefined;
+    const b = beatIndexAt(beats, cursor);
+    return b >= 0 ? b : undefined;
+  });
 
   // On the run page the panels float over the sequence diagram; measure how
   // much of its right and bottom edges they cover, so the cursor row scrolls
@@ -180,7 +254,7 @@ export function Playback({
     const ro = new ResizeObserver(measure);
     for (const el of [stage, sideRef.current, mapRef.current]) if (el) ro.observe(el);
     return () => ro.disconnect();
-  }, [page, side, mapState, graph, n]);
+  }, [page, side, mapState, graph, n, viewMode]);
 
   const setCursor = useCallback(
     (i: number) => {
@@ -196,14 +270,38 @@ export function Playback({
     if (!playing || cursor >= n - 1) return;
     const e = playback.events[cursor];
     const t = window.setTimeout(() => {
-      setCursor(cursor + 1);
-      if (cursor + 1 >= n - 1) setPlaying(false);
+      const next = stepTarget(playback.events, cursor, 1, hideNoise);
+      setCursor(next);
+      if (next >= n - 1 || next === cursor) setPlaying(false);
     }, (DWELL[e?.type ?? ""] ?? 300) / speed);
     return () => window.clearTimeout(t);
-  }, [playing, cursor, n, speed, playback, setCursor]);
+  }, [playing, cursor, n, speed, playback, setCursor, hideNoise]);
 
-  // Keyboard: Space play/pause, ←/→ step (Shift: 10), Home/End; on the run
-  // page, i cycles the inspector panel and m the map.
+  const jumpTo = useCallback(
+    (i: number) => {
+      if (i < 0) return;
+      setPlaying(false);
+      setCursor(i);
+      setCenterKey((k) => k + 1);
+    },
+    [setCursor],
+  );
+  const jump = useCallback(
+    (target: "fault" | "error" | "state") => {
+      if (target === "fault") jumpTo(jumps.firstFault);
+      else if (target === "error") jumpTo(jumps.firstError);
+      else {
+        const next = nextStateChange(jumps, cursor);
+        // Past the last one, start over from the first.
+        jumpTo(next >= 0 ? next : (jumps.stateChanges[0] ?? -1));
+      }
+    },
+    [jumpTo, jumps, cursor],
+  );
+
+  // Keyboard: Space play/pause, ←/→ step (Shift: 10), Home/End, f first fault,
+  // e first error, n next state change; on the run page, s cycles the views,
+  // i the inspector panel and m the map.
   useEffect(() => {
     const onKey = (ev: KeyboardEvent) => {
       if (ev.metaKey || ev.ctrlKey || ev.altKey) return;
@@ -215,11 +313,11 @@ export function Playback({
       } else if (ev.key === "ArrowRight") {
         ev.preventDefault();
         setPlaying(false);
-        setCursor(cursor + (ev.shiftKey ? 10 : 1));
+        setCursor(stepTarget(events, cursor, 1, hideNoise, ev.shiftKey ? 10 : 1));
       } else if (ev.key === "ArrowLeft") {
         ev.preventDefault();
         setPlaying(false);
-        setCursor(cursor - (ev.shiftKey ? 10 : 1));
+        setCursor(stepTarget(events, cursor, -1, hideNoise, ev.shiftKey ? 10 : 1));
       } else if (ev.key === "Home") {
         ev.preventDefault();
         setPlaying(false);
@@ -228,6 +326,18 @@ export function Playback({
         ev.preventDefault();
         setPlaying(false);
         setCursor(n - 1);
+      } else if (!ev.shiftKey && ev.key === "f" && jumps.firstFault >= 0) {
+        ev.preventDefault();
+        jump("fault");
+      } else if (!ev.shiftKey && ev.key === "e" && jumps.firstError >= 0) {
+        ev.preventDefault();
+        jump("error");
+      } else if (!ev.shiftKey && ev.key === "n" && jumps.stateChanges.length > 0) {
+        ev.preventDefault();
+        jump("state");
+      } else if (!ev.shiftKey && ev.key === "s") {
+        ev.preventDefault();
+        setViewMode((m) => VIEW_MODES[(VIEW_MODES.findIndex((v) => v.mode === m) + 1) % VIEW_MODES.length].mode);
       } else if (page && !ev.shiftKey && ev.key === "i") {
         ev.preventDefault();
         setSide(nextFloat);
@@ -238,10 +348,13 @@ export function Playback({
     };
     window.addEventListener("keydown", onKey);
     return () => window.removeEventListener("keydown", onKey);
-  }, [cursor, n, playing, setCursor, page, graph, setSide, setMapState]);
+  }, [cursor, n, playing, setCursor, page, graph, setSide, setMapState, events, hideNoise, jumps, jump]);
 
   const current = playback.events[cursor];
+  const mapShown = page ? mapState !== "hidden" : mapOpen;
   const highlight: MapHighlight = useMemo(() => {
+    // Nothing reads this with the map hidden, and it walks every span.
+    if (!mapShown) return { involved: new Set<string>(), busy: new Set<string>(), error: false, seq: 0 };
     const act = activeFor(current);
     const tone = current ? eventTone(current) : "note";
     const busy = new Set(openSpans(playback, cursor).map((s) => laneComponent(s.to)));
@@ -253,7 +366,7 @@ export function Playback({
       error: tone === "error" || tone === "fault",
       seq: current?.seq ?? 0,
     };
-  }, [current, playback, cursor]);
+  }, [current, playback, cursor, mapShown]);
 
   // A large ontology's map draws only the run's components (and their groups): see runGraph.
   const involvedKey = playback.lifelines.map(laneComponent).sort().join("\n");
@@ -267,7 +380,7 @@ export function Playback({
   if (n === 0) {
     return (
       <div className={cx("flex flex-col gap-2", className)}>
-        <SummaryCard run={run} />
+        <SummaryCard run={run} jumps={jumps} />
         <div className="rounded-lg border border-dashed border-line p-6 text-center text-muted">This run has no trace to play back.</div>
       </div>
     );
@@ -277,6 +390,7 @@ export function Playback({
     setPlaying(false);
     setCursor(i);
   };
+  const onBeat = (b: Beat) => jumpTo(b.at);
   const legend = (
     <span className="hidden items-center gap-3 text-[10.5px] text-faint md:flex" aria-label="Legend">
       <span>→ request</span>
@@ -295,13 +409,91 @@ export function Playback({
     </span>
   );
   const sequence = (
-    <SequenceDiagram playback={playback} doc={doc} scale={colorScale} colorKey={colorKey} cursor={cursor} onCursor={onJump} insets={page ? insets : undefined} />
+    <SequenceDiagram
+      playback={playback}
+      doc={doc}
+      scale={colorScale}
+      colorKey={colorKey}
+      cursor={cursor}
+      onCursor={onJump}
+      insets={page ? insets : undefined}
+      view={laneView}
+      onToggleArea={toggleArea}
+      hideNoise={hideNoise}
+      weak={weakIfaces}
+      centerKey={centerKey}
+    />
   );
-  const map = mapGraph && <ArchitectureMap graph={mapGraph} highlight={highlight} ariaLabel="Architecture map highlighting the current event" />;
+  const sequenceActions = (
+    <span className="flex items-center gap-2">
+      {canGroup && (
+        <Toggle on={grouped} onClick={() => setGroupChoice(!grouped)} title={grouped ? "Show one lane per component" : "Fold lanes into their areas"}>
+          lanes by area
+        </Toggle>
+      )}
+      {noiseCount > 0 && (
+        <Toggle on={!hideNoise} onClick={() => setNoiseChoice(hideNoise)} title={hideNoise ? `Show the ${noiseCount} set and note events` : "Hide set and note events"}>
+          {hideNoise ? `${noiseCount} set and note hidden` : "set and note shown"}
+        </Toggle>
+      )}
+      {legend}
+    </span>
+  );
+  const viewSwitch = (
+    <span className="flex items-center gap-1 text-[11px] text-faint" role="group" aria-label="What to show">
+      {VIEW_MODES.map((v) => (
+        <button key={v.mode} type="button" aria-pressed={viewMode === v.mode} onClick={() => setViewMode(v.mode)} className={cx("rounded px-2 py-0.5", viewMode === v.mode ? "bg-panel-3 text-ink" : "hover:text-ink")}>
+          {v.label}
+        </button>
+      ))}
+    </span>
+  );
+  const summaryTrace = (insetRight: number, insetBottom: number) => (
+    <SummaryTrace
+      events={events}
+      beats={beats}
+      cursor={cursor}
+      onBeat={onBeat}
+      onSpan={jumpTo}
+      weakBeats={weakByBeat}
+      weakIfaces={weakIfaces}
+      stateLeft={stateLeft}
+      focusKey={centerKey}
+      insetRight={insetRight}
+      insetBottom={insetBottom}
+      initialOpen={initialBeat}
+    />
+  );
+  const summaryTitle = `Summary: ${plural(beats.length, "beat")} from ${plural(n, "event")}`;
+  const map = mapShown && mapGraph && <ArchitectureMap graph={mapGraph} highlight={highlight} ariaLabel="Architecture map highlighting the current event" />;
   const inspector = <Inspector playback={playback} cursor={cursor} doc={doc} onJump={onJump} />;
   const ledger = <StateLedger playback={playback} cursor={cursor} doc={doc} />;
   const transport = (
-    <Transport playback={playback} cursor={cursor} setCursor={setCursor} playing={playing && cursor < n - 1} setPlaying={setPlaying} speed={speed} setSpeed={setSpeed} />
+    <Transport
+      playback={playback}
+      cursor={cursor}
+      setCursor={setCursor}
+      playing={playing && cursor < n - 1}
+      setPlaying={setPlaying}
+      speed={speed}
+      setSpeed={setSpeed}
+      jumps={jumps}
+      extraHints={
+        <>
+          <Kbd>s</Kbd> view
+          {page && (
+            <>
+              <Kbd>i</Kbd> inspector
+              {graph && (
+                <>
+                  <Kbd>m</Kbd> map
+                </>
+              )}
+            </>
+          )}
+        </>
+      }
+    />
   );
 
   if (page) {
@@ -313,18 +505,35 @@ export function Playback({
     // and the diagram scrolls its cursor row into the region they leave.
     const mapRight =
       side === "hidden" ? "right-[50px]" : side === "open" ? "right-[50px] lg:right-[442px]" : "right-[14px]";
+    const summaryOnly = viewMode === "summary";
+    const summaryCovered = summaryOnly || viewMode === "both";
     return (
       <div className={cx("flex min-h-0 flex-col gap-2", className)}>
         <div className="max-h-[40%] shrink-0 overflow-y-auto">
-          <SummaryCard run={run} />
+          <SummaryCard run={run} jumps={jumps} onJump={jump} />
+        </div>
+        <div className="flex flex-wrap items-center gap-x-3 gap-y-1 px-1">
+          {viewSwitch}
+          <span className="text-[11px] text-faint" title="This run's input was generated by the model's scenario, not captured from a real request.">
+            generated input
+          </span>
+          <MechanismWarning mechanisms={weakMechanisms} className="min-w-0 flex-1" />
+          {actions && <span className="ml-auto flex items-center gap-2">{actions}</span>}
         </div>
         {transport}
         <div ref={stageRef} className="relative min-h-0 flex-1 overflow-hidden">
-          <Panel title="Sequence" className="absolute inset-0" bodyClassName="p-0" actions={legend}>
-            {sequence}
-          </Panel>
+          {summaryCovered && (
+            <Panel title={summaryTitle} className={summaryOnly ? "absolute inset-0" : "absolute inset-y-0 left-0 w-[min(380px,45%)]"} bodyClassName="p-0">
+              {summaryTrace(summaryOnly ? insets.right : 0, summaryOnly ? insets.bottom : 0)}
+            </Panel>
+          )}
+          {!summaryOnly && (
+            <Panel title="Sequence" className={viewMode === "both" ? "absolute inset-y-0 left-[min(388px,46%)] right-0" : "absolute inset-0"} bodyClassName="p-0" actions={sequenceActions}>
+              {sequence}
+            </Panel>
+          )}
           {graph && (
-            <div ref={mapRef} className={cx("absolute bottom-[14px] left-2 z-10", mapRight, mapState === "open" && "h-[30%]", mapState === "expanded" && "h-[75%]")}>
+            <div ref={mapRef} className={cx("absolute bottom-[14px] z-10", viewMode === "both" ? "left-[min(396px,47%)]" : "left-2", mapRight, mapState === "open" && "h-[30%]", mapState === "expanded" && "h-[75%]")}>
               <Panel
                 id="run-map"
                 title="Architecture"
@@ -401,13 +610,25 @@ export function Playback({
 
   return (
     <div className={cx("flex min-h-0 flex-col gap-2", className)}>
-      <SummaryCard run={run} />
+      <SummaryCard run={run} jumps={jumps} onJump={jump} />
       {transport}
+      <div className="flex flex-wrap items-center gap-x-3 gap-y-1 px-1">
+        {viewSwitch}
+        <MechanismWarning mechanisms={weakMechanisms} className="min-w-0 flex-1" />
+        {actions}
+      </div>
       <div className="grid min-h-0 flex-1 grid-cols-1 gap-2 lg:grid-cols-[minmax(0,1fr)_minmax(330px,30%)]">
         <div className="flex min-h-0 flex-col gap-2">
-          <Panel title="Sequence" className="min-h-[300px] flex-[3]" bodyClassName="p-0" actions={legend}>
-            {sequence}
-          </Panel>
+          {viewMode !== "sequence" && (
+            <Panel title={summaryTitle} className="min-h-[300px] flex-[3]" bodyClassName="p-0">
+              {summaryTrace(0, 0)}
+            </Panel>
+          )}
+          {viewMode !== "summary" && (
+            <Panel title="Sequence" className="min-h-[300px] flex-[3]" bodyClassName="p-0" actions={sequenceActions}>
+              {sequence}
+            </Panel>
+          )}
           {graph && (
             <Panel
               title="Architecture"

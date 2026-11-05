@@ -122,11 +122,16 @@ cd web && pnpm dev
 
 The web UI lives in [web/](web/README.md). Set `MOSAIC_SERVER` if `mosaicd` listens somewhere else,
 or set `NEXT_PUBLIC_MOSAIC_FIXTURES=1` to use fixtures generated from the engine, with no daemon.
+Its tabs are Overview, Map, Flows and Runs for the system, then Evidence and History for the model.
+A large model opens on its areas, and a run opens on a summary with jump keys. Every page shows a
+passport that says how far to trust the model: a blind benchmark and mechanism coverage where they're
+stored, and "Not benchmarked" otherwise. Everything a run shows is a claim by the model, not a fact
+about the real system. Press `/` to search and `?` for the keys.
 Click any code citation (`path:line`) to open the cited file in a floating viewer, fetched by
-`mosaicd` from GitHub at the model's commit, with syntax coloring and vim keys; private repos need
-`GITHUB_TOKEN` or `gh auth login` where `mosaicd` runs.
+`mosaicd` from GitHub at the model's commit, with the claim it backs, syntax coloring and vim keys;
+private repos need `GITHUB_TOKEN` or `gh auth login` where `mosaicd` runs.
 
-The Architecture tab shows the Envoy model's components, nested by their parent, and the calls
+The Map tab shows the Envoy model's components, nested by their parent, and the calls
 between them:
 
 ![The Envoy example's architecture map](docs/images/envoy-architecture.png)

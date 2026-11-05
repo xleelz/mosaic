@@ -213,9 +213,12 @@ func (s *Store) CreateOntology(ctx context.Context, in api.CreateOntology) (*api
 		if err := dropBranchAndTags(ctx, c, in.ID); err != nil {
 			return err
 		}
-		// Likewise for commits left by an interrupted delete.
-		if _, err := c.ExecContext(ctx, "DELETE FROM commits WHERE ontology_id = ?", in.ID); err != nil {
-			return err
+		// Likewise for commits and measures left by an interrupted delete: an
+		// old model's evidence must not describe a new one.
+		for _, t := range []string{"commits", "evidence", "test_reports"} {
+			if _, err := c.ExecContext(ctx, "DELETE FROM "+t+" WHERE ontology_id = ?", in.ID); err != nil {
+				return err
+			}
 		}
 		if _, err := c.ExecContext(ctx, "CALL dolt_branch(?, ?)", branchName(in.ID), BaseBranch); err != nil {
 			return err
@@ -226,7 +229,7 @@ func (s *Store) CreateOntology(ctx context.Context, in api.CreateOntology) (*api
 			_, _ = c.ExecContext(ctx, "CALL dolt_branch('-D', ?)", branchName(in.ID))
 			return err
 		}
-		return commitIfDirty(ctx, c, []string{"ontologies", "commits"}, "Create ontology "+in.ID)
+		return commitIfDirty(ctx, c, []string{"ontologies", "commits", "evidence"}, "Create ontology "+in.ID)
 	})
 	if err != nil {
 		return nil, err
@@ -270,7 +273,7 @@ func (s *Store) UpdateOntology(ctx context.Context, id string, in api.UpdateOnto
 	return s.GetOntology(ctx, id)
 }
 
-// DeleteOntology drops an ontology's tags, branch, runs, commits and registry row.
+// DeleteOntology drops an ontology's tags, branch, runs, test reports, commits, evidence and registry row.
 func (s *Store) DeleteOntology(ctx context.Context, id string) error {
 	unlock := s.lock(id)
 	defer unlock()
@@ -283,16 +286,15 @@ func (s *Store) DeleteOntology(ctx context.Context, id string) error {
 		if err := dropBranchAndTags(ctx, c, id); err != nil {
 			return err
 		}
-		if _, err := c.ExecContext(ctx, "DELETE FROM simulation_runs WHERE ontology_id = ?", id); err != nil {
-			return err
-		}
-		if _, err := c.ExecContext(ctx, "DELETE FROM commits WHERE ontology_id = ?", id); err != nil {
-			return err
+		for _, t := range []string{"simulation_runs", "test_reports", "commits", "evidence"} {
+			if _, err := c.ExecContext(ctx, "DELETE FROM "+t+" WHERE ontology_id = ?", id); err != nil {
+				return err
+			}
 		}
 		if _, err := c.ExecContext(ctx, "DELETE FROM ontologies WHERE id = ?", id); err != nil {
 			return err
 		}
-		return commitIfDirty(ctx, c, []string{"ontologies", "commits"}, "Delete ontology "+id)
+		return commitIfDirty(ctx, c, []string{"ontologies", "commits", "evidence"}, "Delete ontology "+id)
 	})
 }
 

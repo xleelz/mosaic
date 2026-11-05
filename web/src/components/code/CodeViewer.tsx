@@ -2,18 +2,23 @@
 
 // The code viewer: a floating window over the page that shows a cited file at
 // the model's commit (GET /v1/ontologies/{id}/source), with the cited range
-// highlighted and vim keys. CodeViewerProvider is mounted in the workspace
+// highlighted, vim keys, the claim it was opened from, and what else in the
+// model cites the file. It shows where a claim comes from, not that it's right,
+// and says so. CodeViewerProvider is mounted in the workspace
 // shell; SourceRef (components/ui.tsx) opens citations through it. The editor
 // (CodeEditor.tsx, CodeMirror) is loaded on the first open.
 
+import Link from "next/link";
 import { lazy, Suspense, useCallback, useEffect, useMemo, useRef, useState, type PointerEvent as ReactPointerEvent, type ReactNode } from "react";
 import { createPortal } from "react-dom";
 import type { Source } from "@/lib/api/types";
 import { useQuery } from "@/lib/hooks";
+import { citationsOf, fileCoverage, lineCount, type Citation } from "@/lib/model/citations";
+import { plural } from "@/lib/model/format";
 import { blobUrl, citedRange, languageOf, rangeSuffix, viewerTitle } from "@/lib/source";
-import { ErrorBox, Spinner, cx } from "@/components/ui";
+import { ErrorBox, ProgressiveList, Spinner, cx } from "@/components/ui";
 import { useDocument, useWorkspace } from "@/components/workspace/Workspace";
-import { CodeViewerContext } from "./context";
+import { CodeViewerContext, type OpenSource } from "./context";
 
 const CodeEditor = lazy(() => import("./CodeEditor"));
 
@@ -28,12 +33,12 @@ function readVim(): boolean {
 }
 
 export function CodeViewerProvider({ children }: { children: ReactNode }) {
-  const [target, setTarget] = useState<Source | null>(null);
+  const [target, setTarget] = useState<{ source: Source; claim?: string } | null>(null);
   const opener = useRef<HTMLElement | null>(null);
 
-  const open = useCallback((source: Source, from?: HTMLElement | null) => {
+  const open = useCallback<OpenSource>((source, from, options) => {
     if (from) opener.current = from;
-    setTarget(source);
+    setTarget({ source, claim: options?.claim });
   }, []);
   const close = useCallback(() => {
     setTarget(null);
@@ -45,7 +50,7 @@ export function CodeViewerProvider({ children }: { children: ReactNode }) {
   return (
     <CodeViewerContext.Provider value={open}>
       {children}
-      {target && <CodeWindow source={target} onClose={close} />}
+      {target && <CodeWindow source={target.source} claim={target.claim} onOpen={open} onClose={close} />}
     </CodeViewerContext.Provider>
   );
 }
@@ -77,13 +82,64 @@ function clampRect(r: Rect): Rect {
   return { w, h, x: Math.min(Math.max(r.x, 80 - w), vw - 80), y: Math.min(Math.max(r.y, 0), vh - 36) };
 }
 
-function CodeWindow({ source, onClose }: { source: Source; onClose: () => void }) {
-  const { id, rev, dataRev } = useWorkspace();
+/** What else in the model cites this file, by line. Picking one shows its lines and its claim. */
+function CitationsPanel({
+  citations,
+  current,
+  onPick,
+  entityHref,
+}: {
+  citations: Citation[];
+  current: Source;
+  onPick: (c: Citation) => void;
+  entityHref: (c: Citation) => string | null;
+}) {
+  return (
+    <aside aria-label="What in the model cites this file" className="flex w-[300px] shrink-0 flex-col border-l border-line bg-panel">
+      <ProgressiveList
+        items={citations}
+        step={100}
+        as="ul"
+        className="min-h-0 flex-1 overflow-auto"
+        render={(c, i) => {
+          const here = c.source.line === current.line && c.source.end_line === current.end_line;
+          const href = entityHref(c);
+          return (
+            <li key={`${c.kind}:${c.id}:${c.source.line ?? ""}:${i}`} className={cx("border-b border-line-soft px-2.5 py-1.5", here && "bg-panel-2")}>
+              <button type="button" onClick={() => onPick(c)} aria-current={here ? "true" : undefined} className="block w-full text-left hover:underline">
+                <span className="block truncate text-[12px] text-ink" title={c.claim}>
+                  {c.claim}
+                </span>
+              </button>
+              <div className="flex items-baseline gap-1.5 text-[11px] text-faint">
+                <span className="tnum shrink-0 whitespace-nowrap font-mono">{rangeSuffix(c.source.line, c.source.end_line).slice(1) || "whole file"}</span>
+                <span>{c.kind}</span>
+                {href ? (
+                  <Link href={href} className="min-w-0 truncate font-mono text-link hover:underline" title={`Open ${c.id}`}>
+                    {c.id}
+                  </Link>
+                ) : (
+                  <span className="min-w-0 truncate font-mono" title={c.id}>
+                    {c.id}
+                  </span>
+                )}
+              </div>
+            </li>
+          );
+        }}
+      />
+    </aside>
+  );
+}
+
+function CodeWindow({ source, claim, onOpen, onClose }: { source: Source; claim?: string; onOpen: OpenSource; onClose: () => void }) {
+  const { id, rev, dataRev, href } = useWorkspace();
   const doc = useDocument();
   const [rect, setRect] = useState<Rect>(defaultRect);
   const [expanded, setExpanded] = useState(false);
   const [vimOn, setVimOn] = useState(readVim);
   const [copied, setCopied] = useState(false);
+  const [showCitations, setShowCitations] = useState(false);
   const root = useRef<HTMLDivElement>(null);
 
   const key = `source:${id}:${dataRev}:${source.repo ?? ""}:${source.sha ?? ""}:${source.path}`;
@@ -98,6 +154,15 @@ function CodeWindow({ source, onClose }: { source: Source; onClose: () => void }
     if (content === undefined) return null;
     return citedRange(content.split("\n").length, source.line, source.end_line);
   }, [content, source.line, source.end_line]);
+
+  const citations = useMemo(() => (doc.data ? citationsOf(doc.data, source.path, repo) : []), [doc.data, source.path, repo]);
+  const coverage = useMemo(() => (content === undefined ? null : fileCoverage(citations, lineCount(content))), [citations, content]);
+  const percent = coverage && coverage.totalLines ? Math.round((coverage.citedLines / coverage.totalLines) * 100) : 0;
+  const entityHref = (c: Citation): string | null => {
+    if (c.kind === "flow") return href("flows", { flow: c.id });
+    if (c.kind === "config") return href("world", { config: c.id });
+    return c.component ? href("map", { c: c.component }) : null;
+  };
 
   // The viewer owns the keyboard while focus is inside it: page shortcuts
   // (the run page's Space and arrows, the header's Escape) never see its keys.
@@ -208,8 +273,14 @@ function CodeWindow({ source, onClose }: { source: Source; onClose: () => void }
           vim
         </button>
         {github && (
-          <a href={github} target="_blank" rel="noreferrer" className="text-[12px] text-link hover:underline">
-            ↗ Open on GitHub
+          <a
+            href={github}
+            target="_blank"
+            rel="noreferrer"
+            title="The code this citation points at, on GitHub, at the model's commit. It shows where the claim comes from, not that the claim is right."
+            className="text-[12px] text-link hover:underline"
+          >
+            ↗ Source on GitHub
           </a>
         )}
         <button type="button" onClick={copyPath} title="Copy the path" className="rounded px-1.5 py-0.5 text-[12px] text-muted hover:bg-panel-3 hover:text-ink">
@@ -234,7 +305,33 @@ function CodeWindow({ source, onClose }: { source: Source; onClose: () => void }
           ✕
         </button>
       </div>
-      <div className="relative min-h-0 flex-1 bg-bg">
+      <div className="flex h-7 shrink-0 items-center gap-3 border-b border-line-soft bg-panel px-3 text-[12px]" data-testid="code-viewer-claim">
+        <span className="min-w-0 flex-1 truncate text-muted" title={claim}>
+          {claim ? (
+            <>
+              <span className="text-faint">Claim:</span> <span className="text-ink">{claim}</span>
+            </>
+          ) : (
+            <span className="text-faint">Cited by the model</span>
+          )}
+        </span>
+        <span className="shrink-0 text-[11px] text-faint" title="Reading this code lets you check the claim. The link alone doesn't prove it.">
+          Source, not proof
+        </span>
+        {coverage && coverage.citations > 0 && (
+          <button
+            type="button"
+            onClick={() => setShowCitations((v) => !v)}
+            aria-expanded={showCitations}
+            title={`${coverage.citedLines} of ${coverage.totalLines} lines fall in a cited range${coverage.wholeFile ? `, and ${plural(coverage.wholeFile, "citation")} cite${coverage.wholeFile === 1 ? "s" : ""} the whole file` : ""}. Cited doesn't mean modeled correctly.`}
+            className="tnum shrink-0 rounded px-1.5 py-0.5 text-[11.5px] text-link hover:bg-panel-3"
+          >
+            {plural(coverage.entities, "entity", "entities")} cite this file · {percent}% of lines cited {showCitations ? "▾" : "▸"}
+          </button>
+        )}
+      </div>
+      <div className="relative flex min-h-0 flex-1 bg-bg">
+        <div className="relative min-w-0 flex-1">
         {file.error ? (
           <div className="p-4">
             <ErrorBox error={file.error} onRetry={file.reload} />
@@ -252,6 +349,10 @@ function CodeWindow({ source, onClose }: { source: Source; onClose: () => void }
               onClose={onClose}
             />
           </Suspense>
+        )}
+        </div>
+        {showCitations && coverage && coverage.citations > 0 && (
+          <CitationsPanel citations={citations} current={source} entityHref={entityHref} onPick={(c) => onOpen({ ...source, line: c.source.line, end_line: c.source.end_line }, null, { claim: c.claim })} />
         )}
       </div>
       {!expanded && (

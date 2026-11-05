@@ -100,17 +100,13 @@ export function ImpactSummary({ impact }: { impact: Impact }) {
           </tbody>
         </table>
       )}
-      <div className="text-[12.5px] text-muted">
-        {impact.flows_affected.length ? (
-          <>
-            <span className="font-semibold text-ink">{plural(impact.flows_affected.length, "flow")} affected</span> (unchanged, but
-            {impact.flows_affected.length === 1 ? " it reaches" : " they reach"} changed entities):{" "}
-            <span className="font-mono text-[12px] text-ink">{impact.flows_affected.map((f) => f.flow).join(", ")}</span>
-          </>
-        ) : (
-          "No other flows are affected."
-        )}
-      </div>
+      {impact.flows_affected.length > 0 && (
+        <div className="text-[12.5px] text-muted">
+          <span className="font-semibold text-ink">{plural(impact.flows_affected.length, "flow")} affected</span> (unchanged, but
+          {impact.flows_affected.length === 1 ? " it reaches" : " they reach"} changed entities):{" "}
+          <span className="font-mono text-[12px] text-ink">{impact.flows_affected.map((f) => f.flow).join(", ")}</span>
+        </div>
+      )}
     </div>
   );
 }
@@ -165,7 +161,7 @@ function DetailView({ d, revision }: { d: CommitDetail; revision?: Revision }) {
         </div>
         {d.after > 0 && (
           <div className="mt-3 flex flex-wrap gap-2">
-            <Link href={ws.href("", { commit: c.sha })} className={linkButton}>
+            <Link href={ws.href("map", { commit: c.sha })} className={linkButton}>
               View architecture before/after{changedComponents ? ` · ${changedComponents}` : ""}
             </Link>
             <Link href={ws.href("flows", { commit: c.sha })} className={linkButton}>
@@ -197,7 +193,7 @@ function DetailView({ d, revision }: { d: CommitDetail; revision?: Revision }) {
         {c.files.length === 0 ? (
           <div className="text-[12.5px] text-muted">No files recorded.</div>
         ) : (
-          <ul className="max-h-[320px] overflow-auto rounded-md border border-line-soft bg-[#0c1116] py-1 font-mono text-[12px]">
+          <ul tabIndex={0} aria-label="Changed files" className="max-h-[320px] overflow-auto rounded-md border border-line-soft bg-[#0c1116] py-1 font-mono text-[12px]">
             {c.files.map((f) => (
               <li key={f} className="truncate px-2.5 py-0.5 text-ink" title={f}>
                 {f}
@@ -249,6 +245,18 @@ export function CommitsTab() {
 
   const changedCount = list.filter((c) => c.changed).length;
 
+  // No commits: one quiet line, with no search, filter or empty detail pane.
+  if (commits.data && list.length === 0) {
+    return (
+      <div className="mx-auto max-w-[1400px] p-4">
+        <p className="text-[12.5px] text-muted">
+          No commits imported, so this model has no code history to compare. Revisions still work. To add it, run{" "}
+          <code className="font-mono text-[12px] text-ink">mosaic commits import --repo PATH --range A..B</code>.
+        </p>
+      </div>
+    );
+  }
+
   return (
     <div className="mx-auto grid h-full max-w-[1400px] grid-cols-1 gap-3 p-4 xl:grid-cols-[minmax(0,480px)_minmax(0,1fr)]">
       <Panel
@@ -276,13 +284,8 @@ export function CommitsTab() {
         </div>
         {commits.loading && <Spinner label="Loading commits" />}
         {commits.error ? <ErrorBox error={commits.error} onRetry={commits.reload} /> : null}
-        {commits.data && list.length === 0 && (
-          <Empty>
-            No commits imported. Run <span className="font-mono">mosaic commits import --repo PATH --range A..B</span>.
-          </Empty>
-        )}
-        {commits.data && list.length > 0 && shown.length === 0 && <Empty>No commits match.</Empty>}
-        <ol className="min-h-0 flex-1 space-y-1.5 overflow-auto" aria-label="Commits, newest first">
+        {commits.data && shown.length === 0 && <Empty>No commits match.</Empty>}
+        <ol tabIndex={0} className="min-h-0 flex-1 space-y-1.5 overflow-auto" aria-label="Commits, newest first">
           {shown.map((c) => (
             <CommitRow key={c.sha} c={c} selected={selected?.sha === c.sha} onSelect={() => select(c.sha)} />
           ))}

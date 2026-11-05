@@ -197,7 +197,9 @@ as a **warning**, not an error.
 | `GET /ontologies/{id}/flows/{flow}/plan?rev=` | Reachable interfaces, choice points, stateful components and fault targets |
 | `GET, POST /ontologies/{id}/simulations` | List runs; run `{rev, flow, scenario, seed, input, choices, state, faults, expect, fixtures, topology, config, clock, save}` |
 | `GET /simulations/{run}` | A run with its trace |
-| `POST /ontologies/{id}/test?rev=` | Run every scenario's expectations |
+| `POST /ontologies/{id}/test?rev=` | Run every scenario's expectations; records the report as the revision's latest, with or without `save=false` |
+| `GET /ontologies/{id}/test-results?rev=` | That revision's latest recorded report, no traces, plus `ran_at`; not inherited, 404 when never run. The draft has its own slot, which later draft edits don't clear |
+| `GET, PUT /ontologies/{id}/evidence?rev=` | How far to trust the model (`Evidence`). PUT replaces a revision's record (default the latest; the draft is 400; 422 with issues when invalid). GET returns the newest record at or before `rev` (default the draft), with `revision` the one viewed (0 for the draft) and each `measured_on_revision` where its figure came from; 404 when none is stored |
 | `GET /ontologies/{id}/source?path=&rev=&repo=&sha=` | A cited file's text from GitHub at the document's commit |
 | `GET /system/version?refresh=` | The running build and whether its checkout can be updated |
 | `POST /system/update` | Fast-forward the checkout to its upstream, then restart when supervised (§8) |
@@ -1671,15 +1673,27 @@ The stages are the same for every repo:
       - **uncovered:** they exist, but no scenario's trace reaches one (a mocked call isn't reach).
         A mechanism reached only by scenarios item 39 leaves out is uncovered too;
       - **shell:** reached, but it fails item 39;
+      - **weak:** reached, and something notices its removal, but it only passes item 39 by an
+        abort, or one of its interfaces proves nothing alone (item 39);
       - **ok**, or **skipped** (a valid reason). A skip with a bad reason is named, and the
         mechanism keeps its measured status.
       Without `--mechanism-e2e`, a reached mechanism reads **reached**, and doesn't count as ok.
       A mechanism that is missing or uncovered, in an area with no fragment in this merge, is
       counted apart and left out of the share.
-    - **Report.** Per-area and per-kind counts and a total, every non-ok mechanism, and the
-      enumerator's `fidelity` beside the status. A disagreement is flagged both ways: `modeled` or
-      `partial` should measure ok, `shell` shell or uncovered, `absent` missing.
-    - **Gate.** `--min-mechanisms R` fails when ok / unskipped is below R. The profile key is
+    - **Report.** Per-area and per-kind counts and a total, every non-ok mechanism with why, and
+      the enumerator's `fidelity` beside the status. A disagreement is flagged both ways: `modeled`
+      should measure ok, `partial` ok or weak, `shell` shell or uncovered, `absent` missing.
+    - **The list's own data.** The check names duplicate ids, an id outside its file's area, and
+      unknown interface ids, and counts interfaces several areas list (`-v` names them: an area can
+      have a reason). With `--code`, each citation is resolved, and those that don't resolve are
+      named. A file named like a secret or `credentials*` is never opened, by this or by any citation
+      check; it counts as skipped.
+    - **`--mechanisms-json FILE`** writes every mechanism, as a JSON array in the shape of
+      `EvidenceMechanism` (`web/src/lib/api/types.ts`), with its measured `gate_status`: `ok`,
+      `weak`, `shell`, `uncovered`, `missing` or `skipped`. A mechanism in an area not in this merge
+      keeps the status it measured. The flag implies `--mechanism-e2e`, so `reached` never appears.
+    - **Gate.** `--min-mechanisms R` fails when ok / unskipped is below R, and a weak mechanism
+      isn't ok. The profile key is
       `gates.min_mechanisms`; unset, it records without gating. **It only ratchets up**, the
       opposite of the `max_*` gates, and the check prints `~ ratchet: --min-mechanisms can go up
       to R`. The flag implies `--mechanism-e2e`.
@@ -1712,12 +1726,16 @@ The stages are the same for every repo:
       evaluation failure on the synchronous call chain from the scenario's entry, or a run cap
       (events, virtual time) with an entry call still open, so its caller never gets an answer. An
       abort in background work (an emit, a timer, a subscriber) doesn't count, since the boundary
-      answered without it, and neither does a cap after the entry answered, or the depth limit.
+      answered without it, and neither does a cap after the entry answered, or the depth limit. An
+      abort is the weakest notice there is, so a run doesn't stop at one: it goes on through the
+      mechanism's scenarios for an expectation. If none notices, in the mechanism's runs or for any
+      of its interfaces alone, the mechanism is **weak**, "only an abort".
     - **The scenario's own entry.** A scenario that reaches a listed interface by a call disables
       the interfaces it reaches that way, and not its own entry: disabling the entry would fail
       every check of its result, whatever the mechanism does. A scenario that only enters a listed
       interface runs when that is a **boundary entry** (a flow's entry, an interface of a boundary
-      component, or a kind other than `function`, `kernel` or `store`). A step entering a plain
+      component, a kind other than `function`, `kernel` or `store`, or one named `serve-http` or
+      `main`, which a server or the OS enters whatever its label). A step entering any other plain
       function is a unit test, and shows nothing about callers: a mechanism reached only that way
       is a shell, "no caller".
     - **Refusals.** For a kind other than `gate` or `retry`, a failed expectation that only asserts
@@ -1725,22 +1743,34 @@ The stages are the same for every repo:
       pipeline's validation step isn't evidence of the pipeline. The finding names that check.
     - **Constants.** When every reached interface only returns literal values, the mechanism is a
       shell without a mutation, since disabling a constant fails any check of that constant.
-    - **Weak interfaces.** One real interface proves a list of several, so an ok mechanism's
-      interfaces are also disabled one at a time, and each that nothing notices alone, or that has
-      no caller, is printed as `! mechanism M is ok, but its interface I`. It doesn't change the
-      status: an enumerator lists helpers too, and the gates can't tell them from main work.
+    - **Weak interfaces.** One real interface proves a list of several, so a noticed mechanism's
+      interfaces are also disabled one at a time, and one that nothing notices alone, or that has
+      no caller, makes the mechanism **weak**. Each is named under its mechanism, with why. This
+      replaces the earlier warning that left the status ok: 431 of 788 and 680 of 881 mechanisms
+      read ok that way, while vLLM's shell `async-llm.encode` (it returns no vectors) was among
+      them. An enumerator lists helpers too, and the gate can't tell them from main work, so a
+      weak mechanism may be sound; the fix is then to drop the helper from the list, or to check it.
     - **Which scenarios.** A scenario whose tag or id names a race, concurrency or exploration
       stays out: its expectations may hold on one schedule only. So does one failing unmutated. A
-      mechanism runs at most `--mechanism-e2e-scenarios N` (default 10), stopping at the first
-      notice. The order is deterministic: scenarios with no boundary expectation last; then those
+      mechanism runs every remaining scenario before it is called a shell, stopping at the first
+      expectation that notices; `--mechanism-e2e-scenarios N` caps that for a faster run. The order
+      is deterministic: scenarios with no boundary expectation last; then those
       starting at a boundary entry; refusals first for a `gate` or `retry`, last otherwise; the most
       boundary expectations; the id. Every other slot goes to the scenario whose id names the
       mechanism most. Scenarios with different disabled sets take turns, so one interface reached
-      everywhere doesn't take every slot. The cap can only add shells: on the same two models,
-      about one shell in ten went away with no cap, so confirm a finding with a large N before
-      fixing it.
+      everywhere doesn't take every slot. A cap can only add shells: on the same two models, a cap
+      of 10, the earlier default, reported 95 and 60 where no cap finds 84 and 54, so the default is
+      no cap.
     - **Cost.** Mechanisms run in parallel, on `--mechanism-e2e-workers N` workers (default the
-      CPUs, at most 8), and the check prints the elapsed time.
+      CPUs, at most 8), and the check prints the elapsed time. A survivor costs all its scenarios,
+      and a noticed one stops early, so no cap took 11,188 and 8,271 mutated runs, 2m37s and 53s on
+      8 workers, against 45s and 23s with a cap of 10.
+    - **Measured precision (2026-11).** One reader took a seeded sample of 33 findings across both
+      models and read each against the model and the cited source: shell 11 of 12 right, weak 10 of
+      12, ok 4 of 6, uncovered 1 of 1, missing 2 of 2. The wrong shell is an external sink (a
+      disabled call still appears in the trace, so mutation can't test it). The wrong weak ones are a
+      thin wrapper and a trigger listed beside proven work. The wrong ok ones are mechanisms whose
+      interfaces are generic and run anyway: ok shows an effect, not that it's this mechanism's.
     - **Gate.** `--max-shell-mechanisms N` fails above N shells. The profile key is
       `gates.max_shell_mechanisms`; unset, it records without gating. The flag implies
       `--mechanism-e2e`. Each finding names the mechanism, its interfaces, the scenarios run and the

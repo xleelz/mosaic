@@ -24,6 +24,7 @@
 // documents and plans (src/lib/model/impact.ts).
 
 import { ApiError, FixtureUnsupportedError, type MosaicClient } from "./client";
+import type { Evidence, StoredTestReport } from "./types";
 import { diffDocuments, impactOf } from "@/lib/model/impact";
 import { normalizeCommits, normalizeGraph, normalizeReport, normalizeRun, normalizeValidation } from "./normalize";
 import type {
@@ -309,6 +310,18 @@ export class FixtureClient implements MosaicClient {
   async runTests(id: string, _rev?: RevSelector): Promise<TestReport> {
     void _rev;
     return normalizeReport(await this.load<TestReport>(`${id}/test-report.json`));
+  }
+
+  /** Fixtures keep no recorded report. */
+  async getTestResults(id: string, _rev?: RevSelector): Promise<StoredTestReport> {
+    void _rev;
+    throw new ApiError(404, { code: "not_found", message: `no recorded test report for ${id}` });
+  }
+
+  /** `<ont>/evidence.json` when a fixture has one; otherwise a 404, shown as "Not benchmarked". */
+  async getEvidence(id: string, _rev?: RevSelector): Promise<Evidence> {
+    void _rev;
+    return this.load<Evidence>(`${id}/evidence.json`);
   }
 
   async listComposeRuns(): Promise<ComposeRunList> {

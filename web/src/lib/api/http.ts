@@ -3,6 +3,7 @@
 // The browser never holds a token; the proxy adds it from MOSAIC_TOKEN.
 
 import { ApiError, type MosaicClient } from "./client";
+import type { Evidence, StoredTestReport } from "./types";
 import {
   normalizeCommitDetail,
   normalizeCommits,
@@ -68,9 +69,11 @@ export class HttpClient implements MosaicClient {
     this.target = base;
   }
 
-  private async request<T>(method: string, path: string, body?: unknown): Promise<T> {
+  private async request<T>(method: string, path: string, body?: unknown, absentOk = false): Promise<T> {
     const headers: Record<string, string> = { Accept: "application/json" };
     if (body !== undefined) headers["Content-Type"] = "application/json";
+    // Nothing stored is a normal answer here, so it shouldn't land in the console as a failed request.
+    if (absentOk) headers["X-Mosaic-Absent-Ok"] = "1";
     let res: Response;
     try {
       res = await fetch(`${this.base}${path}`, {
@@ -85,6 +88,7 @@ export class HttpClient implements MosaicClient {
         message: `mosaicd is unreachable: ${err instanceof Error ? err.message : String(err)}`,
       });
     }
+    if (absentOk && res.status === 204) throw new ApiError(404, { code: "not_found", message: "nothing is stored" });
     const text = await res.text();
     let data: unknown = undefined;
     if (text) {
@@ -177,8 +181,19 @@ export class HttpClient implements MosaicClient {
     return normalizeRun(await this.request<SimulationRun>("GET", `/simulations/${enc(runId)}`));
   }
 
-  async runTests(id: string, rev?: RevSelector): Promise<TestReport> {
-    return normalizeReport(await this.request<TestReport>("POST", `/ontologies/${enc(id)}/test${query({ rev })}`));
+  async runTests(id: string, rev?: RevSelector, opts: { keepTraces?: boolean } = {}): Promise<TestReport> {
+    return normalizeReport(
+      await this.request<TestReport>("POST", `/ontologies/${enc(id)}/test${query({ rev, save: opts.keepTraces ? undefined : "false" })}`),
+    );
+  }
+
+  async getTestResults(id: string, rev?: RevSelector): Promise<StoredTestReport> {
+    const r = await this.request<StoredTestReport>("GET", `/ontologies/${enc(id)}/test-results${query({ rev })}`, undefined, true);
+    return { ...normalizeReport(r), ran_at: r.ran_at };
+  }
+
+  getEvidence(id: string, rev?: RevSelector) {
+    return this.request<Evidence>("GET", `/ontologies/${enc(id)}/evidence${query({ rev })}`, undefined, true);
   }
 
   async listCommits(id: string): Promise<CommitList> {

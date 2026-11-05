@@ -189,7 +189,7 @@ function DiffPanel({
             {st !== "removed" && after > 0 && (
               <>
                 {" "}
-                <Link href={ws.href("", { rev: String(after), c: id })} className="text-link hover:underline">
+                <Link href={ws.href("map", { rev: String(after), c: id })} className="text-link hover:underline">
                   Open it at r{after}
                 </Link>
                 .
@@ -231,7 +231,7 @@ function DiffPanel({
           </section>
         )}
         {st !== "removed" && after > 0 && own.length > 0 && (
-          <Link href={ws.href("", { rev: String(after), c: id })} className="inline-block text-[12px] text-link hover:underline">
+          <Link href={ws.href("map", { rev: String(after), c: id })} className="inline-block text-[12px] text-link hover:underline">
             Open {node?.name ?? id} at r{after} →
           </Link>
         )}
@@ -320,7 +320,7 @@ export function ArchitectureDiff() {
     return (
       <div className="p-4">
         <Empty>
-          No revision models this commit, so there is no architecture to compare. <Link href={ws.href("")} className="text-link">Back to the map</Link>
+          No revision models this commit, so there is no architecture to compare. <Link href={ws.href("map")} className="text-link">Back to the map</Link>
         </Empty>
       </div>
     );
@@ -336,7 +336,7 @@ export function ArchitectureDiff() {
     <div className="flex h-full min-h-0 flex-col">
       <div className="flex shrink-0 flex-wrap items-center gap-x-4 gap-y-2 border-b border-line-soft px-4 py-2 text-[12px]">
         <div className="flex min-w-0 items-center gap-2">
-          <Link href={ws.href("")} className="text-faint hover:text-ink" title="Back to the normal map">
+          <Link href={ws.href("map")} className="text-faint hover:text-ink" title="Back to the normal map">
             ← Map
           </Link>
           <span className="min-w-0 truncate">{src.data.title}</span>

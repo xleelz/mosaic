@@ -212,7 +212,8 @@ func isPacked(s model.Source) bool {
 
 func secretPath(p string) bool {
 	b := filepath.Base(p)
-	return strings.Contains(b, ".env") || strings.HasSuffix(b, ".age") || strings.HasSuffix(b, ".pem") || strings.HasSuffix(b, ".key")
+	return strings.Contains(b, ".env") || strings.HasSuffix(b, ".age") || strings.HasSuffix(b, ".pem") || strings.HasSuffix(b, ".key") ||
+		strings.HasPrefix(strings.ToLower(b), "credentials")
 }
 
 // resolve checks one citation.
@@ -255,8 +256,11 @@ func (c *codeRoot) resolve(s model.Source) (string, []string) {
 	return citeOK, nil
 }
 
-// file returns a file's lines; it is only called for non-secret files.
+// file returns a file's lines. A secret file is never opened: it has none.
 func (c *codeRoot) file(rel string) []string {
+	if secretPath(rel) {
+		return nil
+	}
 	if l, ok := c.lines[rel]; ok {
 		return l
 	}

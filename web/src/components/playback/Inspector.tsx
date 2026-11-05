@@ -5,11 +5,12 @@ import type { Document, SimEvent } from "@/lib/api/types";
 import { componentName, formatDuration, formatMs, formatTime } from "@/lib/model/format";
 import { eventLabel, eventTone, setLabel, TONE_ICON, type EventTone, type Playback } from "@/lib/sim/playback";
 import { JsonView } from "@/components/json";
+import { ClaimScope } from "@/components/code/context";
 import { Badge, SourceRef, cx, type Tone } from "@/components/ui";
 
 const toneBadge: Record<EventTone, Tone> = {
   call: "info",
-  ok: "ok",
+  ok: "neutral",
   error: "bad",
   fault: "bad",
   retry: "violet",
@@ -65,7 +66,7 @@ export function Inspector({ playback, cursor, doc, onJump }: { playback: Playbac
   const name = (c?: string) => (c ? componentName(doc, c) : "—");
 
   const facts: [string, ReactNode][] = [];
-  facts.push(["time", <span key="t" className="tnum">{formatTime(e.t, e.t_us)}</span>]);
+  facts.push(["virtual time", <span key="t" className="tnum">{formatTime(e.t, e.t_us)}</span>]);
   // timeout and deadline describe the caller; `to` is the callee (§13.1 item 11).
   const callerSide = e.type === "timeout" || e.type === "deadline";
   if (e.component) facts.push([callerSide ? "caller" : "component", <span key="c">{name(e.component)} <span className="font-mono text-[11px] text-faint">{e.component}</span></span>]);
@@ -90,7 +91,7 @@ export function Inspector({ playback, cursor, doc, onJump }: { playback: Playbac
   if (e.type === "set" && e.table) facts.push(["row", <span key="row" className="font-mono text-[11.5px]">{e.table} · {e.key}</span>]);
   if (e.attempt && e.attempt > 1) facts.push(["attempt", <span key="a" className="text-violet">↻ {e.attempt}</span>]);
   if (e.async) facts.push(["async", "yes, delivered after the top-level call tree"]);
-  if (e.duration_ms !== undefined && (e.type === "call.end" || e.type === "timeout")) facts.push(["duration", <span key="d" className="tnum">{formatDuration(e.duration_ms, e.duration_us)}</span>]);
+  if (e.duration_ms !== undefined && (e.type === "call.end" || e.type === "timeout")) facts.push(["duration", <span key="d" className="tnum">{formatDuration(e.duration_ms, e.duration_us)} virtual</span>]);
   if (e.late) facts.push(["late", <span key="l" className="text-warn">{e.branch !== undefined ? "ran after the join completed; its work stands" : "finished after the caller timed out; its work stands"}</span>]);
   const ids = [e.span ? `span ${e.span}` : null, e.parent ? `parent ${e.parent}` : null, e.call ? `call ${e.call}` : null].filter(Boolean).join(" · ");
   if (ids) facts.push(["ids", <span key="ids" className="font-mono text-[11px] text-faint">{ids}</span>]);
@@ -114,7 +115,11 @@ export function Inspector({ playback, cursor, doc, onJump }: { playback: Playbac
         <Section title="Note">
           {e.title && <div className="text-[13px] font-medium text-ink">{e.title}</div>}
           {e.detail && <p className="text-[12.5px] leading-snug text-muted">{e.detail}</p>}
-          {e.source && <SourceRef source={e.source} />}
+          {e.source && (
+            <ClaimScope claim={e.detail ? `${e.title ?? "Note"}: ${e.detail}` : e.title}>
+              <SourceRef source={e.source} />
+            </ClaimScope>
+          )}
         </Section>
       )}
 
@@ -174,7 +179,11 @@ export function Inspector({ playback, cursor, doc, onJump }: { playback: Playbac
             <div className="mt-1.5 border-l-2 border-[#3d3766] pl-2">
               {e.title && <div className="text-[12.5px] font-medium text-ink">{e.title}</div>}
               {e.detail && <p className="text-[12px] text-muted">{e.detail}</p>}
-              {e.source && <SourceRef source={e.source} />}
+              {e.source && (
+                <ClaimScope claim={e.detail ? `${e.title ?? "Retry"}: ${e.detail}` : e.title}>
+                  <SourceRef source={e.source} />
+                </ClaimScope>
+              )}
             </div>
           )}
         </Section>
@@ -234,7 +243,7 @@ export function Inspector({ playback, cursor, doc, onJump }: { playback: Playbac
       )}
 
       {e.input !== undefined && (
-        <Section title={e.type === "emit" ? "Message" : "Input"}>
+        <Section title={e.type === "emit" ? "Message (generated)" : "Input (generated)"}>
           <JsonView value={e.input} />
         </Section>
       )}

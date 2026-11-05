@@ -626,5 +626,9 @@ func (s *Server) test(w http.ResponseWriter, r *http.Request) {
 		}
 		rep.Results = append(rep.Results, res)
 	}
+	if err := s.store.SaveTestReport(r.Context(), id, &rep); err != nil {
+		s.fail(w, r, err)
+		return
+	}
 	writeJSON(w, http.StatusOK, rep)
 }

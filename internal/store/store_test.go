@@ -170,7 +170,7 @@ func TestConcurrentDraftsAreIsolated(t *testing.T) {
 	}
 	// main holds only the registry tables.
 	tables := showTables(t, "mosaic")
-	if !reflect.DeepEqual(tables, []string{"commits", "ontologies", "simulation_runs"}) {
+	if !reflect.DeepEqual(tables, []string{"commits", "evidence", "ontologies", "simulation_runs", "test_reports"}) {
 		t.Fatalf("main tables = %v", tables)
 	}
 	if tables := showTables(t, "mosaic/ont/iso-a"); !reflect.DeepEqual(tables, []string{"entities", "meta"}) {

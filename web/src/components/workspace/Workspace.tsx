@@ -2,11 +2,16 @@
 
 import Link from "next/link";
 import { useParams, usePathname, useRouter, useSearchParams } from "next/navigation";
-import { createContext, useCallback, useContext, useEffect, useMemo, useState, type ReactNode } from "react";
+import { Fragment, createContext, useCallback, useContext, useEffect, useMemo, useState, type ReactNode } from "react";
 import type { CommitDetail, CommitList, Document, Graph, OntologyDetail, RevisionList } from "@/lib/api/types";
-import { useQuery, type QueryState } from "@/lib/hooks";
-import { Badge, ErrorBox, Select, Spinner, cx } from "@/components/ui";
+import { useQuery, useValidation, type QueryState } from "@/lib/hooks";
+import { Badge, ErrorBox, Select, cx } from "@/components/ui";
 import { CodeViewerProvider } from "@/components/code/CodeViewer";
+import { CommandPalette } from "@/components/palette/CommandPalette";
+import { MapSkeleton, OverviewSkeleton } from "@/components/overview/Skeletons";
+import { latestOf, modelIdentity } from "@/components/overview/identity";
+import { ModelPassport } from "@/components/trust/ModelPassport";
+import { MAP_PARAMS, TAB_GROUPS, activeTab, routeSegment } from "./tabs";
 
 export interface WorkspaceCtx {
   id: string;
@@ -71,17 +76,6 @@ export function authorName(a: string | undefined): string {
   return (a ?? "").replace(/\s*<[^>]*>\s*$/, "") || a || "";
 }
 
-const TABS: { sub: string; label: string }[] = [
-  { sub: "", label: "Architecture" },
-  { sub: "flows", label: "Flows" },
-  { sub: "world", label: "Configs & fixtures" },
-  { sub: "simulate", label: "Simulate" },
-  { sub: "commits", label: "Commits" },
-  { sub: "revisions", label: "Revisions" },
-  { sub: "tests", label: "Tests" },
-  { sub: "explore", label: "Exploration" },
-];
-
 export function revLabel(rev: string): string {
   if (rev === "draft" || rev === "latest") return rev;
   return `r${rev}`;
@@ -101,7 +95,9 @@ export function WorkspaceShell({ children }: { children: ReactNode }) {
 
   const dataRev = rev === "latest" && detail.data?.latest_revision ? String(detail.data.latest_revision) : rev;
 
-  const validation = useQuery(detail.data ? `validate:${id}:${rev}` : null, (c) => c.validate(id, rev));
+  // Validating a large model takes seconds, and a revision is frozen: kept per revision hash.
+  const dataHash = revisions.data?.revisions.find((r) => String(r.number) === dataRev)?.hash;
+  const validation = useValidation(id, detail.data ? dataRev : null, dataHash);
 
   const base = `/o/${encodeURIComponent(id)}`;
   const href = useCallback(
@@ -110,7 +106,9 @@ export function WorkspaceShell({ children }: { children: ReactNode }) {
       if (explicitRev) q.set("rev", explicitRev);
       for (const [k, v] of Object.entries(extra ?? {})) q.set(k, v);
       const qs = q.toString();
-      return `${base}${sub ? `/${sub}` : ""}${qs ? `?${qs}` : ""}`;
+      // "" is Overview now. A link built when it was the map, asking for something on the map, goes there.
+      const route = sub || (Object.keys(extra ?? {}).some((k) => MAP_PARAMS.includes(k)) ? "map" : "");
+      return `${base}${route ? `/${route}` : ""}${qs ? `?${qs}` : ""}`;
     },
     [base, explicitRev],
   );
@@ -124,7 +122,8 @@ export function WorkspaceShell({ children }: { children: ReactNode }) {
     [pathname, router, search],
   );
 
-  const activeSub = pathname.replace(base, "").replace(/^\//, "").split("/")[0];
+  const activeSub = routeSegment(pathname, base);
+  const active = activeTab(activeSub);
   // The run page gives the run the whole viewport: the app bar, this header and
   // the run's title hide, and reveal as one overlay from the top edge.
   const focus = activeSub === "runs";
@@ -136,6 +135,8 @@ export function WorkspaceShell({ children }: { children: ReactNode }) {
   );
   const revs = revisions.data?.revisions ?? [];
   const latest = detail.data?.latest_revision ?? 0;
+  const newest = latestOf(revs);
+  const identity = modelIdentity(detail.data?.name, id, newest?.message);
 
   return (
     <Ctx.Provider value={ctx}>
@@ -145,18 +146,19 @@ export function WorkspaceShell({ children }: { children: ReactNode }) {
           <div className="flex flex-wrap items-center gap-x-4 gap-y-2 px-4 pt-2.5">
             <div className="flex min-w-0 items-baseline gap-2">
               <Link href="/" className="text-[12px] text-faint hover:text-ink">
-                Ontologies
+                Models
               </Link>
               <span className="text-faint">/</span>
-              <h1 className="truncate text-[16px] font-semibold text-ink">{detail.data?.name || id}</h1>
+              <h1 className="truncate text-[16px] font-semibold text-ink" title={identity.staleNote}>
+                {identity.title}
+              </h1>
               <span className="font-mono text-[11px] text-faint">{id}</span>
             </div>
+            <ModelPassport id={id} rev={rev} evidenceHref={href("evidence")} className="max-w-[min(640px,100%)]" />
             <div className="ml-auto flex items-center gap-2">
               {validation.data &&
                 (validation.data.valid ? (
-                  <Badge tone="ok" title={`Validated ${revLabel(rev)}`}>
-                    ✓ valid
-                  </Badge>
+                  <Badge title={`The document at ${revLabel(rev)} matches the schema and its references resolve. This says nothing about whether the model is accurate.`}>Schema OK</Badge>
                 ) : (
                   <Badge tone="bad" title={validation.data.issues.map((i) => `${i.path}: ${i.message}`).join("\n")}>
                     ✗ {validation.data.issues.filter((i) => i.severity === "error").length} issues
@@ -169,7 +171,7 @@ export function WorkspaceShell({ children }: { children: ReactNode }) {
               <label htmlFor="rev-select" className="text-[11px] text-faint">
                 Revision
               </label>
-              <Select id="rev-select" value={rev} onChange={(e) => setRev(e.target.value)} className="h-7 text-[12px]">
+              <Select id="rev-select" value={rev} onChange={(e) => setRev(e.target.value)} className="h-7 max-w-[220px] text-[12px]">
                 <option value="latest" disabled={latest === 0}>
                   latest{latest ? ` (r${latest})` : ""}
                 </option>
@@ -183,26 +185,38 @@ export function WorkspaceShell({ children }: { children: ReactNode }) {
                     </option>
                   ))}
               </Select>
+              <CommandPalette id={id} rev={rev} dataRev={dataRev} href={href} />
             </div>
           </div>
-          <nav aria-label="Workspace" className="mt-1.5 flex gap-0.5 px-2">
-            {TABS.map((t) => {
-              const active = t.sub === activeSub || (t.sub === "simulate" && activeSub === "runs");
-              return (
-                <Link
-                  key={t.sub}
-                  href={href(t.sub)}
-                  aria-current={active ? "page" : undefined}
-                  className={cx(
-                    "relative rounded-t-md px-3 py-1.5 text-[13px] font-medium",
-                    active ? "text-ink" : "text-faint hover:text-ink",
-                  )}
-                >
-                  {t.label}
-                  {active && <span className="absolute inset-x-2 -bottom-px h-[2px] rounded bg-accent" aria-hidden />}
-                </Link>
-              );
-            })}
+          <nav aria-label="Workspace" className="mt-1.5 flex flex-wrap items-center gap-x-0.5 px-2">
+            {TAB_GROUPS.filter((g) => g.length > 0).map((group, i) => (
+              <Fragment key={group[0].sub}>
+                {i > 0 && <span aria-hidden className="mx-2 h-4 w-px bg-line" />}
+                {group.map((t) => {
+                  const on = t === active;
+                  return (
+                    <Link
+                      key={t.sub}
+                      href={href(t.sub)}
+                      aria-current={on ? "page" : undefined}
+                      className={cx("relative rounded-t-md px-3 py-1.5 text-[13px] font-medium", on ? "text-ink" : "text-faint hover:text-ink")}
+                    >
+                      {t.label}
+                      {on && <span className="absolute inset-x-2 -bottom-px h-[2px] rounded bg-accent" aria-hidden />}
+                    </Link>
+                  );
+                })}
+              </Fragment>
+            ))}
+            {active?.pages && (
+              <div aria-label={`Inside ${active.label}`} role="group" className="ml-auto flex items-center gap-3 pr-2 text-[12px]">
+                {active.pages.map((p) => (
+                  <Link key={p.sub} href={href(p.sub)} aria-current={p.sub === activeSub ? "page" : undefined} className={p.sub === activeSub ? "text-ink" : "text-faint hover:text-ink"}>
+                    {p.label}
+                  </Link>
+                ))}
+              </div>
+            )}
           </nav>
           {focus && <div ref={setChromeSlot} className="border-t border-line-soft px-4 py-2 empty:hidden" />}
         </div>
@@ -212,7 +226,7 @@ export function WorkspaceShell({ children }: { children: ReactNode }) {
               <ErrorBox error={detail.error} onRetry={detail.reload} />
             </div>
           ) : detail.loading && !detail.data ? (
-            <Spinner label="Loading ontology" />
+            activeSub === "map" ? <MapSkeleton /> : <OverviewSkeleton />
           ) : (
             <CodeViewerProvider>{children}</CodeViewerProvider>
           )}

@@ -3,21 +3,26 @@
 import Link from "next/link";
 import { useSearchParams } from "next/navigation";
 import { useState } from "react";
-import type { Change } from "@/lib/api/types";
 import { formatDate } from "@/lib/model/format";
-import { useQuery } from "@/lib/hooks";
-import { ChangeView } from "@/components/diff";
+import { SemanticDiff } from "@/components/history/SemanticDiff";
 import { Badge, Button, Empty, ErrorBox, Label, Panel, Select, Spinner, cx } from "@/components/ui";
-import { authorName, revLabel, shortSha, useWorkspace } from "./Workspace";
+import { authorName, shortSha, useWorkspace } from "./Workspace";
 
 export function RevisionsTab() {
   const ws = useWorkspace();
   const revs = (ws.revisions.data?.revisions ?? []).slice().sort((a, b) => b.number - a.number);
   const latest = ws.detail.data?.latest_revision ?? 0;
   const search = useSearchParams();
-  const [from, setFrom] = useState(search.get("from") || (latest ? String(latest) : "draft"));
-  const [to, setTo] = useState(search.get("to") || "draft");
-  const diff = useQuery(`diff:${ws.id}:${from}:${to}`, (c) => c.diff(ws.id, from, to));
+  // Until someone picks a pair, open on the change most worth reading: the draft's
+  // edits if it has any, else what the latest revision changed.
+  const [picked, setPicked] = useState<{ from?: string; to?: string }>({ from: search.get("from") ?? undefined, to: search.get("to") ?? undefined });
+  const dirty = !!ws.detail.data?.draft_dirty;
+  const defaults = latest > 1 && !dirty ? { from: String(latest - 1), to: String(latest) } : { from: latest ? String(latest) : "draft", to: "draft" };
+  const from = picked.from ?? defaults.from;
+  const to = picked.to ?? defaults.to;
+  const setFrom = (v: string) => setPicked({ from: v, to });
+  const setTo = (v: string) => setPicked({ from, to: v });
+  const pick = (f: string, t: string) => setPicked({ from: f, to: t });
 
   const options = (
     <>
@@ -29,12 +34,6 @@ export function RevisionsTab() {
       ))}
     </>
   );
-  const byKind = new Map<string, Change[]>();
-  for (const c of diff.data?.changes ?? []) {
-    if (!byKind.has(c.kind)) byKind.set(c.kind, []);
-    byKind.get(c.kind)!.push(c);
-  }
-
   return (
     <div className="mx-auto grid max-w-[1400px] grid-cols-1 gap-3 p-4 xl:grid-cols-[minmax(0,420px)_minmax(0,1fr)]">
       <Panel title={`Revisions · ${revs.length}`}>
@@ -51,7 +50,7 @@ export function RevisionsTab() {
                   Browse
                 </Button>
                 {latest > 0 && (
-                  <Button size="sm" variant="ghost" onClick={() => { setFrom(String(latest)); setTo("draft"); }}>
+                  <Button size="sm" variant="ghost" onClick={() => pick(String(latest), "draft")}>
                     Diff r{latest}→draft
                   </Button>
                 )}
@@ -72,7 +71,7 @@ export function RevisionsTab() {
                       Browse
                     </Button>
                     {r.number > 1 && (
-                      <Button size="sm" variant="ghost" onClick={() => { setFrom(String(r.number - 1)); setTo(String(r.number)); }}>
+                      <Button size="sm" variant="ghost" onClick={() => pick(String(r.number - 1), String(r.number))}>
                         Diff r{r.number - 1}→r{r.number}
                       </Button>
                     )}
@@ -123,47 +122,7 @@ export function RevisionsTab() {
           </div>
         }
       >
-        {diff.loading && <Spinner label="Computing diff" />}
-        {diff.error ? <ErrorBox error={diff.error} onRetry={diff.reload} /> : null}
-        {diff.data && (
-          <>
-            <div className="mb-2 flex flex-wrap items-center gap-2 text-[12px] text-muted">
-              <span>
-                {revLabel(diff.data.from)} → {revLabel(diff.data.to)}
-              </span>
-              <span className="text-faint">·</span>
-              <span>{diff.data.changes.length} changed entities</span>
-              {(["added", "modified", "removed"] as const).map((k) => {
-                const n = diff.data!.changes.filter((c) => c.change === k).length;
-                return n ? (
-                  <Badge key={k} tone={k === "added" ? "ok" : k === "removed" ? "bad" : "warn"}>
-                    {n} {k}
-                  </Badge>
-                ) : null;
-              })}
-            </div>
-            {diff.data.changes.length === 0 ? (
-              <Empty>
-                No entity changes between {revLabel(diff.data.from)} and {revLabel(diff.data.to)}.
-              </Empty>
-            ) : (
-              <div className="space-y-3">
-                {Array.from(byKind.entries()).map(([kind, list]) => (
-                  <section key={kind}>
-                    <h3 className="mb-1 text-[11px] font-semibold uppercase tracking-[0.08em] text-faint">
-                      {kind} · {list.length}
-                    </h3>
-                    <ul className="space-y-1.5">
-                      {list.map((c) => (
-                        <ChangeView key={`${c.kind}:${c.id}`} c={c} />
-                      ))}
-                    </ul>
-                  </section>
-                ))}
-              </div>
-            )}
-          </>
-        )}
+        <SemanticDiff key={`${ws.id}:${from}:${to}`} ontology={ws.id} base={from} head={to} />
       </Panel>
     </div>
   );

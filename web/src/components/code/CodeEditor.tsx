@@ -199,7 +199,7 @@ export default function CodeEditor({ content, lang, range, vimOn, onClose }: Cod
         syntaxHighlighting(highlight),
         theme,
         citedLines(doc, cited),
-        EditorView.contentAttributes.of({ "aria-label": "Source code", "aria-readonly": "true" }),
+        EditorView.contentAttributes.of({ "aria-label": "Source code", "aria-readonly": "true", tabindex: "0" }),
         EditorView.updateListener.of((u) => {
           if (!u.selectionSet && !u.docChanged && !u.focusChanged) return;
           const head = u.state.selection.main.head;
@@ -275,7 +275,8 @@ export default function CodeEditor({ content, lang, range, vimOn, onClose }: Cod
         data-testid="code-viewer-status"
         className="tnum flex h-6 shrink-0 items-center gap-3 border-t border-line bg-panel px-3 font-mono text-[11px] text-muted"
       >
-        {vimOn && <span className={status.mode === "NORMAL" ? "text-accent" : "text-warn"}>{status.mode}</span>}{" "}
+        {/* The file is read-only, so "NORMAL" says nothing; only a mode someone entered is worth showing. */}
+        {vimOn && status.mode !== "NORMAL" && <span className="text-warn">{status.mode}</span>}{" "}
         {vimOn && status.pending && <span className="text-ink">{status.pending}</span>}{" "}
         <span className="ml-auto">
           {status.line}:{status.col}

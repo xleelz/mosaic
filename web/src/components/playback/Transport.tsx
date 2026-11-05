@@ -1,8 +1,10 @@
 "use client";
 
-import { useMemo } from "react";
+import { useMemo, type ReactNode } from "react";
+import type { Jumps } from "@/lib/sim/beats";
 import { formatMs } from "@/lib/model/format";
-import { eventLabel, eventTone, type Playback } from "@/lib/sim/playback";
+import { eventLabel, eventTone, type EventTone, type Playback } from "@/lib/sim/playback";
+import { binTicks } from "@/lib/sim/window";
 import { Button, Kbd, Select } from "@/components/ui";
 
 export const SPEEDS = [0.5, 1, 2, 4, 8];
@@ -22,6 +24,15 @@ const TICK: Partial<Record<string, string>> = {
   step: "#ccff78",
 };
 
+/** Scrubber ticks: one per bin, so a long trace costs what a short one does. */
+const TICK_BINS = 600;
+/** When two events share a bin, the one that matters most shows. */
+const TICK_RANK: EventTone[] = ["error", "fault", "timeout", "retry", "step", "warning", "late", "queue", "parallel", "choice", "async", "call"];
+const tickRank = (t: EventTone) => {
+  const r = TICK_RANK.indexOf(t);
+  return r < 0 ? TICK_RANK.length : r;
+};
+
 export function Transport({
   playback,
   cursor,
@@ -30,6 +41,8 @@ export function Transport({
   setPlaying,
   speed,
   setSpeed,
+  jumps,
+  extraHints,
 }: {
   playback: Playback;
   cursor: number;
@@ -38,16 +51,25 @@ export function Transport({
   setPlaying: (p: boolean) => void;
   speed: number;
   setSpeed: (s: number) => void;
+  jumps?: Jumps;
+  extraHints?: ReactNode;
 }) {
   const n = playback.events.length;
   const e = playback.events[cursor];
-  const ticks = useMemo(
-    () =>
-      playback.events
-        .map((ev, i) => ({ i, tone: eventTone(ev) }))
-        .filter((t) => TICK[t.tone]),
-    [playback],
-  );
+  // One path per tone over the whole scrubber: a handful of elements, whatever the trace's length.
+  const ticks = useMemo(() => {
+    const tones = playback.events.map((ev) => {
+      const t = eventTone(ev);
+      return TICK[t] ? t : null;
+    });
+    const paths = new Map<EventTone, string>();
+    for (const { bin, tone } of binTicks(tones, TICK_BINS, tickRank)) {
+      const major = tone !== "call" && tone !== "async" && tone !== "choice";
+      const x = (bin / (TICK_BINS - 1)) * 1000;
+      paths.set(tone, `${paths.get(tone) ?? ""}M${x.toFixed(1)} ${major ? 1 : 4}V${major ? 15 : 12}`);
+    }
+    return Array.from(paths, ([tone, d]) => ({ tone, d }));
+  }, [playback]);
   const atEnd = cursor >= n - 1;
   const pct = (i: number) => (n <= 1 ? 0 : (i / (n - 1)) * 100);
 
@@ -92,15 +114,14 @@ export function Transport({
       </div>
 
       <div className="relative min-w-[220px] flex-1">
-        <svg className="pointer-events-none absolute inset-x-[7px] top-1/2 h-4 -translate-y-1/2" width="100%" height="16" aria-hidden preserveAspectRatio="none">
-          <rect x="0" y="7" width="100%" height="2" fill="#2a3742" rx="1" />
-          <rect x="0" y="7" width={`${pct(cursor)}%`} height="2" fill="#6f8f3c" rx="1" />
-          {ticks.map((t) => {
-            const major = t.tone !== "call" && t.tone !== "async" && t.tone !== "choice";
-            return (
-              <rect key={t.i} x={`${pct(t.i)}%`} y={major ? 1 : 4} width="2" height={major ? 14 : 8} fill={TICK[t.tone]} transform="translate(-1 0)" opacity={t.i > cursor ? 0.55 : 1} />
-            );
-          })}
+        <svg className="pointer-events-none absolute inset-x-[7px] top-1/2 h-4 -translate-y-1/2" width="100%" height="16" aria-hidden preserveAspectRatio="none" viewBox="0 0 1000 16">
+          <rect x="0" y="7" width="1000" height="2" fill="#2a3742" />
+          <rect x="0" y="7" width={pct(cursor) * 10} height="2" fill="#6f8f3c" />
+          {ticks.map((t) => (
+            <path key={t.tone} d={t.d} stroke={TICK[t.tone]} strokeWidth="2" vectorEffect="non-scaling-stroke" fill="none" />
+          ))}
+          {/* What's ahead of the cursor is dimmed. */}
+          <rect x={pct(cursor) * 10} y="0" width={Math.max(0, 1000 - pct(cursor) * 10)} height="16" fill="#11181f" opacity="0.45" />
         </svg>
         <input
           type="range"
@@ -122,12 +143,28 @@ export function Transport({
           <span className="font-semibold">{e ? e.seq : 0}</span>
           <span className="text-faint"> / {n}</span>
         </span>
-        <span className="text-muted">t = {formatMs(e?.t ?? 0)}</span>
+        <span className="text-muted">t = {formatMs(e?.t ?? 0)} virtual</span>
       </div>
-      <div className="hidden items-center gap-1 text-[10.5px] text-faint 2xl:flex" aria-hidden>
+      <div className="flex w-full flex-wrap items-center gap-x-1 gap-y-0.5 text-[10.5px] text-faint" aria-label="Keyboard shortcuts">
         <Kbd>Space</Kbd> play <Kbd>←</Kbd>
         <Kbd>→</Kbd> step <Kbd>Home</Kbd>
         <Kbd>End</Kbd>
+        {jumps?.firstFault !== undefined && jumps.firstFault >= 0 && (
+          <>
+            <Kbd>f</Kbd> first fault
+          </>
+        )}
+        {jumps?.firstError !== undefined && jumps.firstError >= 0 && (
+          <>
+            <Kbd>e</Kbd> first error
+          </>
+        )}
+        {jumps && jumps.stateChanges.length > 0 && (
+          <>
+            <Kbd>n</Kbd> next state change
+          </>
+        )}
+        {extraHints}
       </div>
     </div>
   );

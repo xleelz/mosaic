@@ -1,7 +1,8 @@
 # mosaic web
 
-The browser UI for mosaic. Use it to browse ontologies (components, interfaces, behaviors, flows,
-scenarios) and to run and play back simulations of requests flowing through a system. The HTTP
+The browser UI for mosaic. Use it to browse models, which the docs and CLI call ontologies
+(components, interfaces, behaviors, flows, scenarios), to see how far to trust each one, and to run
+and play back simulations of requests flowing through a system. The HTTP
 contract it relies on is [docs/DESIGN.md](../docs/DESIGN.md) §6.
 
 Stack: Next.js 16.4 (App Router, Turbopack, Cache Components), React 19.3, TypeScript 5.9 (strict),
@@ -112,12 +113,53 @@ PATH=/usr/local/go/bin:$PATH go run ./internal/devtools/fixtures -out web/fixtur
 
 ## Pages
 
-- **`/`: Ontologies.** One card per ontology, with its description, latest revision, revision
+The workspace's tabs are `Overview  Map  Flows  Runs  |  Evidence  History`, and every older route
+still works ([docs/ux-plan-2026-11.md](../docs/ux-plan-2026-11.md) has the decisions behind this).
+Each route belongs to one tab:
+
+| Tab | Routes | What it answers |
+|---|---|---|
+| Overview | `/o/<id>` | What this is, entry points, main flows, how far to trust it, where to go next |
+| Map | `/o/<id>/map`, `/o/<id>/world` | What it's made of. `/o/<id>?c=...`, the old map link, redirects here |
+| Flows | `/o/<id>/flows` | What it does: the happy path first, and search across flows and scenarios |
+| Runs | `/o/<id>/simulate`, `/o/<id>/runs/<run>` | What happens: the form, recent runs, playback and compare |
+| Evidence | `/o/<id>/evidence`, `.../evidence/tests`, `.../evidence/race-search` (old: `/tests`, `/explore`) | How good it is |
+| History | `/o/<id>/revisions`, `/o/<id>/commits` | How it changed: a per-area summary first, then the entities |
+
+What's new in each, and what the longer list below leaves out:
+
+- **Trust.** `components/trust/` owns the fidelity marks: modeled (solid), partial (half), shell
+  (hollow), absent (dashed). The passport chip reads `GET /v1/ontologies/{id}/evidence?rev=` through
+  `useEvidence` (`lib/evidence.ts`), and shows on each model's card and workspace header. No stored
+  evidence reads "Not benchmarked". A figure measured on another revision says so. Green is kept for
+  checks against something outside the model, so "Schema OK", a run's "ok" and self-checks are
+  neutral. A run's durations say "virtual" and its inputs say "generated".
+- **Map.** Models of 120 components or more with areas open on the Atlas (`components/map/AtlasMap`,
+  `lib/model/atlas*`), which draws at most 40 boxes per view and groups the rest. `?area=`, `?in=`,
+  `?role=` and `?rest=` name the view, `?lens=` picks Area, Failure, Flow or Data, `?c=` selects, and
+  `?select=` goes to wherever a component is drawn. Absent mechanisms show as dashed ghost rows. Smaller
+  models keep the compound map. Esc or ✕ closes the side panel.
+- **Runs.** A run opens on a summary trace (`lib/sim/beats.ts`), with `f`, `e` and `n` to jump to the
+  first fault, the first error and the next state change, swimlanes by area, and a warning that lists
+  the partial and shell mechanisms it passed through. `?compare=<run>` puts any two runs side by side
+  (`components/compare/`).
+- **Evidence.** The passport in full, with what each figure is and isn't, the gate statuses in plain
+  words, per-area strips, and a filterable list of mechanisms. Self-checks keep the last report per
+  revision and always carry their caption. Race search says "Not explored yet" when no replay exists.
+- **Search.** `/` or Ctrl/Cmd-K searches everything (`components/palette/`), and `?` lists every key.
+- **Scale.** `components/WindowedList.tsx` is the one long list: it draws only what's near the
+  viewport. Its row logic is in `lib/windowing.ts`, and fixed-height rows use `playback/VirtualRows`.
+  The query cache is a bounded LRU (`lib/querycache.ts`), and validate results are kept per revision
+  hash (`lib/validationcache.ts`). The proxy gzips JSON (`app/api/mosaic/[...path]/compress.ts`).
+
+The pages in more detail:
+
+- **`/`: Models.** One card per model, with its passport, description, latest revision, revision
   count, draft state and entity counts.
-- **`/o/<id>`: Workspace.** The header has a revision selector (latest, draft or rN), validation
-  status and a draft-changed flag. The selected revision is carried in `?rev=` across tabs. The tabs
+- **`/o/<id>`: Workspace.** The header has a revision selector (latest, draft or rN), the schema
+  status and a draft-changed flag. The selected revision is carried in `?rev=` across tabs. Its pages
   are:
-  - **Architecture.** An ELK compound layout. Components nest by `parent` and are colored by
+  - **Map, on the compound layout.** An ELK compound layout. Components nest by `parent` and are colored by
     `layer` or by `kind`, with a legend. Derived `calls` edges are solid, derived `emits` edges are
     dotted, and explicit links are dashed violet with a label. Edges that leave a container run along
     the gaps between cards instead of across them. You can pan, zoom (+, −) and fit. To open a
@@ -185,7 +227,7 @@ PATH=/usr/local/go/bin:$PATH go run ./internal/devtools/fixtures -out web/fixtur
     see a line diff of its definition (or the unchanged definition) and how its reach changed (the
     interfaces it reaches that were added or dropped, from the plans at both revisions). **← All
     flows** goes back to the normal list.
-  - **Simulate.** Pick a flow and optionally a scenario. The controls come from the plan:
+  - **Runs: the form (`/simulate`).** Pick a flow and optionally a scenario. The controls come from the plan:
     - one select per choice point, with the default marked ★ and the scenario's own choice noted;
     - fault rows: a target from `plan.faultable`, a type (`unavailable`, `error`, `latency` or
       `timeout`), and `code`, `status`, `latency_ms` and `calls`;
@@ -210,8 +252,9 @@ PATH=/usr/local/go/bin:$PATH go run ./internal/devtools/fixtures -out web/fixtur
     or the draft. Changes are grouped by kind and shown as line diffs with context. Each revision
     shows the commit it models (`source`), linked to the Commits tab and to `source.url`.
     `?from=&to=` preselects the diff.
-  - **Tests.** **Run all** sends `POST /test`. You get a pass/fail table, per-assertion details and
-    a link to each run.
+  - **Evidence: self-checks.** **Run all** sends `POST /test` with `save=false`, unless you tick
+    "Keep traces". The report is stored per revision, so it survives a reload. You get a table with
+    search, grouping and "Failed only", per-assertion details and a link to each run.
 - **`/o/<id>/runs/<run>`: Playback.** `?at=<seq>` opens at a given event. The page fills the
   viewport with no page scroll. The app bar, the workspace header and tabs, and the run's title and
   meta lines are hidden; they reveal together as an overlay while you hover the top edge (or the
@@ -220,7 +263,7 @@ PATH=/usr/local/go/bin:$PATH go run ./internal/devtools/fixtures -out web/fixtur
   float in a right panel and the map along the bottom, each **hidden** (a tab or a slim bar),
   **open** (docked: about 420px wide, or 30% of the height) or **expanded** (60% of the width, or
   75% of the height, over the diagram). Both states are remembered in localStorage. The inline
-  playback in Simulate and Exploration keeps the grid layout (`Playback`'s `layout="embedded"`).
+  playback in the Runs form and Race search keeps the grid layout (`Playback`'s `layout="embedded"`).
   The page has:
   - a **summary** card: status, result or error, duration, calls (with a per-interface table),
     retries, faults, assertions ✓/✗ (with details), warnings and, for a repeated flow entry, a
@@ -250,8 +293,14 @@ PATH=/usr/local/go/bin:$PATH go run ./internal/devtools/fixtures -out web/fixtur
 | Space | Play or pause playback |
 | ← / → | Step one event (Shift: 10) |
 | Home / End | Jump to the first or last event |
+| f / e / n | Run page: jump to the first fault, the first error, the next state change |
+| s | Run page: cycle the view (summary, side by side, sequence) |
 | i | Run page: cycle the inspector panel (open, expanded, hidden) |
 | m | Run page: cycle the map (open, expanded, hidden) |
+| / | Search everything |
+| Ctrl/Cmd-K | Search everything, even while typing |
+| ? | Every key, in a sheet |
+| Esc | Close a dialog, the code viewer or the map's side panel |
 | Tab, Enter, Space | Move between and activate every control; Enter on a focused map node opens it |
 
 Playback shortcuts are ignored while you type in an input, select or text area, and while focus is
@@ -302,11 +351,13 @@ Space, arrows, `i` and `m` don't fire.
 src/lib/api/        types.ts (Go mirror), client.ts (interface, errors), http.ts, fixtures.ts, normalize.ts
 src/lib/sim/        playback.ts: spans, lifelines, state replay, event labels and tones
 src/lib/model/      formatting, schema resolution, the categorical palette, impact.ts (entity diff and impact)
-src/lib/hooks.ts    a small keyed query cache (useQuery), useDocIndex, and the plan request queue
+src/lib/hooks.ts    a small keyed query cache (useQuery), useDocIndex, useValidation, and the plan request queue
+src/lib/evidence.ts useEvidence and the mechanism joins; lib/model/atlas* the area map; lib/sim/{beats,lanes,compare,window,wording}.ts the run view
 src/lib/model/docindex.ts  lookup maps built once per document (components, interfaces, flows and
                     scenarios by id, scenarios by flow, members by parent, top-level parent, area),
                     flow grouping and the component tree rows; tests in docindex.test.ts
-src/components/     ui primitives, JSON/CEL views, diff.tsx (line diffs), behavior StepList, map/, playback/, workspace/
+src/components/     ui primitives, JSON/CEL views, WindowedList, diff.tsx (line diffs), behavior StepList, map/, playback/, workspace/,
+                    trust/ (passport, fidelity marks), overview/, evidence/, compare/, history/, palette/
 src/components/code/  the code viewer: CodeViewer.tsx (provider and window), CodeEditor.tsx (CodeMirror,
                     vim, theme; lazy), languages.ts (per-language chunks), hcl.ts; lib/source.ts for
                     the language, blob URL and title (tests in source.test.ts)

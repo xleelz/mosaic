@@ -671,6 +671,37 @@ func (c *Client) GetRun(ctx context.Context, id string) (*api.SimulationRun, err
 	return &out, nil
 }
 
+// PutEvidence is PUT /v1/ontologies/{id}/evidence?rev=: it stores evidence on
+// a revision (empty rev: the latest).
+func (c *Client) PutEvidence(ctx context.Context, ont, rev string, e api.Evidence) (*api.Evidence, error) {
+	var out api.Evidence
+	if err := c.do(ctx, http.MethodPut, "/ontologies/"+esc(ont)+"/evidence", revQuery(rev), e, &out); err != nil {
+		return nil, err
+	}
+	return &out, nil
+}
+
+// GetEvidence is GET /v1/ontologies/{id}/evidence?rev=: the evidence in force
+// at a revision, which it may inherit from an earlier one. Not found when none
+// is stored.
+func (c *Client) GetEvidence(ctx context.Context, ont, rev string) (*api.Evidence, error) {
+	var out api.Evidence
+	if err := c.do(ctx, http.MethodGet, "/ontologies/"+esc(ont)+"/evidence", revQuery(rev), nil, &out); err != nil {
+		return nil, err
+	}
+	return &out, nil
+}
+
+// TestResults is GET /v1/ontologies/{id}/test-results?rev=: the latest report
+// recorded for a revision. Not found when it was never run.
+func (c *Client) TestResults(ctx context.Context, ont, rev string) (*api.StoredTestReport, error) {
+	var out api.StoredTestReport
+	if err := c.do(ctx, http.MethodGet, "/ontologies/"+esc(ont)+"/test-results", revQuery(rev), nil, &out); err != nil {
+		return nil, err
+	}
+	return &out, nil
+}
+
 // Test is POST /v1/ontologies/{id}/test?rev=: it runs every scenario's expectations.
 func (c *Client) Test(ctx context.Context, ont, rev string) (*api.TestReport, error) {
 	var out api.TestReport

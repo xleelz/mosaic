@@ -1,6 +1,6 @@
 "use client";
 
-import { useMemo, useState } from "react";
+import { useEffect, useMemo, useState } from "react";
 import { ancestors, componentRows, descendantCounts, type ComponentGrouping, type DocIndex } from "@/lib/model/docindex";
 import { plural } from "@/lib/model/format";
 import { ProgressiveList, cx, inputClass } from "@/components/ui";
@@ -9,14 +9,34 @@ import { ProgressiveList, cx, inputClass } from "@/components/ui";
 export const BROWSER_COLLAPSE_ABOVE = 50;
 
 /**
- * A collapsible list of components: a tree by parent, or flat under each area
- * (or owner), with a filter and member counts. Selecting a row opens its
- * ancestors, so a component picked on the map is always visible here.
+ * A collapsible list of components: flat under each area, or a tree, with a
+ * filter and member counts. Selecting a row opens its ancestors, so a component
+ * picked on the map is always visible here. The map listens: `onMatches` reports
+ * what the filter finds, and `onArea` reports an area picked in the list.
  */
-export function ComponentBrowser({ idx, selected, onSelect, className }: { idx: DocIndex; selected: string | null; onSelect: (id: string) => void; className?: string }) {
+export function ComponentBrowser({
+  idx,
+  selected,
+  onSelect,
+  className,
+  onMatches,
+  onArea,
+  activeArea,
+}: {
+  idx: DocIndex;
+  selected: string | null;
+  onSelect: (id: string) => void;
+  className?: string;
+  /** The ids the filter matches; null when there's no filter. */
+  onMatches?: (ids: ReadonlySet<string> | null) => void;
+  /** An area's row was picked: the map should go there. */
+  onArea?: (area: string) => void;
+  /** The area the map is in, opened and marked here. */
+  activeArea?: string | null;
+}) {
   const total = idx.componentsById.size;
   const hasAreas = idx.area.size > 0;
-  const [grouping, setGrouping] = useState<ComponentGrouping>("tree");
+  const [grouping, setGrouping] = useState<ComponentGrouping>(hasAreas ? "area" : "tree");
   const [filter, setFilter] = useState("");
   const counts = useMemo(() => descendantCounts(idx), [idx]);
   const [expanded, setExpanded] = useState<Set<string>>(() => {
@@ -38,7 +58,17 @@ export function ComponentBrowser({ idx, selected, onSelect, className }: { idx: 
     }
   }
 
+  // Follow the map into an area.
+  const [openedArea, setOpenedArea] = useState<string | null>(null);
+  if ((activeArea ?? null) !== openedArea) {
+    setOpenedArea(activeArea ?? null);
+    if (activeArea && !expanded.has(`area:${activeArea}`)) setExpanded(new Set([...expanded, `area:${activeArea}`]));
+  }
+
   const rows = useMemo(() => componentRows(idx, grouping, expanded, filter, counts), [idx, grouping, expanded, filter, counts]);
+  const filtering = filter.trim().length > 0;
+  const matchIds = useMemo(() => (filtering ? new Set(rows.flatMap((r) => (r.match && r.id ? [r.id] : []))) : null), [filtering, rows]);
+  useEffect(() => onMatches?.(matchIds), [matchIds, onMatches]);
   const selectedIndex = selected ? rows.findIndex((r) => r.id === selected) : -1;
   const toggle = (key: string) =>
     setExpanded((s) => {
@@ -71,7 +101,7 @@ export function ComponentBrowser({ idx, selected, onSelect, className }: { idx: 
                 onClick={() => setGrouping(g)}
                 className={cx("h-6 rounded border px-1.5", grouping === g ? "border-accent bg-[#1c2a10] text-accent" : "border-line bg-panel-2 text-muted hover:text-ink")}
               >
-                {g === "tree" ? "by parent" : "by area"}
+                {g}
               </button>
             ))}
           <span className="ml-auto flex gap-1.5">
@@ -122,7 +152,13 @@ export function ComponentBrowser({ idx, selected, onSelect, className }: { idx: 
                   {r.count > 0 && <span className="tnum ml-auto shrink-0 pr-1 text-[10.5px] text-faint">{r.count}</span>}
                 </button>
               ) : (
-                <button type="button" onClick={() => toggle(r.key)} className="flex min-w-0 flex-1 items-baseline gap-1.5 px-1 py-0.5 text-left font-medium text-muted hover:text-ink">
+                <button
+                  type="button"
+                  aria-current={activeArea && r.key === `area:${activeArea}` ? "true" : undefined}
+                  title={onArea ? `Go to ${r.label} on the map` : undefined}
+                  onClick={() => (onArea ? onArea(r.label) : toggle(r.key))}
+                  className={cx("flex min-w-0 flex-1 items-baseline gap-1.5 px-1 py-0.5 text-left font-medium hover:text-ink", activeArea && r.key === `area:${activeArea}` ? "text-accent" : "text-muted")}
+                >
                   <span className="truncate">{r.label}</span>
                   <span className="tnum ml-auto shrink-0 pr-1 text-[10.5px] text-faint">{r.count}</span>
                 </button>

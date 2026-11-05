@@ -219,7 +219,7 @@ func TestMechanismStatuses(t *testing.T) {
 		{"core.raced", mechUncovered, "racing"},                        // a race-tagged scenario stays out
 		{"core.embed", mechShell, "only fails a check of its refusal"}, // losing a validation isn't losing the pipeline
 		{"core.embed-gate", mechOK, ""},                                // a gate's work is the refusal
-		{"core.parts", mechOK, ""},
+		{"core.parts", mechWeak, "2 of 3 reached interfaces prove nothing alone"},
 		{"core.excused", mechSkipped, "demo binary"},
 		{"core.badskip", mechMissing, "invalid skip: rejected reason"},
 	} {
@@ -233,7 +233,7 @@ func TestMechanismStatuses(t *testing.T) {
 		weak = append(weak, w.ID+": "+w.Why)
 	}
 	if len(weak) != 2 || !strings.Contains(weak[0], "audit.record: removing it alone") || !strings.Contains(weak[1], "observer.tally: no caller") {
-		t.Errorf("weak interfaces of an ok mechanism: %q", weak)
+		t.Errorf("weak interfaces of a noticed mechanism: %q", weak)
 	}
 	if got["core.partly"].Unknown[0] != "nothing.here" {
 		t.Errorf("unknown interface not reported: %+v", got["core.partly"])
@@ -269,6 +269,17 @@ func TestMechanismDisagreements(t *testing.T) {
 	if d := fidelityAgrees("shell", mechOK); d {
 		t.Error("an enumerator's shell measured ok must disagree (the reverse direction)")
 	}
+	for _, c := range []struct {
+		fidelity string
+		agrees   bool
+	}{{"modeled", false}, {"partial", true}, {"shell", false}, {"absent", false}} {
+		if fidelityAgrees(c.fidelity, mechWeak) != c.agrees {
+			t.Errorf("fidelity %s against weak: want agrees=%v", c.fidelity, c.agrees)
+		}
+	}
+	if got["core.parts"].Disagree != "enumerator says modeled, measured weak" {
+		t.Errorf("a modeled mechanism measuring weak: %q", got["core.parts"].Disagree)
+	}
 }
 
 func TestMechanismGate1WithoutMutation(t *testing.T) {
@@ -290,9 +301,11 @@ func TestMechanismReportAndGates(t *testing.T) {
 	r.print(&b, false)
 	out := b.String()
 	for _, want := range []string{
-		"mechanisms of core: 4 ok, 6 shell, 2 uncovered, 3 missing, 1 skipped",
+		"mechanisms of core: 3 ok, 1 weak, 6 shell, 2 uncovered, 3 missing, 1 skipped",
 		"mechanisms of kind metric:",
-		"mechanisms: 4 of 15 unskipped ok (26.7%)",
+		"mechanisms: 3 of 15 unskipped ok (20.0%)",
+		"✗ mechanism core.parts (core, pipeline) weak [enumerator: modeled]: 2 of 3 reached interfaces prove nothing alone",
+		"interface observer.tally: no caller",
 		"✗ mechanism core.pool (core, pipeline) shell [enumerator: modeled]",
 		"interfaces: pooler.encode",
 		"ran pool-answers with pooler.encode disabled: 1 boundary expectations survived",
@@ -314,8 +327,8 @@ func TestMechanismReportAndGates(t *testing.T) {
 		wants []string
 	}{
 		{-1, -1, false, []string{"recorded, not gated"}},
-		{0.1, -1, false, []string{"✓ mechanisms gate", "can go up to 0.266", "only goes up"}},
-		{0.5, -1, true, []string{"✗ mechanisms gate: share 0.267, --min-mechanisms 0.500"}},
+		{0.1, -1, false, []string{"✓ mechanisms gate", "can go up to 0.2", "only goes up"}},
+		{0.5, -1, true, []string{"✗ mechanisms gate: share 0.200, --min-mechanisms 0.500"}},
 		{-1, 6, false, []string{"✓ shell-mechanisms gate: 6"}},
 		{-1, 9, false, []string{"can go down to 6"}},
 		{-1, 5, true, []string{"✗ shell-mechanisms gate: 6"}},
@@ -339,10 +352,230 @@ func TestMechanismVariants(t *testing.T) {
 	if fail["core.pool"].Status != mechOK || fail["core.helper"].Status != mechOK {
 		t.Errorf("fail variant: pool %s helper %s", fail["core.pool"].Status, fail["core.helper"].Status)
 	}
-	// {} makes the caller's read of the missing field abort on the entry's chain.
+	// {} makes the caller's read of the missing field abort on the entry's chain,
+	// which is all that notices.
 	empty := byID(measureFixture(t, "empty", true))
-	if empty["core.pool"].Status != mechOK {
+	if empty["core.pool"].Status != mechWeak || !empty["core.pool"].E2E.AbortOnly {
 		t.Errorf("empty variant: pool %s", empty["core.pool"].Status)
+	}
+}
+
+// A mechanism whose removal only an abort notices is weak; an expectation in a
+// later scenario makes it ok. The read of a missing key aborts under {}.
+func TestMechanismOnlyByAbort(t *testing.T) {
+	doc, err := model.ParseDocument([]byte(`
+schema_version: 1
+components: [{id: user, kind: external}, {id: api}, {id: dep}, {id: both}]
+interfaces:
+  - component: api
+    name: read
+    kind: http
+    behavior:
+      - {call: dep.get, as: d}
+      - {return: {n: "= vars.d.value.n"}}
+  - component: api
+    name: read-both
+    kind: http
+    behavior:
+      - {call: both.get, as: d, on_error: continue}
+      - {return: {n: "= vars.d.value.n"}}
+  - component: api
+    name: ignore-both
+    kind: http
+    behavior:
+      - {call: both.get, as: d}
+      - {return: {n: "= has(vars.d.value.n) ? vars.d.value.n : 0"}}
+  - component: dep
+    name: get
+    behavior:
+      - {set: {vars.n: 1}}
+      - {return: {n: "= vars.n"}}
+  - component: both
+    name: get
+    behavior:
+      - {set: {vars.n: 1}}
+      - {return: {n: "= vars.n"}}
+flows:
+  - {id: read, entry: {caller: user, interface: api.read}}
+  - {id: a-read-both, entry: {caller: user, interface: api.read-both}}
+  - {id: b-ignore-both, entry: {caller: user, interface: api.ignore-both}}
+scenarios:
+  - {id: read, flow: read, expect: ["result.ok"]}
+  - {id: a-read-both, flow: a-read-both, expect: ["result.ok"]}
+  - {id: b-ignore-both, flow: b-ignore-both, expect: ["result.value.n == 1"]}
+`))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if is := model.Validate(doc); model.HasErrors(is) {
+		t.Fatalf("invalid fixture: %+v", is)
+	}
+	l := &mechanismList{Mechanisms: []mechanism{
+		{ID: "a.only-abort", Area: "a", Interfaces: []string{"dep.get"}},
+		{ID: "a.then-expectation", Area: "a", Interfaces: []string{"both.get"}},
+	}}
+	rr := runAll(io.Discard, doc, nil, runOpts{Track: l.interfaces()})
+	if rr.Failed != 0 {
+		t.Fatalf("fixture scenarios failed: %v", rr.FailedIDs)
+	}
+	r := measureMechanisms(doc, l, rr.Base, nil)
+	runMechanismE2E(r, doc, rr.Base, e2eOpts{Scenarios: 10, Workers: 1, Variant: "empty"})
+	got := byID(r)
+	if res := got["a.only-abort"]; res.Status != mechWeak || !res.E2E.AbortOnly || !strings.Contains(res.Detail, "only an abort") {
+		t.Errorf("only an abort noticed: %+v", res)
+	}
+	if res := got["a.then-expectation"]; res.Status != mechOK || res.E2E.AbortOnly || !strings.Contains(res.E2E.Caught, "b-ignore-both") {
+		t.Errorf("an expectation after an abort: %+v", res)
+	}
+}
+
+// serve-http and main are entered from outside whatever their label, and another
+// plain function entered by a scenario is still a unit.
+func TestServeHTTPIsABoundaryEntry(t *testing.T) {
+	doc, err := model.ParseDocument([]byte(`
+schema_version: 1
+components: [{id: user, kind: external}, {id: gw}]
+interfaces:
+  - component: gw
+    name: serve-http
+    kind: function
+    behavior:
+      - {set: {vars.a: "= input.x"}}
+      - {return: {x: "= vars.a"}}
+  - component: gw
+    name: main
+    kind: function
+    behavior:
+      - {set: {vars.a: "= input.x"}}
+      - {return: {x: "= vars.a"}}
+  - component: gw
+    name: helper
+    kind: function
+    behavior:
+      - {set: {vars.a: "= input.x"}}
+      - {return: {x: "= vars.a"}}
+scenarios:
+  - id: entered
+    steps:
+      - {interface: gw.serve-http, caller: user, input: {x: 1}, as: p}
+    expect: ["steps.p.result.value.x == 1"]
+  - id: boot
+    steps:
+      - {interface: gw.main, caller: user, input: {x: 1}, as: p}
+    expect: ["steps.p.result.value.x == 1"]
+  - id: unit
+    steps:
+      - {interface: gw.helper, caller: user, input: {x: 1}, as: p}
+    expect: ["steps.p.result.value.x == 1"]
+`))
+	if err != nil {
+		t.Fatal(err)
+	}
+	l := &mechanismList{Mechanisms: []mechanism{
+		{ID: "a.serve", Area: "a", Interfaces: []string{"gw.serve-http"}},
+		{ID: "a.main", Area: "a", Interfaces: []string{"gw.main"}},
+		{ID: "a.helper", Area: "a", Interfaces: []string{"gw.helper"}},
+	}}
+	rr := runAll(io.Discard, doc, nil, runOpts{Track: l.interfaces()})
+	r := measureMechanisms(doc, l, rr.Base, nil)
+	runMechanismE2E(r, doc, rr.Base, e2eOpts{Scenarios: 10, Workers: 1, Variant: "zero"})
+	got := byID(r)
+	if got["a.serve"].Status != mechOK {
+		t.Errorf("serve-http: %+v", got["a.serve"])
+	}
+	if got["a.main"].Status != mechOK {
+		t.Errorf("main: %+v", got["a.main"])
+	}
+	if res := got["a.helper"]; res.Status != mechShell || !strings.Contains(res.Detail, "no caller") {
+		t.Errorf("a plain function: %+v", res)
+	}
+}
+
+func TestMechanismsJSON(t *testing.T) {
+	r := measureFixture(t, "zero", true)
+	for _, res := range r.Results {
+		if res.ID == "core.gone" { // its area isn't in this merge
+			res.Raw, res.Status = res.Status, mechAbsent
+		}
+	}
+	path := filepath.Join(t.TempDir(), "m.json")
+	if err := writeMechanismsJSON(path, r); err != nil {
+		t.Fatal(err)
+	}
+	b, err := os.ReadFile(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	var items []map[string]any
+	if err := json.Unmarshal(b, &items); err != nil {
+		t.Fatal(err)
+	}
+	if len(items) != len(r.Results) {
+		t.Fatalf("%d items of %d", len(items), len(r.Results))
+	}
+	allowed := map[string]bool{"ok": true, "weak": true, "shell": true, "uncovered": true, "missing": true, "skipped": true}
+	seen := map[string]string{}
+	for _, it := range items {
+		st, _ := it["gate_status"].(string)
+		if !allowed[st] {
+			t.Errorf("%v: gate_status %q", it["id"], st)
+		}
+		seen[it["id"].(string)] = st
+		// types.ts: citations and interfaces are always arrays.
+		for _, k := range []string{"citations", "interfaces"} {
+			if _, ok := it[k].([]any); !ok {
+				t.Errorf("%v: %s is %T", it["id"], k, it[k])
+			}
+		}
+		for _, k := range []string{"trigger", "observable", "note"} {
+			if _, has := it[k]; has && it[k] == "" {
+				t.Errorf("%v: empty optional %s", it["id"], k)
+			}
+		}
+	}
+	for id, want := range map[string]string{"core.index": "ok", "core.parts": "weak", "core.pool": "shell", "core.observer": "uncovered", "core.gone": "missing", "core.excused": "skipped"} {
+		if seen[id] != want {
+			t.Errorf("%s: gate_status %q, want %q", id, seen[id], want)
+		}
+	}
+}
+
+func TestMechanismListProblems(t *testing.T) {
+	l := &mechanismList{Mechanisms: []mechanism{
+		{ID: "a.one", Area: "a", Interfaces: []string{"x.y", "x.z"}},
+		{ID: "b.two", Area: "b", Interfaces: []string{"x.y"}},
+		{ID: "a.three", Area: "b", Interfaces: []string{"x.w"}},
+	}}
+	problems, shared := l.listProblems()
+	if len(problems) != 1 || !strings.Contains(problems[0], "a.three is in b.json") {
+		t.Errorf("problems: %q", problems)
+	}
+	if len(shared) != 1 || !strings.Contains(shared[0], "x.y is listed by areas a, b") {
+		t.Errorf("shared: %q", shared)
+	}
+	dir := t.TempDir()
+	if err := os.MkdirAll(filepath.Join(dir, "src"), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(dir, "src", "f.go"), []byte("a\nb\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	for _, secret := range []string{".env", "credentials.go"} {
+		if err := os.WriteFile(filepath.Join(dir, "src", secret), []byte("SECRET=x\n"), 0o644); err != nil {
+			t.Fatal(err)
+		}
+	}
+	cited := &mechanismList{Mechanisms: []mechanism{{ID: "a.one", Citations: []string{"src/f.go:2", "src/f.go:9", "src/nope.go:1", "src/.env:1", "src/credentials.go:1"}}}}
+	var b bytes.Buffer
+	printMechanismCitations(&b, cited, newCodeRoot(dir))
+	out := b.String()
+	for _, want := range []string{"citation src/f.go:9: bad_line", "citation src/nope.go:1: missing", "5 cited, 2 don't resolve, 2 in secret files, not opened"} {
+		if !strings.Contains(out, want) {
+			t.Errorf("citations lack %q:\n%s", want, out)
+		}
+	}
+	if strings.Contains(out, "SECRET") {
+		t.Errorf("a secret file was read:\n%s", out)
 	}
 }
 

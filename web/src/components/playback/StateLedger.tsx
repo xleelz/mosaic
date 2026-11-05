@@ -3,7 +3,7 @@
 import { useEffect, useMemo, useRef, useState } from "react";
 import type { Document, JsonObject, JsonValue } from "@/lib/api/types";
 import { componentName, isPlainObject, jsonEqual, jsonInline } from "@/lib/model/format";
-import { changedAt, laneComponent, laneInstance, snapshotAt, touchedState, type Playback } from "@/lib/sim/playback";
+import { changedAt, laneComponent, laneInstance, leafChanged, runWrites, snapshotAt, touchedState, type Playback } from "@/lib/sim/playback";
 import { cx } from "@/components/ui";
 
 interface Leaf {
@@ -40,6 +40,9 @@ function matches(leaf: string[], changed: string[] | null): boolean {
   return true;
 }
 
+/** How many fields a component shows before "show all". */
+const LEAF_CAP = 40;
+
 function LeafRow({ leaf, hot, diff, initial }: { leaf: Leaf; hot: boolean; diff: boolean; initial?: JsonValue }) {
   const ref = useRef<HTMLDivElement>(null);
   useEffect(() => {
@@ -57,6 +60,7 @@ function LeafRow({ leaf, hot, diff, initial }: { leaf: Leaf; hot: boolean; diff:
       <span className="flex min-w-0 items-baseline gap-1 font-mono text-[#9fd2ff]">
         <span
           className={cx("inline-block h-1.5 w-1.5 shrink-0 rounded-full", diff ? "bg-accent" : "bg-transparent")}
+          role={diff ? "img" : undefined}
           aria-label={diff ? "changed since the start" : undefined}
         />
         <span className="truncate">{leaf.path}</span>
@@ -83,11 +87,16 @@ export function StateLedger({ playback, cursor, doc }: { playback: Playback; cur
   const frameSpan = frame ? playback.spans.get(frame) : undefined;
 
   const touched = useMemo(() => touchedState(playback), [playback]);
+  const writes = useMemo(() => runWrites(playback), [playback]);
+  const [scope, setScope] = useState<"changed" | "touched">("changed");
   const [showOthers, setShowOthers] = useState(false);
+  const [uncapped, setUncapped] = useState<ReadonlySet<string>>(() => new Set());
   const all = Array.from(new Set([...Object.keys(initial.state), ...Object.keys(snap.state)])).sort();
+  const changedComps = all.filter((c) => writes.has(c));
   // Only what this run read or wrote; the rest of the ontology's stateful components fold away.
-  const comps = all.filter((c) => touched.has(c));
+  const comps = scope === "changed" ? changedComps : all.filter((c) => touched.has(c));
   const others = all.filter((c) => !touched.has(c));
+  const shown = scope === "touched" && showOthers ? [...comps, ...others] : comps;
 
   return (
     <div className="space-y-3 p-3">
@@ -120,15 +129,33 @@ export function StateLedger({ playback, cursor, doc }: { playback: Playback; cur
       )}
 
       <section aria-label="component state">
-        <h4 className="mb-1 text-[11px] font-semibold uppercase tracking-[0.08em] text-muted">component state</h4>
+        <h4 className="mb-1 flex flex-wrap items-baseline gap-x-2 text-[11px] font-semibold uppercase tracking-[0.08em] text-muted">
+          component state
+          <span className="flex items-center gap-1 font-normal normal-case tracking-normal" role="group" aria-label="Which state to show">
+            {([
+              ["changed", `changed in this run (${changedComps.length})`],
+              ["touched", "everything it read"],
+            ] as const).map(([k, label]) => (
+              <button key={k} type="button" aria-pressed={scope === k} onClick={() => setScope(k)} className={cx("rounded px-1 py-px text-[11px]", scope === k ? "bg-panel-3 text-ink" : "text-faint hover:text-ink")}>
+                {label}
+              </button>
+            ))}
+          </span>
+        </h4>
         {all.length === 0 && <div className="px-1.5 text-[11.5px] text-faint">No stateful components.</div>}
-        {all.length > 0 && comps.length === 0 && <div className="px-1.5 text-[11.5px] text-faint">This run read or wrote no component state.</div>}
+        {all.length > 0 && comps.length === 0 && <div className="px-1.5 text-[11.5px] text-faint">{scope === "changed" ? "This run changed no component state." : "This run read or wrote no component state."}</div>}
         <div className="space-y-2">
-          {[...comps, ...(showOthers ? others : [])].map((c) => {
+          {shown.map((c) => {
             const st = snap.state[c] ?? {};
             const init = initial.state[c] ?? {};
-            const leaves: Leaf[] = [];
-            flatten(st, [], leaves);
+            const flat: Leaf[] = [];
+            flatten(st, [], flat);
+            const written = writes.get(c);
+            const hotLeaf = (l: Leaf) => changed?.scope === "state" && changed.component === c && matches(l.segs, changed.segs);
+            const inScope = scope === "changed" && written ? flat.filter((l) => hotLeaf(l) || leafChanged(written, l.segs)) : flat;
+            // A component can hold thousands of fields: cap them, keeping the one changing now.
+            const capped = !uncapped.has(c) && inScope.length > LEAF_CAP;
+            const leaves = capped ? inScope.filter((l, i) => i < LEAF_CAP || hotLeaf(l)) : inScope;
             const isCur = e?.component === laneComponent(c) && (!laneInstance(c) || e?.instance === laneInstance(c));
             const anyDiff = !jsonEqual(st, init);
             return (
@@ -139,7 +166,7 @@ export function StateLedger({ playback, cursor, doc }: { playback: Playback; cur
                   <span className="font-mono text-[10.5px] text-faint">{laneComponent(c)}</span>
                   {anyDiff && <span className="ml-auto text-[10.5px] text-accent">changed</span>}
                 </div>
-                {Object.keys(st).length === 0 ? (
+                {Object.keys(st).length === 0 && scope === "touched" ? (
                   <div className="px-1.5 text-[11.5px] text-faint">{"{}"}</div>
                 ) : (
                   leaves.map((l) => {
@@ -148,18 +175,23 @@ export function StateLedger({ playback, cursor, doc }: { playback: Playback; cur
                       <LeafRow
                         key={l.id}
                         leaf={l}
-                        hot={changed?.scope === "state" && changed.component === c && matches(l.segs, changed.segs)}
+                        hot={hotLeaf(l)}
                         diff={!jsonEqual(iv, l.value)}
                         initial={iv}
                       />
                     );
                   })
                 )}
+                {capped && (
+                  <button type="button" onClick={() => setUncapped((u) => new Set(u).add(c))} className="px-1.5 py-0.5 text-[11px] text-link hover:underline">
+                    and {inScope.length - leaves.length} more
+                  </button>
+                )}
               </div>
             );
           })}
         </div>
-        {others.length > 0 && (
+        {scope === "touched" && others.length > 0 && (
           <button
             type="button"
             onClick={() => setShowOthers((v) => !v)}

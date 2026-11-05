@@ -28,7 +28,7 @@ import (
 
 var (
 	mechanismE2E          = flag.Bool("mechanism-e2e", false, "with --mechanisms, rerun each reached mechanism's scenarios with its interfaces disabled and call it a shell when no boundary expectation fails (DESIGN §13.1 item 39)")
-	mechanismE2EScenarios = flag.Int("mechanism-e2e-scenarios", 10, "with --mechanism-e2e, the most scenarios run per mechanism, chosen deterministically, those starting at a boundary entry first")
+	mechanismE2EScenarios = flag.Int("mechanism-e2e-scenarios", 0, "with --mechanism-e2e, the most scenarios run per mechanism, chosen deterministically, those starting at a boundary entry first (0: every one, so a capped-out shell is never reported; a cap is faster and can only add shells)")
 	mechanismE2EWorkers   = flag.Int("mechanism-e2e-workers", min(runtime.NumCPU(), 8), "with --mechanism-e2e, how many mechanisms run at once")
 	mechanismE2EVariant   = flag.String("mechanism-e2e-variant", "zero", "with --mechanism-e2e, what a disabled interface answers: zero (its usual result's shape with every value emptied), empty ({}), or fail (an error)")
 	maxShellMechanisms    = flag.Int("max-shell-mechanisms", -1, "with --mechanisms, run --mechanism-e2e and exit 1 when more than N mechanisms are shells (unset: recorded, not gated)")
@@ -158,15 +158,15 @@ type mechE2E struct {
 	Runs     []e2eRun // the reruns, in order; a caught one is last
 	Caught   string   // what noticed the removal: "<scenario>: <expectation>"
 	Constant []string // when every reached interface returns a constant
-	// Weak lists, for an ok mechanism of several interfaces, the listed
-	// interfaces whose own removal nothing notices: the rest of the mechanism
-	// proved it reaches the boundary, and these didn't.
+	// Weak lists, for a mechanism of several interfaces, the listed interfaces
+	// whose own removal nothing notices: the rest of the mechanism proved it
+	// reaches the boundary, and these didn't.
 	Weak []weakInterface
-	// AbortCaught: an abort, not an expectation, noticed the removal.
-	AbortCaught bool
+	// AbortOnly: an abort noticed the removal, and no expectation did.
+	AbortOnly bool
 }
 
-// weakInterface is one interface of an ok mechanism that didn't prove itself.
+// weakInterface is one interface of a noticed mechanism that didn't prove itself.
 type weakInterface struct {
 	ID, Why string
 	Runs    []e2eRun
@@ -221,7 +221,7 @@ type e2eCandidate struct {
 	disabled []string
 }
 
-// runMechanismE2E settles every reached mechanism: ok or shell, or uncovered
+// runMechanismE2E settles every reached mechanism: ok, weak or shell, or uncovered
 // when only scenarios the gate leaves out reach it.
 func runMechanismE2E(r *mechReport, doc *model.Document, base map[string]*baseRun, o e2eOpts) {
 	start := time.Now()
@@ -297,15 +297,17 @@ func newE2EGate(doc *model.Document, base map[string]*baseRun, o e2eOpts) *e2eGa
 
 // boundaryEntries is the set of interfaces something outside the system
 // enters by: a flow's declared entry, an interface of a boundary component,
-// or one whose kind is a transport (anything but a plain function, a kernel,
-// a store or an unnamed kind). A scenario step entering a plain function is a
+// one whose kind is a transport (anything but a plain function, a kernel, a
+// store or an unnamed kind), or one named for what enters it from outside,
+// whatever its kind (a server calls ServeHTTP, the OS calls main: a label can't
+// make them units). A scenario step entering any other plain function is a
 // unit test, not a boundary.
 func boundaryEntries(doc *model.Document, x *model.Index) map[string]bool {
 	out := map[string]bool{}
 	for id, f := range x.Interfaces {
 		switch f.Kind {
 		case "", "function", "kernel", "store":
-			if sim.IsBoundaryComponent(x.Components[f.Component]) {
+			if sim.IsBoundaryComponent(x.Components[f.Component]) || f.Name == "serve-http" || f.Name == "main" {
 				out[id] = true
 			}
 		default:
@@ -494,19 +496,32 @@ func (g *e2eGate) settle(res *mechResult) {
 		res.Detail = "every reached interface returns a constant: " + strings.Join(ev.Constant, ", ")
 		return
 	}
-	var caught, refusal string
-	ev.Runs, caught, refusal, ev.AbortCaught = g.mutateUntilCaught(cands, refusalProves(res.Kind))
-	if caught == "" {
+	m := g.mutateUntilCaught(cands, refusalProves(res.Kind))
+	ev.Runs, ev.AbortOnly = m.Runs, m.Abort
+	if m.Caught == "" {
 		res.Status = mechShell
 		res.Detail = fmt.Sprintf("removing it fails no boundary expectation in %d scenarios", len(ev.Runs))
-		if refusal != "" {
-			res.Detail = fmt.Sprintf("in %d scenarios, removing it only fails a check of its refusal (%s); none notices its work when it succeeds", len(ev.Runs), oneLine(refusal, 120))
+		if m.Refusal != "" {
+			res.Detail = fmt.Sprintf("in %d scenarios, removing it only fails a check of its refusal (%s); none notices its work when it succeeds", len(ev.Runs), oneLine(m.Refusal, 120))
 		}
 		return
 	}
-	res.Status, ev.Caught = mechOK, ev.Runs[len(ev.Runs)-1].Scenario+": "+caught
-	if n := len(res.Interfaces) - len(res.Unknown) - len(res.Unreached); n > 1 {
-		ev.Weak = g.weakInterfaces(res)
+	ev.Caught = m.Scenario + ": " + m.Caught
+	n := len(res.Interfaces) - len(res.Unknown) - len(res.Unreached)
+	if n > 1 {
+		var byExpectation bool
+		ev.Weak, byExpectation = g.weakInterfaces(res)
+		ev.AbortOnly = ev.AbortOnly && !byExpectation
+	}
+	res.Status = mechOK
+	switch {
+	case ev.AbortOnly:
+		res.Status, res.Detail = mechWeak, "no expectation notices its removal, only an abort: "+oneLine(ev.Caught, 200)
+	case len(ev.Weak) > 0:
+		res.Status, res.Detail = mechWeak, fmt.Sprintf("%d of %d reached interfaces prove nothing alone", len(ev.Weak), n)
+	}
+	if ev.AbortOnly && len(ev.Weak) > 0 {
+		res.Detail += fmt.Sprintf("; and %d of %d reached interfaces prove nothing alone", len(ev.Weak), n)
 	}
 }
 
@@ -519,31 +534,49 @@ func refusalProves(kind string) bool { return kind == "gate" || kind == "retry" 
 // refusalCheck recognizes an expectation that asserts an error.
 var refusalCheck = regexp.MustCompile(`!\s*(steps\.\w+\.)?result\.ok|\.error\b|error_code|status\s*==\s*'error'|\.status\s*==\s*[45]\d\d`)
 
-// mutateUntilCaught runs candidates, up to the cap, until one notices. It also
-// returns the first check of a refusal that didn't count.
-func (g *e2eGate) mutateUntilCaught(cands []e2eCandidate, refusals bool) (runs []e2eRun, caught, refusal string, abort bool) {
-	for i, c := range cands {
-		if i == g.o.Scenarios {
-			break
-		}
-		run, what, ab := g.mutate(c, refusals)
-		runs = append(runs, run)
-		if refusal == "" {
-			refusal = run.Refusal
-		}
-		if what != "" {
-			return runs, what, refusal, ab
-		}
-	}
-	return runs, "", refusal, false
+// mutation is what a capped run of a mechanism's scenarios found.
+type mutation struct {
+	Runs     []e2eRun
+	Scenario string // the scenario that noticed
+	Caught   string // what noticed; "" when nothing did
+	Abort    bool   // that was an abort, and no expectation in the runs noticed
+	Refusal  string // the first check of a refusal that didn't count
 }
 
-// weakInterfaces disables an ok mechanism's interfaces one at a time. One
+// mutateUntilCaught runs candidates, up to the cap, until an expectation
+// notices. An abort doesn't stop it: an expectation in a later scenario makes
+// the mechanism more than ok only by an abort.
+func (g *e2eGate) mutateUntilCaught(cands []e2eCandidate, refusals bool) mutation {
+	var m mutation
+	for i, c := range cands {
+		if g.o.Scenarios > 0 && i == g.o.Scenarios {
+			break
+		}
+		run, what, abort := g.mutate(c, refusals)
+		m.Runs = append(m.Runs, run)
+		if m.Refusal == "" {
+			m.Refusal = run.Refusal
+		}
+		if what == "" {
+			continue
+		}
+		if !abort {
+			m.Scenario, m.Caught, m.Abort = c.id, what, false
+			return m
+		}
+		if m.Caught == "" {
+			m.Scenario, m.Caught, m.Abort = c.id, what, true
+		}
+	}
+	return m
+}
+
+// weakInterfaces disables a noticed mechanism's interfaces one at a time. One
 // real interface proves the whole list by its own removal, so a dead part
 // (an observer with no caller, an encode whose result nobody reads) would
-// otherwise stay hidden behind it.
-func (g *e2eGate) weakInterfaces(res *mechResult) []weakInterface {
-	var out []weakInterface
+// otherwise stay hidden behind it. It also reports whether an expectation
+// noticed any of them alone.
+func (g *e2eGate) weakInterfaces(res *mechResult) (out []weakInterface, byExpectation bool) {
 	for _, id := range res.Interfaces {
 		if slices.Contains(res.Unknown, id) || slices.Contains(res.Unreached, id) {
 			continue
@@ -557,15 +590,17 @@ func (g *e2eGate) weakInterfaces(res *mechResult) []weakInterface {
 			}
 			continue
 		}
-		if runs, caught, refusal, _ := g.mutateUntilCaught(cands, refusalProves(res.Kind)); caught == "" {
-			why := fmt.Sprintf("removing it alone fails no boundary expectation in %d scenarios", len(runs))
-			if refusal != "" {
-				why = fmt.Sprintf("removing it alone only fails a check of its refusal (%s) in %d scenarios", oneLine(refusal, 120), len(runs))
+		m := g.mutateUntilCaught(cands, refusalProves(res.Kind))
+		byExpectation = byExpectation || (m.Caught != "" && !m.Abort)
+		if m.Caught == "" {
+			why := fmt.Sprintf("removing it alone fails no boundary expectation in %d scenarios", len(m.Runs))
+			if m.Refusal != "" {
+				why = fmt.Sprintf("removing it alone only fails a check of its refusal (%s) in %d scenarios", oneLine(m.Refusal, 120), len(m.Runs))
 			}
-			out = append(out, weakInterface{ID: id, Why: why, Runs: runs})
+			out = append(out, weakInterface{ID: id, Why: why, Runs: m.Runs})
 		}
 	}
-	return out
+	return out, byExpectation
 }
 
 // constantInterfaces lists the mechanism's reached interfaces when every one

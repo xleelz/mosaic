@@ -2,7 +2,7 @@
 
 // Line diffs of entity JSON, shared by the Revisions tab and the commit views.
 
-import { useMemo, useState } from "react";
+import { useMemo, useState, type ReactNode } from "react";
 import type { Change, JsonValue } from "@/lib/api/types";
 import { Badge, cx } from "@/components/ui";
 
@@ -65,28 +65,54 @@ export function withContext(lines: DiffLine[], ctx = 3): (DiffLine | { skip: num
   return out;
 }
 
-/** One entity change, collapsible, with a line diff of its JSON. */
-export function ChangeView({ c, defaultOpen }: { c: Change; defaultOpen?: boolean }) {
-  const [open, setOpen] = useState(defaultOpen ?? c.change === "modified");
-  const diff = useMemo(() => withContext(lineDiff(linesOf(c.before), linesOf(c.after))), [c]);
+/**
+ * One entity change, collapsible, with a line diff of its JSON. The diff is only
+ * computed once it's open, so a long list stays cheap. Pass `open` and `onToggle`
+ * when the row can unmount while open (a windowed list).
+ */
+export function ChangeView({
+  c,
+  defaultOpen,
+  open: controlled,
+  onToggle,
+  detail,
+  as: Root = "li",
+}: {
+  c: Change;
+  defaultOpen?: boolean;
+  open?: boolean;
+  onToggle?: () => void;
+  /** Shown in the header: what changed, in words. */
+  detail?: ReactNode;
+  as?: "li" | "div";
+}) {
+  const [own, setOwn] = useState(defaultOpen ?? c.change === "modified");
+  const open = controlled ?? own;
+  const diff = useMemo(() => (open ? withContext(lineDiff(linesOf(c.before), linesOf(c.after))) : null), [c, open]);
   const tone = c.change === "added" ? "ok" : c.change === "removed" ? "bad" : "warn";
-  const adds = diff.filter((l) => "op" in l && l.op === "+").length;
-  const dels = diff.filter((l) => "op" in l && l.op === "-").length;
   return (
-    <li className="rounded-md border border-line bg-panel-2/40">
-      <button type="button" onClick={() => setOpen((o) => !o)} aria-expanded={open} className="flex w-full items-center gap-2 px-2.5 py-1.5 text-left hover:bg-panel-2">
+    <Root className="rounded-md border border-line bg-panel-2/40">
+      <button
+        type="button"
+        onClick={() => (onToggle ? onToggle() : setOwn((o) => !o))}
+        aria-expanded={open}
+        className="flex w-full items-center gap-2 px-2.5 py-1.5 text-left hover:bg-panel-2"
+      >
         <span className="text-faint" aria-hidden>
           {open ? "▾" : "▸"}
         </span>
         <Badge tone={tone}>{c.change === "added" ? "+ added" : c.change === "removed" ? "− removed" : "~ modified"}</Badge>
         <span className="text-[11px] text-faint">{c.kind}</span>
-        <span className="font-mono text-[12.5px] text-ink">{c.id}</span>
-        <span className="tnum ml-auto text-[11px]">
-          <span className="text-ok">+{adds}</span> <span className="text-bad">−{dels}</span>
-        </span>
+        <span className="min-w-0 truncate font-mono text-[12.5px] text-ink">{c.id}</span>
+        {detail}
+        {diff && (
+          <span className="tnum ml-auto shrink-0 text-[11px]">
+            <span className="text-ok">+{diff.filter((l) => "op" in l && l.op === "+").length}</span> <span className="text-bad">−{diff.filter((l) => "op" in l && l.op === "-").length}</span>
+          </span>
+        )}
       </button>
-      {open && (
-        <pre className="max-h-[420px] overflow-auto border-t border-line-soft bg-[#0c1116] py-1 font-mono text-[11.5px] leading-[1.5]" tabIndex={0}>
+      {diff && (
+        <pre aria-label={`JSON diff of ${c.id}`} className="max-h-[420px] overflow-auto border-t border-line-soft bg-[#0c1116] py-1 font-mono text-[11.5px] leading-[1.5]" tabIndex={0}>
           {diff.map((l, i) =>
             "skip" in l ? (
               <div key={i} className="px-2 text-faint">
@@ -111,7 +137,6 @@ export function ChangeView({ c, defaultOpen }: { c: Change; defaultOpen?: boolea
           )}
         </pre>
       )}
-    </li>
+    </Root>
   );
 }
-

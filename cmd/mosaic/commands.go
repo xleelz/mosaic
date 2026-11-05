@@ -147,6 +147,20 @@ Exits 1 when an expectation fails or the run aborts.`},
 			help: `Run every scenario's expectations. Prints ✓/✗ per scenario, with its step count for
 multi-step scenarios and its mock count (mocks declared, calls mocked) when it uses mocks;
 exits 1 if any fails.`},
+		{name: "evidence put", synopsis: "evidence put <ont> -f FILE [--rev R] [--format json|text]", run: cmdEvidencePut,
+			help: `Store evidence, how far to trust the model, on a revision (default: the latest), replacing
+what that revision had. Later revisions without their own inherit it. A measured_on_revision
+of 0 or none means the revision it is stored on. FILE is what evidence build writes.`},
+		{name: "evidence get", synopsis: "evidence get <ont> [--rev R] [--format json|text]", run: cmdEvidenceGet,
+			help: `Print the evidence in force at a revision (default: the draft): its own, or that of the
+newest earlier revision with some. revision is the one viewed (0 for the draft) and
+measured_on_revision says where each figure comes from. Exits 1 when none is stored.`},
+		{name: "evidence build", synopsis: "evidence build --mechanisms DIR [--mechanisms-json FILE] --blind FILE [--built-by B] [--source-repo R] [--source-commit SHA] [-o FILE]", run: cmdEvidenceBuild,
+			help: `Build an evidence file locally, with no server, for evidence put. --mechanisms reads DIR's
+<area>.json mechanism lists (not its skips/); as in check --mechanisms, the file name is the
+area and the first of a duplicate id is kept. --mechanisms-json adds gate_status per mechanism
+id from check's JSON: {"id": "ok"}, or a list or map of them under "mechanisms". --blind reads
+the blind measure. Refused when the result doesn't validate or the gate names an unknown id.`},
 	}
 	commands = append(commands, composeCommands()...)
 }

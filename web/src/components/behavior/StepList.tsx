@@ -4,6 +4,7 @@ import type { ReactNode } from "react";
 import type { RetrySpec, Step, StoreSpec } from "@/lib/api/types";
 import { celOf } from "@/lib/model/format";
 import { Cel, Tpl } from "@/components/json";
+import { ClaimScope } from "@/components/code/context";
 import { SourceRef, cx } from "@/components/ui";
 
 type Action = "call" | "if" | "choice" | "foreach" | "break" | "continue" | "set" | "return" | "fail" | "emit" | "wait" | "note";
@@ -128,7 +129,11 @@ function RetryBlock({ r }: { r: RetrySpec }) {
         <div className="mt-1 border-t border-[#2b2650] pt-1 text-[12px]">
           {r.title && <div className="font-medium text-ink">{r.title}</div>}
           {r.detail && <div className="text-muted">{r.detail}</div>}
-          {r.source && <SourceRef source={r.source} />}
+          {r.source && (
+            <ClaimScope claim={r.detail ? `${r.title ?? "Retry"}: ${r.detail}` : r.title}>
+              <SourceRef source={r.source} />
+            </ClaimScope>
+          )}
         </div>
       )}
     </div>
@@ -398,7 +403,11 @@ export function StepList({
                 <div className="mb-0.5">
                   {s.title && <div className="text-[12.5px] font-semibold text-ink">{s.title}</div>}
                   {s.detail && <div className="text-[12px] leading-snug text-muted">{s.detail}</div>}
-                  {s.source && <SourceRef source={s.source} />}
+                  {s.source && (
+                    <ClaimScope claim={s.detail ? `${s.title ?? "Step"}: ${s.detail}` : s.title}>
+                      <SourceRef source={s.source} />
+                    </ClaimScope>
+                  )}
                 </div>
               )}
               {s.when && (

@@ -6,7 +6,7 @@ package main
 // enumerator agent lists each area's mechanisms from the code
 // (templates/MECHANISMS.md), and this measures each one:
 //
-//	--mechanisms DIR [--min-mechanisms R]
+//	--mechanisms DIR [--min-mechanisms R] [--mechanisms-json FILE]
 //	--mechanism-e2e [--mechanism-e2e-scenarios N] [--mechanism-e2e-workers N]
 //	    [--mechanism-e2e-variant zero|empty|fail] [--max-shell-mechanisms N]
 //
@@ -14,7 +14,8 @@ package main
 // ([{id, reason, covered_by}], under the feature skip rules). A mechanism is
 // missing (no interface exists), uncovered (no scenario's trace reaches one),
 // shell (reached, but the mutation of mechanisme2e.go finds no boundary
-// expectation that notices its removal), ok, or skipped.
+// expectation that notices its removal), weak (something notices, but only an
+// abort, or not for each of its interfaces), ok, or skipped.
 
 import (
 	"encoding/json"
@@ -31,8 +32,9 @@ import (
 )
 
 var (
-	mechanismsDir = flag.String("mechanisms", "", "`DIR` of <area>.json mechanism lists (and skips/<area>.json) to report as ok, shell, uncovered, missing or skipped (DESIGN §13.1 item 38)")
-	minMechanisms = flag.Float64("min-mechanisms", -1, "with --mechanisms, run --mechanism-e2e and exit 1 when ok / unskipped mechanisms is below this ratio; it only ratchets up (unset: recorded, not gated)")
+	mechanismsDir  = flag.String("mechanisms", "", "`DIR` of <area>.json mechanism lists (and skips/<area>.json) to report as ok, weak, shell, uncovered, missing or skipped (DESIGN §13.1 item 38)")
+	minMechanisms  = flag.Float64("min-mechanisms", -1, "with --mechanisms, run --mechanism-e2e and exit 1 when ok / unskipped mechanisms is below this ratio (a weak mechanism isn't ok); it only ratchets up (unset: recorded, not gated)")
+	mechanismsJSON = flag.String("mechanisms-json", "", "with --mechanisms, run --mechanism-e2e and write each mechanism with its measured gate_status to `FILE`, as a JSON array of web's EvidenceMechanism")
 )
 
 func init() {
@@ -142,6 +144,7 @@ func (l *mechanismList) interfaces() map[string]bool {
 // Mechanism statuses.
 const (
 	mechOK        = "ok"
+	mechWeak      = "weak" // noticed, but only by an abort, or not for each interface
 	mechShell     = "shell"
 	mechUncovered = "uncovered"
 	mechMissing   = "missing"
@@ -154,6 +157,7 @@ const (
 type mechResult struct {
 	mechanism
 	Status    string
+	Raw       string   // Status, before an absent area hides missing or uncovered
 	Detail    string   // the skip reason, or why it isn't ok
 	Unknown   []string // listed ids that name no interface
 	Unreached []string // listed interfaces, known, that no trace reaches
@@ -165,8 +169,9 @@ type mechResult struct {
 type mechReport struct {
 	Results  []*mechResult
 	Warnings []string
-	Elapsed  string // Gate 2's wall time; "" when it didn't run
-	Runs     int    // Gate 2's mutated runs
+	Shared   []string // interfaces several areas list
+	Elapsed  string   // Gate 2's wall time; "" when it didn't run
+	Runs     int      // Gate 2's mutated runs
 	Workers  int
 	Variant  string
 }
@@ -177,6 +182,8 @@ type mechReport struct {
 func measureMechanisms(doc *model.Document, l *mechanismList, base map[string]*baseRun, present map[string]bool) *mechReport {
 	x := indexed(doc)
 	r := &mechReport{Warnings: append([]string(nil), l.Warnings...)}
+	problems, shared := l.listProblems()
+	r.Warnings, r.Shared = append(r.Warnings, problems...), shared
 	known := map[string]string{} // mechanism id -> area
 	for _, m := range l.Mechanisms {
 		known[m.ID] = m.Area
@@ -242,7 +249,7 @@ func measureMechanisms(doc *model.Document, l *mechanismList, base map[string]*b
 			res.Detail = strings.TrimPrefix(res.Detail+"; invalid skip: "+p, "; ")
 		}
 		if (res.Status == mechMissing || res.Status == mechUncovered) && present != nil && !present[m.Area] {
-			res.Status = mechAbsent
+			res.Raw, res.Status = res.Status, mechAbsent
 		}
 	}
 	return r
@@ -258,10 +265,11 @@ func sortedKeysOf[V any](m map[string]V) []string {
 }
 
 // fidelityAgrees reports whether an enumerator's reading matches a measured
-// status. Modeled and partial say the main path runs: ok. A shell can show as
-// a mutation survivor or as nothing reaching it. Absent is missing. Skipped,
-// and reached (Gate 2 didn't run), measure nothing to disagree with, except
-// that an absent mechanism shouldn't be reached at all.
+// status. Modeled says it all runs as the code runs: ok, and a weak one has a
+// part nothing notices. Partial says the main path runs: ok or weak. A shell
+// can show as a mutation survivor or as nothing reaching it. Absent is missing.
+// Skipped, and reached (Gate 2 didn't run), measure nothing to disagree with,
+// except that an absent mechanism shouldn't be reached at all.
 func fidelityAgrees(fidelity, status string) bool {
 	switch status {
 	case mechSkipped, mechAbsent:
@@ -270,8 +278,10 @@ func fidelityAgrees(fidelity, status string) bool {
 		return fidelity != "absent"
 	}
 	switch fidelity {
-	case "modeled", "partial":
+	case "modeled":
 		return status == mechOK
+	case "partial":
+		return status == mechOK || status == mechWeak
 	case "shell":
 		return status == mechShell || status == mechUncovered
 	case "absent":
@@ -291,13 +301,15 @@ func (r *mechReport) finish() {
 
 // mechCounts is one line of the report.
 type mechCounts struct {
-	OK, Shell, Uncovered, Missing, Skipped, Reached, Absent, Disagree int
+	OK, Weak, Shell, Uncovered, Missing, Skipped, Reached, Absent, Disagree int
 }
 
 func (c *mechCounts) add(res *mechResult) {
 	switch res.Status {
 	case mechOK:
 		c.OK++
+	case mechWeak:
+		c.Weak++
 	case mechShell:
 		c.Shell++
 	case mechUncovered:
@@ -317,10 +329,12 @@ func (c *mechCounts) add(res *mechResult) {
 }
 
 // unskipped is the gate's denominator.
-func (c mechCounts) unskipped() int { return c.OK + c.Shell + c.Uncovered + c.Missing + c.Reached }
+func (c mechCounts) unskipped() int {
+	return c.OK + c.Weak + c.Shell + c.Uncovered + c.Missing + c.Reached
+}
 
 func (c mechCounts) String() string {
-	s := fmt.Sprintf("%d ok, %d shell, %d uncovered, %d missing, %d skipped", c.OK, c.Shell, c.Uncovered, c.Missing, c.Skipped)
+	s := fmt.Sprintf("%d ok, %d weak, %d shell, %d uncovered, %d missing, %d skipped", c.OK, c.Weak, c.Shell, c.Uncovered, c.Missing, c.Skipped)
 	if c.Reached > 0 {
 		s += fmt.Sprintf(", %d reached (Gate 2 not run)", c.Reached)
 	}
@@ -358,6 +372,11 @@ func (r *mechReport) print(w io.Writer, verbose bool) {
 	for _, s := range r.Warnings {
 		fmt.Fprintf(w, "! mechanisms: %s\n", s)
 	}
+	if verbose {
+		for _, s := range r.Shared {
+			fmt.Fprintf(w, "! mechanisms: %s\n", s)
+		}
+	}
 	for _, res := range r.Results {
 		switch res.Status {
 		case mechAbsent:
@@ -371,14 +390,6 @@ func (r *mechReport) print(w io.Writer, verbose bool) {
 		}
 		if len(res.Unknown) > 0 && (res.Status == mechOK || res.Status == mechReached) {
 			fmt.Fprintf(w, "! mechanism %s: unknown interface %s\n", res.ID, strings.Join(res.Unknown, ", "))
-		}
-		if res.E2E != nil {
-			for _, weak := range res.E2E.Weak {
-				fmt.Fprintf(w, "! mechanism %s (%s) is ok, but its interface %s: %s\n", res.ID, res.Area, weak.ID, weak.Why)
-				if verbose {
-					printE2ERuns(w, weak.Runs, verbose)
-				}
-			}
 		}
 	}
 	for _, res := range r.Results {
@@ -398,13 +409,18 @@ func (r *mechReport) print(w io.Writer, verbose bool) {
 		for _, res := range r.Results {
 			if res.E2E != nil {
 				weak += len(res.E2E.Weak)
-				if res.E2E.AbortCaught {
+				if res.E2E.AbortOnly {
 					aborts++
 				}
 			}
 		}
-		fmt.Fprintf(w, "mechanism e2e: %d mutated runs, variant %s, %d workers, %s; %d ok only by an abort; %d weak interfaces in ok mechanisms\n", r.Runs, r.Variant, r.Workers, r.Elapsed, aborts, weak)
+		fmt.Fprintf(w, "mechanism e2e: %d mutated runs, variant %s, %d workers, %s; %d noticed only by an abort; %d weak interfaces\n", r.Runs, r.Variant, r.Workers, r.Elapsed, aborts, weak)
 	}
+	unknown := 0
+	for _, res := range r.Results {
+		unknown += len(res.Unknown)
+	}
+	fmt.Fprintf(w, "mechanism list: %d unknown interface ids, %d problems named above, %d interfaces listed by several areas\n", unknown, len(r.Warnings), len(r.Shared))
 	fmt.Fprintf(w, "mechanisms: %d of %d unskipped ok (%.1f%%): %s\n", total.OK, total.unskipped(), 100*mechShare(total), total)
 }
 
@@ -417,8 +433,16 @@ func (res *mechResult) printLine(w io.Writer, mark string, verbose bool) {
 	if len(res.Unknown) > 0 {
 		fmt.Fprintf(w, "    unknown interface: %s\n", strings.Join(res.Unknown, ", "))
 	}
-	if res.E2E != nil && (res.Status == mechShell || verbose) {
-		res.E2E.print(w, res.Interfaces, res.Unreached, verbose)
+	if res.E2E != nil {
+		for _, weak := range res.E2E.Weak {
+			fmt.Fprintf(w, "    interface %s: %s\n", weak.ID, weak.Why)
+			if verbose {
+				printE2ERuns(w, weak.Runs, verbose)
+			}
+		}
+		if res.Status == mechShell || verbose {
+			res.E2E.print(w, res.Interfaces, res.Unreached, verbose)
+		}
 	}
 }
 
@@ -469,13 +493,13 @@ func ratchetUpHint(w io.Writer, flagName string, measured, min float64) {
 // run, so that a run can record reach for it. It returns nil without
 // --mechanisms.
 func mechanismsPrepare() *mechanismList {
-	if *minMechanisms >= 0 || *maxShellMechanisms >= 0 {
+	if *minMechanisms >= 0 || *maxShellMechanisms >= 0 || *mechanismsJSON != "" {
 		*mechanismE2E = true
 	}
 	if *mechanismsDir == "" {
 		set := map[string]bool{}
 		flag.Visit(func(f *flag.Flag) { set[f.Name] = true })
-		for _, n := range []string{"min-mechanisms", "mechanism-e2e", "mechanism-e2e-scenarios", "mechanism-e2e-workers", "mechanism-e2e-variant", "max-shell-mechanisms"} {
+		for _, n := range []string{"min-mechanisms", "mechanisms-json", "mechanism-e2e", "mechanism-e2e-scenarios", "mechanism-e2e-workers", "mechanism-e2e-variant", "max-shell-mechanisms"} {
 			if set[n] {
 				fail(fmt.Errorf("--%s needs --mechanisms", n))
 			}
@@ -485,8 +509,8 @@ func mechanismsPrepare() *mechanismList {
 	if *minMechanisms > 1 {
 		fail(fmt.Errorf("--min-mechanisms must be at most 1"))
 	}
-	if *mechanismE2EScenarios < 1 {
-		fail(fmt.Errorf("--mechanism-e2e-scenarios must be at least 1"))
+	if *mechanismE2EScenarios < 0 {
+		fail(fmt.Errorf("--mechanism-e2e-scenarios must be 0 (every scenario) or more"))
 	}
 	if *mechanismE2EWorkers < 1 {
 		fail(fmt.Errorf("--mechanism-e2e-workers must be at least 1"))
@@ -502,7 +526,7 @@ func mechanismsPrepare() *mechanismList {
 }
 
 // runMechanisms runs both gates over the list and reports whether one failed.
-func runMechanisms(w io.Writer, doc *model.Document, l *mechanismList, base map[string]*baseRun, present map[string]bool, run, verbose bool) bool {
+func runMechanisms(w io.Writer, doc *model.Document, l *mechanismList, base map[string]*baseRun, present map[string]bool, code string, run, verbose bool) bool {
 	if l == nil {
 		return false
 	}
@@ -516,5 +540,105 @@ func runMechanisms(w io.Writer, doc *model.Document, l *mechanismList, base map[
 	}
 	r.finish()
 	r.print(w, verbose)
+	if code != "" {
+		printMechanismCitations(w, l, newCodeRoot(code))
+	}
+	if *mechanismsJSON != "" {
+		if err := writeMechanismsJSON(*mechanismsJSON, r); err != nil {
+			fail(err)
+		}
+	}
 	return r.gates(w, *minMechanisms, *maxShellMechanisms)
+}
+
+// evidenceMechanism is one mechanism of --mechanisms-json, in the shape of
+// EvidenceMechanism in web/src/lib/api/types.ts.
+type evidenceMechanism struct {
+	ID         string   `json:"id"`
+	Area       string   `json:"area"`
+	Kind       string   `json:"kind"`
+	Name       string   `json:"name"`
+	Trigger    string   `json:"trigger,omitempty"`
+	Observable string   `json:"observable,omitempty"`
+	Citations  []string `json:"citations"`
+	Interfaces []string `json:"interfaces"`
+	Fidelity   string   `json:"fidelity"`
+	Note       string   `json:"note,omitempty"`
+	GateStatus string   `json:"gate_status"`
+}
+
+// gateStatus is the status --mechanisms-json writes. An absent mechanism is
+// still missing or uncovered: its area not being in this merge doesn't change
+// what was measured.
+func (res *mechResult) gateStatus() string {
+	if res.Status == mechAbsent {
+		return res.Raw
+	}
+	return res.Status
+}
+
+// writeMechanismsJSON writes the measured list for an evidence loader.
+func writeMechanismsJSON(path string, r *mechReport) error {
+	out := make([]evidenceMechanism, 0, len(r.Results))
+	for _, res := range r.Results {
+		out = append(out, evidenceMechanism{
+			ID: res.ID, Area: res.Area, Kind: res.Kind, Name: res.Name, Trigger: res.Trigger, Observable: res.Observable,
+			Citations: append([]string{}, res.Citations...), Interfaces: append([]string{}, res.Interfaces...),
+			Fidelity: res.Fidelity, Note: res.Note, GateStatus: res.gateStatus(),
+		})
+	}
+	b, err := json.MarshalIndent(out, "", "  ")
+	if err != nil {
+		return err
+	}
+	if err := os.WriteFile(path, append(b, '\n'), 0o644); err != nil {
+		return fmt.Errorf("--mechanisms-json: %w", err)
+	}
+	return nil
+}
+
+// listProblems checks the list's own data. It returns the problems to name
+// (a mechanism id outside its file's area), and the interfaces several areas
+// list, which an area can do for a reason, so only -v names them. Unknown
+// interfaces are on each mechanism's line, and duplicate ids warned at load.
+func (l *mechanismList) listProblems() (problems, shared []string) {
+	byInterface := map[string]map[string]bool{}
+	for _, m := range l.Mechanisms {
+		for _, id := range m.Interfaces {
+			if byInterface[id] == nil {
+				byInterface[id] = map[string]bool{}
+			}
+			byInterface[id][m.Area] = true
+		}
+		if !strings.HasPrefix(m.ID, m.Area+".") {
+			problems = append(problems, fmt.Sprintf("%s is in %s.json", m.ID, m.Area))
+		}
+	}
+	for _, id := range sortedKeysOf(byInterface) {
+		if len(byInterface[id]) > 1 {
+			shared = append(shared, fmt.Sprintf("interface %s is listed by areas %s", id, strings.Join(sortedKeysOf(byInterface[id]), ", ")))
+		}
+	}
+	return problems, shared
+}
+
+// printMechanismCitations resolves the list's citations against the code, as
+// --code does the model's, and names those that don't resolve. A secret path
+// is never opened: it reads as skipped.
+func printMechanismCitations(w io.Writer, l *mechanismList, code *codeRoot) {
+	total, bad, secret := 0, 0, 0
+	for _, m := range l.Mechanisms {
+		for _, c := range m.Citations {
+			total++
+			switch st, _ := code.resolve(model.ParseSource(c)); st {
+			case citeOK:
+			case citeSkipped:
+				secret++
+			default:
+				bad++
+				fmt.Fprintf(w, "! mechanism %s: citation %s: %s\n", m.ID, c, st)
+			}
+		}
+	}
+	fmt.Fprintf(w, "mechanism citations: %d cited, %d don't resolve, %d in secret files, not opened\n", total, bad, secret)
 }

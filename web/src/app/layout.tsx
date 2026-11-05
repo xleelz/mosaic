@@ -1,12 +1,13 @@
 import type { Metadata } from "next";
 import Link from "next/link";
 import { ModeBadge } from "@/components/ModeBadge";
+import { ShortcutSheet } from "@/components/palette/ShortcutSheet";
 import { UpdateChip } from "@/components/UpdateChip";
 import "./globals.css";
 
 export const metadata: Metadata = {
   title: "mosaic",
-  description: "Browse software ontologies and watch simulated flows through their components.",
+  description: "Browse models of software systems and watch simulated flows through their components.",
 };
 
 export default function RootLayout({ children }: LayoutProps<"/">) {
@@ -31,10 +32,10 @@ export default function RootLayout({ children }: LayoutProps<"/">) {
               mosaic
             </Link>
             <span className="text-faint">/</span>
-            <span className="text-[12px] text-muted">ontology explorer &amp; simulator</span>
+            <span className="text-[12px] text-muted">model explorer &amp; simulator</span>
             <nav aria-label="Site" className="ml-3 flex items-center gap-3 text-[12px]">
               <Link href="/" className="text-muted hover:text-ink">
-                Ontologies
+                Models
               </Link>
               <Link href="/compose" className="text-muted hover:text-ink">
                 Compose runs
@@ -44,6 +45,7 @@ export default function RootLayout({ children }: LayoutProps<"/">) {
           <div className="flex items-center gap-2">
             <UpdateChip />
             <ModeBadge />
+            <ShortcutSheet />
           </div>
         </header>
         <main id="main" className="flex min-h-0 flex-1 flex-col">

@@ -1,9 +1,9 @@
 "use client";
 
-// §16.6: exploration results. `check --explore` writes each failing
-// schedule as a replay file (.mosaic/replay, §15.5). This lists the ones
-// for this ontology's scenarios at the viewed revision, re-runs each to
-// show whether it still fails, and removes the stale ones (DESIGN §6).
+// §16.6: race search, the UI's name for exploration. `check --explore` writes
+// each failing schedule as a replay file (.mosaic/replay, §15.5). This lists the
+// ones for this model's scenarios at the viewed revision, re-runs each to show
+// whether it still fails, and removes the stale ones (DESIGN §6).
 
 import Link from "next/link";
 import { useRef, useState } from "react";
@@ -14,7 +14,8 @@ import { invalidate, limiter, useDocIndex, useQueries, useQuery, type QueryState
 import { docIndex } from "@/lib/model/docindex";
 import { Cel } from "@/components/json";
 import { RunHeader, RunPlayback } from "@/components/playback/RunView";
-import { Badge, Button, Empty, ErrorBox, Notice, Panel, Spinner, cx } from "@/components/ui";
+import { Badge, Button, ErrorBox, Notice, Panel, Spinner, cx } from "@/components/ui";
+import { EvidenceNav } from "@/components/evidence/EvidenceNav";
 import { useDocument, useWorkspace } from "./Workspace";
 
 const KIND_TONE: Record<string, "info" | "violet" | "warn" | "neutral"> = { tie: "info", delivery: "info", jitter: "warn", branch: "violet", join: "violet" };
@@ -43,8 +44,8 @@ function StatusBadge({ st }: { st: QueryState<ReplayRun> }) {
   if (v === "fails") return <Badge tone="bad">✗ Still fails</Badge>;
   if (v === "passes")
     return (
-      <Badge tone="ok" title="The recorded schedule passes on this revision: the race was fixed and the file is stale">
-        ✓ Passes now · stale
+      <Badge title="The recorded schedule passes on this revision: the race is gone from the model, and the file is stale">
+        Passes now · stale
       </Badge>
     );
   const msg = st.error instanceof Error ? st.error.message : String(st.error);
@@ -150,7 +151,7 @@ function ReplayCard({
           <span className="font-mono text-muted">[{rp.decisions.join(", ")}]</span>
           {points.length > 0 && (
             <button type="button" className="ml-2 text-link hover:underline" onClick={() => setShowPoints((s) => !s)} aria-expanded={showPoints}>
-              {showPoints ? "hide" : "show"} {plural(points.length, "choice point")}
+              {showPoints ? "hide" : "show"} {plural(points.length, "open decision")}
             </button>
           )}
         </div>
@@ -259,25 +260,32 @@ export function ExploreTab() {
     <span className="flex flex-wrap items-center gap-2">
       <span>Replays · {mine.length}</span>
       {failing > 0 && <Badge tone="bad">{failing} still {failing === 1 ? "fails" : "fail"}</Badge>}
-      {passing.length > 0 && <Badge tone="ok">{passing.length} {passing.length === 1 ? "passes" : "pass"} now</Badge>}
+      {passing.length > 0 && <Badge>{passing.length} {passing.length === 1 ? "passes" : "pass"} now</Badge>}
       {checking > 0 && <Badge>{checking} checking</Badge>}
     </span>
   );
 
   return (
-    <div className="space-y-3 p-3">
+    <div className="mx-auto max-w-[1400px] space-y-3 p-4">
+      <div className="flex flex-wrap items-center gap-3">
+        <h2 className="text-[15px] font-semibold text-ink">Evidence</h2>
+        <EvidenceNav active="race-search" />
+      </div>
       <div className="flex flex-wrap items-baseline gap-3">
-        <h2 className="text-[15px] font-semibold text-ink">Exploration results</h2>
+        <h3 className="text-[14px] font-semibold text-ink">Race search</h3>
         <span className="font-mono text-[12px] text-faint">{replays.data?.dir ?? ".mosaic/replay"}</span>
         <Button size="sm" variant="ghost" className="ml-auto" onClick={reload}>
           ↻ Reload
         </Button>
       </div>
       <p className="text-[12.5px] text-muted">
-        <span className="font-mono">check --explore &lt;regex&gt; --schedules N</span> reruns scenarios under perturbed schedules and writes each failing
-        schedule as a replay file. Each replay of this ontology&apos;s scenarios is re-run here under its exact schedule at revision{" "}
+        A schedule is one order concurrent events could land in: which of two tied calls goes first, which message arrives next.
+      </p>
+      <p className="text-[12.5px] text-muted">
+        <span className="font-mono">check --explore &lt;regex&gt; --schedules N</span> reruns scenarios under other schedules and writes each failing one as a
+        replay file. Each replay of this model&apos;s scenarios is re-run here under its exact schedule at revision{" "}
         <span className="font-mono text-ink">{ws.rev}</span> (runs aren&apos;t saved): <b className="text-bad">Still fails</b> or{" "}
-        <b className="text-ok">Passes now</b>, which means the race was fixed and the file is stale.
+        <b className="text-ink">Passes now</b>, which means the race is gone from the model and the file is stale.
       </p>
       {FIXTURE_MODE && (
         <Notice tone="warn" title="Fixture mode">
@@ -287,19 +295,17 @@ export function ExploreTab() {
       )}
       {replays.error ? <ErrorBox error={replays.error} onRetry={replays.reload} /> : null}
       {replays.loading && <Spinner label="Loading replay files" />}
-      {replays.data && mine.length === 0 && <Empty>No replay files for this ontology&apos;s scenarios: exploration has no recorded failing schedules.</Empty>}
+      {replays.data && mine.length === 0 && (
+        <div className="rounded-lg border border-dashed border-line bg-panel px-4 py-5 text-center">
+          <div className="text-[14px] font-semibold text-ink">Not explored yet</div>
+          <p className="mx-auto mt-1 max-w-[640px] text-[12.5px] text-muted">
+            No race search has recorded a result for this model, so this says nothing about whether it has races. A search that finds no failure writes no file,
+            so it would look the same here. To run one: <span className="font-mono">check --explore &lt;regex&gt; --schedules N</span>.
+          </p>
+        </div>
+      )}
       {mine.length > 0 && (
-        <Panel
-          title={title}
-          actions={
-            passing.length > 0 ? (
-              <Button size="sm" variant="danger" onClick={() => remove(passing)} disabled={passing.some((n) => removing.has(n))}>
-                Remove all passing ({passing.length})
-              </Button>
-            ) : undefined
-          }
-          bodyClassName="p-2"
-        >
+        <Panel title={title} bodyClassName="p-2">
           <ul className="space-y-2">
             {rows.map(({ rp, st }) => (
               <ReplayCard
@@ -315,6 +321,14 @@ export function ExploreTab() {
               />
             ))}
           </ul>
+          {passing.length > 0 && (
+            <div className="mt-3 flex flex-wrap items-center gap-3 border-t border-line-soft px-1 pt-2">
+              <Button size="sm" variant="danger" onClick={() => remove(passing)} disabled={passing.some((n) => removing.has(n))}>
+                Remove all passing ({passing.length})
+              </Button>
+              <span className="text-[12px] text-muted">Deletes these replay files for good. They pass on this revision, but may still fail on another.</span>
+            </div>
+          )}
         </Panel>
       )}
       {error ? isFixtureUnsupported(error) ? <Notice tone="warn" title="Needs mosaicd">{(error as Error).message}</Notice> : <ErrorBox error={error} /> : null}
@@ -324,7 +338,7 @@ export function ExploreTab() {
             <span className="text-faint">Replay of</span>
             <span className="font-mono text-ink">{result.replay.name}</span>
             {result.failures.length === 0 ? (
-              <Badge tone="ok">✓ passes under its schedule now</Badge>
+              <Badge>passes under its schedule now</Badge>
             ) : (
               <Badge tone="bad">✗ still fails: {plural(result.failures.length, "failure")}</Badge>
             )}

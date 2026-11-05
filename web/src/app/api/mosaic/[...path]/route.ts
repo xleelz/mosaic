@@ -5,7 +5,11 @@
 // ever compiled into the client bundle. The browser never sees the token: the
 // proxy adds `Authorization: Bearer ${MOSAIC_TOKEN}` itself and drops any
 // Authorization or Cookie header the browser sent. Status codes, error bodies
-// and response bodies are passed through unchanged (streamed).
+// and response bodies are passed through unchanged (streamed), except that JSON
+// is gzipped for a browser that accepts it (compress.ts), and a 404 is a 204 for a
+// request marked X-Mosaic-Absent-Ok, where nothing stored is a normal answer.
+
+import { gzipped, shouldGzip } from "./compress";
 
 const DEFAULT_SERVER = "http://127.0.0.1:7878";
 
@@ -25,6 +29,7 @@ const DROP_REQUEST = new Set([
   "authorization",
   "cookie",
   "accept-encoding",
+  "x-mosaic-absent-ok",
 ]);
 
 // fetch() has already decoded the body, so the length and encoding no longer apply.
@@ -78,12 +83,26 @@ async function proxy(req: Request, ctx: RouteContext<"/api/mosaic/[...path]">): 
     );
   }
 
+  if (upstream.status === 404 && req.headers.has("x-mosaic-absent-ok")) {
+    return new Response(null, { status: 204, headers: { "Cache-Control": "no-store" } });
+  }
+
   const out = new Headers();
   upstream.headers.forEach((value, key) => {
     if (!DROP_RESPONSE.has(key.toLowerCase())) out.set(key, value);
   });
   out.set("Cache-Control", "no-store");
-  return new Response(req.method === "HEAD" ? null : upstream.body, {
+  let body = req.method === "HEAD" ? null : upstream.body;
+  // A compressed upstream reply's length is the compressed one, so it isn't used.
+  const compress = shouldGzip({
+    method: req.method,
+    status: upstream.status,
+    acceptEncoding: req.headers.get("accept-encoding"),
+    contentType: upstream.headers.get("content-type"),
+    contentLength: upstream.headers.has("content-encoding") ? null : upstream.headers.get("content-length"),
+  });
+  if (body && compress) body = gzipped(body, out);
+  return new Response(body, {
     status: upstream.status,
     statusText: upstream.statusText,
     headers: out,

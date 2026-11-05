@@ -1,18 +1,30 @@
 "use client";
 
-import { memo, useEffect, useMemo, useRef, type ReactNode } from "react";
+import { memo, useCallback, useLayoutEffect, useMemo, useRef, useState, type MouseEvent, type ReactNode } from "react";
 import type { Document, SimEvent } from "@/lib/api/types";
 import { formatDuration, ifaceName, jsonChip, jsonInline } from "@/lib/model/format";
 import type { ColorScale } from "@/lib/model/colors";
 import { docIndex } from "@/lib/model/docindex";
+import { isNoise, type WeakFidelity } from "@/lib/sim/beats";
+import { laneDepths, type LaneView } from "@/lib/sim/lanes";
+import { covers, drawRegion, firstRowAt, lastRowBefore, type Viewport } from "@/lib/sim/window";
 import { laneComponent, laneInstance, setLabel, type EventLanes, type Playback } from "@/lib/sim/playback";
 
 // Geometry
 const LIFE_W = 118;
 const GUTTER = 62;
 const HEAD_H = 50;
+/** The strip above the heads that names and toggles each area, when lanes are grouped. */
+const AREA_STRIP_H = 15;
 const RIGHT_PAD = 260;
 const ACT_W = 10;
+/** How far past the viewport to draw, so most scrolling needs no render. */
+const MARGIN_X = 600;
+const MARGIN_Y = 800;
+/** How far a lane's mark or label can reach to the right of its lane. */
+const LABEL_REACH = 480;
+/** Activation bars stop stepping right past this depth. */
+const MAX_DEPTH_STEP = 8;
 
 const ROW_H: Record<string, number> = {
   "call.start": 32,
@@ -70,6 +82,34 @@ interface Row {
   h: number;
   /** y of the arrow / marker line */
   y: number;
+  /** Draws its time in the gutter: the first row shown at that time. */
+  showT: boolean;
+}
+
+/** What the static layer needs from the lane view. */
+interface LaneGeometry {
+  lifeX: (c: string) => number;
+  depthOf: (span: SpanRef | undefined) => number;
+  weak?: ReadonlyMap<string, WeakFidelity>;
+}
+
+type SpanRef = { span: number; depth: number };
+
+/** The fidelity vocabulary's shapes, as text a label can carry (components/trust). */
+const WEAK_LABEL: Record<WeakFidelity, { text: string; color: string; meaning: string }> = {
+  partial: { text: "◐ partial", color: "#ffd08a", meaning: "Partial: the main path only" },
+  shell: { text: "○ shell", color: "#ec835a", meaning: "Shell: the model claims this, but doesn't do it" },
+  absent: { text: "◌ absent", color: "#a2b1bc", meaning: "Absent: known to exist in the code, not in this model" },
+};
+
+function WeakTag({ fidelity }: { fidelity?: WeakFidelity }) {
+  if (!fidelity) return null;
+  const w = WEAK_LABEL[fidelity];
+  return (
+    <tspan dx={5} fill={w.color} fontSize={10} style={{ fontWeight: 600 }}>
+      {w.text}
+    </tspan>
+  );
 }
 
 function truncate(s: string, max: number): string {
@@ -130,6 +170,16 @@ interface Props {
    * gets that much extra room so its last rows and lifelines can clear them.
    */
   insets?: { right: number; bottom: number };
+  /** The lanes to draw. */
+  view: LaneView;
+  /** Toggles an area between one lane and its components. */
+  onToggleArea?: (area: string) => void;
+  /** Hide `set` and `note` rows. */
+  hideNoise?: boolean;
+  /** interface -> its worst fidelity, for the calls that pass through a weak mechanism. */
+  weak?: ReadonlyMap<string, WeakFidelity>;
+  /** Change this to center the diagram on the cursor, rather than just keep it in view. */
+  centerKey?: number;
 }
 
 function Glyph({ x, y, color, children, title }: { x: number; y: number; color: string; children: string; title?: string }) {
@@ -144,22 +194,35 @@ function Glyph({ x, y, color, children, title }: { x: number; y: number; color: 
   );
 }
 
-function StaticLayer({ playback, rows, lifeX, width }: { playback: Playback; rows: Row[]; lifeX: (c: string) => number; width: number }) {
-  const { events, spans } = playback;
-  const height = rows.length ? rows[rows.length - 1].top + rows[rows.length - 1].h + 24 : 40;
+function StaticLayer({ playback, rows, geo, width, spanList, region }: { playback: Playback; rows: Row[]; geo: LaneGeometry; width: number; spanList: SpanRefFull[]; region: Viewport }) {
+  const { events } = playback;
+  const { lifeX, depthOf } = geo;
   const els: ReactNode[] = [];
+  const y0 = region.y;
+  const y1 = region.y + region.h;
+  const x0 = region.x;
+  const x1 = region.x + region.w;
+  const laneShown = (x: number) => x >= x0 - LABEL_REACH && x <= x1 + LIFE_W;
+  // A band from row r0 to r1 (its y range) meets the drawn region.
+  const meets = (top: number, bottom: number) => bottom >= y0 && top <= y1;
 
-  // Lifelines
+  // Lifelines: one line per drawn lane.
+  const lanesDrawn = new Set<number>();
   playback.lifelines.forEach((c) => {
-    els.push(<line key={`l-${c}`} x1={lifeX(c)} y1={0} x2={lifeX(c)} y2={height} stroke={C.life} strokeWidth={1} strokeDasharray="3 4" />);
+    const x = lifeX(c);
+    if (lanesDrawn.has(x) || x < x0 || x > x1) return;
+    lanesDrawn.add(x);
+    els.push(<line key={`l-${x}`} x1={x} y1={y0} x2={x} y2={y1} stroke={C.life} strokeWidth={1} strokeDasharray="3 4" />);
   });
 
   // Activation bars
-  spans.forEach((s) => {
+  for (const s of spanList) {
     const r0 = rows[s.startIdx];
     const r1 = s.endIdx >= 0 ? rows[s.endIdx] : rows[rows.length - 1];
-    if (!r0 || !r1) return;
-    const x = lifeX(s.to) - ACT_W / 2 + s.depth * 4;
+    if (!r0 || !r1 || !meets(r0.y, r1.y)) continue;
+    const x = lifeX(s.to) - ACT_W / 2 + Math.min(depthOf(s), MAX_DEPTH_STEP) * 4;
+    if (x < x0 - ACT_W || x > x1) continue;
+    const weak = geo.weak?.get(s.iface);
     els.push(
       <rect
         key={`a-${s.span}`}
@@ -168,28 +231,27 @@ function StaticLayer({ playback, rows, lifeX, width }: { playback: Playback; row
         width={ACT_W}
         height={Math.max(4, r1.y - r0.y)}
         rx={2}
-        fill={s.async ? "#12302c" : "#1c2a36"}
-        stroke={s.ok === false ? "#7a3434" : s.async ? "#2f6e64" : "#3b4d5c"}
+        fill={weak === "shell" ? "transparent" : s.async ? "#12302c" : "#1c2a36"}
+        stroke={weak ? WEAK_LABEL[weak].color : s.ok === false ? "#7a3434" : s.async ? "#2f6e64" : "#3b4d5c"}
         strokeWidth={1}
+        strokeDasharray={weak === "partial" ? "4 2" : undefined}
       />,
     );
-  });
+  }
 
   // Multi-step scenario separators (§11.7): a band per step.
   playback.steps.forEach((m, k) => {
     const r0 = rows[m.startIdx];
     const r1 = m.endIdx >= 0 ? rows[m.endIdx] : rows[rows.length - 1];
-    if (!r0 || !r1) return;
-    els.push(
-      <rect key={`st-${k}`} x={0} y={r0.top} width={width} height={Math.max(4, r1.top + r1.h - r0.top)} fill={k % 2 ? "rgba(204,255,120,0.025)" : "transparent"} />,
-    );
+    if (!r0 || !r1 || !meets(r0.top, r1.top + r1.h) || !(k % 2)) return;
+    els.push(<rect key={`st-${k}`} x={x0} y={r0.top} width={region.w} height={Math.max(4, r1.top + r1.h - r0.top)} fill="rgba(204,255,120,0.025)" />);
   });
 
   // Parallel groups (§11.2): a bracket on the behavior's lane, and a bar per branch spanning its rows.
   playback.parallels.forEach((g, k) => {
     const r0 = rows[g.startIdx];
     const r1 = g.endIdx >= 0 ? rows[g.endIdx] : rows[rows.length - 1];
-    if (!r0 || !r1) return;
+    if (!r0 || !r1 || !meets(r0.y, r1.y) || !laneShown(lifeX(g.lane))) return;
     const x = lifeX(g.lane) - 18 - g.depth * 6;
     els.push(<path key={`pg-${k}`} d={`M ${x + 6} ${r0.y} h -6 V ${r1.y} h 6`} fill="none" stroke={C.parallel} strokeWidth={1.4} opacity={0.9} />);
     const bx = lifeX(g.lane) + ACT_W + 4;
@@ -198,7 +260,7 @@ function StaticLayer({ playback, rows, lifeX, width }: { playback: Playback; row
       const br = g.branches.get(b)!;
       const a = rows[br.first];
       const z = rows[br.last];
-      if (!a || !z) return;
+      if (!a || !z || !meets(a.top, z.top + z.h)) return;
       const late = playback.events[br.last]?.late || (g.endIdx >= 0 && br.last > g.endIdx);
       els.push(
         <g key={`pb-${k}-${b}`} opacity={late ? 0.45 : 0.9}>
@@ -209,29 +271,38 @@ function StaticLayer({ playback, rows, lifeX, width }: { playback: Playback; row
     });
   });
 
-  // Time gutter + events
-  let lastT = -1;
-  events.forEach((e, i) => {
+  // Time gutter + events, for the rows in the drawn region only.
+  const first = firstRowAt(rows, y0);
+  const last = lastRowBefore(rows, y1);
+  for (let i = first; i <= last; i++) {
     const r = rows[i];
-    if (e.t !== lastT) {
+    if (r.h === 0) continue;
+    const e = events[i];
+    if (r.showT && x0 < GUTTER) {
       els.push(
         <text key={`t-${i}`} x={GUTTER - 10} y={r.y + 3.5} textAnchor="end" fontSize={10} fill={C.faint} className="tnum">
           {e.t} ms
         </text>,
       );
-      lastT = e.t;
     }
-    const mark = <EventMark key={`e-${i}`} i={i} e={e} r={r} rows={rows} lifeX={lifeX} playback={playback} width={width} />;
+    if (!rowInView(playback.lanes[i] ?? {}, e, lifeX, x0, x1)) continue;
+    const mark = <EventMark key={`e-${i}`} i={i} e={e} r={r} rows={rows} geo={geo} playback={playback} width={width} />;
     // Late work (after a timeout or a join) is dimmed.
     els.push(e.late && e.type !== "call.end" ? <g key={`e-${i}`} opacity={0.5}>{mark}</g> : mark);
-  });
+  }
 
-  return (
-    <g>
-      <rect x={0} y={0} width={width} height={height} fill="transparent" />
-      {els}
-    </g>
-  );
+  return <g>{els}</g>;
+}
+
+/** Whether a row's mark can reach the drawn columns: an arrow if it overlaps them, a lane mark if its label can. */
+function rowInView(lane: EventLanes, e: SimEvent, lifeX: (c: string) => number, x0: number, x1: number): boolean {
+  if (e.type === "step.start" || e.type === "step.end") return true;
+  const xs: number[] = [];
+  for (const l of [lane.from, lane.to, lane.at]) if (l !== undefined) xs.push(lifeX(l));
+  if (xs.length === 0) return true;
+  const lo = Math.min(...xs);
+  const hi = Math.max(...xs);
+  return hi + LABEL_REACH >= x0 && lo <= x1;
 }
 
 const MemoStatic = memo(StaticLayer);
@@ -306,7 +377,7 @@ function EventMark({
   e,
   r,
   rows,
-  lifeX,
+  geo,
   playback,
   width,
 }: {
@@ -314,12 +385,14 @@ function EventMark({
   e: SimEvent;
   r: Row;
   rows: Row[];
-  lifeX: (c: string) => number;
+  geo: LaneGeometry;
   playback: Playback;
   width: number;
 }) {
+  const { lifeX } = geo;
   const y = r.y;
   const span = e.span ? playback.spans.get(e.span) : undefined;
+  const weak = e.interface ? geo.weak?.get(e.interface) : undefined;
   const lane: EventLanes = playback.lanes[i] ?? {};
   const atX = lifeX(lane.at ?? e.component ?? "");
   const branch = e.branch !== undefined ? <tspan fill={C.parallel} fontSize={10}>{`#${e.branch} `}</tspan> : null;
@@ -338,7 +411,7 @@ function EventMark({
       const x1 = lifeX(from);
       const x2raw = lifeX(to);
       const dir = x2raw >= x1 ? 1 : -1;
-      const depth = span?.depth ?? 0;
+      const depth = Math.min(geo.depthOf(span), MAX_DEPTH_STEP);
       const x2 = x2raw - dir * (ACT_W / 2) + depth * 4;
       const async = !!e.async;
       const attempt = e.attempt ?? 1;
@@ -356,9 +429,11 @@ function EventMark({
             {ifaceName(e.interface ?? "")}
           </tspan>
           {e.mock && <MockTag />}
+          <WeakTag fidelity={weak} />
         </>
       );
-      if (from === to) {
+      // Same drawn lane: a real self-call, or two components in one collapsed area.
+      if (x1 === x2raw) {
         return (
           <g>
             <path d={`M ${x1} ${y - 8} h 26 v 10 h -${26 - ACT_W / 2}`} fill="none" stroke={color} strokeWidth={1.4} markerEnd={async ? "url(#sq-async)" : "url(#sq-call)"} strokeDasharray={async ? "1.5 4" : undefined} strokeLinecap="round" />
@@ -376,7 +451,7 @@ function EventMark({
     case "call.end": {
       const from = lane.from ?? "";
       const to = lane.to ?? "";
-      const depth = span?.depth ?? 0;
+      const depth = Math.min(geo.depthOf(span), MAX_DEPTH_STEP);
       const xs0 = lifeX(to);
       const xd = lifeX(from);
       const dir = xd >= xs0 ? 1 : -1;
@@ -398,7 +473,7 @@ function EventMark({
           {e.mock && <MockTag />}
         </>
       );
-      if (from === to) {
+      if (xs0 === xd) {
         return (
           <g>
             <path d={`M ${xs0 + ACT_W / 2} ${y - 8} h 20 v 10 h -20`} fill="none" stroke={color} strokeWidth={1.3} markerEnd={marker} strokeDasharray={dash} />
@@ -718,58 +793,150 @@ function EventMark({
 
 const NO_INSETS = { right: 0, bottom: 0 };
 
-export function SequenceDiagram({ playback, doc, scale, colorKey, cursor, onCursor, insets = NO_INSETS }: Props) {
+type SpanRefFull = SpanRef & { to: string; startIdx: number; endIdx: number; iface: string; async: boolean; ok?: boolean };
+
+function regionEqual(a: Viewport, b: Viewport): boolean {
+  return a.x === b.x && a.y === b.y && a.w === b.w && a.h === b.h;
+}
+
+/**
+ * The diagram is windowed: its scroll content has the full trace's size, but only the rows and
+ * lanes near the viewport are in the DOM, in an SVG positioned over them. So its cost follows
+ * the screen, not the trace. A click finds its row by position, so rows need no hit targets.
+ */
+export function SequenceDiagram({ playback, doc, scale, colorKey, cursor, onCursor, insets = NO_INSETS, view, onToggleArea, hideNoise = false, weak, centerKey }: Props) {
   const scrollRef = useRef<HTMLDivElement>(null);
-  const { events, lifelines } = playback;
+  const hoverRef = useRef<HTMLDivElement>(null);
+  const { events } = playback;
+  const lanes = view.lanes;
+  const headH = HEAD_H + (view.grouped ? AREA_STRIP_H : 0);
 
   const rows = useMemo(() => {
     const out: Row[] = [];
     let top = 8;
+    let lastT = -1;
     for (const e of events) {
+      if (hideNoise && isNoise(e)) {
+        // Hidden: no height, but still a position, so everything that indexes rows by event holds.
+        out.push({ top, h: 0, y: top, showT: false });
+        continue;
+      }
       const h = ROW_H[e.type] ?? 22;
-      out.push({ top, h, y: top + h - (e.type === "call.start" || e.type === "call.end" || e.type === "emit" || e.type === "step.start" ? 8 : h / 2) });
+      out.push({ top, h, y: top + h - (e.type === "call.start" || e.type === "call.end" || e.type === "emit" || e.type === "step.start" ? 8 : h / 2), showT: e.t !== lastT });
+      lastT = e.t;
       top += h;
     }
     return out;
-  }, [events]);
+  }, [events, hideNoise]);
 
-  const index = useMemo(() => new Map(lifelines.map((c, i) => [c, i])), [lifelines]);
-  const lifeX = useMemo(() => (c: string) => GUTTER + (index.get(c) ?? 0) * LIFE_W + LIFE_W / 2, [index]);
-  const width = GUTTER + lifelines.length * LIFE_W + RIGHT_PAD;
-  const height = rows.length ? rows[rows.length - 1].top + rows[rows.length - 1].h + 24 : 60;
+  const laneX = useCallback((i: number) => GUTTER + i * LIFE_W + LIFE_W / 2, []);
+  const spanList = useMemo(() => Array.from(playback.spans.values()) as SpanRefFull[], [playback]);
+  const depths = useMemo(() => (view.grouped ? laneDepths(spanList, view.indexOf) : null), [view, spanList]);
+  const geo = useMemo<LaneGeometry>(
+    () => ({
+      lifeX: (c: string) => laneX(view.indexOf.get(c) ?? 0),
+      depthOf: (s) => (s ? (depths ? (depths.get(s.span) ?? 0) : s.depth) : 0),
+      weak,
+    }),
+    [view, depths, laneX, weak],
+  );
+  const width = GUTTER + lanes.length * LIFE_W + RIGHT_PAD;
+  const last = rows[rows.length - 1];
+  const height = last ? last.top + last.h + 24 : 60;
+
+  const [region, setRegion] = useState<Viewport>({ x: 0, y: 0, w: 1600, h: 1600 });
+  // Redraws only when the viewport leaves what's drawn.
+  const syncRegion = useCallback(() => {
+    const el = scrollRef.current;
+    if (!el) return;
+    const v = { x: el.scrollLeft, y: Math.max(0, el.scrollTop - headH), w: el.clientWidth, h: el.clientHeight };
+    setRegion((cur) => {
+      if (covers(cur, v, width, height) && cur.x + cur.w <= width && cur.y + cur.h <= height && cur.h > 0) return cur;
+      const next = drawRegion(v, width, height, MARGIN_X, MARGIN_Y);
+      return regionEqual(cur, next) ? cur : next;
+    });
+  }, [width, height, headH]);
 
   const curRow = rows[cursor];
-  const activeLife = new Set<string>();
   const curLane = playback.lanes[cursor];
+  const activeLanes = new Set<number>();
   if (curLane) {
-    for (const l of [curLane.from, curLane.to, curLane.at]) if (l) activeLife.add(l);
+    for (const l of [curLane.from, curLane.to, curLane.at]) {
+      const i = l ? view.indexOf.get(l) : undefined;
+      if (i !== undefined) activeLanes.add(i);
+    }
   }
+  const activeKey = Array.from(activeLanes).join(",");
 
-  // Keep the cursor row (and its lifelines) in view.
-  useEffect(() => {
+  // Keep the cursor row (and its lanes) in view; center on it when asked, and on first showing.
+  const centered = useRef<number | undefined>(undefined);
+  const mounted = useRef(false);
+  useLayoutEffect(() => {
     const el = scrollRef.current;
-    if (!el || !curRow) return;
-    // Rows sit below the sticky lifeline heads.
-    // Floating panels cover the right and bottom edges; aim for what's left.
-    const viewH = Math.max(HEAD_H + curRow.h, el.clientHeight - insets.bottom);
-    const viewW = Math.max(LIFE_W, el.clientWidth - insets.right);
-    const top = HEAD_H + curRow.top;
-    const bottom = top + curRow.h;
-    if (top < el.scrollTop + HEAD_H + 6 || bottom > el.scrollTop + viewH - 6) {
-      el.scrollTop = Math.max(0, top - HEAD_H - (viewH - HEAD_H) * 0.4);
+    if (el && curRow) {
+      const center = !mounted.current || centered.current !== centerKey;
+      mounted.current = true;
+      centered.current = centerKey;
+      // Rows sit below the sticky lifeline heads.
+      // Floating panels cover the right and bottom edges; aim for what's left.
+      const viewH = Math.max(headH + curRow.h, el.clientHeight - insets.bottom);
+      const viewW = Math.max(LIFE_W, el.clientWidth - insets.right);
+      const top = headH + curRow.top;
+      const bottom = top + curRow.h;
+      if (center) el.scrollTop = Math.max(0, top - headH - (viewH - headH) / 2);
+      else if (top < el.scrollTop + headH + 6 || bottom > el.scrollTop + viewH - 6) {
+        el.scrollTop = Math.max(0, top - headH - (viewH - headH) * 0.4);
+      }
+      // Keep the active lanes and their labels in view, moving as little as possible.
+      const xs = Array.from(activeLanes).map((i) => laneX(i));
+      if (xs.length) {
+        const lo = Math.max(0, Math.min(...xs) - 70);
+        const hi = Math.max(...xs) + 300;
+        const minLeft = hi - viewW;
+        if (center) el.scrollLeft = Math.max(0, (lo + hi - viewW) / 2);
+        else if (minLeft > lo) el.scrollLeft = lo;
+        else el.scrollLeft = Math.min(Math.max(el.scrollLeft, minLeft), lo);
+      }
     }
-    // Keep the active lifelines and their labels in view, moving as little as possible.
-    const xs = Array.from(activeLife).map((c) => lifeX(c));
-    if (xs.length) {
-      const lo = Math.max(0, Math.min(...xs) - 70);
-      const hi = Math.max(...xs) + 300;
-      const minLeft = hi - viewW;
-      if (minLeft > lo) el.scrollLeft = lo;
-      else el.scrollLeft = Math.min(Math.max(el.scrollLeft, minLeft), lo);
-    }
-    // activeLife derives from cursor; recomputing on cursor is intended.
+    syncRegion();
+    // activeLanes derives from the cursor; recomputing on cursor is intended.
     // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [cursor, curRow, lifeX, insets.right, insets.bottom]);
+  }, [cursor, curRow, activeKey, centerKey, insets.right, insets.bottom, syncRegion, headH, laneX]);
+
+  // A resize can show more than was drawn.
+  useLayoutEffect(() => {
+    const el = scrollRef.current;
+    if (!el) return;
+    const ro = new ResizeObserver(syncRegion);
+    ro.observe(el);
+    return () => ro.disconnect();
+  }, [syncRegion]);
+
+  const rowAt = (ev: MouseEvent<HTMLDivElement>): number => {
+    const y = ev.clientY - ev.currentTarget.getBoundingClientRect().top;
+    let i = firstRowAt(rows, y);
+    while (i < rows.length && rows[i].h === 0) i++;
+    return i < rows.length && rows[i].top <= y ? i : -1;
+  };
+  const onMove = (ev: MouseEvent<HTMLDivElement>) => {
+    const el = hoverRef.current;
+    if (!el) return;
+    const i = rowAt(ev);
+    if (i < 0) {
+      el.style.display = "none";
+      return;
+    }
+    el.style.display = "block";
+    el.style.top = `${rows[i].top}px`;
+    el.style.height = `${rows[i].h}px`;
+  };
+  const onLeave = () => {
+    if (hoverRef.current) hoverRef.current.style.display = "none";
+  };
+  const onClick = (ev: MouseEvent<HTMLDivElement>) => {
+    const i = rowAt(ev);
+    if (i >= 0) onCursor(i);
+  };
 
   const name = (c: string) => {
     if (c.startsWith("?")) return `? ${c.slice(1)}`;
@@ -778,20 +945,56 @@ export function SequenceDiagram({ playback, doc, scale, colorKey, cursor, onCurs
   };
   const kind = (c: string) => (doc ? docIndex(doc).componentsById.get(laneComponent(c))?.kind : undefined);
 
+  // Only the lanes near the viewport get a head.
+  const headFrom = Math.max(0, Math.floor((region.x - GUTTER) / LIFE_W) - 1);
+  const headTo = Math.min(lanes.length - 1, Math.ceil((region.x + region.w - GUTTER) / LIFE_W));
+  const strips: { area: string; from: number; to: number; collapsed: boolean; members: number }[] = [];
+  if (view.grouped) {
+    lanes.forEach((l, i) => {
+      const a = l.area ?? "";
+      const prev = strips[strips.length - 1];
+      if (prev && prev.area === a) {
+        prev.to = i;
+        prev.members += l.members.length;
+      } else strips.push({ area: a, from: i, to: i, collapsed: l.collapsed, members: l.members.length });
+    });
+  }
+
+  const dimTop = curRow ? curRow.top + Math.max(curRow.h, 0) : 0;
+
   return (
-    <div ref={scrollRef} className="relative h-full overflow-auto" role="group" aria-label="Sequence diagram">
+    <div ref={scrollRef} onScroll={syncRegion} tabIndex={0} className="relative h-full overflow-auto" role="group" aria-label="Sequence diagram">
       <div style={{ width: width + insets.right, minWidth: "100%", paddingBottom: insets.bottom }}>
         {/* Lifeline heads */}
-        <div className="sticky top-0 z-10 bg-panel/95 backdrop-blur" style={{ height: HEAD_H, width }}>
-          <svg width={width} height={HEAD_H} aria-hidden>
-            {lifelines.map((c) => {
-              const x = lifeX(c);
-              const inst = laneInstance(c);
-              const [l1, l2] = inst ? [truncate(name(c), 16), truncate(`@${inst}`, 16)] : splitName(name(c));
-              const active = activeLife.has(c);
+        <div className="sticky top-0 z-10 bg-panel" style={{ height: headH, width }}>
+          <div className="absolute left-1 top-1 text-[10px] leading-tight text-faint" style={{ width: GUTTER - 6 }}>
+            virtual time
+          </div>
+          {strips.filter((a) => a.to >= headFrom && a.from <= headTo).map((a) => (
+            <button
+              key={a.area}
+              type="button"
+              onClick={() => onToggleArea?.(a.area)}
+              aria-expanded={!a.collapsed}
+              title={a.collapsed ? `Show the ${a.members} lanes in ${a.area}` : `Fold ${a.area} into one lane`}
+              className="absolute top-0 truncate border-b border-line px-1.5 text-left text-[10px] font-medium leading-[14px] text-muted hover:bg-panel-3 hover:text-ink"
+              style={{ left: GUTTER + a.from * LIFE_W + 4, width: (a.to - a.from + 1) * LIFE_W - 8, height: AREA_STRIP_H }}
+            >
+              {a.collapsed ? "▸" : "▾"} {a.collapsed ? `${a.members} lane${a.members === 1 ? "" : "s"}` : a.area}
+            </button>
+          ))}
+          <svg width={width} height={HEAD_H} aria-hidden className="absolute left-0" style={{ top: headH - HEAD_H }}>
+            {lanes.map((lane, i) => {
+              if (i < headFrom || i > headTo) return null;
+              const c = lane.members[0];
+              const x = laneX(i);
+              const inst = lane.collapsed ? "" : laneInstance(c);
+              const [l1, l2] = lane.collapsed ? splitName(lane.area ?? "") : inst ? [truncate(name(c), 16), truncate(`@${inst}`, 16)] : splitName(name(c));
+              const active = activeLanes.has(i);
+              const sub = lane.collapsed ? "area" : kind(c);
               return (
-                <g key={c}>
-                  <title>{c}</title>
+                <g key={lane.key}>
+                  <title>{lane.collapsed ? `${lane.area}: ${lane.members.join(", ")}` : c}</title>
                   <rect x={x - LIFE_W / 2 + 6} y={6} width={LIFE_W - 12} height={HEAD_H - 12} rx={6} fill={active ? "#1c2a10" : "#17212b"} stroke={active ? C.accent : "#2a3742"} strokeWidth={active ? 1.5 : 1} />
                   <rect x={x - LIFE_W / 2 + 6} y={6} width={4} height={HEAD_H - 12} rx={2} fill={scale.color(colorKey(c))} />
                   <text x={x + 2} y={l2 ? 21 : 26} textAnchor="middle" fontSize={11} fill={C.ink} style={{ fontWeight: 600 }} {...fitHead(l1)}>
@@ -802,9 +1005,9 @@ export function SequenceDiagram({ playback, doc, scale, colorKey, cursor, onCurs
                       {l2}
                     </text>
                   )}
-                  {!l2 && kind(c) && (
+                  {!l2 && sub && (
                     <text x={x + 2} y={38} textAnchor="middle" fontSize={9.5} fill={C.faint}>
-                      {kind(c)}
+                      {sub}
                     </text>
                   )}
                 </g>
@@ -812,27 +1015,35 @@ export function SequenceDiagram({ playback, doc, scale, colorKey, cursor, onCurs
             })}
           </svg>
         </div>
-        <svg width={width} height={height} className="block select-none" aria-hidden>
-          <Markers />
-          {/* Cursor band */}
-          {curRow && (
-            <g>
-              <rect x={0} y={curRow.top} width={width} height={curRow.h} fill="rgba(204,255,120,0.07)" />
-              <rect x={0} y={curRow.top} width={3} height={curRow.h} fill={C.accent} />
-            </g>
-          )}
-          {/* Active lifelines */}
-          {Array.from(activeLife).map((c) => (
-            <line key={`al-${c}`} x1={lifeX(c)} y1={0} x2={lifeX(c)} y2={height} stroke="rgba(204,255,120,0.22)" strokeWidth={2} />
-          ))}
-          <MemoStatic playback={playback} rows={rows} lifeX={lifeX} width={width} />
-          {/* Future events are dimmed */}
-          {curRow && <rect x={0} y={curRow.top + curRow.h} width={width} height={Math.max(0, height - curRow.top - curRow.h)} fill="#11181f" opacity={0.62} pointerEvents="none" />}
-          {/* Hit targets */}
-          {rows.map((r, i) => (
-            <rect key={`h-${i}`} x={0} y={r.top} width={width} height={r.h} fill="transparent" className="cursor-pointer hover:fill-[rgba(118,204,255,0.05)]" onClick={() => onCursor(i)} />
-          ))}
-        </svg>
+        <div className="relative cursor-pointer select-none" style={{ width, height }} onClick={onClick} onMouseMove={onMove} onMouseLeave={onLeave}>
+          <svg
+            className="absolute block"
+            style={{ left: region.x, top: region.y }}
+            width={region.w}
+            height={region.h}
+            viewBox={`${region.x} ${region.y} ${region.w} ${region.h}`}
+            aria-hidden
+          >
+            <Markers />
+            {/* Cursor band */}
+            {curRow && (
+              <g>
+                <rect x={region.x} y={curRow.top} width={region.w} height={Math.max(curRow.h, 2)} fill="rgba(204,255,120,0.07)" />
+                <rect x={0} y={curRow.top} width={3} height={Math.max(curRow.h, 2)} fill={C.accent} />
+              </g>
+            )}
+            {/* Active lanes */}
+            {Array.from(activeLanes).map((i) => (
+              <line key={`al-${i}`} x1={laneX(i)} y1={region.y} x2={laneX(i)} y2={region.y + region.h} stroke="rgba(204,255,120,0.22)" strokeWidth={2} />
+            ))}
+            <MemoStatic playback={playback} rows={rows} geo={geo} width={width} spanList={spanList} region={region} />
+            {/* Future events are dimmed */}
+            {curRow && dimTop < region.y + region.h && (
+              <rect x={region.x} y={Math.max(dimTop, region.y)} width={region.w} height={region.y + region.h - Math.max(dimTop, region.y)} fill="#11181f" opacity={0.62} pointerEvents="none" />
+            )}
+          </svg>
+          <div ref={hoverRef} className="pointer-events-none absolute inset-x-0 hidden bg-[rgba(118,204,255,0.05)]" />
+        </div>
       </div>
     </div>
   );

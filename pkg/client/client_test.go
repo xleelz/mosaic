@@ -545,3 +545,29 @@ func TestCommitsAndImpact(t *testing.T) {
 		t.Fatalf("err = %v", err)
 	}
 }
+
+func TestEvidenceAndTestResults(t *testing.T) {
+	s := newStub(t)
+	c := New(s.srv.URL, "")
+
+	s.reply(200, `{"revision":2,"built_by":"generated"}`)
+	ev, err := c.PutEvidence(ctx, "o", "2", api.Evidence{BuiltBy: "generated"})
+	if err != nil || ev.Revision != 2 {
+		t.Fatalf("put = %+v, %v", ev, err)
+	}
+	s.expect("PUT", "/v1/ontologies/o/evidence", "rev=2")
+
+	s.reply(200, `{"revision":3,"blind":{"measured_on_revision":2,"steps_total":1}}`)
+	ev, err = c.GetEvidence(ctx, "o", "3")
+	if err != nil || ev.Revision != 3 || ev.Blind.MeasuredOnRevision != 2 {
+		t.Fatalf("get = %+v, %v", ev, err)
+	}
+	s.expect("GET", "/v1/ontologies/o/evidence", "rev=3")
+
+	s.reply(200, `{"revision":"1","passed":true,"total":0,"failed":0,"results":[],"ran_at":"2026-11-05T01:02:03Z"}`)
+	rep, err := c.TestResults(ctx, "o", "1")
+	if err != nil || rep.Revision != "1" || rep.RanAt.IsZero() || rep.Results == nil {
+		t.Fatalf("results = %+v, %v", rep, err)
+	}
+	s.expect("GET", "/v1/ontologies/o/test-results", "rev=1")
+}

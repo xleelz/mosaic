@@ -118,14 +118,11 @@ export function Badge({ tone = "neutral", children, className, title }: { tone?:
 }
 
 export function StatusBadge({ status }: { status: string }) {
-  if (status === "ok") return <Badge tone="ok">✓ ok</Badge>;
+  // A run that returned is a claim by the model, not a check against anything outside it: no green.
+  if (status === "ok") return <Badge>ok</Badge>;
   if (status === "error") return <Badge tone="bad">✗ error</Badge>;
   if (status === "aborted") return <Badge tone="warn">⊘ aborted</Badge>;
   return <Badge>{status}</Badge>;
-}
-
-export function PassBadge({ passed }: { passed: boolean }) {
-  return passed ? <Badge tone="ok">✓ pass</Badge> : <Badge tone="bad">✗ fail</Badge>;
 }
 
 export function Kbd({ children }: { children: ReactNode }) {

@@ -4,19 +4,23 @@ import Link from "next/link";
 import type { ReactNode } from "react";
 import { createPortal } from "react-dom";
 import type { SimulationRun } from "@/lib/api/types";
-import { formatDate } from "@/lib/model/format";
+import { formatDate, formatDuration } from "@/lib/model/format";
+import { plural, runVerdict } from "@/lib/sim/wording";
 import { useQuery } from "@/lib/hooks";
 import { docIndex } from "@/lib/model/docindex";
-import { Badge, ErrorBox, Spinner, StatusBadge } from "@/components/ui";
+import { Badge, ErrorBox, Spinner } from "@/components/ui";
 import { useWorkspace } from "@/components/workspace/Workspace";
+import { CompareWith } from "@/components/compare/CompareWith";
+import { MechanismWarning } from "./MechanismWarning";
 import { Playback, type PlaybackLayout } from "./Playback";
+import { useRunMechanisms } from "./useRunMechanisms";
 
 export function RunHeader({ run, scenarioName, actions }: { run: SimulationRun; scenarioName?: string; actions?: ReactNode }) {
   const req = run.request;
   const overrides: string[] = [];
-  if (req.choices && Object.keys(req.choices).length) overrides.push(`${Object.keys(req.choices).length} choices`);
-  if (req.faults?.length) overrides.push(`${req.faults.length} faults`);
-  if (req.state && Object.keys(req.state).length) overrides.push(`state: ${Object.keys(req.state).join(", ")}`);
+  if (req.choices && Object.keys(req.choices).length) overrides.push(plural(Object.keys(req.choices).length, "choice"));
+  if (req.faults?.length) overrides.push(plural(req.faults.length, "fault"));
+  const seeded = Object.keys(req.state ?? {});
   if (req.fixtures?.length) overrides.push(`fixtures: ${req.fixtures.join(", ")}`);
   if (req.topology && Object.keys(req.topology).length) overrides.push(`topology: ${Object.keys(req.topology).join(", ")}`);
   if (req.config && Object.keys(req.config).length) overrides.push(`config: ${Object.keys(req.config).join(", ")}`);
@@ -24,14 +28,15 @@ export function RunHeader({ run, scenarioName, actions }: { run: SimulationRun; 
   const refinedPaths = Object.entries(req.resolution ?? {}).filter(([, v]) => v === "refined").map(([c]) => c);
   if (refinedPaths.length) overrides.push(`refined: ${refinedPaths.join(", ")}`);
   const steps = run.summary.steps?.length ?? 0;
+  const verdict = runVerdict(run.summary);
+  const mechanisms = useRunMechanisms(run);
   return (
     <div className="flex flex-wrap items-center gap-x-3 gap-y-1">
       <h2 className="text-[16px] font-semibold text-ink">{scenarioName || run.scenario || `Ad hoc run of ${run.flow}`}</h2>
-      <StatusBadge status={run.summary.status} />
-      {steps > 0 && <Badge tone="info">{steps} steps</Badge>}
-      {run.summary.assertions.length > 0 && (run.summary.passed ? <Badge tone="ok">✓ expectations pass</Badge> : <Badge tone="bad">✗ expectations fail</Badge>)}
+      <Badge tone={verdict.tone}>{verdict.text}</Badge>
+      {steps > 0 && <Badge tone="info">{plural(steps, "step")}</Badge>}
       <span className="text-[12px] text-faint">
-        flow <span className="font-mono text-muted">{run.flow}</span>
+        {formatDuration(run.summary.duration_ms, run.summary.duration_us)} virtual · generated input · flow <span className="font-mono text-muted">{run.flow}</span>
         {run.scenario && (
           <>
             {" "}
@@ -42,11 +47,18 @@ export function RunHeader({ run, scenarioName, actions }: { run: SimulationRun; 
         <span className="font-mono text-muted">{run.summary.seed}</span>
         {overrides.length > 0 && <> · {overrides.join(" · ")}</>}
       </span>
+      {seeded.length > 0 && (
+        <details className="text-[12px] text-faint">
+          <summary className="cursor-pointer select-none hover:text-ink">seeded {plural(seeded.length, "component")}</summary>
+          <div className="mt-1 max-h-[120px] max-w-[720px] overflow-y-auto font-mono text-[11px] text-muted">{seeded.join(", ")}</div>
+        </details>
+      )}
       <span className="ml-auto flex items-center gap-2 text-[11px] text-faint">
         {run.id && <span className="hidden font-mono 2xl:inline">{run.id}</span>}
         <span title={run.id}>{formatDate(run.created_at)}</span>
         {actions}
       </span>
+      {mechanisms.length > 0 && <MechanismWarning mechanisms={mechanisms} className="w-full" />}
     </div>
   );
 }
@@ -58,12 +70,14 @@ export function RunPlayback({
   initialCursor,
   layout,
   className,
+  actions,
 }: {
   run: SimulationRun;
   ontology: string;
   initialCursor?: number;
   layout?: PlaybackLayout;
   className?: string;
+  actions?: ReactNode;
 }) {
   const rev = run.revision || "draft";
   const doc = useQuery(`doc:${ontology}:${rev}`, (c) => c.getDocument(ontology, rev));
@@ -72,12 +86,12 @@ export function RunPlayback({
   return (
     <>
       {(doc.error || graph.error) ? <ErrorBox error={doc.error || graph.error} className="mb-2" /> : null}
-      <Playback run={run} doc={doc.data} graph={graph.data} initialCursor={initialCursor} layout={layout} className={className} />
+      <Playback run={run} doc={doc.data} graph={graph.data} initialCursor={initialCursor} layout={layout} className={className} actions={actions} />
     </>
   );
 }
 
-export function RunPage({ ontology, runId, at }: { ontology: string; runId: string; at?: number }) {
+export function RunPage({ ontology, runId, at, compare }: { ontology: string; runId: string; at?: number; compare?: string }) {
   const { chromeSlot } = useWorkspace();
   const run = useQuery(`run:${runId}`, (c) => c.getRun(runId));
   const doc = useQuery(run.data ? `doc:${ontology}:${run.data.revision || "draft"}` : null, (c) => c.getDocument(ontology, run.data?.revision || "draft"));
@@ -98,9 +112,16 @@ export function RunPage({ ontology, runId, at }: { ontology: string; runId: stri
   // The title and meta lines live in the workspace's hidden header overlay, so
   // the summary, transport and diagrams get the whole viewport.
   return (
-    <div className="flex h-full flex-col gap-2 p-3">
+    <div className="relative flex h-full flex-col gap-2 p-3">
       {chromeSlot ? createPortal(header, chromeSlot) : header}
-      <RunPlayback run={run.data} ontology={ontology} initialCursor={at !== undefined ? at - 1 : undefined} layout="page" className="min-h-0 flex-1" />
+      <RunPlayback
+        run={run.data}
+        ontology={ontology}
+        initialCursor={at !== undefined ? at - 1 : undefined}
+        layout="page"
+        className="min-h-0 flex-1"
+        actions={<CompareWith run={run.data} ontology={ontology} initial={compare} />}
+      />
     </div>
   );
 }

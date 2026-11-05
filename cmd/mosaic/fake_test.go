@@ -42,11 +42,12 @@ type fakeServer struct {
 type ekey struct{ kind, id string }
 
 type fakeOnt struct {
-	sum     api.OntologySummary
-	draft   map[ekey]json.RawMessage
-	revs    []fakeRev
-	repo    string
-	commits []api.Commit // import order
+	sum      api.OntologySummary
+	draft    map[ekey]json.RawMessage
+	revs     []fakeRev
+	repo     string
+	commits  []api.Commit // import order
+	evidence map[int]api.Evidence
 }
 
 type fakeRev struct {
@@ -89,6 +90,8 @@ func newFake(t *testing.T) *fakeServer {
 	mux.HandleFunc("GET /v1/ontologies/{id}/simulations", f.withOnt(f.listRuns))
 	mux.HandleFunc("POST /v1/ontologies/{id}/simulations", f.withOnt(f.runSimulation))
 	mux.HandleFunc("POST /v1/ontologies/{id}/test", f.withOnt(f.test))
+	mux.HandleFunc("GET /v1/ontologies/{id}/evidence", f.withOnt(f.getEvidence))
+	mux.HandleFunc("PUT /v1/ontologies/{id}/evidence", f.withOnt(f.putEvidence))
 	mux.HandleFunc("GET /v1/simulations/{run}", f.getRun)
 	mux.HandleFunc("GET /v1/ontologies/{id}/source", f.withOnt(f.source))
 	mux.HandleFunc("GET /v1/system/version", f.systemVersion)

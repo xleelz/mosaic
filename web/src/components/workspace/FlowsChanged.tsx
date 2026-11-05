@@ -11,7 +11,7 @@ import { parseReason } from "@/lib/model/impact";
 import { useDocIndex, useQuery } from "@/lib/hooks";
 import { ChangeView } from "@/components/diff";
 import { JsonView } from "@/components/json";
-import { Badge, Empty, ErrorBox, Panel, Spinner, cx } from "@/components/ui";
+import { Badge, Empty, ErrorBox, Panel, Spinner } from "@/components/ui";
 import { shortSha, useCommitDetail, useWorkspace } from "./Workspace";
 
 type Group = "added" | "modified" | "removed" | "affected";
@@ -50,14 +50,15 @@ function ReachDiff({ before, after }: { before?: Plan; after?: Plan }) {
   );
 }
 
-const BASIS: Record<NonNullable<FlowImpact["basis"]>, { label: string; tone: "ok" | "neutral"; title: string }> = {
+// Neutral, not green: scenarios are the model checking itself.
+const BASIS: Record<NonNullable<FlowImpact["basis"]>, { label: string; tone: "neutral"; title: string }> = {
   traces: {
     label: "exercised by scenarios",
-    tone: "ok",
-    title: "Scenario runs of this flow actually went through the changed entities listed here.",
+    tone: "neutral",
+    title: "Simulated scenario runs of this flow went through the changed entities listed here. That's the model's behavior, not a measurement of the real system.",
   },
   static: {
-    label: "static reach",
+    label: "could reach (static)",
     tone: "neutral",
     title:
       "Found by static reachability over the call graph, not by running scenarios. Static reach over-approximates: it counts every path the flow could take, so the flow may never actually hit these changes.",
@@ -122,7 +123,7 @@ function FlowItem({
             return comp ? (
               <Link
                 key={r}
-                href={ws.href("", { commit: sha, c: comp })}
+                href={ws.href("map", { commit: sha, c: comp })}
                 className="rounded border border-[#24445a] bg-[#122230] px-1 font-mono text-[11px] text-link hover:underline"
                 title="Show it on the before/after map"
               >
@@ -221,26 +222,20 @@ export function FlowsChanged({ sha }: { sha: string }) {
         <span className="font-mono text-[12px] text-faint">
           r{d.before || "∅"} → r{d.after}
         </span>
-        <Link href={ws.href("", { commit: d.commit.sha })} className="ml-auto text-[12px] text-link hover:underline">
+        <Link href={ws.href("map", { commit: d.commit.sha })} className="ml-auto text-[12px] text-link hover:underline">
           Architecture before/after →
         </Link>
       </div>
       {total === 0 && <Empty>This commit creates, modifies or affects no flows.</Empty>}
-      {GROUPS.map((g) =>
-        items[g.key].length === 0 && g.key === "removed" ? null : (
-          <Panel key={g.key} title={`${g.title} · ${items[g.key].length}`} actions={<span className="text-[11px] text-faint">{g.hint}</span>}>
-            {items[g.key].length === 0 ? (
-              <div className={cx("text-[12.5px] text-faint")}>None.</div>
-            ) : (
-              <ul className="space-y-1.5">
-                {items[g.key].map((it) => (
-                  <FlowItem key={it.id} id={it.id} group={g.key} flow={flowOf(it.id)} change={changeOf(it.id)} reasons={it.reasons} basis={it.basis} detail={d} />
-                ))}
-              </ul>
-            )}
-          </Panel>
-        ),
-      )}
+      {GROUPS.filter((g) => items[g.key].length > 0).map((g) => (
+        <Panel key={g.key} title={`${g.title} · ${items[g.key].length}`} actions={<span className="text-[11px] text-faint">{g.hint}</span>}>
+          <ul className="space-y-1.5">
+            {items[g.key].map((it) => (
+              <FlowItem key={it.id} id={it.id} group={g.key} flow={flowOf(it.id)} change={changeOf(it.id)} reasons={it.reasons} basis={it.basis} detail={d} />
+            ))}
+          </ul>
+        </Panel>
+      ))}
     </div>
   );
 }
