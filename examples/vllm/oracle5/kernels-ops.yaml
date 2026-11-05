@@ -1,0 +1,867 @@
+schema_version: 1
+id: vllm
+scenarios:
+- id: oracle-kernels-ops-config-picker-exact-match
+  description: 'tests/kernels/helion/test_rms_norm_per_block_quant.py TestRmsNormPerBlockQuantConfigPicker.test_config_picker_exact_match:
+    the tuned keys contain the exact (hidden_size, group_size, num_tokens) of the input, and pick_config returns it. The keys
+    are seeded in the real config manager, and the kernel registers through the real path.'
+  fixtures: &id001
+  - full-tp1-llama-8b
+  state:
+    helion-config-manager:
+      configs:
+        rms_norm_per_block_quant/nvidia_h100:
+          has_default: false
+          keys:
+          - hidden_size: 2048
+            group_size: 64
+            num_tokens: 16
+          - hidden_size: 4096
+            group_size: 128
+            num_tokens: 16
+  steps:
+  - interface: helion-kernel-wrapper.register-kernel
+    input:
+      op_name: rms_norm_per_block_quant
+      device_name: NVIDIA H100 80GB HBM3
+      helion_installed: true
+    as: reg
+    caller: gpu-worker
+  - interface: helion-kernel-wrapper.call
+    input:
+      op_name: rms_norm_per_block_quant
+      num_tokens: 16
+      hidden_size: 4096
+      group_size: 128
+      intermediate_size:
+        $absent: true
+    as: pick
+    caller: gpu-worker
+  expect:
+  - steps.reg.result.ok && !steps.reg.result.value.disabled
+  - steps.pick.result.ok
+  - steps.pick.result.value.case_key == '{"group_size":128,"hidden_size":4096,"num_tokens":16}'
+  - '!trace.exists(e, e.type == ''call.start'' && e.interface == ''silu-mul-fp8.silu-mul-fp8'')'
+  max_events: 200000
+- id: oracle-kernels-ops-per-tensor-quant-static-schema
+  description: 'tests/kernels/quantization/test_quant_op_schema.py test_per_tensor_quant_static_schema: the caller-provided
+    scale case of vllm::rocm_aiter_per_tensor_quant runs through opcheck. Only the control flow is translated: the static
+    branch reaches the op once with [128, 4096]. The opcheck schema and aliasing checks are below the model.'
+  fixtures: *id001
+  steps:
+  - interface: aiter-ops.per-tensor-quant
+    input:
+      num_tokens: 128
+      hidden_size: 4096
+      dtype_bytes: 2
+      scale_given: true
+    as: wrap
+    caller: gpu-worker
+  - interface: aiter-ops.rocm-aiter-per-tensor-quant
+    input:
+      num_tokens: 128
+      hidden_size: 4096
+      dtype_bytes: 2
+    as: op
+    caller: gpu-worker
+  expect:
+  - steps.wrap.result.ok && steps.wrap.result.value.is_dynamic == false
+  - steps.wrap.result.value.out_shape == [128, 4096]
+  - steps.op.result.ok
+  - calls['aiter-ops.rocm-aiter-per-tensor-quant'] == 2
+- id: oracle-kernels-ops-dynamic-shapes-backed-aot0-hook1
+  description: 'tests/compile/dynamic_shapes/test_dynamic_shapes_compilation.py test_dynamic_shapes_compilation[backed-aot0-hook1]:
+    under VLLM_COMPILE, with VLLM_USE_AOT_COMPILE=0 and VLLM_USE_BYTECODE_HOOK=1, the runner warms up and generates non-empty
+    output, and the model forward enters the @support_torch_compile __call__. Steps direct and direct2 drive that __call__
+    itself. The shapes type has no config in the model, so only the AOT and hook axes differ here. Logprob closeness is numeric.'
+  fixtures: *id001
+  config:
+    compilation-mode: 3
+    vllm-use-aot-compile: false
+    vllm-use-bytecode-hook: true
+    vllm-disable-compile-cache: false
+  steps:
+  - flow: wr-compile-or-warm-up
+    'on': rank0
+    as: warm
+  - flow: serving-api-offline-generate
+    input: &id002
+      prompts:
+      - Hello, my name is
+      sampling_params:
+        max_tokens: 5
+        temperature: 0
+        logprobs: 10
+    as: gen
+  - flow: kernels-ops-support-torch-compile
+    as: direct
+  - flow: kernels-ops-support-torch-compile
+    as: direct2
+  expect:
+  - steps.warm.result.ok
+  - steps.gen.result.ok
+  - size(steps.gen.result.value) == 1 && steps.gen.result.value[0].finished
+  - trace.filter(e, e.type == 'call.start' && e.interface == 'support-torch-compile.call').size() > 2
+  - steps.direct.result.ok && steps.direct.result.value.path == 'jit-compiled'
+  - steps.direct2.result.ok && steps.direct2.result.value.path == 'compiled'
+  - trace.exists(e, e.type == 'call.start' && e.interface == 'torch-compile-with-no-guards-wrapper.call')
+  max_events: 1000000
+- id: oracle-kernels-ops-dynamic-shapes-backed-aot1-hook0
+  description: 'tests/compile/dynamic_shapes/test_dynamic_shapes_compilation.py test_dynamic_shapes_compilation[backed-aot1-hook0]:
+    under VLLM_COMPILE, with VLLM_USE_AOT_COMPILE=1 and VLLM_USE_BYTECODE_HOOK=0, the runner warms up and generates non-empty
+    output, and the model forward enters the @support_torch_compile __call__. Steps direct and direct2 drive that __call__
+    itself. The shapes type has no config in the model, so only the AOT and hook axes differ here. Logprob closeness is numeric.'
+  fixtures: *id001
+  config:
+    compilation-mode: 3
+    vllm-use-aot-compile: true
+    vllm-use-bytecode-hook: false
+    vllm-disable-compile-cache: false
+  steps:
+  - flow: wr-compile-or-warm-up
+    'on': rank0
+    as: warm
+  - flow: serving-api-offline-generate
+    input: *id002
+    as: gen
+  - flow: kernels-ops-support-torch-compile
+    as: direct
+  - flow: kernels-ops-support-torch-compile
+    as: direct2
+  expect:
+  - steps.warm.result.ok
+  - steps.gen.result.ok
+  - size(steps.gen.result.value) == 1 && steps.gen.result.value[0].finished
+  - trace.filter(e, e.type == 'call.start' && e.interface == 'support-torch-compile.call').size() > 2
+  - steps.direct.result.ok && steps.direct.result.value.path == 'aot-compiled'
+  - steps.direct2.result.ok && steps.direct2.result.value.path == 'aot'
+  - trace.exists(e, e.type == 'call.start' && e.interface == 'torch-compile-cache.save-aot-artifact')
+  max_events: 1000000
+- id: oracle-kernels-ops-dynamic-shapes-unbacked-aot0-hook0
+  description: 'tests/compile/dynamic_shapes/test_dynamic_shapes_compilation.py test_dynamic_shapes_compilation[unbacked-aot0-hook0]:
+    under VLLM_COMPILE, with VLLM_USE_AOT_COMPILE=0 and VLLM_USE_BYTECODE_HOOK=0, the runner warms up and generates non-empty
+    output, and the model forward enters the @support_torch_compile __call__. Steps direct and direct2 drive that __call__
+    itself. The shapes type has no config in the model, so only the AOT and hook axes differ here. Logprob closeness is numeric.'
+  fixtures: *id001
+  config:
+    compilation-mode: 3
+    vllm-use-aot-compile: false
+    vllm-use-bytecode-hook: false
+    vllm-disable-compile-cache: false
+  steps:
+  - flow: wr-compile-or-warm-up
+    'on': rank0
+    as: warm
+  - flow: serving-api-offline-generate
+    input: *id002
+    as: gen
+  - flow: kernels-ops-support-torch-compile
+    as: direct
+  - flow: kernels-ops-support-torch-compile
+    as: direct2
+  expect:
+  - steps.warm.result.ok
+  - steps.gen.result.ok
+  - size(steps.gen.result.value) == 1 && steps.gen.result.value[0].finished
+  - trace.filter(e, e.type == 'call.start' && e.interface == 'support-torch-compile.call').size() > 2
+  - steps.direct.result.ok && steps.direct.result.value.path == 'jit-compiled'
+  - steps.direct2.result.ok && steps.direct2.result.value.path == 'compiled'
+  - trace.exists(e, e.type == 'call.start' && e.interface == 'torch-compile-with-no-guards-wrapper.call')
+  max_events: 1000000
+- id: oracle-kernels-ops-dynamic-shapes-unbacked-aot1-hook1
+  description: 'tests/compile/dynamic_shapes/test_dynamic_shapes_compilation.py test_dynamic_shapes_compilation[unbacked-aot1-hook1]:
+    under VLLM_COMPILE, with VLLM_USE_AOT_COMPILE=1 and VLLM_USE_BYTECODE_HOOK=1, the runner warms up and generates non-empty
+    output, and the model forward enters the @support_torch_compile __call__. Steps direct and direct2 drive that __call__
+    itself. The shapes type has no config in the model, so only the AOT and hook axes differ here. Logprob closeness is numeric.'
+  fixtures: *id001
+  config:
+    compilation-mode: 3
+    vllm-use-aot-compile: true
+    vllm-use-bytecode-hook: true
+    vllm-disable-compile-cache: false
+  steps:
+  - flow: wr-compile-or-warm-up
+    'on': rank0
+    as: warm
+  - flow: serving-api-offline-generate
+    input: *id002
+    as: gen
+  - flow: kernels-ops-support-torch-compile
+    as: direct
+  - flow: kernels-ops-support-torch-compile
+    as: direct2
+  expect:
+  - steps.warm.result.ok
+  - steps.gen.result.ok
+  - size(steps.gen.result.value) == 1 && steps.gen.result.value[0].finished
+  - trace.filter(e, e.type == 'call.start' && e.interface == 'support-torch-compile.call').size() > 2
+  - steps.direct.result.ok && steps.direct.result.value.path == 'aot-compiled'
+  - steps.direct2.result.ok && steps.direct2.result.value.path == 'aot'
+  - trace.exists(e, e.type == 'call.start' && e.interface == 'torch-compile-cache.save-aot-artifact')
+  max_events: 1000000
+- id: oracle-kernels-ops-dynamic-shapes-size-oblivious-aot0-hook1
+  description: 'tests/compile/dynamic_shapes/test_dynamic_shapes_compilation.py test_dynamic_shapes_compilation[size-oblivious-aot0-hook1]:
+    under VLLM_COMPILE, with VLLM_USE_AOT_COMPILE=0 and VLLM_USE_BYTECODE_HOOK=1, the runner warms up and generates non-empty
+    output, and the model forward enters the @support_torch_compile __call__. Steps direct and direct2 drive that __call__
+    itself. The shapes type has no config in the model, so only the AOT and hook axes differ here. Logprob closeness is numeric.'
+  fixtures: *id001
+  config:
+    compilation-mode: 3
+    vllm-use-aot-compile: false
+    vllm-use-bytecode-hook: true
+    vllm-disable-compile-cache: false
+  steps:
+  - flow: wr-compile-or-warm-up
+    'on': rank0
+    as: warm
+  - flow: serving-api-offline-generate
+    input: *id002
+    as: gen
+  - flow: kernels-ops-support-torch-compile
+    as: direct
+  - flow: kernels-ops-support-torch-compile
+    as: direct2
+  expect:
+  - steps.warm.result.ok
+  - steps.gen.result.ok
+  - size(steps.gen.result.value) == 1 && steps.gen.result.value[0].finished
+  - trace.filter(e, e.type == 'call.start' && e.interface == 'support-torch-compile.call').size() > 2
+  - steps.direct.result.ok && steps.direct.result.value.path == 'jit-compiled'
+  - steps.direct2.result.ok && steps.direct2.result.value.path == 'compiled'
+  - trace.exists(e, e.type == 'call.start' && e.interface == 'torch-compile-with-no-guards-wrapper.call')
+  max_events: 1000000
+- id: oracle-kernels-ops-dynamic-shapes-size-oblivious-aot1-hook0
+  description: 'tests/compile/dynamic_shapes/test_dynamic_shapes_compilation.py test_dynamic_shapes_compilation[size-oblivious-aot1-hook0]:
+    under VLLM_COMPILE, with VLLM_USE_AOT_COMPILE=1 and VLLM_USE_BYTECODE_HOOK=0, the runner warms up and generates non-empty
+    output, and the model forward enters the @support_torch_compile __call__. Steps direct and direct2 drive that __call__
+    itself. The shapes type has no config in the model, so only the AOT and hook axes differ here. Logprob closeness is numeric.'
+  fixtures: *id001
+  config:
+    compilation-mode: 3
+    vllm-use-aot-compile: true
+    vllm-use-bytecode-hook: false
+    vllm-disable-compile-cache: false
+  steps:
+  - flow: wr-compile-or-warm-up
+    'on': rank0
+    as: warm
+  - flow: serving-api-offline-generate
+    input: *id002
+    as: gen
+  - flow: kernels-ops-support-torch-compile
+    as: direct
+  - flow: kernels-ops-support-torch-compile
+    as: direct2
+  expect:
+  - steps.warm.result.ok
+  - steps.gen.result.ok
+  - size(steps.gen.result.value) == 1 && steps.gen.result.value[0].finished
+  - trace.filter(e, e.type == 'call.start' && e.interface == 'support-torch-compile.call').size() > 2
+  - steps.direct.result.ok && steps.direct.result.value.path == 'aot-compiled'
+  - steps.direct2.result.ok && steps.direct2.result.value.path == 'aot'
+  - trace.exists(e, e.type == 'call.start' && e.interface == 'torch-compile-cache.save-aot-artifact')
+  max_events: 1000000
+- id: oracle-kernels-ops-dynamic-shapes-eager-baseline
+  description: 'tests/compile/dynamic_shapes/test_dynamic_shapes_compilation.py test_dynamic_shapes_compilation (get_eager_outputs):
+    enforce_eager generates through a plain forward, with no compilation.'
+  fixtures: *id001
+  config:
+    compilation-mode: 0
+    enforce-eager: true
+    cudagraph-mode: NONE
+  steps:
+  - flow: serving-api-offline-generate
+    input: *id002
+    as: gen
+  - flow: kernels-ops-support-torch-compile
+    as: direct
+  expect:
+  - steps.gen.result.ok
+  - size(steps.gen.result.value) == 1 && steps.gen.result.value[0].finished
+  - steps.direct.result.value.path == 'eager'
+  - '!trace.exists(e, e.type == ''call.start'' && e.interface == ''vllm-backend.call'')'
+  - trace.exists(e, e.type == 'call.start' && e.interface == 'llama-for-causal-lm.forward')
+  - '!trace.exists(e, e.type == ''call.start'' && e.interface == ''cuda-graph-manager.run-pw-graph'')'
+  max_events: 1000000
+- id: oracle-kernels-ops-dynamic-shapes-type-settable
+  description: 'tests/compile/dynamic_shapes/test_dynamic_shapes_compilation.py test_dynamic_shapes_compilation: the test
+    parametrizes compilation_config.dynamic_shapes_config.type over backed, unbacked and backed_size_oblivious, so the model
+    has to expose that setting. It is looked up under the likely config ids, because an unknown id fails validation.'
+  fixtures: *id001
+  steps:
+  - flow: kernels-ops-support-torch-compile
+    as: direct
+  expect:
+  - steps.direct.result.ok && trace.exists(e, e.type == 'call.start' && e.interface == 'vllm-backend.call')
+  - '''dynamic-shapes-type'' in config || ''dynamic-shapes-config-type'' in config || ''compilation-dynamic-shapes-type''
+    in config'
+  max_events: 1000000
+- id: oracle-kernels-ops-cutlass-w4a8
+  description: 'tests/kernels/quantization/test_cutlass_w4a8.py test_cutlass_w4a8: each (m, n, k) shape reaches _C::cutlass_w4a8_mm
+    once through the Python wrapper. assert_close on the GEMM output is numeric and is not translated.'
+  fixtures: *id001
+  steps:
+  - interface: custom-ops.cutlass-w4a8-mm
+    input:
+      m: 1
+      n: 128
+      k: 128
+      dtype_bytes: 1
+    as: s0
+    caller: gpu-worker
+  - interface: custom-ops.cutlass-w4a8-mm
+    input:
+      m: 1
+      n: 512
+      k: 1024
+      dtype_bytes: 1
+    as: s1
+    caller: gpu-worker
+  - interface: custom-ops.cutlass-w4a8-mm
+    input:
+      m: 1
+      n: 4096
+      k: 4096
+      dtype_bytes: 1
+    as: s2
+    caller: gpu-worker
+  - interface: custom-ops.cutlass-w4a8-mm
+    input:
+      m: 1
+      n: 8192
+      k: 28672
+      dtype_bytes: 1
+    as: s3
+    caller: gpu-worker
+  - interface: custom-ops.cutlass-w4a8-mm
+    input:
+      m: 13
+      n: 8192
+      k: 4096
+      dtype_bytes: 1
+    as: s4
+    caller: gpu-worker
+  - interface: custom-ops.cutlass-w4a8-mm
+    input:
+      m: 26
+      n: 4096
+      k: 8192
+      dtype_bytes: 1
+    as: s5
+    caller: gpu-worker
+  - interface: custom-ops.cutlass-w4a8-mm
+    input:
+      m: 64
+      n: 4096
+      k: 4096
+      dtype_bytes: 1
+    as: s6
+    caller: gpu-worker
+  - interface: custom-ops.cutlass-w4a8-mm
+    input:
+      m: 64
+      n: 8192
+      k: 28672
+      dtype_bytes: 1
+    as: s7
+    caller: gpu-worker
+  - interface: custom-ops.cutlass-w4a8-mm
+    input:
+      m: 257
+      n: 128
+      k: 4096
+      dtype_bytes: 1
+    as: s8
+    caller: gpu-worker
+  - interface: custom-ops.cutlass-w4a8-mm
+    input:
+      m: 257
+      n: 4096
+      k: 4096
+      dtype_bytes: 1
+    as: s9
+    caller: gpu-worker
+  - interface: custom-ops.cutlass-w4a8-mm
+    input:
+      m: 1024
+      n: 4096
+      k: 8192
+      dtype_bytes: 1
+    as: s10
+    caller: gpu-worker
+  - interface: custom-ops.cutlass-w4a8-mm
+    input:
+      m: 1024
+      n: 8192
+      k: 4096
+      dtype_bytes: 1
+    as: s11
+    caller: gpu-worker
+  expect:
+  - steps.s0.result.ok && steps.s1.result.ok && steps.s2.result.ok && steps.s3.result.ok && steps.s4.result.ok && steps.s5.result.ok
+    && steps.s6.result.ok && steps.s7.result.ok && steps.s8.result.ok && steps.s9.result.ok && steps.s10.result.ok && steps.s11.result.ok
+  - calls['torch-bindings.cutlass-w4a8-mm'] == 12
+  - calls['custom-ops.cutlass-w4a8-mm'] == 12
+- id: oracle-kernels-ops-cpu-fused-moe
+  description: 'tests/kernels/moe/test_cpu_fused_moe.py test_cpu_fused_moe: w13 and w2 are prepacked, then _C::cpu_fused_moe
+    runs on the packed weights. assert_close against the reference is numeric and is not translated.'
+  fixtures: *id001
+  config:
+    vllm-target-device: cpu
+  steps:
+  - interface: custom-ops.cpu-prepack-moe-weight
+    input:
+      m: 8
+      n: 256
+      k: 128
+      dtype_bytes: 2
+    as: w13_0
+    caller: gpu-worker
+  - interface: custom-ops.cpu-prepack-moe-weight
+    input:
+      m: 8
+      n: 128
+      k: 128
+      dtype_bytes: 2
+    as: w2_0
+    caller: gpu-worker
+  - interface: custom-ops.cpu-fused-moe
+    input:
+      num_tokens: 1
+      num_experts: 8
+      topk: 4
+      k: 128
+      n: 256
+      dtype_bytes: 2
+    as: moe_0
+    caller: gpu-worker
+  - interface: custom-ops.cpu-prepack-moe-weight
+    input:
+      m: 8
+      n: 256
+      k: 2880
+      dtype_bytes: 2
+    as: w13_1
+    caller: gpu-worker
+  - interface: custom-ops.cpu-prepack-moe-weight
+    input:
+      m: 8
+      n: 2880
+      k: 128
+      dtype_bytes: 2
+    as: w2_1
+    caller: gpu-worker
+  - interface: custom-ops.cpu-fused-moe
+    input:
+      num_tokens: 64
+      num_experts: 8
+      topk: 4
+      k: 2880
+      n: 256
+      dtype_bytes: 2
+    as: moe_1
+    caller: gpu-worker
+  - interface: custom-ops.cpu-prepack-moe-weight
+    input:
+      m: 8
+      n: 5760
+      k: 128
+      dtype_bytes: 2
+    as: w13_2
+    caller: gpu-worker
+  - interface: custom-ops.cpu-prepack-moe-weight
+    input:
+      m: 8
+      n: 128
+      k: 2880
+      dtype_bytes: 2
+    as: w2_2
+    caller: gpu-worker
+  - interface: custom-ops.cpu-fused-moe
+    input:
+      num_tokens: 256
+      num_experts: 8
+      topk: 4
+      k: 128
+      n: 5760
+      dtype_bytes: 2
+    as: moe_2
+    caller: gpu-worker
+  - interface: custom-ops.cpu-prepack-moe-weight
+    input:
+      m: 8
+      n: 5760
+      k: 2880
+      dtype_bytes: 2
+    as: w13_3
+    caller: gpu-worker
+  - interface: custom-ops.cpu-prepack-moe-weight
+    input:
+      m: 8
+      n: 2880
+      k: 2880
+      dtype_bytes: 2
+    as: w2_3
+    caller: gpu-worker
+  - interface: custom-ops.cpu-fused-moe
+    input:
+      num_tokens: 256
+      num_experts: 8
+      topk: 4
+      k: 2880
+      n: 5760
+      dtype_bytes: 2
+    as: moe_3
+    caller: gpu-worker
+  expect:
+  - steps.w13_0.result.ok && steps.w2_0.result.ok && steps.moe_0.result.ok && steps.w13_1.result.ok && steps.w2_1.result.ok
+    && steps.moe_1.result.ok && steps.w13_2.result.ok && steps.w2_2.result.ok && steps.moe_2.result.ok && steps.w13_3.result.ok
+    && steps.w2_3.result.ok && steps.moe_3.result.ok
+  - calls['cpu-torch-bindings.prepack-moe-weight'] == 8
+  - calls['cpu-torch-bindings.cpu-fused-moe'] == 4
+  - trace.filter(e, e.type == 'call.start' && e.interface in ['cpu-torch-bindings.prepack-moe-weight', 'cpu-torch-bindings.cpu-fused-moe']).map(e,
+    e.interface).slice(0, 3) == ['cpu-torch-bindings.prepack-moe-weight', 'cpu-torch-bindings.prepack-moe-weight', 'cpu-torch-bindings.cpu-fused-moe']
+- id: oracle-kernels-ops-rocm-mxfp8-linear-matches-dequant-reference
+  description: 'tests/kernels/quantization/test_rocm_mxfp8_linear.py test_rocm_mxfp8_linear_matches_dequant_reference: RocmDotScaledMxfp8LinearKernel
+    returns (num_tokens, n) on each V4.1 attention shape through the native dot_scaled GEMM. The model has no such kernel,
+    so the format-agnostic ModelOptLinearMethod.apply is the nearest entity. The finite and relative-error checks are numeric.'
+  fixtures: *id001
+  steps:
+  - interface: model-opt-linear-method.apply
+    input:
+      num_tokens: 1
+      in_features: 5120
+      out_features: 1792
+      bytes_per_weight: 1
+      quant: mxfp8
+    as: fused_wqa_wkv_1
+    caller: gpu-worker
+  - interface: model-opt-linear-method.apply
+    input:
+      num_tokens: 2
+      in_features: 5120
+      out_features: 1792
+      bytes_per_weight: 1
+      quant: mxfp8
+    as: fused_wqa_wkv_2
+    caller: gpu-worker
+  - interface: model-opt-linear-method.apply
+    input:
+      num_tokens: 7
+      in_features: 5120
+      out_features: 1792
+      bytes_per_weight: 1
+      quant: mxfp8
+    as: fused_wqa_wkv_7
+    caller: gpu-worker
+  - interface: model-opt-linear-method.apply
+    input:
+      num_tokens: 16
+      in_features: 5120
+      out_features: 1792
+      bytes_per_weight: 1
+      quant: mxfp8
+    as: fused_wqa_wkv_16
+    caller: gpu-worker
+  - interface: model-opt-linear-method.apply
+    input:
+      num_tokens: 31
+      in_features: 5120
+      out_features: 1792
+      bytes_per_weight: 1
+      quant: mxfp8
+    as: fused_wqa_wkv_31
+    caller: gpu-worker
+  - interface: model-opt-linear-method.apply
+    input:
+      num_tokens: 32
+      in_features: 5120
+      out_features: 1792
+      bytes_per_weight: 1
+      quant: mxfp8
+    as: fused_wqa_wkv_32
+    caller: gpu-worker
+  - interface: model-opt-linear-method.apply
+    input:
+      num_tokens: 128
+      in_features: 5120
+      out_features: 1792
+      bytes_per_weight: 1
+      quant: mxfp8
+    as: fused_wqa_wkv_128
+    caller: gpu-worker
+  - interface: model-opt-linear-method.apply
+    input:
+      num_tokens: 1024
+      in_features: 5120
+      out_features: 1792
+      bytes_per_weight: 1
+      quant: mxfp8
+    as: fused_wqa_wkv_1024
+    caller: gpu-worker
+  - interface: model-opt-linear-method.apply
+    input:
+      num_tokens: 1
+      in_features: 1280
+      out_features: 8192
+      bytes_per_weight: 1
+      quant: mxfp8
+    as: wq_b_1
+    caller: gpu-worker
+  - interface: model-opt-linear-method.apply
+    input:
+      num_tokens: 2
+      in_features: 1280
+      out_features: 8192
+      bytes_per_weight: 1
+      quant: mxfp8
+    as: wq_b_2
+    caller: gpu-worker
+  - interface: model-opt-linear-method.apply
+    input:
+      num_tokens: 7
+      in_features: 1280
+      out_features: 8192
+      bytes_per_weight: 1
+      quant: mxfp8
+    as: wq_b_7
+    caller: gpu-worker
+  - interface: model-opt-linear-method.apply
+    input:
+      num_tokens: 16
+      in_features: 1280
+      out_features: 8192
+      bytes_per_weight: 1
+      quant: mxfp8
+    as: wq_b_16
+    caller: gpu-worker
+  - interface: model-opt-linear-method.apply
+    input:
+      num_tokens: 31
+      in_features: 1280
+      out_features: 8192
+      bytes_per_weight: 1
+      quant: mxfp8
+    as: wq_b_31
+    caller: gpu-worker
+  - interface: model-opt-linear-method.apply
+    input:
+      num_tokens: 32
+      in_features: 1280
+      out_features: 8192
+      bytes_per_weight: 1
+      quant: mxfp8
+    as: wq_b_32
+    caller: gpu-worker
+  - interface: model-opt-linear-method.apply
+    input:
+      num_tokens: 128
+      in_features: 1280
+      out_features: 8192
+      bytes_per_weight: 1
+      quant: mxfp8
+    as: wq_b_128
+    caller: gpu-worker
+  - interface: model-opt-linear-method.apply
+    input:
+      num_tokens: 1024
+      in_features: 1280
+      out_features: 8192
+      bytes_per_weight: 1
+      quant: mxfp8
+    as: wq_b_1024
+    caller: gpu-worker
+  - interface: model-opt-linear-method.apply
+    input:
+      num_tokens: 1
+      in_features: 4096
+      out_features: 2048
+      bytes_per_weight: 1
+      quant: mxfp8
+    as: wo_a_1
+    caller: gpu-worker
+  - interface: model-opt-linear-method.apply
+    input:
+      num_tokens: 2
+      in_features: 4096
+      out_features: 2048
+      bytes_per_weight: 1
+      quant: mxfp8
+    as: wo_a_2
+    caller: gpu-worker
+  - interface: model-opt-linear-method.apply
+    input:
+      num_tokens: 7
+      in_features: 4096
+      out_features: 2048
+      bytes_per_weight: 1
+      quant: mxfp8
+    as: wo_a_7
+    caller: gpu-worker
+  - interface: model-opt-linear-method.apply
+    input:
+      num_tokens: 16
+      in_features: 4096
+      out_features: 2048
+      bytes_per_weight: 1
+      quant: mxfp8
+    as: wo_a_16
+    caller: gpu-worker
+  - interface: model-opt-linear-method.apply
+    input:
+      num_tokens: 31
+      in_features: 4096
+      out_features: 2048
+      bytes_per_weight: 1
+      quant: mxfp8
+    as: wo_a_31
+    caller: gpu-worker
+  - interface: model-opt-linear-method.apply
+    input:
+      num_tokens: 32
+      in_features: 4096
+      out_features: 2048
+      bytes_per_weight: 1
+      quant: mxfp8
+    as: wo_a_32
+    caller: gpu-worker
+  - interface: model-opt-linear-method.apply
+    input:
+      num_tokens: 128
+      in_features: 4096
+      out_features: 2048
+      bytes_per_weight: 1
+      quant: mxfp8
+    as: wo_a_128
+    caller: gpu-worker
+  - interface: model-opt-linear-method.apply
+    input:
+      num_tokens: 1024
+      in_features: 4096
+      out_features: 2048
+      bytes_per_weight: 1
+      quant: mxfp8
+    as: wo_a_1024
+    caller: gpu-worker
+  - interface: model-opt-linear-method.apply
+    input:
+      num_tokens: 1
+      in_features: 2048
+      out_features: 5120
+      bytes_per_weight: 1
+      quant: mxfp8
+    as: wo_b_1
+    caller: gpu-worker
+  - interface: model-opt-linear-method.apply
+    input:
+      num_tokens: 2
+      in_features: 2048
+      out_features: 5120
+      bytes_per_weight: 1
+      quant: mxfp8
+    as: wo_b_2
+    caller: gpu-worker
+  - interface: model-opt-linear-method.apply
+    input:
+      num_tokens: 7
+      in_features: 2048
+      out_features: 5120
+      bytes_per_weight: 1
+      quant: mxfp8
+    as: wo_b_7
+    caller: gpu-worker
+  - interface: model-opt-linear-method.apply
+    input:
+      num_tokens: 16
+      in_features: 2048
+      out_features: 5120
+      bytes_per_weight: 1
+      quant: mxfp8
+    as: wo_b_16
+    caller: gpu-worker
+  - interface: model-opt-linear-method.apply
+    input:
+      num_tokens: 31
+      in_features: 2048
+      out_features: 5120
+      bytes_per_weight: 1
+      quant: mxfp8
+    as: wo_b_31
+    caller: gpu-worker
+  - interface: model-opt-linear-method.apply
+    input:
+      num_tokens: 32
+      in_features: 2048
+      out_features: 5120
+      bytes_per_weight: 1
+      quant: mxfp8
+    as: wo_b_32
+    caller: gpu-worker
+  - interface: model-opt-linear-method.apply
+    input:
+      num_tokens: 128
+      in_features: 2048
+      out_features: 5120
+      bytes_per_weight: 1
+      quant: mxfp8
+    as: wo_b_128
+    caller: gpu-worker
+  - interface: model-opt-linear-method.apply
+    input:
+      num_tokens: 1024
+      in_features: 2048
+      out_features: 5120
+      bytes_per_weight: 1
+      quant: mxfp8
+    as: wo_b_1024
+    caller: gpu-worker
+  expect:
+  - steps.fused_wqa_wkv_1.result.ok && steps.fused_wqa_wkv_1.result.value.out_shape == [1, 1792]
+  - steps.fused_wqa_wkv_2.result.ok && steps.fused_wqa_wkv_2.result.value.out_shape == [2, 1792]
+  - steps.fused_wqa_wkv_7.result.ok && steps.fused_wqa_wkv_7.result.value.out_shape == [7, 1792]
+  - steps.fused_wqa_wkv_16.result.ok && steps.fused_wqa_wkv_16.result.value.out_shape == [16, 1792]
+  - steps.fused_wqa_wkv_31.result.ok && steps.fused_wqa_wkv_31.result.value.out_shape == [31, 1792]
+  - steps.fused_wqa_wkv_32.result.ok && steps.fused_wqa_wkv_32.result.value.out_shape == [32, 1792]
+  - steps.fused_wqa_wkv_128.result.ok && steps.fused_wqa_wkv_128.result.value.out_shape == [128, 1792]
+  - steps.fused_wqa_wkv_1024.result.ok && steps.fused_wqa_wkv_1024.result.value.out_shape == [1024, 1792]
+  - steps.wq_b_1.result.ok && steps.wq_b_1.result.value.out_shape == [1, 8192]
+  - steps.wq_b_2.result.ok && steps.wq_b_2.result.value.out_shape == [2, 8192]
+  - steps.wq_b_7.result.ok && steps.wq_b_7.result.value.out_shape == [7, 8192]
+  - steps.wq_b_16.result.ok && steps.wq_b_16.result.value.out_shape == [16, 8192]
+  - steps.wq_b_31.result.ok && steps.wq_b_31.result.value.out_shape == [31, 8192]
+  - steps.wq_b_32.result.ok && steps.wq_b_32.result.value.out_shape == [32, 8192]
+  - steps.wq_b_128.result.ok && steps.wq_b_128.result.value.out_shape == [128, 8192]
+  - steps.wq_b_1024.result.ok && steps.wq_b_1024.result.value.out_shape == [1024, 8192]
+  - steps.wo_a_1.result.ok && steps.wo_a_1.result.value.out_shape == [1, 2048]
+  - steps.wo_a_2.result.ok && steps.wo_a_2.result.value.out_shape == [2, 2048]
+  - steps.wo_a_7.result.ok && steps.wo_a_7.result.value.out_shape == [7, 2048]
+  - steps.wo_a_16.result.ok && steps.wo_a_16.result.value.out_shape == [16, 2048]
+  - steps.wo_a_31.result.ok && steps.wo_a_31.result.value.out_shape == [31, 2048]
+  - steps.wo_a_32.result.ok && steps.wo_a_32.result.value.out_shape == [32, 2048]
+  - steps.wo_a_128.result.ok && steps.wo_a_128.result.value.out_shape == [128, 2048]
+  - steps.wo_a_1024.result.ok && steps.wo_a_1024.result.value.out_shape == [1024, 2048]
+  - steps.wo_b_1.result.ok && steps.wo_b_1.result.value.out_shape == [1, 5120]
+  - steps.wo_b_2.result.ok && steps.wo_b_2.result.value.out_shape == [2, 5120]
+  - steps.wo_b_7.result.ok && steps.wo_b_7.result.value.out_shape == [7, 5120]
+  - steps.wo_b_16.result.ok && steps.wo_b_16.result.value.out_shape == [16, 5120]
+  - steps.wo_b_31.result.ok && steps.wo_b_31.result.value.out_shape == [31, 5120]
+  - steps.wo_b_32.result.ok && steps.wo_b_32.result.value.out_shape == [32, 5120]
+  - steps.wo_b_128.result.ok && steps.wo_b_128.result.value.out_shape == [128, 5120]
+  - steps.wo_b_1024.result.ok && steps.wo_b_1024.result.value.out_shape == [1024, 5120]
+  - trace.exists(e, e.type == 'call.start' && e.interface == 'rocm-dot-scaled-mxfp8-linear-kernel.apply-weights')
+  max_events: 200000
+- id: oracle-kernels-ops-compute-expert-num-tokens
+  description: 'tests/kernels/moe/test_count_expert_num_tokens.py test_compute_expert_num_tokens: count_expert_num_tokens
+    returns per-expert counts on each EP rank, with and without the expert map. The model has no such interface, so an EP-sharded
+    MoE generate is driven and asserted to reach it. That is an arbitrary driver, not the direct call the test makes, and
+    the MoE world does not use the deep-GEMM caller (deep_gemm_utils.py:538).'
+  fixtures:
+  - full-moe-mixtral-8x7b-tp2-ep
+  steps:
+  - flow: serving-api-offline-generate
+    input: *id002
+    as: gen
+  expect:
+  - steps.gen.result.ok
+  - trace.exists(e, e.type == 'call.start' && e.interface == 'fused-moe-utils.count-expert-num-tokens')
+  max_events: 1000000

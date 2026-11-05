@@ -3,7 +3,7 @@ components:
   - id: multi-modal-registry
     name: MultiModalRegistry (MULTIMODAL_REGISTRY)
     kind: module
-    parent: model-executor
+    parent: api-server
     layer: multimodal
     summary: "The global registry that dispatches multimodal data processing to the processor a model class registered."
     sources: ["vllm/multimodal/__init__.py:5", "vllm/multimodal/registry.py:79-113"]
@@ -183,13 +183,14 @@ interfaces:
       properties:
         model: {type: string, examples: [Qwen/Qwen2-VL-7B-Instruct]}
         architectures: {type: array, items: {type: string, examples: [Qwen2VLForConditionalGeneration]}}
-        prompt_token_ids: {type: array, items: {type: integer}, maxItems: 8}
+        prompt_token_ids: {type: array, items: {type: integer}}
         mm_counts: {type: object}
         embeds: {type: boolean, default: false}
         mm_uuids: {type: [object, "null"], default: null, description: "per-modality item identities (urls or user uuids); item i defaults to '<modality>-<i>'"}
         item_bytes: {type: [integer, "null"], default: null, description: "processed size of one item; null = tokens_per_item * config['mm-item-bytes-per-token']"}
         mm_processor_kwargs: {type: object, default: {}}
-    response: {type: object, properties: {num_prompt_tokens: {type: integer}, placeholders: {type: object}, mm_hashes: {type: object}}}
+        mm_items: {type: array, default: [], items: {type: object}, description: "optional per-item data in prompt order: {modality, width, height}; image sizes give each item its own token count (the model's processing info)"}
+    response: {type: object, properties: {num_prompt_tokens: {type: integer}, placeholders: {type: object}, mm_hashes: {type: object}, mm_placeholders: {type: object}}}
     errors:
       - {code: value-error, status: 0, retryable: false}
       - {code: vllm-validation-error, status: 0, retryable: false}
@@ -204,10 +205,26 @@ interfaces:
         source: "vllm/multimodal/processing/processor.py:1829"
         call: base-processing-info.parse-mm-data
         input: {mm_data: "= input.mm_counts", supported_limits: "= vars.proc.value.supported_limits", embeds: "= input.embeds"}
-      - title: "_get_mm_hashes: each item's identity is hashed with the model id (MultiModalHasher); a user uuid replaces the data hash"
-        source: "vllm/multimodal/processing/processor.py:1396-1401"
+      - title: "_get_mm_hashes (ProcessorInputs.get_mm_hashes): a client uuid is the identity as given when the modality has no hash factors (media_io / processor kwargs); otherwise MultiModalHasher.hash_kwargs(mm_hasher_algorithm, model_id, item or uuid, factors). The digest here is a stand-in: CEL has no blake3"
+        source: "vllm/multimodal/processing/inputs.py:34-105"
         set:
-          vars.items: "= input.mm_counts.transformList(m, n, lists.range(n).map(i, {'modality': m, 'idx': i, 'tokens': m in vars.proc.value.tokens_per_item ? vars.proc.value.tokens_per_item[m] : 1, 'mm_hash': sha256(input.model + ':' + m + ':' + (input.mm_uuids != null && m in input.mm_uuids && size(input.mm_uuids[m]) > i ? string(input.mm_uuids[m][i]) : m + '-' + string(i)))})).flatten()"
+          vars.factors: "= size(input.mm_processor_kwargs) > 0 ? string(input.mm_processor_kwargs) : ''"
+      - set:
+          vars.items: "= input.mm_counts.transformList(m, n, lists.range(n).map(i, {'modality': m, 'idx': i, 'tokens': m in vars.proc.value.tokens_per_item ? vars.proc.value.tokens_per_item[m] : 1, 'mm_hash': (input.mm_uuids != null && m in input.mm_uuids && size(input.mm_uuids[m]) > i && input.mm_uuids[m][i] != null && vars.factors == '') ? string(input.mm_uuids[m][i]) : sha256(config['mm-hasher-algorithm'] + ':' + input.model + ':' + m + ':' + (input.mm_uuids != null && m in input.mm_uuids && size(input.mm_uuids[m]) > i && input.mm_uuids[m][i] != null ? string(input.mm_uuids[m][i]) : m + '-' + string(i)) + vars.factors)})).flatten()"
+      - title: "Per-item feature sizes from the model's processing info (_get_prompt_updates: Qwen2-VL / Qwen3-VL image tokens from smart_resize)"
+        source: "vllm/model_executor/models/qwen2_vl.py:1236-1265"
+        foreach: "= lists.range(size(input.mm_items))"
+        as: j
+        steps:
+          - set: {vars.mi: "= input.mm_items[vars.j]"}
+          - if: "vars.mi.modality == 'image' && has(vars.mi.width) && has(vars.mi.height) && input.architectures[0] in ['Qwen2VLForConditionalGeneration', 'Qwen3VLForConditionalGeneration']"
+            then:
+              - call: "= input.architectures[0] == 'Qwen3VLForConditionalGeneration' ? 'qwen3-vl-processing-info.get-num-image-tokens' : 'qwen2-vl-processing-info.get-num-image-tokens'"
+                targets: [qwen2-vl-processing-info.get-num-image-tokens, qwen3-vl-processing-info.get-num-image-tokens]
+                input: {image_width: "= vars.mi.width", image_height: "= vars.mi.height"}
+                as: nt
+              - set:
+                  vars.items: "= lists.range(size(vars.items)).map(i, vars.items[i].modality == 'image' && vars.items[i].idx == size(input.mm_items.slice(0, vars.j).filter(x, x.modality == 'image')) ? merge(vars.items[i], {'tokens': vars.nt.value.num_tokens}) : vars.items[i])"
       - title: The processor cache this process uses (processor_cache_from_config)
         source: "vllm/multimodal/cache/factories.py:49-63"
         call: multi-modal-cache-factories.processor-cache-from-config
@@ -225,7 +242,7 @@ interfaces:
           - title: "_get_cache_missing_items: cache.is_cached per modality (does not touch the LRU order)"
             source: "vllm/multimodal/processing/processor.py:1345-1351"
             call: "= vars.cache.value.component + '.is-cached'"
-            targets: [multi-modal-processor-only-cache.is-cached, lru-key-replicated-sender-cache.is-cached]
+            targets: [multi-modal-processor-only-cache.is-cached, lru-key-replicated-sender-cache.is-cached, shm-object-store-sender-cache.is-cached]
             input: {mm_hashes: "= vars.items.map(it, it.mm_hash)"}
             as: cached
           - set:
@@ -241,22 +258,30 @@ interfaces:
             index: k
             steps:
               - call: "= vars.cache.value.component + '.get-and-update'"
-                targets: [multi-modal-processor-only-cache.get-and-update, lru-key-replicated-sender-cache.get-and-update]
-                input:
-                  mm_hash: "= vars.it.mm_hash"
-                  item: "= vars.cached.value.cached[vars.k] ? dyn(null) : dyn({'modality': vars.it.modality, 'bytes': input.item_bytes != null ? input.item_bytes : vars.it.tokens * config['mm-item-bytes-per-token'], 'prompt_updates': {'tokens': vars.it.tokens}})"
+                targets: [multi-modal-processor-only-cache.get-and-update, lru-key-replicated-sender-cache.get-and-update, shm-object-store-sender-cache.get-and-update]
+                input: "= vars.cache.value.component == 'shm-object-store-sender-cache' ? {'mm_hash': vars.it.mm_hash, 'size_bytes': input.item_bytes != null ? input.item_bytes : vars.it.tokens * config['mm-item-bytes-per-token']} : {'mm_hash': vars.it.mm_hash, 'item': vars.cached.value.cached[vars.k] ? dyn(null) : dyn({'modality': vars.it.modality, 'bytes': input.item_bytes != null ? input.item_bytes : vars.it.tokens * config['mm-item-bytes-per-token'], 'prompt_updates': {'tokens': vars.it.tokens}})}"
           - title: release_sender_touches (in finally)
             source: "vllm/multimodal/processing/processor.py:1558-1560"
       - title: _maybe_apply_prompt_updates - one placeholder run of feature tokens per item
         source: "vllm/multimodal/processing/processor.py:1831-1840"
         set:
-          vars.ph: "= input.mm_counts.transformMap(m, n, n * (m in vars.proc.value.tokens_per_item ? vars.proc.value.tokens_per_item[m] : 1))"
+          vars.ph: "= input.mm_counts.transformMap(m, n, sum(vars.items.filter(it, it.modality == m).map(it, it.tokens)))"
+      - title: "PlaceholderRange per item: each image pad token in the prompt becomes the item's feature tokens, shifting the later offsets"
+        source: "vllm/multimodal/processing/processor.py:1690-1760"
+        set:
+          vars.img_tok: "= input.architectures[0] in ['Qwen2VLForConditionalGeneration', 'Qwen3VLForConditionalGeneration'] ? 151655 : -1"
+          vars.imgs: "= vars.items.filter(it, it.modality == 'image')"
+      - set:
+          vars.pos: "= lists.range(size(input.prompt_token_ids)).filter(i, input.prompt_token_ids[i] == vars.img_tok)"
+      - set:
+          vars.mmph: "= size(vars.pos) == size(vars.imgs) && size(vars.imgs) > 0 ? {'image': lists.range(size(vars.imgs)).map(k, {'offset': vars.pos[k] + sum(vars.imgs.slice(0, k).map(it, it.tokens)) - k, 'length': vars.imgs[k].tokens})} : {}"
       - title: mm_input(prompt_token_ids, mm_kwargs (MultiModalKwargsItems), mm_hashes, mm_placeholders)
         source: "vllm/multimodal/processing/processor.py:1842-1847"
         return:
-          num_prompt_tokens: "= size(input.prompt_token_ids) + sum(vars.ph.map(m, vars.ph[m]))"
+          num_prompt_tokens: "= size(vars.mmph) > 0 ? size(input.prompt_token_ids) - size(vars.imgs) + sum(vars.imgs.map(it, it.tokens)) + sum(vars.ph.map(m, m == 'image' ? 0 : vars.ph[m])) : size(input.prompt_token_ids) + sum(vars.ph.map(m, vars.ph[m]))"
           placeholders: "= vars.ph"
           mm_hashes: "= vars.hashes"
+          mm_placeholders: "= vars.mmph"
 
   - component: base-multi-modal-processor
     name: apply-hf-processor-main

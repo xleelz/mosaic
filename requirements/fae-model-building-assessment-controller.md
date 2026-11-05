@@ -6,7 +6,7 @@
 | Target | `~/workplace/fae` working tree (HEAD `e547c03`, about 1,160 uncommitted changes, read 2026-11-04). Line numbers refer to that working tree. |
 | Scope | The controller and gate side: the coordinator as a fae Controller, per-round templates, gate steps, decision points, artifact passing, blind roles, prompt parameters, kernel floors, commit and push, secrets and observability. The execution side (sessions, fan-out width, concurrency, recursion) is covered by the parallel assessment, `requirements/fae-model-building-assessment-execution.md`. |
 | New | FAE-CTL-101 to FAE-CTL-113 |
-| Builds on | `requirements/fae-hierarchical-workflows.md` (FAE-WF-095 to -104, FAE-SCH-023, FAE-API-034 to -036, FAE-CLI-055, -056), `requirements/fae-host-workflow-limit.md` (FAE-SCH-015 to -022, FAE-CLI-044) |
+| Builds on | `requirements/fae-hierarchical-workflows.md` (FAE-WF-097 to -104, FAE-SCH-024, FAE-API-034 to -036, FAE-CLI-055, -056), `requirements/fae-host-workflow-limit.md` (FAE-SCH-016 to -022, FAE-CLI-044) |
 
 Another process owns fae's working tree, so this document lives in mosaic. The proposals are
 written in REQUIREMENTS.md's form, so that they can be pasted in.
@@ -75,8 +75,8 @@ Status: **S** supported, **P** partly, **M** missing.
 | Coordinator acts as a Controller over the daemon API | S | Glossary `REQUIREMENTS.md:59`; FAE-OPS-001 `:943`; `api/principal.go:22-42`; `daemon/principals.go:20-70`; `daemon/authority.go:76-78` | Credential file (0600, outside any repo) names actor `controller`. Every mutating RPC is open to it, ProphetChat excepted. |
 | Authorizing messages | P | FAE-OPS-002 `REQUIREMENTS.md:956`; `controlplane/action_authority.go:56-62`; `daemon/messages.go:60-66`; `controlplane/job.go:421-424`; `controlplane/store.go:39-40` | The operator must record each message; a controller can only relay one, and a relay carries no authority. One message whose `authorize.classes` are `[governance, task]` covers put, admit and decide. It expires after 24 h (default `MessageMaxAge`), so a multi-day round needs fresh operator messages. → FAE-CTL-111 |
 | Author a new template per round: validate, simulate, put | S | FAE-CLI-020 `REQUIREMENTS.md:1107`; `cmd/fae/workflow.go:31, 92-110`; `daemon/authority.go:31-32` (`WorkflowValidate`, `WorkflowSimulate` reads; `WorkflowInstall` governance) | Validate runs offline and lists every error. Simulate runs the real engine on scripted outputs (`GRAMMAR.md:140-148`), but doesn't run SubWorkflow children (`GRAMMAR.md:295-297`). Revisions are immutable, and a put appends latest+1 (FAE-WF-002). |
-| Admit tasks on a chosen revision | S | `daemon/rpc.go:20-50` (`WorkflowID`, `Revision`, `Content`, `DeclaredFiles`, `TestFilter`, `TaskClass`); `daemon/authority.go:32` | No typed inputs or parent link (FAE-WF-099, -100 still proposed). |
-| Footprint and host limit before admitting about 10 tasks | M | not in the code (see above) | FAE-SCH-015 to -022 are still proposed. |
+| Admit tasks on a chosen revision | S | `daemon/rpc.go:20-50` (`WorkflowID`, `Revision`, `Content`, `DeclaredFiles`, `TestFilter`, `TaskClass`); `daemon/authority.go:32` | No typed inputs or parent link (FAE-WF-101, -100 still proposed). |
+| Footprint and host limit before admitting about 10 tasks | M | not in the code (see above) | FAE-SCH-016 to -022 are still proposed. |
 
 ### Gates and decisions
 
@@ -100,7 +100,7 @@ Status: **S** supported, **P** partly, **M** missing.
 | Agents read the code under study and the model | **M** | `provider/claude.go:16-19, 78` (`--tools ""`; only `StructuredOutput`); `provider/codex.go:169` (read-only sandbox, shell disabled); `provider/README.md:10-46`; `LIVE.md:9-12, 551` ("general brokered agent command tools ... remain open") | A turn sees its declared files in full and a list of paths (at most 5,000). Each file is capped at 1 MiB and a turn at 4 MiB. One gateway-platform fragment is 2.0 MB, and merged models run from 5.5 MB to 22 MB. The snapshot is outside the bound workspace (one workspace per instance, `REQUIREMENTS.md:55`). → FAE-CTL-101, -102 |
 | Agents write fragment documents | P | Edits only in `test-first` and `implement` phases (`provider/README.md:121-129`). `phase` is closed to those two (`workflow/workflow.go:577`). A change producer can't be in a FanOut (`workflow/fan.go:194-196`). | An area agent would be a code-style `implement` change producer, one task per area. → FAE-CTL-104 |
 | "Blind" role with restricted readable inputs | P | Inputs are bound explicitly (FAE-WF-031); siblings are hidden in a FanOut (`GRAMMAR.md:259-260`). But scope is **per task**: `taskScopeBlock(binding.Scope)` in every brief (`execution/executor.go:52-55, 543`), and every turn gets the repository path list (`provider/README.md:52-56`). | Blindness holds across tasks with disjoint declared files, never across stages of one task, and file names still show in the path list. → FAE-CTL-106 |
-| Per-area prompt parameters | P | Brief templates are static strings, sent as-is beside the bound inputs (`execution/executor.go:531-545`). Task `Content` reaches every brief as acceptance context (`daemon/backlog.go:862-871`, `daemon/live.go:331`). No template parameters (`daemon/rpc.go:20-50`). | Today: one task per area, with the area spec in `Content` and its files in `DeclaredFiles`. → FAE-CTL-107 (with FAE-WF-099) |
+| Per-area prompt parameters | P | Brief templates are static strings, sent as-is beside the bound inputs (`execution/executor.go:531-545`). Task `Content` reaches every brief as acceptance context (`daemon/backlog.go:862-871`, `daemon/live.go:331`). No template parameters (`daemon/rpc.go:20-50`). | Today: one task per area, with the area spec in `Content` and its files in `DeclaredFiles`. → FAE-CTL-107 (with FAE-WF-101) |
 
 ### Floors, commits, secrets and observability
 
@@ -265,8 +265,8 @@ A role's sessions read the task worktree plus the roots the role names.
   (default 1 MiB, maximum 16 MiB).
 - An `author` stage MAY sit inside a FanOut region when the regions' `writes` globs are provably
   disjoint. The validator MUST refuse overlapping globs.
-- It complements FAE-WF-102 (`produces: artifacts`): `author` writes files that are later
-  committed, while FAE-WF-102 writes no commits.
+- It complements FAE-WF-104 (`produces: artifacts`): `author` writes files that are later
+  committed, while FAE-WF-104 writes no commits.
 - *Rationale:* an area agent writes YAML, notes and skip files, not code. Pretending it's an
   `implement` turn imports code-only rules, keeps it out of fan-outs, and caps its fragment at
   1 MiB.
@@ -329,8 +329,8 @@ scope.
 
 ### Parameters (§4.4)
 
-**FAE-CTL-107 (MUST)** Brief templates MAY reference the workflow's signature inputs (FAE-WF-099)
-and, inside a dynamic FanOut branch, its `item` (FAE-WF-095), as `{{input.<name>}}` and
+**FAE-CTL-107 (MUST)** Brief templates MAY reference the workflow's signature inputs (FAE-WF-101)
+and, inside a dynamic FanOut branch, its `item` (FAE-WF-097), as `{{input.<name>}}` and
 `{{item.<path>}}`.
 - The executor MUST render each reference as a quoted, typed data block positioned at the
   reference (FAE-WF-043's structured binding), never by splicing text into instructions.
@@ -473,7 +473,7 @@ It MUST be consistent with the event stream at a stated sequence number.
    FAE-OPS-001 forbids to workflow roles. That is probably right.
 2. **Blind by task or by stage?** FAE-CTL-106 makes it per stage. The cheaper alternative is to
    keep blind roles in separate tasks and only filter the path list.
-3. **One template per round, or one with parameters?** With FAE-CTL-107 and FAE-WF-099, briefs
+3. **One template per round, or one with parameters?** With FAE-CTL-107 and FAE-WF-101, briefs
    can stay stable and per-round content can go in inputs. Per-round revisions are still useful
    when a round changes the graph.
 4. **`mcheck` in the broker.** `go run` compiles on every call. Should the target pin a prebuilt

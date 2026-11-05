@@ -129,7 +129,7 @@ interfaces:
         then:
           - title: One BlockRemoved event per evicted hash (the hash bytes, or a 64-bit int with VLLM_KV_EVENTS_USE_INT_BLOCK_HASHES)
             source: "vllm/v1/core/block_pool.py:615-625"
-            set: {state.kv_event_queue: "= state.kv_event_queue + vars.evicted.map(h, {'type': 'BlockRemoved', 'block_hashes': [h], 'group_idx': 0})"}
+            set: {state.kv_event_queue: "= state.kv_event_queue + vars.evicted.map(h, {'type': 'BlockRemoved', 'block_hashes': [h], 'medium': 'GPU', 'group_idx': 0})"}
       - return: {block_ids: "= vars.ids", evicted_hashes: "= vars.evicted"}
 
   - component: block-pool
@@ -168,6 +168,10 @@ interfaces:
       properties:
         block_ids: {type: array, items: {type: integer}}
         block_hashes: {type: array, items: {type: string}}
+        parent_block_hash: {type: [string, "null"], default: null, description: "KV events only: the hash of the block before the first newly cached one (None from block 0)."}
+        token_ids: {type: [array, "null"], default: null, description: "KV events only: all_token_ids[num_cached_blocks * block_size : num_full_blocks * block_size]."}
+        lora_request: {type: [object, "null"], default: null}
+        group_idx: {type: integer, default: 0}
     response: {type: object, properties: {cached: {type: integer}}}
     behavior:
       - set:
@@ -181,8 +185,9 @@ interfaces:
       - if: "config['enable-kv-cache-events'] && size(vars.pairs) > 0"
         then:
           - title: Queue a BlockStored event for the newly cached blocks
-            source: "vllm/v1/core/block_pool.py:333-345"
-            set: {state.kv_event_queue: "= state.kv_event_queue + [{'type': 'BlockStored', 'block_hashes': vars.pairs.map(p, p.h), 'group_idx': 0}]"}
+            detail: "_build_block_stored_event: the new hashes, the parent hash, the blocks' token ids, block_size, the LoRA id and name, medium GPU, extra_keys (None for a text request without salt) and the group."
+            source: "vllm/v1/core/block_pool.py:303-377"
+            set: {state.kv_event_queue: "= state.kv_event_queue + [{'type': 'BlockStored', 'block_hashes': vars.pairs.map(p, p.h), 'parent_block_hash': has(input.parent_block_hash) ? input.parent_block_hash : dyn(null), 'token_ids': has(input.token_ids) ? input.token_ids : dyn(null), 'block_size': int(config['block-size']), 'lora_id': has(input.lora_request) && input.lora_request != null ? input.lora_request.lora_int_id : dyn(null), 'medium': 'GPU', 'lora_name': has(input.lora_request) && input.lora_request != null ? input.lora_request.lora_name : dyn(null), 'extra_keys': null, 'group_idx': has(input.group_idx) ? input.group_idx : 0, 'session_id': null}]"}
       - return: {cached: "= size(vars.pairs)"}
 
   - component: block-pool
@@ -238,6 +243,11 @@ interfaces:
             source: "vllm/v1/core/block_pool.py:838-845"
             return: {reset: false}
       - set: {state.cached: {}, state.block_hash: {}, state.hash_tokens: {}}
+      - if: "config['enable-kv-cache-events']"
+        then:
+          - title: Queue one AllBlocksCleared event
+            source: "vllm/v1/core/block_pool.py:863-864"
+            set: {state.kv_event_queue: "= state.kv_event_queue + [{'type': 'AllBlocksCleared'}]"}
       - return: {reset: true}
 
   # ======================================================== full attention manager
@@ -385,6 +395,8 @@ interfaces:
         request_id: {type: string}
         num_tokens: {type: integer}
         block_hashes: {type: array, items: {type: string}}
+        token_ids: {type: [array, "null"], default: null, description: "KV events only: request.all_token_ids (prompt then output). A prompt given as segments has no ids; each of its positions is the stand-in '<segment key>#<offset>'."}
+        lora_request: {type: [object, "null"], default: null, description: "KV events only: the request's LoRA (lora_int_id, lora_name)."}
     response: {type: object, properties: {num_cached_blocks: {type: integer}}}
     behavior:
       - set:
@@ -397,6 +409,9 @@ interfaces:
         input:
           block_ids: "= vars.blocks.slice(vars.num_cached, math.least(vars.num_full, size(vars.blocks)))"
           block_hashes: "= input.block_hashes.slice(vars.num_cached, vars.num_full)"
+          parent_block_hash: "= vars.num_cached == 0 ? dyn(null) : input.block_hashes[vars.num_cached - 1]"
+          token_ids: "= has(input.token_ids) && input.token_ids != null ? input.token_ids.slice(math.least(vars.num_cached * int(config['block-size']), size(input.token_ids)), math.least(vars.num_full * int(config['block-size']), size(input.token_ids))) : dyn(null)"
+          lora_request: "= has(input.lora_request) ? input.lora_request : dyn(null)"
       - set: {state.num_cached_block: "= merge(state.num_cached_block, {input.request_id: vars.num_full})"}
       - return: {num_cached_blocks: "= vars.num_full"}
 
@@ -446,6 +461,9 @@ interfaces:
         block_hashes: {type: array, items: {type: string}}
         num_tokens: {type: integer}
         skip_reading_prefix_cache: {type: boolean, default: false}
+        kv_cache_report_mode: {type: string, default: incremental, enum: [incremental, full], description: "Request.kv_cache_report_mode: sampling_params.extra_args['kv_cache_report_mode'], default incremental (request.py:122-130)."}
+        token_ids: {type: [array, "null"], default: null, description: "KV events only: request.all_token_ids (prompt then output). A prompt given as segments has no ids; each of its positions is the stand-in '<segment key>#<offset>'."}
+        lora_request: {type: [object, "null"], default: null, description: "KV events only: the request's LoRA (lora_int_id, lora_name)."}
     response: {type: object, properties: {blocks: {type: array, items: SchedKvBlock}, num_computed_tokens: {type: integer}, mamba_block: {}}}
     behavior:
       - if: "!config['enable-prefix-caching'] || (has(input.skip_reading_prefix_cache) && input.skip_reading_prefix_cache)"
@@ -468,6 +486,16 @@ interfaces:
         call: full-attention-manager.find-longest-cache-hit
         input: {block_hashes: "= input.block_hashes", max_length: "= input.num_tokens - 1"}
         as: hit
+      - if: "vars.hit.value.hit_length > 0 && config['enable-kv-cache-events'] && has(input.kv_cache_report_mode) && input.kv_cache_report_mode == 'full'"
+        then:
+          - title: kv_cache_report_mode full - announce the reused prefix-cache blocks as BlockStored
+            source: "vllm/v1/core/kv_cache_manager.py:302-310"
+            call: block-pool.emit-cached-block-events
+            input:
+              block_hashes: "= input.block_hashes"
+              num_cached_blocks: "= size(vars.hit.value.blocks)"
+              token_ids: "= has(input.token_ids) ? input.token_ids : dyn(null)"
+              lora_request: "= has(input.lora_request) ? input.lora_request : dyn(null)"
       - return: {blocks: "= vars.hit.value.blocks", num_computed_tokens: "= vars.hit.value.hit_length", mamba_block: null}
 
   - component: kv-cache-manager
@@ -495,6 +523,8 @@ interfaces:
         block_hashes: {type: array, default: [], items: {type: string}}
         full_sequence_must_fit: {type: boolean, default: false}
         has_scheduled_reqs: {type: boolean, default: true}
+        token_ids: {type: [array, "null"], default: null, description: "KV events only: request.all_token_ids (prompt then output). A prompt given as segments has no ids; each of its positions is the stand-in '<segment key>#<offset>'."}
+        lora_request: {type: [object, "null"], default: null, description: "KV events only: the request's LoRA (lora_int_id, lora_name)."}
     response:
       type: object
       properties:
@@ -597,6 +627,8 @@ interfaces:
           request_id: "= input.request_id"
           num_tokens: "= math.least(vars.total + input.num_new_tokens, has(input.num_tokens) ? input.num_tokens : vars.total + input.num_new_tokens)"
           block_hashes: "= vars.hashes"
+          token_ids: "= has(input.token_ids) ? input.token_ids : dyn(null)"
+          lora_request: "= has(input.lora_request) ? input.lora_request : dyn(null)"
       - call: full-attention-manager.get-block-ids
         input: {request_id: "= input.request_id"}
         as: table
@@ -608,7 +640,15 @@ interfaces:
     latency_ms: 0
     summary: "Cache a request's full blocks, if prefix caching is enabled (a no-op otherwise)."
     sources: ["vllm/v1/core/kv_cache_manager.py:782-792"]
-    request: {type: object, required: [request_id, num_tokens], properties: {request_id: {type: string}, num_tokens: {type: integer}, block_hashes: {type: array, default: [], items: {type: string}}}}
+    request:
+      type: object
+      required: [request_id, num_tokens]
+      properties:
+        request_id: {type: string}
+        num_tokens: {type: integer}
+        block_hashes: {type: array, default: [], items: {type: string}}
+        token_ids: {type: [array, "null"], default: null, description: "KV events only: request.all_token_ids (prompt then output). A prompt given as segments has no ids; each of its positions is the stand-in '<segment key>#<offset>'."}
+        lora_request: {type: [object, "null"], default: null, description: "KV events only: the request's LoRA (lora_int_id, lora_name)."}
     response: {type: object, properties: {cached: {type: boolean}}}
     behavior:
       - if: "!config['enable-prefix-caching'] || !has(input.block_hashes) || size(input.block_hashes) == 0"
@@ -617,7 +657,7 @@ interfaces:
             source: "vllm/v1/core/kv_cache_manager.py:791-792"
             return: {cached: false}
       - call: full-attention-manager.cache-blocks
-        input: {request_id: "= input.request_id", num_tokens: "= input.num_tokens", block_hashes: "= input.block_hashes"}
+        input: {request_id: "= input.request_id", num_tokens: "= input.num_tokens", block_hashes: "= input.block_hashes", token_ids: "= has(input.token_ids) ? input.token_ids : dyn(null)", lora_request: "= has(input.lora_request) ? input.lora_request : dyn(null)"}
       - if: "size(state.kv_cache_groups) > 1"
         then:
           - title: Hybrid - the Mamba group checkpoints its state at the newest full block
@@ -768,7 +808,7 @@ interfaces:
           vars.bs: "= int(config['block-size'])"
       - set:
           vars.p: "= sum(vars.segs.map(s, s.num_tokens))"
-          vars.starts: "= lists.range(size(vars.segs)).map(j, sum(vars.segs.slice(0, j).map(s, s.num_tokens)))"
+          vars.starts: "= vars.segs.all(s, s.num_tokens == 1) ? lists.range(size(vars.segs)) : lists.range(size(vars.segs)).map(j, sum(vars.segs.slice(0, j).map(s, s.num_tokens)))"
       - set:
           vars.n_full: "= (vars.p + size(vars.out)) / vars.bs"
       - if: "vars.start >= vars.n_full"

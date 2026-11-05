@@ -3,7 +3,16 @@ configs:
   - {id: vllm-max-audio-clip-filesize-mb, type: number, value: 25, default: 25, summary: "VLLM_MAX_AUDIO_CLIP_FILESIZE_MB: the largest audio file run-batch downloads or decodes (MiB)", sources: ["vllm/envs.py:1023-1025", "vllm/entrypoints/launchers/run_batch.py:77-78"], attributes: {key: VLLM_MAX_AUDIO_CLIP_FILESIZE_MB}}
   - {id: shutdown-timeout, type: integer, value: 0, default: 0, summary: "shutdown_timeout (seconds): 0 makes the API server stop the engine client in abort mode, >0 in drain mode (owned by engine-core)", sources: ["vllm/config/vllm.py:443"], attributes: {key: shutdown_timeout, boundary: true, owner: engine-core}}
 components:
-  - {id: instrumentator-metrics, name: metrics instrumentator, kind: module, parent: api-server, layer: api, summary: "GET /metrics: prometheus_client's ASGI app mounted on the API server, exposing the process registry the PrometheusStatLogger writes vllm:* metrics into (text exposition format).", sources: ["vllm/entrypoints/serve/instrumentator/metrics.py:56-81", "vllm/entrypoints/serve/instrumentator/__init__.py:7-22"]}
+  - id: instrumentator-metrics
+    name: metrics instrumentator
+    kind: module
+    parent: api-server
+    layer: api
+    summary: "GET /metrics: prometheus_client's ASGI app mounted on the API server, exposing the process registry the PrometheusStatLogger writes vllm:* metrics into (text exposition format), plus prometheus_fastapi_instrumentator's http_* series for every handler except the info routes."
+    sources: ["vllm/entrypoints/serve/instrumentator/metrics.py:56-81", "vllm/entrypoints/serve/instrumentator/__init__.py:7-22"]
+    state:
+      schema: {type: object, properties: {http_requests: {type: object, description: "http_requests_total by '<method> <handler> <status class>'"}}}
+      initial: {http_requests: {}}
   - {id: deepseek-v3-reasoning-parser, name: DeepSeekV3ReasoningParser, kind: module, parent: api-server, layer: parsers, summary: "--reasoning-parser deepseek_v3: built per request with the effective chat_template_kwargs; thinking (or enable_thinking) delegates to DeepSeekR1ReasoningParser (<think>...</think>), otherwise to IdentityReasoningParser (all content).", sources: ["vllm/reasoning/deepseek_v3_reasoning_parser.py:20-60", "vllm/reasoning/basic_parsers.py:153-176", "vllm/reasoning/identity_reasoning_parser.py:67-72"]}
   - {id: cohere-command-parser, name: CohereCommandParser, kind: module, parent: api-server, layer: parsers, summary: "The unified Cohere Command parser (cohere_command3 / cohere_command4): melody-based reasoning, citations and tool calls; adjust_request folds JSON schemas and tools into structural tags.", sources: ["vllm/parser/cohere_command.py:472-691"]}
   - {id: online-derenderer, name: OnlineDerenderer, kind: module, parent: api-server, layer: api, summary: "renderers.online_derenderer: turns token-in/token-out generate chunks back into chat (or completion) responses; the stream path replays prior chunks through the parser and pins tool-call ids across chunks.", sources: ["vllm/renderers/online_derenderer.py:500-700"]}
@@ -105,9 +114,34 @@ interfaces:
         source: "vllm/entrypoints/serve/instrumentator/metrics.py:76-81"
         call: prometheus-registry.collect
         as: all
+      - title: "Instrumentator().add() registers http_requests_total (method, status, handler) in the same registry; an excluded handler never gets a series, but the HELP and TYPE lines are always exposed"
+        source: "vllm/entrypoints/serve/instrumentator/metrics.py:63-74"
+        set:
+          vars.http: "= ['# HELP http_requests_total Total number of requests by method, status and handler.', '# TYPE http_requests_total counter'] + state.http_requests.map(k, 'http_requests_total{handler=\"' + k.split(' ')[1] + '\",method=\"' + k.split(' ')[0] + '\",status=\"' + k.split(' ')[2] + '\"} ' + string(state.http_requests[k]) + '.0')"
       - title: "PrometheusResponse: Content-Type text/plain; version=0.0.4; charset=utf-8"
         source: "vllm/entrypoints/serve/instrumentator/metrics.py:51-53"
-        return: {content_type: "text/plain; version=0.0.4; charset=utf-8", metrics: "= vars.all.value"}
+        return: {content_type: "text/plain; version=0.0.4; charset=utf-8", metrics: "= vars.all.value", http_metrics: "= vars.http"}
+  - component: instrumentator-metrics
+    name: observe-request
+    kind: function
+    latency_ms: 0
+    summary: "The Instrumentator's middleware: after a response, count it in http_requests_total by method, handler template and status class, unless the handler is excluded (/metrics, /health, /load, /ping, /version, /server_info)."
+    sources: ["vllm/entrypoints/serve/instrumentator/metrics.py:63-74"]
+    request: {type: object, properties: {method: {type: string, examples: [POST]}, handler: {type: string, examples: [/v1/chat/completions]}, status: {type: string, examples: [2xx]}}, required: [method, handler, status]}
+    behavior:
+      - if: "input.handler in ['/metrics', '/health', '/load', '/ping', '/version', '/server_info']"
+        then: [{title: "excluded_handlers", source: "vllm/entrypoints/serve/instrumentator/metrics.py:64-71", return: {recorded: false}}]
+      - call: instrumentator-metrics.incr-http-requests
+        input: {key: "= input.method + ' ' + input.handler + ' ' + input.status"}
+      - return: {recorded: true}
+  - component: instrumentator-metrics
+    name: incr-http-requests
+    kind: function
+    latency_ms: 0
+    summary: "http_requests_total.labels(method, status, handler).inc()"
+    sources: ["vllm/entrypoints/serve/instrumentator/metrics.py:72-74"]
+    request: {type: object, properties: {key: {type: string, examples: [POST /v1/chat/completions 2xx]}}, required: [key]}
+    store: {table: http_requests, op: incr, key: "= input.key", value: 1}
   - component: launcher
     name: handle-shutdown-signal
     kind: function
@@ -535,6 +569,7 @@ scenarios:
     steps:
       - {flow: serving-api-chat-stream, as: s, input: {body: {messages: [{role: user, content: hi}], stream: true, logprobs: true, top_logprobs: 30}}}
     expect:
+      - "trace.exists(e, e.type == 'call.end' && e.interface == 'instrumentator-metrics.observe-request' && e.output.recorded)"
       - "steps.s.result.ok && size(steps.s.result.value.items) == 2"
       - "steps.s.result.value.items[0].error.code == 400 && steps.s.result.value.items[0].error.type == 'BadRequestError' && steps.s.result.value.items[0].error.message.startsWith('Requested sample logprobs of 30, which is greater than max allowed: 20')"
       - "!steps.s.result.value.items.exists(i, json(i).contains('assistant'))"
@@ -560,15 +595,16 @@ scenarios:
       - "steps.echo.result.ok && steps.echo.result.value.choices[0].text.startsWith('Hello world') && steps.echo.result.value.usage.completion_tokens <= 2"
       - "steps.beam_stream.result.error.message == 'Streaming is not currently supported with beam search'"
   - id: serving-api-r5-online-beam-search
-    name: "Online beam search: one one-token request per live beam per step under <request_id>-<uuid>-beam-<i>, with logprobs 2 x beam_width; without sample logprobs from the engine no beam extends"
+    name: "Online beam search: one one-token request per live beam per step under <request_id>-<uuid>-beam-<i>, with logprobs 2 x beam_width; the forwarded logprobs extend the single prompt beam to beam_width distinct beams, which each later step sends again"
     fixtures: [full-tp1-llama-8b]
     max_events: 400000
     steps:
       - {interface: generate-base-serving.beam-search, caller: api-server, as: bs, input: {prompt_token_ids: [128000, 791, 6864], request_id: cmpl-bs, params: {beam_width: 3, max_tokens: 4, temperature: 0.0}}}
     expect:
       - "steps.bs.result.ok && steps.bs.result.value.finished"
-      - "trace.filter(e, e.type == 'call.start' && e.interface == 'async-llm.generate').all(e, e.input.sampling_params.max_tokens == 1 && e.input.sampling_params.logprobs == 6 && e.input.request_id.startsWith('cmpl-bs-') && e.input.request_id.endsWith('-beam-0'))"
-      - "calls['async-llm.generate'] >= 1"
+      - "trace.filter(e, e.type == 'call.start' && e.interface == 'async-llm.generate').all(e, e.input.sampling_params.max_tokens == 1 && e.input.sampling_params.logprobs == 6 && e.input.request_id.startsWith('cmpl-bs-') && e.input.request_id.matches('-beam-[0-2]$'))"
+      - "calls['async-llm.generate'] == 10 && trace.filter(e, e.type == 'call.start' && e.interface == 'async-llm.generate' && e.input.request_id.endsWith('-beam-2')).size() == 3"
+      - "size(steps.bs.result.value.final.completions) == 3 && steps.bs.result.value.final.completions.all(c, size(c.token_ids) == 4) && steps.bs.result.value.final.completions[0].token_ids != steps.bs.result.value.final.completions[1].token_ids"
   - id: serving-api-r5-tokenize-precision
     name: "/tokenize does not check max_model_len, refuses continue_final_message with add_generation_prompt (no parameter), honors add_special_tokens; /detokenize refuses a negative id in pydantic; the FP8 world reports its 8192 max_model_len"
     fixtures: [full-fp8-llama-3-8b]
@@ -590,6 +626,7 @@ scenarios:
       - {interface: serving-tokenization.post-tokenize, caller: api-client, as: tok, input: {path: /tokenize, body: {model: llama-3-8b-fp8, prompt: Hello world}}}
       - {flow: serving-api-completion, as: long, input: {body: {model: llama-3-8b-fp8, prompt: Hello, max_tokens: 9000}}}
     expect:
+      - "trace.exists(e, e.type == 'call.end' && e.interface == 'instrumentator-metrics.observe-request' && e.output.recorded)"
       - "steps.tok.result.value.max_model_len == 8192 && steps.tok.result.value.tokens == [128000, 9906, 1917]"
       - "steps.long.result.error.status == 400 && steps.long.result.error.message.startsWith('max_tokens=9000 cannot be greater than max_model_len=8192')"
   - id: serving-api-r5-http-plumbing

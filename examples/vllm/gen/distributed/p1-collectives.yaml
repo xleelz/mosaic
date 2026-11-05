@@ -118,6 +118,7 @@ components:
           world_initialized: {type: boolean}
           mp_initialized: {type: boolean}
           world_size: {type: integer}
+          rank: {type: integer, description: "this process's global torch.distributed rank; -1 = the instance's rank index"}
           backend: {type: string}
           custom_all_reduce_enabled: {type: boolean}
           groups: {type: object}
@@ -125,7 +126,7 @@ components:
       # The default world is a worker after startup: Worker.init_device already ran
       # init_worker_distributed_environment, so the groups exist and follow the deployed
       # config (tensor-parallel-size). Scenarios of a fresh process override the flags.
-      initial: {world_initialized: true, mp_initialized: true, world_size: 0, backend: nccl, custom_all_reduce_enabled: true, groups: {pp: {world_size: 1, unique_name: "pp:0"}, dp: {world_size: 1, unique_name: "dp:0"}}, destroyed_groups: []}
+      initial: {world_initialized: true, mp_initialized: true, world_size: 0, rank: -1, backend: nccl, custom_all_reduce_enabled: true, groups: {pp: {world_size: 1, unique_name: "pp:0"}, dp: {world_size: 1, unique_name: "dp:0"}}, destroyed_groups: []}
   - id: tensor-model-parallel
     name: communication_op (tensor_model_parallel_* helpers)
     kind: module
@@ -262,7 +263,7 @@ interfaces:
   - component: parallel-state
     name: init-distributed-environment
     kind: function
-    summary: "Create the world process group (torch.distributed.init_process_group) and the world GroupCoordinator, falling back to gloo when the backend is unavailable."
+    summary: "init_distributed_environment: with DP > 1 offset the rank by the DP rank and widen the world to TP x PP x DP over a tcp:// DP init method; if torch.distributed isn't initialized log the world and init_process_group (falling back to gloo when the backend is unavailable); resolve local_rank; build the world GroupCoordinator once, or assert an existing one has the same size."
     sources: ["vllm/distributed/parallel_state.py:1814-2016"]
     request:
       type: object
@@ -272,37 +273,62 @@ interfaces:
         rank: {type: integer, examples: [0]}
         local_rank: {type: integer, default: -1}
         backend: {type: string, default: nccl}
-        distributed_init_method: {type: string, default: "env://"}
+        distributed_init_method: {type: string, default: "env://", description: "the executor's tcp://<loopback>:<open port> for multiprocessing workers (worker_base); env:// otherwise"}
         backend_available: {type: boolean, default: true}
-    response: {type: object, properties: {world_size: {type: integer}, backend: {type: string}, already_initialized: {type: boolean}}}
+        data_parallel_rank: {type: integer, default: 0}
+        dp_init_port: {type: [integer, "null"], default: null, description: "the port get_next_dp_init_port pops; null takes data_parallel_master_port (29500)"}
+    response: {type: object, properties: {world_size: {type: integer}, rank: {type: integer}, local_rank: {type: integer}, backend: {type: string}, distributed_init_method: {type: string}, already_initialized: {type: boolean}, log: {type: [string, "null"]}}}
     errors:
       - {code: assertion-error, status: 0, retryable: false, summary: "world group already initialized with a different world size"}
     behavior:
+      - set:
+          vars.args: "= merge({'local_rank': -1, 'backend': 'nccl', 'distributed_init_method': 'env://', 'backend_available': true, 'data_parallel_rank': 0, 'dp_init_port': null}, input)"
+      - set:
+          vars.ws: "= vars.args.world_size"
+          vars.rank: "= vars.args.rank"
+          vars.method: "= vars.args.distributed_init_method"
+          vars.backend: "= vars.args.backend"
+          vars.log: null
+      - title: "DP > 1 (not external_launcher, one node): rank += data_parallel_rank * world_size, world_size = world_size_across_dp, init method tcp://data_parallel_master_ip:<next DP init port>"
+        source: "vllm/distributed/parallel_state.py:1835-1904"
+        if: "config['data-parallel-size'] > 1 && (!('distributed-executor-backend' in config) || config['distributed-executor-backend'] != 'external_launcher')"
+        then:
+          - set:
+              vars.rank: "= vars.args.data_parallel_rank * vars.args.world_size + vars.args.rank"
+              vars.ws: "= vars.args.world_size * config['data-parallel-size']"
+              vars.method: "= 'tcp://127.0.0.1:' + string(vars.args.dp_init_port != null ? vars.args.dp_init_port : 29500)"
       - if: "state.world_initialized"
         then:
           - title: World group already exists
             detail: "torch.distributed is initialized; the world GroupCoordinator must match the requested world size."
             source: "vllm/distributed/parallel_state.py:1989-1992"
-            if: "state.world_size > 0 && state.world_size != input.world_size"
+            if: "state.world_size > 0 && state.world_size != vars.ws"
             then:
               - fail: {code: assertion-error, status: 0, message: "world group already initialized with a different world size"}
-          - return: {world_size: "= input.world_size", backend: "= state.backend", already_initialized: true}
-      - title: Fall back to gloo when the backend is missing
-        source: "vllm/distributed/parallel_state.py:1913-1922"
-        if: "!input.backend_available"
+          - return: {world_size: "= vars.ws", rank: "= vars.rank", local_rank: "= vars.args.local_rank == -1 ? vars.rank : vars.args.local_rank", backend: "= state.backend", distributed_init_method: "= vars.method", already_initialized: true, log: null}
+      - title: "world_size=%d rank=%d local_rank=%d distributed_init_method=%s backend=%s (info, before init_process_group)"
+        source: "vllm/distributed/parallel_state.py:1905-1913"
+        set:
+          vars.log: "= 'world_size=' + string(vars.ws) + ' rank=' + string(vars.rank) + ' local_rank=' + string(vars.args.local_rank) + ' distributed_init_method=' + vars.method + ' backend=' + vars.backend"
+      - title: "Distributed backend <backend> is not available; falling back to gloo."
+        source: "vllm/distributed/parallel_state.py:1918-1925"
+        if: "!vars.args.backend_available"
         then:
           - set: {vars.backend: gloo}
-        else:
-          - set: {vars.backend: "= input.backend"}
+      - title: "local_rank -1: LOCAL_RANK for env://, else the rank"
+        source: "vllm/distributed/parallel_state.py:1966-1972"
+        set:
+          vars.local: "= vars.args.local_rank != -1 ? vars.args.local_rank : vars.rank"
       - title: init_process_group and the world GroupCoordinator
         detail: "The world group spans every rank (ranks = range(world_size)); the node count is derived from the CPU group."
         source: "vllm/distributed/parallel_state.py:1981-1988"
         set:
           state.world_initialized: true
-          state.world_size: "= input.world_size"
+          state.world_size: "= vars.ws"
+          state.rank: "= vars.rank"
           state.backend: "= vars.backend"
-          state.groups: "= merge(state.groups, {'world': {'world_size': input.world_size, 'unique_name': 'world:0'}})"
-      - return: {world_size: "= input.world_size", backend: "= vars.backend", already_initialized: false}
+          state.groups: "= merge(state.groups, {'world': {'world_size': vars.ws, 'unique_name': 'world:0'}})"
+      - return: {world_size: "= vars.ws", rank: "= vars.rank", local_rank: "= vars.local", backend: "= vars.backend", distributed_init_method: "= vars.method", already_initialized: false, log: "= vars.log"}
 
   - component: parallel-state
     name: set-custom-all-reduce
@@ -340,10 +366,12 @@ interfaces:
     errors:
       - {code: assertion-error, status: 0, retryable: false}
     behavior:
-      - if: "!state.mp_initialized"
+      - title: "model_parallel_is_initialized: the TP and PP groups exist. A world seeded without a TP group has not built its groups yet, so a MoE checkpoint builds them here and gets its EP group"
+        source: "vllm/distributed/parallel_state.py:2385-2391"
+        if: "!state.mp_initialized || (has(input.is_moe) && input.is_moe && !('tp' in state.groups))"
         then:
           - call: parallel-state.initialize-model-parallel
-            input: "= input"
+            input: "= merge({'data_parallel_size': null}, input)"
             as: init
           - return: {tp_world_size: "= input.tensor_model_parallel_size", pp_world_size: "= input.pipeline_model_parallel_size", created: true}
       - title: get_pp_group().world_size
@@ -378,7 +406,7 @@ interfaces:
         data_parallel_size: {type: [integer, "null"], default: null, description: "Read from the current config's parallel_config.data_parallel_size (config['data-parallel-size']) when null"}
         is_moe: {type: boolean, default: false, description: "The current config's model_config.is_moe (the caller passes it)"}
         enable_eplb: {type: boolean, default: false}
-    response: {type: object, properties: {groups: {type: array, items: {type: string}}}}
+    response: {type: object, properties: {groups: {type: array, items: {type: string}}, ranks: {type: object}, log: {type: string}}}
     errors:
       - {code: assertion-error, status: 0, retryable: false}
       - {code: runtime-error, status: 0, retryable: false}
@@ -430,10 +458,24 @@ interfaces:
             when: "input.enable_eplb"
             set:
               vars.groups: "= merge(vars.groups, {'eplb': {'world_size': vars.dp * input.tensor_model_parallel_size, 'unique_name': 'eplb:0'}})"
+      - title: "This process's rank in each group: all_ranks is laid out (-1, DP, PP, PCP, TP); EP and EPLB span DP x PCP x TP within a PP stage; ETP is the TP group without an Engram config"
+        source: "vllm/distributed/parallel_state.py:2135-2141,2160-2168,2289-2302"
+        set:
+          vars.r: "= has(state.rank) && state.rank >= 0 ? state.rank : int(self.replace('rank', ''))"
+          vars.tp: "= input.tensor_model_parallel_size"
+          vars.pp: "= input.pipeline_model_parallel_size"
+      - set:
+          vars.ranks: "= {'tp': vars.r % vars.tp, 'pcp': 0, 'pp': (vars.r / vars.tp) % vars.pp, 'dp': (vars.r / (vars.tp * vars.pp)) % vars.dp}"
+      - set:
+          vars.ep_rank: "= 'ep' in vars.groups ? string(vars.ranks.dp * vars.tp + vars.ranks.tp) : 'N/A'"
+      - title: "rank %s in world size %s is assigned as DP rank %s, PP rank %s, PCP rank %s, TP rank %s, ETP rank %s, EP rank %s, EPLB rank %s (info_once)"
+        source: "vllm/distributed/parallel_state.py:2350-2362"
+        set:
+          vars.log: "= 'rank ' + string(vars.r) + ' in world size ' + string(state.world_size) + ' is assigned as DP rank ' + string(vars.ranks.dp) + ', PP rank ' + string(vars.ranks.pp) + ', PCP rank 0, TP rank ' + string(vars.ranks.tp) + ', ETP rank ' + string(vars.ranks.tp) + ', EP rank ' + vars.ep_rank + ', EPLB rank ' + ('eplb' in vars.groups ? vars.ep_rank : 'N/A')"
       - set:
           state.groups: "= merge(state.groups, vars.groups)"
           state.mp_initialized: true
-      - return: {groups: "= vars.groups.map(k, k)"}
+      - return: {groups: "= vars.groups.map(k, k)", ranks: "= vars.ranks", log: "= vars.log"}
 
   - component: parallel-state
     name: get-tp-group

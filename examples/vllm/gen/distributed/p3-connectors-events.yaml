@@ -11,6 +11,11 @@ configs:
     summary: "kv_events_config.enable_kv_cache_events: off unless --kv-events-config enables it; then the scheduler's EventPublisherFactory builds a ZMQ publisher."
     sources: ["vllm/config/kv_events.py:14", "vllm/engine/arg_utils.py:771"]
     attributes: {key: kv_events_config.enable_kv_cache_events}
+  - {id: kv-events-endpoint, type: string, value: "tcp://*:5557", default: "tcp://*:5557", summary: "kv_events_config.endpoint: the PUB address; its port is offset by the DP rank", sources: ["vllm/config/kv_events.py:23"], attributes: {key: kv_events_config.endpoint}}
+  - {id: kv-events-replay-endpoint, type: string, value: null, default: null, summary: "kv_events_config.replay_endpoint: the optional ROUTER address for replay requests", sources: ["vllm/config/kv_events.py:27"], attributes: {key: kv_events_config.replay_endpoint}}
+  - {id: kv-events-hwm, type: integer, value: 100000, default: 100000, summary: "kv_events_config.hwm: the ZMQ high water mark of the PUB socket", sources: ["vllm/config/kv_events.py:36"], attributes: {key: kv_events_config.hwm}}
+  - {id: kv-events-max-queue-size, type: integer, value: 100000, default: 100000, summary: "kv_events_config.max_queue_size: events queued for the publisher thread", sources: ["vllm/config/kv_events.py:41"], attributes: {key: kv_events_config.max_queue_size}}
+  - {id: kv-events-topic, type: string, value: "", default: "", summary: "kv_events_config.topic: the topic batches are published under", sources: ["vllm/config/kv_events.py:45"], attributes: {key: kv_events_config.topic}}
   - id: kv-events-publisher
     type: string
     value: null
@@ -73,8 +78,8 @@ components:
     summary: "Worker side of the MoRI-IO connector: serves engine/KV-layout metadata to peers on a handshake ROUTER socket."
     sources: ["vllm/distributed/kv_transfer/kv_connector/v1/moriio/moriio_connector.py:2006-2051"]
     state:
-      schema: {type: object, properties: {handshake_inbox: {type: array}, replies: {type: array}, done_recv: {type: array}}}
-      initial: {handshake_inbox: [], replies: [], done_recv: []}
+      schema: {type: object, properties: {handshake_inbox: {type: array}, replies: {type: array}, done_recv: {type: array}, moriio_config: {type: [object, "null"]}, mode: {type: string}}}
+      initial: {handshake_inbox: [], replies: [], done_recv: [], moriio_config: null, mode: WRITE}
   - id: moriio-wrapper
     name: MoRIIOWrapper
     kind: module
@@ -92,7 +97,8 @@ components:
           done_req_ids: {type: array}
           done_write_cache_req_ids: {type: array}
           terminal: {type: array}
-      initial: {role: PRODUCER, notify_inbox: [], done_remote_allocate: {}, done_req_ids: [], done_write_cache_req_ids: [], terminal: []}
+          transfer_timeout_ms: {type: integer}
+      initial: {role: PRODUCER, notify_inbox: [], done_remote_allocate: {}, done_req_ids: [], done_write_cache_req_ids: [], terminal: [], transfer_timeout_ms: 30000}
   - id: moriio-writer
     name: MoRIIOWriter
     kind: module
@@ -103,7 +109,7 @@ components:
     sources: ["vllm/distributed/kv_transfer/kv_connector/v1/moriio/moriio_engine.py:184-249"]
     state:
       schema: {type: object, properties: {write_tasks: {type: array}, deferred: {type: array}, written: {type: array}, defer_timeout_ms: {type: integer}}}
-      initial: {write_tasks: [], deferred: [], written: [], defer_timeout_ms: 30000}
+      initial: {write_tasks: [], deferred: [], written: [], defer_timeout_ms: 60000}
   - id: moriio-heartbeat
     name: moriio_heartbeat (subprocess)
     kind: module
@@ -968,38 +974,96 @@ interfaces:
   - component: event-publisher-factory
     name: create
     kind: function
-    summary: "EventPublisherFactory.create: NullEventPublisher unless events are enabled and the publisher is not 'null'; unknown names raise ValueError; 'zmq' starts a ZmqEventPublisher (and its thread) with ports offset by the DP rank."
-    sources: ["vllm/distributed/kv_events.py:578-598"]
+    summary: "EventPublisherFactory.create: NullEventPublisher without a config, with events disabled, or with publisher 'null'. An unset publisher was resolved by KVEventsConfig.__post_init__ (zmq when events are enabled, else null). Unknown names raise ValueError; 'zmq' starts a ZmqEventPublisher (and its thread) whose PUB and replay ports are offset by the DP rank."
+    sources: ["vllm/distributed/kv_events.py:578-598", "vllm/config/kv_events.py:50-52"]
     request: {type: object, properties: {has_config: {type: boolean, default: true}, data_parallel_rank: {type: integer, default: 0}}}
-    response: {type: object, properties: {publisher: {type: string}}}
+    response: {type: object, properties: {publisher: {type: string}, endpoint: {type: [string, "null"]}, replay_endpoint: {type: [string, "null"]}, hwm: {type: integer}, topic: {type: string}, max_queue_size: {type: integer}}}
     errors:
       - {code: value-error, status: 0, retryable: false}
     behavior:
-      - if: "(has(input.has_config) && !input.has_config) || !config['enable-kv-cache-events'] || !('kv-events-publisher' in config) || config['kv-events-publisher'] == null || config['kv-events-publisher'] == 'null'"
+      - title: "KVEventsConfig.__post_init__: an unset publisher is zmq when events are enabled, else null"
+        source: "vllm/config/kv_events.py:50-52"
+        set:
+          vars.kind: "= ('kv-events-publisher' in config && config['kv-events-publisher'] != null) ? config['kv-events-publisher'] : (config['enable-kv-cache-events'] ? 'zmq' : 'null')"
+      - if: "(has(input.has_config) && !input.has_config) || !config['enable-kv-cache-events'] || vars.kind == 'null'"
         then:
-          - source: "vllm/distributed/kv_events.py:582-587"
+          - source: "vllm/distributed/kv_events.py:583-588"
             return: {publisher: "null"}
-      - if: "config['kv-events-publisher'] != 'zmq'"
+      - if: "vars.kind != 'zmq'"
         then:
           - source: "vllm/distributed/kv_events.py:592-597"
-            fail: {code: value-error, status: 0, message: "= 'Unknown event publisher \\'' + config['kv-events-publisher'] + '\\''"}
+            fail: {code: value-error, status: 0, message: "= 'Unknown event publisher \\'' + vars.kind + '\\''"}
       - title: ZmqEventPublisher binds PUB (and replay ROUTER) and starts its thread
-        source: "vllm/distributed/kv_events.py:334-384"
-        set: {vars.zmq: true}
-      - call: zmq-event-publisher.start
-        input: {data_parallel_rank: "= input.data_parallel_rank"}
-      - return: {publisher: zmq}
+        source: "vllm/distributed/kv_events.py:345-384"
+        call: zmq-event-publisher.start
+        input:
+          data_parallel_rank: "= has(input.data_parallel_rank) ? input.data_parallel_rank : 0"
+          endpoint: "= config['kv-events-endpoint']"
+          replay_endpoint: "= 'kv-events-replay-endpoint' in config ? config['kv-events-replay-endpoint'] : null"
+        as: z
+      - return: {publisher: zmq, endpoint: "= vars.z.value.endpoint", replay_endpoint: "= vars.z.value.replay_endpoint", hwm: "= config['kv-events-hwm']", topic: "= config['kv-events-topic']", max_queue_size: "= config['kv-events-max-queue-size']"}
+
+  - component: zmq-event-publisher
+    name: offset-endpoint-port
+    kind: function
+    latency_ms: 0
+    summary: "ZmqEventPublisher.offset_endpoint_port: unchanged when empty or at DP rank 0; inproc gets a _dp<rank> suffix; tcp gets its port + rank (port 0 is left for the OS); anything else raises ValueError."
+    sources: ["vllm/distributed/kv_events.py:530-563"]
+    request: {type: object, required: [data_parallel_rank], properties: {endpoint: {type: [string, "null"], examples: ["tcp://*:5557"]}, data_parallel_rank: {type: integer, examples: [1]}}}
+    response: {type: object, properties: {endpoint: {type: [string, "null"]}}}
+    errors:
+      - {code: value-error, status: 0, retryable: false}
+    behavior:
+      - set: {vars.e: "= has(input.endpoint) ? input.endpoint : null"}
+      - if: "vars.e == null || vars.e == '' || input.data_parallel_rank == 0"
+        then:
+          - source: "vllm/distributed/kv_events.py:547-548"
+            return: {endpoint: "= vars.e"}
+      - if: "vars.e.contains('inproc')"
+        then:
+          - source: "vllm/distributed/kv_events.py:550-551"
+            return: {endpoint: "= vars.e + '_dp' + string(input.data_parallel_rank)"}
+      - if: "!vars.e.contains('tcp')"
+        then:
+          - source: "vllm/distributed/kv_events.py:563"
+            fail: {code: value-error, status: 0, message: "Invalid endpoint: must contain 'inproc' or 'tcp'"}
+      - if: "!vars.e.contains(':')"
+        then:
+          - return: {endpoint: "= vars.e"}
+      - set:
+          vars.i: "= vars.e.lastIndexOf(':')"
+      - set:
+          vars.port: "= int(vars.e.substring(vars.i + 1))"
+      - if: "vars.port == 0"
+        then:
+          - title: A tcp port of 0 is left for the OS
+            source: "vllm/distributed/kv_events.py:558-559"
+            return: {endpoint: "= vars.e"}
+      - source: "vllm/distributed/kv_events.py:560-561"
+        return: {endpoint: "= vars.e.substring(0, vars.i) + ':' + string(vars.port + input.data_parallel_rank)"}
 
   - component: zmq-event-publisher
     name: start
     kind: function
-    summary: "ZmqEventPublisher.__init__ tail: mark running and start the zmq-publisher thread."
-    sources: ["vllm/distributed/kv_events.py:374-384"]
-    request: {type: object, properties: {data_parallel_rank: {type: integer}}}
-    response: {type: object, properties: {running: {type: boolean}}}
+    summary: "ZmqEventPublisher.__init__: offset the PUB and replay endpoints by the DP rank, mark running and start the zmq-publisher thread."
+    sources: ["vllm/distributed/kv_events.py:345-384"]
+    request: {type: object, properties: {data_parallel_rank: {type: integer}, endpoint: {type: [string, "null"]}, replay_endpoint: {type: [string, "null"]}}}
+    response: {type: object, properties: {running: {type: boolean}, endpoint: {type: [string, "null"]}, replay_endpoint: {type: [string, "null"]}}}
+    errors:
+      - {code: value-error, status: 0, retryable: false}
     behavior:
-      - set: {state.running: true, state.dp_rank: "= input.data_parallel_rank"}
-      - return: {running: true}
+      - set: {vars.rank: "= has(input.data_parallel_rank) ? input.data_parallel_rank : 0"}
+      - source: "vllm/distributed/kv_events.py:355-358"
+        call: zmq-event-publisher.offset-endpoint-port
+        input: {endpoint: "= has(input.endpoint) ? input.endpoint : 'tcp://*:5557'", data_parallel_rank: "= vars.rank"}
+        as: e
+      - call: zmq-event-publisher.offset-endpoint-port
+        input: {endpoint: "= has(input.replay_endpoint) ? input.replay_endpoint : null", data_parallel_rank: "= vars.rank"}
+        as: r
+      - title: Starting ZMQ publisher thread
+        source: "vllm/distributed/kv_events.py:376-384"
+        set: {state.running: true, state.dp_rank: "= vars.rank"}
+      - return: {running: true, endpoint: "= vars.e.value.endpoint", replay_endpoint: "= vars.r.value.endpoint"}
 
   - component: zmq-event-publisher
     name: publish

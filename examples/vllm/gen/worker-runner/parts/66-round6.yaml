@@ -1,0 +1,130 @@
+# Fix round 6 (mechanism coverage): returned logprobs, model-state prepare_attn with positions.
+schemas:
+  - id: WrLogprobsLists
+    summary: "LogprobsLists (vllm/v1/outputs.py:34-45): per logits row, the sampled token then the top-k ids, their logprobs, the sampled token's rank; cu_num_generated_tokens slices rows per request under speculative decoding (None otherwise)."
+    schema:
+      type: [object, "null"]
+      properties:
+        logprob_token_ids: {type: array, items: {type: array, items: {type: integer}}}
+        logprobs: {type: array, items: {type: array, items: {type: number}}}
+        sampled_token_ranks: {type: array, items: {type: integer}}
+        cu_num_generated_tokens: {type: [array, "null"], items: {type: integer}}
+  - id: WrLogprobsTensors
+    summary: "LogprobsTensors of one request's prompt (vllm/v1/outputs.py:89-101): one row per prompt position after the first, the actual prompt token first, then the top num_prompt_logprobs ids."
+    schema:
+      type: object
+      properties:
+        logprob_token_ids: {type: array, items: {type: array, items: {type: integer}}}
+        logprobs: {type: array, items: {type: array, items: {type: number}}}
+        selected_token_ranks: {type: array, items: {type: integer}}
+
+components:
+  - id: default-model-state
+    name: DefaultModelState
+    kind: module
+    parent: gpu-model-runner
+    layer: runner
+    summary: "The model state of a plain decoder model: prepare_attn builds the attention metadata of the step from the input batch (positions, is_prefilling, padded sizes under a FULL graph)."
+    sources: ["vllm/v1/worker/gpu/model_states/default.py:29-60", "vllm/v1/worker/gpu/model_states/default.py:169-238"]
+
+interfaces:
+  - component: default-model-state
+    name: prepare-attn
+    kind: function
+    summary: "DefaultModelState.prepare_attn: unpadded sizes for PIECEWISE and eager (padded under FULL), then build_attn_metadata with the batch's positions and is_prefilling."
+    sources: ["vllm/v1/worker/gpu/model_states/default.py:169-238"]
+    latency_ms: 0
+    request:
+      type: object
+      required: [build]
+      properties:
+        build: {type: object, description: "the builder arguments and CommonAttentionMetadata fields the runner computed"}
+        positions: {type: array, items: {type: integer}}
+        is_prefilling: {type: array, items: {type: boolean}}
+        num_scheduled_tokens: {type: array, items: {type: integer}}
+        num_draft_tokens: {type: array, items: {type: integer}}
+        cg_mode: {type: string, default: NONE}
+    response: {type: object, properties: {positions: {type: array}, metadata: {type: object}}}
+    behavior:
+      - source: "vllm/v1/worker/gpu/model_states/default.py:213-235"
+        call: attn-utils.build-attn-metadata
+        input:
+          build: "= input.build"
+          positions: "= has(input.positions) ? input.positions : []"
+          is_prefilling: "= has(input.is_prefilling) ? input.is_prefilling : []"
+          model_specific: null
+        as: md
+      - return: "= vars.md.value"
+  - component: mamba-hybrid-model-state
+    name: prepare-attn
+    kind: function
+    summary: "MambaHybridModelState.prepare_attn: is_prefilling per request, and with speculative decoding the accepted-token counts and per-row decode draft counts (-1 for non-decode rows); aligned state indices in align mode; then build_attn_metadata with the batch's positions and the MambaHybridAttnMetadata."
+    sources: ["vllm/v1/worker/gpu/model_states/mamba_hybrid.py:230-345", "vllm/v1/worker/gpu/model_states/mamba_hybrid.py:41-71"]
+    latency_ms: 0
+    errors: [{code: assertion-error, status: 0, retryable: false}]
+    request:
+      type: object
+      required: [build]
+      properties:
+        build: {type: object, description: "the builder arguments and CommonAttentionMetadata fields the runner computed"}
+        positions: {type: array, items: {type: integer}}
+        is_prefilling: {type: array, items: {type: boolean}}
+        num_scheduled_tokens: {type: array, items: {type: integer}}
+        num_draft_tokens: {type: array, items: {type: integer}}
+        cg_mode: {type: string, default: NONE}
+        ubatch_idx: {type: integer, default: 0}
+    response: {type: object, properties: {positions: {type: array}, metadata: {type: object}, mamba: {type: object}}}
+    behavior:
+      - if: "has(input.ubatch_idx) && input.ubatch_idx != 0"
+        then:
+          - title: Dual-batch overlap is not supported for hybrid models
+            source: "vllm/v1/worker/gpu/model_states/mamba_hybrid.py:242"
+            fail: {code: assertion-error, status: 0, message: "DBO is not supported"}
+      - set:
+          vars.pref: "= has(input.is_prefilling) ? input.is_prefilling : []"
+          vars.nst: "= has(input.num_scheduled_tokens) ? input.num_scheduled_tokens : []"
+          vars.nd: "= has(input.num_draft_tokens) ? input.num_draft_tokens : []"
+          vars.acc: null
+          vars.ndd: null
+      - if: "int(config['num-speculative-tokens']) > 0"
+        then:
+          - title: "With speculation: num_accepted_tokens per request, and num_decode_draft_tokens = the draft count for decode rows (not prefilling, 0 < scheduled <= k + 1), else -1"
+            source: "vllm/v1/worker/gpu/model_states/mamba_hybrid.py:274-306"
+            set:
+              vars.acc: "= vars.pref.map(p, 1)"
+              vars.ndd: "= lists.range(size(vars.pref)).map(i, !vars.pref[i] && vars.nst[i] > 0 && vars.nst[i] <= int(config['num-speculative-tokens']) + 1 ? (i < size(vars.nd) ? vars.nd[i] : 0) : -1)"
+      - set:
+          vars.mamba: {is_prefilling: "= vars.pref", num_accepted_tokens: "= vars.acc", num_decode_draft_tokens_cpu: "= vars.ndd"}
+      - source: "vllm/v1/worker/gpu/model_states/mamba_hybrid.py:324-341"
+        call: attn-utils.build-attn-metadata
+        input:
+          build: "= input.build"
+          positions: "= has(input.positions) ? input.positions : []"
+          is_prefilling: "= vars.pref"
+          model_specific: "= vars.mamba"
+        as: md
+      - return: {positions: "= vars.md.value.positions", metadata: "= vars.md.value.metadata", mamba: "= vars.mamba"}
+  - component: attn-utils
+    name: build-attn-metadata
+    kind: function
+    summary: "build_attn_metadata: for each KV cache group, a CommonAttentionMetadata carrying the batch's query/seq lengths, block table, slot mapping, positions and is_prefilling (a model-specific is_prefilling wins), handed to each attention group's metadata builder."
+    sources: ["vllm/v1/worker/gpu/attn_utils.py:455-581"]
+    latency_ms: 0
+    request:
+      type: object
+      required: [build]
+      properties:
+        build: {type: object}
+        positions: {type: array, items: {type: integer}}
+        is_prefilling: {type: array, items: {type: boolean}}
+        model_specific: {type: ["object", "null"], default: null}
+    response: {type: object, properties: {positions: {type: array, items: {type: integer}}, metadata: {type: object}}}
+    behavior:
+      - source: "vllm/v1/worker/gpu/attn_utils.py:507-516"
+        set:
+          vars.pref: "= has(input.model_specific) && input.model_specific != null && has(input.model_specific.is_prefilling) ? input.model_specific.is_prefilling : (has(input.is_prefilling) ? input.is_prefilling : [])"
+      - source: "vllm/v1/worker/gpu/attn_utils.py:523-576"
+        call: flash-attention-metadata-builder.build
+        input: "= merge(input.build, {'common': merge(input.build.common, {'positions': has(input.positions) ? input.positions : [], 'is_prefilling': vars.pref})})"
+        as: b
+      - return: {positions: "= has(input.positions) ? input.positions : []", metadata: "= vars.b.value"}

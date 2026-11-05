@@ -46,6 +46,7 @@ interfaces:
       type: object
       properties:
         params: {type: object, description: "the keyword arguments the request's to_sampling_params passes (unset ones take the dataclass defaults)"}
+        repetition_detection: {type: [object, "null"], default: null, description: "RepetitionDetectionParams built on its own (its __post_init__ validates at construction), when not passed inside params"}
       required: [params]
     errors: [{code: vllm-validation-error, status: 0, retryable: false}]
     behavior:
@@ -70,6 +71,20 @@ interfaces:
         source: "vllm/sampling_params.py:510-555"
         set:
           vars.p: "= merge(merge({'n': 1, 'presence_penalty': 0.0, 'frequency_penalty': 0.0, 'repetition_penalty': 1.0, 'temperature': 1.0, 'top_p': 1.0, 'top_k': 0, 'min_p': 0.0, 'seed': null, 'stop': [], 'stop_token_ids': [], 'ignore_eos': false, 'max_tokens': 16, 'min_tokens': 0, 'logprobs': null, 'prompt_logprobs': null, 'include_stop_str_in_output': false, 'skip_special_tokens': true, 'detokenize': true}, input.params.filter(k, input.params[k] != null).transformMapEntry(i, k, {k: input.params[k]})), has(vars.lb) ? {'logit_bias': vars.lb} : {})"
+      - set:
+          vars.rd_in: "= has(input.params) && has(input.params.repetition_detection) && input.params.repetition_detection != null ? dyn(input.params.repetition_detection) : (has(input.repetition_detection) && input.repetition_detection != null ? dyn(input.repetition_detection) : null)"
+      - if: "vars.rd_in != null"
+        then:
+          - set:
+              vars.rd: "= {'max_pattern_size': 0, 'min_pattern_size': 0, 'min_count': 0}.transformMap(k, v, k in vars.rd_in && vars.rd_in[k] != null ? vars.rd_in[k] : v)"
+          - title: "RepetitionDetectionParams.__post_init__: pattern sizes non-negative and min <= max"
+            source: "vllm/sampling_params.py:186-196"
+            if: "vars.rd.max_pattern_size < 0 || vars.rd.min_pattern_size < 0 || vars.rd.min_pattern_size > vars.rd.max_pattern_size"
+            then: [{fail: {code: vllm-validation-error, message: "max_pattern_size, min_pattern_size must be >=0, with min_pattern_size <= max_pattern_size. Set both to 0 to disable repetitive pattern detection."}}]
+          - title: "a pattern size needs min_count >= 2"
+            source: "vllm/sampling_params.py:197-202"
+            if: "vars.rd.max_pattern_size > 0 && vars.rd.min_count < 2"
+            then: [{fail: {code: vllm-validation-error, message: "min_count must be >= 2 to detect repetitive patterns in engine output. If you do not wish to detect repetitive patterns, set max_pattern_size to 0."}}]
       - if: "double(vars.p.temperature) > 0.0 && double(vars.p.temperature) < 0.01"
         then:
           - title: "__post_init__: 0 < temperature < 0.01 is raised to 0.01 (with a warning: it may cause nan or inf)"
@@ -334,6 +349,10 @@ interfaces:
         source: "vllm/entrypoints/openai/completion/protocol.py:471-499"
         if: "has(input.body.structured_outputs) && input.body.structured_outputs != null && size(['json', 'regex', 'choice'].filter(k, k in input.body.structured_outputs && input.body.structured_outputs[k] != null)) > 1"
         then: [{fail: {code: vllm-validation-error, message: "You can only use one kind of constraints for structured outputs ('json', 'regex' or 'choice').", data: {param: structured_outputs}}}]
+      - title: "Field validation of prompt (after the before validators): list[int] | list[list[int]] | str | list[str] | None, so a bare number or an object fails every branch (RequestValidationError -> 400 Bad Request; ASSUMPTION: each branch's error reported at body.prompt)"
+        source: "vllm/entrypoints/openai/completion/protocol.py:51-57"
+        if: "vars.p != null && type(vars.p) != string && type(vars.p) != list"
+        then: [{fail: {code: Bad Request, status: 400, message: "= '4 validation errors:\\n  {\\'type\\': \\'list_type\\', \\'loc\\': \\'body.prompt\\', \\'msg\\': \\'Input should be a valid list\\', \\'input\\': ' + string(vars.p) + '}\\n  {\\'type\\': \\'list_type\\', \\'loc\\': \\'body.prompt\\', \\'msg\\': \\'Input should be a valid list\\', \\'input\\': ' + string(vars.p) + '}\\n  {\\'type\\': \\'string_type\\', \\'loc\\': \\'body.prompt\\', \\'msg\\': \\'Input should be a valid string\\', \\'input\\': ' + string(vars.p) + '}\\n  {\\'type\\': \\'list_type\\', \\'loc\\': \\'body.prompt\\', \\'msg\\': \\'Input should be a valid list\\', \\'input\\': ' + string(vars.p) + '}'", data: {param: body.prompt}}}]
       - title: "Field validation of prompt: token ids are Annotated[int, Field(ge=0)], so a negative id fails every union branch (RequestValidationError -> 400 Bad Request; ASSUMPTION: the message is cut to its count and first error)"
         source: "vllm/entrypoints/openai/completion/protocol.py:51-57"
         if: "vars.p != null && type(vars.p) == list && (vars.p.exists(x, type(x) == int && x < 0) || vars.p.exists(x, type(x) == list && x.exists(y, type(y) == int && y < 0)))"
@@ -344,8 +363,8 @@ interfaces:
   - component: tokenize-params
     name: post-init
     kind: function
-    summary: "TokenizeParams.__post_init__: truncation_side must be left or right, and the requested output tokens may not exceed max_model_len (the message names the request's own field)."
-    sources: ["vllm/renderers/params.py:243-290"]
+    summary: "TokenizeParams.__post_init__: truncation_side must be left or right, the requested output tokens may not exceed max_model_len (the message names the request's own field), and truncate_prompt_tokens may not exceed max_input_tokens."
+    sources: ["vllm/renderers/params.py:243-283"]
     request:
       type: object
       properties:
@@ -354,6 +373,8 @@ interfaces:
         max_output_tokens_param: {type: string, default: max_output_tokens}
         max_total_tokens_param: {type: string, default: max_total_tokens}
         truncation_side: {type: [string, "null"], default: null}
+        truncate_prompt_tokens: {type: [integer, "null"], default: null}
+        truncate_prompt_tokens_param: {type: string, default: truncate_prompt_tokens}
       required: [max_output_tokens]
     errors: [{code: vllm-validation-error, status: 0, retryable: false}]
     behavior:
@@ -363,6 +384,10 @@ interfaces:
         source: "vllm/renderers/params.py:256-267"
         if: "has(input.max_total_tokens) && input.max_total_tokens != null && input.max_output_tokens > input.max_total_tokens"
         then: [{fail: {code: vllm-validation-error, message: "= input.max_output_tokens_param + '=' + string(input.max_output_tokens) + ' cannot be greater than ' + input.max_total_tokens_param + '=' + string(input.max_total_tokens) + '. Please request fewer output tokens.'", data: {param: "= input.max_output_tokens_param", value: "= input.max_output_tokens"}}}]
+      - title: "truncate_prompt_tokens above max_input_tokens (= max_total_tokens): request a smaller truncation size"
+        source: "vllm/renderers/params.py:270-282"
+        if: "has(input.max_total_tokens) && input.max_total_tokens != null && has(input.truncate_prompt_tokens) && input.truncate_prompt_tokens != null && input.truncate_prompt_tokens > input.max_total_tokens"
+        then: [{fail: {code: vllm-validation-error, message: "= (has(input.truncate_prompt_tokens_param) ? input.truncate_prompt_tokens_param : 'truncate_prompt_tokens') + '=' + string(input.truncate_prompt_tokens) + ' cannot be greater than ' + (has(input.max_total_tokens_param) ? input.max_total_tokens_param : 'max_total_tokens') + ' = ' + string(input.max_total_tokens) + '. Please request a smaller truncation size.'", data: {param: "= has(input.truncate_prompt_tokens_param) ? input.truncate_prompt_tokens_param : 'truncate_prompt_tokens'", value: "= input.truncate_prompt_tokens"}}}]
       - return: {max_input_tokens: "= has(input.max_total_tokens) ? input.max_total_tokens : null", max_output_tokens: "= input.max_output_tokens"}
   - component: base-serving
     name: maybe-get-adapters
@@ -410,7 +435,7 @@ scenarios:
     steps:
       - {interface: api-server-entry.run-server, caller: operator, input: {}, as: up, await: false}
       - {flow: serving-api-health, at_ms: 100, as: early}
-      - {flow: serving-api-models-list, at_ms: 2000, as: models}
+      - {flow: serving-api-models-list, at_ms: 4000, as: models}
     expect:
       - "steps.up.result.ok"
       - "!steps.early.result.ok && steps.early.result.error.code == 'ConnectionRefusedError'"

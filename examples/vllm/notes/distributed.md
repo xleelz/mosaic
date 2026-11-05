@@ -389,3 +389,62 @@ New: `nixl-push-connector-scheduler` (request_finished), NIXL pull-worker peer r
 ### Simulator notes
 - None needed from the round-5 simulator fixes; `{$absent: true}` is used in the round-5 test 6 and a
   regression scenario.
+
+## 17. Fix round 6 (FIXES6.md): mechanism coverage
+
+Generated from two new parts: `gen/distributed/p13-round6-eplb.yaml` and `p14-round6-coverage.yaml`.
+
+### Round-5 absent mechanisms
+- **EPLB (oracle4 `test_eplb_fml`, judge4 P4-6 d, e).** New owner definitions: `eplb-state` (`add-model`, `start-async-loop`,
+  `step`, `rearrange`, `consume-async-layer`, `record-expert-load`), `eplb-communicator` (`create`, `add-send`, `add-recv`, `execute`, `info`),
+  `rebalance-execute` (`get-ep-ranks-with-experts-batch`, `move-to-buffer`, `move-from-buffer`, `rearrange-expert-weights-inplace`),
+  `eplb-policy.rebalance-experts`, `parallel-state.get-eplb-group`. Each local slot holds the identity of the logical expert whose
+  weights it carries, so `distributed-eplb-rearrange-inplace-two-ranks` asserts the test's check: rank r slot e holds `new[r*nle+e]`.
+- **MoRIIO config (oracle4 `test_timeout_must_be_positive_and_finite`).** `moriio-config.positive-finite-timeout` and `.from-vllm-config`;
+  `moriio-connector-worker.init` feeds `moriio-wrapper.init` and `moriio-writer.init`.
+- **KV events publisher (judge4 Q4-3 a, reported by scheduler-kv).** `event-publisher-factory.create` resolved an unset publisher to null;
+  it now applies `KVEventsConfig.__post_init__` (zmq when enabled, config/kv_events.py:50-52). Endpoint, replay endpoint, hwm, queue size,
+  topic and `offset-endpoint-port` (5557 + DP rank) are modeled. Q4-3 a passes unedited.
+- **TP 2 process groups.** `init-distributed-environment` models the DP world widening, the info log and local_rank;
+  `initialize-model-parallel` returns each group rank and the rank-assignment log.
+
+### Approximations
+- The async EPLB worker is a thread. `consume-async-layer` runs its `transfer_layer` inline in the step that consumes the layer, which
+  assumes the thread keeps up (one layer per step, async_worker.py:128-176). Migration batching (`enable_migration_batching`) isn't modeled.
+- `eplb-policy` is modeled for one node (every world is single-node); the tie order of `argsort(-weight)` is stable as numpy's insertion
+  sort is below 17 elements. ROCm's skip-if-no-gain check and elastic-EP `rank_mapping` aren't modeled.
+- The load enters through `record-expert-load`, which stands for the MoE layers writing the shared `expert_load_pass` tensor.
+- All peer transfers complete in one rendezvous per layer, so a rank with nothing to transfer also waits; torch's batch would not block it.
+
+### Code finding
+`MoRIIOConfig.from_vllm_config` calls `get_port_offset(dp_rank, tp_rank)` without `tp_size`, so the default 1 gives offset `dp_rank + tp_rank`
+(moriio_common.py:216-217, 344): DP 0 TP 1 and DP 1 TP 0 get the same notify port.
+
+### Coverage additions (from coverage_gaps)
+`transfer-topology` (heterogeneous-TP handshake targets, consumer count, block ratio, replication), `multi-connector.request-finished` and
+`.update-connector-output` (routed from `kv-connector-base-v1`), `group-coordinator.rank-info`, `.send-tensor-dict`, `.recv-tensor-dict`,
+`.send-object`, `.recv-object` (PP handoff with the all-gather slice). 6 mechanisms. Fixture `distributed-tp2-llama-8b` is local to my
+scenarios; it isn't a `variant_of`, so `worlds.yaml` needs no regeneration for it.
+
+### Unwritten fields
+No finding in `fragments/distributed.yaml`.
+
+### Breaking changes
+- `moriio-writer` initial `defer_timeout_ms` is 60000, not 30000 (DEFAULT_DEFER_TIMEOUT). Callers: my scenarios, which seed it.
+- `eplb-state.add-model` and `.start-async-loop` move from worker-runner's stubs to real behaviors; `add-model` now builds a communicator.
+- `event-publisher-factory.create`: enabled with no publisher gives zmq, not null, and starts the publisher thread.
+- `kv-connector-base-v1.request-finished` and `.update-connector-output` route to MultiConnector when it's configured.
+
+### Cross-area requests
+- **worker-runner:** call `eplb-state.step` from the profile run with `{is_dummy: true, is_profile: true}` (model_runner.py:1006,
+  eplb_utils.py:170-177) and once per forward; P4-6 d, e need it. `add_model` calls `set_eplb_state` itself in the code (eplb_state.py:486);
+  your `eplb-controller.load` still makes that call, so I left it out of `add-model` to keep your counts.
+- **models-layers:** feed `eplb-state.record-expert-load` from `eplb-map-to-physical-and-record` if a run should accumulate load.
+- **coordinator:** the shared worlds have no dense TP 2 deployment; a judge probing TP 2 must adapt tp4 or the MoE world.
+
+### Measures
+With the same peer fragments, HEAD's fragment and this one give the same verdict on all 612 judge, oracle and build-oracle scenarios (512 pass);
+that run predates the KV events and racy edits. A re-run of the P and Q judge cases, the distributed and scheduler-kv oracles and my build-oracle
+files after them (180 scenarios) regressed none, and Q4-3 a now passes. Still failing: judge4 `bench-p4-6-de-profile-and-steps` (worker-runner, above).
+Oracle4 `test_eplb_fml` and the MoRIIO timeout test have no runnable scenario in `oracle4/distributed.yaml`; their regressions are
+`distributed-eplb-rearrange-inplace-two-ranks` and `distributed-moriio-timeout-must-be-positive-and-finite`.

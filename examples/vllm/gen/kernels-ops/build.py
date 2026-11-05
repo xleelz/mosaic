@@ -15,11 +15,13 @@ import hand  # noqa: E402
 import hand2  # noqa: E402
 import hand3  # noqa: E402
 import hand4  # noqa: E402
+import hand5  # noqa: E402
 import ops  # noqa: E402
 import scen  # noqa: E402
 from common import HERE, findline  # noqa: E402
 
-scen.SCENARIOS = scen.SCENARIOS + hand3.SCENARIOS + hand4.SCENARIOS
+scen.SCENARIOS = scen.SCENARIOS + hand3.SCENARIOS + hand4.SCENARIOS + hand5.SCENARIOS
+scen.FLOWS = scen.FLOWS + hand5.FLOWS
 
 ROOT = os.path.abspath(os.path.join(HERE, "..", ".."))
 
@@ -80,7 +82,7 @@ for f, (cid, name, desc) in ops.BINDING_COMPONENTS.items():
     if cid not in components:
         components[cid] = {"id": cid, "name": name, "kind": "module", "layer": "kernels", "parent": "compilation" if "compilation" in f else "kernels-ops",
                            "summary": desc, "sources": [f"{f}:1"], "attributes": {"owner": "kernels-ops"}}
-for c in hand3.COMPONENTS:
+for c in hand3.COMPONENTS + hand5.COMPONENTS:
     components[c["id"]] = c
 for cid, init in hand3.COMPONENT_PATCHES.items():
     c = components[cid]
@@ -89,6 +91,9 @@ for cid, init in hand3.COMPONENT_PATCHES.items():
         st["initial"][k] = v
         st["schema"]["properties"].setdefault(k, {"type": ["object", "array", "string", "boolean", "integer", "null"]} if v is None else
                                                   {"type": {bool: "boolean", str: "string", dict: "object", list: "array", int: "integer"}[type(v)]})
+for cid in hand5.COMPONENT_CAPACITY:
+    components[cid]["capacity"] = {"concurrency": 1}
+    components[cid]["description"] = "Capacity 1: each GPU worker process runs compilation and model execution on a single thread (Worker.execute_model), so calls never overlap."
 components["rms-norm-quant-fusion-pass"]["parent"] = "rms-quant-fusion"
 components["all-reduce-fusion-pass"]["parent"] = "allreduce-rms-fusion"
 for iid, f in ifaces.items():
@@ -259,7 +264,7 @@ def ordered(d):
 doc = {
     "schema_version": 1,
     "id": "vllm",
-    "configs": hand.configs() + hand3.CONFIGS + hand4.CONFIGS,
+    "configs": hand.configs() + hand3.CONFIGS + hand4.CONFIGS + hand5.CONFIGS,
     "schemas": schemas,
     "components": list(components.values()),
     "interfaces": [ordered(ifaces[i]) for i in sorted(ifaces)],

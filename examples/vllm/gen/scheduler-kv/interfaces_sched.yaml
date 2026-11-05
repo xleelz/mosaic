@@ -42,8 +42,17 @@
     name: check-stop
     kind: function
     latency_ms: 0
-    summary: "After appending a sampled token: EOS or a stop token id stops; max_tokens or max_model_len caps the length."
-    sources: ["vllm/v1/core/sched/utils.py:98-140"]
+    summary: "After appending a sampled token: EOS or a stop token id stops; max_tokens or max_model_len caps the length; past min_tokens, a repeating N-gram tail (repetition_detection) ends the request FINISHED_REPETITION."
+    description: >-
+      The order is the code's: EOS, stop token ids and the length cap are checked before the
+      min_tokens gate, so EOS sampled below min_tokens still stops here (the sampler masks it
+      below min_tokens, so it is only sampled under ignore-style params or a forced token). The
+      min_tokens gate guards only the repetition check. check_sequence_repetition takes
+      min_pattern_size 0 as 1, is off when max_pattern_size <= 0, min_count < 2 or min > max, and
+      tries pattern lengths upward, giving up once pattern_len * min_count exceeds the output.
+      _has_repeating_pattern compares the last pattern_len tokens with the min_count - 1
+      repetitions before them.
+    sources: ["vllm/v1/core/sched/utils.py:98-140", "vllm/v1/core/sched/utils.py:10-67", "vllm/v1/request.py:386", "vllm/v1/request.py:411"]
     request:
       type: object
       required: [last_token_id, num_tokens, num_output_tokens, max_tokens]
@@ -52,9 +61,18 @@
         num_tokens: {type: integer}
         num_output_tokens: {type: integer}
         max_tokens: {type: integer}
-        min_tokens: {type: integer}
+        min_tokens: {type: integer, default: 0}
         eos_token_id: {type: [integer, "null"]}
         stop_token_ids: {type: array, items: {type: integer}}
+        output_token_ids: {type: array, items: {type: integer}, description: "request.output_token_ids including last_token_id; read only by the repetition check."}
+        repetition_detection:
+          type: [object, "null"]
+          default: null
+          description: "SamplingParams.repetition_detection (RepetitionDetectionParams), already validated by its __post_init__."
+          properties:
+            max_pattern_size: {type: integer, default: 0}
+            min_pattern_size: {type: integer, default: 0}
+            min_count: {type: integer, default: 0}
     response: {type: object, properties: {stopped: {type: boolean}, status: {type: string}, stop_reason: {}}}
     behavior:
       - if: "has(input.eos_token_id) && input.eos_token_id != null && input.last_token_id == input.eos_token_id"
@@ -72,6 +90,31 @@
           - title: Length cap (max_tokens or max_model_len)
             source: "vllm/v1/core/sched/utils.py:114-119"
             return: {stopped: true, status: FINISHED_LENGTH_CAPPED, stop_reason: null}
+      - if: "has(input.min_tokens) && input.min_tokens != null && input.num_output_tokens < input.min_tokens"
+        then:
+          - title: Below min_tokens - no repetition check yet
+            source: "vllm/v1/core/sched/utils.py:121-126"
+            return: {stopped: false, status: RUNNING, stop_reason: null}
+      - if: "has(input.repetition_detection) && input.repetition_detection != null && has(input.output_token_ids)"
+        then:
+          - set:
+              vars.rd: "= input.repetition_detection"
+              vars.t: "= input.output_token_ids"
+          - set:
+              vars.maxp: "= has(vars.rd.max_pattern_size) ? int(vars.rd.max_pattern_size) : 0"
+              vars.minp: "= has(vars.rd.min_pattern_size) && int(vars.rd.min_pattern_size) > 0 ? int(vars.rd.min_pattern_size) : 1"
+              vars.mc: "= has(vars.rd.min_count) ? int(vars.rd.min_count) : 0"
+              vars.L: "= size(vars.t)"
+          - title: check_sequence_repetition over the output tokens
+            detail: "Pattern lengths min..max; a length whose min_count repetitions exceed the output ends the search (False)."
+            source: "vllm/v1/core/sched/utils.py:28-67"
+            set:
+              vars.rep: "= vars.maxp > 0 && vars.mc >= 2 && vars.minp <= vars.maxp && lists.range(vars.maxp - vars.minp + 1).map(k, vars.minp + k).exists(p, p * vars.mc <= vars.L && lists.range(p).all(i, lists.range(vars.mc - 1).all(j, vars.t[vars.L - (p * (j + 1) + i + 1)] == vars.t[vars.L - (i + 1)])))"
+          - if: "vars.rep"
+            then:
+              - title: Repetition detected
+                source: "vllm/v1/core/sched/utils.py:128-138"
+                return: {stopped: true, status: FINISHED_REPETITION, stop_reason: repetition_detected}
       - return: {stopped: false, status: RUNNING, stop_reason: null}
 
   # ===================================================================== scheduler
@@ -148,6 +191,8 @@
               'block_hashes': vars.hashes, 'spec_token_ids': [],
               'kv_transfer_params': has(input.kv_transfer_params) ? input.kv_transfer_params : dyn(null),
               'num_preemptions': 0, 'num_cached_tokens': -1, 'is_prefill_chunk': true,
+              'prefill_stats': {'num_prompt_tokens': 0, 'num_computed_tokens': 0, 'num_cached_tokens': 0, 'num_local_cached_tokens': 0, 'num_external_cached_tokens': 0, 'num_cache_creation_tokens': 0},
+              'last_sched_seq': 0,
               'grammar_id': vars.grammar_id,
               'skip_reading_prefix_cache': vars.skip_read, 'mm_features': vars.mm,
               'num_in_flight_tokens': 0, 'num_stale_output_tokens': 0, 'drop_stale_output': false,
@@ -192,7 +237,7 @@
       - title: Free the request's KV blocks
         detail: "Its cached full blocks stay in the prefix cache (ref_cnt 0, evictable), so resuming can hit them."
         source: "vllm/v1/core/sched/scheduler.py:1589"
-        call: kv-cache-manager.free
+        call: scheduler.free-request-blocks
         input: {request_id: "= input.request_id"}
       - if: "has(vars.r.mm_features) && size(vars.r.mm_features) > 0"
         then:
@@ -257,7 +302,9 @@
           - title: Keep the blocks (and the request) until the connector reports finished_sending
             source: "vllm/v1/core/sched/scheduler.py:2744-2748"
             return: {request_id: "= input.request_id", delay_free_blocks: true, kv_transfer_params: "= vars.params"}
-      - call: kv-cache-manager.free
+      - title: _free_blocks - free (or, behind an in-flight step, defer) the request's blocks
+        source: "vllm/v1/core/sched/scheduler.py:2752-2755"
+        call: scheduler.free-request-blocks
         input: {request_id: "= input.request_id"}
       - title: Remember the id for the workers and drop the request
         source: "vllm/v1/core/sched/scheduler.py:2736-2750"
@@ -505,6 +552,8 @@
                   num_new_tokens: "= vars.num_new"
                   num_lookahead_tokens: "= vars.lookahead"
                   block_hashes: "= vars.req.block_hashes"
+                  token_ids: "= config['enable-kv-cache-events'] ? (vars.req.prompt_token_ids != null ? dyn(vars.req.prompt_token_ids + vars.req.output_token_ids) : dyn(vars.req.prompt_segments.map(s, lists.range(s.num_tokens).map(i, s.key + '#' + string(i))).flatten() + vars.req.output_token_ids.map(t, dyn(t)))) : dyn(null)"
+                  lora_request: "= has(vars.req.lora_request) ? vars.req.lora_request : dyn(null)"
                 as: alloc
               - if: "vars.alloc.value.allocated"
                 then: [{set: {vars.alloc_ok: true}}, {break: true}]
@@ -656,7 +705,7 @@
                     detail: "A fully loaded prompt recomputes its last token so the next one can be sampled."
                     source: "vllm/v1/core/sched/scheduler.py:3123-3175"
                     call: kv-cache-manager.cache-blocks
-                    input: {request_id: "= vars.wid", num_tokens: "= vars.wreq.num_computed_tokens", block_hashes: "= vars.wreq.block_hashes"}
+                    input: {request_id: "= vars.wid", num_tokens: "= vars.wreq.num_computed_tokens", block_hashes: "= vars.wreq.block_hashes", token_ids: "= config['enable-kv-cache-events'] ? (vars.wreq.prompt_token_ids != null ? dyn(vars.wreq.prompt_token_ids + vars.wreq.output_token_ids) : dyn(vars.wreq.prompt_segments.map(s, lists.range(s.num_tokens).map(i, s.key + '#' + string(i))).flatten() + vars.wreq.output_token_ids.map(t, dyn(t)))) : dyn(null)", lora_request: "= has(vars.wreq.lora_request) ? vars.wreq.lora_request : dyn(null)"}
                   - set:
                       state.finished_recving_kv_req_ids: "= state.finished_recving_kv_req_ids.filter(r, r != vars.wid)"
                       state.requests: "= merge(state.requests, {vars.wid: {'status': vars.wreq.num_preemptions > 0 ? 'PREEMPTED' : 'WAITING', 'num_computed_tokens': vars.wreq.num_computed_tokens == vars.wreq.num_prompt_tokens + size(vars.wreq.output_token_ids) ? vars.wreq.num_computed_tokens - 1 : vars.wreq.num_computed_tokens}})"
@@ -669,7 +718,7 @@
                   - title: Look up already-cached tokens
                     source: "vllm/v1/core/sched/scheduler.py:960-968"
                     call: kv-cache-manager.get-computed-blocks
-                    input: {request_id: "= vars.wid", block_hashes: "= vars.wreq.block_hashes", num_tokens: "= vars.num_tokens", skip_reading_prefix_cache: "= has(vars.wreq.skip_reading_prefix_cache) && vars.wreq.skip_reading_prefix_cache"}
+                    input: {request_id: "= vars.wid", block_hashes: "= vars.wreq.block_hashes", num_tokens: "= vars.num_tokens", skip_reading_prefix_cache: "= has(vars.wreq.skip_reading_prefix_cache) && vars.wreq.skip_reading_prefix_cache", kv_cache_report_mode: "= has(vars.wreq.sampling_params.extra_args) && vars.wreq.sampling_params.extra_args != null && 'kv_cache_report_mode' in vars.wreq.sampling_params.extra_args ? vars.wreq.sampling_params.extra_args.kv_cache_report_mode : 'incremental'", token_ids: "= config['enable-kv-cache-events'] ? (vars.wreq.prompt_token_ids != null ? dyn(vars.wreq.prompt_token_ids + vars.wreq.output_token_ids) : dyn(vars.wreq.prompt_segments.map(s, lists.range(s.num_tokens).map(i, s.key + '#' + string(i))).flatten() + vars.wreq.output_token_ids.map(t, dyn(t)))) : dyn(null)", lora_request: "= has(vars.wreq.lora_request) ? vars.wreq.lora_request : dyn(null)"}
                     as: hit
                   - set: {vars.hit_blocks: "= vars.hit.value.blocks", vars.num_hit: "= vars.hit.value.num_computed_tokens", vars.mamba_hit: "= vars.hit.value.mamba_block"}
                   - if: "config['kv-connector'] != ''"
@@ -736,6 +785,8 @@
                   block_hashes: "= vars.wreq.block_hashes"
                   full_sequence_must_fit: "= config['scheduler-reserve-full-isl']"
                   has_scheduled_reqs: "= size(state.running) > 0"
+                  token_ids: "= config['enable-kv-cache-events'] ? (vars.wreq.prompt_token_ids != null ? dyn(vars.wreq.prompt_token_ids + vars.wreq.output_token_ids) : dyn(vars.wreq.prompt_segments.map(s, lists.range(s.num_tokens).map(i, s.key + '#' + string(i))).flatten() + vars.wreq.output_token_ids.map(t, dyn(t)))) : dyn(null)"
+                  lora_request: "= has(vars.wreq.lora_request) ? vars.wreq.lora_request : dyn(null)"
                 as: walloc
               - if: "!vars.walloc.value.allocated"
                 then:
@@ -764,6 +815,13 @@
                   - if: "vars.upd.value.kv_transfer_params != null"
                     then:
                       - set: {state.requests: "= merge(state.requests, {vars.wid: {'kv_transfer_params': vars.upd.value.kv_transfer_params}})"}
+              - if: "vars.wreq.num_computed_tokens == 0 && vars.wreq.num_preemptions <= 0 && has(vars.wreq.prefill_stats) && vars.wreq.prefill_stats != null"
+                then:
+                  - title: Track the first scheduled prefill (not a post-preemption repeat) in the request's PrefillStats
+                    detail: "PrefillStats.set: computed = prompt - (local + external cached)."
+                    source: "vllm/v1/core/sched/scheduler.py:1074-1081"
+                    set:
+                      state.requests: "= merge(state.requests, {vars.wid: {'prefill_stats': {'num_prompt_tokens': vars.wreq.num_prompt_tokens, 'num_computed_tokens': vars.wreq.num_prompt_tokens - vars.num_hit - vars.num_ext, 'num_cached_tokens': vars.num_hit + vars.num_ext, 'num_local_cached_tokens': vars.num_hit, 'num_external_cached_tokens': vars.num_ext, 'num_cache_creation_tokens': 0}}})"
               - if: "vars.wreq.num_computed_tokens == 0"
                 then:
                   - title: Record prefix-cache stats at admission
@@ -864,8 +922,14 @@
         source: "vllm/v1/core/sched/async_scheduler.py:31-38"
         set:
           vars.output: "= merge(vars.output, {'pending_structured_output_tokens': vars.async_sched && vars.sched.exists(sid, has(state.requests[sid].grammar_id) && state.requests[sid].grammar_id != null && state.requests[sid].num_output_placeholders > 0 && state.requests[sid].num_computed_tokens + vars.sched[sid] >= state.requests[sid].num_prompt_tokens + size(state.requests[sid].output_token_ids) + state.requests[sid].num_output_placeholders)})"
+      - if: "vars.total > 0 && (config['kv-connector'] != '' && 'kv-role' in config && config['kv-role'] in ['kv_consumer', 'kv_both'] && (config['async-scheduling'] == true ? (config['use-v2-model-runner'] ? ('pipeline-parallel-size' in config && config['pipeline-parallel-size'] != null ? int(config['pipeline-parallel-size']) : 1) + 1 : (('pipeline-parallel-size' in config && config['pipeline-parallel-size'] != null ? int(config['pipeline-parallel-size']) : 1) <= 1 ? 2 : ('pipeline-parallel-size' in config && config['pipeline-parallel-size'] != null ? int(config['pipeline-parallel-size']) : 1))) : ('pipeline-parallel-size' in config && config['pipeline-parallel-size'] != null ? int(config['pipeline-parallel-size']) : 1)) > 1)"
+        then:
+          - title: Deferred block free - advance the fence for a non-empty step
+            source: "vllm/v1/core/sched/scheduler.py:1549-1552"
+            set:
+              state.sched_step_seq: "= (has(state.sched_step_seq) ? state.sched_step_seq : 0) + 1"
       - title: Advance num_computed_tokens after scheduling
-        detail: "So a chunked prefill can be scheduled again next step; async scheduling also adds one output placeholder per decoding request."
+        detail: "So a chunked prefill can be scheduled again next step; async scheduling also adds one output placeholder per decoding request. With deferred block free on, each scheduled request records this step's fence (last_sched_seq)."
         source: "vllm/v1/core/sched/scheduler.py:1616-1648"
         foreach: "= vars.sched"
         as: n
@@ -883,7 +947,7 @@
           - title: Async - placeholders for the sampled and draft tokens, and -1 draft slots for the next step
             source: "vllm/v1/core/sched/async_scheduler.py:25-57"
             set:
-              state.requests: "= merge(state.requests, {vars.sid: {'num_computed_tokens': vars.computed, 'num_in_flight_tokens': (has(vars.r.num_in_flight_tokens) ? vars.r.num_in_flight_tokens : 0) + vars.n, 'is_prefill_chunk': vars.is_chunk, 'num_output_placeholders': vars.async_sched && !vars.is_chunk ? vars.r.num_output_placeholders + 1 + vars.n_spec_sched : vars.r.num_output_placeholders, 'spec_token_ids': vars.async_sched && !vars.is_chunk && vars.k > 0 ? lists.range(vars.k).map(i, -1) : vars.r.spec_token_ids}})"
+              state.requests: "= merge(state.requests, {vars.sid: {'num_computed_tokens': vars.computed, 'num_in_flight_tokens': (has(vars.r.num_in_flight_tokens) ? vars.r.num_in_flight_tokens : 0) + vars.n, 'last_sched_seq': has(state.sched_step_seq) ? state.sched_step_seq : 0, 'is_prefill_chunk': vars.is_chunk, 'num_output_placeholders': vars.async_sched && !vars.is_chunk ? vars.r.num_output_placeholders + 1 + vars.n_spec_sched : vars.r.num_output_placeholders, 'spec_token_ids': vars.async_sched && !vars.is_chunk && vars.k > 0 ? lists.range(vars.k).map(i, -1) : vars.r.spec_token_ids}})"
       - title: Clear finished and preempted ids (they went out in this output)
         source: "vllm/v1/core/sched/scheduler.py:1644-1648"
         set:
@@ -916,6 +980,19 @@
                     finished_sending: {type: array, items: {type: string}}
                     finished_recving: {type: array, items: {type: string}}
                     finished_store_events: {type: array, items: {type: integer}}
+                logprobs:
+                  type: [object, "null"]
+                  default: null
+                  description: "LogprobsLists of the batch's sampled positions (ModelRunnerOutput.logprobs; None when no row asked for logprobs). Rows are per sampled position: row req_index (or cu_num_generated_tokens[req_index] with spec decode) starts the request's positions. logprob_token_ids has the sampled token first then the top k. update_from_output hands them on under engine-core's EngineCoreOutput names {token_ids, logprobs, ranks}."
+                  properties:
+                    logprob_token_ids: {type: array, items: {type: array, items: {type: integer}}}
+                    logprobs: {type: array, items: {type: array, items: {type: number}}}
+                    sampled_token_ranks: {type: array, items: {type: integer}}
+                    cu_num_generated_tokens: {type: [array, "null"], items: {type: integer}, default: null}
+                prompt_logprobs_dict:
+                  type: object
+                  default: {}
+                  description: "ModelRunnerOutput.prompt_logprobs_dict: req_id -> LogprobsTensors {logprob_token_ids, logprobs, selected_token_ranks} of this step's prompt positions (only for requests with prompt_logprobs; a partial prefill chunk's are held by the worker until the prompt completes)."
     response: SchedKvEngineCoreOutputs
     behavior:
       - set:
@@ -923,6 +1000,13 @@
           vars.mro: "= input.model_runner_output"
           vars.async_sched: "= config['async-scheduling'] == true"
           vars.spec_stats: null
+      - if: "(config['kv-connector'] != '' && 'kv-role' in config && config['kv-role'] in ['kv_consumer', 'kv_both'] && (config['async-scheduling'] == true ? (config['use-v2-model-runner'] ? ('pipeline-parallel-size' in config && config['pipeline-parallel-size'] != null ? int(config['pipeline-parallel-size']) : 1) + 1 : (('pipeline-parallel-size' in config && config['pipeline-parallel-size'] != null ? int(config['pipeline-parallel-size']) : 1) <= 1 ? 2 : ('pipeline-parallel-size' in config && config['pipeline-parallel-size'] != null ? int(config['pipeline-parallel-size']) : 1))) : ('pipeline-parallel-size' in config && config['pipeline-parallel-size'] != null ? int(config['pipeline-parallel-size']) : 1)) > 1) && input.scheduler_output.total_num_scheduled_tokens > 0"
+        then:
+          - title: Every GPU write of this and earlier steps completed - advance processed_step_seq and return deferred blocks whose fence passed
+            source: "vllm/v1/core/sched/scheduler.py:2044-2048"
+            set:
+              state.processed_step_seq: "= (has(state.processed_step_seq) ? state.processed_step_seq : 0) + 1"
+          - call: scheduler.drain-deferred-frees
       - title: Walk the requests scheduled in that step
         source: "vllm/v1/core/sched/scheduler.py:2075-2077"
         foreach: "= input.scheduler_output.num_scheduled_tokens"
@@ -981,6 +1065,7 @@
               vars.status: "= state.requests[vars.rid].status"
               vars.stop_reason: null
               vars.kept: []
+              vars.ex: {prefill_stats: null, new_logprobs: null}
           - if: "size(vars.gen) > 0"
             then:
               - title: Append tokens and check for stop
@@ -1000,6 +1085,8 @@
                       min_tokens: "= vars.req.min_tokens"
                       eos_token_id: "= vars.req.eos_token_id"
                       stop_token_ids: "= vars.req.stop_token_ids"
+                      output_token_ids: "= vars.req.output_token_ids + vars.kept"
+                      repetition_detection: "= has(vars.req.sampling_params.repetition_detection) ? vars.req.sampling_params.repetition_detection : dyn(null)"
                     as: chk
                   - if: "vars.chk.value.stopped"
                     then:
@@ -1040,13 +1127,40 @@
                       request_id: "= vars.rid"
                       num_tokens: "= state.requests[vars.rid].num_computed_tokens - state.requests[vars.rid].num_output_placeholders"
                       block_hashes: "= state.requests[vars.rid].block_hashes"
+                      token_ids: "= config['enable-kv-cache-events'] ? (state.requests[vars.rid].prompt_token_ids != null ? dyn(state.requests[vars.rid].prompt_token_ids + state.requests[vars.rid].output_token_ids) : dyn(state.requests[vars.rid].prompt_segments.map(s, lists.range(s.num_tokens).map(i, s.key + '#' + string(i))).flatten() + state.requests[vars.rid].output_token_ids.map(t, dyn(t)))) : dyn(null)"
+                      lora_request: "= has(state.requests[vars.rid].lora_request) ? state.requests[vars.rid].lora_request : dyn(null)"
           - if: "size(vars.gen) == 0 && config['mm-encoder-only'] && state.requests[vars.rid].num_computed_tokens >= state.requests[vars.rid].num_prompt_tokens"
             then:
               - title: An encoder-only instance stops a request once its whole prompt is consumed (every item in it was encoded)
                 source: "vllm/v1/core/sched/scheduler.py:2174-2184"
                 set: {vars.stopped: true, vars.status: FINISHED_STOPPED}
+          - if: "(size(vars.kept) > 0 || vars.stopped) && has(state.requests[vars.rid].prefill_stats) && state.requests[vars.rid].prefill_stats != null"
+            then:
+              - title: Take the request's PrefillStats on its first output and finalize it with the tokens its blocks now cache
+                detail: "num_cache_creation_tokens = max(0, min(estimate_cached_tokens, num_prompt_tokens) - num_cached_tokens). Taken once (take_prefill_stats sets it None), before the stop handling frees the blocks."
+                source: "vllm/v1/core/sched/scheduler.py:2207-2212"
+                call: kv-cache-manager.estimate-cached-tokens
+                input: {request_id: "= vars.rid"}
+                as: est
+              - set:
+                  vars.ps0: "= state.requests[vars.rid].prefill_stats"
+              - set:
+                  vars.ex: "= merge(vars.ex, {'prefill_stats': merge(vars.ps0, {'num_cache_creation_tokens': math.greatest(0, math.least(vars.est.value.num_cached_tokens, vars.ps0.num_prompt_tokens) - vars.ps0.num_cached_tokens)})})"
+                  state.requests: "= merge(state.requests, {vars.rid: {'prefill_stats': null}})"
+          - if: "has(vars.mro.logprobs) && vars.mro.logprobs != null && size(has(vars.mro.logprobs.logprob_token_ids) ? vars.mro.logprobs.logprob_token_ids : vars.mro.logprobs.token_ids) > 0 && has(vars.req.sampling_params) && ((has(vars.req.sampling_params.logprobs) && vars.req.sampling_params.logprobs != null) || (has(vars.req.sampling_params.logprob_token_ids) && vars.req.sampling_params.logprob_token_ids != null && size(vars.req.sampling_params.logprob_token_ids) > 0)) && has(vars.mro.req_ids) && vars.rid in vars.mro.req_ids"
+            then:
+              - title: Slice the request's sample logprobs (one row per kept token) before stop handling
+                detail: "LogprobsLists.slice_request(req_index, len(new_token_ids)): the start row is req_index, or cu_num_generated_tokens[req_index] when set; trimmed tokens after a stop are not included. The runner's LogprobsLists(logprob_token_ids, logprobs, sampled_token_ranks) is handed on under engine-core's EngineCoreOutput names {token_ids, logprobs, ranks}."
+                source: "vllm/v1/core/sched/scheduler.py:2214-2221"
+                set:
+                  vars.ridx: "= lists.range(size(vars.mro.req_ids)).filter(i, vars.mro.req_ids[i] == vars.rid)[0]"
+                  vars.lp: "= {'token_ids': has(vars.mro.logprobs.logprob_token_ids) ? vars.mro.logprobs.logprob_token_ids : vars.mro.logprobs.token_ids, 'logprobs': vars.mro.logprobs.logprobs, 'ranks': has(vars.mro.logprobs.sampled_token_ranks) ? vars.mro.logprobs.sampled_token_ranks : vars.mro.logprobs.ranks, 'cu_num_generated_tokens': has(vars.mro.logprobs.cu_num_generated_tokens) ? vars.mro.logprobs.cu_num_generated_tokens : dyn(null)}"
+              - set:
+                  vars.lp_start: "= has(vars.lp.cu_num_generated_tokens) && vars.lp.cu_num_generated_tokens != null ? vars.lp.cu_num_generated_tokens[vars.ridx] : vars.ridx"
+              - set:
+                  vars.ex: "= merge(vars.ex, {'new_logprobs': {'token_ids': vars.lp.token_ids.slice(vars.lp_start, math.least(vars.lp_start + size(vars.kept), size(vars.lp.token_ids))), 'logprobs': vars.lp.logprobs.slice(vars.lp_start, math.least(vars.lp_start + size(vars.kept), size(vars.lp.logprobs))), 'ranks': vars.lp.ranks.slice(vars.lp_start, math.least(vars.lp_start + size(vars.kept), size(vars.lp.ranks)))}})"
           - set:
-              vars.finish_reason: "= !vars.stopped ? dyn(null) : dyn(vars.status == 'FINISHED_STOPPED' ? 'stop' : (vars.status == 'FINISHED_LENGTH_CAPPED' ? 'length' : (vars.status == 'FINISHED_ABORTED' ? 'abort' : 'error')))"
+              vars.finish_reason: "= !vars.stopped ? dyn(null) : dyn(vars.status == 'FINISHED_STOPPED' ? 'stop' : (vars.status == 'FINISHED_LENGTH_CAPPED' ? 'length' : (vars.status == 'FINISHED_ABORTED' ? 'abort' : (vars.status == 'FINISHED_REPETITION' ? 'repetition' : 'error'))))"
           - if: "vars.stopped"
             then:
               - title: Stopped - remove from running (or, for a preempted request, from waiting and the deferred set) and free the request
@@ -1064,10 +1178,10 @@
           - if: "size(vars.kept) > 0 || vars.stopped"
             then:
               - title: Emit an EngineCoreOutput
-                detail: "Partial prefill chunks sample nothing and emit nothing."
-                source: "vllm/v1/core/sched/scheduler.py:2261-2290"
+                detail: "Partial prefill chunks sample nothing and emit nothing (and carry no prompt logprobs: the worker holds a chunk's until the prompt completes). The output carries the sliced sample logprobs, this step's prompt logprobs for the request and the finalized PrefillStats."
+                source: "vllm/v1/core/sched/scheduler.py:2252-2291"
                 set:
-                  vars.outputs: "= vars.outputs + [{'request_id': vars.rid, 'new_token_ids': vars.kept, 'finish_reason': vars.finish_reason, 'stop_reason': vars.stop_reason, 'num_cached_tokens': vars.req.num_cached_tokens, 'client_index': vars.req.client_index, 'kv_transfer_params': vars.ktp, 'events': has(vars.req.events) && size(vars.req.events) > 0 ? vars.req.events : dyn(null)}]"
+                  vars.outputs: "= vars.outputs + [{'request_id': vars.rid, 'new_token_ids': vars.kept, 'finish_reason': vars.finish_reason, 'stop_reason': vars.stop_reason, 'num_cached_tokens': vars.req.num_cached_tokens, 'client_index': vars.req.client_index, 'kv_transfer_params': vars.ktp, 'events': has(vars.req.events) && size(vars.req.events) > 0 ? vars.req.events : dyn(null), 'new_logprobs': vars.ex.new_logprobs, 'new_prompt_logprobs_tensors': has(vars.mro.prompt_logprobs_dict) && vars.mro.prompt_logprobs_dict != null && vars.rid in vars.mro.prompt_logprobs_dict ? {'token_ids': has(vars.mro.prompt_logprobs_dict[vars.rid].logprob_token_ids) ? vars.mro.prompt_logprobs_dict[vars.rid].logprob_token_ids : vars.mro.prompt_logprobs_dict[vars.rid].token_ids, 'logprobs': vars.mro.prompt_logprobs_dict[vars.rid].logprobs, 'ranks': has(vars.mro.prompt_logprobs_dict[vars.rid].selected_token_ranks) ? vars.mro.prompt_logprobs_dict[vars.rid].selected_token_ranks : vars.mro.prompt_logprobs_dict[vars.rid].ranks} : dyn(null), 'prefill_stats': vars.ex.prefill_stats}]"
               - if: "vars.rid in state.requests && has(state.requests[vars.rid].events) && size(state.requests[vars.rid].events) > 0"
                 then:
                   - set: {state.requests: "= merge(state.requests, {vars.rid: {'events': []}})"}
@@ -1102,7 +1216,7 @@
             foreach: "= has(vars.mro.kv_connector_output.finished_sending) ? vars.mro.kv_connector_output.finished_sending.filter(r, r in state.requests) : []"
             as: sent
             steps:
-              - call: kv-cache-manager.free
+              - call: scheduler.free-request-blocks
                 input: {request_id: "= vars.sent"}
               - set: {state.requests: "= omit(state.requests, vars.sent)"}
       - title: Attach this step's SchedulerStats (spec-decoding stats included)

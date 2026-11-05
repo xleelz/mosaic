@@ -150,7 +150,7 @@ def flows_and_scenarios():
             "size(steps.tmla.result.value.invalid_reasons) == 0",
             "'compute capability not supported' in steps.cutlass.result.value.invalid_reasons",
             "'kv_cache_dtype not supported' in steps.tq.result.value.invalid_reasons && size(steps.tq2.result.value.invalid_reasons) == 0",
-            "'attention type encoder not supported' in steps.flex.result.value.invalid_reasons",
+            "'attention type AttentionType.ENCODER not supported' in steps.flex.result.value.invalid_reasons",
             "['sliding window not supported', 'batch invariance not supported'].all(r, r in steps.fmla.result.value.invalid_reasons)",
             "trace.exists(e, e.type == 'call.end' && e.interface == 'attention-backend.validate-configuration')"],
            steps=[{"flow": "attn-validate-backend", "input": {"backend": "FLASHINFER", "device_capability": {"major": 10, "minor": 0}, "fa_version": 4}, "as": "fi"},

@@ -3,7 +3,7 @@ interfaces:
   - component: sampler
     name: add-request
     kind: function
-    summary: "Sampler.add_request: stages temperature/top-k/top-p/min-p/seed/logprobs into the slot and asks each logits processor (logit bias, penalties, bad words, custom) and the thinking budget whether the slot needs logits processing."
+    summary: "Sampler.add_request: stages temperature/top-k/top-p/min-p/seed/logprobs into the slot and asks each logits processor (logit bias, penalties, bad words, custom) and the thinking budget whether the slot needs logits processing. An unseeded request's seed is drawn from np.random in the code (seeds_set false); the model stores null, because no stand-in token reads it and a draw here would shift every later random token; logprobs -1 means the whole vocabulary; min_tokens > 0 alone enables the logit-bias stage, because its mask keys on all_stop_token_ids, which always holds the model's EOS (update_from_generation_config adds it even under ignore_eos, sampling_params.py:781-784)."
     sources: ["vllm/v1/worker/gpu/sample/sampler.py:96-107", "vllm/v1/worker/gpu/sample/states.py:41-71"]
     latency_ms: 0
     request:
@@ -24,7 +24,7 @@ interfaces:
       - set:
           vars.base: "= vars.t != 0.0 && (vars.t != 1.0 || vars.min_p != 0.0 || vars.top_k != state.vocab_size || vars.top_p != 1.0)"
           vars.penalties: "= (has(vars.sp.repetition_penalty) && double(vars.sp.repetition_penalty) != 1.0) || (has(vars.sp.frequency_penalty) && double(vars.sp.frequency_penalty) != 0.0) || (has(vars.sp.presence_penalty) && double(vars.sp.presence_penalty) != 0.0)"
-          vars.logit_bias: "= (has(vars.sp.logit_bias) && size(vars.sp.logit_bias) > 0) || (has(vars.sp.allowed_token_ids) && size(vars.sp.allowed_token_ids) > 0) || (has(vars.sp.min_tokens) && vars.sp.min_tokens > 0 && has(vars.sp.stop_token_ids) && size(vars.sp.stop_token_ids) > 0)"
+          vars.logit_bias: "= (has(vars.sp.logit_bias) && size(vars.sp.logit_bias) > 0) || (has(vars.sp.allowed_token_ids) && size(vars.sp.allowed_token_ids) > 0) || (has(vars.sp.min_tokens) && vars.sp.min_tokens != null && vars.sp.min_tokens > 0)"
           vars.thinking: "= has(vars.sp.thinking_token_budget)"
       - if: "vars.penalties"
         then:
@@ -49,8 +49,9 @@ interfaces:
           - set: {vars.custom_needs: "= vars.custom_needs || vars.cp.value.modifies_logits"}
       - set:
           vars.needs: "= vars.base || vars.penalties || vars.logit_bias || vars.thinking || vars.bw.value.uses_bad_words || vars.custom_needs"
-      - set:
-          state.slots: "= merge(state.slots, {string(input.slot): {'temperature': vars.t, 'top_p': vars.top_p, 'top_k': vars.top_k, 'min_p': vars.min_p, 'min_tokens': has(vars.sp.min_tokens) && vars.sp.min_tokens != null ? int(vars.sp.min_tokens) : 0, 'seeded': has(vars.sp.seed) && vars.sp.seed != null, 'seed': has(vars.sp.seed) && vars.sp.seed != null ? int(vars.sp.seed) : 0, 'logprobs': has(vars.sp.logprobs) && vars.sp.logprobs != null ? int(vars.sp.logprobs) : -1, 'penalties': vars.penalties, 'logit_bias': vars.logit_bias, 'thinking': vars.thinking, 'needs_processing': vars.needs}})"
+      - source: "vllm/v1/worker/gpu/sample/states.py:53-64"
+        set:
+          state.slots: "= merge(state.slots, {string(input.slot): {'temperature': vars.t, 'top_p': vars.top_p, 'top_k': vars.top_k, 'min_p': vars.min_p, 'min_tokens': has(vars.sp.min_tokens) && vars.sp.min_tokens != null ? int(vars.sp.min_tokens) : 0, 'seeded': has(vars.sp.seed) && vars.sp.seed != null, 'seed': has(vars.sp.seed) && vars.sp.seed != null ? dyn(int(vars.sp.seed)) : dyn(null), 'logprobs': has(vars.sp.logprobs) && vars.sp.logprobs != null ? (int(vars.sp.logprobs) == -1 ? int(state.vocab_size) : int(vars.sp.logprobs)) : -1, 'penalties': vars.penalties, 'logit_bias': vars.logit_bias, 'thinking': vars.thinking, 'needs_processing': vars.needs}})"
       - return: {needs_processing: "= vars.needs"}
   - component: sampler
     name: sample
@@ -59,7 +60,7 @@ interfaces:
     sources: ["vllm/v1/worker/gpu/sample/sampler.py:134-224", "vllm/v1/worker/gpu/sample/sampler.py:226-356", "vllm/v1/worker/gpu/sample/output.py:16-23"]
     latency_ms: 0
     request: {type: object, properties: {rows: {type: array}}}
-    response: {type: object, properties: {req_ids: {type: array}, sampled_token_ids: {type: array}, masked: {type: array}}}
+    response: {type: object, properties: {req_ids: {type: array}, sampled_token_ids: {type: array}, masked: {type: array}, logprobs: {$ref: WrLogprobsLists}}}
     behavior:
       - if: "input.rows.exists(r, !(string(r.slot) in state.slots))"
         then:
@@ -128,15 +129,34 @@ interfaces:
         then:
           - call: sampling-mask-tensors.compact-sampling-mask-kernel
             input: {num_rows: "= size(input.rows)"}
-      - return:
+      - set: {vars.logprobs: null}
+      - if: "vars.p.exists(s, s.logprobs != null && s.logprobs >= 0)"
+        then:
+          - title: "LogprobsTensors for every logits row, at the batch's largest num_logprobs: column 0 is the sampled token, then the top-k ids; plus the sampled token's rank (the scheduler slices the rows of the requests that asked)"
+            detail: "The model holds no logits, so the values are labeled stand-ins: a greedy row's token is the argmax (rank 1, so it is also the first top-k id); another row's rank is 1 + token % 4. The other top-k ids are deterministic from the token, and the logprob of rank r is -0.25 r."
+            source: "vllm/v1/worker/gpu/sample/logprob.py:122-133"
+            set:
+              vars.k: "= vars.p.map(s, s.logprobs != null ? s.logprobs : -1).sortBy(x, -x)[0]"
+              vars.toks: "= lists.range(size(input.rows)).map(i, vars.asp.value.tokens[i][0])"
+          - set:
+              vars.ranks: "= lists.range(size(input.rows)).map(i, vars.asp.value.greedy[i] ? 1 : 1 + (vars.toks[i] < 0 ? 0 : vars.toks[i]) % 4)"
+          - set:
+              vars.logprobs:
+                logprob_token_ids: "= lists.range(size(input.rows)).map(i, [vars.toks[i]] + lists.range(vars.k).map(j, j + 1 == vars.ranks[i] ? vars.toks[i] : ((vars.toks[i] < 0 ? 0 : vars.toks[i]) * 17 + (j + 1) * 7919) % 127900 + 100))"
+                logprobs: "= lists.range(size(input.rows)).map(i, [-0.25 * double(vars.ranks[i])] + lists.range(vars.k).map(j, -0.25 * double(j + 1)))"
+                sampled_token_ranks: "= vars.ranks"
+                cu_num_generated_tokens: null
+      - source: "vllm/v1/worker/gpu/sample/sampler.py:212-222"
+        return:
           req_ids: "= input.rows.map(r, r.req_id)"
           sampled_token_ids: "= lists.range(size(input.rows)).map(i, !input.rows[i].is_final ? [] : [vars.asp.value.tokens[i][0]])"
           masked: "= vars.masked"
+          logprobs: "= vars.logprobs"
 
   - component: sampler
     name: apply-sampling-params
     kind: function
-    summary: "Sampler.apply_sampling_params: when any row needs processing, copies the logits to FP32, builds the step's LogitsContext and runs the logits processors in order (logit bias and min_tokens, penalties, bad words, then custom processors), the thinking-budget forcing last, then temperature and min_p, and top-k/top-p unless skipped. The rejection sampler calls it for the target's logits too. The model holds no logits, so it returns, for each logits row, the token the processed logits would yield (a labeled stand-in; -1 for a chunked prefill that samples nothing): the model's EOS at the request's natural output length (masked until min_tokens), else a deterministic token for greedy or seeded rows and a random one otherwise."
+    summary: "Sampler.apply_sampling_params: when any row needs processing, copies the logits to FP32, builds the step's LogitsContext and runs the logits processors in order (logit bias and min_tokens, penalties, bad words, then custom processors), the thinking-budget forcing last, then temperature and min_p, and top-k/top-p unless skipped. The rejection sampler calls it for the target's logits too. The model holds no logits, so it returns, for each logits row, the token the processed logits would yield (a labeled stand-in; -1 for a chunked prefill that samples nothing): the model's EOS at the request's natural output length (masked until min_tokens), else a deterministic token for greedy or seeded rows and a random one otherwise. A token the bad-words mask set to -inf cannot win the argmax (bad_words.py:165), so such a row takes the next token id outside its masked set at that logits position."
     sources: ["vllm/v1/worker/gpu/sample/sampler.py:226-276", "vllm/v1/worker/gpu/sample/logits_processor/interface.py:63-89"]
     latency_ms: 0
     request:
@@ -210,8 +230,13 @@ interfaces:
       - title: Token values stand in for logits
         detail: "A greedy row (temperature 0: plain argmax in the Gumbel kernel) or a seeded row gets a deterministic token from the request's prompt and the position (plus the seed for a seeded random row only: at temperature 0 the kernel skips the noise, so the seed has no effect, gumbel.py:182-198), so identical requests produce identical outputs and a greedy target's verdict on a draft is reproducible; an unseeded random row gets a seeded-per-run random token."
         source: "vllm/v1/worker/gpu/sample/gumbel.py:21-44"
-        return:
-          tokens: "= lists.range(size(input.rows)).map(i, lists.range(size(vars.pos[i])).map(j, (has(input.rows[i].is_final) && !input.rows[i].is_final) ? -1 : (!has(input.rows[i].grammar) ? (vars.eos[i][j] ? (has(input.rows[i].eos_token_id) ? input.rows[i].eos_token_id : 128009) : ((vars.p[i].temperature == 0.0 || vars.p[i].seeded) ? ((has(input.rows[i].prompt_hash) ? input.rows[i].prompt_hash : 0) * 31 + (vars.pos[i][j] >= 0 ? vars.pos[i][j] : 0) * 7919 + (vars.p[i].temperature != 0.0 && has(vars.p[i].seed) ? vars.p[i].seed % 1000003 : 0)) % 127900 + 100 : random(127900) + 100)) : ((vars.eos[i][j] && input.rows[i].grammar.stop) ? (has(input.rows[i].eos_token_id) ? input.rows[i].eos_token_id : 128009) : (input.rows[i].grammar.content ? ((vars.p[i].temperature == 0.0 || vars.p[i].seeded) ? ((has(input.rows[i].prompt_hash) ? input.rows[i].prompt_hash : 0) * 31 + (vars.pos[i][j] >= 0 ? vars.pos[i][j] : 0) * 7919 + (vars.p[i].temperature != 0.0 && has(vars.p[i].seed) ? vars.p[i].seed % 1000003 : 0)) % 127900 + 100 : random(127900) + 100) : (input.rows[i].grammar.quote ? 1 : (input.rows[i].grammar.stop ? (has(input.rows[i].eos_token_id) ? input.rows[i].eos_token_id : 128009) : ((vars.p[i].temperature == 0.0 || vars.p[i].seeded) ? ((has(input.rows[i].prompt_hash) ? input.rows[i].prompt_hash : 0) * 31 + (vars.pos[i][j] >= 0 ? vars.pos[i][j] : 0) * 7919 + (vars.p[i].temperature != 0.0 && has(vars.p[i].seed) ? vars.p[i].seed % 1000003 : 0)) % 127900 + 100 : random(127900) + 100))))))))"
+        set:
+          vars.tok0: "= lists.range(size(input.rows)).map(i, lists.range(size(vars.pos[i])).map(j, (has(input.rows[i].is_final) && !input.rows[i].is_final) ? -1 : (!has(input.rows[i].grammar) ? (vars.eos[i][j] ? (has(input.rows[i].eos_token_id) ? input.rows[i].eos_token_id : 128009) : ((vars.p[i].temperature == 0.0 || vars.p[i].seeded) ? ((has(input.rows[i].prompt_hash) ? input.rows[i].prompt_hash : 0) * 31 + (vars.pos[i][j] >= 0 ? vars.pos[i][j] : 0) * 7919 + (vars.p[i].temperature != 0.0 && has(vars.p[i].seed) ? vars.p[i].seed % 1000003 : 0)) % 127900 + 100 : random(127900) + 100)) : ((vars.eos[i][j] && input.rows[i].grammar.stop) ? (has(input.rows[i].eos_token_id) ? input.rows[i].eos_token_id : 128009) : (input.rows[i].grammar.content ? ((vars.p[i].temperature == 0.0 || vars.p[i].seeded) ? ((has(input.rows[i].prompt_hash) ? input.rows[i].prompt_hash : 0) * 31 + (vars.pos[i][j] >= 0 ? vars.pos[i][j] : 0) * 7919 + (vars.p[i].temperature != 0.0 && has(vars.p[i].seed) ? vars.p[i].seed % 1000003 : 0)) % 127900 + 100 : random(127900) + 100) : (input.rows[i].grammar.quote ? 1 : (input.rows[i].grammar.stop ? (has(input.rows[i].eos_token_id) ? input.rows[i].eos_token_id : 128009) : ((vars.p[i].temperature == 0.0 || vars.p[i].seeded) ? ((has(input.rows[i].prompt_hash) ? input.rows[i].prompt_hash : 0) * 31 + (vars.pos[i][j] >= 0 ? vars.pos[i][j] : 0) * 7919 + (vars.p[i].temperature != 0.0 && has(vars.p[i].seed) ? vars.p[i].seed % 1000003 : 0)) % 127900 + 100 : random(127900) + 100))))))))"
+      - source: "vllm/v1/worker/gpu/sample/bad_words.py:160-165"
+        set:
+          vars.ban: "= lists.range(size(input.rows)).map(i, lists.range(size(vars.pos[i])).map(j, vars.masked.filter(m, m.slot == input.rows[i].slot && m.local_pos == j).map(m, m.token)))"
+      - return:
+          tokens: "= lists.range(size(input.rows)).map(i, lists.range(size(vars.tok0[i])).map(j, vars.tok0[i][j] < 0 || size(vars.ban[i][j]) == 0 || !(vars.tok0[i][j] in vars.ban[i][j]) ? vars.tok0[i][j] : lists.range(size(vars.ban[i][j]) + 1).map(d, (vars.tok0[i][j] - 100 + d + 1) % 127900 + 100).filter(c, !(c in vars.ban[i][j]))[0]))"
           greedy: "= vars.p.map(s, s.temperature == 0.0)"
           masked: "= vars.masked"
   - component: sampler
@@ -373,24 +398,85 @@ interfaces:
   - component: prompt-logprobs-worker
     name: compute-prompt-logprobs
     kind: function
-    summary: "compute_prompt_logprobs: only for new requests whose sampling params ask for prompt_logprobs (computed over their prefill chunk)."
+    summary: "compute_prompt_logprobs: for each batch request that uses prompt logprobs and whose prefill still covers prompt positions (not one resumed after preemption), score the next prompt token at each of this step's positions; a chunked prompt keeps its chunks until its last chunk, whose final row (it predicts the first output token) is dropped. Returns req_id -> LogprobsTensors (width num_prompt_logprobs + 1, the actual prompt token first)."
     sources: ["vllm/v1/worker/gpu/sample/prompt_logprob.py:120-230"]
     latency_ms: 0
-    request: {type: object, properties: {new_reqs: {type: object}, model_component: {type: string, default: llama-for-causal-lm, description: "the loaded model's component"}}}
-    response: {type: object, properties: {req_ids: {type: array}}}
+    request:
+      type: object
+      properties:
+        rows: {type: array, description: "the batch: req_id, slot, nct (num_computed_tokens), n (scheduled tokens), prompt_len, prefill_len, token_ids (all_token_ids)"}
+        model_component: {type: string, default: llama-for-causal-lm, description: "the loaded model's component"}
+    response: {type: object, properties: {prompt_logprobs_dict: {type: object, additionalProperties: {$ref: WrLogprobsTensors}}, req_ids: {type: array, items: {type: string}}}}
+    behavior:
+      - title: "needs_prompt_logprobs: the slot uses prompt logprobs, the step still includes prompt positions, and the request was not resumed after its prompt (prompt_len < prefill_len)"
+        source: "vllm/v1/worker/gpu/sample/prompt_logprob.py:131-147"
+        set:
+          vars.need: "= input.rows.filter(r, string(r.slot) in state.slots && r.nct < r.prompt_len && !(r.prompt_len < r.prefill_len))"
+      - if: "size(vars.need) == 0"
+        then:
+          - source: "vllm/v1/worker/gpu/sample/prompt_logprob.py:133-136"
+            return: {prompt_logprobs_dict: {}, req_ids: []}
+      - call: prompt-logprobs-worker.prompt-logprobs-token-ids-kernel
+        input: {num_rows: "= size(vars.need)"}
+      - title: The loaded model's compute_logits over the prompt positions (chunked)
+        source: "vllm/v1/worker/gpu/sample/prompt_logprob.py:157-174"
+        call: "= (has(input.model_component) ? input.model_component : 'llama-for-causal-lm') + '.compute-logits'"
+        targets: [llama-for-causal-lm.compute-logits, mixtral-for-causal-lm.compute-logits, qwen2-vl-for-conditional-generation.compute-logits, qwen3-vl-for-conditional-generation.compute-logits]
+        input: {num_tokens: "= sum(vars.need.map(r, r.n))"}
+      - title: "Per request: rows start_idx..end_idx of this step's positions, minus the last when the prompt ends this step; the token at position p is all_token_ids[p + 1]"
+        detail: "The model holds no logits: the actual token's rank is a labeled stand-in, 1 + token % 3, the other top ids are deterministic from the token, and rank r has logprob -0.5 r."
+        source: "vllm/v1/worker/gpu/sample/prompt_logprob.py:176-204"
+        set:
+          vars.chunks: "= vars.need.map(r, {'req_id': r.req_id, 'chunked': r.nct + r.n < r.prompt_len, 'k': state.slots[string(r.slot)] < 0 ? 20 : state.slots[string(r.slot)], 'pos': lists.range(r.nct + r.n - (r.nct + r.n < r.prompt_len ? 0 : 1) - r.nct).map(j, r.nct + j).filter(p, p + 1 < size(r.token_ids)).map(p, r.token_ids[p + 1])})"
+      - set:
+          vars.tensors: "= vars.chunks.map(c, {'req_id': c.req_id, 'chunked': c.chunked, 't': {'logprob_token_ids': c.pos.map(t, [t] + lists.range(c.k).map(j, j + 1 == 1 + t % 3 ? t : (t * 13 + (j + 1) * 7919) % 127900 + 100)), 'logprobs': c.pos.map(t, [-0.5 * double(1 + t % 3)] + lists.range(c.k).map(j, -0.5 * double(j + 1))), 'selected_token_ranks': c.pos.map(t, 1 + t % 3)}})"
+      - title: "A chunked prompt's logprobs wait in in_progress_prompt_logprobs; the last chunk concatenates them (LogprobsTensors.cat) and returns the whole prompt's rows"
+        source: "vllm/v1/worker/gpu/sample/prompt_logprob.py:206-228"
+        set:
+          vars.merged: "= vars.tensors.map(x, x.req_id in state.in_progress ? {'req_id': x.req_id, 'chunked': x.chunked, 't': {'logprob_token_ids': state.in_progress[x.req_id].map(c, c.logprob_token_ids).flatten() + x.t.logprob_token_ids, 'logprobs': state.in_progress[x.req_id].map(c, c.logprobs).flatten() + x.t.logprobs, 'selected_token_ranks': state.in_progress[x.req_id].map(c, c.selected_token_ranks).flatten() + x.t.selected_token_ranks}} : x)"
+      - set:
+          state.in_progress: "= merge(state.in_progress.filter(k, !vars.tensors.exists(x, x.req_id == k)).transformMapEntry(i, k, {k: state.in_progress[k]}), vars.tensors.filter(x, x.chunked || x.req_id in state.in_progress).transformMapEntry(i, x, {x.req_id: x.chunked ? (x.req_id in state.in_progress ? state.in_progress[x.req_id] : []) + [x.t] : []}))"
+      - set:
+          vars.out: "= vars.merged.filter(x, !x.chunked && size(x.t.selected_token_ranks) > 0)"
+      - return:
+          prompt_logprobs_dict: "= vars.out.transformMapEntry(i, x, {x.req_id: x.t})"
+          req_ids: "= vars.out.map(x, x.req_id).sort()"
+  - component: prompt-logprobs-worker
+    name: add-request
+    kind: function
+    summary: "PromptLogprobsWorker.add_request: records whether the request uses prompt logprobs (prompt_logprobs is not None) and how many, and opens its in-progress list."
+    sources: ["vllm/v1/worker/gpu/sample/prompt_logprob.py:49-54"]
+    latency_ms: 0
+    request: {type: object, required: [req_id, slot], properties: {req_id: {type: string}, slot: {type: integer}, sampling_params: {type: object, default: {}}}}
+    response: {type: object, properties: {uses_prompt_logprobs: {type: boolean}}}
     behavior:
       - set:
-          vars.ids: "= input.new_reqs.map(k, k).filter(k, has(input.new_reqs[k].sampling_params) && has(input.new_reqs[k].sampling_params.prompt_logprobs)).sort()"
-      - if: "size(vars.ids) == 0"
-        then: [{return: {req_ids: []}}]
-      - call: prompt-logprobs-worker.prompt-logprobs-token-ids-kernel
-        input: {num_rows: "= size(vars.ids)"}
-      - title: The loaded model's compute_logits over the prompt positions
-        source: "vllm/v1/worker/gpu/sample/prompt_logprob.py:150-175"
-        call: "= (has(input.model_component) ? input.model_component : 'llama-for-causal-lm') + '.compute-logits'"
-        targets: [llama-for-causal-lm.compute-logits, mixtral-for-causal-lm.compute-logits, qwen2-vl-for-conditional-generation.compute-logits]
-        input: {num_tokens: "= size(vars.ids)"}
-      - return: {req_ids: "= vars.ids"}
+          vars.uses: "= has(input.sampling_params) && has(input.sampling_params.prompt_logprobs) && input.sampling_params.prompt_logprobs != null"
+      - if: "vars.uses"
+        then:
+          - set:
+              state.slots: "= merge(state.slots, {string(input.slot): int(input.sampling_params.prompt_logprobs)})"
+              state.in_progress: "= merge(state.in_progress, {input.req_id: []})"
+        else:
+          - title: The slot no longer uses prompt logprobs (a recycled slot stops computing them)
+            source: "vllm/v1/worker/gpu/sample/prompt_logprob.py:50-52"
+            set:
+              state.slots: "= omit(state.slots, string(input.slot))"
+      - return: {uses_prompt_logprobs: "= vars.uses"}
+  - component: prompt-logprobs-worker
+    name: remove-request
+    kind: function
+    summary: "PromptLogprobsWorker.remove_request: drops a finished request's in-progress chunks."
+    sources: ["vllm/v1/worker/gpu/sample/prompt_logprob.py:65-66"]
+    latency_ms: 0
+    request: {type: object, required: [req_id], properties: {req_id: {type: string}}}
+    response: {type: object, properties: {removed: {type: boolean}}}
+    behavior:
+      - set: {vars.had: "= input.req_id in state.in_progress"}
+      - if: "vars.had"
+        then:
+          - set: {state.in_progress: "= omit(state.in_progress, input.req_id)"}
+      - return: {removed: "= vars.had"}
   - component: structured-outputs-worker
     name: apply-grammar-bitmask
     kind: function

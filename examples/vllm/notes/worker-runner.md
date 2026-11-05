@@ -545,3 +545,119 @@ rows now pass; P3-6a fails only on the capture-model count (measure notes). Thre
 (S3-4b, oracle-r3 video, oracle serving-engine mixed image) come from the multimodal processor
 path (`multi-modal-registry.create-processor`, `hf-hub.download-config`), serving-api/models-layers work
 in progress, not from this fragment.
+
+## Fix round 6 (mechanism coverage)
+
+New parts: `gen/worker-runner/parts/66-round6.yaml` (schemas `WrLogprobsLists`, `WrLogprobsTensors`;
+component `default-model-state`; `default-model-state.prepare-attn`,
+`mamba-hybrid-model-state.prepare-attn`, `attn-utils.build-attn-metadata`) and
+`89-scenarios-round6.yaml` (`wr-r6-*`). Edits in `30-runner.yaml`, `40-sampler.yaml`,
+`50-spec-misc.yaml`, `10-components.yaml`.
+
+**Absent mechanisms from the round-5 measure (RESULTS, oracle4, judge4), now modeled**
+1. *Top-k and prompt logprobs never returned* (oracle4 row 1). `sampler.sample` returns
+   `logprobs` (LogprobsLists) when any row asks: per logits row, the sampled token first, then the
+   batch's largest k top ids; the sampled token's rank; `cu_num_generated_tokens` null without drafts
+   (sampler.py:171-222, logprob.py:122-133). Values are labeled stand-ins (no logits): a greedy
+   token is the argmax (rank 1), others rank 1 + token % 4; rank r has logprob -0.25 r.
+   `prompt-logprobs-worker` now has state (slot -> num_prompt_logprobs, in-progress chunks) and
+   `add-request` / `remove-request` (called from `add-requests` / `finish-requests`,
+   model_runner.py:1147-1148, 1225-1228). `compute-prompt-logprobs` takes the batch rows and returns
+   `prompt_logprobs_dict` (req_id -> LogprobsTensors, one row per prompt position after the first,
+   the actual next prompt token in column 0, width k+1); a chunked prompt waits in in-progress until its
+   last chunk (prompt_logprob.py:131-228). `gpu-model-runner.sample-tokens` returns both in the
+   ModelRunnerOutput (async_utils.py:173-200). Regressions `wr-r6-logprobs-returned`,
+   `wr-r6-chunked-prompt-logprobs`.
+   **Shape for scheduler-kv (agreed through these notes, the code's field names):**
+   `ModelRunnerOutput.logprobs = {logprob_token_ids: [[int]], logprobs: [[float]], sampled_token_ranks: [int], cu_num_generated_tokens: null|[int]}`,
+   one row per entry of `req_ids` (row i belongs to `req_ids[i]`; with drafts, rows per request
+   follow `cu_num_generated_tokens`); null when no request asked.
+   `ModelRunnerOutput.prompt_logprobs_dict = {req_id: {logprob_token_ids: [[int]], logprobs: [[float]], selected_token_ranks: [int]}}`,
+   present only for a request whose prompt finished this step.
+   `Scheduler.update_from_output` should slice `logprobs` per request (`slice_request(i, len(new_token_ids))`,
+   scheduler.py:2156-2270) into `EngineCoreOutput.new_logprobs` and pass
+   `prompt_logprobs_dict[req_id]` as `new_prompt_logprobs_tensors`. Engine-core's processor reads
+   `new_logprobs` as `{token_ids, logprobs, ranks}` (its round-6 working copy), so the scheduler maps
+   `logprob_token_ids -> token_ids`, `sampled_token_ranks -> ranks`. `prefill_stats` is the
+   scheduler's own (Request.take_prefill_stats, scheduler.py:2208-2240); nothing in ModelRunnerOutput carries it.
+   scheduler-kv adopted this shape (its notes); `oracle-worker-runner-get-logprobs-and-prompt-logprobs` passes unedited on the merged working copies.
+2. *Bad-words mask ignored* (oracle4 row 2). `sampler.apply-sampling-params` now walks a row whose
+   stand-in token is masked at that logits position to the next unmasked id (the -inf of
+   bad_words.py:165 before the argmax). The bad-words context is the slot's committed output
+   (all_token_ids after the prompt), not only a new request's prefill. `oracle-worker-runner-one-token-bad-word`
+   passes unedited; regression `wr-r6-bad-word-changes-sample`. Text `bad_words` still need
+   `SamplingParams.update_from_tokenizer` (serving-api / engine-core).
+3. *Mamba prepare_attn positions* (oracle4 row 3). `execute-model` calls the model state's
+   `prepare-attn` (`mamba-hybrid-model-state` for a hybrid model, else `default-model-state`), which
+   calls `attn-utils.build-attn-metadata` with `positions` (num_computed_tokens + j per scheduled
+   token) and is_prefilling; the hybrid state adds MambaHybridAttnMetadata (is_prefilling, and with
+   speculation num_accepted_tokens and num_decode_draft_tokens, -1 for non-decode rows)
+   (mamba_hybrid.py:230-345, default.py:169-238, attn_utils.py:455-581). The builder gets
+   `common.positions`. Regressions `wr-r6-prepare-attn-positions`, `wr-r6-default-prepare-attn-decode-positions`.
+   The oracle scenario still fails on its last expectation: it reads `input.positions` on
+   `*metadata-builder.build`, but the code passes positions to `build_attn_metadata` (the test mocks that
+   function) and from there inside `CommonAttentionMetadata` to the builder (attn_utils.py:523-545).
+   See `reconcile/round6/measure-notes.md`.
+4. *Collective RPC waits on every rank* (judge4 P4-2 d). The worker side is right: rank 0's
+   `execute-model` fails at once and its FAILURE reply is immediate. The wait is
+   `multiproc-executor.collective-rpc` (engine-core, `vllm/v1/executor/**`): it joins `need: all`
+   over the ranks even with `unique_reply_rank`. **Request to engine-core:** with an output rank,
+   enqueue to every rank but wait only on that rank's reply (multiproc_executor.py:421-423, 444-449),
+   so ranks 1-3 blocked in the TP all-reduce don't hold the RuntimeError for 300 s.
+5. *judge4 scheduling-kv: min_tokens mask keys on stop_token_ids* (`sampler.add-request`):
+   min_tokens > 0 alone enables the logit-bias stage, since all_stop_token_ids always holds EOS
+   (sampling_params.py:781-784, logit_bias.py:96-112). `wr-r6-min-tokens-enables-logit-bias`.
+6. *judge4 P4-8 #6: unseeded requests stored seed 0*: an unseeded slot now stores null with
+   `seeded` false (the code draws np.random.randint, states.py:53-57; see the breaking changes for why
+   the model doesn't). The global `--seed` config (model_config.seed) is config-platform's.
+
+**Other mechanisms added (coverage_gaps, request paths): 1, pooling.** `pooling-runner` has state
+(slot -> pooling params, supported tasks), `add-request` (the task must be supported:
+`ValueError: Unsupported task: 'x'. Supported tasks: [...]`, pooling_runner.py:66-88),
+`remove-request`, and `pool` now runs models-layers' `dispatch-pooler.forward` on the batch
+(task, prompt length, scheduled tokens, dimensions, use_activation) and returns the finished
+mask: a prompt still being prefilled gets no output (pooling_runner.py:139-170). Regression
+`wr-r6-pooling-chunked-and-task`. Needs models-layers' round-6 `dispatch-pooler` (joint stage).
+No world variant added (a pooling model is driven by `is_pooling_model` and `model.pooler_tasks` state, as in round 5).
+
+**Coordinator items.**
+- *Breakable CUDA graphs:* `cuda-graph-manager.run-pw-graph` calls kernels-ops' `breakable-cuda-graph-wrapper.call` under `VLLM_USE_BREAKABLE_CUDAGRAPH` (capture runs the model; replay doesn't enter it; cudagraph_utils.py:565-576), and `capture` calls it per PIECEWISE descriptor (:752-755). `wr-r6-breakable-cudagraph-capture-then-replay`. **Open, kernels-ops:** no interface for `BreakableCUDAGraphWrapper.clear_all_graphs` (cudagraph_utils.py:405-406, 962), so `cuda-graph-manager.release` doesn't clear the wrapper's entries: after a profiling capture with the env on, real capture would replay.
+- *EPLB:* new `eplb-controller.step` (eplb_utils.py:167-177) calls distributed's `eplb-state.step` after `sample-tokens`, `pool` and `dummy-run` (unless `skip_eplb`; warmup's dummy run skips, gpu_worker.py:937-945). judge4 `bench-p4-6-de` passes. Regressions `wr-r6-eplb-profile-run-steps-state`, `wr-r6-eplb-unregistered-model-no-step`. Simplification: the decorator also steps when `sample_tokens`/`pool` return early because `execute_model_state` is None (a prior failed execute); the model doesn't, since that call inside the guard makes the guard a racy read-then-write and the code has no lock token an exemption could cite (the state is confined to the WorkerProc RPC loop, multiproc_executor.py:1037-1041).
+- *Kernel warmup:* `compile-or-warm-up-model` calls models-layers' `kernel-warmup.kernel-warmup` after the dummy run (gpu_worker.py:949), and that dummy run passes `skip_eplb`.
+- *Hollow and internal assertions:* my hollow findings are 0, internal assertions 88/429 (20.5%; gate 0.217), by moving round-6 expectations to the boundary (attention's build input, models-layers' compute-logits and dispatch-pooler inputs).
+
+- *Forward dispatch (models-layers' request):* `dummy-run` and `execute-model` take the component `load_model` returned; in a world that never loaded, a non-Llama/Mixtral/Qwen2-VL architecture goes through `model-registry.resolve-model-cls` (a refused one keeps the Llama stand-in). Targets gain `qwen3-vl-for-conditional-generation` and `bert-embedding-model`; `execute_model_state.model_component` carries it to sampling. `wr-r6-forward-dispatch-resolves-architecture`. `oracle-models-layers-qwen-vl-vision-warmup` now reaches `qwen3-vl-for-conditional-generation.forward`, which raises attribute-error because that world loads Qwen2-VL and the scenario doesn't load Qwen3-VL: **open, models-layers**.
+- *Dummy-run forward context (models-layers' request):* `dummy-run` wraps PIECEWISE and eager forwards in `set-forward-context`/`exit-forward-context` (model_runner.py:2008-2027), and both forward paths pass `is_moe_model` and `dp_rank`, so DPMetadata exists under DP. `wr-r6-dummy-run-dp2-moe-forward-context` asserts `[0, 16]` on rank1. **Open:** in the seeded MoE world at DP 2 x TP 1 the forward then stops at `parallel-state.get-ep-group` (no `ep` group, even after `init-device`; cause not confirmed, next check is whether the seed's existing `tp` group stops `initialize_model_parallel` from building it). judge4 L4-8 a still fails on `lru-key-replicated-sender-cache.get-and-update`, not on the forward.
+
+- *Resolved KV dtype and seed (config-platform's request):* `get-kv-cache-spec` and `initialize-kv-cache` read the resolved `cache_config.cache_dtype` through `vllm-config.set-current-vllm-config` when the flag is `auto` (a world that never built a config keeps the flag). `wr-r6-kv-spec-reads-resolved-cache-dtype`. judge4 `bench-q4-6-d` still fails, first at `steps.cfg.result.value.cache_config.cache_dtype`: on the merged copies `engine-args.resolve-kv-cache-dtype-string` takes "No algorithm named" for that scenario's checkpoint, before the worker reads anything (**open, config-platform**). `init-device` records `random_seed` from `config['seed']` (gpu_worker.py:520-521); `compile-or-warm-up-model` reseeds with the DP index (:1060-1064). `wr-r6-worker-seeds-from-config`. No stand-in token reads the seed, so `--seed` doesn't change an unseeded request's tokens in the model.
+
+**Unwritten fields:** 1 finding, fixed: `state.model.use_mla` in `gpu-model-runner.get-kv-cache-spec` no world writes (none is MLA), so it now reads as an optional field with a false fallback; the lint is 0.
+
+**Not modeled, waiting on others**
+- judge4 P4-7 c (encoder-cache profiling in `profile_run`): needs models-layers' `MultiModalBudget`
+  (vllm/multimodal/encoder_budget.py: per-modality max tokens, dummy encoder inputs). Worker side would be
+  `encoder-runner.profile-encoder-cache` (encoder_runner.py:110-147).
+- judge4 Q4-6 logs (`Model loading took`, `Available KV cache memory`) and Q4-6 d (`auto` from a
+  ModelOpt kv_cache_quant_algo, resolved in `arg_utils.py:2256-2259`, config-platform).
+- Rejection-sampler logprobs under speculative decoding (rows per `cu_num_generated_tokens`).
+
+**Breaking changes (callers)**
+- `prompt-logprobs-worker.compute-prompt-logprobs` takes `rows` (batch rows), not `new_reqs`, and
+  returns `prompt_logprobs_dict` (caller: my `sample-tokens` only).
+- `gpu-model-runner.sample-tokens` / `sampler.sample` return `logprobs` and (sample-tokens)
+  `prompt_logprobs_dict` (scheduler-kv's `update-from-output` may read them).
+- `execute-model` no longer calls `flash-attention-metadata-builder.build` directly; it goes through
+  `<model-state>.prepare-attn` -> `attn-utils.build-attn-metadata`, and the builder's `common` gains
+  `positions` and `is_prefilling` (attention: please declare them in `AttnCommonMetadata`).
+- A pooling model's new request must carry `pooling_params.task` (the code asserts it is not None);
+  `wr-pooling-model-step` now sends `{task: embed}`, and `pool` returns the pooler's outputs, not
+  `'embedding'` strings.
+- An unseeded slot's `seed` is null, not 0 (no fragment reads it). The code draws from np.random; the model doesn't draw, because no stand-in token reads it and a draw would shift every later random token (judge2 S4, S8 hard-code them).
+
+**Cross-area requests**
+- engine-core: collective_rpc waits only on the output rank (item 4).
+- attention: `positions`, `is_prefilling` in `AttnCommonMetadata`.
+- models-layers: `MultiModalBudget` for profile_run's encoder branch.
+- serving-api: `serving-api-chat-completion-sampling-params` is close to the 20,000-event budget
+  (19.5k with the round-5 fragments); it needs `max_events` if any area adds a step on that path.
+  I removed step titles on the hot paths I added so it stays under.

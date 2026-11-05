@@ -1,0 +1,1635 @@
+# Fix round 6 (mechanism coverage): the pooling, embedding and scoring endpoints end to end, the
+# pooling task and its refusals, SageMaker routing by validation, LLM.encode's checks, the renderer's
+# post-expansion truncation and the "at least N" over-long prompt text.
+configs:
+  - {id: enable-prompt-tokens-details, type: boolean, value: false, default: false, summary: "--enable-prompt-tokens-details: usage carries prompt_tokens_details (cached_tokens, multimodal_tokens)", sources: ["vllm/entrypoints/launchers/cli_args.py:148", "vllm/entrypoints/openai/chat_completion/serving.py:97-98"], attributes: {key: enable_prompt_tokens_details}}
+  - {id: vllm-max-num-bad-words, type: integer, value: 128, default: 128, summary: "VLLM_MAX_NUM_BAD_WORDS (boundary copy): the most tokenized bad words SamplingParams.update_from_tokenizer accepts", sources: ["vllm/envs.py:1161-1162", "vllm/sampling_params.py:806"], attributes: {key: VLLM_MAX_NUM_BAD_WORDS, env: true, boundary: true, owner: worker-runner}}
+  - {id: fingerprint-mode, type: string, value: full, default: full, summary: "--fingerprint-mode: full (vllm-<version>[-tpN][-ppN][-dpN][-ep]-<hash8>), hash (no parallelism), custom (--fingerprint-value) or none (no system_fingerprint)", sources: ["vllm/entrypoints/launchers/cli_args.py:214-223", "vllm/entrypoints/generate/api_router.py:89-96"], attributes: {key: fingerprint_mode}}
+  - {id: fingerprint-value, type: string, value: null, default: null, summary: "--fingerprint-value: the literal system_fingerprint under --fingerprint-mode custom", sources: ["vllm/entrypoints/launchers/cli_args.py:224-225"], attributes: {key: fingerprint_value}}
+  - {id: data-parallel-size, type: integer, value: 1, default: 1, summary: "data_parallel_size (boundary copy): a DP degree above 1 adds -dpN to the system fingerprint", sources: ["vllm/config/parallel.py:146", "vllm/entrypoints/serve/utils/fingerprint.py:78-80"], attributes: {key: data_parallel_size, boundary: true, owner: engine-core}}
+  - {id: pipeline-parallel-size, type: integer, value: 1, default: 1, summary: "pipeline_parallel_size (boundary copy): a PP degree above 1 adds -ppN to the system fingerprint", sources: ["vllm/config/parallel.py:139", "vllm/entrypoints/serve/utils/fingerprint.py:75-77"], attributes: {key: pipeline_parallel_size, boundary: true, owner: distributed}}
+  - {id: enable-expert-parallel, type: boolean, value: false, default: false, summary: "--enable-expert-parallel (boundary copy): adds -ep to the system fingerprint", sources: ["vllm/config/parallel.py:182-205", "vllm/entrypoints/serve/utils/fingerprint.py:81-82"], attributes: {key: enable_expert_parallel, boundary: true, owner: config-platform}}
+components:
+  - id: system-fingerprint
+    name: vllm.entrypoints.serve.utils.fingerprint
+    kind: module
+    parent: api-server
+    layer: api
+    summary: "The system_fingerprint the generate handlers stamp on responses, built once per serving class from the configured --fingerprint-mode."
+    sources: ["vllm/entrypoints/serve/utils/fingerprint.py:28-84"]
+  - id: hermes2-pro-tool-parser
+    name: Hermes2ProToolParser
+    kind: module
+    parent: api-server
+    layer: parsers
+    summary: "--tool-call-parser hermes (and qwen3_json): JSON tool calls inside <tool_call>...</tool_call> (an unterminated last one runs to the end); adjust_request also turns skip_special_tokens off so the tags survive detokenization."
+    sources: ["vllm/tool_parsers/hermes_tool_parser.py:34-120"]
+  - id: serving-generative-scoring
+    name: ServingGenerativeScoring
+    kind: module
+    parent: base-serving
+    layer: api
+    summary: "POST /generative_scoring on a generate model: the probability that each label token comes next after query+item, read from one max_tokens=1 request per item with logprob_token_ids."
+    sources: ["vllm/entrypoints/generate/generative_scoring/serving.py:159-458", "vllm/entrypoints/generate/generative_scoring/api_router.py:30-57"]
+  - id: label-reads
+    name: vllm.entrypoints.generate.label_reads
+    kind: module
+    parent: api-server
+    layer: api
+    summary: "next_token_label_reads: one-token reads, merged, each returning the full-vocabulary logprob of every label token."
+    sources: ["vllm/entrypoints/generate/label_reads.py:14-76"]
+  - id: pooling-factories
+    name: vllm.entrypoints.pooling.factories
+    kind: module
+    parent: api-server
+    layer: api
+    summary: "Which pooling routes, handlers and IO processors exist: everything keys off model_config.get_pooling_task(supported_tasks) and enable_scoring_api; get_pooling_invocation_types lists the pooling request types /invocations tries."
+    sources: ["vllm/entrypoints/pooling/factories.py:37-272", "vllm/entrypoints/pooling/utils.py:232-250"]
+  - id: scoring-io-processor
+    name: ScoringIOProcessor
+    kind: module
+    parent: serving-scores
+    layer: api
+    summary: "The scoring IO processors (bi-encoder, cross-encoder, late-interaction): validate the (data_1, data_2) shapes, check and apply max_tokens_per_query / max_tokens_per_doc, and build one engine input per prompt (bi-encoder) or per pair (cross-encoder)."
+    sources: ["vllm/entrypoints/pooling/scoring/io_processor.py:95-752", "vllm/entrypoints/pooling/scoring/utils.py:42-141"]
+
+interfaces:
+  - component: system-fingerprint
+    name: build-system-fingerprint
+    kind: function
+    latency_ms: 0
+    summary: "build_system_fingerprint: none gives None; custom the --fingerprint-value; otherwise vllm-<version>, then (full mode) -tpN, -ppN, -dpN for degrees above 1 and -ep with expert parallelism, then the first 8 hex digits of vllm_config.compute_hash()."
+    sources: ["vllm/entrypoints/serve/utils/fingerprint.py:49-84", "vllm/entrypoints/generate/base/serving.py:157-167"]
+    request: {type: object, properties: {}}
+    behavior:
+      - if: "config['fingerprint-mode'] == 'none'"
+        then: [{source: "vllm/entrypoints/serve/utils/fingerprint.py:53-54", return: {system_fingerprint: null}}]
+      - if: "config['fingerprint-mode'] == 'custom'"
+        then: [{source: "vllm/entrypoints/serve/utils/fingerprint.py:55-56", return: {system_fingerprint: "= config['fingerprint-value']"}}]
+      - title: "hash8 = vllm_config.compute_hash()[:8] (ASSUMPTION: a sha256 over the model, dtype-independent parallel shape and max_model_len stands in for the full config hash)"
+        source: "vllm/entrypoints/serve/utils/fingerprint.py:60-63"
+        set:
+          vars.hash8: "= sha256(json(['0.32.0', config['model'], config['max-model-len'], config['tensor-parallel-size'], config['pipeline-parallel-size'], config['data-parallel-size'], config['enable-expert-parallel']])).substring(0, 8)"
+      - if: "config['fingerprint-mode'] == 'hash'"
+        then: [{source: "vllm/entrypoints/serve/utils/fingerprint.py:65-66", return: {system_fingerprint: "= 'vllm-0.32.0-' + vars.hash8"}}]
+      - title: "full: the non-trivial parallelism degrees between the version and the hash"
+        source: "vllm/entrypoints/serve/utils/fingerprint.py:69-84"
+        return:
+          system_fingerprint: "= (['vllm-0.32.0'] + (config['tensor-parallel-size'] > 1 ? ['tp' + string(config['tensor-parallel-size'])] : []) + (config['pipeline-parallel-size'] > 1 ? ['pp' + string(config['pipeline-parallel-size'])] : []) + (config['data-parallel-size'] > 1 ? ['dp' + string(config['data-parallel-size'])] : []) + (config['enable-expert-parallel'] ? ['ep'] : []) + [vars.hash8]).join('-')"
+  - component: hermes2-pro-tool-parser
+    name: adjust-request
+    kind: function
+    summary: "Hermes2ProToolParser.adjust_request: ToolParser.adjust_request (a required or named tool choice forces a JSON schema), then, with tools and a tool_choice other than none, skip_special_tokens = False."
+    sources: ["vllm/tool_parsers/hermes_tool_parser.py:58-67"]
+    request: {type: object, properties: {body: {type: object}}, required: [body]}
+    errors: [{code: value-error, status: 0}]
+    behavior:
+      - title: "super().adjust_request(request)"
+        source: "vllm/tool_parsers/hermes_tool_parser.py:61"
+        call: llama3-json-tool-parser.adjust-request
+        input: {body: "= input.body"}
+        as: base
+      - if: "has(vars.base.value.tools) && vars.base.value.tools != null && size(vars.base.value.tools) > 0 && (!has(vars.base.value.tool_choice) || vars.base.value.tool_choice != 'none')"
+        then: [{title: "The <tool_call> tags are special tokens in some checkpoints, so they must not be skipped", source: "vllm/tool_parsers/hermes_tool_parser.py:62-66", return: "= merge(vars.base.value, {'skip_special_tokens': false})"}]
+      - return: "= vars.base.value"
+  - component: hermes2-pro-tool-parser
+    name: extract-tool-calls
+    kind: function
+    summary: "Hermes2ProToolParser.extract_tool_calls: no <tool_call> means plain content; otherwise every <tool_call>{json}</tool_call> (or a trailing unterminated one) becomes a function call with JSON-encoded arguments and the text before the first tag is the content; any decode error returns the whole output as content."
+    sources: ["vllm/tool_parsers/hermes_tool_parser.py:69-119"]
+    request: {type: object, properties: {model_output: {type: string, examples: ["<tool_call>{\"name\": \"get_weather\", \"arguments\": {\"city\": \"Paris\"}}</tool_call>"]}}, required: [model_output]}
+    behavior:
+      - if: "!input.model_output.contains('<tool_call>')"
+        then: [{title: "Sanity check: no start token", source: "vllm/tool_parsers/hermes_tool_parser.py:74-78", return: {tools_called: false, tool_calls: [], content: "= input.model_output"}}]
+      - title: "tool_call_regex.findall: each <tool_call>(.*?)</tool_call>, or a last <tool_call> running to the end of the output"
+        source: "vllm/tool_parsers/hermes_tool_parser.py:38-40"
+        set:
+          vars.parts: "= input.model_output.split('<tool_call>').slice(1, size(input.model_output.split('<tool_call>'))).map(p, p.contains('</tool_call>') ? p.split('</tool_call>')[0] : p).map(p, p.trim())"
+      - title: "json.loads every match; a match that is not a JSON object with name and arguments is an exception: log it and return the whole output as content"
+        source: "vllm/tool_parsers/hermes_tool_parser.py:84-118"
+        if: "!vars.parts.all(p, p.matches('(?s)^\\\\{.*\\\\}$'))"
+        then: [{return: {tools_called: false, tool_calls: [], content: "= input.model_output"}}]
+      - set:
+          vars.calls: "= vars.parts.map(p, eval(p, {}))"
+      - if: "!vars.calls.all(c, type(c) == map && 'name' in c && 'arguments' in c)"
+        then: [{source: "vllm/tool_parsers/hermes_tool_parser.py:114-118", return: {tools_called: false, tool_calls: [], content: "= input.model_output"}}]
+      - title: "ToolCall(type function, FunctionCall(name, arguments=json.dumps(arguments))); content is the text before the first tag, or None"
+        source: "vllm/tool_parsers/hermes_tool_parser.py:95-113"
+        return:
+          tools_called: true
+          tool_calls: "= vars.calls.map(c, {'type': 'function', 'function': {'name': c['name'], 'arguments': json(c['arguments'])}})"
+          content: "= input.model_output.substring(0, input.model_output.indexOf('<tool_call>')) == '' ? dyn(null) : dyn(input.model_output.substring(0, input.model_output.indexOf('<tool_call>')))"
+  - component: serve-subcommand
+    name: run-multi-api-server
+    kind: function
+    summary: "run_multi_api_server: a multiprocess Prometheus directory when there is more than one API server; bind the listening socket once (SO_REUSEPORT when several servers share it); build the VllmConfig with _api_process_count; refuse runtime LoRA updating across processes; launch the engine cores, then one ApiServer_<i> process per API server on the shared socket, each a client of every engine."
+    sources: ["vllm/entrypoints/cli/serve.py:269-382"]
+    request: {type: object, properties: {api_server_count: {type: integer, examples: [4]}, host: {type: string, default: 0.0.0.0}, port: {type: integer, default: 8000}}, required: [api_server_count]}
+    errors: [{code: value-error, status: 0, retryable: false}, {code: key-error, status: 0, retryable: false}]
+    behavior:
+      - title: "setup_multiprocess_prometheus: PROMETHEUS_MULTIPROC_DIR, so /metrics in any API server aggregates every process's samples"
+        source: "vllm/entrypoints/cli/serve.py:282-283"
+        set:
+          vars.mp_prometheus: "= input.api_server_count > 1"
+      - title: "setup_server(args, reuse_port=num_api_servers > 1): validate the parsers and bind the socket the API servers will share"
+        source: "vllm/entrypoints/cli/serve.py:297"
+        call: launcher.setup-server
+        input: {host: "= input.host", port: "= input.port"}
+        as: addr
+      - title: "engine_args.create_engine_config with _api_process_count = N, _api_process_rank = -1"
+        source: "vllm/entrypoints/cli/serve.py:306-312"
+        call: engine-args.create-engine-config
+        input: {model: "= config['model']"}
+        fill: true
+        as: vc
+      - title: "Runtime LoRA loading can't be kept consistent across API processes"
+        source: "vllm/entrypoints/cli/serve.py:314-317"
+        if: "input.api_server_count > 1 && config['vllm-allow-runtime-lora-updating']"
+        then: [{fail: {code: value-error, message: "VLLM_ALLOW_RUNTIME_LORA_UPDATING cannot be used with api_server_count > 1"}}]
+      - title: "bind_engine_zmq_listeners(vllm_config, N), then launch_core_engines: one EngineCore process per local DP rank (plus the DP coordinator above DP 1), started before the API servers"
+        source: "vllm/entrypoints/cli/serve.py:329-336"
+        call: core-engine-proc-manager.launch-core-engines
+        input: {api_server_count: "= input.api_server_count"}
+        as: engines
+      - title: "APIServerProcessManager: spawn ApiServer_0..ApiServer_<N-1> on the shared socket, each with the engines' input and output addresses; they are watched during engine startup, so one that dies aborts it"
+        source: "vllm/entrypoints/cli/serve.py:358-372"
+        set:
+          vars.procs: "= lists.range(input.api_server_count).map(i, 'ApiServer_' + string(i))"
+      - title: "wait_for_completion_or_failure: block until a process exits or a signal arrives"
+        source: "vllm/entrypoints/cli/serve.py:378-382"
+        return: {listen_address: "= vars.addr.value.listen_address", reuse_port: "= input.api_server_count > 1", multiprocess_prometheus: "= vars.mp_prometheus", api_server_processes: "= vars.procs", engines: "= has(vars.engines.value.engines) ? vars.engines.value.engines : null"}
+  - component: sampling-params
+    name: update-from-tokenizer
+    kind: function
+    summary: "SamplingParams.update_from_tokenizer (the engine's InputProcessor calls it): each bad word is encoded without special tokens, bare and with a leading space; the bare form must give a token, the spaced form counts only when it starts with a different token of the same length; past VLLM_MAX_NUM_BAD_WORDS, or with an id outside the vocabulary, it is a VLLMValidationError naming bad_words."
+    sources: ["vllm/sampling_params.py:802-861"]
+    request: {type: object, properties: {bad_words: {type: [array, "null"], items: {type: string}, default: null}, max_token_id: {type: integer, default: 128255}}}
+    response: {type: object, properties: {bad_words_token_ids: {type: array, items: {type: array, items: {type: integer}}}}}
+    errors: [{code: vllm-validation-error, status: 0, retryable: false}]
+    behavior:
+      - if: "!has(input.bad_words) || input.bad_words == null || size(input.bad_words) == 0"
+        then: [{source: "vllm/sampling_params.py:803-804", return: {bad_words_token_ids: []}}]
+      - title: "tokenizer.encode(prefix + bad_word.lstrip(), add_special_tokens=False) (ASSUMPTION: the word-per-token stand-in, so the spaced form encodes like the bare one and adds no entry)"
+        source: "vllm/sampling_params.py:807-816"
+        set:
+          vars.ids: "= input.bad_words.map(w, w.trim() == '' ? [] : w.trim().split(' ').filter(x, x != '').map(x, x in {'Hello': 9906, 'world': 1917, 'The': 791, 'capital': 6864, 'of': 315, 'France': 9822, 'is': 374} ? {'Hello': 9906, 'world': 1917, 'The': 791, 'capital': 6864, 'of': 315, 'France': 9822, 'is': 374}[x] : 1000 + size(x)))"
+      - if: "vars.ids.exists(t, size(t) == 0)"
+        then: [{title: "The bare form must tokenize to something", source: "vllm/sampling_params.py:818-825", fail: {code: vllm-validation-error, message: bad_words entries must tokenize to at least one token., data: {param: bad_words, value: "= input.bad_words"}}}]
+      - if: "size(vars.ids) > config['vllm-max-num-bad-words']"
+        then: [{source: "vllm/sampling_params.py:836-845", fail: {code: vllm-validation-error, message: "= 'Too many bad words after tokenization: ' + string(config['vllm-max-num-bad-words'] + 1) + '. The max number is ' + string(config['vllm-max-num-bad-words']) + '.'", data: {param: bad_words, value: "= input.bad_words"}}}]
+      - set:
+          vars.bad: "= vars.ids.map(t, t.filter(i, i < 0 || i > input.max_token_id)).filter(l, size(l) > 0).map(l, l[0])"
+      - if: "size(vars.bad) > 0"
+        then: [{source: "vllm/sampling_params.py:847-861", fail: {code: vllm-validation-error, message: "= 'The model vocabulary size is ' + string(input.max_token_id + 1) + ', but the following tokens were specified as bad: [' + vars.bad.map(i, string(i)).join(', ') + ']. All token id values should be integers satisfying: 0 <= token_id <= ' + string(input.max_token_id) + '.'", data: {param: bad_words, value: "= input.bad_words"}}}]
+      - return: {bad_words_token_ids: "= vars.ids"}
+  - component: serving-generative-scoring
+    name: create-generative-scoring
+    kind: function
+    summary: "create_generative_scoring: _check_model, the engine-alive and admission preflight for len(items), every label id inside [0, vocab_size), at least one label and one item, the LoRA adapter, then one prompt per item (query + item, or item + query, cut to max_model_len - 1), next_token_label_reads with max_tokens=1 and logprob_token_ids, and per item the first label's probability (softmax over the labels, or exp of the full-vocabulary logprob). Validation failures are ErrorResponses (400 BadRequestError)."
+    sources: ["vllm/entrypoints/generate/generative_scoring/serving.py:185-325"]
+    request:
+      type: object
+      properties:
+        body:
+          type: object
+          properties:
+            model: {type: [string, "null"], examples: [llama-8b]}
+            query: {type: [string, array], examples: ["Is Paris the capital of France? Answer:"]}
+            items: {type: array, items: {type: [string, array]}, examples: [[" Yes", " No"]]}
+            label_token_ids: {type: array, items: {type: integer}, examples: [[9642, 2822]]}
+            apply_softmax: {type: boolean, default: true}
+            item_first: {type: boolean, default: false}
+            add_special_tokens: {type: boolean, default: true}
+            priority: {type: [integer, "null"], default: null}
+            request_id: {type: [string, "null"], default: null}
+        x_request_id: {type: [string, "null"]}
+      required: [body]
+    errors: [{code: BadRequestError, status: 400}, {code: NotFoundError, status: 404}, {code: engine-dead-error, status: 500}]
+    behavior:
+      - call: base-serving.check-model
+        input: {model: "= has(input.body.model) && input.body.model != null ? input.body.model : ''"}
+        as: model
+      - title: "engine_client.errored raises the dead error; check_admission(len(items))"
+        source: "vllm/entrypoints/generate/generative_scoring/serving.py:206-209"
+        call: async-llm.check-admission
+        input: {n: "= size(input.body.items)"}
+      - title: "model_config.get_vocab_size(): the served checkpoint's vocab_size"
+        source: "vllm/entrypoints/generate/generative_scoring/serving.py:218-219"
+        call: hf-hub.download-config
+        input: {model: "= config['model']"}
+        as: hfc
+        on_error: continue
+      - set:
+          vars.vocab: "= vars.hfc.ok && has(vars.hfc.value.vocab_size) ? vars.hfc.value.vocab_size : 128256"
+          vars.bad: "= input.body.label_token_ids.filter(t, t < 0 || t >= (vars.hfc.ok && has(vars.hfc.value.vocab_size) ? vars.hfc.value.vocab_size : 128256))"
+      - if: "size(vars.bad) > 0"
+        then: [{title: "The first label id outside the vocabulary", source: "vllm/entrypoints/generate/generative_scoring/serving.py:219-224", fail: {code: BadRequestError, status: 400, message: "= 'label_token_id ' + string(vars.bad[0]) + ' is out of vocabulary range [0, ' + string(vars.vocab) + '). Please provide valid token IDs.'"}}]
+      - if: "size(input.body.label_token_ids) == 0"
+        then: [{source: "vllm/entrypoints/generate/generative_scoring/serving.py:226-229", fail: {code: BadRequestError, status: 400, message: label_token_ids must contain at least one token ID.}}]
+      - if: "size(input.body.items) == 0"
+        then: [{source: "vllm/entrypoints/generate/generative_scoring/serving.py:231-233", fail: {code: BadRequestError, status: 400, message: items must contain at least one item.}}]
+      - call: base-serving.maybe-get-adapters
+        input: {model: "= has(input.body.model) && input.body.model != null ? input.body.model : ''"}
+        as: lora
+      - set:
+          vars.rid: "= 'generative-scoring-' + (has(input.x_request_id) && input.x_request_id != null ? input.x_request_id : (has(input.body.request_id) && input.body.request_id != null ? input.body.request_id : id('random-uuid', seq('random-uuid'))))"
+      - call: serving-generative-scoring.build-prompts
+        input: {query: "= input.body.query", items: "= input.body.items", item_first: "= has(input.body.item_first) && input.body.item_first", add_special_tokens: "= !has(input.body.add_special_tokens) || input.body.add_special_tokens"}
+        as: prompts
+      - title: "SamplingParams(max_tokens=1, logprobs=len(labels), logprob_token_ids=labels): the labels' logprobs come from the raw logits"
+        source: "vllm/entrypoints/generate/generative_scoring/serving.py:250-262"
+        call: label-reads.next-token-label-reads
+        input: {request_id: "= vars.rid", prompts: "= vars.prompts.value.prompts", label_token_ids: "= input.body.label_token_ids", priority: "= has(input.body.priority) && input.body.priority != null ? input.body.priority : 0"}
+        as: reads
+        on_error:
+          - title: "A ValueError out of the reads is an ErrorResponse (400)"
+            source: "vllm/entrypoints/generate/generative_scoring/serving.py:288-293"
+            fail: {code: BadRequestError, status: 400, message: "= error.message"}
+      - title: "_compute_probabilities: softmax over just the labels (shifted by the max logprob), or exp(logprob); the first label's probability is the item's score (ASSUMPTION: exp(x) as (1 + x/1024)^1024, CEL has no exp)"
+        source: "vllm/entrypoints/generate/generative_scoring/serving.py:296-318"
+        set:
+          vars.softmax: "= !has(input.body.apply_softmax) || input.body.apply_softmax"
+          vars.e: "= vars.reads.value.reads.map(r, r.logprobs.map(x, 1.0 + (x - (!has(input.body.apply_softmax) || input.body.apply_softmax ? math.greatest(r.logprobs) : 0.0)) / 1024.0))"
+      - foreach: "= lists.range(10)"
+        as: k
+        steps:
+          - set: {vars.e: "= vars.e.map(l, l.map(y, y * y))"}
+      - set:
+          vars.scores: "= vars.e.map(l, vars.softmax ? l[0] / sum(l) : l[0])"
+      - source: "vllm/entrypoints/generate/generative_scoring/serving.py:320-341"
+        return:
+          id: "= vars.rid"
+          object: list
+          created: "= now / 1000"
+          model: "= vars.model.value.model_name"
+          data: "= lists.range(size(vars.scores)).map(i, {'index': i, 'object': 'score', 'score': vars.scores[i]})"
+          usage: {prompt_tokens: "= sum(vars.prompts.value.counts)", completion_tokens: "= size(vars.scores)", total_tokens: "= sum(vars.prompts.value.counts) + size(vars.scores)"}
+  - component: serving-generative-scoring
+    name: build-prompts
+    kind: function
+    summary: "_build_prompts: the query encoded once (with special tokens when asked), each item without them; item_first puts the item first; each prompt is cut to max_model_len - 1 to leave room for the one output token."
+    sources: ["vllm/entrypoints/generate/generative_scoring/serving.py:343-405"]
+    request: {type: object, properties: {query: {type: [string, array]}, items: {type: array}, item_first: {type: boolean, default: false}, add_special_tokens: {type: boolean, default: true}}, required: [query, items]}
+    behavior:
+      - if: "type(input.query) == string"
+        then:
+          - call: base-renderer.tokenize-prompt
+            input: {prompt: "= input.query", max_total_tokens: null, add_special_tokens: "= input.add_special_tokens"}
+            as: q
+          - set: {vars.q: "= vars.q.value.prompt_token_ids"}
+        else:
+          - set: {vars.q: "= input.query"}
+      - set:
+          vars.prompts: []
+          vars.max_prompt: "= config['max-model-len'] - 1"
+      - foreach: "= input.items"
+        as: item
+        max: 64
+        steps:
+          - if: "type(vars.item) == string"
+            then:
+              - call: base-renderer.tokenize-prompt
+                input: {prompt: "= vars.item", max_total_tokens: null, add_special_tokens: false}
+                as: it
+              - set: {vars.ids: "= vars.it.value.prompt_token_ids"}
+            else:
+              - set: {vars.ids: "= vars.item"}
+          - set:
+              vars.p: "= input.item_first ? vars.ids + vars.q : vars.q + vars.ids"
+          - title: "Truncate to max_model_len - 1"
+            source: "vllm/entrypoints/generate/generative_scoring/serving.py:394-397"
+            set: {vars.prompts: "= vars.prompts + [size(vars.p) > vars.max_prompt ? vars.p.slice(0, vars.max_prompt) : vars.p]"}
+      - return: {prompts: "= vars.prompts", counts: "= vars.prompts.map(p, size(p))"}
+  - component: label-reads
+    name: next-token-label-reads
+    kind: function
+    summary: "next_token_label_reads: one generate per prompt (<id>-<i>), merged; each read needs an output, a non-error finish, logprobs, and every label token among the first position's logprobs (ValueError naming the item otherwise)."
+    sources: ["vllm/entrypoints/generate/label_reads.py:23-76"]
+    request: {type: object, properties: {request_id: {type: string}, prompts: {type: array, items: {type: array, items: {type: integer}}}, label_token_ids: {type: array, items: {type: integer}}, priority: {type: integer, default: 0}}, required: [request_id, prompts, label_token_ids]}
+    errors: [{code: value-error, status: 0}]
+    behavior:
+      - title: "engine_client.generate per prompt, merged with merge_async_iterators"
+        source: "vllm/entrypoints/generate/label_reads.py:35-49"
+        parallel: "= lists.range(size(input.prompts))"
+        as: i
+        steps:
+          - call: async-llm.generate
+            input: {request_id: "= input.request_id + '-' + string(vars.i)", prompt_token_ids: "= input.prompts[vars.i]", sampling_params: {max_tokens: 1, n: 1, logprobs: "= size(input.label_token_ids)"}, priority: "= input.priority"}
+            as: g
+          - return: "= vars.g.value"
+        join: {need: all}
+        as_result: outs
+        on_insufficient: {code: value-error}
+      - set:
+          vars.res: "= vars.outs.results.sortBy(r, r.index).map(r, r.value)"
+      - title: "finish_reason error: Generation error for item i"
+        source: "vllm/entrypoints/generate/label_reads.py:60-61"
+        if: "vars.res.exists(r, has(r.finish_reason) && r.finish_reason == 'error')"
+        then: [{fail: {code: value-error, message: "= 'Generation error for item ' + string(lists.range(size(vars.res)).filter(i, has(vars.res[i].finish_reason) && vars.res[i].finish_reason == 'error')[0])"}}]
+      - title: "No logprobs on the output (ASSUMPTION: the engine's RequestOutput carries them as logprobs[0], a map from token id to logprob)"
+        source: "vllm/entrypoints/generate/label_reads.py:62-66"
+        if: "vars.res.exists(r, !has(r.logprobs) || r.logprobs == null || size(r.logprobs) == 0)"
+        then: [{fail: {code: value-error, message: "= 'No logprobs available for item ' + string(lists.range(size(vars.res)).filter(i, !has(vars.res[i].logprobs) || vars.res[i].logprobs == null || size(vars.res[i].logprobs) == 0)[0]) + '. This might indicate an issue with logprobs configuration.'"}}]
+      - if: "vars.res.exists(r, input.label_token_ids.exists(t, !(string(t) in r.logprobs[0])))"
+        then: [{source: "vllm/entrypoints/generate/label_reads.py:67-74", fail: {code: value-error, message: "= 'Token IDs ' + string(input.label_token_ids.filter(t, !(string(t) in vars.res.filter(r, input.label_token_ids.exists(x, !(string(x) in r.logprobs[0])))[0].logprobs[0]))) + ' not found in logprobs for item ' + string(lists.range(size(vars.res)).filter(i, input.label_token_ids.exists(t, !(string(t) in vars.res[i].logprobs[0])))[0]) + '. This might indicate the tokens are outside the model\\'s vocabulary.'"}}]
+      - source: "vllm/entrypoints/generate/label_reads.py:75-76"
+        return: {reads: "= vars.res.map(r, {'logprobs': input.label_token_ids.map(t, double(type(r.logprobs[0][string(t)]) == map ? r.logprobs[0][string(t)].logprob : r.logprobs[0][string(t)]))})"}
+  - component: openai-serving-chat
+    name: create-chat-logprobs
+    kind: function
+    latency_ms: 0
+    summary: "_create_chat_logprobs: per sampled token, its decoded text, max(logprob, -9999.0) and UTF-8 bytes, and the first top_logprobs entries of the position's logprob dict (the sampled token first, then the top-k by rank, a repeated id kept once); a position without the sampled token's logprob gives only the token and its bytes."
+    sources: ["vllm/entrypoints/openai/chat_completion/serving.py:1242-1333"]
+    request: {type: object, properties: {token_ids: {type: array, items: {type: integer}}, logprobs: {type: [array, "null"], description: "per position the engine's entries {token_id, logprob, rank}, the sampled token first"}, top_logprobs: {type: [integer, "null"], default: 0}}, required: [token_ids]}
+    behavior:
+      - title: "One dict per position: dict(zip(token_ids, Logprob(logprob, rank, decoded_token))) keeps the first position of a repeated id (ASSUMPTION: the stand-in detokenizer decodes id N as ' tN', the Llama-3 special tokens by name; bytes over printable ASCII)"
+        source: "vllm/entrypoints/openai/chat_completion/serving.py:1286-1288"
+        set:
+          vars.steps: "= lists.range(size(input.token_ids)).map(i, input.logprobs != null && i < size(input.logprobs) && input.logprobs[i] != null ? lists.range(size(input.logprobs[i])).filter(j, !lists.range(j).exists(k, input.logprobs[i][k].token_id == input.logprobs[i][j].token_id)).map(j, input.logprobs[i][j]) : [])"
+          vars.n: "= has(input.top_logprobs) && input.top_logprobs != null ? input.top_logprobs : 0"
+      - title: "ChatCompletionLogProbsContent per token; top_logprobs from _get_top_logprobs (i < top_logprobs, or all for -1)"
+        source: "vllm/entrypoints/openai/chat_completion/serving.py:1299-1331"
+        return:
+          content: "= lists.range(size(input.token_ids)).map(i, !vars.steps[i].exists(e, e.token_id == input.token_ids[i]) ? {'token': (input.token_ids[i] == 128009 ? '<|eot_id|>' : (input.token_ids[i] == 128001 ? '<|end_of_text|>' : (input.token_ids[i] == 128000 ? '<|begin_of_text|>' : ' t' + string(input.token_ids[i])))), 'logprob': -9999.0, 'bytes': lists.range(size((input.token_ids[i] == 128009 ? '<|eot_id|>' : (input.token_ids[i] == 128001 ? '<|end_of_text|>' : (input.token_ids[i] == 128000 ? '<|begin_of_text|>' : ' t' + string(input.token_ids[i])))))).map(c, ' !\"#$%&\\'()*+,-./0123456789:;<=>?@ABCDEFGHIJKLMNOPQRSTUVWXYZ[\\\\]^_`abcdefghijklmnopqrstuvwxyz{|}~'.indexOf((input.token_ids[i] == 128009 ? '<|eot_id|>' : (input.token_ids[i] == 128001 ? '<|end_of_text|>' : (input.token_ids[i] == 128000 ? '<|begin_of_text|>' : ' t' + string(input.token_ids[i])))).substring(c, c + 1)) + 32), 'top_logprobs': []} : {'token': (input.token_ids[i] == 128009 ? '<|eot_id|>' : (input.token_ids[i] == 128001 ? '<|end_of_text|>' : (input.token_ids[i] == 128000 ? '<|begin_of_text|>' : ' t' + string(input.token_ids[i])))), 'logprob': math.greatest([double(vars.steps[i].filter(e, e.token_id == input.token_ids[i])[0].logprob), -9999.0]), 'bytes': lists.range(size((input.token_ids[i] == 128009 ? '<|eot_id|>' : (input.token_ids[i] == 128001 ? '<|end_of_text|>' : (input.token_ids[i] == 128000 ? '<|begin_of_text|>' : ' t' + string(input.token_ids[i])))))).map(c, ' !\"#$%&\\'()*+,-./0123456789:;<=>?@ABCDEFGHIJKLMNOPQRSTUVWXYZ[\\\\]^_`abcdefghijklmnopqrstuvwxyz{|}~'.indexOf((input.token_ids[i] == 128009 ? '<|eot_id|>' : (input.token_ids[i] == 128001 ? '<|end_of_text|>' : (input.token_ids[i] == 128000 ? '<|begin_of_text|>' : ' t' + string(input.token_ids[i])))).substring(c, c + 1)) + 32), 'top_logprobs': lists.range(size(vars.steps[i])).filter(j, vars.n == -1 || j < vars.n).map(j, {'token': (vars.steps[i][j].token_id == 128009 ? '<|eot_id|>' : (vars.steps[i][j].token_id == 128001 ? '<|end_of_text|>' : (vars.steps[i][j].token_id == 128000 ? '<|begin_of_text|>' : ' t' + string(vars.steps[i][j].token_id)))), 'logprob': math.greatest([double(vars.steps[i][j].logprob), -9999.0]), 'bytes': lists.range(size((vars.steps[i][j].token_id == 128009 ? '<|eot_id|>' : (vars.steps[i][j].token_id == 128001 ? '<|end_of_text|>' : (vars.steps[i][j].token_id == 128000 ? '<|begin_of_text|>' : ' t' + string(vars.steps[i][j].token_id)))))).map(c, ' !\"#$%&\\'()*+,-./0123456789:;<=>?@ABCDEFGHIJKLMNOPQRSTUVWXYZ[\\\\]^_`abcdefghijklmnopqrstuvwxyz{|}~'.indexOf((vars.steps[i][j].token_id == 128009 ? '<|eot_id|>' : (vars.steps[i][j].token_id == 128001 ? '<|end_of_text|>' : (vars.steps[i][j].token_id == 128000 ? '<|begin_of_text|>' : ' t' + string(vars.steps[i][j].token_id)))).substring(c, c + 1)) + 32)})})"
+  - component: openai-serving-completion
+    name: create-completion-logprobs
+    kind: function
+    latency_ms: 0
+    summary: "_create_completion_logprobs: tokens, token_logprobs (max(logprob, -9999.0)), top_logprobs (a dict of the position's first logprobs + 1 entries, the sampled token first; OpenAI's 'top N + 1') and text_offset (each token's start, from the initial offset)."
+    sources: ["vllm/entrypoints/openai/completion/serving.py:654-742"]
+    request: {type: object, properties: {token_ids: {type: array, items: {type: integer}}, logprobs: {type: [array, "null"]}, num_logprobs: {type: integer, default: 0}, initial_text_offset: {type: integer, default: 0}}, required: [token_ids]}
+    behavior:
+      - source: "vllm/entrypoints/openai/completion/serving.py:677-698"
+        set:
+          vars.steps: "= lists.range(size(input.token_ids)).map(i, input.logprobs != null && i < size(input.logprobs) && input.logprobs[i] != null ? dyn(lists.range(size(input.logprobs[i])).filter(j, !lists.range(j).exists(k, input.logprobs[i][k].token_id == input.logprobs[i][j].token_id)).map(j, input.logprobs[i][j])) : dyn(null))"
+          vars.toks: "= input.token_ids.map(t, (t == 128009 ? '<|eot_id|>' : (t == 128001 ? '<|end_of_text|>' : (t == 128000 ? '<|begin_of_text|>' : ' t' + string(t)))))"
+          vars.n: "= has(input.num_logprobs) && input.num_logprobs != null ? input.num_logprobs : 0"
+          vars.off0: "= has(input.initial_text_offset) && input.initial_text_offset != null ? input.initial_text_offset : 0"
+      - title: "text_offset: the initial offset, then each previous token's length added"
+        source: "vllm/entrypoints/openai/completion/serving.py:731-735"
+        return:
+          tokens: "= vars.toks"
+          token_logprobs: "= lists.range(size(input.token_ids)).map(i, vars.steps[i] == null ? dyn(null) : dyn(math.greatest([double(vars.steps[i].filter(e, e.token_id == input.token_ids[i])[0].logprob), -9999.0])))"
+          top_logprobs: "= lists.range(size(input.token_ids)).map(i, vars.steps[i] == null ? dyn(null) : dyn(lists.range(size(vars.steps[i])).filter(j, vars.n == -1 || vars.n >= j).map(j, vars.steps[i][j]).transformMapEntry(k, e, {(e.token_id == 128009 ? '<|eot_id|>' : (e.token_id == 128001 ? '<|end_of_text|>' : (e.token_id == 128000 ? '<|begin_of_text|>' : ' t' + string(e.token_id)))): math.greatest([double(e.logprob), -9999.0])})))"
+          text_offset: "= lists.range(size(vars.toks)).map(i, vars.off0 + sum(lists.range(i).map(k, size(vars.toks[k]))))"
+  # ------------------------------------------------------------------ pooling task resolution
+  - component: pooling-factories
+    name: get-pooling-task
+    kind: function
+    summary: "model_config.get_pooling_task(supported_tasks), as the pooling factories call it: --pooler-config's task when set (it must be supported), else the first supported of embed&token_classify, embed, classify, token_embed, token_classify, plugin; a generate-only model has none. enable_scoring_api: embed and token_embed models always; classify models only with num_labels == 1."
+    sources: ["vllm/entrypoints/pooling/factories.py:118-140", "vllm/entrypoints/pooling/utils.py:232-250"]
+    request: {type: object, properties: {pooler_task: {type: [string, "null"], default: null, description: "PoolerConfig.task (--pooler-config '{\"task\": ...}'); unset in every world"}, supported_tasks: {type: [array, "null"], items: {type: string}, default: null, description: "the offline LLM passes its own supported_tasks; the server reads app.state's"}}}
+    errors: [{code: runtime-error, status: 0, retryable: false}]
+    behavior:
+      - if: "has(input.supported_tasks) && input.supported_tasks != null"
+        then:
+          - set: {vars.t: "= input.supported_tasks"}
+        else:
+          - call: app-state.supported-tasks
+            as: tasks
+          - set: {vars.t: "= vars.tasks.value"}
+      - title: "ModelConfig.get_pooling_task: an explicit pooler task must be one the model supports (RuntimeError at startup)"
+        source: "vllm/entrypoints/pooling/factories.py:118"
+        if: "has(input.pooler_task) && input.pooler_task != null && !(input.pooler_task in vars.t)"
+        then: [{fail: {code: runtime-error, message: "= 'Unsupported task: \\'' + input.pooler_task + '\\' Supported tasks: (' + vars.t.map(x, '\\'' + x + '\\'').join(', ') + (size(vars.t) == 1 ? ',' : '') + ')'"}}]
+      - title: "Otherwise the priority order embed&token_classify, embed, classify, token_embed, token_classify, plugin (ASSUMPTION: no *ForTokenClassification architecture, whose token_classify would win first)"
+        source: "vllm/entrypoints/pooling/factories.py:163"
+        set:
+          vars.task: "= has(input.pooler_task) && input.pooler_task != null ? dyn(input.pooler_task) : ('embed&token_classify' in vars.t ? dyn('embed&token_classify') : ('embed' in vars.t ? dyn('embed') : ('classify' in vars.t ? dyn('classify') : ('token_embed' in vars.t ? dyn('token_embed') : ('token_classify' in vars.t ? dyn('token_classify') : ('plugin' in vars.t ? dyn('plugin') : null))))))"
+      - if: "vars.task == 'classify'"
+        then:
+          - title: "enable_scoring_api for a classifier reads hf_config.num_labels (ASSUMPTION: 1 when the hub row has no num_labels, as for single-logit rerankers)"
+            source: "vllm/entrypoints/pooling/utils.py:243-248"
+            call: hf-hub.download-config
+            input: {model: "= config['model']"}
+            as: hf
+            on_error: continue
+      - set:
+          vars.num_labels: "= vars.task == 'classify' && vars.hf.ok && has(vars.hf.value.num_labels) ? vars.hf.value.num_labels : 1"
+      - source: "vllm/entrypoints/pooling/utils.py:239-250"
+        return:
+          supported_tasks: "= vars.t"
+          pooling_task: "= vars.task"
+          score_type: "= vars.task == 'embed' ? dyn('bi-encoder') : (vars.task == 'classify' ? dyn('cross-encoder') : (vars.task == 'token_embed' ? dyn('late-interaction') : null))"
+          enable_scoring_api: "= vars.task in ['embed', 'token_embed'] || (vars.task == 'classify' && vars.num_labels == 1)"
+  # ------------------------------------------------------------------ the shared pooling pipeline
+  - component: pooling-base-serving
+    name: serve
+    kind: function
+    summary: "PoolingBaseServing.__call__: _init_ctx (request id, _check_model, pooling params, _maybe_get_adapters, the truncate_prompt_tokens check), _preprocessing (prompt_to_seq, render every prompt with the request's TokenizeParams; the first error propagates), _prepare_generators (PoolingParams.verify, one AsyncLLM.encode per prompt, merged), _collect_batch (an output error is a GenerationError), then the endpoint's response: EmbeddingResponse, ClassificationResponse or PoolingResponse."
+    sources: ["vllm/entrypoints/pooling/base/serving.py:67-257"]
+    request:
+      type: object
+      properties:
+        task: {type: string, examples: [embed], description: "the engine pooling task the IO processor uses"}
+        kind: {type: [string, "null"], default: null, description: "the response type: embed (EmbeddingResponse), classify (ClassificationResponse) or pooling (PoolingResponse); defaults to the task"}
+        prefix: {type: string, examples: [embd]}
+        body:
+          type: object
+          properties:
+            model: {type: [string, "null"], examples: [llama-8b]}
+            input: {type: [string, array], items: {type: [string, integer, array]}, default: [hello world]}
+            truncate_prompt_tokens: {type: [integer, "null"], default: null}
+            truncation_side: {type: [string, "null"], default: null}
+            use_activation: {type: [boolean, "null"], default: null}
+            dimensions: {type: [integer, "null"], default: null}
+            request_id: {type: [string, "null"], default: null}
+        x_request_id: {type: [string, "null"]}
+      required: [task, body]
+    errors: [{code: value-error, status: 0}, {code: generation-error, status: 0}, {code: vllm-validation-error, status: 0}, {code: vllm-not-found-error, status: 0}]
+    behavior:
+      - set:
+          vars.kind: "= has(input.kind) && input.kind != null ? input.kind : input.task"
+          vars.model: "= has(input.body.model) && input.body.model != null ? input.body.model : ''"
+      - title: "_init_ctx: request id <prefix>-<X-Request-Id, else the body's request_id, else a random uuid>"
+        source: "vllm/entrypoints/pooling/base/serving.py:113-116"
+        set:
+          vars.request_id: "= input.prefix + '-' + (has(input.x_request_id) && input.x_request_id != null ? input.x_request_id : (has(input.body.request_id) && input.body.request_id != null ? input.body.request_id : id('random-uuid', seq('random-uuid'))))"
+      - title: "PoolingBaseServing._check_model returns None for an unknown name (it only resolves runtime LoRA), so the 404 comes from _maybe_get_adapters: 'The model `<name>` does not exist.'"
+        source: "vllm/entrypoints/pooling/base/serving.py:117-121"
+        call: base-serving.maybe-get-adapters
+        input: {model: "= vars.model"}
+        as: lora
+      - set:
+          vars.model_name: "= vars.lora.value.lora_request != null ? vars.model : (config['served-model-name'] != null ? config['served-model-name'][0] : config['model'])"
+      - title: "_validate_request: truncate_prompt_tokens above max_model_len is a ValueError (before any tokenization)"
+        source: "vllm/entrypoints/pooling/base/serving.py:244-255"
+        if: "has(input.body.truncate_prompt_tokens) && input.body.truncate_prompt_tokens != null && input.body.truncate_prompt_tokens > config['max-model-len']"
+        then: [{fail: {code: value-error, message: "truncate_prompt_tokens value is greater than max_model_len. Please request a smaller truncation size."}}]
+      - title: "prompt_to_seq: a string, or one list of token ids, is one prompt; any other list is the sequence of prompts"
+        source: "vllm/entrypoints/pooling/base/io_processor.py:136-139"
+        set:
+          vars.inputs: "= type(input.body.input) == string || (type(input.body.input) == list && size(input.body.input) > 0 && input.body.input.all(x, type(x) == int)) ? [input.body.input] : input.body.input"
+      - if: "size(vars.inputs) == 0"
+        then: [{source: "vllm/entrypoints/pooling/base/serving.py:86-89", fail: {code: value-error, message: You must pass at least one prompt}}]
+      - title: "build_tok_params: max_total_tokens = max_model_len, max_output_tokens = 0, the request's truncation"
+        source: "vllm/entrypoints/pooling/base/protocol.py:108-144"
+        call: tokenize-params.post-init
+        input: {max_total_tokens: "= config['max-model-len']", max_output_tokens: 0, max_total_tokens_param: max_model_len, truncate_prompt_tokens: "= has(input.body.truncate_prompt_tokens) ? input.body.truncate_prompt_tokens : null", truncation_side: "= has(input.body.truncation_side) ? input.body.truncation_side : null"}
+      - set:
+          vars.toks: []
+      - title: "render_async per prompt under asyncio.gather: the first VLLMValidationError (an over-long prompt) propagates as a 400"
+        source: "vllm/entrypoints/pooling/base/serving.py:91-93"
+        foreach: "= vars.inputs"
+        as: p
+        max: 64
+        steps:
+          - call: base-renderer.tokenize-prompt
+            input: "= type(vars.p) == list ? {'prompt_token_ids': vars.p, 'max_output_tokens': 0, 'truncate_prompt_tokens': has(input.body.truncate_prompt_tokens) ? input.body.truncate_prompt_tokens : null, 'truncation_side': has(input.body.truncation_side) ? input.body.truncation_side : null} : {'prompt': vars.p, 'max_output_tokens': 0, 'truncate_prompt_tokens': has(input.body.truncate_prompt_tokens) ? input.body.truncate_prompt_tokens : null, 'truncation_side': has(input.body.truncation_side) ? input.body.truncation_side : null}"
+            as: tok
+          - set:
+              vars.toks: "= vars.toks + [vars.tok.value.prompt_token_ids]"
+      - title: "_prepare_generators: pooling_params.verify(model_config)"
+        source: "vllm/entrypoints/pooling/base/serving.py:158-160"
+        call: pooling-params.verify
+        input: {task: "= input.task", use_activation: "= has(input.body.use_activation) ? input.body.use_activation : null", dimensions: "= has(input.body.dimensions) ? input.body.dimensions : null"}
+        as: pp
+      - title: "One AsyncLLM.encode per prompt (<request_id>-<i>), merged by merge_async_iterators"
+        source: "vllm/entrypoints/pooling/base/serving.py:162-187"
+        parallel: "= lists.range(size(vars.toks))"
+        as: i
+        steps:
+          - call: async-llm.encode
+            input: {request_id: "= vars.request_id + '-' + string(vars.i)", prompt_token_ids: "= vars.toks[vars.i]", pooling_params: {task: "= input.task"}}
+            as: e
+            on_error: continue
+          - return: "= {'error': vars.e.ok ? null : vars.e.error, 'data': !vars.e.ok || vars.e.value == null || !has(vars.e.value.outputs) ? [] : vars.e.value.outputs.data, 'prompt_tokens': size(vars.toks[vars.i])}"
+        join: {need: all}
+        as_result: outs
+        on_insufficient: {code: generation-error}
+      - title: "_collect_batch: an exception out of the merged iterator propagates (a validation error stays a 400)"
+        source: "vllm/entrypoints/pooling/base/serving.py:203-213"
+        foreach: "= vars.outs.results"
+        as: o
+        max: 64
+        steps:
+          - if: "vars.o.value.error != null"
+            then: [{fail: "= vars.o.value.error"}]
+      - title: "get_pooling_usage: the prompt token ids of every output"
+        source: "vllm/entrypoints/pooling/utils.py:147-157"
+        set:
+          vars.ptoks: "= sum(vars.outs.results.map(r, r.value.prompt_tokens))"
+          vars.sorted: "= vars.outs.results.sortBy(r, r.index)"
+      - if: "vars.kind == 'pooling'"
+        then:
+          - title: "PoolingResponse: one PoolingResponseData(index, object pooling, data) per prompt"
+            source: "vllm/entrypoints/pooling/pooling/serving.py:138-171"
+            return: {id: "= vars.request_id", object: list, created: "= now / 1000", model: "= vars.model_name", data: "= vars.sorted.map(r, {'index': r.index, 'object': 'pooling', 'data': r.value.data})", usage: {prompt_tokens: "= vars.ptoks", total_tokens: "= vars.ptoks"}}
+      - if: "vars.kind == 'classify'"
+        then:
+          - title: "ClassificationResponse: label = id2label[argmax(probs)], probs, num_classes per prompt"
+            source: "vllm/entrypoints/pooling/classify/serving.py:34-72"
+            return: {id: "= vars.request_id", object: list, created: "= now / 1000", model: "= vars.model_name", data: "= vars.sorted.map(r, {'index': r.index, 'label': null, 'probs': r.value.data, 'num_classes': size(r.value.data)})", usage: {prompt_tokens: "= vars.ptoks", total_tokens: "= vars.ptoks"}}
+      - title: "EmbeddingResponse: one EmbeddingResponseData(index, object embedding, embedding) per prompt"
+        source: "vllm/entrypoints/pooling/embed/serving.py:42-220"
+        return:
+          id: "= vars.request_id"
+          object: list
+          created: "= now / 1000"
+          model: "= vars.model_name"
+          data: "= vars.sorted.map(r, {'index': r.index, 'object': 'embedding', 'embedding': r.value.data})"
+          usage: {prompt_tokens: "= vars.ptoks", total_tokens: "= vars.ptoks"}
+  # ------------------------------------------------------------------ /pooling
+  - component: serving-pooling
+    name: verify-pooling-task
+    kind: function
+    summary: "ServingPooling._verify_pooling_task (get_io_processor): dimensions is refused; the task defaults to the model's pooling task (an IOProcessorRequest is plugin); a task other than the pooling task is 'Unsupported task' when the model lacks it, else a hint to switch --pooler-config.task; plugin needs an IOProcessor plugin. Every refusal is a VLLMValidationError naming task."
+    sources: ["vllm/entrypoints/pooling/pooling/serving.py:56-100"]
+    request:
+      type: object
+      properties:
+        body: {type: object, properties: {task: {type: [string, "null"], default: null}, dimensions: {type: [integer, "null"], default: null}}}
+        io_processor_plugin: {type: boolean, default: false, description: "has_io_processor(vllm_config, model_config.io_processor_plugin): no world installs one"}
+      required: [body]
+    errors: [{code: vllm-validation-error, status: 0, retryable: false}]
+    behavior:
+      - if: "has(input.body.dimensions) && input.body.dimensions != null"
+        then: [{source: "vllm/entrypoints/pooling/pooling/serving.py:62-65", fail: {code: vllm-validation-error, message: dimensions is currently not supported, data: {param: dimensions}}}]
+      - call: pooling-factories.get-pooling-task
+        as: pt
+      - title: "request.task defaults to the model's pooling task; a body with data (and no input or messages) is an IOProcessorRequest, whose task is plugin"
+        source: "vllm/entrypoints/pooling/pooling/serving.py:67-74"
+        set:
+          vars.task: "= has(input.body.data) && input.body.data != null && !(has(input.body.input) && input.body.input != null) && !(has(input.body.messages) && input.body.messages != null) ? dyn('plugin') : (has(input.body.task) && input.body.task != null ? dyn(input.body.task) : vars.pt.value.pooling_task)"
+          vars.tasks: "= vars.pt.value.supported_tasks"
+      - if: "vars.task != 'plugin' && vars.task != vars.pt.value.pooling_task"
+        then:
+          - if: "!(vars.task in vars.tasks)"
+            then: [{title: "A task the model does not support", source: "vllm/entrypoints/pooling/pooling/serving.py:78-83", fail: {code: vllm-validation-error, message: "= 'Unsupported task: \\'' + vars.task + '\\' Supported tasks: (' + vars.tasks.map(x, '\\'' + x + '\\'').join(', ') + (size(vars.tasks) == 1 ? ',' : '') + ')'", data: {param: task}}}]
+          - title: "Supported, but not the task the pooler was built for"
+            source: "vllm/entrypoints/pooling/pooling/serving.py:84-89"
+            fail: {code: vllm-validation-error, message: "= 'Try switching the model\\'s pooling_task via --pooler-config.task ' + vars.task + '.'", data: {param: task}}
+      - if: "vars.task == 'plugin' && !(has(input.io_processor_plugin) && input.io_processor_plugin) && vars.pt.value.pooling_task != 'plugin'"
+        then: [{title: "No IOProcessor plugin among the io_processors", source: "vllm/entrypoints/pooling/pooling/serving.py:91-98", fail: {code: vllm-validation-error, message: "No IOProcessor plugin installed. Please refer to the documentation and to the 'prithvi_geospatial_mae_io_processor' offline inference example for more details.", data: {param: task}}}]
+      - return: {pooling_task: "= vars.task"}
+  - component: serving-pooling
+    name: serve-pooling
+    kind: function
+    summary: "ServingPooling.__call__ for POST /pooling: the BeforeValidator rejects the removed normalize parameter and the removed score / encode tasks; get_io_processor verifies the task; then the shared pooling pipeline answers a PoolingResponse (data per prompt)."
+    sources: ["vllm/entrypoints/pooling/pooling/serving.py:35-171", "vllm/entrypoints/pooling/pooling/protocol.py:96-114"]
+    request:
+      type: object
+      properties:
+        body:
+          type: object
+          properties:
+            model: {type: [string, "null"], examples: [llama-8b]}
+            input: {type: [string, array], items: {type: [string, integer, array]}, default: [hello world]}
+            task: {type: [string, "null"], default: null}
+            encoding_format: {type: string, default: float}
+        x_request_id: {type: [string, "null"]}
+      required: [body]
+    errors: [{code: vllm-validation-error, status: 0, retryable: false}, {code: value-error, status: 0}]
+    behavior:
+      - title: "reject_removed_pooling_parameters (the request union's BeforeValidator): normalize was removed"
+        source: "vllm/entrypoints/pooling/base/protocol.py:23-32"
+        if: "has(input.body.normalize)"
+        then: [{fail: {code: vllm-validation-error, message: "Parameter `normalize` was removed; use `use_activation` instead.", data: {param: normalize}}}]
+      - title: "check_removed_pooling_task: score and encode are gone"
+        source: "vllm/tasks.py:20-31"
+        if: "has(input.body.task) && input.body.task in ['score', 'encode']"
+        then: [{fail: {code: vllm-validation-error, message: "= input.body.task == 'score' ? '`score` task was removed; use `classify` instead.' : '`encode` task was removed; use `token_embed` or `token_classify` instead.'", data: {param: task}}}]
+      - call: serving-pooling.verify-pooling-task
+        input: {body: "= input.body"}
+        as: v
+      - call: pooling-base-serving.serve
+        input: {task: "= vars.v.value.pooling_task", kind: pooling, prefix: pooling, body: "= input.body", x_request_id: "= has(input.x_request_id) ? input.x_request_id : null"}
+        as: r
+      - return: "= vars.r.value"
+  # ------------------------------------------------------------------ scoring
+  - component: scoring-io-processor
+    name: valid-inputs
+    kind: function
+    summary: "valid_inputs_online + validate_score_input: a ScoreRequest's data_1/data_2 (queries+documents, queries+items, data_1+data_2 or text_1+text_2; a rerank's query and documents), each wrapped into a list; a multimodal item needs a multimodal model; data_1 must have one entry or as many as data_2, and neither may be empty."
+    sources: ["vllm/entrypoints/pooling/scoring/io_processor.py:168-192", "vllm/entrypoints/pooling/scoring/utils.py:92-141"]
+    request:
+      type: object
+      properties:
+        data_1: {type: [string, object, array, "null"], examples: ["What is the capital of France?"]}
+        data_2: {type: [string, object, array, "null"], examples: [The capital of France is Paris.]}
+        is_multimodal_model: {type: boolean, default: false}
+        architecture: {type: string, default: LlamaForCausalLM}
+      required: [data_1, data_2]
+    errors: [{code: vllm-validation-error, status: 0, retryable: false}]
+    behavior:
+      - title: "A single ScoreInput becomes a one-item list"
+        source: "vllm/entrypoints/pooling/scoring/utils.py:132-136"
+        set:
+          vars.d1: "= type(input.data_1) == list ? input.data_1 : [input.data_1]"
+          vars.d2: "= type(input.data_2) == list ? input.data_2 : [input.data_2]"
+      - title: "_validate_mm_score_input: a content-part item (not a string) is refused on a text-only model"
+        source: "vllm/entrypoints/pooling/scoring/utils.py:98-107"
+        if: "!(has(input.is_multimodal_model) && input.is_multimodal_model) && (vars.d1 + vars.d2).exists(d, type(d) != string)"
+        then: [{fail: {code: vllm-validation-error, message: "= 'MultiModalParam is not supported for ' + input.architecture"}}]
+      - title: "_validate_score_input_lens: 1:1, 1:N or N:N, then neither side empty"
+        source: "vllm/entrypoints/pooling/scoring/utils.py:111-123"
+        if: "size(vars.d1) > 1 && size(vars.d1) != size(vars.d2)"
+        then: [{fail: {code: vllm-validation-error, message: "Input lengths must be either 1:1, 1:N or N:N"}}]
+      - if: "size(vars.d1) == 0"
+        then: [{source: "vllm/entrypoints/pooling/scoring/utils.py:120-121", fail: {code: vllm-validation-error, message: At least one text element must be given}}]
+      - if: "size(vars.d2) == 0"
+        then: [{source: "vllm/entrypoints/pooling/scoring/utils.py:122-123", fail: {code: vllm-validation-error, message: At least one text_pair element must be given}}]
+      - return: {data_1: "= vars.d1.map(d, type(d) == string ? d : (has(d.content) ? d.content : []))", data_2: "= vars.d2.map(d, type(d) == string ? d : (has(d.content) ? d.content : []))"}
+  - component: scoring-io-processor
+    name: get-token-limits
+    kind: function
+    summary: "_get_token_limits: max_tokens_per_query and max_tokens_per_doc (0 means no limit); a non-zero limit must be non-negative and below max_model_len (ValueError, a 400)."
+    sources: ["vllm/entrypoints/pooling/scoring/io_processor.py:110-141"]
+    request: {type: object, properties: {max_tokens_per_query: {type: [integer, "null"], default: 0}, max_tokens_per_doc: {type: [integer, "null"], default: 0}}}
+    errors: [{code: value-error, status: 0, retryable: false}]
+    behavior:
+      - set:
+          vars.q: "= has(input.max_tokens_per_query) && input.max_tokens_per_query != null ? input.max_tokens_per_query : 0"
+          vars.d: "= has(input.max_tokens_per_doc) && input.max_tokens_per_doc != null ? input.max_tokens_per_doc : 0"
+      - title: "_validate_token_limit(max_tokens_per_query) when it is set"
+        source: "vllm/entrypoints/pooling/scoring/io_processor.py:137-138"
+        if: "vars.q != 0"
+        then:
+          - if: "vars.q < 0"
+            then: [{source: "vllm/entrypoints/pooling/scoring/io_processor.py:111-112", fail: {code: value-error, message: max_tokens_per_query must be a non-negative integer}}]
+          - if: "vars.q >= config['max-model-len']"
+            then: [{source: "vllm/entrypoints/pooling/scoring/io_processor.py:113-117", fail: {code: value-error, message: "= 'max_tokens_per_query (' + string(vars.q) + ') must be less than max_model_len (' + string(config['max-model-len']) + ').'"}}]
+      - title: "then max_tokens_per_doc"
+        source: "vllm/entrypoints/pooling/scoring/io_processor.py:139-140"
+        if: "vars.d != 0"
+        then:
+          - if: "vars.d < 0"
+            then: [{source: "vllm/entrypoints/pooling/scoring/io_processor.py:111-112", fail: {code: value-error, message: max_tokens_per_doc must be a non-negative integer}}]
+          - if: "vars.d >= config['max-model-len']"
+            then: [{source: "vllm/entrypoints/pooling/scoring/io_processor.py:113-117", fail: {code: value-error, message: "= 'max_tokens_per_doc (' + string(vars.d) + ') must be less than max_model_len (' + string(config['max-model-len']) + ').'"}}]
+      - return: {max_tokens_per_query: "= vars.q", max_tokens_per_doc: "= vars.d"}
+  - component: scoring-io-processor
+    name: truncate-text-to-tokens
+    kind: function
+    summary: "truncate_text_to_tokens: cut a text to at most max_tokens content tokens (no special tokens) at a character boundary; 0 or less gives the empty string (ASSUMPTION: the word-per-token stand-in tokenizer, so the first max_tokens words)."
+    sources: ["vllm/entrypoints/pooling/scoring/utils.py:42-71"]
+    request: {type: object, properties: {text: {type: string, examples: [The capital of France is Paris.]}, max_tokens: {type: integer, examples: [10]}}, required: [text, max_tokens]}
+    behavior:
+      - if: "input.max_tokens <= 0"
+        then: [{source: "vllm/entrypoints/pooling/scoring/utils.py:53-54", return: {text: ""}}]
+      - set:
+          vars.words: "= input.text.split(' ')"
+      - if: "size(vars.words) <= input.max_tokens"
+        then: [{source: "vllm/entrypoints/pooling/scoring/utils.py:63-64", return: {text: "= input.text"}}]
+      - title: "Slice the text at the end of the max_tokens-th token (offset_mapping), re-encoding until it fits"
+        source: "vllm/entrypoints/pooling/scoring/utils.py:56-69"
+        return: {text: "= vars.words.slice(0, input.max_tokens).join(' ')"}
+  - component: serving-scores
+    name: serve-score
+    kind: function
+    summary: "ServingScores.__call__ for /score and /rerank: the IO processor follows the model's pooling task (embed: bi-encoder, classify: cross-encoder, token_embed: late interaction). _init_ctx checks the model and truncate_prompt_tokens; the processor validates the inputs and the per-query/per-document token limits, then renders one engine input per prompt (bi-encoder: queries then documents, each embedded) or per (query, document) pair (cross-encoder, the classify task), every one tokenized with max_model_len and the request's truncation; usage counts the prompt token ids."
+    sources: ["vllm/entrypoints/pooling/scoring/serving.py:36-107", "vllm/entrypoints/pooling/scoring/io_processor.py:216-357", "vllm/entrypoints/pooling/scoring/io_processor.py:442-752"]
+    request:
+      type: object
+      properties:
+        body:
+          type: object
+          properties:
+            model: {type: [string, "null"], examples: [llama-8b]}
+            queries: {type: [string, array, object, "null"], default: null}
+            documents: {type: [string, array, object, "null"], default: null}
+            items: {type: [string, array, object, "null"], default: null}
+            data_1: {type: [string, array, object, "null"], default: null}
+            data_2: {type: [string, array, object, "null"], default: null}
+            text_1: {type: [string, array, object, "null"], default: null}
+            text_2: {type: [string, array, object, "null"], default: null}
+            query: {type: [string, object, "null"], default: null}
+            top_n: {type: [integer, "null"], default: null}
+            truncate_prompt_tokens: {type: [integer, "null"], default: null}
+            truncation_side: {type: [string, "null"], default: null}
+            max_tokens_per_query: {type: [integer, "null"], default: 0}
+            max_tokens_per_doc: {type: [integer, "null"], default: 0}
+            use_activation: {type: [boolean, "null"], default: null}
+            request_id: {type: [string, "null"], default: null}
+        prefix: {type: string, default: score}
+        x_request_id: {type: [string, "null"]}
+      required: [body]
+    errors: [{code: value-error, status: 0}, {code: vllm-validation-error, status: 0}, {code: vllm-not-found-error, status: 0}, {code: generation-error, status: 0}]
+    behavior:
+      - call: pooling-factories.get-pooling-task
+        as: pt
+      - set:
+          vars.prefix: "= has(input.prefix) ? input.prefix : 'score'"
+          vars.score_type: "= vars.pt.value.score_type"
+          vars.model: "= has(input.body.model) && input.body.model != null ? input.body.model : ''"
+      - title: "The engine task of the scoring processor: classify for the cross-encoder, embed for the bi-encoder, token_embed for late interaction"
+        source: "vllm/entrypoints/pooling/scoring/io_processor.py:216-218"
+        set:
+          vars.task: "= vars.score_type == 'cross-encoder' ? 'classify' : (vars.score_type == 'late-interaction' ? 'token_embed' : 'embed')"
+          vars.rid: "= vars.prefix + '-' + (has(input.x_request_id) && input.x_request_id != null ? input.x_request_id : (has(input.body.request_id) && input.body.request_id != null ? input.body.request_id : id('random-uuid', seq('random-uuid'))))"
+      - title: "_init_ctx: _maybe_get_adapters (PoolingBaseServing._check_model never 404s)"
+        source: "vllm/entrypoints/pooling/base/serving.py:117-121"
+        call: base-serving.maybe-get-adapters
+        input: {model: "= vars.model"}
+        as: lora
+      - set:
+          vars.model_name: "= vars.lora.value.lora_request != null ? vars.model : (config['served-model-name'] != null ? config['served-model-name'][0] : config['model'])"
+      - title: "_validate_request: truncate_prompt_tokens above max_model_len"
+        source: "vllm/entrypoints/pooling/base/serving.py:244-255"
+        if: "has(input.body.truncate_prompt_tokens) && input.body.truncate_prompt_tokens != null && input.body.truncate_prompt_tokens > config['max-model-len']"
+        then: [{fail: {code: value-error, message: "truncate_prompt_tokens value is greater than max_model_len. Please request a smaller truncation size."}}]
+      - title: "valid_inputs_online: a RerankRequest scores query against documents; a ScoreRequest's data_1/data_2 are queries+documents, queries+items, data_1+data_2 or text_1+text_2 (the union's members in order)"
+        source: "vllm/entrypoints/pooling/scoring/io_processor.py:181-192"
+        set:
+          vars.b: "= input.body"
+      - set:
+          vars.pair: "= vars.prefix == 'rerank' ? [has(vars.b.query) ? vars.b.query : null, has(vars.b.documents) ? vars.b.documents : null] : (has(vars.b.queries) && vars.b.queries != null && has(vars.b.documents) && vars.b.documents != null ? [vars.b.queries, vars.b.documents] : (has(vars.b.queries) && vars.b.queries != null && has(vars.b.items) && vars.b.items != null ? [vars.b.queries, vars.b.items] : (has(vars.b.data_1) && vars.b.data_1 != null && has(vars.b.data_2) && vars.b.data_2 != null ? [vars.b.data_1, vars.b.data_2] : [has(vars.b.text_1) ? vars.b.text_1 : null, has(vars.b.text_2) ? vars.b.text_2 : null])))"
+      - if: "vars.pair[0] == null || vars.pair[1] == null"
+        then:
+          - title: "No member of the request type validates: RequestValidationError, 400 Bad Request (ASSUMPTION: reported as the first missing field)"
+            source: "vllm/entrypoints/serve/exception_handling/handlers/validation.py:149-195"
+            fail: {code: Bad Request, status: 400, message: "= '1 validation error:\\n  {\\'type\\': \\'missing\\', \\'loc\\': \\'body.' + (vars.prefix == 'rerank' ? (vars.pair[0] == null ? 'query' : 'documents') : (vars.pair[0] == null ? 'queries' : 'documents')) + '\\', \\'msg\\': \\'Field required\\', \\'input\\': \\'<dict of ' + string(size(vars.b)) + ' items>\\'}'", data: {param: "= 'body.' + (vars.prefix == 'rerank' ? (vars.pair[0] == null ? 'query' : 'documents') : (vars.pair[0] == null ? 'queries' : 'documents'))"}}
+      - call: scoring-io-processor.valid-inputs
+        input: {data_1: "= vars.pair[0]", data_2: "= vars.pair[1]", architecture: "= config['model']"}
+        as: sd
+      - call: scoring-io-processor.get-token-limits
+        input: {max_tokens_per_query: "= has(vars.b.max_tokens_per_query) ? vars.b.max_tokens_per_query : 0", max_tokens_per_doc: "= has(vars.b.max_tokens_per_doc) ? vars.b.max_tokens_per_doc : 0"}
+        as: lim
+      - title: "build_tok_params: max_total_tokens = max_model_len, max_output_tokens = 0, the request's truncation"
+        source: "vllm/entrypoints/pooling/scoring/protocol.py:69-75"
+        call: tokenize-params.post-init
+        input: {max_total_tokens: "= config['max-model-len']", max_output_tokens: 0, max_total_tokens_param: max_model_len, truncate_prompt_tokens: "= has(vars.b.truncate_prompt_tokens) ? vars.b.truncate_prompt_tokens : null", truncation_side: "= has(vars.b.truncation_side) ? vars.b.truncation_side : null"}
+      - set:
+          vars.d1: "= vars.sd.value.data_1"
+          vars.d2: "= vars.sd.value.data_2"
+          vars.tpt: "= has(vars.b.truncate_prompt_tokens) ? vars.b.truncate_prompt_tokens : null"
+          vars.side: "= has(vars.b.truncation_side) ? vars.b.truncation_side : null"
+          vars.texts: []
+      - if: "vars.score_type == 'cross-encoder'"
+        then:
+          - title: "CrossEncoderIOProcessor: one ScoringRenderParams per document, the single query replicated"
+            source: "vllm/entrypoints/pooling/scoring/io_processor.py:484-518"
+            set:
+              vars.qs: "= size(vars.d1) == 1 ? lists.range(size(vars.d2)).map(j, vars.d1[0]) : vars.d1"
+          - title: "get_score_prompt: the query and the document are cut to their token limits before they are composed into one pair prompt"
+            source: "vllm/entrypoints/pooling/scoring/io_processor.py:653-659"
+            foreach: "= lists.range(size(vars.d2))"
+            as: j
+            max: 64
+            steps:
+              - set: {vars.qt: "= vars.qs[vars.j]", vars.dt: "= vars.d2[vars.j]"}
+              - if: "vars.lim.value.max_tokens_per_query > 0 && type(vars.qt) == string"
+                then:
+                  - call: scoring-io-processor.truncate-text-to-tokens
+                    input: {text: "= vars.qt", max_tokens: "= vars.lim.value.max_tokens_per_query"}
+                    as: tq
+                  - set: {vars.qt: "= vars.tq.value.text"}
+              - if: "vars.lim.value.max_tokens_per_doc > 0 && type(vars.dt) == string"
+                then:
+                  - call: scoring-io-processor.truncate-text-to-tokens
+                    input: {text: "= vars.dt", max_tokens: "= vars.lim.value.max_tokens_per_doc"}
+                    as: td
+                  - set: {vars.dt: "= vars.td.value.text"}
+              - title: "tokenizer(text=query, text_pair=document) (use_sep_token; ASSUMPTION: one sequence, the separators not counted)"
+                source: "vllm/entrypoints/pooling/scoring/io_processor.py:672-699"
+                set: {vars.texts: "= vars.texts + [(type(vars.qt) == string ? vars.qt : '') + ' ' + (type(vars.dt) == string ? vars.dt : '')]"}
+        else:
+          - title: "BiEncoderIOProcessor: texts cut to their limits, then every query and every document is its own prompt (queries first)"
+            source: "vllm/entrypoints/pooling/scoring/io_processor.py:223-267"
+            foreach: "= lists.range(size(vars.d1) + size(vars.d2))"
+            as: k
+            max: 128
+            steps:
+              - set:
+                  vars.t: "= vars.k < size(vars.d1) ? vars.d1[vars.k] : vars.d2[vars.k - size(vars.d1)]"
+                  vars.lt: "= vars.k < size(vars.d1) ? vars.lim.value.max_tokens_per_query : vars.lim.value.max_tokens_per_doc"
+              - if: "vars.lt > 0 && type(vars.t) == string"
+                then:
+                  - source: "vllm/entrypoints/pooling/scoring/io_processor.py:143-166"
+                    call: scoring-io-processor.truncate-text-to-tokens
+                    input: {text: "= vars.t", max_tokens: "= vars.lt"}
+                    as: tt
+                  - set: {vars.t: "= vars.tt.value.text"}
+              - set: {vars.texts: "= vars.texts + [type(vars.t) == string ? vars.t : '']"}
+      - set:
+          vars.toks: []
+      - title: "_preprocessing: render every engine input under asyncio.gather; an over-long prompt fails the request with its VLLMValidationError (a 400) before anything is encoded"
+        source: "vllm/entrypoints/pooling/base/serving.py:83-93"
+        foreach: "= vars.texts"
+        as: text
+        max: 128
+        steps:
+          - call: base-renderer.tokenize-prompt
+            input: {prompt: "= vars.text", max_output_tokens: 0, truncate_prompt_tokens: "= vars.tpt", truncation_side: "= vars.side"}
+            as: tok
+          - set: {vars.toks: "= vars.toks + [vars.tok.value.prompt_token_ids]"}
+      - title: "_prepare_generators: PoolingParams(task, use_activation).verify, then one AsyncLLM.encode per engine input, merged"
+        source: "vllm/entrypoints/pooling/scoring/protocol.py:77-81"
+        call: pooling-params.verify
+        input: {task: "= vars.task", use_activation: "= has(vars.b.use_activation) ? vars.b.use_activation : null"}
+        as: pp
+      - source: "vllm/entrypoints/pooling/base/serving.py:162-187"
+        parallel: "= lists.range(size(vars.toks))"
+        as: i
+        steps:
+          - call: async-llm.encode
+            input: {request_id: "= vars.rid + '-' + string(vars.i)", prompt_token_ids: "= vars.toks[vars.i]", pooling_params: {task: "= vars.task"}}
+            as: e
+            on_error: continue
+          - return: "= {'error': vars.e.ok ? null : vars.e.error, 'data': !vars.e.ok || vars.e.value == null || !has(vars.e.value.outputs) || !has(vars.e.value.outputs.data) ? [1.0] : vars.e.value.outputs.data}"
+        join: {need: all}
+        as_result: outs
+        on_insufficient: {code: generation-error}
+      - title: "_collect_batch: the first error out of the merged generators propagates"
+        source: "vllm/entrypoints/pooling/base/serving.py:203-211"
+        foreach: "= vars.outs.results"
+        as: o
+        max: 128
+        steps:
+          - if: "vars.o.value.error != null"
+            then: [{fail: "= vars.o.value.error"}]
+      - set:
+          vars.data: "= vars.outs.results.sortBy(r, r.index).map(r, r.value.data)"
+          vars.ptoks: "= sum(vars.toks.map(t, size(t)))"
+      - if: "vars.score_type == 'cross-encoder'"
+        then:
+          - title: "ScoringRequestOutput.from_base: the classifier's single logit is the pair's score"
+            source: "vllm/entrypoints/pooling/scoring/serving.py:119-125"
+            set:
+              vars.scores: "= vars.data.map(x, size(x) > 0 ? double(x[0]) : 0.0)"
+        else:
+          - title: "_post_process: cosine similarity of query i (or the one query) with document i"
+            source: "vllm/entrypoints/pooling/scoring/io_processor.py:325-357"
+            set:
+              vars.scores: "= lists.range(size(vars.d2)).map(j, [vars.data[size(vars.d1) == 1 ? 0 : j], vars.data[size(vars.d1) + j]]).map(p, size(p[0]) == size(p[1]) ? sum(lists.range(size(p[0])).map(k, double(p[0][k]) * double(p[1][k]))) / (math.sqrt(sum(p[0].map(x, double(x) * double(x)))) * math.sqrt(sum(p[1].map(x, double(x) * double(x)))) + 1e-12) : 0.0)"
+      - title: "_build_response: usage counts the prompt token ids of every engine input"
+        source: "vllm/entrypoints/pooling/scoring/serving.py:75-107"
+        call: serving-scores.build-response
+        input: {prefix: "= vars.prefix", request_id: "= vars.rid", model_name: "= vars.model_name", scores: "= vars.scores", documents: "= type(vars.pair[1]) == list ? vars.pair[1] : [vars.pair[1]]", top_n: "= has(vars.b.top_n) && vars.b.top_n != null ? vars.b.top_n : 0", num_prompt_tokens: "= vars.ptoks"}
+        as: resp
+      - return: "= vars.resp.value"
+  # ------------------------------------------------------------------ LLM.encode
+  - component: llm
+    name: encode
+    kind: function
+    summary: "PoolingOfflineMixin.encode: a DataPrompt only for plugin; _verify_pooling_task against the resolved runner_type, the supported tasks and the model's pooling task; get_request_factory_offline (one PoolingParams for every prompt, or exactly one per prompt, each taking the task unless it names another); then _run_tiling_engine."
+    sources: ["vllm/entrypoints/pooling/offline.py:62-195", "vllm/entrypoints/pooling/base/io_processor.py:183-241", "vllm/entrypoints/pooling/base/io_processor.py:307-321"]
+    request:
+      type: object
+      properties:
+        prompts: {type: [string, object, array], items: {type: [string, object, array, integer]}, default: [hello world]}
+        pooling_params: {type: [object, array, "null"], items: {type: object}, default: null, description: "one PoolingParams for every prompt, a list with one per prompt, or None (the defaults)"}
+        pooling_task: {type: [string, "null"], default: null}
+      required: [prompts]
+    errors: [{code: value-error, status: 0}, {code: vllm-validation-error, status: 0}]
+    behavior:
+      - if: "type(input.prompts) == map && 'data' in input.prompts && (!has(input.pooling_task) || input.pooling_task != 'plugin')"
+        then: [{source: "vllm/entrypoints/pooling/offline.py:96-99", fail: {code: value-error, message: "The 'data' field is only supported for the 'plugin' pooling task."}}]
+      - title: "self.runner_type is model_config.runner_type, resolved from --runner (auto picks pooling for a pooling architecture), not the raw option"
+        source: "vllm/entrypoints/pooling/offline.py:137-142"
+        call: model-config.post-init
+        input: {model: "= config['model']", max_model_len: "= config['max-model-len']", runner: "= config['runner']", quantization: null, enforce_eager: false, language_model_only: false, mm_processor_device: null, mm_processor_kwargs: null, mm_encoder_attn_backend: null, mm_tensor_ipc: direct_rpc, hf_overrides: null}
+        as: mc
+        on_error: continue
+      - set:
+          vars.runner_type: "= vars.mc.ok && has(vars.mc.value.runner_type) ? vars.mc.value.runner_type : (config['runner'] == 'pooling' ? 'pooling' : 'generate')"
+      - if: "vars.runner_type != 'pooling'"
+        then: [{title: "_verify_pooling_task: not a pooling model", source: "vllm/entrypoints/pooling/offline.py:137-142", fail: {code: value-error, message: "LLM.encode() is only supported for pooling models. Try passing `--runner pooling` to use the model as a pooling model."}}]
+      - if: "!has(input.pooling_task) || input.pooling_task == null"
+        then: [{source: "vllm/entrypoints/pooling/offline.py:144-156", fail: {code: value-error, message: "\n                pooling_task required for `LLM.encode`.\n                Please use one of the more specific methods or set the pooling_task when using `LLM.encode`:\n                  - For embeddings, use `LLM.embed(...)` or `pooling_task=\"embed\"`.\n                  - For classification logits, use `LLM.classify(...)` or `pooling_task=\"classify\"`.\n                  - For similarity scores, use `LLM.score(...)`.\n                  - For rewards, `pooling_task=\"classify\"` or `pooling_task=\"token_classify\"`.\n                  - For token classification, use `pooling_task=\"token_classify\"`.\n                  - For multi-vector retrieval, use `pooling_task=\"token_embed\"`.\n                "}}]
+      - set:
+          vars.task: "= input.pooling_task"
+          vars.tasks: "= state.supported_tasks"
+      - if: "vars.task in ['embed', 'token_embed'] && !(vars.task in vars.tasks)"
+        then: [{source: "vllm/entrypoints/pooling/offline.py:158-165", fail: {code: value-error, message: "Embedding API is not supported by this model. Try converting the model using `--convert embed`."}}]
+      - if: "vars.task in ['classify', 'token_classify'] && !(vars.task in vars.tasks)"
+        then: [{source: "vllm/entrypoints/pooling/offline.py:167-174", fail: {code: value-error, message: "Classification API is not supported by this model. Try converting the model using `--convert classify`."}}]
+      - title: "self.pooling_task = model_config.get_pooling_task(self.supported_tasks)"
+        source: "vllm/entrypoints/pooling/offline.py:46-48"
+        call: pooling-factories.get-pooling-task
+        input: {supported_tasks: "= vars.tasks"}
+        as: pt
+      - if: "vars.task != 'plugin' && vars.task != vars.pt.value.pooling_task"
+        then:
+          - if: "!(vars.task in vars.tasks)"
+            then: [{source: "vllm/entrypoints/pooling/offline.py:177-182", fail: {code: value-error, message: "= 'Unsupported task: \\'' + vars.task + '\\' Supported tasks: (' + vars.tasks.map(x, '\\'' + x + '\\'').join(', ') + (size(vars.tasks) == 1 ? ',' : '') + ')'"}}]
+          - source: "vllm/entrypoints/pooling/offline.py:183-187"
+            fail: {code: value-error, message: "= 'Try switching the model\\'s pooling_task via `PoolerConfig(task=\"' + vars.task + '\")`'"}
+      - if: "vars.task == 'plugin' && vars.pt.value.pooling_task != 'plugin'"
+        then: [{source: "vllm/entrypoints/pooling/offline.py:189-195", fail: {code: value-error, message: "No IOProcessor plugin installed. Please refer to the documentation and to the 'prithvi_geospatial_mae_io_processor' offline inference example for more details."}}]
+      - title: "prompt_to_seq: a string, a dict or one list of token ids is one prompt"
+        source: "vllm/entrypoints/pooling/base/io_processor.py:188-189"
+        set:
+          vars.prompts: "= type(input.prompts) == string || type(input.prompts) == map || (type(input.prompts) == list && size(input.prompts) > 0 && input.prompts.all(x, type(x) == int)) ? [input.prompts] : input.prompts"
+          vars.pp: "= has(input.pooling_params) ? input.pooling_params : null"
+      - title: "_params_to_seq: a list of PoolingParams must match the prompts one to one"
+        source: "vllm/entrypoints/pooling/base/io_processor.py:307-321"
+        if: "vars.pp != null && type(vars.pp) == list && size(vars.pp) != size(vars.prompts)"
+        then: [{fail: {code: vllm-validation-error, message: "= 'The lengths of prompts (' + string(size(vars.prompts)) + ') and params (' + string(size(vars.pp)) + ') must be the same.'"}}]
+      - set:
+          vars.params: "= vars.pp == null ? lists.range(size(vars.prompts)).map(i, {}) : (type(vars.pp) == list ? vars.pp : lists.range(size(vars.prompts)).map(i, vars.pp))"
+      - title: "Each cloned PoolingParams takes the pooling task; one naming a different task is refused (plugin may overwrite it)"
+        source: "vllm/entrypoints/pooling/base/io_processor.py:215-224"
+        if: "vars.task != 'plugin' && vars.params.exists(p, has(p.task) && p.task != null && p.task != vars.task)"
+        then:
+          - set: {vars.bad: "= vars.params.filter(p, has(p.task) && p.task != null && p.task != vars.task)[0].task"}
+          - fail: {code: vllm-validation-error, message: "= 'You cannot overwrite param.task=\\'' + vars.bad + '\\' with pooling_task=\\'' + vars.task + '\\'!'"}
+      - title: "_run_tiling_engine: add the requests through LLMEngine and step it until they finish"
+        source: "vllm/entrypoints/pooling/offline.py:120-134"
+        call: llm.run-tiling-engine
+        input: {prompts: "= vars.prompts", pooling_task: "= vars.task"}
+        as: out
+      - return: {num_outputs: "= size(vars.out.value)", pooling_task: "= vars.task", outputs: "= vars.out.value"}
+  # ------------------------------------------------------------------ SageMaker /invocations
+  - component: sagemaker-router
+    name: post-invocations
+    kind: http
+    summary: "POST /invocations: JSON-decode the body (a decode error is an HTTPException 400), then try each enabled endpoint's request type in order with TypeAdapter.validate_python -- ChatCompletionRequest and CompletionRequest for a generate model; EmbeddingRequest or ClassificationRequest by pooling task, RerankRequest and ScoreRequest when scoring is enabled, PoolingRequest for any pooling model -- and call the first that validates. A pydantic ValidationError moves on; any other exception a validator raises (a VLLMValidationError) escapes to the app's handlers. No match is a 400 listing the type names."
+    sources: ["vllm/entrypoints/serve/sagemaker/api_router.py:98-140", "vllm/entrypoints/pooling/factories.py:221-272", "vllm/entrypoints/generate/factories.py:16-41"]
+    attributes: {method: POST, path: /invocations}
+    request:
+      type: object
+      properties:
+        path: {type: string, examples: [/invocations]}
+        headers: {$ref: ServingHttpHeaders}
+        body:
+          type: [object, string]
+          description: "the decoded JSON body; a string stands for raw bytes that are not JSON. The fields of every request type /invocations may validate as."
+          properties:
+            model: {type: string, examples: [llama-8b]}
+            messages: {type: [array, "null"], items: {type: object}, default: null}
+            prompt: {type: [array, string, integer, "null"], items: {type: string}, default: null}
+            max_tokens: {type: [integer, "null"], default: null}
+            stream_options: {type: [object, "null"], default: null}
+            input: {type: [string, array, "null"], default: null}
+            query: {type: [string, object, "null"], default: null}
+            queries: {type: [string, array, "null"], default: null}
+            documents: {type: [string, array, "null"], default: null}
+            items: {type: [string, array, "null"], default: null}
+            data_1: {type: [string, array, object, "null"], default: null}
+            data_2: {type: [string, array, object, "null"], default: null}
+            text_1: {type: [string, array, object, "null"], default: null}
+            text_2: {type: [string, array, object, "null"], default: null}
+            data: {type: [object, array, string, "null"], default: null}
+            task: {type: [string, "null"], default: null}
+      required: [path, body]
+    errors: [{code: BadRequestError, status: 400}, {code: Bad Request, status: 400}, {code: NotFoundError, status: 404}, {code: InternalServerError, status: 500}, {code: UnprocessableEntityError, status: 422}, {code: ConnectionRefusedError, status: 0, retryable: true}]
+    behavior:
+      - call: launcher.accept-connection
+      - title: "validate_json_request (the route dependency): a Content-Type other than application/json is refused"
+        source: "vllm/entrypoints/serve/utils/api_utils.py:350-356"
+        if: "has(input.headers) && input.headers != null && 'Content-Type' in input.headers && input.headers['Content-Type'].lowerAscii().split(';')[0].trim() != 'application/json'"
+        then: [{fail: {code: Bad Request, status: 400, message: "1 validation error:\n  Unsupported Media Type: Only 'application/json' is allowed"}}]
+      - if: "type(input.body) == string"
+        then:
+          - set:
+              vars.raw: "= input.body.trim()"
+          - title: "await raw_request.json() raised json.JSONDecodeError: HTTPException(400, 'JSON decode error: ...'), which vLLM's HTTPException handler answers with type Bad Request (ASSUMPTION: json's message for an empty body, an object with no quoted key, or anything else)"
+            source: "vllm/entrypoints/serve/sagemaker/api_router.py:112-118"
+            fail: {code: Bad Request, status: 400, message: "= 'JSON decode error: ' + (vars.raw == '' ? 'Expecting value: line 1 column 1 (char 0)' : (vars.raw.startsWith('{') && !vars.raw.substring(1).trim().startsWith('\"') && !vars.raw.substring(1).trim().startsWith('}') ? 'Expecting property name enclosed in double quotes: line 1 column ' + string(size(input.body) - size(input.body.substring(1).trim()) + 1) + ' (char ' + string(size(input.body) - size(input.body.substring(1).trim())) + ')' : 'Expecting value: line 1 column 1 (char 0)'))"}
+      - set:
+          vars.b: "= input.body.transformMap(k, v, v != null, v)"
+          vars.names: []
+      - call: app-state.supported-tasks
+        as: tasks
+      - title: "INVOCATION_TYPES: generate types first, then the pooling ones (earlier entries win)"
+        source: "vllm/entrypoints/serve/sagemaker/api_router.py:81-89"
+        call: pooling-factories.get-pooling-task
+        as: pt
+      - if: "'generate' in vars.tasks.value"
+        then:
+          - set: {vars.names: "= ['ChatCompletionRequest', 'CompletionRequest']"}
+          - if: "has(vars.b.messages) && vars.b.messages != null && type(vars.b.messages) == list"
+            then:
+              - title: "ChatCompletionRequest: its before validators run first and a VLLMValidationError escapes the loop"
+                source: "vllm/entrypoints/serve/sagemaker/api_router.py:126-130"
+                call: openai-serving-chat.validate-request
+                input: {body: "= vars.b"}
+                as: cv
+                on_error: continue
+              - if: "!vars.cv.ok"
+                then:
+                  - call: exception-handling.vllm-error-handler
+                    input: {code: "= vars.cv.error.code", status: "= has(vars.cv.error.status) ? vars.cv.error.status : 0", message: "= vars.cv.error.message", param: "= has(vars.cv.error.data) && vars.cv.error.data != null && 'param' in vars.cv.error.data ? vars.cv.error.data.param : null", value: "= has(vars.cv.error.data) && vars.cv.error.data != null && 'value' in vars.cv.error.data ? vars.cv.error.data.value : null"}
+              - title: "It validates: await create_chat_completion(request, raw_request)"
+                source: "vllm/entrypoints/serve/sagemaker/api_router.py:132"
+                call: openai-serving-chat.post-v1-chat-completions
+                input: {path: /v1/chat/completions, headers: "= has(input.headers) ? input.headers : {}", body: "= vars.b"}
+                as: c
+              - return: "= vars.c.value"
+          - title: "CompletionRequest: no messages field means a missing-field ValidationError for chat, so the completion type is tried; its before validators (e.g. the missing prompt) raise VLLMValidationError, which escapes"
+            source: "vllm/entrypoints/serve/sagemaker/api_router.py:126-130"
+            call: openai-serving-completion.validate-request
+            input: {body: "= vars.b"}
+            as: pv
+            on_error: continue
+          - if: "!vars.pv.ok && vars.pv.error.code != 'Bad Request'"
+            then:
+              - call: exception-handling.vllm-error-handler
+                input: {code: "= vars.pv.error.code", status: "= has(vars.pv.error.status) ? vars.pv.error.status : 0", message: "= vars.pv.error.message", param: "= has(vars.pv.error.data) && vars.pv.error.data != null && 'param' in vars.pv.error.data ? vars.pv.error.data.param : null", value: "= has(vars.pv.error.data) && vars.pv.error.data != null && 'value' in vars.pv.error.data ? vars.pv.error.data.value : null"}
+          - if: "vars.pv.ok"
+            then:
+              - call: openai-serving-completion.post-v1-completions
+                input: {path: /v1/completions, headers: "= has(input.headers) ? input.headers : {}", body: "= vars.b"}
+                as: p
+              - return: "= vars.p.value"
+      - set:
+          vars.task: "= vars.pt.value.pooling_task"
+          vars.has_input: "= (has(vars.b.input) && vars.b.input != null) || (has(vars.b.messages) && vars.b.messages != null)"
+      - title: "reject_removed_pooling_parameters, the BeforeValidator of the Embedding, Classification and Pooling request unions, raises VLLMValidationError, which escapes the loop"
+        source: "vllm/entrypoints/pooling/base/protocol.py:23-32"
+        if: "vars.task != null && has(vars.b.normalize)"
+        then: [{call: exception-handling.vllm-error-handler, input: {code: vllm-validation-error, message: "Parameter `normalize` was removed; use `use_activation` instead.", param: normalize}}]
+      - if: "vars.task == 'embed'"
+        then:
+          - set: {vars.names: "= vars.names + ['EmbeddingRequest']"}
+          - if: "vars.has_input"
+            then:
+              - title: "EmbeddingRequest validates: create_embedding"
+                source: "vllm/entrypoints/pooling/factories.py:233-239"
+                call: pooling-base-serving.serve
+                input: {task: embed, prefix: embd, body: "= vars.b", x_request_id: "= has(input.headers) && input.headers != null && 'X-Request-Id' in input.headers ? input.headers['X-Request-Id'] : null"}
+                as: e
+                on_error:
+                  - call: exception-handling.vllm-error-handler
+                    input: {code: "= error.code", status: "= error.status", message: "= error.message", param: "= has(error.data) && error.data != null && 'param' in error.data ? error.data.param : null", value: "= has(error.data) && error.data != null && 'value' in error.data ? error.data.value : null"}
+              - return: "= vars.e.value"
+      - if: "vars.task == 'classify'"
+        then:
+          - set: {vars.names: "= vars.names + ['ClassificationRequest']"}
+          - if: "vars.has_input"
+            then:
+              - title: "ClassificationRequest validates: create_classify"
+                source: "vllm/entrypoints/pooling/factories.py:241-247"
+                call: pooling-base-serving.serve
+                input: {task: classify, prefix: classify, body: "= vars.b", x_request_id: "= has(input.headers) && input.headers != null && 'X-Request-Id' in input.headers ? input.headers['X-Request-Id'] : null"}
+                as: cl
+                on_error:
+                  - call: exception-handling.vllm-error-handler
+                    input: {code: "= error.code", status: "= error.status", message: "= error.message", param: "= has(error.data) && error.data != null && 'param' in error.data ? error.data.param : null", value: "= has(error.data) && error.data != null && 'value' in error.data ? error.data.value : null"}
+              - return: "= vars.cl.value"
+      - if: "vars.pt.value.enable_scoring_api"
+        then:
+          - set: {vars.names: "= vars.names + ['RerankRequest', 'ScoreRequest']"}
+          - title: "RerankRequest (query and documents) validates: do_rerank"
+            source: "vllm/entrypoints/pooling/factories.py:249-255"
+            if: "has(vars.b.query) && vars.b.query != null && has(vars.b.documents) && vars.b.documents != null"
+            then:
+              - call: serving-scores.serve-score
+                input: {prefix: rerank, body: "= vars.b", x_request_id: "= has(input.headers) && input.headers != null && 'X-Request-Id' in input.headers ? input.headers['X-Request-Id'] : null"}
+                as: rr
+                on_error:
+                  - call: exception-handling.vllm-error-handler
+                    input: {code: "= error.code", status: "= error.status", message: "= error.message", param: "= has(error.data) && error.data != null && 'param' in error.data ? error.data.param : null", value: "= has(error.data) && error.data != null && 'value' in error.data ? error.data.value : null"}
+              - return: "= vars.rr.value"
+          - title: "ScoreRequest (queries+documents, queries+items, data_1+data_2 or text_1+text_2) validates: create_score"
+            source: "vllm/entrypoints/pooling/factories.py:257-262"
+            if: "(has(vars.b.queries) && vars.b.queries != null && ((has(vars.b.documents) && vars.b.documents != null) || (has(vars.b.items) && vars.b.items != null))) || (has(vars.b.data_1) && vars.b.data_1 != null && has(vars.b.data_2) && vars.b.data_2 != null) || (has(vars.b.text_1) && vars.b.text_1 != null && has(vars.b.text_2) && vars.b.text_2 != null)"
+            then:
+              - call: serving-scores.serve-score
+                input: {prefix: score, body: "= vars.b", x_request_id: "= has(input.headers) && input.headers != null && 'X-Request-Id' in input.headers ? input.headers['X-Request-Id'] : null"}
+                as: sc
+                on_error:
+                  - call: exception-handling.vllm-error-handler
+                    input: {code: "= error.code", status: "= error.status", message: "= error.message", param: "= has(error.data) && error.data != null && 'param' in error.data ? error.data.param : null", value: "= has(error.data) && error.data != null && 'value' in error.data ? error.data.value : null"}
+              - return: "= vars.sc.value"
+      - if: "vars.task != null"
+        then:
+          - set: {vars.names: "= vars.names + ['PoolingRequest']"}
+          - title: "PoolingRequest (input, messages, or an IOProcessorRequest's data) validates: create_pooling"
+            source: "vllm/entrypoints/pooling/factories.py:264-270"
+            if: "vars.has_input || (has(vars.b.data) && vars.b.data != null)"
+            then:
+              - call: serving-pooling.serve-pooling
+                input: {body: "= vars.b", x_request_id: "= has(input.headers) && input.headers != null && 'X-Request-Id' in input.headers ? input.headers['X-Request-Id'] : null"}
+                as: po
+                on_error:
+                  - call: exception-handling.vllm-error-handler
+                    input: {code: "= error.code", status: "= error.status", message: "= error.message", param: "= has(error.data) && error.data != null && 'param' in error.data ? error.data.param : null", value: "= has(error.data) && error.data != null && 'value' in error.data ? error.data.value : null"}
+              - return: "= vars.po.value"
+      - title: "No request type validated: base(raw_request).create_error_response, 400 BadRequestError; the names are the list's repr (quoted)"
+        source: "vllm/entrypoints/serve/sagemaker/api_router.py:134-140"
+        fail: {code: BadRequestError, status: 400, message: "= 'Cannot find suitable handler for request. Expected one of: [' + vars.names.map(n, '\\'' + n + '\\'').join(', ') + ']'"}
+  # ------------------------------------------------------------------ renderer: truncation after multimodal expansion
+  - component: base-renderer
+    name: process-multimodal
+    kind: function
+    summary: "_process_multimodal: in the API process, on the single-worker mm executor, parse the media items and run mm_processor.apply through this process's processor cache. The token ids come back with each image placeholder expanded to the item's feature tokens, plus the hashes and placeholder ranges. The simulation expands image placeholders only; a video already carries its frame placeholders from the template stand-in."
+    sources: ["vllm/renderers/base.py:894-932", "vllm/renderers/base.py:1099-1129"]
+    request:
+      type: object
+      required: [prompt_token_ids, mm_counts]
+      properties:
+        prompt_token_ids: {type: array, items: {type: integer}}
+        mm_counts: {type: object}
+        mm_items: {type: array, items: {type: object}, default: []}
+    behavior:
+      - title: "self.mm_processor was built at renderer init from the model config's architectures"
+        source: "vllm/renderers/base.py:192-196"
+        call: hf-hub.download-config
+        input: {model: "= config['model']"}
+        as: hfc
+      - set:
+          vars.items: "= has(input.mm_items) ? input.mm_items : []"
+      - title: "mm_processor.apply(MMProcessorInputs(prompt, items, uuids, cache=self._mm_processor_cache)); the content hash is a digest of the media reference, unless the client gave a uuid"
+        source: "vllm/renderers/base.py:913-930"
+        call: base-multi-modal-processor.apply
+        input:
+          model: "= config['model']"
+          architectures: "= vars.hfc.value.architectures"
+          prompt_token_ids: "= input.prompt_token_ids"
+          mm_counts: "= input.mm_counts"
+          mm_uuids: "= size(vars.items) > 0 ? dyn({'image': vars.items.map(it, it.uuid)}) : dyn(null)"
+          mm_items: "= vars.items.map(it, {'modality': it.modality, 'width': it.width, 'height': it.height})"
+        as: ap
+      - set:
+          vars.ranges: "= 'image' in vars.ap.value.mm_placeholders ? vars.ap.value.mm_placeholders.image : []"
+          vars.img_positions: "= size(vars.ap.value.mm_placeholders) > 0 ? lists.range(size(input.prompt_token_ids)).filter(i, input.prompt_token_ids[i] == 151655) : []"
+      - title: "The image placeholder token repeats for each item's feature tokens (_apply_token_matches)"
+        source: "vllm/multimodal/processing/processor.py:1690-1760"
+        set:
+          vars.ids: "= size(vars.ranges) == 0 ? input.prompt_token_ids : lists.range(size(input.prompt_token_ids)).map(i, i in vars.img_positions ? lists.range(vars.ranges[size(vars.img_positions.filter(p, p < i))].length).map(k, 151655) : [input.prompt_token_ids[i]]).flatten()"
+      - source: "vllm/renderers/base.py:932"
+        return:
+          type: multimodal
+          prompt_token_ids: "= vars.ids"
+          mm_placeholders: "= vars.ap.value.mm_placeholders"
+          mm_hashes: "= vars.ap.value.mm_hashes"
+          mm_token_counts: "= 'image' in vars.ap.value.placeholders ? dyn({'image': vars.ap.value.placeholders.image}) : dyn(null)"
+  - component: base-renderer
+    name: process-singleton
+    kind: function
+    summary: "_process_singleton(_async): an embeds prompt goes to _process_embeds; a tokens prompt becomes the engine input (multimodal processing expands its placeholders), then _truncate_expanded_prompt re-applies truncate_prompt_tokens to the expanded ids."
+    sources: ["vllm/renderers/base.py:1099-1129"]
+    request:
+      type: object
+      properties:
+        engine_input: {type: object, properties: {type: {type: string, examples: [multimodal]}, prompt_token_ids: {type: array, items: {type: integer}}, mm_placeholders: {type: object}}}
+        tok_params: {type: [object, "null"], default: null, properties: {truncate_prompt_tokens: {type: [integer, "null"]}, truncation_side: {type: [string, "null"]}, max_total_tokens: {type: [integer, "null"]}, max_output_tokens: {type: [integer, "null"]}}}
+      required: [engine_input]
+    errors: [{code: vllm-validation-error, status: 0, retryable: false}]
+    behavior:
+      - if: "input.engine_input.type == 'embeds'"
+        then: [{title: "prompt_embeds: _process_embeds, never truncated here", source: "vllm/renderers/base.py:1106-1107", return: "= input.engine_input"}]
+      - title: "_truncate_expanded_prompt(engine_input, tok_params)"
+        source: "vllm/renderers/base.py:1113"
+        call: base-renderer.truncate-expanded-prompt
+        input: {engine_input: "= input.engine_input", tok_params: "= has(input.tok_params) ? input.tok_params : null"}
+        as: t
+      - return: "= vars.t.value"
+  - component: base-renderer
+    name: truncate-expanded-prompt
+    kind: function
+    summary: "_truncate_expanded_prompt: only a multimodal input with truncate_prompt_tokens can outgrow the limit after its placeholders expand; slice the expanded ids again (the same _truncation_slice), refuse when any placeholder span would be split or dropped, and shift the spans left by the dropped prefix."
+    sources: ["vllm/renderers/base.py:1035-1097", "vllm/renderers/params.py:481-505"]
+    request:
+      type: object
+      properties:
+        engine_input: {type: object, properties: {type: {type: string, examples: [multimodal]}, prompt_token_ids: {type: [array, "null"], items: {type: integer}}, mm_placeholders: {type: object, description: "modality -> [{offset, length}]"}}}
+        tok_params: {type: [object, "null"], default: null}
+      required: [engine_input]
+    errors: [{code: vllm-validation-error, status: 0, retryable: false}]
+    behavior:
+      - set:
+          vars.ei: "= input.engine_input"
+          vars.tp: "= has(input.tok_params) && input.tok_params != null ? input.tok_params : {}"
+      - if: "vars.ei.type != 'multimodal'"
+        then: [{title: "Only multimodal inputs grow after apply_post_tokenization", source: "vllm/renderers/base.py:1053-1054", return: "= vars.ei"}]
+      - if: "!has(vars.tp.truncate_prompt_tokens) || vars.tp.truncate_prompt_tokens == null || !has(vars.ei.prompt_token_ids) || vars.ei.prompt_token_ids == null"
+        then: [{source: "vllm/renderers/base.py:1056-1061", return: "= vars.ei"}]
+      - title: "_truncation_slice: a negative limit is max_truncation_tokens; none when the prompt already fits; 0 keeps nothing; left keeps the tail"
+        source: "vllm/renderers/params.py:481-505"
+        set:
+          vars.n: "= size(vars.ei.prompt_token_ids)"
+          vars.tpt: "= vars.tp.truncate_prompt_tokens"
+          vars.max_in: "= has(vars.tp.max_total_tokens) && vars.tp.max_total_tokens != null ? dyn(vars.tp.max_total_tokens) : null"
+      - set:
+          vars.limit: "= vars.tpt < 0 ? (vars.max_in == null ? null : dyn(has(vars.tp.max_output_tokens) && vars.tp.max_output_tokens == 0 ? vars.max_in : math.greatest([0, vars.max_in - 1]))) : dyn(vars.tpt)"
+      - if: "vars.limit == null || vars.limit >= vars.n"
+        then: [{source: "vllm/renderers/base.py:1063-1066", return: "= vars.ei"}]
+      - set:
+          vars.left: "= has(vars.tp.truncation_side) && vars.tp.truncation_side != null ? vars.tp.truncation_side == 'left' : config['runner'] != 'pooling'"
+      - set:
+          vars.start: "= vars.limit == 0 ? 0 : (vars.left ? vars.n - vars.limit : 0)"
+          vars.stop: "= vars.limit == 0 ? 0 : (vars.left ? vars.n : vars.limit)"
+          vars.mm: "= has(vars.ei.mm_placeholders) && vars.ei.mm_placeholders != null ? vars.ei.mm_placeholders : {}"
+      - title: "Every placeholder span must survive whole: a span cut by the slice, or outside it, is refused"
+        source: "vllm/renderers/base.py:1070-1085"
+        foreach: "= vars.mm.map(k, k)"
+        as: modality
+        max: 16
+        steps:
+          - set:
+              vars.bad: "= vars.mm[vars.modality].filter(p, !(p.offset >= vars.start && p.offset + p.length <= vars.stop))"
+          - if: "size(vars.bad) > 0"
+            then:
+              - fail: {code: vllm-validation-error, message: "= 'truncate_prompt_tokens=' + string(vars.tpt) + ' would split or drop a(n) ' + vars.modality + ' item, which spans tokens ' + string(vars.bad[0].offset) + ' to ' + string(vars.bad[0].offset + vars.bad[0].length) + ' of the ' + string(vars.n) + '-token prompt. Multimodal placeholders expand after truncation is applied, so the limit must leave every multimodal item intact. Please raise truncate_prompt_tokens or shorten the multimodal input.'", data: {param: truncate_prompt_tokens, value: "= vars.tpt"}}
+      - title: "A left cut shifts every span by the dropped prefix; the ids are sliced"
+        source: "vllm/renderers/base.py:1087-1097"
+        return: "= merge(vars.ei, {'prompt_token_ids': vars.ei.prompt_token_ids.slice(vars.start, vars.stop), 'mm_placeholders': vars.start > 0 ? vars.mm.transformMap(k, v, v.map(p, merge(p, {'offset': p.offset - vars.start}))) : vars.mm})"
+
+scenarios:
+  # ------------------------------------------------------------------ pooling task and refusals
+  - id: serving-api-r6-pooling-task-refusals
+    name: "/pooling on a single-logit reranker (pooling task classify): classify answers a PoolingResponse; embed and token_embed are unsupported; token_classify needs --pooler-config.task; plugin has no IOProcessor; dimensions and the removed score task are refused"
+    fixtures: [full-tp1-llama-8b]
+    config: &rr_config {model: BAAI/bge-reranker-base, served-model-name: [BAAI/bge-reranker-base], runner: pooling, max-model-len: 100}
+    state: &rr_state
+      app-state: {supported_tasks: [classify, token_classify]}
+      async-llm: {supported_tasks: [classify, token_classify]}
+    steps:
+      - {interface: serving-pooling.post-pooling, caller: api-client, as: cls, input: {path: /pooling, body: {model: BAAI/bge-reranker-base, input: "This product was excellent", task: classify}}}
+      - {interface: serving-pooling.post-pooling, caller: api-client, as: dflt, input: {path: /pooling, body: {model: BAAI/bge-reranker-base, input: [a b, c d]}}}
+      - {interface: serving-pooling.post-pooling, caller: api-client, as: embed, input: {path: /pooling, body: {model: BAAI/bge-reranker-base, input: [hi], task: embed}}}
+      - {interface: serving-pooling.post-pooling, caller: api-client, as: tokcls, input: {path: /pooling, body: {model: BAAI/bge-reranker-base, input: [hi], task: token_classify}}}
+      - {interface: serving-pooling.post-pooling, caller: api-client, as: plugin, input: {path: /pooling, body: {model: BAAI/bge-reranker-base, input: [hi], task: plugin}}}
+      - {interface: serving-pooling.post-pooling, caller: api-client, as: dims, input: {path: /pooling, body: {model: BAAI/bge-reranker-base, input: [hi], dimensions: 8}}}
+      - {interface: serving-pooling.post-pooling, caller: api-client, as: score, input: {path: /pooling, body: {model: BAAI/bge-reranker-base, input: [hi], task: score}}}
+    expect:
+      - "steps.cls.result.ok && steps.cls.result.value.id.startsWith('pooling-') && size(steps.cls.result.value.data) == 1 && steps.cls.result.value.data[0].object == 'pooling' && steps.cls.result.value.usage.prompt_tokens == 5"
+      - "steps.dflt.result.ok && size(steps.dflt.result.value.data) == 2"
+      - "trace.filter(e, e.type == 'call.start' && e.interface == 'async-llm.encode' && e.input.pooling_params.task == 'classify').size() == 3"
+      - "!steps.embed.result.ok && steps.embed.result.error.code == 'BadRequestError' && steps.embed.result.error.message == \"Unsupported task: 'embed' Supported tasks: ('classify', 'token_classify') (parameter=task)\" && steps.embed.result.error.data.param == 'task'"
+      - "!steps.tokcls.result.ok && steps.tokcls.result.error.message == \"Try switching the model's pooling_task via --pooler-config.task token_classify. (parameter=task)\""
+      - "!steps.plugin.result.ok && steps.plugin.result.error.message.startsWith('No IOProcessor plugin installed.')"
+      - "!steps.dims.result.ok && steps.dims.result.error.message == 'dimensions is currently not supported (parameter=dimensions)'"
+      - "!steps.score.result.ok && steps.score.result.error.message == '`score` task was removed; use `classify` instead. (parameter=task)'"
+  - id: serving-api-r6-pooling-generate-model
+    name: "A generate-only model has no pooling task: /pooling and /score are not registered (404), and /v1/embeddings neither"
+    fixtures: [full-tp1-llama-8b]
+    steps:
+      - {interface: serving-pooling.post-pooling, caller: api-client, as: pool, input: {path: /pooling, body: {model: llama-8b, input: hi}}}
+      - {interface: serving-scores.post-score, caller: api-client, as: score, input: {path: /score, body: {model: llama-8b, queries: q, documents: [d]}}}
+    expect:
+      - "!steps.pool.result.ok && steps.pool.result.error.status == 404 && steps.pool.result.error.message == 'Not Found'"
+      - "!steps.score.result.ok && steps.score.result.error.status == 404"
+      - "calls['async-llm.encode'] == 0"
+  - id: serving-api-r6-embeddings-truncation
+    name: "/v1/embeddings: an unknown model is 404 from _maybe_get_adapters; truncate_prompt_tokens above max_model_len is refused before tokenizing; a prompt over max_model_len is a 400 'at least'; truncate_prompt_tokens cuts it instead"
+    fixtures: [full-tp1-llama-8b]
+    config: {runner: pooling, max-model-len: 8}
+    state:
+      app-state: {supported_tasks: [embed]}
+      async-llm: {supported_tasks: [embed]}
+    steps:
+      - {interface: serving-embedding.post-v1-embeddings, caller: api-client, as: unknown, input: {path: /v1/embeddings, body: {model: no-such-model, input: hi}}}
+      - {interface: serving-embedding.post-v1-embeddings, caller: api-client, as: big, input: {path: /v1/embeddings, body: {model: llama-8b, input: hi, truncate_prompt_tokens: 9}}}
+      - {interface: serving-embedding.post-v1-embeddings, caller: api-client, as: long, input: {path: /v1/embeddings, body: {model: llama-8b, input: "one two three four five six seven eight nine ten"}}}
+      - {interface: serving-embedding.post-v1-embeddings, caller: api-client, as: cut, input: {path: /v1/embeddings, body: {model: llama-8b, input: "one two three four five six seven eight nine ten", truncate_prompt_tokens: 4}}}
+    expect:
+      - "trace.exists(e, e.type == 'call.end' && e.interface == 'base-serving.maybe-get-adapters' && e.error != null)"
+      - "!steps.unknown.result.ok && steps.unknown.result.error.status == 404 && steps.unknown.result.error.code == 'NotFoundError' && steps.unknown.result.error.message == 'The model `no-such-model` does not exist.'"
+      - "!steps.big.result.ok && steps.big.result.error.status == 400 && steps.big.result.error.message == 'truncate_prompt_tokens value is greater than max_model_len. Please request a smaller truncation size.'"
+      - "!steps.long.result.ok && steps.long.result.error.status == 400 && steps.long.result.error.message.contains('your prompt contains at least 9 input tokens') && steps.long.result.error.data.param == 'input_tokens'"
+      - "steps.cut.result.ok && steps.cut.result.value.usage.prompt_tokens == 4 && steps.cut.result.value.data[0].object == 'embedding'"
+      - "calls['async-llm.encode'] == 1"
+  # ------------------------------------------------------------------ scoring
+  - id: serving-api-r6-score-request-shapes
+    name: "/score on a cross-encoder accepts queries+items, data_1+data_2 and list text_1+text_2 (one classify encode per pair); a missing field is a validation 400; 2:3 is refused"
+    fixtures: [full-tp1-llama-8b]
+    config: *rr_config
+    state: *rr_state
+    steps:
+      - {interface: serving-scores.post-score, caller: api-client, as: items, input: {path: /score, body: {model: BAAI/bge-reranker-base, queries: [q1 a, q2 b], documents: {$absent: true}, items: [d1 x, d2 y]}}}
+      - {interface: serving-scores.post-score, caller: api-client, as: data, input: {path: /score, body: {model: BAAI/bge-reranker-base, queries: {$absent: true}, documents: {$absent: true}, data_1: q, data_2: [d1, d2, d3]}}}
+      - {interface: serving-scores.post-score, caller: api-client, as: text, input: {path: /score, body: {model: BAAI/bge-reranker-base, queries: {$absent: true}, documents: {$absent: true}, text_1: [q1, q2], text_2: [d1, d2]}}}
+      - {interface: serving-scores.post-score, caller: api-client, as: lens, input: {path: /score, body: {model: BAAI/bge-reranker-base, queries: [q1, q2], documents: [d1, d2, d3]}}}
+      - {interface: serving-scores.post-score, caller: api-client, as: missing, input: {path: /score, body: {model: BAAI/bge-reranker-base, queries: {$absent: true}, documents: [d1]}}}
+    expect:
+      - "steps.items.result.ok && size(steps.items.result.value.data) == 2 && steps.items.result.value.data[1].object == 'score' && steps.items.result.value.usage.prompt_tokens == 10"
+      - "steps.data.result.ok && size(steps.data.result.value.data) == 3"
+      - "steps.text.result.ok && size(steps.text.result.value.data) == 2"
+      - "!steps.lens.result.ok && steps.lens.result.error.code == 'BadRequestError' && steps.lens.result.error.message == 'Input lengths must be either 1:1, 1:N or N:N'"
+      - "!steps.missing.result.ok && steps.missing.result.error.code == 'Bad Request' && steps.missing.result.error.data.param == 'body.queries'"
+      - "trace.filter(e, e.type == 'call.start' && e.interface == 'async-llm.encode' && e.input.pooling_params.task == 'classify').size() == 7"
+  - id: serving-api-r6-rerank-token-limits
+    name: "/rerank: max_tokens_per_doc truncates each document before the pair is tokenized (usage drops); a negative or too-large limit is a 400; an over-long pair is a 400 'at least'; truncate_prompt_tokens above max_model_len is refused"
+    fixtures: [full-tp1-llama-8b]
+    config: *rr_config
+    state: *rr_state
+    steps:
+      - {interface: serving-scores.post-rerank, caller: api-client, as: full, input: {path: /rerank, body: {model: BAAI/bge-reranker-base, query: "What is the capital of France?", documents: ["The capital of France is Paris. The capital of France is Paris. The capital of France is Paris."]}}}
+      - {interface: serving-scores.post-rerank, caller: api-client, as: limited, input: {path: /rerank, body: {model: BAAI/bge-reranker-base, query: "What is the capital of France?", documents: ["The capital of France is Paris. The capital of France is Paris. The capital of France is Paris."], max_tokens_per_doc: 5}}}
+      - {interface: serving-scores.post-rerank, caller: api-client, as: neg, input: {path: /rerank, body: {model: BAAI/bge-reranker-base, query: q, documents: [d], max_tokens_per_doc: -5}}}
+      - {interface: serving-scores.post-rerank, caller: api-client, as: toolarge, input: {path: /rerank, body: {model: BAAI/bge-reranker-base, query: q, documents: [d], max_tokens_per_query: 100}}}
+      - {interface: serving-scores.post-rerank, caller: api-client, as: trunc, input: {path: /rerank, body: {model: BAAI/bge-reranker-base, query: q, documents: [d], truncate_prompt_tokens: 101}}}
+    expect:
+      - "trace.filter(e, e.type == 'call.end' && e.interface == 'scoring-io-processor.truncate-text-to-tokens' && e.output.text == 'The capital of France is').size() == 1"
+      - "steps.full.result.ok && steps.limited.result.ok && steps.full.result.value.usage.prompt_tokens == 25 && steps.limited.result.value.usage.prompt_tokens == 12"
+      - "steps.limited.result.value.results[0].document.text == 'The capital of France is Paris. The capital of France is Paris. The capital of France is Paris.'"
+      - "!steps.neg.result.ok && steps.neg.result.error.status == 400 && steps.neg.result.error.message == 'max_tokens_per_doc must be a non-negative integer'"
+      - "!steps.toolarge.result.ok && steps.toolarge.result.error.message == 'max_tokens_per_query (100) must be less than max_model_len (100).'"
+      - "!steps.trunc.result.ok && steps.trunc.result.error.status == 400 && steps.trunc.result.error.message.endsWith('Please request a smaller truncation size.')"
+      - "calls['async-llm.encode'] == 2"
+  - id: serving-api-r6-score-over-long-pair
+    name: "A /score pair longer than max_model_len fails in rendering with the tokenizer's 'at least <max+1>' (a 400, not a 500), and nothing is encoded"
+    fixtures: [full-tp1-llama-8b]
+    config: {model: BAAI/bge-reranker-base, served-model-name: [BAAI/bge-reranker-base], runner: pooling, max-model-len: 6}
+    state: *rr_state
+    steps:
+      - {interface: serving-scores.post-score, caller: api-client, as: long, input: {path: /score, body: {model: BAAI/bge-reranker-base, queries: "a b c", documents: [d, "e f g h"]}}}
+    expect:
+      - "!steps.long.result.ok && steps.long.result.error.status == 400 && steps.long.result.error.code == 'BadRequestError' && steps.long.result.error.message == \"This model's maximum context length is 6 tokens. However, your prompt contains at least 7 input tokens, which exceeds this limit even without any output tokens. Please reduce the length of the input prompt. (parameter=input_tokens, value=7)\""
+      - "calls['async-llm.encode'] == 0"
+  - id: serving-api-r6-score-bi-encoder-usage
+    name: "A bi-encoder embeds every query and document separately; usage sums all their prompt tokens; max_tokens_per_query cuts the query"
+    fixtures: [full-tp1-llama-8b]
+    config: {runner: pooling}
+    state:
+      app-state: {supported_tasks: [embed]}
+      async-llm: {supported_tasks: [embed]}
+    steps:
+      - {interface: serving-scores.post-score, caller: api-client, as: s, input: {path: /score, body: {model: llama-8b, queries: "a b c d", documents: [e f, g h i], max_tokens_per_query: 2}}}
+    expect:
+      - "steps.s.result.ok && size(steps.s.result.value.data) == 2 && steps.s.result.value.usage.prompt_tokens == 10"
+      - "trace.filter(e, e.type == 'call.start' && e.interface == 'async-llm.encode' && e.input.pooling_params.task == 'embed').size() == 3"
+      - "trace.exists(e, e.type == 'call.end' && e.interface == 'scoring-io-processor.truncate-text-to-tokens' && e.output.text == 'a b')"
+  # ------------------------------------------------------------------ /invocations
+  - id: serving-api-r6-invocations-pooling
+    name: "/invocations on a reranker routes by validation: a RerankRequest body to rerank, a ScoreRequest body to score, an input body to classify (ClassificationRequest comes before PoolingRequest), a data body to pooling (plugin, refused); no match lists the pooling types"
+    fixtures: [full-tp1-llama-8b]
+    config: *rr_config
+    state: *rr_state
+    steps:
+      - {interface: sagemaker-router.post-invocations, caller: api-client, as: rr, input: {path: /invocations, body: {model: BAAI/bge-reranker-base, messages: {$absent: true}, prompt: {$absent: true}, max_tokens: {$absent: true}, query: q, documents: [d1, d2]}}}
+      - {interface: sagemaker-router.post-invocations, caller: api-client, as: sc, input: {path: /invocations, body: {model: BAAI/bge-reranker-base, messages: {$absent: true}, prompt: {$absent: true}, max_tokens: {$absent: true}, text_1: q, text_2: [d1]}}}
+      - {interface: sagemaker-router.post-invocations, caller: api-client, as: cls, input: {path: /invocations, body: {model: BAAI/bge-reranker-base, messages: {$absent: true}, prompt: {$absent: true}, max_tokens: {$absent: true}, input: [hello]}}}
+      - {interface: sagemaker-router.post-invocations, caller: api-client, as: plugin, input: {path: /invocations, body: {model: BAAI/bge-reranker-base, messages: {$absent: true}, prompt: {$absent: true}, max_tokens: {$absent: true}, data: {image: x}}}}
+      - {interface: sagemaker-router.post-invocations, caller: api-client, as: none, input: {path: /invocations, body: {model: BAAI/bge-reranker-base, messages: {$absent: true}, prompt: {$absent: true}, max_tokens: {$absent: true}}}}
+    expect:
+      - "trace.exists(e, e.type == 'call.end' && e.interface == 'pooling-factories.get-pooling-task' && e.output.pooling_task == 'classify' && e.output.enable_scoring_api)"
+      - "steps.rr.result.ok && size(steps.rr.result.value.results) == 2 && steps.rr.result.value.id.startsWith('rerank-')"
+      - "steps.sc.result.ok && steps.sc.result.value.object == 'list' && steps.sc.result.value.id.startsWith('score-')"
+      - "steps.cls.result.ok && steps.cls.result.value.id.startsWith('classify-') && size(steps.cls.result.value.data) == 1"
+      - "!steps.plugin.result.ok && steps.plugin.result.error.code == 'BadRequestError' && steps.plugin.result.error.message.startsWith('No IOProcessor plugin installed.')"
+      - "!steps.none.result.ok && steps.none.result.error.message == \"Cannot find suitable handler for request. Expected one of: ['ClassificationRequest', 'RerankRequest', 'ScoreRequest', 'PoolingRequest']\""
+      - "calls['serving-scores.serve-score'] == 2 && calls['serving-pooling.serve-pooling'] == 1 && calls['openai-serving-chat.create-chat-completion'] == 0"
+  - id: serving-api-r6-invocations-validation
+    name: "/invocations on a generate model: a malformed body is a JSON decode 400; a completion validator's VLLMValidationError escapes the loop; a pooling body fails both generate types"
+    fixtures: [full-tp1-llama-8b]
+    steps:
+      - {interface: sagemaker-router.post-invocations, caller: api-client, as: bad, input: {path: /invocations, body: "{"}}
+      - {interface: sagemaker-router.post-invocations, caller: api-client, as: emb, input: {path: /invocations, body: {model: llama-8b, messages: {$absent: true}, prompt: {$absent: true}, max_tokens: {$absent: true}, input: hi}}}
+      - {interface: sagemaker-router.post-invocations, caller: api-client, as: so, input: {path: /invocations, body: {model: llama-8b, messages: {$absent: true}, prompt: hi, max_tokens: 2, stream_options: {include_usage: true}}}}
+    expect:
+      - "!steps.bad.result.ok && steps.bad.result.error.code == 'Bad Request' && steps.bad.result.error.message == 'JSON decode error: Expecting property name enclosed in double quotes: line 1 column 2 (char 1)'"
+      - "!steps.emb.result.ok && steps.emb.result.error.data.param == 'prompt' && steps.emb.result.error.message == 'Either prompt or prompt_embeds must be provided and non-empty. (parameter=prompt)'"
+      - "!steps.so.result.ok && steps.so.result.error.message == 'Stream options can only be defined when `stream=True`. (parameter=stream_options)'"
+      - "calls['async-llm.generate'] == 0"
+  # ------------------------------------------------------------------ LLM.encode
+  - id: serving-api-r6-llm-encode-checks
+    name: "LLM.encode on an embedding model: N params for N prompts run; a length mismatch is a VLLMValidationError; a param naming another task is refused; classify is unsupported; token_embed is supported but not the pooling task"
+    fixtures: [full-tp1-llama-8b]
+    config: {runner: pooling}
+    state:
+      llm: {supported_tasks: [embed, token_embed]}
+      async-llm: {supported_tasks: [embed, token_embed]}
+    steps:
+      - {interface: llm.encode, caller: api-client, as: two, input: {prompts: [a, b], pooling_params: [{}, {}], pooling_task: embed}}
+      - {interface: llm.encode, caller: api-client, as: mismatch, input: {prompts: [a, b], pooling_params: [{}], pooling_task: embed}}
+      - {interface: llm.encode, caller: api-client, as: overwrite, input: {prompts: [a], pooling_params: {task: classify}, pooling_task: embed}}
+      - {interface: llm.encode, caller: api-client, as: cls, input: {prompts: [a], pooling_task: classify}}
+      - {interface: llm.encode, caller: api-client, as: tok, input: {prompts: [a], pooling_task: token_embed}}
+    expect:
+      - "trace.filter(e, e.type == 'call.end' && e.interface == 'pooling-factories.get-pooling-task' && e.output.pooling_task == 'embed').size() >= 1"
+      - "steps.two.result.ok && steps.two.result.value.num_outputs == 2"
+      - "!steps.mismatch.result.ok && steps.mismatch.result.error.code == 'vllm-validation-error' && steps.mismatch.result.error.message == 'The lengths of prompts (2) and params (1) must be the same.'"
+      - "!steps.overwrite.result.ok && steps.overwrite.result.error.message == \"You cannot overwrite param.task='classify' with pooling_task='embed'!\""
+      - "!steps.cls.result.ok && steps.cls.result.error.message == 'Classification API is not supported by this model. Try converting the model using `--convert classify`.'"
+      - "!steps.tok.result.ok && steps.tok.result.error.message == 'Try switching the model\\'s pooling_task via `PoolerConfig(task=\"token_embed\")`'"
+      - "calls['llm.run-tiling-engine'] == 1"
+  - id: serving-api-r6-llm-encode-resolved-runner
+    name: "LLM.encode reads the resolved runner_type: --runner auto on a causal-LM checkpoint resolves to generate, so encode is refused before any request is added"
+    fixtures: [full-tp1-llama-8b]
+    config: {runner: auto}
+    steps:
+      - {interface: llm.encode, caller: api-client, as: e, input: {prompts: [a], pooling_task: embed}}
+    expect:
+      - "!steps.e.result.ok && steps.e.result.error.code == 'value-error' && steps.e.result.error.message.startsWith('LLM.encode() is only supported for pooling models.')"
+      - "trace.exists(e, e.type == 'call.end' && e.interface == 'model-config.post-init' && e.output.runner_type == 'generate')"
+      - "calls['llm-engine.add-request'] == 0"
+  # ------------------------------------------------------------------ renderer: truncation after expansion
+  - id: serving-api-r6-truncate-expanded-prompt
+    name: "_truncate_expanded_prompt: an expanded multimodal prompt is cut back to truncate_prompt_tokens with its audio span intact; within the limit, a text-only input or no truncation is untouched; a split or dropped span is refused; a left cut shifts the span"
+    fixtures: [full-tp1-llama-8b]
+    steps:
+      - {interface: base-renderer.process-singleton, caller: api-server, as: bounded, input: {engine_input: {type: multimodal, prompt_token_ids: "= lists.range(147)", mm_placeholders: {audio: [{offset: 1, length: 52}]}}, tok_params: {max_total_tokens: 4096, truncate_prompt_tokens: 96, truncation_side: right}}}
+      - {interface: base-renderer.truncate-expanded-prompt, caller: api-server, as: within, input: {engine_input: {type: multimodal, prompt_token_ids: "= lists.range(64)", mm_placeholders: {audio: [{offset: 1, length: 52}]}}, tok_params: {max_total_tokens: 4096, truncate_prompt_tokens: 96, truncation_side: right}}}
+      - {interface: base-renderer.truncate-expanded-prompt, caller: api-server, as: split, input: {engine_input: {type: multimodal, prompt_token_ids: "= lists.range(147)", mm_placeholders: {audio: [{offset: 80, length: 50}]}}, tok_params: {max_total_tokens: 4096, truncate_prompt_tokens: 96, truncation_side: right}}}
+      - {interface: base-renderer.truncate-expanded-prompt, caller: api-server, as: dropped, input: {engine_input: {type: multimodal, prompt_token_ids: "= lists.range(147)", mm_placeholders: {audio: [{offset: 100, length: 20}]}}, tok_params: {max_total_tokens: 4096, truncate_prompt_tokens: 96, truncation_side: right}}}
+      - {interface: base-renderer.truncate-expanded-prompt, caller: api-server, as: left, input: {engine_input: {type: multimodal, prompt_token_ids: "= lists.range(147)", mm_placeholders: {audio: [{offset: 100, length: 20}]}}, tok_params: {max_total_tokens: 4096, truncate_prompt_tokens: 96, truncation_side: left}}}
+      - {interface: base-renderer.truncate-expanded-prompt, caller: api-server, as: text, input: {engine_input: {type: token, prompt_token_ids: "= lists.range(147)"}, tok_params: {max_total_tokens: 4096, truncate_prompt_tokens: 96, truncation_side: right}}}
+      - {interface: base-renderer.truncate-expanded-prompt, caller: api-server, as: none, input: {engine_input: {type: multimodal, prompt_token_ids: "= lists.range(147)", mm_placeholders: {audio: [{offset: 1, length: 52}]}}, tok_params: {max_total_tokens: 4096, truncate_prompt_tokens: null, truncation_side: right}}}
+    expect:
+      - "steps.bounded.result.ok && steps.bounded.result.value.prompt_token_ids == lists.range(96) && steps.bounded.result.value.mm_placeholders.audio[0].offset == 1 && steps.bounded.result.value.mm_placeholders.audio[0].length == 52"
+      - "steps.within.result.ok && size(steps.within.result.value.prompt_token_ids) == 64"
+      - "!steps.split.result.ok && steps.split.result.error.code == 'vllm-validation-error' && steps.split.result.error.message.startsWith('truncate_prompt_tokens=96 would split or drop a(n) audio item, which spans tokens 80 to 130 of the 147-token prompt.')"
+      - "!steps.dropped.result.ok && steps.dropped.result.error.data.param == 'truncate_prompt_tokens'"
+      - "steps.left.result.ok && steps.left.result.value.prompt_token_ids == lists.range(147).slice(51, 147) && steps.left.result.value.mm_placeholders.audio[0].offset == 49"
+      - "steps.text.result.ok && size(steps.text.result.value.prompt_token_ids) == 147"
+      - "steps.none.result.ok && size(steps.none.result.value.prompt_token_ids) == 147"
+  # ------------------------------------------------------------------ the error mapper
+  - id: serving-api-r6-error-mapper-status-pass-through
+    name: "create_error_response maps an exception by its class even when it carries a status: a 422 VLLMUnprocessableEntityError keeps its parameter and value in the message; a handler-built ErrorResponse passes through"
+    fixtures: [full-tp1-llama-8b]
+    steps:
+      - {interface: exception-handling.create-error-response, caller: api-server, as: ue, input: {code: vllm-unprocessable-entity-error, status: 422, message: "Failed to fetch media from URL: HTTP 404 error", param: image_url, value: "https://upload.wikimedia.org/cat.png"}}
+      - {interface: exception-handling.create-error-response, caller: api-server, as: ve, input: {code: vllm-validation-error, status: 400, message: bad, param: x}}
+      - {interface: exception-handling.create-error-response, caller: api-server, as: er, input: {code: NotFoundError, status: 404, message: "The model `x` does not exist."}}
+    expect:
+      - "!steps.ue.result.ok && steps.ue.result.error.status == 422 && steps.ue.result.error.code == 'UnprocessableEntityError' && steps.ue.result.error.message == 'Failed to fetch media from URL: HTTP 404 error (parameter=image_url, value=https://upload.wikimedia.org/cat.png)' && steps.ue.result.error.data.param == 'image_url'"
+      - "!steps.ve.result.ok && steps.ve.result.error.code == 'BadRequestError' && steps.ve.result.error.message == 'bad (parameter=x)'"
+      - "!steps.er.result.ok && steps.er.result.error.code == 'NotFoundError' && steps.er.result.error.status == 404"
+  # ------------------------------------------------------------------ over-long prompts and request validation
+  - id: serving-api-r6-over-long-prompt-at-least
+    name: "Text is tokenized with truncation at max_input_tokens + 1, so an over-long text prompt reports 'at least <max+1>'; a token-id prompt reports its exact count; truncate_prompt_tokens -1 keeps max_model_len - 1 tokens"
+    fixtures: [full-tp1-llama-8b]
+    config: {max-model-len: 8}
+    steps:
+      - {flow: serving-api-completion, as: text, input: {body: {prompt: "a b c d e f g h i j k l", max_tokens: 1}}}
+      - {flow: serving-api-completion, as: ids, input: {body: {prompt: [1, 2, 3, 4, 5, 6, 7, 8, 9, 10], max_tokens: 1}}}
+      - {flow: serving-api-completion, as: cut, input: {body: {prompt: "a b c d e f g h i j k l", max_tokens: 1, truncate_prompt_tokens: -1}}}
+      - {flow: serving-api-completion, as: toobig, input: {body: {prompt: "a b", max_tokens: 1, truncate_prompt_tokens: 9}}}
+    expect:
+      - "trace.filter(e, e.type == 'call.end' && e.interface == 'base-renderer.tokenize-prompt' && e.error != null && e.error.code == 'vllm-validation-error').size() == 2"
+      - "!steps.text.result.ok && steps.text.result.error.message == \"This model's maximum context length is 8 tokens. However, your prompt contains at least 9 input tokens, which exceeds this limit even without any output tokens. Please reduce the length of the input prompt. (parameter=input_tokens, value=9)\""
+      - "!steps.ids.result.ok && steps.ids.result.error.message.contains('your prompt contains 10 input tokens')"
+      - "steps.cut.result.ok && steps.cut.result.value.usage.prompt_tokens == 7"
+      - "!steps.toobig.result.ok && steps.toobig.result.error.message == 'truncate_prompt_tokens=9 cannot be greater than max_model_len = 8. Please request a smaller truncation size. (parameter=truncate_prompt_tokens, value=9)'"
+  - id: serving-api-r6-chat-field-validation
+    name: "ChatCompletionRequest field validation after the before validators: missing messages, a string max_tokens and out-of-range priority or seed are 400 Bad Request with the errors listed; a before validator still wins; X-Vllm-Priority overrides the body"
+    fixtures: [full-tp1-llama-8b]
+    steps:
+      - {flow: serving-api-chat-completion, as: missing, input: {body: {model: llama-8b, messages: {$absent: true}}}}
+      - {flow: serving-api-chat-completion, as: two, input: {body: {messages: hi, max_tokens: ten}}}
+      - {flow: serving-api-chat-completion, as: prio, input: {body: {messages: [{role: user, content: hi}], max_tokens: 2, priority: {$bigint: '9223372036854775808'}}}}
+      - {flow: serving-api-chat-completion, as: before, input: {body: {messages: {$absent: true}, top_logprobs: 2}}}
+      - {flow: serving-api-chat-completion, as: hdr, input: {body: {messages: [{role: user, content: hi}], max_tokens: 2, priority: 7, guided_json: {type: object}}, headers: {X-Vllm-Priority: '-3'}}}
+    expect:
+      - "!steps.missing.result.ok && steps.missing.result.error.code == 'Bad Request' && steps.missing.result.error.data.param == 'body.messages' && steps.missing.result.error.message.startsWith(\"1 validation error:\\n  {'type': 'missing', 'loc': 'body.messages', 'msg': 'Field required'\")"
+      - "!steps.two.result.ok && steps.two.result.error.message.startsWith('2 validation errors:') && steps.two.result.error.message.contains('int_parsing') && steps.two.result.error.data.param == 'body.messages'"
+      - "!steps.prio.result.ok && steps.prio.result.error.data.param == 'body.priority' && steps.prio.result.error.message.contains('less_than_equal')"
+      - "!steps.before.result.ok && steps.before.result.error.data.param == 'top_logprobs'"
+      - "steps.hdr.result.ok && trace.exists(e, e.type == 'call.start' && e.interface == 'async-llm.generate' && e.input.priority == -3)"
+      - "trace.exists(e, e.type == 'note' && string(e).contains('guided_json'))"
+  - id: serving-api-r6-server-info
+    name: "/server_info in dev mode: text and json configs; VLLM_* env values except names containing KEY; config_format=yaml is a query validation 400"
+    fixtures: [full-tp1-llama-8b]
+    config: {vllm-server-dev-mode: true, api-key: [secret]}
+    steps:
+      - {interface: server-info-router.get-server-info, caller: api-client, as: text, input: {path: /server_info, query: {config_format: text}}}
+      - {interface: server-info-router.get-server-info, caller: api-client, as: json, input: {path: /server_info, query: {config_format: json}}}
+      - {interface: server-info-router.get-server-info, caller: api-client, as: yaml, input: {path: /server_info, query: {config_format: yaml}}}
+    expect:
+      - "steps.text.result.ok && type(steps.text.result.value.vllm_config) == string && steps.text.result.value.vllm_env['VLLM_SERVER_DEV_MODE'] == true && !('VLLM_API_KEY' in steps.text.result.value.vllm_env)"
+      - "steps.json.result.ok && type(steps.json.result.value.vllm_config) == map"
+      - "!steps.yaml.result.ok && steps.yaml.result.error.status == 400 && steps.yaml.result.error.code == 'Bad Request' && steps.yaml.result.error.data.param == 'query.config_format' && steps.yaml.result.error.message.contains('literal_error')"
+  - id: serving-api-r6-hermes-tool-parser
+    name: "--tool-call-parser hermes: tagged JSON calls are extracted (an unterminated last one too), text before the first tag is the content, bad JSON returns the output as content; with tools the request keeps special tokens, which reaches the engine's sampling params"
+    fixtures: [full-tp1-llama-8b]
+    config: {tool-call-parser: hermes, enable-auto-tool-choice: true}
+    steps:
+      - {interface: hermes2-pro-tool-parser.extract-tool-calls, caller: api-server, as: two, input: {model_output: "Let me check.<tool_call>{\"name\": \"get_weather\", \"arguments\": {\"city\": \"Paris\"}}</tool_call><tool_call>{\"name\": \"get_time\", \"arguments\": {}}"}}
+      - {interface: hermes2-pro-tool-parser.extract-tool-calls, caller: api-server, as: plain, input: {model_output: "No tools needed."}}
+      - {interface: hermes2-pro-tool-parser.extract-tool-calls, caller: api-server, as: bad, input: {model_output: "<tool_call>not json</tool_call>"}}
+      - {flow: serving-api-chat-completion, as: chat, input: {body: {messages: [{role: user, content: "weather?"}], max_tokens: 2, tools: [{type: function, function: {name: get_weather, parameters: {type: object}}}], tool_choice: auto}}}
+    expect:
+      - "steps.two.result.ok && steps.two.result.value.tools_called && size(steps.two.result.value.tool_calls) == 2 && steps.two.result.value.tool_calls[0].function.name == 'get_weather' && steps.two.result.value.tool_calls[1].function.name == 'get_time' && steps.two.result.value.content == 'Let me check.'"
+      - "steps.plain.result.ok && !steps.plain.result.value.tools_called && steps.plain.result.value.content == 'No tools needed.'"
+      - "steps.bad.result.ok && !steps.bad.result.value.tools_called && steps.bad.result.value.content == '<tool_call>not json</tool_call>'"
+      - "steps.chat.result.ok && trace.exists(e, e.type == 'call.end' && e.interface == 'hermes2-pro-tool-parser.adjust-request' && e.output.skip_special_tokens == false)"
+      - "trace.exists(e, e.type == 'call.start' && e.interface == 'async-llm.generate' && e.input.sampling_params.skip_special_tokens == false)"
+      - "calls['hermes2-pro-tool-parser.extract-tool-calls'] == 4"
+  - id: serving-api-r6-http-instrumentator
+    name: "The HTTP instrumentator counts a chat request under its handler; /version is excluded, so it never gets a series, while the http_requests_total HELP and TYPE lines are always exposed"
+    fixtures: [full-tp1-llama-8b]
+    steps:
+      - {flow: serving-api-chat-completion, as: chat, input: {body: {messages: [{role: user, content: hi}], max_tokens: 1}}}
+      - {interface: instrumentator-basic.get-version, caller: api-client, as: v, input: {path: /version}}
+      - {interface: instrumentator-metrics.get-metrics, caller: api-client, as: m, input: {path: /metrics, headers: {Authorization: {$absent: true}}}}
+    expect:
+      - "steps.m.result.ok && steps.m.result.value.http_metrics.exists(l, l == 'http_requests_total{handler=\"/v1/chat/completions\",method=\"POST\",status=\"2xx\"} 1.0')"
+      - "!string(steps.m.result.value).contains('handler=\"/version\"') && string(steps.m.result.value).contains('# TYPE http_requests_total counter')"
+      - "state['instrumentator-metrics'].http_requests['POST /v1/chat/completions 2xx'] == 1"
+  - id: serving-api-r6-fingerprint-and-model-card
+    name: "system_fingerprint is vllm-<version>-<hash8> on a full chat response and on the terminal stream chunk only; --fingerprint-mode none drops it; /v1/models cards carry created, parent and one modelperm permission; /v1/models/<id> is a framework 404"
+    fixtures: [full-tp1-llama-8b]
+    steps:
+      - {flow: serving-api-chat-completion, as: full, input: {body: {messages: [{role: user, content: hi}], max_tokens: 2}}}
+      - {flow: serving-api-chat-stream, as: stream, input: {body: {messages: [{role: user, content: hi}], max_tokens: 2, stream: true, stream_options: {$absent: true}}}}
+      - {flow: serving-api-models-list, as: models}
+      - {flow: serving-api-models-list, as: nf, input: {path: /v1/models/llama-8b}}
+    expect:
+      - "trace.exists(e, e.type == 'call.end' && e.interface == 'system-fingerprint.build-system-fingerprint' && e.output.system_fingerprint != null)"
+      - "steps.full.result.ok && steps.full.result.value.system_fingerprint.matches('^vllm-0\\\\.32\\\\.0-[0-9a-f]{8}$')"
+      - "steps.stream.result.ok && steps.stream.result.value.items.filter(i, type(i) == map && 'system_fingerprint' in i).size() == 1 && steps.stream.result.value.items.exists(i, type(i) == map && 'system_fingerprint' in i && i.choices[0].finish_reason != null)"
+      - "steps.models.result.ok && steps.models.result.value.data[0].parent == null && steps.models.result.value.data[0].permission[0].id.startsWith('modelperm-') && steps.models.result.value.data[0].permission[0].allow_sampling"
+      - "!steps.nf.result.ok && steps.nf.result.error.status == 404 && steps.nf.result.error.message == 'Not Found'"
+  - id: serving-api-r6-fingerprint-mode-none
+    name: "--fingerprint-mode none: the full response's system_fingerprint is null"
+    fixtures: [full-tp1-llama-8b]
+    config: {fingerprint-mode: none}
+    steps:
+      - {flow: serving-api-chat-completion, as: full, input: {body: {messages: [{role: user, content: hi}], max_tokens: 2}}}
+    expect:
+      - "trace.exists(e, e.type == 'call.end' && e.interface == 'system-fingerprint.build-system-fingerprint' && e.output.system_fingerprint == null)"
+      - "steps.full.result.ok && steps.full.result.value.system_fingerprint == null"
+  - id: serving-api-r6-responses-incomplete-details
+    name: "A Responses request cut by max_output_tokens is incomplete with incomplete_details.reason max_output_tokens and echoes max_output_tokens; a retrieve of an unstored id is 404 with param response_id"
+    fixtures: [full-tp1-llama-8b]
+    steps:
+      - {flow: serving-api-responses-create, as: c, input: {body: {input: Hi, max_output_tokens: 2, stream: false, background: {$absent: true}, store: {$absent: true}, previous_response_id: {$absent: true}, request_id: resp_r6}}}
+      - {flow: serving-api-responses-retrieve, as: g, input: {path: /v1/responses/resp_r6}}
+    expect:
+      - "trace.exists(e, e.type == 'call.end' && e.interface == 'openai-serving-responses.retrieve-responses' && e.error != null && e.error.data.param == 'response_id')"
+      - "steps.c.result.ok && steps.c.result.value.status == 'incomplete' && steps.c.result.value.incomplete_details.reason == 'max_output_tokens' && steps.c.result.value.max_output_tokens == 2"
+      - "!steps.g.result.ok && steps.g.result.error.status == 404 && steps.g.result.error.code == 'invalid_request_error' && steps.g.result.error.data.param == 'response_id'"
+  - id: serving-api-r6-multi-api-server
+    name: "vllm serve with DP 4 defaults api_server_count to 4 and runs run_multi_api_server: multiprocess Prometheus, one shared socket with SO_REUSEPORT, the engine cores launched, then ApiServer_0..3; runtime LoRA updating is refused across processes"
+    fixtures: [full-tp1-llama-8b]
+    steps:
+      - {interface: serve-subcommand.cmd, caller: operator, as: dp4, input: {model_tag: meta-llama/Llama-3.1-8B-Instruct, data_parallel_size: 4}}
+    expect:
+      - "steps.dp4.result.ok && steps.dp4.result.value.mode == 'multi-api-server' && steps.dp4.result.value.api_server_count == 4 && steps.dp4.result.value.reuse_port && steps.dp4.result.value.multiprocess_prometheus && steps.dp4.result.value.api_server_processes == ['ApiServer_0', 'ApiServer_1', 'ApiServer_2', 'ApiServer_3']"
+      - "trace.exists(e, e.type == 'call.start' && e.interface == 'core-engine-proc-manager.launch-core-engines')"
+  - id: serving-api-r6-multi-api-server-lora
+    name: "run_multi_api_server refuses VLLM_ALLOW_RUNTIME_LORA_UPDATING with more than one API server, before any engine starts"
+    fixtures: [full-tp1-llama-8b]
+    config: {vllm-allow-runtime-lora-updating: true}
+    steps:
+      - {interface: serve-subcommand.run-multi-api-server, caller: operator, as: lora, input: {api_server_count: 2}}
+    expect:
+      - "trace.exists(e, e.type == 'call.end' && e.interface == 'launcher.setup-server' && e.error == null)"
+      - "!steps.lora.result.ok && steps.lora.result.error.code == 'value-error' && steps.lora.result.error.message == 'VLLM_ALLOW_RUNTIME_LORA_UPDATING cannot be used with api_server_count > 1'"
+      - "calls['core-engine-proc-manager.launch-core-engines'] == 0"
+  - id: serving-api-r6-prompt-tokens-details
+    name: "--enable-prompt-tokens-details adds usage.prompt_tokens_details with the prefix-cache hits (0 on a cold cache); without the flag it is null"
+    fixtures: [full-tp1-llama-8b]
+    config: {enable-prompt-tokens-details: true}
+    steps:
+      - {flow: serving-api-chat-completion, as: c, input: {body: {messages: [{role: user, content: hi}], max_tokens: 1}}}
+    expect:
+      - "trace.exists(e, e.type == 'call.end' && e.interface == 'openai-serving-chat.chat-completion-full-generator')"
+      - "steps.c.result.ok && steps.c.result.value.usage.prompt_tokens_details != null && steps.c.result.value.usage.prompt_tokens_details.cached_tokens == 0"
+  - id: serving-api-r6-repetition-detection-params
+    name: "RepetitionDetectionParams.__post_init__: negative or inverted pattern sizes and a pattern without min_count >= 2 are refused; a valid one passes"
+    fixtures: [full-tp1-llama-8b]
+    steps:
+      - {interface: sampling-params.post-init, caller: api-server, as: inv, input: {params: {repetition_detection: {max_pattern_size: 2, min_pattern_size: 3, min_count: 3}}}}
+      - {interface: sampling-params.post-init, caller: api-server, as: cnt, input: {params: {repetition_detection: {max_pattern_size: 4, min_count: 1}}}}
+      - {interface: sampling-params.post-init, caller: api-server, as: ok, input: {params: {repetition_detection: {max_pattern_size: 4, min_pattern_size: 1, min_count: 3}}}}
+    expect:
+      - "!steps.inv.result.ok && steps.inv.result.error.message.startsWith('max_pattern_size, min_pattern_size must be >=0')"
+      - "!steps.cnt.result.ok && steps.cnt.result.error.message.startsWith('min_count must be >= 2')"
+      - "steps.ok.result.ok"
+  - id: serving-api-r6-bad-words-from-tokenizer
+    name: "update_from_tokenizer turns text bad words into token-id lists; an empty word and too many words are refused"
+    fixtures: [full-tp1-llama-8b]
+    config: {vllm-max-num-bad-words: 2}
+    steps:
+      - {interface: sampling-params.update-from-tokenizer, caller: engine-core, as: ok, input: {bad_words: [Hello, " world"]}}
+      - {interface: sampling-params.update-from-tokenizer, caller: engine-core, as: empty, input: {bad_words: ["  "]}}
+      - {interface: sampling-params.update-from-tokenizer, caller: engine-core, as: many, input: {bad_words: [a, b, c]}}
+    expect:
+      - "steps.ok.result.ok && steps.ok.result.value.bad_words_token_ids == [[9906], [1917]]"
+      - "!steps.empty.result.ok && steps.empty.result.error.message == 'bad_words entries must tokenize to at least one token.'"
+      - "!steps.many.result.ok && steps.many.result.error.message == 'Too many bad words after tokenization: 3. The max number is 2.'"
+  - id: serving-api-r6-generative-scoring
+    name: "POST /generative_scoring: an out-of-vocabulary label, no labels and no items are 400s before any engine request; a valid request sends one max_tokens=1 read per item, and the engine's outputs carry no logprobs, so the read fails 'No logprobs available for item 0' (400)"
+    fixtures: [full-tp1-llama-8b]
+    steps:
+      - {interface: serving-generative-scoring.post-generative-scoring, caller: api-client, as: oov, input: {path: /generative_scoring, body: {query: "Is Paris the capital of France? Answer:", items: [" Yes"], label_token_ids: [9642, 999999]}}}
+      - {interface: serving-generative-scoring.post-generative-scoring, caller: api-client, as: nolabels, input: {path: /generative_scoring, body: {query: q, items: [a], label_token_ids: []}}}
+      - {interface: serving-generative-scoring.post-generative-scoring, caller: api-client, as: noitems, input: {path: /generative_scoring, body: {query: q, items: [], label_token_ids: [9642]}}}
+      - {interface: serving-generative-scoring.post-generative-scoring, caller: api-client, as: read, input: {path: /generative_scoring, body: {query: "Is Paris the capital of France? Answer:", items: [" Yes", " No"], label_token_ids: [9642, 2822]}}}
+    expect:
+      - "!steps.oov.result.ok && steps.oov.result.error.status == 400 && steps.oov.result.error.message == 'label_token_id 999999 is out of vocabulary range [0, 128256). Please provide valid token IDs.'"
+      - "!steps.nolabels.result.ok && steps.nolabels.result.error.message == 'label_token_ids must contain at least one token ID.'"
+      - "!steps.noitems.result.ok && steps.noitems.result.error.message == 'items must contain at least one item.'"
+      - "!steps.read.result.ok && steps.read.result.error.status == 400 && steps.read.result.error.message == 'No logprobs available for item 0. This might indicate an issue with logprobs configuration.'"
+      - "trace.filter(e, e.type == 'call.start' && e.interface == 'async-llm.generate' && e.input.request_id.startsWith('generative-scoring-') && e.input.sampling_params.max_tokens == 1).size() == 2"
+      - "trace.exists(e, e.type == 'call.end' && e.interface == 'serving-generative-scoring.build-prompts' && size(e.output.prompts) == 2)"
+  - id: serving-api-r6-multi-api-server-dp4
+    name: "vllm serve with DP 4 (deployed data_parallel_size 4): api_server_count defaults to 4, run_multi_api_server launches EngineCore_DP0..3 through launch_core_engines while ApiServer_0..3 wait for their ready responses"
+    flow: serving-api-cli-serve
+    fixtures: [full-tp4-llama-70b]
+    config: {data-parallel-size: 4, tensor-parallel-size: 1}
+    input: {argv: [serve], args: {model_tag: Qwen/Qwen3-30B-A3B, data_parallel_size: 4, tensor_parallel_size: 1}}
+    expect:
+      - "result.ok && result.value.mode == 'multi-api-server' && result.value.api_server_count == 4 && result.value.engines == 4"
+      - "calls['engine-core-proc.run-engine-core'] == 4"
+      - "trace.exists(e, e.type == 'call.end' && e.interface == 'serve-subcommand.run-multi-api-server' && e.output.reuse_port)"
+  - id: serving-api-r6-logprobs-formatting
+    name: "Forwarded logprobs: chat gives per token its text, logprob, bytes and the first top_logprobs entries (sampled token first); completions give tokens, token_logprobs, top_logprobs dicts of logprobs + 1 entries and text offsets"
+    fixtures: [full-tp1-llama-8b]
+    steps:
+      - {flow: serving-api-chat-completion, as: chat, input: {body: {messages: [{role: user, content: hi}], max_tokens: 2, logprobs: true, top_logprobs: 2}}}
+      - {flow: serving-api-completion, as: cmpl, input: {body: {prompt: "The capital of France is", max_tokens: 2, logprobs: 1}}}
+    expect:
+      - "steps.chat.result.ok && steps.chat.result.value.choices[0].logprobs.content.all(c, 'token' in c && 'bytes' in c && size(c.top_logprobs) == 2 && c.top_logprobs[0].token == c.token)"
+      - "steps.cmpl.result.ok && size(steps.cmpl.result.value.choices[0].logprobs.tokens) == size(steps.cmpl.result.value.choices[0].logprobs.token_logprobs) && steps.cmpl.result.value.choices[0].logprobs.top_logprobs.all(d, size(d) <= 2) && steps.cmpl.result.value.choices[0].logprobs.text_offset[0] == 0"
+      - "trace.exists(e, e.type == 'call.end' && e.interface == 'openai-serving-completion.create-completion-logprobs')"
+  - id: serving-api-r6-chat-mm-processor-in-api-process
+    name: "A chat with an image runs the multimodal processor in the API process: the placeholder expands to the item's 800 tokens, usage counts them, and a repeated image crosses IPC without data"
+    description: "renderers/base.py:894-932, 1116-1129; processor.py:1690-1760; cache/lru.py:51-65; chat_completion/serving.py:90-109."
+    fixtures: [full-vl-qwen2-vl-7b]
+    config: {enable-prompt-tokens-details: true}
+    max_events: 600000
+    steps:
+      - {flow: serving-api-multimodal-chat, as: first, input: {headers: {X-Request-Id: m1}, body: {model: qwen2-vl-7b, max_tokens: 2, messages: [{role: user, content: [{type: image_url, image_url: {url: "data:image/png;base64,iVBORw0KGgo="}}, {type: text, text: "What is this?"}]}]}}}
+      - {flow: serving-api-multimodal-chat, as: second, input: {headers: {X-Request-Id: m2}, body: {model: qwen2-vl-7b, max_tokens: 2, messages: [{role: user, content: [{type: image_url, image_url: {url: "data:image/png;base64,iVBORw0KGgo="}}, {type: text, text: "What is this?"}]}]}}}
+    expect:
+      - "steps.first.result.ok && steps.first.result.value.usage.prompt_tokens > 800 && steps.first.result.value.usage.prompt_tokens_details.multimodal_tokens == {'image': 800}"
+      - "trace.exists(e, e.type == 'call.end' && e.interface == 'base-renderer.process-multimodal' && e.output.mm_placeholders.image[0].length == 800 && size(e.output.prompt_token_ids) > 800)"
+      - "calls['lru-key-replicated-sender-cache.get-and-update'] == 2 && trace.exists(e, e.type == 'call.end' && e.interface == 'lru-key-replicated-sender-cache.get-and-update' && e.output.hit == true && e.output.item == null)"
+      - "state['lru-key-replicated-sender-cache'].used > 0"

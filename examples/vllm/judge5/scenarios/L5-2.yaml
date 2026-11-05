@@ -1,0 +1,79 @@
+schema_version: 1
+id: vllm
+scenarios:
+  - id: bench-l5-2-a-metrics-exist
+    fixtures: [full-tp1-llama-8b]
+    config: {speculative-method: ngram, num-speculative-tokens: 3}
+    steps:
+    - {as: init, interface: stat-logger-manager.init-prometheus, caller: engine-core, input: {engine_indexes: [0]}}
+    - {as: m, interface: instrumentator-metrics.get-metrics, caller: api-client, input: {path: /metrics}}
+    expect:
+    - "steps.m.result.value.metrics.exists(x, x.name == 'vllm:spec_decode_num_drafts')"
+    - "steps.m.result.value.metrics.exists(x, x.name == 'vllm:spec_decode_num_draft_tokens')"
+    - "steps.m.result.value.metrics.exists(x, x.name == 'vllm:spec_decode_num_accepted_tokens')"
+    - "['0','1','2'].all(p, steps.m.result.value.metrics.exists(x, x.name == 'vllm:spec_decode_num_accepted_tokens_per_pos' && x.series.contains('position=\"' + p + '\"')))"
+  - id: bench-l5-2-a-default-world-none
+    fixtures: [full-tp1-llama-8b]
+    steps:
+    - {as: init, interface: stat-logger-manager.init-prometheus, caller: engine-core, input: {engine_indexes: [0]}}
+    - {as: m, interface: instrumentator-metrics.get-metrics, caller: api-client, input: {path: /metrics}}
+    expect:
+    - "!steps.m.result.value.metrics.exists(x, x.name.startsWith('vllm:spec_decode'))"
+  - id: bench-l5-2-b-c-three-steps
+    fixtures: [full-tp1-llama-8b]
+    config: {async-scheduling: false, speculative-method: ngram, num-speculative-tokens: 3}
+    max_events: 200000
+    steps:
+    - {as: add, flow: scheduler-add-request, input: {prompt_token_ids: [128000, 9906, 1917], request_id: sd-1, sampling_params: {max_tokens: 64}}}
+    - {as: s0, flow: scheduler-schedule, input: {}}
+    - {as: u0, flow: scheduler-update-from-output, input: {model_runner_output: {req_ids: [sd-1], sampled_token_ids: [[791]]}, scheduler_output: "= steps.s0.result.value"}}
+    - {as: d1, interface: scheduler.update-draft-token-ids, caller: engine-core, input: {req_ids: [sd-1], draft_token_ids: [[201, 202, 203]]}}
+    - {as: s1, flow: scheduler-schedule, input: {}}
+    - {as: u1, flow: scheduler-update-from-output, input: {model_runner_output: {req_ids: [sd-1], sampled_token_ids: [[201, 202, 203, 9]]}, scheduler_output: "= steps.s1.result.value"}}
+    - {as: p1, interface: spec-decoding-prom.observe, caller: engine-core, input: {stats: "= steps.u1.result.value.scheduler_stats.spec_decoding_stats"}}
+    - {as: d2, interface: scheduler.update-draft-token-ids, caller: engine-core, input: {req_ids: [sd-1], draft_token_ids: [[301, 302, 303]]}}
+    - {as: s2, flow: scheduler-schedule, input: {}}
+    - {as: u2, flow: scheduler-update-from-output, input: {model_runner_output: {req_ids: [sd-1], sampled_token_ids: [[301, 9]]}, scheduler_output: "= steps.s2.result.value"}}
+    - {as: p2, interface: spec-decoding-prom.observe, caller: engine-core, input: {stats: "= steps.u2.result.value.scheduler_stats.spec_decoding_stats"}}
+    - {as: d3, interface: scheduler.update-draft-token-ids, caller: engine-core, input: {req_ids: [sd-1], draft_token_ids: [[401, 402, 403]]}}
+    - {as: s3, flow: scheduler-schedule, input: {}}
+    - {as: u3, flow: scheduler-update-from-output, input: {model_runner_output: {req_ids: [sd-1], sampled_token_ids: [[9]]}, scheduler_output: "= steps.s3.result.value"}}
+    - {as: p3, interface: spec-decoding-prom.observe, caller: engine-core, input: {stats: "= steps.u3.result.value.scheduler_stats.spec_decoding_stats"}}
+    - {as: log, interface: spec-decoding-stats.log, caller: engine-core, input: {observed: ["= steps.u1.result.value.scheduler_stats.spec_decoding_stats", "= steps.u2.result.value.scheduler_stats.spec_decoding_stats", "= steps.u3.result.value.scheduler_stats.spec_decoding_stats"]}}
+    - {as: m, interface: prometheus-registry.collect, caller: api-server}
+    expect:
+    # (b) the counters, from the real scheduler stats
+    - "steps.p3.result.value.num_drafts == 3 && steps.p3.result.value.num_draft_tokens == 9 && steps.p3.result.value.num_accepted_tokens == 4"
+    - "steps.p3.result.value.num_accepted_tokens_per_pos == [2, 1, 1]"
+    # (b) the end-to-end path: the stat logger, not this scenario, feeds the counters, and /metrics shows them
+    - "trace.exists(e, e.type == 'call.start' && e.interface == 'stat-logger-manager.record-prometheus')"
+    - "steps.m.result.value.exists(x, x.name == 'vllm:spec_decode_num_drafts')"
+    # (c) the values of the line
+    - "steps.log.result.value.mean_acceptance_length > 2.33 && steps.log.result.value.mean_acceptance_length < 2.34"
+    - "steps.log.result.value.acceptance_rates.map(r, int(r * 1000.0 + 0.5)) == [667, 333, 333]"
+    - "steps.log.result.value.draft_acceptance_rate > 44.4 && steps.log.result.value.draft_acceptance_rate < 44.5"
+    - "steps.log.result.value.num_accepted_tokens == 4 && steps.log.result.value.num_draft_tokens == 9"
+    # (c) the line itself, from the periodic logger
+    - "trace.exists(e, e.type == 'note' && e.title.contains('SpecDecoding metrics: Mean acceptance length: 2.33'))"
+    - "calls['logging-stat-logger.record'] > 0"
+  - id: bench-l5-2-d-no-match-and-cut
+    fixtures: [full-tp1-llama-8b]
+    config: {async-scheduling: false, speculative-method: ngram, num-speculative-tokens: 3, max-num-batched-tokens: 2, long-prefill-token-threshold: 0}
+    max_events: 200000
+    steps:
+    - {as: add, flow: scheduler-add-request, input: {prompt_token_ids: [128000, 9906], request_id: sd-1, sampling_params: {max_tokens: 64}}}
+    - {as: s0, flow: scheduler-schedule, input: {}}
+    - {as: u0, flow: scheduler-update-from-output, input: {model_runner_output: {req_ids: [sd-1], sampled_token_ids: [[791]]}, scheduler_output: "= steps.s0.result.value"}}
+    # no n-gram match: no drafts for this step
+    - {as: s1, flow: scheduler-schedule, input: {}}
+    - {as: u1, flow: scheduler-update-from-output, input: {model_runner_output: {req_ids: [sd-1], sampled_token_ids: [[792]]}, scheduler_output: "= steps.s1.result.value"}}
+    # 3 drafts, budget 2: 1 sampled position plus 1 draft
+    - {as: d2, interface: scheduler.update-draft-token-ids, caller: engine-core, input: {req_ids: [sd-1], draft_token_ids: [[201, 202, 203]]}}
+    - {as: s2, flow: scheduler-schedule, input: {}}
+    - {as: u2, flow: scheduler-update-from-output, input: {model_runner_output: {req_ids: [sd-1], sampled_token_ids: [[201, 9]]}, scheduler_output: "= steps.s2.result.value"}}
+    expect:
+    - "steps.u1.result.value.scheduler_stats.spec_decoding_stats == null"
+    - "steps.s2.result.value.scheduled_spec_decode_tokens['sd-1'] == [201]"
+    - "steps.u2.result.value.scheduler_stats.spec_decoding_stats.num_drafts == 1"
+    - "steps.u2.result.value.scheduler_stats.spec_decoding_stats.num_draft_tokens == 1"
+    - "steps.u2.result.value.scheduler_stats.spec_decoding_stats.num_accepted_tokens_per_pos == [1, 0, 0]"

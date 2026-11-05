@@ -168,6 +168,10 @@ interfaces:
       - call: rotary-embedding.get-rope
         input: {head_size: "= vars.hf.hidden_size / vars.hf.num_attention_heads", max_position: "= vars.hf.max_position_embeddings", rope_parameters: "= has(vars.hf.rope_parameters) && vars.hf.rope_parameters != null ? vars.hf.rope_parameters : {}"}
         as: rope
+      - title: "Attention.__init__ selects the backend (get_attn_backend) while the model is built: an unsupported --attention-backend fails here"
+        source: "vllm/model_executor/layers/attention/attention.py:350-360"
+        call: attention-layer.init
+        input: {num_heads: "= vars.hf.num_attention_heads / vars.tp", head_size: "= vars.hf.hidden_size / vars.hf.num_attention_heads", num_kv_heads: "= math.greatest(1, vars.hf.num_key_value_heads / vars.tp)"}
       - title: "Each attention layer initializes its KV-cache scales and quant method"
         source: "vllm/model_executor/layers/attention/attention.py:157-226"
         call: attention-layer.init-kv-cache-quant
@@ -197,6 +201,41 @@ interfaces:
         as: counts
       - set:
           vars.use_ep: "= vars.par.value.use_ep"
+      - title: "FusedMoEFactory: with EPLB, experts must split evenly across the EP ranks"
+        source: "vllm/model_executor/layers/fused_moe/layer.py:258-266"
+        if: "config['enable-eplb'] && vars.use_ep && vars.counts.value.global_num_experts % vars.par.value.ep_size != 0"
+        then:
+          - fail: {code: value-error, status: 0, message: "= 'EPLB currently only supports even distribution of experts across ranks. Got ' + string(vars.counts.value.global_num_experts) + ' experts and ' + string(vars.par.value.ep_size) + ' EP ranks.'"}
+      - title: "Without EPLB, redundant experts are refused (a bare assert with a message)"
+        source: "vllm/model_executor/layers/fused_moe/layer.py:267-270"
+        if: "!config['enable-eplb'] && int(config['num-redundant-experts']) != 0"
+        then:
+          - fail: {code: assertion-error, status: 0, message: "Redundant experts are only supported with EPLB."}
+      - set: {vars.strategy: "= config['expert-placement-strategy']", vars.place_warning: null}
+      - title: "ExpertMapManager under EP: determine_expert_placement_strategy (Mixtral has no expert groups, so round_robin falls back to linear with a warning)"
+        source: "vllm/model_executor/layers/fused_moe/expert_map_manager.py:219-227"
+        if: "vars.use_ep"
+        then:
+          - call: expert-map-manager.determine-expert-placement-strategy
+            input:
+              expert_placement_strategy: "= config['expert-placement-strategy']"
+              num_expert_group: null
+              num_redundant_experts: "= int(config['num-redundant-experts'])"
+              enable_eplb: "= config['enable-eplb']"
+              use_all2all_kernels: "= has(vars.par.value.use_all2all_kernels) ? vars.par.value.use_all2all_kernels : false"
+            as: place
+          - set: {vars.strategy: "= vars.place.value.strategy", vars.place_warning: "= vars.place.value.warning"}
+      - title: "Weights per rank: attention, embeddings and norms split by TP; expert weights by EP (whole experts) and the MoE TP size"
+        source: "vllm/model_executor/models/mixtral.py:93-131"
+        set:
+          vars.bpw: "= input.quant == 'unquantized' ? 2 : 1"
+          vars.expert_bytes: "= vars.hf.num_hidden_layers * vars.hf.num_local_experts * 3 * vars.hf.hidden_size * vars.hf.intermediate_size * (input.quant == 'unquantized' ? 2 : 1)"
+      - set:
+          vars.total_bytes: "= has(vars.hf.weights_bytes) ? vars.hf.weights_bytes : vars.expert_bytes"
+      - set:
+          vars.expert_bytes: "= vars.expert_bytes > vars.total_bytes ? vars.total_bytes : vars.expert_bytes"
+      - set:
+          vars.per_rank: "= (vars.total_bytes - vars.expert_bytes) / vars.tp + vars.expert_bytes / vars.hf.num_local_experts * (vars.counts.value.global_num_experts / vars.par.value.ep_size) / vars.par.value.tp_size"
       - title: MixtralMoE sizes the experts - physical = logical + redundant, local = physical / EP size
         source: "vllm/model_executor/models/mixtral.py:93-131"
         set:
@@ -222,8 +261,11 @@ interfaces:
             num_physical_experts: "= vars.counts.value.global_num_experts"
             num_redundant_experts: "= config['num-redundant-experts']"
             num_local_physical_experts: "= vars.counts.value.global_num_experts / vars.par.value.ep_size"
+            expert_placement_strategy: "= vars.strategy"
+            weights_bytes_per_rank: "= vars.per_rank"
+            defer_moe_finalize_requests: []
           state.eplb_registered: false
-      - return: {initialized: true}
+      - return: {initialized: true, weights_bytes_per_rank: "= vars.per_rank", expert_placement_strategy: "= vars.strategy", placement_warning: "= vars.place_warning"}
 
   - component: mixtral-for-causal-lm
     name: load-weights
@@ -237,11 +279,14 @@ interfaces:
       - call: auto-weights-loader.load-weights
         input: {model: "= input.model", weights_bytes: "= input.weights_bytes"}
         as: awl
+      - title: "This rank's shard: the TP split of the dense weights plus its local experts (computed at init)"
+        set:
+          vars.wb: "= has(state.cfg) && has(state.cfg.weights_bytes_per_rank) ? state.cfg.weights_bytes_per_rank : vars.awl.value.weights_bytes_per_rank"
       - set:
           state.loaded: true
           state.model: "= input.model"
-          state.weights_bytes_per_rank: "= vars.awl.value.weights_bytes_per_rank"
-      - return: {weights_bytes_per_rank: "= vars.awl.value.weights_bytes_per_rank"}
+          state.weights_bytes_per_rank: "= vars.wb"
+      - return: {weights_bytes_per_rank: "= vars.wb"}
 
   - component: mixtral-for-causal-lm
     name: forward
@@ -771,34 +816,117 @@ interfaces:
     request: ModelsLinearInput
     response: {type: object, properties: {owner_ms: {type: integer}}}
     behavior:
-      - title: init_fp8_linear_kernel takes the first supported kernel in priority order
-        detail: "CUDA block kernels: FlashInfer+DeepGEMM, DeepGEMM, CUTLASS, B12x, Marlin, Humming, Triton, torch. Per-tensor: FlashInfer, CUTLASS, ... Which are supported depends on the GPU and installed libraries."
+      - title: "init_fp8_linear_kernel: the kernel chosen by capability at init"
         source: "vllm/model_executor/kernels/linear/__init__.py:726-810"
-        choice: kernel
-        default: "= input.quant == 'fp8_block' ? 'triton_block' : 'cutlass'"
-        options:
-          triton_block:
-            - call: triton-fp8-block-scaled-mm-kernel.apply-weights
-              input: "= input"
-              as: tb
-            - return: {owner_ms: 0}
-          cutlass:
-            - call: cutlass-fp8-scaled-mm-linear-kernel.apply-scaled-mm
-              input: "= input"
-              as: cu
-            - return: {owner_ms: "= vars.cu.value.owner_ms"}
+        call: fp8-linear-method.select-kernel
+        input: {block: "= input.quant == 'fp8_block'"}
+        as: sel
+      - if: "vars.sel.value.kernel == 'triton_block'"
+        then:
+          - call: triton-fp8-block-scaled-mm-kernel.apply-weights
+            input: "= input"
+            as: tb
+          - return: {owner_ms: 0, kernel: "= vars.sel.value.kernel"}
+      - title: "MarlinFP8ScaledMMLinearKernel.apply_weights -> apply_fp8_marlin_linear -> vllm::marlin_gemm: weight-only FP8, BF16 activations"
+        source: "vllm/model_executor/kernels/linear/scaled_mm/marlin.py:81-101"
+        if: "vars.sel.value.kernel == 'marlin'"
+        then:
+          - source: "vllm/model_executor/layers/quantization/utils/marlin_utils.py:440-500"
+            call: torch-bindings.marlin-gemm
+            input: {m: "= input.num_tokens", n: "= input.out_features", k: "= input.in_features", a_dtype: bfloat16, b_type: float8_e4m3fn, dtype_bytes: 1}
+            as: mg
+          - return: {owner_ms: "= vars.mg.duration_ms", kernel: marlin}
+      - title: "CUTLASS (per-tensor, or block on SM90+); SM100+ FlashInfer's FP8 GEMM has this shape and is modeled through the same op"
+        source: "vllm/model_executor/kernels/linear/scaled_mm/cutlass.py:245-275"
+        call: cutlass-fp8-scaled-mm-linear-kernel.apply-scaled-mm
+        input: "= input"
+        as: cu
+      - return: {owner_ms: "= vars.cu.value.owner_ms", kernel: "= vars.sel.value.kernel"}
+
+  - component: fp8-linear-method
+    name: select-kernel
+    kind: function
+    summary: "choose_scaled_mm_linear_kernel for FP8, first supported on this GPU. Per-tensor: FlashInfer (SM100+), CUTLASS (cutlass_scaled_mm_supports_fp8), Marlin (SM75+, not batch invariant). Block: CUTLASS block (cutlass_scaled_mm_supports_block_fp8), Marlin, Triton. The optional DeepGEMM and B12x extras and Humming aren't installed in the modeled deployment; torch._scaled_mm needs SM89, where CUTLASS wins first."
+    sources: ["vllm/model_executor/kernels/linear/__init__.py:443-452", "vllm/model_executor/kernels/linear/__init__.py:478-490", "vllm/model_executor/kernels/linear/__init__.py:712-717", "vllm/model_executor/kernels/linear/scaled_mm/marlin.py:35-47", "vllm/model_executor/layers/quantization/utils/w8a8_utils.py:11-30"]
+    request: {type: object, properties: {block: {type: boolean, default: false}}}
+    response: {type: object, properties: {kernel: {type: string}, class_name: {type: string}}}
+    behavior:
+      - call: cuda-platform.get-device-capability
+        input: {device_id: 0}
+        as: dc
+      - set:
+          vars.cap: "= vars.dc.value == null ? -1 : vars.dc.value.as_int"
+          vars.block: "= has(input.block) && input.block"
+      - if: "!vars.block"
+        then:
+          - title: "FlashInferFP8ScaledMMLinearKernel: FlashInfer installed and compute capability 100 and above"
+            source: "vllm/model_executor/kernels/linear/scaled_mm/flashinfer.py:41-53"
+            call: flashinfer.has-flashinfer
+            as: fi
+          - if: "vars.fi.value.available && vars.cap >= 100"
+            then:
+              - return: {kernel: flashinfer, class_name: FlashInferFP8ScaledMMLinearKernel}
+          - source: "vllm/model_executor/layers/quantization/utils/w8a8_utils.py:11-18"
+            call: torch-bindings.cutlass-scaled-mm-supports-fp8
+            input: {cuda_device_capability: "= vars.cap"}
+            as: cs
+          - if: "vars.cs.value.supported"
+            then:
+              - return: {kernel: cutlass, class_name: CutlassFP8ScaledMMLinearKernel}
+        else:
+          - source: "vllm/model_executor/layers/quantization/utils/w8a8_utils.py:21-28"
+            call: torch-bindings.cutlass-scaled-mm-supports-block-fp8
+            input: {cuda_device_capability: "= vars.cap"}
+            as: cb
+          - if: "vars.cb.value.supported"
+            then:
+              - return: {kernel: cutlass, class_name: CutlassFp8BlockScaledMMKernel}
+      - title: "MarlinFP8ScaledMMLinearKernel: compute capability 7.5 or higher, not batch invariant"
+        source: "vllm/model_executor/kernels/linear/scaled_mm/marlin.py:35-47"
+        if: "vars.cap >= 75 && !config['vllm-batch-invariant']"
+        then:
+          - return: {kernel: marlin, class_name: MarlinFP8ScaledMMLinearKernel}
+      - title: "Block quant falls to the Triton block kernel"
+        source: "vllm/model_executor/kernels/linear/__init__.py:488"
+        if: "vars.block"
+        then:
+          - return: {kernel: triton_block, class_name: TritonFp8BlockScaledMMKernel}
+      - title: "Nothing left (Humming not installed): ValueError from choose_scaled_mm_linear_kernel with each per-tensor kernel's reason on its own line, as '<Kernel> <reason>.' (reasons that end in a period keep both)"
+        source: "vllm/model_executor/kernels/linear/__init__.py:641-650"
+        set:
+          vars.reasons:
+            - "= 'FlashInferFP8ScaledMMLinearKernel ' + (vars.fi.value.available ? 'requires compute capability 100 and above.' : 'requires FlashInfer to be installed.') + '.'"
+            - "CutlassFP8ScaledMMLinearKernel CUTLASS FP8 kernels not available."
+            - "B12xTensorFP8ScaledMMLinearKernel B12X FP8 kernels require a Blackwell 12x device."
+            - "PerTensorTorchFP8ScaledMMLinearKernel requires a platform with torch FP8 scaled-MM support.."
+            - "ChannelWiseTorchFP8ScaledMMLinearKernel requires ROCm.."
+            - "= 'MarlinFP8ScaledMMLinearKernel ' + (vars.cap < 75 ? 'FP8 Marlin requires compute capability 7.5 or higher' : 'FP8 Marlin not supported for batch invariant execution.') + '.'"
+            - "HummingFP8ScaledMMLinearKernel Humming is not installed."
+      - source: "vllm/model_executor/kernels/linear/__init__.py:718-724"
+        fail: {code: value-error, status: 0, message: "= 'Failed to find a kernel that can implement the ScaledMM linear layer. Reasons: \\n' + vars.reasons.join('\\n')"}
 
   - component: fp8-linear-method
     name: process-weights-after-loading
     kind: function
     summary: "Fp8LinearMethod.process_weights_after_loading: canonicalize weight layout and scales for the chosen kernel."
     sources: ["vllm/model_executor/layers/quantization/fp8.py:358-416"]
-    request: {type: object, properties: {block: {type: boolean}}}
+    request: {type: object, properties: {block: {type: boolean}, k: {type: integer, default: 4096}, n: {type: integer, default: 4096}}}
     behavior:
       - title: Block quant keeps 128x128 scales; per-tensor transposes the weight to (K, N)
         source: "vllm/model_executor/layers/quantization/fp8.py:373-386"
         set: {ctx.fp8_weights_processed: "= input.block ? 'block' : 'per_tensor'"}
-      - return: {processed: true}
+      - call: fp8-linear-method.select-kernel
+        input: {block: "= input.block"}
+        as: sel
+      - title: "prepare_fp8_layer_for_marlin warns (Your GPU does not have native support for FP8 computation but FP8 quantization is being used. Weight-only FP8 compression will be used leveraging the Marlin kernel. This may degrade performance for compute-heavy workloads.) and repacks the weight"
+        source: "vllm/model_executor/layers/quantization/utils/marlin_utils_fp8.py:103-113"
+        if: "vars.sel.value.kernel == 'marlin'"
+        then:
+          - call: custom-ops.gptq-marlin-repack
+            input: {k: "= has(input.k) ? input.k : 4096", n: "= has(input.n) ? input.n : 4096", num_bits: 8}
+      - title: "Selected <kernel> for Fp8LinearMethod"
+        source: "vllm/model_executor/kernels/linear/__init__.py:757-763"
+        return: {processed: true, kernel: "= vars.sel.value.kernel", selected: "= 'Selected ' + vars.sel.value.class_name + ' for Fp8LinearMethod'"}
 
   - component: cutlass-fp8-scaled-mm-linear-kernel
     name: apply-scaled-mm

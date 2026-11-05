@@ -263,7 +263,7 @@ interfaces:
       - title: "Process the step's EngineCoreOutputs (chunked by VLLM_V1_OUTPUT_PROC_CHUNK_SIZE)"
         source: "vllm/v1/engine/async_llm.py:861-874"
         call: output-processor.process-outputs
-        input: {outputs: "= has(input.outputs.outputs) ? input.outputs.outputs : []", weight_version: "= has(input.outputs.weight_version) ? input.outputs.weight_version : null"}
+        input: {outputs: "= has(input.outputs.outputs) ? input.outputs.outputs : []", weight_version: "= has(input.outputs.weight_version) ? input.outputs.weight_version : null", timestamp: "= has(input.outputs.timestamp) ? input.outputs.timestamp : null"}
         as: proc
       - title: "Recover from P0/P1 cache drift: invalidate every mm_cache_miss_hashes entry in the renderer's mm processor cache, in order"
         source: "vllm/v1/engine/async_llm.py:873-881"
@@ -311,9 +311,12 @@ interfaces:
     sources: ["vllm/v1/engine/input_processor.py:373-555", "vllm/v1/engine/__init__.py:109-169", "vllm/exceptions.py:28-56"]
     request: EngineCoreClientRequest
     response: EngineCoreClientRequest
-    errors: [{code: vllm-validation-error, status: 0, retryable: false}]
+    errors: [{code: vllm-validation-error, status: 0, retryable: false}, {code: type-error, status: 0, retryable: false}]
     behavior:
-      - set:
+      - title: "arrival_time: the rendered prompt's (stamped by the renderer before the chat template, renderers/base.py:1296), else the caller's, else time.time() now"
+        source: "vllm/v1/engine/input_processor.py:402-415"
+        set:
+          vars.arrival: "= has(input.arrival_time) && input.arrival_time != null ? input.arrival_time : double(now_us) / 1000000.0"
           vars.plen: "= has(input.prompt_token_ids) ? size(input.prompt_token_ids) : 0"
           vars.sp_in: "= has(input.sampling_params) && input.sampling_params != null ? input.sampling_params : {}"
           vars.backend: "= config['structured-outputs-backend']"
@@ -348,6 +351,11 @@ interfaces:
           - title: "After params and LoRA, before the prompt: data_parallel_rank must name one of the DP engines"
             source: "vllm/v1/engine/input_processor.py:391-401"
             fail: {code: vllm-validation-error, message: "= 'data_parallel_rank ' + string(input.data_parallel_rank) + ' is out of range [0, ' + string(config['data-parallel-size']) + ').'"}
+      - if: "has(input.encoder_prompt) && input.encoder_prompt != null"
+        then:
+          - title: "A raw prompt is parsed for the model (parse_model_prompt): a decoder-only model gets parse_dec_only_prompt, which refuses a dict carrying encoder_prompt with a TypeError (not a VLLMValidationError)"
+            source: "vllm/renderers/inputs/preprocess.py:129-142"
+            fail: {code: type-error, message: "Cannot pass encoder-decoder prompt to decoder-only models"}
       - if: "vars.plen == 0"
         then:
           - title: The decoder prompt cannot be empty
@@ -394,7 +402,7 @@ interfaces:
               prompt_token_ids: "= input.prompt_token_ids"
               sampling_params: {n: 1, max_tokens: 1, stop: [], output_kind: final_only}
               pooling_params: "= input.pooling_params"
-              arrival_time: "= now"
+              arrival_time: "= vars.arrival"
               priority: "= has(input.priority) ? input.priority : 0"
       - title: "update_from_generation_config: the tokenizer's EOS (128009 for Llama-3.1) ends generation unless ignore_eos; the generation config's other EOS ids (128001, 128008) become stop_token_ids. An unset max_tokens means up to max_model_len"
         detail: "The EOS ids are Llama-3.1-8B-Instruct's tokenizer and generation_config.json (renderer and model config, not in the shared fixture); a labeled constant here."
@@ -403,13 +411,23 @@ interfaces:
           vars.sp: "= merge(merge({'n': 1, 'stop': [], 'temperature': 1.0, 'top_p': 1.0, 'min_tokens': 0, 'stop_token_ids': [], 'skip_special_tokens': true}, has(vars.resolved_backend) ? merge(vars.sp_in, {'structured_outputs': merge(vars.sp_in.structured_outputs, {'_backend': vars.resolved_backend})}) : vars.sp_in), {'max_tokens': vars.max_tokens, 'eos_token_id': vars.ignore_eos ? dyn(null) : dyn(128009), 'stop_token_ids': vars.ignore_eos ? (has(vars.sp_in.stop_token_ids) ? vars.sp_in.stop_token_ids : []) : (has(vars.sp_in.stop_token_ids) && vars.sp_in.stop_token_ids != null ? vars.sp_in.stop_token_ids : []) + [128001, 128008]})"
       - set:
           vars.sp: "= has(vars.sp.logprobs) && vars.sp.logprobs == null ? omit(vars.sp, 'logprobs') : vars.sp"
+      - if: "has(vars.sp.bad_words) && vars.sp.bad_words != null && size(vars.sp.bad_words) > 0"
+        then:
+          - title: "if self.tokenizer is not None: sampling_params.update_from_tokenizer(self.tokenizer): text bad words become token-id sequences (refused when a word tokenizes to nothing or there are too many)"
+            source: "vllm/v1/engine/input_processor.py:493-494"
+            call: sampling-params.update-from-tokenizer
+            input: {bad_words: "= vars.sp.bad_words", max_token_id: 128255}
+            as: bw
+          - title: "_bad_words_token_ids rides on the SamplingParams to the scheduler and the workers' bad-words mask"
+            source: "vllm/sampling_params.py:805"
+            set: {vars.sp: "= merge(vars.sp, {'bad_words_token_ids': vars.bw.value.bad_words_token_ids})"}
       - title: "Build the EngineCoreRequest: it carries the LoRARequest and the prompt's cache_salt to the engine core"
         source: "vllm/v1/engine/input_processor.py:537-555"
         return:
           request_id: "= input.request_id"
           prompt_token_ids: "= input.prompt_token_ids"
           sampling_params: "= vars.sp"
-          arrival_time: "= now"
+          arrival_time: "= vars.arrival"
           priority: "= has(input.priority) ? input.priority : 0"
           lora_request: "= has(input.lora_request) ? input.lora_request : null"
           cache_salt: "= has(input.cache_salt) ? input.cache_salt : null"
@@ -467,8 +485,17 @@ interfaces:
       - set:
           vars.remote_cached: "= vars.kvtp != null && has(vars.kvtp.do_remote_prefill) && vars.kvtp.do_remote_prefill == true && has(vars.kvtp.remote_prefill_cached_tokens) && type(vars.kvtp.remote_prefill_cached_tokens) == int ? dyn(vars.kvtp.remote_prefill_cached_tokens) : dyn(null)"
       - set:
-          state.request_states: "= merge(state.request_states, {input.request.request_id: {'external_req_id': vars.ext, 'prompt_len': size(input.request.prompt_token_ids), 'is_prefilling': true, 'output_text': '', 'num_output_tokens': 0, 'token_ids': [], 'output_kind': vars.kind, 'stop': vars.stop, 'include_stop_str_in_output': vars.include_stop, 'min_tokens': has(vars.sp.min_tokens) && vars.sp.min_tokens != null ? vars.sp.min_tokens : 0, 'skip_special_tokens': !has(vars.sp.skip_special_tokens) || vars.sp.skip_special_tokens != false, 'stop_buffer_length': size(vars.stop) > 0 && !vars.include_stop ? math.greatest(vars.stop.map(x, size(x))) - 1 : 0, 'last_text_offset': 0, 'logprobs': has(vars.sp.logprobs) ? vars.sp.logprobs : null, 'parent': vars.parent, 'index': has(input.index) ? input.index : 0, 'queue_id': vars.queue_id, 'has_queue': has(input.has_queue) ? input.has_queue : true, 'arrival_ms': now, 'remote_prefill_cached_tokens': vars.remote_cached, 'is_watermarked': vars.wm, 'is_watermark_skipped': vars.wm_skipped}})"
+          state.request_states: "= merge(state.request_states, {input.request.request_id: {'external_req_id': vars.ext, 'prompt_len': size(input.request.prompt_token_ids), 'is_prefilling': true, 'output_text': '', 'num_output_tokens': 0, 'token_ids': [], 'output_kind': vars.kind, 'stop': vars.stop, 'include_stop_str_in_output': vars.include_stop, 'min_tokens': has(vars.sp.min_tokens) && vars.sp.min_tokens != null ? vars.sp.min_tokens : 0, 'skip_special_tokens': !has(vars.sp.skip_special_tokens) || vars.sp.skip_special_tokens != false, 'stop_buffer_length': size(vars.stop) > 0 && !vars.include_stop ? math.greatest(vars.stop.map(x, size(x))) - 1 : 0, 'last_text_offset': 0, 'logprobs': has(vars.sp.logprobs) ? vars.sp.logprobs : null, 'parent': vars.parent, 'index': has(input.index) ? input.index : 0, 'queue_id': vars.queue_id, 'has_queue': has(input.has_queue) ? input.has_queue : true, 'arrival_time': has(input.request.arrival_time) && input.request.arrival_time != null ? input.request.arrival_time : double(now_us) / 1000000.0, 'queued_ts': 0.0, 'scheduled_ts': 0.0, 'first_token_ts': 0.0, 'last_token_ts': 0.0, 'num_generation_tokens': 0, 'num_preemptions': 0, 'max_tokens_param': has(vars.sp.max_tokens) ? vars.sp.max_tokens : null, 'n_param': has(input.n) ? input.n : 1, 'prompt_logprobs': has(vars.sp.prompt_logprobs) ? vars.sp.prompt_logprobs : null, 'remote_prefill_cached_tokens': vars.remote_cached, 'is_watermarked': vars.wm, 'is_watermark_skipped': vars.wm_skipped}})"
           state.external_req_ids: "= merge(state.external_req_ids, {vars.ext: (vars.ext in state.external_req_ids ? state.external_req_ids[vars.ext] : []) + [input.request.request_id]})"
+      - if: "(has(vars.sp.logprobs) && vars.sp.logprobs != null) || (has(vars.sp.prompt_logprobs) && vars.sp.prompt_logprobs != null)"
+        then:
+          - title: "RequestState.from_new_request -> LogprobsProcessor.from_new_request: an empty sample-logprobs list (and cumulative 0.0) when logprobs were asked for, a prompt-logprobs list starting with None when prompt_logprobs were"
+            source: "vllm/v1/engine/output_processor.py:256-259"
+            call: logprobs-processor.from-new-request
+            input:
+              request_id: "= input.request.request_id"
+              num_logprobs: "= has(vars.sp.logprobs) ? vars.sp.logprobs : null"
+              num_prompt_logprobs: "= has(vars.sp.prompt_logprobs) ? vars.sp.prompt_logprobs : null"
       - if: "vars.parent != null"
         then:
           - title: "ParentRequest tracks the children still running and aggregates FINAL_ONLY outputs"
@@ -568,12 +595,14 @@ interfaces:
   - component: output-processor
     name: process-outputs
     kind: function
-    summary: "OutputProcessor.process_outputs: per EngineCoreOutput, skip aborted ids, end prefill, detokenize and check stop strings, put the RequestOutput into the stream, and free finished requests."
+    summary: "OutputProcessor.process_outputs: per EngineCoreOutput, skip aborted ids, update the iteration stats (TTFT from arrival, ITL from the engine core's step timestamps, QUEUED/SCHEDULED/PREEMPTED events), end prefill, detokenize and check stop strings, update the logprobs, put the RequestOutput into the stream, and free finished requests with their phase times."
     sources: ["vllm/v1/engine/output_processor.py:681-833", "vllm/v1/engine/__init__.py:199-244", "vllm/v1/engine/__init__.py:259-290", "vllm/outputs.py:51-106", "vllm/outputs.py:129-201", "vllm/v1/engine/__init__.py:48-69"]
-    request: {type: object, properties: {outputs: {type: array, items: {$ref: EngineCoreOutput}}, weight_version: {type: ["string", "null"], default: null}}}
+    request: {type: object, properties: {outputs: {type: array, items: {$ref: EngineCoreOutput}}, weight_version: {type: ["string", "null"], default: null}, timestamp: {type: ["number", "null"], default: null, description: "EngineCoreOutputs.timestamp: the engine core's clock when the step's outputs were built (seconds); null takes now"}}}
     response: {type: object, properties: {reqs_to_abort: {type: array, items: {type: string}}, finished: {type: integer}, request_outputs: {type: array}, iteration_stats: {type: object}}}
     behavior:
-      - set: {vars.to_abort: [], vars.finished: 0, vars.request_outputs: [], vars.puts: [], vars.it_gen: 0, vars.it_prompt: 0, vars.ttfts: [], vars.itls: [], vars.fin: [], vars.wm_counts: [0, 0, 0]}
+      - title: "IterationStats(): iteration_timestamp = time.time() when the output handler takes the step's outputs"
+        source: "vllm/v1/metrics/stats.py:476-489"
+        set: {vars.to_abort: [], vars.finished: 0, vars.request_outputs: [], vars.puts: [], vars.fin: [], vars.wm_counts: [0, 0, 0], vars.acc: {gen: 0, prompt: 0, computed: 0, cached: 0, local_hit: 0, external: 0, preempted: 0, ttfts: [], itls: [], max_gen: [], n_params: []}, vars.clk: "= {'iter': double(now_us) / 1000000.0, 'ts': has(input.timestamp) && input.timestamp != null ? double(input.timestamp) : double(now_us) / 1000000.0}"}
       - foreach: "= input.outputs"
         as: out
         steps:
@@ -583,13 +612,17 @@ interfaces:
                 source: "vllm/v1/engine/output_processor.py:707-713"
                 continue: true
           - set: {vars.rs: "= state.request_states[vars.out.request_id]"}
-          - title: "_update_stats_from_output -> IterationStats.update_from_output: count the new tokens; the first output records the prompt tokens and the TTFT since arrival, later ones the inter-token latency"
-            source: "vllm/v1/metrics/stats.py:505-557"
+          - set:
+              vars.o: "= {'pre': vars.rs.is_prefilling, 'ps': vars.rs.is_prefilling && has(vars.out.prefill_stats) && vars.out.prefill_stats != null ? vars.out.prefill_stats : null, 'evs': has(vars.out.events) && vars.out.events != null ? vars.out.events : [], 'arrival': has(vars.rs.arrival_time) ? double(vars.rs.arrival_time) : vars.clk.iter}"
+          - title: "IterationStats.update_from_output: count the new tokens; a prefilling request adds its PrefillStats (total, computed, cached by source) and its TTFT = iteration_timestamp - arrival_time; update_from_events counts PREEMPTED events; a decoding request appends ITL = engine_core_timestamp - last_token_ts"
+            detail: "When the scheduler sends no prefill_stats the model counts the whole prompt as computed (the stand-in the earlier rounds used); the code then adds nothing."
+            source: "vllm/v1/metrics/stats.py:505-577"
             set:
-              vars.it_gen: "= vars.it_gen + size(vars.out.new_token_ids)"
-              vars.it_prompt: "= vars.it_prompt + (vars.rs.is_prefilling ? vars.rs.prompt_len : 0)"
-              vars.ttfts: "= vars.rs.is_prefilling ? vars.ttfts + [double(now - (has(vars.rs.arrival_ms) ? vars.rs.arrival_ms : now)) / 1000.0] : vars.ttfts"
-              vars.itls: "= !vars.rs.is_prefilling && has(vars.rs.last_token_ms) ? vars.itls + [double(now - vars.rs.last_token_ms) / 1000.0] : vars.itls"
+              vars.acc: "= {'gen': vars.acc.gen + size(vars.out.new_token_ids), 'prompt': vars.acc.prompt + (vars.o.ps != null ? vars.o.ps.num_prompt_tokens : (vars.o.pre ? vars.rs.prompt_len : 0)), 'computed': vars.acc.computed + (vars.o.ps != null ? vars.o.ps.num_prompt_tokens - vars.o.ps.num_local_cached_tokens - vars.o.ps.num_external_cached_tokens : (vars.o.pre ? vars.rs.prompt_len : 0)), 'cached': vars.acc.cached + (vars.o.ps != null ? vars.o.ps.num_local_cached_tokens + vars.o.ps.num_external_cached_tokens : 0), 'local_hit': vars.acc.local_hit + (vars.o.ps != null ? vars.o.ps.num_local_cached_tokens : 0), 'external': vars.acc.external + (vars.o.ps != null ? vars.o.ps.num_external_cached_tokens : 0), 'preempted': vars.acc.preempted + size(vars.o.evs.filter(e, e.type == 'PREEMPTED')), 'ttfts': vars.o.pre ? vars.acc.ttfts + [vars.clk.iter - vars.o.arrival] : vars.acc.ttfts, 'itls': !vars.o.pre ? vars.acc.itls + [vars.clk.ts - (has(vars.rs.last_token_ts) ? double(vars.rs.last_token_ts) : vars.clk.ts)] : vars.acc.itls, 'max_gen': vars.acc.max_gen, 'n_params': vars.acc.n_params}"
+          - title: "RequestStateStats: QUEUED sets queued_ts, the first SCHEDULED sets scheduled_ts (a re-schedule after preemption is ignored), PREEMPTED counts num_preemptions; a prefilling request's first_token_ts is the engine core timestamp; last_token_ts moves to it"
+            source: "vllm/v1/metrics/stats.py:548-577"
+            set:
+              vars.r6: "= {'queued_ts': vars.o.evs.exists(e, e.type == 'QUEUED') ? double(vars.o.evs.filter(e, e.type == 'QUEUED')[size(vars.o.evs.filter(e, e.type == 'QUEUED')) - 1].timestamp) : (has(vars.rs.queued_ts) ? double(vars.rs.queued_ts) : 0.0), 'sched_ts': (!has(vars.rs.scheduled_ts) || vars.rs.scheduled_ts == 0.0) && vars.o.evs.exists(e, e.type == 'SCHEDULED') ? double(vars.o.evs.filter(e, e.type == 'SCHEDULED')[0].timestamp) : (has(vars.rs.scheduled_ts) ? double(vars.rs.scheduled_ts) : 0.0), 'first_ts': vars.o.pre ? vars.clk.ts : (has(vars.rs.first_token_ts) ? double(vars.rs.first_token_ts) : vars.clk.ts), 'ngen': (has(vars.rs.num_generation_tokens) ? vars.rs.num_generation_tokens : 0) + size(vars.out.new_token_ids), 'npreempt': (has(vars.rs.num_preemptions) ? vars.rs.num_preemptions : 0) + size(vars.o.evs.filter(e, e.type == 'PREEMPTED'))}"
           - title: Detokenize the new token ids and check stop strings
             source: "vllm/v1/engine/output_processor.py:760-776"
             call: incremental-detokenizer.update
@@ -603,24 +636,30 @@ interfaces:
               min_tokens: "= has(vars.rs.min_tokens) ? vars.rs.min_tokens : 0"
               skip_special_tokens: "= !has(vars.rs.skip_special_tokens) || vars.rs.skip_special_tokens"
             as: det
-          - set: {vars.lp: null}
-          - if: "has(vars.rs.logprobs) && vars.rs.logprobs != null && has(vars.out.new_logprobs) && vars.out.new_logprobs != null"
+          - set:
+              vars.lp: null
+              vars.kept: "= vars.det.value.kept_token_ids"
+              vars.kind: "= has(vars.rs.output_kind) ? vars.rs.output_kind : 'cumulative'"
+          - if: "(has(vars.rs.logprobs) && vars.rs.logprobs != null) || (has(vars.rs.prompt_logprobs) && vars.rs.prompt_logprobs != null)"
             then:
-              - title: "logprobs_processor.update_from_output: the sampled tokens' top-logprobs rows (new_logprobs) extend the request's logprobs and cumulative_logprob"
-                source: "vllm/v1/engine/output_processor.py:784-785"
-                call: logprobs-processor.update-sample-logprobs
-                input: {request_id: "= vars.out.request_id", num_logprobs: "= vars.rs.logprobs", logprobs_lists: "= vars.out.new_logprobs"}
+              - title: "logprobs_processor.update_from_output: new sample logprobs (sliced to the kept tokens when a stop string trimmed the step, _trim_surplus_tokens) and prompt logprobs; DELTA pops the prompt logprobs, others read the accumulated ones"
+                source: "vllm/v1/engine/output_processor.py:782-785"
+                call: logprobs-processor.update-from-output
+                input:
+                  request_id: "= vars.out.request_id"
+                  num_logprobs: "= has(vars.rs.logprobs) ? vars.rs.logprobs : null"
+                  new_logprobs: "= !has(vars.out.new_logprobs) || vars.out.new_logprobs == null ? null : (size(vars.kept) < size(vars.out.new_token_ids) ? {'token_ids': vars.out.new_logprobs.token_ids.slice(0, size(vars.kept)), 'logprobs': vars.out.new_logprobs.logprobs.slice(0, size(vars.kept)), 'ranks': vars.out.new_logprobs.ranks.slice(0, size(vars.kept))} : vars.out.new_logprobs)"
+                  new_prompt_logprobs_tensors: "= has(vars.out.new_prompt_logprobs_tensors) ? vars.out.new_prompt_logprobs_tensors : null"
+                  pop_prompt_logprobs: "= vars.kind == 'delta'"
                 as: lpu
               - set: {vars.lp: "= vars.lpu.value"}
           - set:
               vars.reason: "= vars.det.value.stop_string != null ? 'stop' : (has(vars.out.finish_reason) ? vars.out.finish_reason : null)"
               vars.stop_reason: "= vars.det.value.stop_string != null ? vars.det.value.stop_string : (has(vars.out.stop_reason) ? vars.out.stop_reason : null)"
-              vars.kept: "= vars.det.value.kept_token_ids"
           - title: "The first output ends prefill (num_cached_tokens recorded)"
             source: "vllm/v1/engine/output_processor.py:731-742"
             set:
               vars.all: "= (has(vars.rs.token_ids) ? vars.rs.token_ids : []) + vars.kept"
-              vars.kind: "= has(vars.rs.output_kind) ? vars.rs.output_kind : 'cumulative'"
               vars.idx: "= has(vars.rs.index) ? vars.rs.index : 0"
               vars.parent: "= has(vars.rs.parent) ? vars.rs.parent : null"
               vars.done: "= vars.reason != null"
@@ -636,12 +675,15 @@ interfaces:
               vars.delta_text: "= vars.last_off < vars.visible_len ? vars.det.value.output_text.substring(vars.last_off, vars.visible_len) : ''"
               vars.new_off: "= vars.last_off < vars.visible_len ? vars.visible_len : vars.last_off"
               vars.num_cached: "= vars.rs.is_prefilling ? (has(vars.rs.remote_prefill_cached_tokens) && vars.rs.remote_prefill_cached_tokens != null ? vars.rs.remote_prefill_cached_tokens : (has(vars.out.prefill_stats) && vars.out.prefill_stats != null ? vars.out.prefill_stats.num_local_cached_tokens + vars.out.prefill_stats.num_external_cached_tokens : (has(vars.out.num_cached_tokens) && vars.out.num_cached_tokens != null ? vars.out.num_cached_tokens : 0))) : (has(vars.rs.num_cached_tokens) ? vars.rs.num_cached_tokens : 0)"
-          - set:
-              state.request_states: "= vars.out.request_id in state.request_states ? merge(state.request_states, {vars.out.request_id: merge(state.request_states[vars.out.request_id], {'is_prefilling': false, 'num_cached_tokens': vars.num_cached, 'output_text': vars.det.value.output_text, 'num_output_tokens': size(vars.all), 'token_ids': vars.all, 'last_text_offset': vars.kind == 'delta' ? vars.new_off : vars.last_off, 'last_token_ms': now})}) : state.request_states"
-              vars.comp: "= {'index': vars.idx, 'token_ids': vars.kind == 'delta' ? vars.kept : vars.all, 'text': vars.kind == 'delta' ? vars.delta_text : vars.cum_text, 'finish_reason': vars.reason, 'stop_reason': vars.stop_reason, 'logprobs': vars.lp == null ? dyn(null) : dyn(vars.kind == 'delta' ? vars.lp.logprobs.slice(int(math.greatest(size(vars.lp.logprobs) - size(vars.out.new_token_ids), 0)), size(vars.lp.logprobs)) : vars.lp.logprobs), 'cumulative_logprob': vars.lp == null ? dyn(null) : dyn(vars.lp.cumulative_logprob)}"
+          - title: "_new_completion_output: logprobs is the accumulated list (None only when the request didn't ask); DELTA keeps the last len(token_ids) positions, and [:0] (an empty list) when the step brought no new token"
+            source: "vllm/v1/engine/output_processor.py:428-449"
+            set:
+              state.request_states: "= vars.out.request_id in state.request_states ? merge(state.request_states, {vars.out.request_id: merge(state.request_states[vars.out.request_id], {'is_prefilling': false, 'num_cached_tokens': vars.num_cached, 'output_text': vars.det.value.output_text, 'num_output_tokens': size(vars.all), 'token_ids': vars.all, 'last_text_offset': vars.kind == 'delta' ? vars.new_off : vars.last_off, 'queued_ts': vars.r6.queued_ts, 'scheduled_ts': vars.r6.sched_ts, 'first_token_ts': vars.r6.first_ts, 'last_token_ts': vars.clk.ts, 'num_generation_tokens': vars.r6.ngen, 'num_preemptions': vars.r6.npreempt})}) : state.request_states"
+              vars.comp: "= {'index': vars.idx, 'token_ids': vars.kind == 'delta' ? vars.kept : vars.all, 'text': vars.kind == 'delta' ? vars.delta_text : vars.cum_text, 'finish_reason': vars.reason, 'stop_reason': vars.stop_reason, 'logprobs': !has(vars.rs.logprobs) || vars.rs.logprobs == null || vars.lp == null ? dyn(null) : dyn(vars.kind == 'delta' ? (size(vars.kept) > 0 ? vars.lp.logprobs.slice(int(math.greatest(size(vars.lp.logprobs) - size(vars.kept), 0)), size(vars.lp.logprobs)) : []) : vars.lp.logprobs), 'cumulative_logprob': !has(vars.rs.logprobs) || vars.rs.logprobs == null || vars.lp == null ? dyn(null) : dyn(vars.lp.cumulative_logprob)}"
               vars.emit: "= vars.reason != null || vars.kind != 'final_only'"
               vars.finished_all: "= vars.reason != null"
               vars.comps: []
+              vars.par: "= {'remaining': [], 'pmax': vars.r6.ngen}"
           - if: "vars.parent != null && vars.parent in state.parent_requests"
             then:
               - title: "ParentRequest.get_outputs: a finished child leaves child_requests; FINAL_ONLY aggregates all n completions; the parent is finished when no child remains"
@@ -649,15 +691,15 @@ interfaces:
                 set:
                   vars.pr: "= state.parent_requests[vars.parent]"
               - set:
-                  vars.remaining: "= vars.done ? vars.pr.remaining.filter(r, r != vars.out.request_id) : vars.pr.remaining"
+                  vars.par: "= {'remaining': vars.done ? vars.pr.remaining.filter(r, r != vars.out.request_id) : vars.pr.remaining, 'pmax': vars.done ? int(math.greatest(has(vars.pr.max_gen) ? vars.pr.max_gen : 0, vars.r6.ngen)) : (has(vars.pr.max_gen) ? vars.pr.max_gen : 0)}"
                   vars.final: "= vars.done ? merge(vars.pr.final, {string(vars.idx): vars.comp}) : vars.pr.final"
               - set:
-                  vars.finished_all: "= size(vars.remaining) == 0"
-                  vars.emit: "= vars.kind != 'final_only' || size(vars.remaining) == 0"
+                  vars.finished_all: "= size(vars.par.remaining) == 0"
+                  vars.emit: "= vars.kind != 'final_only' || size(vars.par.remaining) == 0"
                   vars.comps: "= vars.kind == 'final_only' ? lists.range(64).filter(i, string(i) in vars.final).map(i, vars.final[string(i)]) : []"
-                  state.parent_requests: "= size(vars.remaining) == 0 ? omit(state.parent_requests, vars.parent) : merge(state.parent_requests, {vars.parent: merge(vars.pr, {'remaining': vars.remaining, 'final': vars.final})})"
+                  state.parent_requests: "= size(vars.par.remaining) == 0 ? omit(state.parent_requests, vars.parent) : merge(state.parent_requests, {vars.parent: merge(vars.pr, {'remaining': vars.par.remaining, 'final': vars.final, 'max_gen': vars.par.pmax})})"
           - set:
-              vars.ro: "= {'request_id': vars.rs.external_req_id, 'num_cached_tokens': vars.num_cached, 'kind': vars.kind, 'completions': size(vars.comps) > 0 ? vars.comps : [vars.comp], 'text': vars.comp.text, 'token_ids': size(vars.comps) > 0 ? vars.comps.map(c, c.token_ids).flatten() : vars.comp.token_ids, 'finish_reason': vars.reason, 'stop_reason': vars.stop_reason, 'finished': vars.finished_all}"
+              vars.ro: "= {'request_id': vars.rs.external_req_id, 'num_cached_tokens': vars.num_cached, 'kind': vars.kind, 'completions': size(vars.comps) > 0 ? vars.comps : [vars.comp], 'text': vars.comp.text, 'token_ids': size(vars.comps) > 0 ? vars.comps.map(c, c.token_ids).flatten() : vars.comp.token_ids, 'finish_reason': vars.reason, 'stop_reason': vars.stop_reason, 'finished': vars.finished_all, 'prompt_logprobs': !has(vars.rs.prompt_logprobs) || vars.rs.prompt_logprobs == null || vars.lp == null ? dyn(null) : dyn(vars.lp.prompt_logprobs)}"
           - if: "!vars.emit"
             then:
               - title: "FINAL_ONLY: no RequestOutput until the request (or all n children) finished"
@@ -681,9 +723,18 @@ interfaces:
                   state.request_states: "= omit(state.request_states, vars.out.request_id)"
                   state.external_req_ids: "= state.external_req_ids.transformMap(k, v, v.exists(i, i != vars.out.request_id), v.filter(i, i != vars.out.request_id))"
                   vars.finished: "= vars.finished + 1"
-                  vars.fin: "= vars.fin + [{'finish_reason': vars.reason, 'request_id': vars.out.request_id, 'e2e_latency': double(now - (has(vars.rs.arrival_ms) ? vars.rs.arrival_ms : now)) / 1000.0, 'num_prompt_tokens': vars.rs.prompt_len, 'num_generation_tokens': size(vars.all)}]"
                   vars.wm_counts: "= has(vars.rs.is_watermarked) && vars.rs.is_watermarked ? [vars.wm_counts[0] + 1, vars.wm_counts[1], vars.wm_counts[2]] : (has(vars.rs.is_watermark_skipped) && vars.rs.is_watermark_skipped ? [vars.wm_counts[0], vars.wm_counts[1] + 1, vars.wm_counts[2]] : [vars.wm_counts[0], vars.wm_counts[1], vars.wm_counts[2] + 1])"
                   vars.to_abort: "= (has(vars.out.finish_reason) && vars.out.finish_reason != null) ? vars.to_abort : vars.to_abort + [vars.out.request_id]"
+              - title: "update_from_finished_request: e2e = iteration_timestamp - arrival_time; queued = scheduled - queued; prefill = first token - scheduled; decode = last token - first token; inference = last token - scheduled; TPOT = decode / (generation tokens - 1), 0 for a single token"
+                source: "vllm/v1/metrics/stats.py:579-624"
+                set:
+                  vars.fin: "= vars.fin + [{'finish_reason': vars.reason, 'request_id': vars.rs.external_req_id, 'e2e_latency': vars.clk.iter - vars.o.arrival, 'num_prompt_tokens': vars.rs.prompt_len, 'num_generation_tokens': vars.r6.ngen, 'num_preemptions': vars.r6.npreempt, 'max_tokens_param': has(vars.rs.max_tokens_param) ? vars.rs.max_tokens_param : null, 'queued_time': vars.r6.sched_ts - vars.r6.queued_ts, 'prefill_time': vars.r6.first_ts - vars.r6.sched_ts, 'decode_time': vars.clk.ts - vars.r6.first_ts, 'inference_time': vars.clk.ts - vars.r6.sched_ts, 'mean_time_per_output_token': vars.r6.ngen - 1 > 0 ? (vars.clk.ts - vars.r6.first_ts) / double(vars.r6.ngen - 1) : 0.0, 'num_cached_tokens': vars.num_cached}]"
+              - title: "ParentRequest.observe_finished_request: n_param is the parent's n (1 without a parent); the max generation tokens over the children is recorded once, when the last child finishes"
+                source: "vllm/v1/engine/parallel_sampling.py:136-152"
+                if: "vars.parent == null || size(vars.par.remaining) == 0"
+                then:
+                  - set:
+                      vars.acc: "= merge(vars.acc, {'max_gen': vars.acc.max_gen + [vars.parent == null ? vars.r6.ngen : vars.par.pmax], 'n_params': vars.acc.n_params + [vars.parent == null ? 1 : (has(vars.rs.n_param) ? vars.rs.n_param : 1)]})"
       - title: "process_outputs is synchronous (no await between puts): every output of the step lands in the collectors before a generate() task can read"
         source: "vllm/v1/engine/async_llm.py:860-885"
         foreach: "= vars.puts"
@@ -695,7 +746,7 @@ interfaces:
           reqs_to_abort: "= vars.to_abort"
           finished: "= vars.finished"
           request_outputs: "= vars.request_outputs"
-          iteration_stats: {num_generation_tokens: "= vars.it_gen", num_prompt_tokens: "= vars.it_prompt", num_preempted_reqs: 0, time_to_first_tokens_iter: "= vars.ttfts", inter_token_latencies_iter: "= vars.itls", finished_requests: "= vars.fin", num_watermarked_reqs: "= vars.wm_counts[0]", num_watermark_skipped_reqs: "= vars.wm_counts[1]", num_not_watermarked_reqs: "= vars.wm_counts[2]"}
+          iteration_stats: {iteration_timestamp: "= vars.clk.iter", num_generation_tokens: "= vars.acc.gen", num_prompt_tokens: "= vars.acc.prompt", prompt_token_stats: {total: "= vars.acc.prompt", computed: "= vars.acc.computed", cached_tokens: "= vars.acc.cached", local_cache_hit: "= vars.acc.local_hit", external_kv_transfer: "= vars.acc.external"}, num_preempted_reqs: "= vars.acc.preempted", time_to_first_tokens_iter: "= vars.acc.ttfts", inter_token_latencies_iter: "= vars.acc.itls", finished_requests: "= vars.fin", max_num_generation_tokens_iter: "= vars.acc.max_gen", n_params_iter: "= vars.acc.n_params", num_watermarked_reqs: "= vars.wm_counts[0]", num_watermark_skipped_reqs: "= vars.wm_counts[1]", num_not_watermarked_reqs: "= vars.wm_counts[2]"}
 
   # ------------------------------------------------------------------ RequestOutputCollector
   - component: request-output-collector

@@ -19,6 +19,7 @@ sys.path.insert(0, str(HERE))
 import scenarios  # noqa: E402
 import scenarios_r4  # noqa: E402
 import scenarios_r5  # noqa: E402
+import scenarios_r6  # noqa: E402
 
 REG = "vllm/model_executor/models/registry.py"
 TABLES = {
@@ -35,10 +36,98 @@ TABLES = {
 }
 POOLING_TABLES = {"embedding", "late_interaction", "reward", "token_classification", "sequence_classification"}
 # Classes modeled in depth: the registry row points the loader at their component.
-DEFAULTS_FILES = {"core-r4.yaml", "core-r4b.yaml", "core-r4c.yaml", "core-r5.yaml"}
+DEFAULTS_FILES = {"core-r4.yaml", "core-r4b.yaml", "core-r4c.yaml", "core-r5.yaml", "core-r6.yaml"}
 DEFAULTS_IFACES = {"base-multi-modal-processor.apply", "base-multi-modal-processor.apply-hf-processor-main", "qkv-parallel-linear.weight-loader"}
 MODELED = {("llama", "LlamaForCausalLM"): "llama-for-causal-lm", ("mixtral", "MixtralForCausalLM"): "mixtral-for-causal-lm",
-           ("qwen2_vl", "Qwen2VLForConditionalGeneration"): "qwen2-vl-for-conditional-generation"}
+           ("qwen2_vl", "Qwen2VLForConditionalGeneration"): "qwen2-vl-for-conditional-generation",
+           ("qwen3_vl", "Qwen3VLForConditionalGeneration"): "qwen3-vl-for-conditional-generation",
+           ("embedding_gemma2", "EmbeddingGemma2Model"): "embedding-gemma2-model",
+           ("bert", "BertEmbeddingModel"): "bert-embedding-model", ("roberta", "RobertaEmbeddingModel"): "bert-embedding-model"}
+MODELS_DIR = "vllm/model_executor/models"
+_CLASSES = {}
+
+
+def _module_classes(mod):
+    """Class definitions of a model module: decorators (default_pooling_type, attn_type), class
+    attributes, bases, and names imported from sibling modules."""
+    if mod in _CLASSES:
+        return _CLASSES[mod]
+    path = SNAP / MODELS_DIR / (mod + ".py")
+    out = {"classes": {}, "imports": {}, "assigns": set()}
+    _CLASSES[mod] = out
+    if not path.exists():
+        return out
+    tree = ast.parse(path.read_text())
+    for node in tree.body:
+        if isinstance(node, ast.ImportFrom) and node.level == 1 and node.module:
+            for a in node.names:
+                out["imports"][a.asname or a.name] = node.module
+        elif isinstance(node, ast.Assign) and len(node.targets) == 1 and isinstance(node.targets[0], ast.Name):
+            out["assigns"].add(node.targets[0].id)
+        elif isinstance(node, ast.ClassDef):
+            info = {"bases": [b.id for b in node.bases if isinstance(b, ast.Name)], "seq": None, "tok": None, "attn": None}
+            for d in node.decorator_list:
+                if isinstance(d, ast.Call) and isinstance(d.func, ast.Name):
+                    if d.func.id == "default_pooling_type":
+                        kw = {k.arg: ast.literal_eval(k.value) for k in d.keywords}
+                        info["seq"], info["tok"] = kw.get("seq_pooling_type", "LAST"), kw.get("tok_pooling_type", "ALL")
+                    elif d.func.id == "attn_type" and d.args:
+                        info["attn"] = ast.literal_eval(d.args[0])
+            for st in node.body:
+                if isinstance(st, (ast.Assign, ast.AnnAssign)):
+                    tgt = st.targets[0] if isinstance(st, ast.Assign) else st.target
+                    if isinstance(tgt, ast.Name) and st.value is not None and isinstance(st.value, ast.Constant):
+                        if tgt.id == "default_seq_pooling_type":
+                            info["seq"] = st.value.value
+                        elif tgt.id == "default_tok_pooling_type":
+                            info["tok"] = st.value.value
+                        elif tgt.id == "attn_type":
+                            info["attn"] = st.value.value
+            out["classes"][node.name] = info
+    return out
+
+
+def pooling_info(mod, cls, depth=0):
+    """_ModelInfo.default_seq_pooling_type / default_tok_pooling_type / attn_type of a registered
+    class: the class attribute the decorators set, inherited through the bases (interfaces_base.py:
+    235-273); adapters (as_seq_cls_model, as_embedding_model) and undecorated classes keep the
+    defaults LAST / ALL / decoder."""
+    res = {"seq": None, "tok": None, "attn": None}
+    if depth > 8:
+        return res
+    m = _module_classes(mod)
+    info = m["classes"].get(cls)
+    if info is None:
+        if cls in m["imports"]:
+            return pooling_info(m["imports"][cls], cls, depth + 1)
+        return res
+    res = {k: info[k] for k in res}
+    for b in info["bases"]:
+        if all(res[k] is not None for k in res):
+            break
+        bmod = mod if b in m["classes"] else m["imports"].get(b)
+        if bmod is None:
+            continue
+        sub = pooling_info(bmod, b, depth + 1)
+        for k in res:
+            if res[k] is None:
+                res[k] = sub[k]
+    return res
+
+
+def has_interface(mod, cls, marker, depth=0):
+    """_ModelInfo.is_hybrid / is_attention_free: the class inherits the IsHybrid or IsAttentionFree
+    interface (interfaces.py:909-941, registry.py:867-910), directly or through a base."""
+    if depth > 8:
+        return False
+    m = _module_classes(mod)
+    info = m["classes"].get(cls)
+    if info is None:
+        return cls in m["imports"] and has_interface(m["imports"][cls], cls, marker, depth + 1)
+    if marker in info["bases"]:
+        return True
+    return any(has_interface(mod if b in m["classes"] else m["imports"][b], b, marker, depth + 1)
+               for b in info["bases"] if b in m["classes"] or b in m["imports"])
 
 
 def parse_registry():
@@ -59,7 +148,13 @@ def parse_registry():
                 # _VLLM_MODELS merges the tables in order, so later tables override.
                 row = {"module": mod, "class_name": cls, "table": table,
                        "is_pooling": table in POOLING_TABLES,
-                       "is_text_generation": table in ("text_generation", "transformers_supported")}
+                       "is_text_generation": table in ("text_generation", "transformers_supported", "multimodal")}
+                pi = pooling_info(mod, cls)
+                row["default_seq_pooling_type"] = pi["seq"] or "LAST"
+                row["default_tok_pooling_type"] = pi["tok"] or "ALL"
+                row["attn_type"] = pi["attn"] or "decoder"
+                row["is_hybrid"] = has_interface(mod, cls, "IsHybrid")
+                row["is_attention_free"] = has_interface(mod, cls, "IsAttentionFree")
                 comp = MODELED.get((mod, cls))
                 if comp:
                     row["component"] = comp
@@ -151,7 +246,7 @@ def main():
     models, spans, prev, oot = parse_registry()
     doc = {"schema_version": 1, "id": "vllm", "components": [], "interfaces": [], "schemas": [],
            "configs": [], "flows": [], "scenarios": [], "fixtures": []}
-    for f in ["core-registry.yaml", "core-loader.yaml", "core-layers.yaml", "core-moe.yaml", "core-lora.yaml", "core-fix.yaml", "core-mm.yaml", "core-r3.yaml", "core-r4.yaml", "core-r4b.yaml", "core-r4c.yaml", "core-r5.yaml"]:
+    for f in ["core-registry.yaml", "core-loader.yaml", "core-layers.yaml", "core-moe.yaml", "core-lora.yaml", "core-fix.yaml", "core-mm.yaml", "core-r3.yaml", "core-r4.yaml", "core-r4b.yaml", "core-r4c.yaml", "core-r5.yaml", "core-r6.yaml"]:
         part = load(f)
         for i in part.get("interfaces") or []:
             if f in DEFAULTS_FILES or (i["component"] + "." + i["name"]) in DEFAULTS_IFACES:
@@ -168,10 +263,11 @@ def main():
         i.pop("tags", None)
         if "latency_ms" not in i:
             i["latency_ms"] = 0  # in-process Python; the kernels below carry the time
-    for extra in (scenarios.extra(), scenarios_r4.extra(), scenarios_r5.extra()):
+    for extra in (scenarios.extra(), scenarios_r4.extra(), scenarios_r5.extra(), scenarios_r6.extra()):
         for k in ("components", "interfaces", "schemas", "configs", "flows", "scenarios", "fixtures"):
             doc[k].extend(extra.get(k) or [])
     scenarios_r5.patch(doc)
+    scenarios_r6.patch(doc)
     doc = fill(doc)
     out = OUT / "fragments" / "models-layers.yaml"
     out.write_text("# Generated by examples/vllm/gen/models-layers/build.py; edit the generator, not this file.\n"

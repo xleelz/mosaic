@@ -263,6 +263,36 @@ interfaces:
         return: {kernel: top_k_top_p_sampling_from_logits}
 
   - component: encoder-runner
+    name: profile-encoder-cache
+    kind: function
+    summary: "EncoderRunner.profile_encoder_cache: with a nonzero budget and a tower modality, log the budget and run the encoder over the dummy items of the maximum feature size, so the peak includes the tower and its outputs (reset after the profile run)."
+    sources: ["vllm/v1/worker/gpu/mm/encoder_runner.py:111-147", "vllm/v1/worker/gpu/model_runner.py:993-1021"]
+    latency_ms: 0
+    response: {type: object, properties: {profiled: {type: boolean}, modality: {type: [string, "null"]}, num_items: {type: integer}, encoder_budget: {type: integer}}}
+    behavior:
+      - call: hf-hub.download-config
+        input: {model: "= config['model']"}
+        as: hfc
+      - call: multi-modal-budget.init
+        input: {model: "= config['model']", architectures: "= vars.hfc.value.architectures"}
+        as: budget
+      - call: multi-modal-budget.get-dummy-encoder-profile-inputs
+        input: {budget: "= vars.budget.value"}
+        as: dummy
+      - set:
+          vars.encoder_budget: "= math.least(vars.budget.value.encoder_compute_budget, vars.budget.value.encoder_cache_size)"
+      - if: "vars.encoder_budget <= 0 || size(vars.dummy.value.items) == 0"
+        then:
+          - title: "No budget, or embedding-only (all limits 0 with enable_mm_embeds): the tower is not profiled"
+            source: "vllm/v1/worker/gpu/mm/encoder_runner.py:117-125"
+            return: {profiled: false, modality: null, num_items: 0, encoder_budget: "= vars.encoder_budget"}
+      - title: "execute_mm_encoder(dummy_mm_inputs): the model's embed_multimodal runs the tower on the dummy batch"
+        source: "vllm/v1/worker/gpu/mm/encoder_runner.py:139"
+        call: "= vars.hfc.value.architectures[0] == 'Qwen3VLForConditionalGeneration' ? 'qwen3-vl-for-conditional-generation.embed-multimodal' : 'qwen2-vl-for-conditional-generation.embed-multimodal'"
+        targets: [qwen2-vl-for-conditional-generation.embed-multimodal, qwen3-vl-for-conditional-generation.embed-multimodal]
+        input: {mm_kwargs: "= vars.dummy.value.items"}
+      - return: {profiled: true, modality: "= vars.dummy.value.modality", num_items: "= size(vars.dummy.value.items)", encoder_budget: "= vars.encoder_budget"}
+  - component: encoder-runner
     name: execute-mm-encoder
     kind: function
     summary: "ModelState.execute_mm_encoder (prepare_mm_inputs + the encoder forward): for each scheduled encoder input, skip items without data or already cached by mm hash, run the vision encoder on the rest, and store each output in the encoder cache under its mm hash."
@@ -290,12 +320,12 @@ interfaces:
           - title: Every scheduled item is cached already; the encoder does not run
             source: "vllm/v1/worker/gpu/model_states/interface.py:197"
             return: {mm_hashes: []}
-      - if: "has(input.model_component) && input.model_component == 'qwen2-vl-for-conditional-generation'"
+      - if: "has(input.model_component) && input.model_component in ['qwen2-vl-for-conditional-generation', 'qwen3-vl-for-conditional-generation']"
         then:
           - title: "The model's embed_multimodal runs the vision tower on the batched items (_execute_mm_encoder)"
             source: "vllm/v1/worker/gpu/mm/encoder_runner.py:150-175"
             call: "= input.model_component + '.embed-multimodal'"
-            targets: [qwen2-vl-for-conditional-generation.embed-multimodal]
+            targets: [qwen2-vl-for-conditional-generation.embed-multimodal, qwen3-vl-for-conditional-generation.embed-multimodal]
             input:
               mm_kwargs: "= vars.hashes.map(h, vars.feats.filter(f, f.identifier == h)[0]).map(f, {'modality': has(f.modality) ? f.modality : 'image', 'kind': 'pixel_values', 'grid_thw': has(f.grid_thw) ? f.grid_thw : [1, 2 * int(math.ceil(math.sqrt(double(f.length)))), 2 * int(math.ceil(math.sqrt(double(f.length))))]})"
       - title: Store each output in the encoder cache under its mm hash

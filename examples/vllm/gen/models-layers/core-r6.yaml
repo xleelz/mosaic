@@ -1,0 +1,1533 @@
+# models-layers fix round 6 (mechanism coverage): kernel warmup and FlashInfer autotune with the
+# deferred-MoE token counts, the Qwen-VL Triton warmup and the Qwen3-VL architecture,
+# EmbeddingGemma2 (bidirectional sliding layers with the +1 window offset), the Attention layer's
+# window and attention type, the pooler family (DispatchPooler, CLS/LAST/MEAN pooling, the
+# embedding head), the shared-memory processor cache, and MoE expert placement.
+components:
+  - id: multi-modal-budget
+    name: MultiModalBudget
+    kind: module
+    parent: model-executor
+    layer: multimodal
+    summary: "Budget helper the worker's profile_run and the scheduler build from the model's processor: the most tokens one item of each active modality can take, the encoder compute budget and cache size, and the items of the largest modality to profile."
+    sources: ["vllm/multimodal/encoder_budget.py:43-140", "vllm/multimodal/encoder_budget.py:190-218"]
+  - id: kernel-warmup
+    name: model_executor/warmup/kernel_warmup.py
+    kind: module
+    parent: model-executor
+    layer: warmup
+    summary: "kernel_warmup (called by Worker.compile_or_warm_up_model): JIT warmup, the Qwen-VL Triton warmup, DeepGEMM and FlashInfer autotune (one profile dummy run per token count: max_num_batched_tokens, then each deferred-MoE finalize limit)."
+    sources: ["vllm/model_executor/warmup/kernel_warmup.py:162-290", "vllm/model_executor/warmup/kernel_warmup.py:314-381"]
+  - id: qwen-vl-triton-warmup
+    name: model_executor/warmup/qwen_vl_triton_warmup.py
+    kind: module
+    parent: model-executor
+    layer: warmup
+    summary: "Warms the Qwen3-VL vision tower's position-embedding interpolation and vision rotary kernels on a few grids, and the M-RoPE Triton kernel of SupportsMRoPE models, without running a forward."
+    sources: ["vllm/model_executor/warmup/qwen_vl_triton_warmup.py:1-116"]
+  - id: qwen3-vl-for-conditional-generation
+    name: Qwen3VLForConditionalGeneration
+    kind: module
+    parent: model-executor
+    layer: models
+    summary: "Qwen3-VL: a Qwen3 vision transformer (16 x 16 patches, learned position embeddings interpolated per grid, 2-D rotary, 2x2 merger plus DeepStack mergers) and a Qwen3 language model with interleaved M-RoPE that adds the DeepStack visual features to its first layers. Holds this rank's loaded weights."
+    sources: ["vllm/model_executor/models/qwen3_vl.py:1938-2063", "vllm/model_executor/models/qwen3_vl.py:3165-3230"]
+    state:
+      initial: {loaded: false}
+  - id: qwen3-vision-transformer
+    name: Qwen3_VisionTransformer
+    kind: module
+    parent: qwen3-vl-for-conditional-generation
+    layer: models
+    summary: "The Qwen3-VL vision tower: patch embedding, pos_embed (num_position_embeddings learned positions, bilinearly interpolated to each grid), the 2-D rotary over half the head dim, depth ViT blocks, the patch merger and one DeepStack merger per deepstack_visual_indexes entry."
+    sources: ["vllm/model_executor/models/qwen3_vl.py:561-678", "vllm/model_executor/models/qwen3_vl.py:718-763"]
+  - id: qwen3-vision-attention
+    name: Qwen3-VL vision attention (Qwen2_5_VisionAttention)
+    kind: module
+    parent: qwen3-vision-transformer
+    layer: models
+    summary: "The vision blocks' attention: QKV projection, apply_rotary_emb with the tower's cos/sin, the ViT attention backend, output projection; heads split across TP."
+    sources: ["vllm/model_executor/models/qwen3_vl.py:455-507"]
+  - id: qwen3-vl-processing-info
+    name: Qwen3VLProcessingInfo
+    kind: module
+    parent: multi-modal-registry
+    layer: multimodal
+    summary: "Qwen3-VL's processing info (a Qwen2VLProcessingInfo): image and video, no fixed limit; the token count of an item from smart_resize with factor patch_size x merge_size (32) and the image processor's shortest/longest edge."
+    sources: ["vllm/model_executor/models/qwen3_vl.py:925-1022"]
+  - id: embedding-gemma2-model
+    name: EmbeddingGemma2Model
+    kind: module
+    parent: model-executor
+    layer: models
+    summary: "EmbeddingGemma2: a bidirectional Gemma4-derived multimodal embedding model (MEAN sequence pooling, ALL token pooling). Its text layers use ENCODER_ONLY attention; sliding layers get per_layer_sliding_window = sliding_window + 1, because vLLM's encoder-only window masks |q-k| <= W-1 where HF masks <= W."
+    sources: ["vllm/model_executor/models/embedding_gemma2.py:979-1139", "vllm/model_executor/models/embedding_gemma2.py:83-160"]
+    state:
+      initial: {loaded: false}
+  - id: dispatch-pooler
+    name: DispatchPooler
+    kind: module
+    parent: model-executor
+    layer: pooling
+    summary: "The pooling model's pooler: one sub-pooler per pooling task (embed and token_embed for embedding models, classify and token_classify for classifiers); each batch's requests are grouped by task and routed to their sub-pooler."
+    sources: ["vllm/model_executor/layers/pooler/special.py:25-150"]
+  - id: sequence-pooling-method
+    name: SequencePoolingMethod (CLSPool, LastPool, MeanPool)
+    kind: module
+    parent: dispatch-pooler
+    layer: pooling
+    summary: "Sequence pooling: CLS takes each prompt's first token, LAST its last token, MEAN the average over the prompt. CLS and MEAN need the whole prompt in one step (a partial prefill is a RuntimeError)."
+    sources: ["vllm/model_executor/layers/pooler/seqwise/methods.py:21-119"]
+  - id: embedding-pooler-head
+    name: EmbeddingPoolerHead
+    kind: module
+    parent: dispatch-pooler
+    layer: pooling
+    summary: "The embed task's head: cast to head_dtype, the Sentence-Transformers projector if any, Matryoshka truncation to each request's dimensions, then normalization for requests with use_activation."
+    sources: ["vllm/model_executor/layers/pooler/seqwise/heads.py:33-117"]
+  - id: shm-object-store-sender-cache
+    name: ShmObjectStoreSenderCache
+    kind: module
+    parent: multi-modal-registry
+    layer: multimodal
+    summary: "P0's processor cache when --mm-processor-cache-type shm: items go into a single-writer shared-memory ring buffer (mm_processor_cache_gb) read by every worker; a cached item is sent as its address, monotonic id and signature instead of tensors."
+    sources: ["vllm/multimodal/cache/shm.py:64-245"]
+    state:
+      initial: {entries: {}, order: [], used_bytes: 0, next_id: 0, hits: 0, total: 0}
+  - id: shm-object-store-receiver-cache
+    name: ShmObjectStoreReceiverCache
+    kind: module
+    parent: model-executor
+    layer: multimodal
+    summary: "The worker side of the shm processor cache: an item that carries an address is read back from shared memory; one without is used as is."
+    sources: ["vllm/multimodal/cache/shm.py:248-324"]
+
+  - id: bert-embedding-model
+    name: BertEmbeddingModel / RobertaEmbeddingModel
+    kind: module
+    parent: model-executor
+    layer: models
+    summary: "BERT-family embedding models (BertModel and XLMRobertaModel checkpoints): BertModel with EncoderOnlyAttention in every layer (bidirectional, no KV cache) and DispatchPooler.for_embedding; CLS pooling by default."
+    sources: ["vllm/model_executor/models/bert.py:450-525", "vllm/model_executor/models/roberta.py:116-185"]
+    state:
+      initial: {loaded: false}
+
+  - id: vision-utils
+    name: model_executor/models/vision.py
+    kind: module
+    parent: model-executor
+    layer: models
+    summary: "Vision-tower helpers: the ViT attention backend (--mm-encoder-attn-backend or the platform's first supported), and --mm-encoder-tp-mode data, where each TP rank runs a whole tower on a greedy, size-balanced share of the images and the embeddings are padded, all-gathered and put back in order."
+    sources: ["vllm/model_executor/models/vision.py:100-113", "vllm/model_executor/models/vision.py:323-581"]
+  - id: online-quantization-config
+    name: OnlineQuantizationConfig
+    kind: module
+    parent: quantization
+    layer: quantization
+    summary: "Online quantization (--quantization fp8 / fp8_per_tensor on an unquantized checkpoint): each LinearBase is quantized at load by its scheme, and the load logs a summary of the quantized layers."
+    sources: ["vllm/model_executor/layers/quantization/online/base.py:151-198"]
+
+interfaces:
+  - component: multi-modal-budget
+    name: init
+    kind: function
+    latency_ms: 0
+    summary: "MultiModalBudget.__init__: build the processor; the active modalities are those with a nonzero limit; get_mm_max_tokens_per_item bounds each (Qwen2-VL: the max_pixels image, and for a video the frames that fit in max_model_len); then compute_mm_encoder_budget and each modality's max items per prompt and per batch."
+    sources: ["vllm/multimodal/encoder_budget.py:46-140", "vllm/multimodal/encoder_budget.py:143-187", "vllm/model_executor/models/qwen2_vl.py:980-987", "vllm/model_executor/models/qwen2_vl.py:1130-1177"]
+    request:
+      type: object
+      required: [model, architectures]
+      properties:
+        model: {type: string, examples: [Qwen/Qwen2-VL-7B-Instruct]}
+        architectures: {type: array, items: {type: string, examples: [Qwen2VLForConditionalGeneration]}}
+    response: {type: object, properties: {encoder_compute_budget: {type: integer}, encoder_cache_size: {type: integer}, mm_max_toks_per_item: {type: object}, mm_max_items_per_batch: {type: object}}}
+    behavior:
+      - title: "mm_registry.create_processor(model_config)"
+        source: "vllm/multimodal/encoder_budget.py:60"
+        call: multi-modal-registry.create-processor
+        input: {model: "= input.model", architectures: "= input.architectures"}
+        as: proc
+      - title: "The modalities with a limit above 0 pass through the encoder tower; limit_mm_per_prompt overrides the processor's (null = unlimited)"
+        source: "vllm/multimodal/encoder_budget.py:67-79"
+        set:
+          vars.limits: "= config['limit-mm-per-prompt']"
+          vars.modalities: "= vars.proc.value.supported_limits.map(m, m).filter(m, !(m in config['limit-mm-per-prompt']) || int(config['limit-mm-per-prompt'][m]) > 0)"
+      - title: "get_mm_max_tokens_per_item: Qwen2-VL's largest image is (max_pixels / 14^2) / merge^2 tokens; a video gets the most 2-frame groups of that size that fit in max_model_len, at least one"
+        source: "vllm/model_executor/models/qwen2_vl.py:1130-1177"
+        set:
+          vars.max_image: "= 12845056 / (14 * 14 * 4)"
+          vars.vl: "= input.architectures[0] in ['Qwen2VLForConditionalGeneration', 'Qwen2_5_VLForConditionalGeneration', 'Qwen3VLForConditionalGeneration']"
+      - set:
+          vars.max_video: "= math.greatest(int(config['max-model-len']) / vars.max_image, 1) * vars.max_image"
+      - set:
+          vars.toks: "= vars.modalities.filter(m, m in vars.proc.value.tokens_per_item).transformMapEntry(i, m, {m: vars.vl ? (m == 'video' ? vars.max_video : vars.max_image) : vars.proc.value.tokens_per_item[m]})"
+      - title: "compute_mm_encoder_budget(scheduler_config, active_mm_max_toks_per_item)"
+        source: "vllm/multimodal/encoder_budget.py:115-120"
+        call: encoder-cache-manager.compute-mm-encoder-budget
+        input: {mm_max_toks_per_item: "= vars.toks"}
+        as: b
+      - set:
+          vars.budget: "= math.least(vars.b.value.encoder_compute_budget, vars.b.value.encoder_cache_size)"
+      - title: "_get_max_items: the encoder budget's items, capped by the decoder's (max_num_reqs x items per prompt, at least 1)"
+        source: "vllm/multimodal/encoder_budget.py:143-187"
+        set:
+          vars.items: "= vars.toks.transformMap(m, n, n == 0 || vars.budget == 0 ? 0 : math.greatest(1, math.least(vars.budget / n, math.least(int(config['max-num-seqs']), config['enable-chunked-prefill'] ? int(config['max-num-seqs']) : int(config['max-num-batched-tokens']) / n) * math.greatest(1, math.least(m in vars.limits ? int(vars.limits[m]) : 2147483647, int(config['max-model-len']) / n)))))"
+      - return: {encoder_compute_budget: "= vars.b.value.encoder_compute_budget", encoder_cache_size: "= vars.b.value.encoder_cache_size", mm_max_toks_per_item: "= vars.toks", mm_max_items_per_batch: "= vars.items"}
+  - component: multi-modal-budget
+    name: get-dummy-encoder-profile-inputs
+    kind: function
+    latency_ms: 0
+    summary: "get_dummy_encoder_profile_inputs: the modality with the most tokens (ties to the larger name), one dummy item of its maximum feature size repeated max_items_per_batch times; empty without a budget."
+    sources: ["vllm/multimodal/encoder_budget.py:193-218"]
+    request:
+      type: object
+      required: [budget]
+      properties:
+        budget: {type: object}
+    response: {type: object, properties: {modality: {type: [string, "null"]}, items: {type: array}}}
+    behavior:
+      - if: "math.least(input.budget.encoder_compute_budget, input.budget.encoder_cache_size) <= 0 || size(input.budget.mm_max_toks_per_item) == 0"
+        then: [{source: "vllm/multimodal/encoder_budget.py:198-199", return: {modality: null, items: []}}]
+      - set:
+          vars.mods: "= input.budget.mm_max_toks_per_item.map(m, m).sort()"
+          vars.best: "= math.greatest(input.budget.mm_max_toks_per_item.transformList(k, v, v))"
+      - set:
+          vars.modality: "= vars.mods.filter(m, input.budget.mm_max_toks_per_item[m] == vars.best).reverse()[0]"
+      - title: "The dummy item's grid: patches for its tokens x merge^2, as a square per frame group (Qwen2-VL: a video is 2 temporal groups of 256 x 256 patches for 32768 tokens)"
+        source: "vllm/multimodal/encoder_budget.py:205-216"
+        set:
+          vars.t: "= vars.modality == 'video' ? vars.best / (12845056 / (14 * 14 * 4)) : 1"
+          vars.side: "= int(math.sqrt(double(vars.best * 4 / (vars.modality == 'video' ? vars.best / (12845056 / (14 * 14 * 4)) : 1))))"
+      - source: "vllm/multimodal/encoder_budget.py:218"
+        return:
+          modality: "= vars.modality"
+          items: "= lists.range(input.budget.mm_max_items_per_batch[vars.modality]).map(i, {'modality': vars.modality, 'kind': 'pixel_values', 'grid_thw': [vars.t, vars.side, vars.side]})"
+  # ---------------------------------------------------------------- expert placement
+  - component: expert-map-manager
+    name: determine-expert-placement-strategy
+    kind: function
+    summary: "determine_expert_placement_strategy: round_robin needs multiple expert groups, no redundant experts and no EPLB, and (with all2all kernels) a backend with round-robin routing tables; otherwise it warns and falls back to linear."
+    sources: ["vllm/model_executor/layers/fused_moe/expert_map_manager.py:116-148"]
+    request:
+      type: object
+      required: [expert_placement_strategy]
+      properties:
+        expert_placement_strategy: {type: string, examples: [round_robin]}
+        num_expert_group: {type: [integer, "null"], default: null}
+        num_redundant_experts: {type: integer, default: 0}
+        enable_eplb: {type: boolean, default: false}
+        use_all2all_kernels: {type: boolean, default: false}
+        needs_round_robin_routing_tables: {type: boolean, default: false}
+        all2all_backend: {type: string, default: allgather_reducescatter}
+    response: {type: object, properties: {strategy: {type: string}, warning: {type: [string, "null"]}}}
+    behavior:
+      - if: "input.expert_placement_strategy == 'round_robin'"
+        then:
+          - title: "round_robin needs expert groups, no redundant experts and no EPLB, else logger.warning: Round-robin expert placement is only supported for models with multiple expert groups and no redundant experts. Falling back to linear expert placement."
+            source: "vllm/model_executor/layers/fused_moe/expert_map_manager.py:123-136"
+            if: "!((input.num_expert_group != null && input.num_expert_group > 1) && input.num_redundant_experts == 0 && !input.enable_eplb)"
+            then:
+              - return: {strategy: linear, warning: "Round-robin expert placement is only supported for models with multiple expert groups and no redundant experts. Falling back to linear expert placement."}
+          - title: "All2all kernels need a backend with round-robin routing tables (DeepEP low-latency, NIXL EP), else a warning: Falling back to linear expert placement."
+            source: "vllm/model_executor/layers/fused_moe/expert_map_manager.py:137-146"
+            if: "input.use_all2all_kernels && !input.needs_round_robin_routing_tables"
+            then:
+              - return: {strategy: linear, warning: "= 'Round-robin expert placement currently only supports the DeepEP low-latency or NIXL EP backend, but \\'' + input.all2all_backend + '\\' was configured. Falling back to linear expert placement.'"}
+      - source: "vllm/model_executor/layers/fused_moe/expert_map_manager.py:148"
+        return: {strategy: "= input.expert_placement_strategy", warning: null}
+
+  # ---------------------------------------------------------------- deferred MoE finalize
+  - component: fused-moe-config
+    name: defer-moe-finalize
+    kind: function
+    summary: "FusedMoEConfig.defer_moe_finalize / limit_deferred_moe_finalize / use_deferred_moe_finalize: a layer whose consumer fuses the top-k reduction asks once at build time (capped at max_num_tokens; the cap only goes down); the request is honored only on a TP-only deployment (tp > 1, dp = ep = pcp = 1, no sequence parallelism) without hidden-dim padding."
+    sources: ["vllm/model_executor/layers/fused_moe/config.py:1459-1531", "vllm/model_executor/layers/fused_moe/config.py:1305-1310"]
+    request:
+      type: object
+      properties:
+        requested: {type: boolean, default: false, description: "the layer called defer_moe_finalize() (_defer_moe_finalize)"}
+        max_num_tokens: {type: integer, default: -1, description: "the consumer's limit; negative is no limit"}
+        current_max_num_tokens: {type: integer, default: -1, description: "defer_moe_finalize_max_num_tokens before the call"}
+        tp_size: {type: integer, default: 1}
+        dp_size: {type: integer, default: 1}
+        ep_size: {type: integer, default: 1}
+        pcp_size: {type: integer, default: 1}
+        is_sequence_parallel: {type: boolean, default: false}
+        hidden_dim: {type: integer, default: 4096}
+        hidden_dim_unpadded: {type: integer, default: 4096}
+    response:
+      type: object
+      properties:
+        use_deferred_moe_finalize: {type: boolean}
+        defer_moe_finalize_max_num_tokens: {type: integer}
+    behavior:
+      - title: "limit_deferred_moe_finalize: a non-negative limit replaces an unbounded or larger one"
+        source: "vllm/model_executor/layers/fused_moe/config.py:1523-1531"
+        set:
+          vars.cap: "= input.requested && input.max_num_tokens >= 0 && (input.current_max_num_tokens < 0 || input.max_num_tokens < input.current_max_num_tokens) ? input.max_num_tokens : input.current_max_num_tokens"
+      - title: "use_deferred_moe_finalize is evaluated on read"
+        source: "vllm/model_executor/layers/fused_moe/config.py:1459-1477"
+        return:
+          use_deferred_moe_finalize: "= input.requested && input.tp_size > 1 && input.dp_size == 1 && input.ep_size == 1 && input.pcp_size == 1 && !input.is_sequence_parallel && input.hidden_dim == input.hidden_dim_unpadded"
+          defer_moe_finalize_max_num_tokens: "= vars.cap"
+
+  - component: fused-moe-config
+    name: should-defer-moe-finalize
+    kind: function
+    summary: "should_defer_moe_finalize(num_tokens): deferral is on for this deployment, the call is non-empty and within the cap (a negative cap is unbounded)."
+    sources: ["vllm/model_executor/layers/fused_moe/config.py:1514-1521"]
+    request:
+      type: object
+      required: [num_tokens]
+      properties:
+        num_tokens: {type: integer, examples: [64]}
+        use_deferred_moe_finalize: {type: boolean, default: false}
+        defer_moe_finalize_max_num_tokens: {type: integer, default: -1}
+    response: {type: object, properties: {defer: {type: boolean}}}
+    behavior:
+      - source: "vllm/model_executor/layers/fused_moe/config.py:1516-1521"
+        return:
+          defer: "= input.use_deferred_moe_finalize && input.num_tokens > 0 && (input.defer_moe_finalize_max_num_tokens < 0 || input.num_tokens <= input.defer_moe_finalize_max_num_tokens)"
+
+  - component: mixtral-for-causal-lm
+    name: get-moe-configs
+    kind: function
+    summary: "The moe_config of each MoERunner in model.modules(), as kernel warmup reads them: Mixtral never asks for deferred finalization (only Kimi-K3 and DeepSeek-V4.1 layers do), so every layer reports use_deferred_moe_finalize false; a seeded defer_moe_finalize_requests list stands for a deferring model's per-layer requests."
+    sources: ["vllm/model_executor/warmup/kernel_warmup.py:317-330", "vllm/model_executor/models/mixtral.py:93-131"]
+    request: {type: object}
+    response: {type: object, properties: {moe_configs: {type: array, items: {type: object}}}}
+    errors:
+      - {code: attribute-error, status: 0, retryable: false}
+    behavior:
+      - if: "!state.loaded"
+        then:
+          - fail: {code: attribute-error, status: 0, message: "model weights are not loaded on this rank"}
+      - set:
+          vars.reqs: "= has(state.cfg.defer_moe_finalize_requests) ? state.cfg.defer_moe_finalize_requests : []"
+          vars.out: []
+      - foreach: "= vars.reqs"
+        as: r
+        steps:
+          - call: fused-moe-config.defer-moe-finalize
+            input:
+              requested: "= has(vars.r.requested) ? vars.r.requested : true"
+              max_num_tokens: "= has(vars.r.max_num_tokens) ? vars.r.max_num_tokens : -1"
+              tp_size: "= state.cfg.moe_tp"
+              dp_size: "= int(config['data-parallel-size'])"
+              ep_size: "= state.cfg.ep_size"
+              hidden_dim: "= state.cfg.hidden_size"
+              hidden_dim_unpadded: "= state.cfg.hidden_size"
+            as: d
+          - set: {vars.out: "= vars.out + [vars.d.value]"}
+      - return:
+          moe_configs: "= size(vars.out) > 0 ? vars.out : lists.range(state.cfg.num_layers).map(i, {'use_deferred_moe_finalize': false, 'defer_moe_finalize_max_num_tokens': -1})"
+
+  # ---------------------------------------------------------------- kernel warmup
+  - component: kernel-warmup
+    name: kernel-warmup
+    kind: function
+    summary: "kernel_warmup(worker): the Qwen-VL Triton warmup, then (unless process_local_only) FlashInfer autotune when enable_flashinfer_autotune isn't False, FlashInfer is installed and the GPU is SM90 or newer, then the FlashInfer attention warmup for non-pooling models whose attention groups are all FlashInfer."
+    sources: ["vllm/model_executor/warmup/kernel_warmup.py:162-290"]
+    request:
+      type: object
+      properties:
+        process_local_only: {type: boolean, default: false}
+        is_pooling_model: {type: boolean, default: false}
+    response:
+      type: object
+      properties:
+        autotuned: {type: boolean}
+        autotune_skipped: {type: [string, "null"]}
+        token_counts: {type: array, items: {type: integer}}
+    behavior:
+      - title: "The runner's model (attribute-error before load_model)"
+        call: gpu-model-runner.get-model
+        as: m
+      - title: "qwen_vl_triton_warmup(worker.model_runner): Qwen3-VL vision kernels and M-RoPE"
+        source: "vllm/model_executor/warmup/kernel_warmup.py:195"
+        call: qwen-vl-triton-warmup.qwen-vl-triton-warmup
+        input: {architecture: "= has(vars.m.value.architecture) ? vars.m.value.architecture : ''"}
+      - title: "process_local_only stops before the collective warmups"
+        source: "vllm/model_executor/warmup/kernel_warmup.py:224-225"
+        if: "input.process_local_only"
+        then:
+          - return: {autotuned: false, autotune_skipped: process_local_only, token_counts: []}
+      - title: "enable_flashinfer_autotune: None resolves from the optimization level (False at -O0, True at -O1..-O3)"
+        source: "vllm/config/vllm.py:264-330"
+        set:
+          vars.enabled: "= 'enable-flashinfer-autotune' in config && config['enable-flashinfer-autotune'] != null ? config['enable-flashinfer-autotune'] : int(config['optimization-level']) != 0"
+      - title: "Disabled: log and skip"
+        source: "vllm/model_executor/warmup/kernel_warmup.py:259-264"
+        if: "!vars.enabled"
+        then:
+          - return: {autotuned: false, autotune_skipped: "Skipping FlashInfer autotune because it is disabled.", token_counts: []}
+      - title: "has_flashinfer() and has_device_capability(90): Hopper or Blackwell"
+        source: "vllm/model_executor/warmup/kernel_warmup.py:265-267"
+        call: flashinfer.has-flashinfer
+        as: fi
+      - call: platforms.has-device-capability
+        input: {capability: 90}
+        as: cap
+      - if: "!vars.fi.value.available || !vars.cap.value.result"
+        then:
+          - return: {autotuned: false, autotune_skipped: "= !vars.fi.value.available ? 'flashinfer not available' : 'device capability below 9.0'", token_counts: []}
+      - source: "vllm/model_executor/warmup/kernel_warmup.py:267"
+        call: kernel-warmup.flashinfer-autotune
+        input: {architecture: "= has(vars.m.value.architecture) ? vars.m.value.architecture : ''"}
+        as: at
+      - return: {autotuned: true, autotune_skipped: null, token_counts: "= vars.at.value.token_counts"}
+
+  - component: kernel-warmup
+    name: flashinfer-autotune-token-counts
+    kind: function
+    summary: "_flashinfer_autotune_token_counts: max_num_batched_tokens first (the widest bucket set), then min(max, limit) for every MoE layer whose moe_config defers finalization with a positive limit, de-duplicated in order."
+    sources: ["vllm/model_executor/warmup/kernel_warmup.py:314-339"]
+    request:
+      type: object
+      properties:
+        max_num_batched_tokens: {type: integer, examples: [8192]}
+        moe_configs: {type: array, default: [], items: {type: object}}
+    response: {type: object, properties: {token_counts: {type: array, items: {type: integer}}}}
+    behavior:
+      - title: "Deferred-MoE counts: only layers with use_deferred_moe_finalize and a limit > 0"
+        source: "vllm/model_executor/warmup/kernel_warmup.py:320-330"
+        set:
+          vars.deferred: "= input.moe_configs.filter(c, c.use_deferred_moe_finalize && c.defer_moe_finalize_max_num_tokens > 0).map(c, math.least(input.max_num_batched_tokens, c.defer_moe_finalize_max_num_tokens))"
+      - set:
+          vars.all: "= [input.max_num_batched_tokens] + vars.deferred"
+      - title: "tuple(dict.fromkeys(...)): de-duplicate, first occurrence wins"
+        source: "vllm/model_executor/warmup/kernel_warmup.py:332-339"
+        return:
+          token_counts: "= lists.range(size(vars.all)).filter(i, !vars.all.slice(0, i).exists(x, x == vars.all[i])).map(i, vars.all[i])"
+
+  - component: kernel-warmup
+    name: flashinfer-autotune
+    kind: function
+    summary: "flashinfer_autotune(runner): inside FlashInfer's autotune(tune_mode=True), one profile dummy run per token count with randomized inputs and EPLB skipped (randomized routing keeps every EP rank in the synchronized MoE kernels); results are saved per rank to the autotune cache file."
+    sources: ["vllm/model_executor/warmup/kernel_warmup.py:404-504", "vllm/model_executor/warmup/kernel_warmup.py:342-381"]
+    request:
+      type: object
+      properties:
+        architecture: {type: string, default: ""}
+    response: {type: object, properties: {token_counts: {type: array, items: {type: integer}}, cache_file: {type: string}}}
+    behavior:
+      - set: {vars.moe: []}
+      - title: "for module in runner.get_model().modules(): isinstance(module, MoERunner)"
+        source: "vllm/model_executor/warmup/kernel_warmup.py:322-325"
+        if: "input.architecture.startsWith('Mixtral')"
+        then:
+          - call: mixtral-for-causal-lm.get-moe-configs
+            as: mc
+          - set: {vars.moe: "= vars.mc.value.moe_configs"}
+      - call: kernel-warmup.flashinfer-autotune-token-counts
+        input: {max_num_batched_tokens: "= int(config['max-num-batched-tokens'])", moe_configs: "= vars.moe"}
+        as: tc
+      - title: "_run_flashinfer_autotune_dummy_runs: runner._dummy_run(num_tokens, skip_eplb=True, is_profile=True, randomize_inputs=True) per count"
+        source: "vllm/model_executor/warmup/kernel_warmup.py:347-381"
+        foreach: "= vars.tc.value.token_counts"
+        as: n
+        steps:
+          - call: gpu-model-runner.dummy-run
+            input: {num_tokens: "= vars.n", is_profile: true, uniform_decode: false}
+      - title: "Each rank saves its own file: <stem>_dp<dp_rank>_rank<world rank>.json (FlashInfer keys MoE entries by tp/ep rank)"
+        source: "vllm/model_executor/warmup/kernel_warmup.py:451-456"
+        return:
+          token_counts: "= vars.tc.value.token_counts"
+          cache_file: "= 'autotune_configs_dp0_rank' + (self.startsWith('rank') ? self.substring(4) : '0') + '.json'"
+
+  # ---------------------------------------------------------------- Qwen-VL Triton warmup
+  - component: qwen-vl-triton-warmup
+    name: qwen-vl-triton-warmup
+    kind: function
+    summary: "qwen_vl_triton_warmup(runner): _warm_vision over every Qwen3_VisionTransformer of the model, then _warm_mrope for SupportsMRoPE models, then a device synchronize."
+    sources: ["vllm/model_executor/warmup/qwen_vl_triton_warmup.py:110-116"]
+    request: {type: object, properties: {architecture: {type: string, default: ""}}}
+    response: {type: object, properties: {vision_grids: {type: array}, mrope_token_counts: {type: array}}}
+    behavior:
+      - set: {vars.grids: [], vars.mrope: []}
+      - title: "_warm_vision: only Qwen3-VL towers (Qwen3_VisionTransformer modules)"
+        source: "vllm/model_executor/warmup/qwen_vl_triton_warmup.py:21-25"
+        if: "input.architecture.startsWith('Qwen3VL')"
+        then:
+          - call: qwen-vl-triton-warmup.warm-vision
+            as: wv
+          - set: {vars.grids: "= vars.wv.value.grids"}
+      - title: "_warm_mrope: supports_mrope(model) - Qwen2-VL and Qwen3-VL"
+        source: "vllm/model_executor/warmup/qwen_vl_triton_warmup.py:63-70"
+        if: "input.architecture.startsWith('Qwen3VL') || input.architecture.startsWith('Qwen2VL')"
+        then:
+          - call: qwen-vl-triton-warmup.warm-mrope
+            input: {architecture: "= input.architecture"}
+            as: wm
+          - set: {vars.mrope: "= vars.wm.value.token_counts"}
+      - return: {vision_grids: "= vars.grids", mrope_token_counts: "= vars.mrope"}
+
+  - component: qwen-vl-triton-warmup
+    name: warm-vision
+    kind: function
+    summary: "_warm_vision: for a tower whose weights are on the runner's device, grids (1, h, w) over spatial sizes [the smallest multiple of 16 reachable in merge steps, plus merge_size (and 2 when merge is 1) unless merge divides 16]; each grid runs fast_pos_embed_interpolate, rot_pos_emb and the first block's apply_rotary_emb, never the tower forward. A CPU-offloaded tower is skipped."
+    sources: ["vllm/model_executor/warmup/qwen_vl_triton_warmup.py:21-60"]
+    request: {type: object}
+    response: {type: object, properties: {grids: {type: array}, skipped: {type: boolean}}}
+    behavior:
+      - call: qwen3-vl-for-conditional-generation.get-visual
+        as: v
+      - title: "CPU offloading keeps tower weights off the accelerator: skip"
+        source: "vllm/model_executor/warmup/qwen_vl_triton_warmup.py:27-31"
+        if: "vars.v.value.device != 'cuda'"
+        then:
+          - return: {grids: [], skipped: true}
+      - set:
+          vars.m: "= vars.v.value.spatial_merge_size"
+          vars.heads: "= vars.v.value.num_heads / config['tensor-parallel-size']"
+          vars.head_size: "= vars.v.value.hidden_size / vars.v.value.num_heads"
+      - title: "divisible = round_up(16, merge), then step by merge until it divides by 16"
+        source: "vllm/model_executor/warmup/qwen_vl_triton_warmup.py:35-37"
+        set:
+          vars.div0: "= (16 + vars.m - 1) / vars.m * vars.m"
+      - set:
+          vars.div: "= lists.range(16).map(k, vars.div0 + k * vars.m).filter(x, x % 16 == 0)[0]"
+      - source: "vllm/model_executor/warmup/qwen_vl_triton_warmup.py:38-43"
+        set:
+          vars.sizes: "= vars.m % 16 != 0 ? (vars.m == 1 ? [vars.div, vars.m, 2] : [vars.div, vars.m]) : [vars.div]"
+      - set:
+          vars.grids: "= vars.sizes.map(h, vars.sizes.map(w, [1, h, w])).flatten()"
+      - foreach: "= vars.grids"
+        as: g
+        steps:
+          - source: "vllm/model_executor/warmup/qwen_vl_triton_warmup.py:47"
+            call: qwen3-vision-transformer.fast-pos-embed-interpolate
+            input: {grid_thw: ["= vars.g"], spatial_merge_size: "= vars.m", num_position_embeddings: "= vars.v.value.num_position_embeddings"}
+          - source: "vllm/model_executor/warmup/qwen_vl_triton_warmup.py:48"
+            call: qwen3-vision-transformer.rot-pos-emb
+            input: {grid_thw: ["= vars.g"], spatial_merge_size: "= vars.m", head_size: "= vars.head_size"}
+          - source: "vllm/model_executor/warmup/qwen_vl_triton_warmup.py:49-55"
+            call: qwen3-vision-attention.apply-rotary-emb
+            input: {num_tokens: "= vars.g[0] * vars.g[1] * vars.g[2]", num_heads: "= vars.heads", head_size: "= vars.head_size"}
+      - return: {grids: "= vars.grids", skipped: false}
+
+  - component: qwen-vl-triton-warmup
+    name: warm-mrope
+    kind: function
+    summary: "_warm_mrope: the model's MRotaryEmbedding on 1, 2 and 16 tokens with (3, N) positions (Triton's ==1, %16==0 and other buckets); skipped when every module holding it fuses qk-norm, rope and gate."
+    sources: ["vllm/model_executor/warmup/qwen_vl_triton_warmup.py:63-102"]
+    request: {type: object, properties: {architecture: {type: string, default: ""}}}
+    response: {type: object, properties: {token_counts: {type: array, items: {type: integer}}}}
+    behavior:
+      - source: "vllm/model_executor/warmup/qwen_vl_triton_warmup.py:17-18"
+        set: {vars.counts: [1, 2, 16]}
+      - foreach: "= vars.counts"
+        as: n
+        steps:
+          - source: "vllm/model_executor/warmup/qwen_vl_triton_warmup.py:86-100"
+            call: m-rotary-embedding.forward-cuda
+            input: {num_tokens: "= vars.n", positions_ndim: 2}
+      - return: {token_counts: "= vars.counts"}
+
+  # ---------------------------------------------------------------- Qwen3-VL
+  - component: qwen3-vl-for-conditional-generation
+    name: get-visual
+    kind: function
+    summary: "The model's visual tower settings (vision_config) and the device its weights are on; before a load on this rank, the Qwen3-VL-8B checkpoint's vision_config."
+    sources: ["vllm/model_executor/models/qwen3_vl.py:578-600", "vllm/model_executor/models/qwen3_vl.py:683-685"]
+    request: {type: object}
+    response: {type: object}
+    behavior:
+      - if: "has(state.cfg) && has(state.cfg.vision)"
+        then:
+          - return: "= merge({'device': 'cuda'}, state.cfg.vision)"
+      - title: "ASSUMPTION: Qwen/Qwen3-VL-8B-Instruct's vision_config (hidden 1152, 16 heads, depth 27, patch 16, merge 2, 2304 positions, DeepStack layers 8/16/24)"
+        return: {device: cuda, hidden_size: 1152, num_heads: 16, depth: 27, patch_size: 16, spatial_merge_size: 2, temporal_patch_size: 2, num_position_embeddings: 2304, out_hidden_size: 4096, intermediate_size: 4304, deepstack_visual_indexes: [8, 16, 24]}
+
+  - component: qwen3-vl-for-conditional-generation
+    name: init
+    kind: function
+    summary: "Qwen3VLForConditionalGeneration(vllm_config, prefix): the Qwen3 vision tower from vision_config, DeepStack (one level per deepstack_visual_indexes entry, buffers of max_num_batched_tokens x text hidden size), and Qwen3LLMForCausalLM built on text_config with architectures ['Qwen3ForCausalLM']."
+    sources: ["vllm/model_executor/models/qwen3_vl.py:1997-2063"]
+    tags: [writes]
+    request:
+      type: object
+      required: [hf_config, quant]
+      properties:
+        hf_config: ModelsHfConfig
+        quant: {type: string, examples: [unquantized]}
+        kv_quant_method: {type: string, default: none}
+    errors:
+      - {code: assertion-error, status: 0, retryable: false}
+    behavior:
+      - set:
+          vars.hf: "= input.hf_config"
+          vars.tp: "= config['tensor-parallel-size']"
+      - title: "The text model's settings come from text_config (Qwen3VLConfig nests them)"
+        source: "vllm/model_executor/models/qwen3_vl.py:2052-2058"
+        set:
+          vars.t: "= has(vars.hf.text_config) && vars.hf.text_config != null ? merge(vars.hf.transformMap(k, v, !(k in ['text_config', 'vision_config']), v), vars.hf.text_config) : vars.hf"
+      - set:
+          vars.vis: "= has(vars.hf.vision_config) && vars.hf.vision_config != null ? vars.hf.vision_config : {}"
+      - title: "Qwen3Attention: heads and KV heads split across TP ranks"
+        source: "vllm/model_executor/models/qwen3.py:79-96"
+        if: "vars.t.num_attention_heads % vars.tp != 0 || (vars.t.num_key_value_heads >= vars.tp && vars.t.num_key_value_heads % vars.tp != 0) || (vars.t.num_key_value_heads < vars.tp && vars.tp % vars.t.num_key_value_heads != 0)"
+        then:
+          - fail: {code: assertion-error, status: 0, message: ""}
+      - call: qwen3-vl-for-conditional-generation.get-visual
+        as: dv
+      - set:
+          vars.v: "= merge(vars.dv.value, vars.vis)"
+      - title: "Attention.__init__ selects the backend (get_attn_backend) while the model is built: an unsupported --attention-backend fails here"
+        source: "vllm/model_executor/layers/attention/attention.py:350-360"
+        call: attention-layer.init
+        input: {num_heads: "= vars.t.num_attention_heads / vars.tp", head_size: "= vars.t.hidden_size / vars.t.num_attention_heads", num_kv_heads: "= math.greatest(1, vars.t.num_key_value_heads / vars.tp)"}
+      - title: "Each attention layer initializes its KV-cache scales and quant method"
+        source: "vllm/model_executor/layers/attention/attention.py:157-226"
+        call: attention-layer.init-kv-cache-quant
+        input: {kv_quant_method: "= input.kv_quant_method"}
+      - set:
+          vars.head_dim: "= has(vars.t.head_dim) && vars.t.head_dim != null ? vars.t.head_dim : vars.t.hidden_size / vars.t.num_attention_heads"
+      - title: "use_deepstack: the vision config lists deepstack_visual_indexes; out_hidden_size grows by one visual_dim per level"
+        source: "vllm/model_executor/models/qwen3_vl.py:2024-2048"
+        set:
+          state.loaded: false
+          state.tp_size: "= vars.tp"
+          state.quant: "= input.quant"
+          state.rope: MRotaryEmbedding
+          state.cfg:
+            hidden_size: "= vars.t.hidden_size"
+            num_heads: "= vars.t.num_attention_heads"
+            num_kv_heads: "= vars.t.num_key_value_heads"
+            head_dim: "= vars.head_dim"
+            intermediate_size: "= has(vars.t.intermediate_size) && vars.t.intermediate_size != null ? vars.t.intermediate_size : vars.t.hidden_size * 3"
+            num_layers: "= vars.t.num_hidden_layers"
+            vocab_size: "= vars.t.vocab_size"
+            bytes_per_weight: "= input.quant == 'unquantized' ? 2.0 : 1.0"
+            mrope_section: [24, 20, 20]
+            image_token_id: "= has(vars.hf.image_token_id) ? vars.hf.image_token_id : 151655"
+            video_token_id: "= has(vars.hf.video_token_id) ? vars.hf.video_token_id : 151656"
+            deepstack_num_level: "= has(vars.v.deepstack_visual_indexes) ? size(vars.v.deepstack_visual_indexes) : 0"
+            vision: "= vars.v"
+      - return: {initialized: true, rope: MRotaryEmbedding, deepstack_num_level: "= has(vars.v.deepstack_visual_indexes) ? size(vars.v.deepstack_visual_indexes) : 0"}
+
+  - component: qwen3-vl-for-conditional-generation
+    name: load-weights
+    kind: function
+    summary: "Qwen3VLForConditionalGeneration.load_weights: AutoWeightsLoader with hf_to_vllm_mapper (model.visual. -> visual., lm_head. -> language_model.lm_head., model.language_model. -> language_model.model.)."
+    sources: ["vllm/model_executor/models/qwen3_vl.py:3227-3229", "vllm/model_executor/models/qwen3_vl.py:1969-1975"]
+    tags: [writes]
+    request:
+      type: object
+      properties:
+        model: {type: string, examples: [Qwen/Qwen3-VL-8B-Instruct]}
+        weights_bytes: {type: integer}
+    response: {type: object, properties: {weights_bytes_per_rank: {type: integer}}}
+    behavior:
+      - source: "vllm/model_executor/models/qwen3_vl.py:1969-1975"
+        call: weights-mapper.map-name
+        input:
+          key: "model.language_model.layers.0.self_attn.q_proj.weight"
+          prefix: [["model.visual.", "visual."], ["lm_head.", "language_model.lm_head."], ["model.language_model.", "language_model.model."]]
+      - call: auto-weights-loader.load-weights
+        input: {model: "= input.model", weights_bytes: "= input.weights_bytes"}
+        as: awl
+      - set:
+          state.loaded: true
+          state.model: "= input.model"
+          state.weights_bytes_per_rank: "= vars.awl.value.weights_bytes_per_rank"
+      - return: {weights_bytes_per_rank: "= vars.awl.value.weights_bytes_per_rank"}
+
+  - component: qwen3-vl-for-conditional-generation
+    name: embed-multimodal
+    kind: function
+    summary: "embed_multimodal: per modality in kwargs order, the vision tower on the pixel inputs; each item yields t*h*w / merge^2 tokens whose embedding is the main visual_dim plus one DeepStack level per index (split off by _compute_deepstack_embeds)."
+    sources: ["vllm/model_executor/models/qwen3_vl.py:3053-3081", "vllm/model_executor/models/qwen3_vl.py:3083-3122"]
+    request:
+      type: object
+      properties:
+        mm_kwargs: {type: array, default: [], items: {type: object}, description: "{modality: image | video, grid_thw: [t, h, w]}"}
+    response: {type: object, properties: {embeddings: {type: array}, num_tokens: {type: integer}}}
+    errors:
+      - {code: attribute-error, status: 0, retryable: false}
+    behavior:
+      - if: "!state.loaded"
+        then:
+          - fail: {code: attribute-error, status: 0, message: "model weights are not loaded on this rank"}
+      - source: "vllm/model_executor/models/qwen3_vl.py:3054-3056"
+        if: "size(input.mm_kwargs) == 0"
+        then:
+          - return: {embeddings: [], num_tokens: 0}
+      - set: {vars.m: "= state.cfg.vision.spatial_merge_size"}
+      - title: "use_data_parallel (--mm-encoder-tp-mode data): run_dp_sharded_mrope_vision_model; else the tower TP-sharded"
+        source: "vllm/model_executor/models/qwen3_vl.py:2454-2498"
+        if: "config['mm-encoder-tp-mode'] == 'data'"
+        then:
+          - call: vision-utils.run-dp-sharded-mrope-vision-model
+            input: {grid_thw_list: "= input.mm_kwargs.map(k, k.grid_thw)", tower: qwen3-vision-transformer.forward, vision: "= state.cfg.vision", out_hidden_size: "= state.cfg.vision.out_hidden_size * (1 + state.cfg.deepstack_num_level)", spatial_merge_size: "= vars.m", tp_rank: "= self.startsWith('rank') ? int(self.substring(4)) % config['tensor-parallel-size'] : 0", tp_size: "= config['tensor-parallel-size']"}
+        else:
+          - call: qwen3-vision-transformer.forward
+            input: {grid_thw: "= input.mm_kwargs.map(k, k.grid_thw)", vision: "= state.cfg.vision", tp: "= config['tensor-parallel-size']"}
+      - return:
+          embeddings: "= input.mm_kwargs.map(k, {'modality': k.modality, 'num_tokens': k.grid_thw[0] * k.grid_thw[1] * k.grid_thw[2] / vars.m / vars.m, 'deepstack_levels': state.cfg.deepstack_num_level})"
+          num_tokens: "= sum(input.mm_kwargs.map(k, k.grid_thw[0] * k.grid_thw[1] * k.grid_thw[2] / vars.m / vars.m))"
+
+  - component: qwen3-vl-for-conditional-generation
+    name: get-placeholder-str
+    kind: function
+    summary: "get_placeholder_str: the prompt text a chat image or video part becomes."
+    sources: ["vllm/model_executor/models/qwen3_vl.py:1977-1984"]
+    request: {type: object, required: [modality], properties: {modality: {type: string, examples: [image]}}}
+    response: {type: object, properties: {placeholder: {type: string}}}
+    errors:
+      - {code: value-error, status: 0, retryable: false}
+    behavior:
+      - if: "input.modality.startsWith('image')"
+        then:
+          - return: {placeholder: "<|vision_start|><|image_pad|><|vision_end|>"}
+      - if: "input.modality.startsWith('video')"
+        then:
+          - return: {placeholder: "<|vision_start|><|video_pad|><|vision_end|>"}
+      - fail: {code: value-error, status: 0, message: "Only image or video modality is supported"}
+
+  - component: qwen3-vl-for-conditional-generation
+    name: forward
+    kind: function
+    summary: "Qwen3VLForConditionalGeneration.forward: the language model on input_ids or merged inputs_embeds with (3, N) M-RoPE positions; with inputs_embeds the DeepStack buffers are read for the first layers and cleared after."
+    sources: ["vllm/model_executor/models/qwen3_vl.py:3165-3219"]
+    request: ModelsForwardRequest
+    response: ModelsForwardResult
+    errors:
+      - {code: attribute-error, status: 0, retryable: false}
+    behavior:
+      - if: "!state.loaded"
+        then:
+          - fail: {code: attribute-error, status: 0, message: "model weights are not loaded on this rank"}
+      - source: "vllm/model_executor/layers/attention/attention.py:700-721"
+        call: attention-layer.get-attention-context
+        input: "= input"
+        as: md
+      - title: "Qwen3LLMModel: the decoder stack (Qwen3DecoderLayer: Llama's structure plus per-head q/k RMSNorm), DeepStack features added after the first layers"
+        source: "vllm/model_executor/models/qwen3_vl.py:1849-1899"
+        call: qwen2-model.forward
+        input: {num_tokens: "= input.num_tokens", cfg: "= state.cfg", tp: "= config['tensor-parallel-size']", quant: "= state.quant", attn_metadata: "= vars.md.value", inputs_embeds: "= has(input.inputs_embeds) && input.inputs_embeds"}
+        as: out
+      - return: {num_tokens: "= input.num_tokens", hidden_size: "= state.cfg.hidden_size", num_layers: "= state.cfg.num_layers", owner_ms: "= vars.out.value.owner_ms"}
+
+  - component: qwen3-vl-for-conditional-generation
+    name: compute-logits
+    kind: function
+    summary: "compute_logits: the language model's logits processor over the LM head."
+    sources: ["vllm/model_executor/models/qwen3_vl.py:3221-3225"]
+    request: ModelsLogitsRequest
+    response: ModelsLogitsResult
+    errors:
+      - {code: attribute-error, status: 0, retryable: false}
+    behavior:
+      - if: "!state.loaded"
+        then:
+          - fail: {code: attribute-error, status: 0, message: "model weights are not loaded on this rank"}
+      - call: logits-processor.forward
+        input: {num_tokens: "= input.num_tokens", hidden_size: "= state.cfg.hidden_size", vocab_size: "= state.cfg.vocab_size", tp: "= config['tensor-parallel-size']"}
+        as: lg
+      - return: "= vars.lg.value"
+
+  - component: qwen3-vision-transformer
+    name: fast-pos-embed-interpolate
+    kind: function
+    summary: "fast_pos_embed_interpolate: per (t, h, w) grid, bilinear interpolation of the num_grid_per_side^2 learned position embeddings onto h x w patches (the Triton kernel when Triton is present), repeated t times and reordered into merge blocks."
+    sources: ["vllm/model_executor/models/qwen3_vl.py:744-763", "vllm/model_executor/models/qwen3_vl.py:255-299"]
+    request:
+      type: object
+      required: [grid_thw]
+      properties:
+        grid_thw: {type: array, items: {type: array, items: {type: integer}}}
+        spatial_merge_size: {type: integer, default: 2}
+        num_position_embeddings: {type: integer, default: 2304}
+    response: {type: object, properties: {num_patches: {type: integer}, num_grid_per_side: {type: integer}}}
+    behavior:
+      - source: "vllm/model_executor/models/qwen3_vl.py:592"
+        set:
+          vars.side: "= int(math.sqrt(double(input.num_position_embeddings)))"
+      - title: "triton_pos_embed_interpolate (HAS_TRITON)"
+        source: "vllm/model_executor/models/qwen3_vl.py:747-749"
+        return:
+          num_patches: "= sum(input.grid_thw.map(g, g[0] * g[1] * g[2]))"
+          num_grid_per_side: "= vars.side"
+
+  - component: qwen3-vision-transformer
+    name: rot-pos-emb
+    kind: function
+    summary: "rot_pos_emb: (h, w) position ids per patch in merge-block order (cached per (h, w, merge)), then cos/sin gathered from the rotary cache up to the largest grid side."
+    sources: ["vllm/model_executor/models/qwen3_vl.py:687-742"]
+    request:
+      type: object
+      required: [grid_thw]
+      properties:
+        grid_thw: {type: array, items: {type: array, items: {type: integer}}}
+        spatial_merge_size: {type: integer, default: 2}
+        head_size: {type: integer, default: 72}
+    response: {type: object, properties: {num_positions: {type: integer}, max_grid_size: {type: integer}}}
+    behavior:
+      - source: "vllm/model_executor/models/qwen3_vl.py:719-740"
+        return:
+          num_positions: "= sum(input.grid_thw.map(g, g[0] * g[1] * g[2]))"
+          max_grid_size: "= math.greatest(input.grid_thw.map(g, math.greatest(g[1], g[2])))"
+
+  - component: qwen3-vision-transformer
+    name: forward
+    kind: function
+    summary: "Qwen3_VisionTransformer.forward: patch embed, interpolated position embeddings, rotary, depth blocks (attention within each frame), the merger and the DeepStack mergers. Roofline latency as for Qwen2-VL's tower."
+    sources: ["vllm/model_executor/models/qwen3_vl.py:862-905"]
+    request:
+      type: object
+      required: [grid_thw, vision]
+      properties:
+        grid_thw: {type: array, items: {type: array, items: {type: integer}}}
+        vision: {type: object}
+        tp: {type: integer, default: 1}
+    response: {type: object, properties: {num_patches: {type: integer}, num_tokens: {type: integer}}}
+    behavior:
+      - source: "vllm/model_executor/models/qwen3_vl.py:866-870"
+        call: qwen3-vision-transformer.fast-pos-embed-interpolate
+        input: {grid_thw: "= input.grid_thw", spatial_merge_size: "= input.vision.spatial_merge_size", num_position_embeddings: "= input.vision.num_position_embeddings"}
+      - call: qwen3-vision-transformer.rot-pos-emb
+        input: {grid_thw: "= input.grid_thw", spatial_merge_size: "= input.vision.spatial_merge_size", head_size: "= input.vision.hidden_size / input.vision.num_heads"}
+      - set:
+          vars.v: "= input.vision"
+          vars.patches: "= sum(input.grid_thw.map(g, g[0] * g[1] * g[2]))"
+      - set:
+          vars.params: "= double(vars.v.depth) * double(vars.v.hidden_size) * (4.0 * double(vars.v.hidden_size) + 2.0 * double(vars.v.intermediate_size)) / double(input.tp)"
+      - title: "self.attn_backend = get_vit_attn_backend(head_dim, dtype); one launch stands for the depth blocks"
+        source: "vllm/model_executor/models/qwen3_vl.py:662-665"
+        call: vision-utils.get-vit-attn-backend
+        input: {head_size: "= input.vision.hidden_size / input.vision.num_heads"}
+        as: vb
+      - if: "vars.vb.value.backend == 'FLASH_ATTN'"
+        then:
+          - call: vit-attn-wrappers.vit-flash-attn-wrapper
+            fill: true
+            input: {shape: {num_tokens: "= sum(input.grid_thw.map(g, g[0] * g[1] * g[2]))", num_heads: "= input.vision.num_heads / input.tp", num_kv_heads: "= input.vision.num_heads / input.tp", head_size: "= input.vision.hidden_size / input.vision.num_heads", num_seqs: "= size(input.grid_thw)"}}
+      - title: "depth blocks over the patches"
+        source: "vllm/model_executor/models/qwen3_vl.py:880-895"
+        wait: "= math.greatest(2.0 * vars.params / (double(config['gpu-hbm-bandwidth-gbps']) * 1000000.0), 2.0 * vars.params * double(vars.patches) / (double(config['gpu-dense-bf16-tflops']) * 1000000000.0))"
+      - return: {num_patches: "= vars.patches", num_tokens: "= vars.patches / (vars.v.spatial_merge_size * vars.v.spatial_merge_size)"}
+
+  - component: qwen3-vision-attention
+    name: apply-rotary-emb
+    kind: function
+    summary: "apply_rotary_emb on the stacked (q, k) of shape (2, tokens, heads, head_size) with the tower's cos/sin (the vision rotary Triton kernel)."
+    sources: ["vllm/model_executor/models/qwen3_vl.py:487-507", "vllm/model_executor/warmup/qwen_vl_triton_warmup.py:49-55"]
+    request:
+      type: object
+      required: [num_tokens]
+      properties:
+        num_tokens: {type: integer, examples: [256]}
+        num_heads: {type: integer, default: 16}
+        head_size: {type: integer, default: 72}
+    response: {type: object, properties: {shape: {type: array, items: {type: integer}}}}
+    behavior:
+      - return: {shape: [2, "= input.num_tokens", "= input.num_heads", "= input.head_size"]}
+
+  - component: qwen3-vl-processing-info
+    name: get-supported-mm-limits
+    kind: function
+    summary: "get_supported_mm_limits (inherited): image and video, no fixed per-prompt maximum."
+    sources: ["vllm/model_executor/models/qwen2_vl.py:865-866"]
+    response: {type: object}
+    behavior:
+      - return: {image: null, video: null}
+
+  - component: qwen3-vl-processing-info
+    name: get-num-image-tokens
+    kind: function
+    summary: "_get_vision_info for an image: smart_resize with factor patch_size x merge_size (16 x 2) and the image processor's shortest_edge / longest_edge, then grid_t x grid_h x grid_w // merge^2 tokens."
+    sources: ["vllm/model_executor/models/qwen3_vl.py:959-1021"]
+    request:
+      type: object
+      required: [image_width, image_height]
+      properties:
+        image_width: {type: integer, examples: [1300]}
+        image_height: {type: integer, examples: [876]}
+        min_pixels: {type: integer, default: 65536, description: "ASSUMPTION: Qwen3-VL preprocessor_config.json size.shortest_edge"}
+        max_pixels: {type: integer, default: 16777216, description: "ASSUMPTION: Qwen3-VL preprocessor_config.json size.longest_edge"}
+    response: {type: object}
+    behavior:
+      - source: "vllm/model_executor/models/qwen3_vl.py:973-1021"
+        call: qwen2-vl-processing-info.get-num-image-tokens
+        input: {image_width: "= input.image_width", image_height: "= input.image_height", num_frames: 1, patch_size: 16, spatial_merge_size: 2, temporal_patch_size: 2, min_pixels: "= input.min_pixels", max_pixels: "= input.max_pixels"}
+        as: n
+      - return: "= vars.n.value"
+
+  # ---------------------------------------------------------------- Attention layer construction
+  - component: attention-layer
+    name: init
+    kind: function
+    summary: "Attention.__init__: the layer's sliding window is per_layer_sliding_window when given, else the cache config's; get_attn_backend selects the backend class for this layer (head size, dtype, KV cache dtype, attention type, sliding window), so an unsupported --attention-backend fails while the model is built; the backend impl turns the window into (left, right): none is (-1, -1), encoder and encoder-only layers see both sides (W-1, W-1), decoders only the past (W-1, 0)."
+    sources: ["vllm/model_executor/layers/attention/attention.py:241-273", "vllm/model_executor/layers/attention/attention.py:339-360"]
+    request:
+      type: object
+      required: [num_heads, head_size]
+      properties:
+        num_heads: {type: integer, examples: [8]}
+        head_size: {type: integer, examples: [256]}
+        num_kv_heads: {type: integer, default: 1}
+        per_layer_sliding_window: {type: [integer, "null"], default: null}
+        cache_sliding_window: {type: [integer, "null"], default: null}
+        attn_type: {type: string, default: decoder}
+        dtype: {type: string, default: bfloat16}
+        backend: {type: [string, "null"], default: null, description: "a backend the model's config hook forced (EmbeddingGemma2: TRITON_ATTN); null takes the selector's choice"}
+    response:
+      type: object
+      properties:
+        sliding_window: {type: [integer, "null"]}
+        attn_type: {type: string}
+        backend: {type: string}
+        backend_cls_path: {type: string}
+        impl_sliding_window: {type: array, items: {type: integer}}
+    errors:
+      - {code: value-error, status: 0, retryable: false}
+    behavior:
+      - source: "vllm/model_executor/layers/attention/attention.py:266-273"
+        set:
+          vars.sw: "= input.per_layer_sliding_window != null ? input.per_layer_sliding_window : input.cache_sliding_window"
+      - title: "get_attn_backend(head_size, dtype, kv_cache_dtype, attn_type=..., has_sliding_window=...): the selector's ValueError (an unsupported or refused backend) fails the model build"
+        source: "vllm/model_executor/layers/attention/attention.py:350-360"
+        call: selector.get-attn-backend
+        fill: true
+        input:
+          head_size: "= input.head_size"
+          dtype: "= input.dtype"
+          kv_cache_dtype: "= config['kv-cache-dtype']"
+          attn_type: "= input.attn_type"
+          has_sliding_window: "= vars.sw != null"
+          num_heads: "= input.num_heads"
+        as: sel
+      - set:
+          vars.path: "= vars.sel.value.backend_cls_path"
+      - set:
+          vars.backend: "= input.backend != null ? input.backend : (vars.path.contains('.flash_attn.') ? 'FLASH_ATTN' : (vars.path.contains('.triton_attn.') ? 'TRITON_ATTN' : (vars.path.contains('.flashinfer.') ? 'FLASHINFER' : vars.path)))"
+      - title: "FLASH_ATTN: FlashAttentionImpl computes the window"
+        if: "vars.backend == 'FLASH_ATTN'"
+        then:
+          - source: "vllm/model_executor/layers/attention/attention.py:350-360"
+            call: flash-attention-impl.init
+            fill: true
+            input: {num_heads: "= input.num_heads", num_kv_heads: "= input.num_kv_heads", head_size: "= input.head_size", sliding_window: "= vars.sw == null ? 0 : vars.sw", attn_type: "= input.attn_type"}
+            as: impl
+          - return: {sliding_window: "= vars.sw", attn_type: "= input.attn_type", backend: "= vars.backend", backend_cls_path: "= vars.path", impl_sliding_window: "= vars.impl.value.sliding_window"}
+      - title: "TRITON_ATTN: TritonAttentionImpl computes the window"
+        if: "vars.backend == 'TRITON_ATTN'"
+        then:
+          - source: "vllm/v1/attention/backends/triton_attn.py:479-484"
+            call: triton-attention-impl.init
+            fill: true
+            input: {num_heads: "= input.num_heads", num_kv_heads: "= input.num_kv_heads", head_size: "= input.head_size", sliding_window: "= vars.sw", attn_type: "= input.attn_type", kv_cache_dtype: "= config['kv-cache-dtype']"}
+            as: timpl
+          - return: {sliding_window: "= vars.sw", attn_type: "= input.attn_type", backend: "= vars.backend", backend_cls_path: "= vars.path", impl_sliding_window: "= vars.timpl.value.sliding_window"}
+      - title: "Other backends apply the same window rule"
+        source: "vllm/v1/attention/backends/triton_attn.py:479-484"
+        return:
+          sliding_window: "= vars.sw"
+          attn_type: "= input.attn_type"
+          backend: "= vars.backend"
+          backend_cls_path: "= vars.path"
+          impl_sliding_window: "= vars.sw == null ? [-1, -1] : (input.attn_type in ['encoder', 'encoder_only'] ? [vars.sw - 1, vars.sw - 1] : [vars.sw - 1, 0])"
+
+  # ---------------------------------------------------------------- EmbeddingGemma2
+  - component: embedding-gemma2-model
+    name: init
+    kind: function
+    summary: "EmbeddingGemma2Model(vllm_config): towers for vision and audio when configured, EmbeddingGemma2TextModel (one layer per text_config.layer_types entry, ENCODER_ONLY attention, sliding layers at sliding_window + 1, attention backend TRITON_ATTN unless one was set), and DispatchPooler.for_embedding over the model's pooler config (MEAN / ALL)."
+    sources: ["vllm/model_executor/models/embedding_gemma2.py:1019-1102", "vllm/model_executor/models/embedding_gemma2.py:337-385", "vllm/model_executor/models/config.py:293-310"]
+    tags: [writes]
+    request:
+      type: object
+      required: [hf_config, quant]
+      properties:
+        hf_config: ModelsHfConfig
+        quant: {type: string, examples: [unquantized]}
+        kv_quant_method: {type: string, default: none}
+    response: {type: object, properties: {layers: {type: array, items: {type: object}}}}
+    errors:
+      - {code: assertion-error, status: 0, retryable: false}
+    behavior:
+      - set:
+          vars.hf: "= input.hf_config"
+          vars.t: "= has(input.hf_config.text_config) && input.hf_config.text_config != null ? merge(input.hf_config.transformMap(k, v, !(k in ['text_config', 'vision_config']), v), input.hf_config.text_config) : input.hf_config"
+          vars.tp: "= config['tensor-parallel-size']"
+      - title: "EmbeddingGemma2Attention asserts config.layer_types is set"
+        source: "vllm/model_executor/models/embedding_gemma2.py:133-134"
+        if: "!has(vars.t.layer_types) || vars.t.layer_types == null"
+        then:
+          - fail: {code: assertion-error, status: 0, message: ""}
+      - title: "EmbeddingGemma2ModelConfig.verify_and_update_config: no backend set -> TRITON_ATTN (heterogeneous head dimensions)"
+        source: "vllm/model_executor/models/config.py:293-305"
+        set:
+          vars.backend: "= 'attention-backend' in config && config['attention-backend'] != null ? dyn(null) : dyn('TRITON_ATTN')"
+          vars.head_dim: "= has(vars.t.head_dim) && vars.t.head_dim != null ? vars.t.head_dim : vars.t.hidden_size / vars.t.num_attention_heads"
+          vars.layers: []
+      - title: "One EmbeddingGemma2DecoderLayer per layer type; window = config.sliding_window on sliding layers, + _WINDOW_OFFSET (1)"
+        source: "vllm/model_executor/models/embedding_gemma2.py:146-160"
+        foreach: "= lists.range(size(vars.t.layer_types))"
+        as: i
+        steps:
+          - set:
+              vars.sliding: "= vars.t.layer_types[vars.i] == 'sliding_attention'"
+          - call: attention-layer.init
+            input:
+              num_heads: "= vars.t.num_attention_heads / vars.tp"
+              head_size: "= vars.head_dim"
+              num_kv_heads: "= math.greatest(1, vars.t.num_key_value_heads / vars.tp)"
+              per_layer_sliding_window: "= vars.sliding ? dyn(vars.t.sliding_window + 1) : dyn(null)"
+              attn_type: encoder_only
+              backend: "= vars.backend"
+            as: a
+          - set:
+              vars.layers: "= vars.layers + [{'index': vars.i, 'layer_type': vars.t.layer_types[vars.i], 'attn_type': vars.a.value.attn_type, 'per_layer_sliding_window': vars.a.value.sliding_window, 'sliding_window': vars.a.value.impl_sliding_window, 'backend': vars.a.value.backend}]"
+      - title: "self.pooler = DispatchPooler.for_embedding(pooler_config)"
+        source: "vllm/model_executor/models/embedding_gemma2.py:1100-1102"
+        call: dispatch-pooler.for-embedding
+        input: {seq_pooling_type: MEAN, tok_pooling_type: ALL}
+        as: pooler
+      - set:
+          state.loaded: false
+          state.quant: "= input.quant"
+          state.cfg:
+            hidden_size: "= vars.t.hidden_size"
+            num_layers: "= vars.t.num_hidden_layers"
+            vocab_size: "= vars.t.vocab_size"
+            backend: "= size(vars.layers) > 0 ? vars.layers[0].backend : ''"
+            layers: "= vars.layers"
+            supported_tasks: "= vars.pooler.value.supported_tasks"
+      - return: {layers: "= vars.layers", backend: "= size(vars.layers) > 0 ? vars.layers[0].backend : ''", supported_tasks: "= vars.pooler.value.supported_tasks"}
+
+  - component: embedding-gemma2-model
+    name: load-weights
+    kind: function
+    summary: "EmbeddingGemma2Model.load_weights: AutoWeightsLoader ignoring the towers' embedding tables (and a missing tower's weights)."
+    sources: ["vllm/model_executor/models/embedding_gemma2.py:1117-1129"]
+    tags: [writes]
+    request:
+      type: object
+      properties:
+        model: {type: string}
+        weights_bytes: {type: integer}
+    response: {type: object, properties: {weights_bytes_per_rank: {type: integer}}}
+    behavior:
+      - call: auto-weights-loader.load-weights
+        input: {model: "= input.model", weights_bytes: "= input.weights_bytes"}
+        as: awl
+      - set:
+          state.loaded: true
+          state.model: "= input.model"
+          state.weights_bytes_per_rank: "= vars.awl.value.weights_bytes_per_rank"
+      - return: {weights_bytes_per_rank: "= vars.awl.value.weights_bytes_per_rank"}
+
+  - component: embedding-gemma2-model
+    name: get-placeholder-str
+    kind: function
+    summary: "get_placeholder_str: <|image|>, <|audio|> or <|video|>; any other modality is refused."
+    sources: ["vllm/model_executor/models/embedding_gemma2.py:1131-1139"]
+    request: {type: object, required: [modality], properties: {modality: {type: string, examples: [image]}}}
+    response: {type: object, properties: {placeholder: {type: string}}}
+    errors:
+      - {code: value-error, status: 0, retryable: false}
+    behavior:
+      - if: "input.modality in ['image', 'audio', 'video']"
+        then:
+          - return: {placeholder: "= '<|' + input.modality + '|>'"}
+      - fail: {code: value-error, status: 0, message: "= 'Unsupported modality: ' + input.modality"}
+
+  # ---------------------------------------------------------------- the pooler
+  - component: dispatch-pooler
+    name: for-embedding
+    kind: function
+    summary: "DispatchPooler.for_embedding(pooler_config): token_embed (token-wise pooling of tok_pooling_type) and embed (sequence pooling of seq_pooling_type with the normalizing EmbeddingPoolerHead); for_seq_cls builds token_classify and classify instead."
+    sources: ["vllm/model_executor/layers/pooler/special.py:28-57", "vllm/model_executor/layers/pooler/seqwise/poolers.py:97-108"]
+    request:
+      type: object
+      properties:
+        seq_pooling_type: {type: string, default: LAST}
+        tok_pooling_type: {type: string, default: ALL}
+        kind: {type: string, default: embedding, enum: [embedding, seq_cls]}
+    response: {type: object, properties: {supported_tasks: {type: array, items: {type: string}}, seq_pooling_type: {type: string}}}
+    errors:
+      - {code: not-implemented-error, status: 0, retryable: false}
+    behavior:
+      - title: "get_seq_pooling_method: CLS, LAST or MEAN"
+        source: "vllm/model_executor/layers/pooler/seqwise/methods.py:109-119"
+        if: "!(input.seq_pooling_type in ['CLS', 'LAST', 'MEAN'])"
+        then:
+          - fail: {code: not-implemented-error, status: 0, message: "= 'Unknown sequence pooling type: \\'' + input.seq_pooling_type + '\\''"}
+      - source: "vllm/model_executor/layers/pooler/special.py:28-57"
+        return:
+          supported_tasks: "= input.kind == 'embedding' ? ['token_embed', 'embed'] : ['token_classify', 'classify']"
+          seq_pooling_type: "= input.seq_pooling_type"
+          tok_pooling_type: "= input.tok_pooling_type"
+
+  - component: dispatch-pooler
+    name: forward
+    kind: function
+    summary: "DispatchPooler.forward: consecutive requests with the same task form a group; each group's tokens go to that task's sub-pooler (an unsupported task is a ValueError naming the supported ones); embed groups run the sequence pooling then the embedding head."
+    sources: ["vllm/model_executor/layers/pooler/special.py:91-146"]
+    request:
+      type: object
+      required: [requests]
+      properties:
+        requests: {type: array, items: {type: object}, description: "per request: {task, prompt_len, num_scheduled_tokens, dimensions, use_activation}"}
+        supported_tasks: {type: array, default: [token_embed, embed], items: {type: string}}
+        seq_pooling_type: {type: string, default: LAST}
+        hidden_size: {type: integer, default: 4096}
+    response: {type: object, properties: {outputs: {type: array, items: {type: object}}}}
+    errors:
+      - {code: value-error, status: 0, retryable: false}
+      - {code: runtime-error, status: 0, retryable: false}
+    behavior:
+      - title: "Every task must have a sub-pooler"
+        source: "vllm/model_executor/layers/pooler/special.py:100-105"
+        if: "input.requests.exists(r, !(r.task in input.supported_tasks))"
+        then:
+          - fail: {code: value-error, status: 0, message: "= 'Unsupported task: \\'' + input.requests.filter(r, !(r.task in input.supported_tasks))[0].task + '\\' Supported tasks: {' + input.supported_tasks.map(t, '\\'' + t + '\\'').join(', ') + '}'"}
+      - set:
+          vars.seq: "= input.requests.filter(r, r.task in ['embed', 'classify'])"
+          vars.out: []
+      - if: "size(vars.seq) > 0"
+        then:
+          - source: "vllm/model_executor/layers/pooler/seqwise/poolers.py:87-95"
+            call: sequence-pooling-method.forward
+            input: {pooling_type: "= input.seq_pooling_type", prompt_lens: "= vars.seq.map(r, r.prompt_len)", num_scheduled_tokens: "= vars.seq.map(r, has(r.num_scheduled_tokens) ? r.num_scheduled_tokens : r.prompt_len)", hidden_size: "= input.hidden_size"}
+            as: pooled
+          - call: embedding-pooler-head.forward
+            input: {num_pooled: "= vars.pooled.value.num_pooled", hidden_size: "= input.hidden_size", dimensions: "= vars.seq.map(r, has(r.dimensions) ? r.dimensions : null)", use_activation: "= vars.seq.map(r, has(r.use_activation) ? r.use_activation : true)"}
+            as: head
+          - set: {vars.out: "= vars.head.value.outputs"}
+      - title: "Token-wise tasks return one vector per prompt token"
+        source: "vllm/model_executor/layers/pooler/tokwise/poolers.py:60-120"
+        return:
+          outputs: "= vars.out + input.requests.filter(r, r.task in ['token_embed', 'token_classify']).map(r, {'task': r.task, 'num_vectors': r.prompt_len, 'dim': input.hidden_size})"
+
+  - component: sequence-pooling-method
+    name: forward
+    kind: function
+    summary: "CLSPool / LastPool / MeanPool over each request's prompt: CLS and MEAN refuse a partial prefill (the prompt split over steps); LAST takes the last scheduled token."
+    sources: ["vllm/model_executor/layers/pooler/seqwise/methods.py:37-106"]
+    request:
+      type: object
+      required: [pooling_type, prompt_lens]
+      properties:
+        pooling_type: {type: string, examples: [CLS]}
+        prompt_lens: {type: array, items: {type: integer}}
+        num_scheduled_tokens: {type: array, default: [], items: {type: integer}, description: "tokens of each prompt in this step (all of it unless chunked)"}
+        hidden_size: {type: integer, default: 4096}
+    response: {type: object, properties: {num_pooled: {type: integer}, token_indices: {type: array}}}
+    errors:
+      - {code: runtime-error, status: 0, retryable: false}
+    behavior:
+      - set:
+          vars.sched: "= size(input.num_scheduled_tokens) == size(input.prompt_lens) ? input.num_scheduled_tokens : input.prompt_lens"
+      - set:
+          vars.partial: "= lists.range(size(input.prompt_lens)).exists(i, vars.sched[i] < input.prompt_lens[i])"
+      - title: "CLSPool: partial prefill is not supported"
+        source: "vllm/model_executor/layers/pooler/seqwise/methods.py:43-45"
+        if: "input.pooling_type == 'CLS' && vars.partial"
+        then:
+          - fail: {code: runtime-error, status: 0, message: "partial prefill is not supported with CLS pooling"}
+      - title: "MeanPool: partial prefill is not supported"
+        source: "vllm/model_executor/layers/pooler/seqwise/methods.py:66-67"
+        if: "input.pooling_type == 'MEAN' && vars.partial"
+        then:
+          - fail: {code: runtime-error, status: 0, message: "partial prefill is not supported with MEAN pooling"}
+      - set:
+          vars.starts: "= lists.range(size(vars.sched)).map(i, sum(vars.sched.slice(0, i)))"
+      - title: "CLS: first token indices; LAST: last token indices; MEAN: segment sums / prompt lengths"
+        source: "vllm/model_executor/layers/pooler/seqwise/methods.py:47-106"
+        return:
+          num_pooled: "= size(input.prompt_lens)"
+          token_indices: "= input.pooling_type == 'CLS' ? vars.starts : (input.pooling_type == 'LAST' ? lists.range(size(vars.sched)).map(i, vars.starts[i] + vars.sched[i] - 1) : lists.range(size(vars.sched)).map(i, -1))"
+
+  - component: embedding-pooler-head
+    name: forward
+    kind: function
+    summary: "EmbeddingPoolerHead.forward: lengths must match the pooling params; Matryoshka truncation to each request's dimensions; normalize where use_activation."
+    sources: ["vllm/model_executor/layers/pooler/seqwise/heads.py:59-117"]
+    request:
+      type: object
+      required: [num_pooled]
+      properties:
+        num_pooled: {type: integer, examples: [2]}
+        hidden_size: {type: integer, default: 4096}
+        dimensions: {type: array, default: [], items: {type: [integer, "null"]}}
+        use_activation: {type: array, default: [], items: {type: boolean}}
+    response: {type: object, properties: {outputs: {type: array, items: {type: object}}}}
+    errors:
+      - {code: value-error, status: 0, retryable: false}
+    behavior:
+      - title: "pooled_data and pooling_params must have the same length"
+        source: "vllm/model_executor/layers/pooler/seqwise/heads.py:64-68"
+        if: "size(input.use_activation) != input.num_pooled"
+        then:
+          - fail: {code: value-error, status: 0, message: "= 'pooled_data length (' + string(input.num_pooled) + ') does not match pooling_params length (' + string(size(input.use_activation)) + ')'"}
+      - set:
+          vars.dims: "= size(input.dimensions) == input.num_pooled ? input.dimensions : lists.range(input.num_pooled).map(i, null)"
+      - source: "vllm/model_executor/layers/pooler/seqwise/heads.py:84-113"
+        return:
+          outputs: "= lists.range(input.num_pooled).map(i, {'task': 'embed', 'dim': vars.dims[i] == null ? input.hidden_size : vars.dims[i], 'normalized': input.use_activation[i]})"
+
+  # ---------------------------------------------------------------- shm processor cache
+  - component: shm-object-store-sender-cache
+    name: is-cached
+    kind: function
+    summary: "is_cached_item per hash: the key is in the shared-memory store's index."
+    sources: ["vllm/multimodal/cache/shm.py:108-110"]
+    request: {type: object, required: [mm_hashes], properties: {mm_hashes: {type: array, items: {type: string}}}}
+    response: {type: object, properties: {cached: {type: array, items: {type: boolean}}}}
+    behavior:
+      - return: {cached: "= input.mm_hashes.map(h, h in state.entries)"}
+
+  - component: shm-object-store-sender-cache
+    name: get-and-update
+    kind: function
+    summary: "get_and_update_item: a hit returns the item's address handle and P0's cached prompt updates; a miss puts the serialized item in the ring buffer (FIFO-freeing old items when it is full) and returns its handle; an item over mm_shm_cache_max_object_size_mb, or a full buffer, is sent uncached."
+    sources: ["vllm/multimodal/cache/shm.py:112-170", "vllm/distributed/device_communicators/shm_object_storage.py:683-730"]
+    tags: [writes]
+    request:
+      type: object
+      required: [mm_hash]
+      properties:
+        mm_hash: {type: string, examples: [img-a]}
+        size_bytes: {type: integer, default: 1048576}
+    response: {type: object, properties: {kind: {type: string}, address: {type: [integer, "null"]}, monotonic_id: {type: [integer, "null"]}, hit: {type: boolean}, warning: {type: [string, "null"]}}}
+    errors:
+      - {code: assertion-error, status: 0, retryable: false}
+    behavior:
+      - title: "Hit: count it and return the address item"
+        source: "vllm/multimodal/cache/shm.py:117-129"
+        if: "input.mm_hash in state.entries"
+        then:
+          - set:
+              state.hits: "= state.hits + 1"
+              state.total: "= state.total + 1"
+          - return: {kind: address, address: "= state.entries[input.mm_hash].address", monotonic_id: "= state.entries[input.mm_hash].monotonic_id", hit: true, warning: null}
+      - set:
+          state.total: "= state.total + 1"
+          vars.max_obj: "= int(config['mm-shm-cache-max-object-size-mb']) * 1048576"
+          vars.cap: "= int(double(config['mm-processor-cache-gb']) * 1073741824.0)"
+      - title: "put: an object over max_object_size is a ValueError, caught: warn and send the item uncached"
+        source: "vllm/distributed/device_communicators/shm_object_storage.py:704-710"
+        if: "input.size_bytes > vars.max_obj"
+        then:
+          - return: {kind: item, address: null, monotonic_id: null, hit: false, warning: "= 'mm_input ' + input.mm_hash + ' too large to cache; raise --mm-shm-cache-max-object-size-mb. (Serialized object size (' + string(input.size_bytes) + ' bytes) exceeds max object size (' + string(vars.max_obj) + ' bytes))'"}
+      - title: "allocate_buf: on MemoryError free unused items in FIFO order, then retry"
+        source: "vllm/distributed/device_communicators/shm_object_storage.py:712-718"
+        set:
+          vars.evict: "= lists.range(size(state.order) + 1).filter(k, state.used_bytes - sum(state.order.slice(0, k).map(h, state.entries[h].size)) + input.size_bytes <= vars.cap)"
+      - title: "Still no room: MemoryError, caught - the item goes uncached"
+        source: "vllm/multimodal/cache/shm.py:161-169"
+        if: "size(vars.evict) == 0"
+        then:
+          - return: {kind: item, address: null, monotonic_id: null, hit: false, warning: null}
+      - set:
+          vars.gone: "= state.order.slice(0, vars.evict[0])"
+          vars.addr: "= state.used_bytes"
+      - set:
+          state.entries: "= state.entries.transformMap(k, v, !(k in vars.gone), v)"
+          state.order: "= state.order.slice(vars.evict[0], size(state.order))"
+          state.used_bytes: "= state.used_bytes - sum(vars.gone.map(h, state.entries[h].size))"
+      - set:
+          state.entries: "= merge(state.entries, {input.mm_hash: {'address': vars.addr, 'monotonic_id': state.next_id, 'size': input.size_bytes}})"
+          state.order: "= state.order + [input.mm_hash]"
+          state.used_bytes: "= state.used_bytes + input.size_bytes"
+          state.next_id: "= state.next_id + 1"
+      - return: {kind: address, address: "= vars.addr", monotonic_id: "= state.next_id - 1", hit: false, warning: null}
+
+  - component: shm-object-store-sender-cache
+    name: clear-cache
+    kind: function
+    summary: "clear_cache: empty the shared-memory store and P0's prompt-update cache, and reset the hit counters."
+    sources: ["vllm/multimodal/cache/shm.py:195-202"]
+    tags: [writes]
+    request: {type: object}
+    response: {type: object, properties: {cleared: {type: integer}}}
+    behavior:
+      - set: {vars.n: "= size(state.order)"}
+      - set: {state.entries: {}, state.order: [], state.used_bytes: 0, state.hits: 0, state.total: 0}
+      - return: {cleared: "= vars.n"}
+
+  - component: shm-object-store-receiver-cache
+    name: get-and-update
+    kind: function
+    summary: "get_and_update_item in the worker: an address item is read from shared memory (the original item); an item without an address is used as is."
+    sources: ["vllm/multimodal/cache/shm.py:289-298"]
+    request:
+      type: object
+      required: [mm_hash]
+      properties:
+        mm_hash: {type: string}
+        kind: {type: string, default: item}
+    response: {type: object, properties: {from_shm: {type: boolean}}}
+    behavior:
+      - source: "vllm/multimodal/cache/shm.py:294-298"
+        return: {from_shm: "= input.kind == 'address'"}
+
+  - component: multi-modal-cache-factories
+    name: worker-receiver-cache-from-config
+    kind: function
+    summary: "worker_receiver_cache_from_config: the worker process gets the shm receiver only for cache type shm (and needs the executor's shared worker lock); none for lru, processor_only or no cache."
+    sources: ["vllm/multimodal/cache/factories.py:90-107"]
+    request:
+      type: object
+      properties:
+        supports_multimodal_inputs: {type: boolean, default: true}
+        has_shared_worker_lock: {type: boolean, default: true}
+    response: {type: object, properties: {component: {type: [string, "null"]}}}
+    errors:
+      - {code: value-error, status: 0, retryable: false}
+    behavior:
+      - call: multi-modal-cache-factories.get-cache-type
+        input: {supports_multimodal_inputs: "= input.supports_multimodal_inputs"}
+        as: t
+      - source: "vllm/multimodal/cache/factories.py:96-97"
+        if: "vars.t.value.cache_type != 'shm'"
+        then:
+          - return: {component: null}
+      - source: "vllm/multimodal/cache/factories.py:99-103"
+        if: "!input.has_shared_worker_lock"
+        then:
+          - fail: {code: value-error, status: 0, message: "Missing `shared_worker_lock` argument from executor. This argument is needed for mm_processor_cache_type='shm'."}
+      - return: {component: shm-object-store-receiver-cache}
+
+  # ---------------------------------------------------------------- BERT-family embedding models
+  - component: bert-embedding-model
+    name: init
+    kind: function
+    summary: "BertEmbeddingModel(vllm_config): asserts the pooler config is set (a pooling runner), builds BertModel (embedding, encoder layers with EncoderOnlyAttention, no sliding window) and DispatchPooler.for_embedding with the model's CLS default unless the pooler config overrides it."
+    sources: ["vllm/model_executor/models/bert.py:478-488", "vllm/model_executor/models/bert.py:518-525", "vllm/model_executor/models/bert.py:230-270"]
+    tags: [writes]
+    request:
+      type: object
+      required: [hf_config, quant]
+      properties:
+        hf_config: ModelsHfConfig
+        quant: {type: string, examples: [unquantized]}
+        kv_quant_method: {type: string, default: none}
+        seq_pooling_type: {type: [string, "null"], default: null, description: "PoolerConfig.seq_pooling_type when the user set one"}
+    response: {type: object, properties: {layers: {type: array, items: {type: object}}}}
+    errors:
+      - {code: assertion-error, status: 0, retryable: false}
+    behavior:
+      - title: "assert pooler_config is not None: only a pooling runner builds this class"
+        source: "vllm/model_executor/models/bert.py:482-483"
+        if: "config['runner'] == 'generate'"
+        then:
+          - fail: {code: assertion-error, status: 0, message: ""}
+      - set:
+          vars.hf: "= input.hf_config"
+          vars.tp: "= config['tensor-parallel-size']"
+          vars.layers: []
+      - title: "BertSelfAttention: EncoderOnlyAttention per layer (bidirectional, writes no KV cache)"
+        source: "vllm/model_executor/models/bert.py:262-270"
+        call: attention-layer.init
+        input: {num_heads: "= vars.hf.num_attention_heads / vars.tp", head_size: "= vars.hf.hidden_size / vars.hf.num_attention_heads", num_kv_heads: "= vars.hf.num_attention_heads / vars.tp", attn_type: encoder_only}
+        as: a
+      - set:
+          vars.layers: "= lists.range(vars.hf.num_hidden_layers).map(i, {'index': i, 'attn_type': vars.a.value.attn_type, 'sliding_window': vars.a.value.impl_sliding_window})"
+      - title: "_build_pooler: DispatchPooler.for_embedding(pooler_config); seq pooling defaults to the class's CLS"
+        source: "vllm/model_executor/models/bert.py:523-525"
+        call: dispatch-pooler.for-embedding
+        input: {seq_pooling_type: "= input.seq_pooling_type != null ? input.seq_pooling_type : 'CLS'", tok_pooling_type: ALL}
+        as: pooler
+      - set:
+          state.loaded: false
+          state.quant: "= input.quant"
+          state.cfg:
+            hidden_size: "= vars.hf.hidden_size"
+            num_heads: "= vars.hf.num_attention_heads"
+            intermediate_size: "= has(vars.hf.intermediate_size) && vars.hf.intermediate_size != null ? vars.hf.intermediate_size : vars.hf.hidden_size * 4"
+            num_layers: "= vars.hf.num_hidden_layers"
+            vocab_size: "= vars.hf.vocab_size"
+            bytes_per_weight: "= input.quant == 'unquantized' ? 2.0 : 1.0"
+            seq_pooling_type: "= vars.pooler.value.seq_pooling_type"
+            supported_tasks: "= vars.pooler.value.supported_tasks"
+      - return: {layers: "= vars.layers", supported_tasks: "= vars.pooler.value.supported_tasks", seq_pooling_type: "= vars.pooler.value.seq_pooling_type"}
+
+  - component: bert-embedding-model
+    name: load-weights
+    kind: function
+    summary: "BertEmbeddingModel.load_weights: lm_head.* is dropped; checkpoints without a model. prefix get one (AutoWeightsLoader)."
+    sources: ["vllm/model_executor/models/bert.py:507-516"]
+    tags: [writes]
+    request:
+      type: object
+      properties:
+        model: {type: string}
+        weights_bytes: {type: integer}
+    response: {type: object, properties: {weights_bytes_per_rank: {type: integer}}}
+    behavior:
+      - source: "vllm/model_executor/models/bert.py:510-514"
+        call: weights-mapper.map-name
+        input: {key: "encoder.layer.0.attention.self.query.weight", prefix: [["lm_head.", null], ["", "model."]]}
+      - call: auto-weights-loader.load-weights
+        input: {model: "= input.model", weights_bytes: "= input.weights_bytes"}
+        as: awl
+      - set:
+          state.loaded: true
+          state.model: "= input.model"
+          state.weights_bytes_per_rank: "= vars.awl.value.weights_bytes_per_rank"
+      - return: {weights_bytes_per_rank: "= vars.awl.value.weights_bytes_per_rank"}
+
+  - component: bert-embedding-model
+    name: forward
+    kind: function
+    summary: "BertModel.forward: token, position and token-type embeddings, then the encoder layers (QKV, bidirectional attention over each prompt, output, GELU MLP, post-LayerNorm). Roofline latency over the encoder weights."
+    sources: ["vllm/model_executor/models/bert.py:492-505", "vllm/model_executor/models/bert.py:394-422"]
+    request: ModelsForwardRequest
+    response: ModelsForwardResult
+    errors:
+      - {code: attribute-error, status: 0, retryable: false}
+    behavior:
+      - if: "!state.loaded"
+        then:
+          - fail: {code: attribute-error, status: 0, message: "model weights are not loaded on this rank"}
+      - call: vocab-parallel-embedding.forward
+        input: {num_tokens: "= input.num_tokens", vocab_size: "= state.cfg.vocab_size", hidden_size: "= state.cfg.hidden_size", tp: "= config['tensor-parallel-size']"}
+        as: emb
+      - set:
+          vars.params: "= double(state.cfg.num_layers) * double(state.cfg.hidden_size) * (4.0 * double(state.cfg.hidden_size) + 2.0 * double(state.cfg.intermediate_size)) / double(config['tensor-parallel-size'])"
+      - title: "the encoder layers"
+        source: "vllm/model_executor/models/bert.py:140-150"
+        wait: "= math.greatest(vars.params * state.cfg.bytes_per_weight / (double(config['gpu-hbm-bandwidth-gbps']) * 1000000.0), 2.0 * vars.params * double(input.num_tokens) / (double(config['gpu-dense-bf16-tflops']) * 1000000000.0))"
+      - return: {num_tokens: "= input.num_tokens", hidden_size: "= state.cfg.hidden_size", num_layers: "= state.cfg.num_layers", owner_ms: "= vars.emb.value.owner_ms"}
+
+  # ---------------------------------------------------------------- vision helpers (judge4 P4-7 b, d)
+  - component: vision-utils
+    name: get-vit-attn-backend
+    kind: function
+    summary: "get_vit_attn_backend -> CudaPlatform.get_vit_attn_backend: the --mm-encoder-attn-backend override if it is in the supported list, else the first of FLASH_ATTN, TRITON_ATTN, TORCH_SDPA, FLASHINFER (SM80+; TORCH_SDPA before TRITON_ATTN below) that supports the head size, dtype and capability; TORCH_SDPA is always accepted."
+    sources: ["vllm/model_executor/models/vision.py:100-113", "vllm/platforms/cuda.py:518-572"]
+    request:
+      type: object
+      required: [head_size]
+      properties:
+        head_size: {type: integer, examples: [80]}
+        dtype: {type: string, default: bfloat16}
+    response: {type: object, properties: {backend: {type: string}}}
+    errors:
+      - {code: assertion-error, status: 0, retryable: false}
+    behavior:
+      - set:
+          vars.override: "= 'mm-encoder-attn-backend' in config ? config['mm-encoder-attn-backend'] : null"
+      - title: "An override must be one of the supported ViT backends"
+        source: "vllm/platforms/cuda.py:541-548"
+        if: "vars.override != null"
+        then:
+          - if: "!(vars.override in ['FLASH_ATTN', 'TRITON_ATTN', 'TORCH_SDPA', 'FLASHINFER'])"
+            then:
+              - fail: {code: assertion-error, status: 0, message: "= 'Backend AttentionBackendEnum.' + vars.override + ' is not supported for vit attention. Supported backends are: [<AttentionBackendEnum.FLASH_ATTN>, <AttentionBackendEnum.TRITON_ATTN>, <AttentionBackendEnum.TORCH_SDPA>, <AttentionBackendEnum.FLASHINFER>]'"}
+          - return: {backend: "= vars.override"}
+      - title: "FlashAttention's supports_head_size: a multiple of 8 up to 256 (Using backend AttentionBackendEnum.FLASH_ATTN for vit attention)"
+        source: "vllm/platforms/cuda.py:550-570"
+        if: "input.head_size % 8 == 0 && input.head_size <= 256"
+        then:
+          - return: {backend: FLASH_ATTN}
+      - return: {backend: TRITON_ATTN}
+
+  - component: vision-utils
+    name: get-load-balance-assignment
+    kind: function
+    summary: "get_load_balance_assignment: largest item first, each to the rank with the smallest load so far; returns the shuffled indices, items per rank and load per rank."
+    sources: ["vllm/model_executor/models/vision.py:323-390"]
+    request:
+      type: object
+      required: [sizes]
+      properties:
+        sizes: {type: array, items: {type: integer}}
+        num_gpus: {type: integer, default: 2}
+    response: {type: object, properties: {shuffle_indices: {type: array}, gpu_sample_counts: {type: array}, gpu_loads: {type: array}, assignments: {type: array}}}
+    behavior:
+      - title: "No items: every rank gets none"
+        source: "vllm/model_executor/models/vision.py:353-354"
+        if: "size(input.sizes) == 0"
+        then:
+          - return: {shuffle_indices: [], gpu_sample_counts: "= lists.range(input.num_gpus).map(i, 0)", gpu_loads: "= lists.range(input.num_gpus).map(i, 0)", assignments: "= lists.range(input.num_gpus).map(i, [])"}
+      - title: "sorted(range(n), key=sizes, reverse=True) is stable: ties keep index order"
+        source: "vllm/model_executor/models/vision.py:361-363"
+        set:
+          vars.order: "= input.sizes.sort().reverse().distinct().map(v, lists.range(size(input.sizes)).filter(i, input.sizes[i] == v)).flatten()"
+          vars.loads: "= lists.range(input.num_gpus).map(i, 0)"
+          vars.groups: "= lists.range(input.num_gpus).map(i, [])"
+      - source: "vllm/model_executor/models/vision.py:365-369"
+        foreach: "= vars.order"
+        as: idx
+        steps:
+          - set:
+              vars.g: "= vars.loads.indexOf(math.least(vars.loads))"
+          - set:
+              vars.groups: "= lists.range(input.num_gpus).map(i, i == vars.g ? vars.groups[i] + [vars.idx] : vars.groups[i])"
+              vars.loads: "= lists.range(input.num_gpus).map(i, i == vars.g ? vars.loads[i] + input.sizes[vars.idx] : vars.loads[i])"
+      - source: "vllm/model_executor/models/vision.py:371-390"
+        return:
+          shuffle_indices: "= vars.groups.flatten()"
+          gpu_sample_counts: "= vars.groups.map(x, size(x))"
+          gpu_loads: "= vars.loads"
+          assignments: "= vars.groups"
+
+  - component: vision-utils
+    name: run-dp-sharded-mrope-vision-model
+    kind: function
+    summary: "run_dp_sharded_mrope_vision_model (--mm-encoder-tp-mode data): each rank runs the whole tower (tp 1) on its balanced share, pads its embeddings to the longest rank's length, all-gathers them, and restores the original item order."
+    sources: ["vllm/model_executor/models/vision.py:393-581"]
+    request:
+      type: object
+      required: [grid_thw_list, tower, out_hidden_size, spatial_merge_size]
+      properties:
+        grid_thw_list: {type: array, items: {type: array, items: {type: integer}}}
+        tower: {type: string, description: "the vision tower's forward interface"}
+        vision: {type: object}
+        out_hidden_size: {type: integer}
+        spatial_merge_size: {type: integer}
+        tp_rank: {type: integer, default: 0}
+        tp_size: {type: integer, default: 2}
+    response: {type: object, properties: {local_items: {type: array}, gpu_sample_counts: {type: array}, max_len_per_rank: {type: integer}, tokens_per_item: {type: array}}}
+    behavior:
+      - call: vision-utils.get-load-balance-assignment
+        input: {sizes: "= input.grid_thw_list.map(g, g[0] * g[1] * g[2])", num_gpus: "= input.tp_size"}
+        as: lb
+      - set:
+          vars.local: "= vars.lb.value.assignments[input.tp_rank]"
+          vars.reduce: "= input.spatial_merge_size * input.spatial_merge_size"
+      - set:
+          vars.max_len: "= math.greatest(vars.lb.value.gpu_loads) / vars.reduce"
+      - title: "vision_model(pixel_values_local, local_grid_thw_list): a rank with no images makes an empty tensor instead"
+        source: "vllm/model_executor/models/vision.py:488-507"
+        if: "size(vars.local) > 0"
+        then:
+          - call: "= input.tower"
+            targets: [qwen2-vision-transformer.forward, qwen3-vision-transformer.forward]
+            input: {grid_thw: "= vars.local.map(i, input.grid_thw_list[i])", vision: "= input.vision", tp: 1}
+      - title: "Pad to max_len_per_rank, then tensor_model_parallel_all_gather"
+        source: "vllm/model_executor/models/vision.py:510-545"
+        call: tensor-model-parallel.all-gather
+        input: {num_tokens: "= vars.max_len", hidden_size: "= input.out_hidden_size", dim: 0}
+      - title: "Unpad each rank's rows and restore the original order"
+        source: "vllm/model_executor/models/vision.py:548-581"
+        return:
+          local_items: "= vars.local"
+          gpu_sample_counts: "= vars.lb.value.gpu_sample_counts"
+          max_len_per_rank: "= vars.max_len"
+          tokens_per_item: "= input.grid_thw_list.map(g, g[0] * g[1] * g[2] / vars.reduce)"
+
+  # ---------------------------------------------------------------- online quantization (judge4 P4-4 b)
+  - component: online-quantization-config
+    name: quantized-layer-summary
+    kind: function
+    summary: "quantized_layer_summaries and the load's log line: per layer type after the layer index, sorted, `<type>: <count> (from <source>: <quant key>)`, joined after `Quantizing N layers of types:`."
+    sources: ["vllm/model_executor/layers/quantization/online/base.py:172-198", "vllm/config/quantization.py:91-104"]
+    request:
+      type: object
+      required: [num_layers, quant_key]
+      properties:
+        num_layers: {type: integer, examples: [32]}
+        quant_key: {type: string, examples: [fp8_per_tensor_static]}
+        layer_types: {type: array, default: [mlp.down_proj, mlp.gate_up_proj, self_attn.o_proj, self_attn.qkv_proj], items: {type: string}}
+    response: {type: object, properties: {summary: {type: string}, num_quantized: {type: integer}}}
+    behavior:
+      - source: "vllm/model_executor/layers/quantization/online/base.py:186-197"
+        return:
+          num_quantized: "= input.num_layers * size(input.layer_types)"
+          summary: "= 'Quantizing ' + string(input.num_layers * size(input.layer_types)) + ' layers of types: ' + input.layer_types.sort().map(t, t + ': ' + string(input.num_layers) + ' (from linear: ' + input.quant_key + ')').join('; ')"

@@ -1,0 +1,193 @@
+schema_version: 1
+id: vllm
+scenarios:
+- id: bench-q5-5-a-registered
+  name: (a) the three histograms exist with --kv-cache-metrics (labels, 21 buckets) and not without
+  fixtures:
+  - full-tp1-llama-8b
+  config: &id001
+    num-gpu-blocks-override: 16
+    async-scheduling: false
+  steps:
+  - interface: stat-logger-manager.init-prometheus
+    caller: api-server
+    input: {}
+    as: i
+  expect:
+  - string(state['prometheus-registry'].metrics).contains('vllm:kv_block_lifetime_seconds')
+  - string(state['prometheus-registry'].metrics).contains('vllm:kv_block_idle_before_evict_seconds')
+  - string(state['prometheus-registry'].metrics).contains('vllm:kv_block_reuse_gap_seconds')
+- id: bench-q5-5-a-buckets
+  name: (a) the residency bucket family has the 21 boundaries
+  fixtures:
+  - full-tp1-llama-8b
+  steps:
+  - interface: buckets.histogram-buckets
+    caller: api-server
+    input:
+      family: kv_cache_residency
+    as: b
+  expect:
+  - steps.b.result.value == [0.001, 0.002, 0.005, 0.01, 0.02, 0.05, 0.1, 0.2, 0.5, 1, 2, 5, 10, 20, 30, 60, 120, 300, 600, 1200, 1800]
+- id: bench-q5-5-a-sample-bound
+  name: (a) --kv-cache-metrics-sample 0 and 1.5 are refused (gt=0, le=1)
+  fixtures:
+  - full-tp1-llama-8b
+  steps:
+  - flow: config-create-engine-config
+    input:
+      kv_cache_metrics: true
+      kv_cache_metrics_sample: 1.5
+    as: c
+  expect:
+  - '!steps.c.result.ok'
+- id: bench-q5-5-b-eviction-events
+  name: '(b) A, B touch, both finish, C reallocates: one eviction event per block'
+  fixtures:
+  - full-tp1-llama-8b
+  config: *id001
+  state:
+    block-pool:
+      num_gpu_blocks: 16
+      next_fresh: 1
+  steps:
+  - flow: scheduler-add-request
+    input:
+      request_id: A
+      prompt_segments:
+      - key: p
+        num_tokens: 40
+      sampling_params:
+        max_tokens: 1
+    as: addA
+  - flow: scheduler-schedule
+    input: {}
+    as: s1
+  - flow: scheduler-add-request
+    input:
+      request_id: B
+      prompt_segments:
+      - key: p
+        num_tokens: 40
+      sampling_params:
+        max_tokens: 1
+    as: addB
+  - flow: scheduler-schedule
+    input: {}
+    as: s2
+  - flow: scheduler-finish-requests
+    input:
+      request_ids:
+      - A
+      - B
+      finished_status: FINISHED_STOPPED
+    as: f
+  - flow: scheduler-add-request
+    input:
+      request_id: C
+      prompt_segments:
+      - key: q
+        num_tokens: 200
+      sampling_params:
+        max_tokens: 1
+    as: addC
+  - flow: scheduler-schedule
+    input: {}
+    as: s3
+  - flow: scheduler-make-stats
+    input: {}
+    as: st
+  expect:
+  - steps.s3.result.value.num_scheduled_tokens.C == 200
+  - size(steps.st.result.value.kv_cache_eviction_events) > 0
+- id: bench-q5-5-c-no-prefix
+  name: '(c) without prefix caching: no eviction event'
+  fixtures:
+  - full-prefix-caching-off
+  config: *id001
+  state:
+    block-pool:
+      num_gpu_blocks: 16
+      next_fresh: 1
+  steps:
+  - flow: scheduler-add-request
+    input:
+      request_id: A
+      prompt_segments:
+      - key: p
+        num_tokens: 40
+      sampling_params:
+        max_tokens: 1
+    as: addA
+  - flow: scheduler-schedule
+    input: {}
+    as: s1
+  - flow: scheduler-finish-requests
+    input:
+      request_ids:
+      - A
+      finished_status: FINISHED_STOPPED
+    as: f
+  - flow: scheduler-add-request
+    input:
+      request_id: C
+      prompt_segments:
+      - key: q
+        num_tokens: 200
+      sampling_params:
+        max_tokens: 1
+    as: addC
+  - flow: scheduler-schedule
+    input: {}
+    as: s3
+  - flow: scheduler-make-stats
+    input: {}
+    as: st
+  expect:
+  - has(steps.st.result.value.kv_cache_eviction_events) && size(steps.st.result.value.kv_cache_eviction_events) == 0
+- id: bench-q5-5-d-reset
+  name: (d) reset clears tracked blocks and pending events; path reaches BlockPool.reset_prefix_cache
+  fixtures:
+  - full-tp1-llama-8b
+  config: *id001
+  steps:
+  - flow: scheduler-add-request
+    input:
+      request_id: A
+      prompt_segments:
+      - key: p
+        num_tokens: 40
+      sampling_params:
+        max_tokens: 1
+    as: addA
+  - flow: scheduler-schedule
+    input: {}
+    as: s1
+  - flow: scheduler-finish-requests
+    input:
+      request_ids:
+      - A
+      finished_status: FINISHED_STOPPED
+    as: f
+  - interface: block-pool.reset-prefix-cache
+    caller: kv-cache-manager
+    input: {}
+    as: r
+  expect:
+  - steps.r.result.ok
+  - '''kv-cache-metrics-collector.reset'' in calls'
+- id: bench-q5-5-e-disable-log-stats
+  name: '(e) --disable-log-stats: no Prometheus logger, so nothing is exported; the scheduler still builds its collector'
+  fixtures:
+  - full-tp1-llama-8b
+  config:
+    num-gpu-blocks-override: 16
+    async-scheduling: false
+    disable-log-stats: true
+  steps:
+  - interface: stat-logger-manager.init-prometheus
+    caller: api-server
+    input: {}
+    as: i
+  expect:
+  - '''kv-cache-metrics-collector.init'' in calls'

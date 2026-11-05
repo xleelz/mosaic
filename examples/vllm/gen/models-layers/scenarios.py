@@ -467,7 +467,7 @@ def scenario_list():
            expect=["steps.load.result.ok && steps.load.result.value.quant == 'fp8_block'",
                    "ctx.fp8_weights_processed == 'block'",
                    # the kernel choice is the point of this case (internal by design)
-                   "steps.fwd.result.ok && calls['scaled-mm-triton.w8a8-triton-block-scaled-mm-func'] == 4 && calls['unquantized-linear-method.apply'] == 0"]),
+                   "steps.fwd.result.ok && calls['cutlass-fp8-scaled-mm-linear-kernel.apply-scaled-mm'] == 4 && calls['unquantized-linear-method.apply'] == 0"]),
         sc("models-get-model-fp8-cutlass", "models-get-model",
            state={"hf-hub": {"models": {FP8: dict(FP8_HF, quantization_config={"quant_method": "fp8", "activation_scheme": "static"})}}},
            steps=[step("models-get-model", as_="load", inp={"model": FP8, "hf_config": dict(FP8_HF, quantization_config={"quant_method": "fp8", "activation_scheme": "static"})}),
@@ -891,7 +891,7 @@ def scenario_list():
         return step("models-multimodal-process", as_=as_, inp=kw)
     L += [
         sc("models-multimodal-qwen2-vl", "models-multimodal-process",
-           expect=["result.ok && result.value.num_prompt_tokens == 261 && result.value.placeholders.image == 256",
+           expect=["result.ok && result.value.num_prompt_tokens == 260 && result.value.placeholders.image == 256 && result.value.mm_placeholders.image == [{'offset': 3, 'length': 256}]",
                    "result.value.placeholders.size() == 1",
                    "trace.filter(e, e.type == 'call.start' && e.interface == 'model-registry.resolve-model-cls').size() == 1"]),
         sc("models-multimodal-limits", "models-multimodal-process", config={"limit-mm-per-prompt": {"image": 2}},

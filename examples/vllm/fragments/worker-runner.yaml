@@ -295,6 +295,17 @@ configs:
     boundary: true
     owner: distributed
     key: pipeline_parallel_size
+- id: seed
+  type: integer
+  value: 0
+  default: 0
+  summary: '--seed (model_config.seed): the global random seed every worker sets'
+  sources:
+  - vllm/config/model.py:206
+  attributes:
+    key: seed
+    boundary: true
+    owner: config-platform
 - id: enable-eplb
   type: boolean
   value: false
@@ -314,9 +325,9 @@ configs:
   sources:
   - vllm/config/model.py:1349-1368
   attributes:
+    key: convert
     boundary: true
     owner: config-platform
-    key: convert
 - id: prefill-context-parallel-size
   type: integer
   value: 1
@@ -629,6 +640,10 @@ components:
           type: boolean
         runner:
           type: string
+        random_seed:
+          type: integer
+        random_seed_dp_index:
+          type: integer
         init_free_memory:
           type: integer
         requested_memory:
@@ -979,6 +994,17 @@ components:
     rebalancing loop.
   sources:
   - vllm/v1/worker/gpu/eplb_utils.py:80-165
+  state:
+    schema:
+      type: object
+      properties:
+        has_registered_models:
+          type: boolean
+        suppressed:
+          type: boolean
+    initial:
+      has_registered_models: false
+      suppressed: false
 - id: attn-utils
   name: attn_utils.py
   kind: module
@@ -1051,9 +1077,24 @@ components:
   kind: module
   parent: gpu-model-runner
   layer: runner
-  summary: Runs the pooler over hidden states for pooling models (embeddings, scores).
+  summary: 'Runs the pooler over hidden states for pooling models (embeddings, scores): per slot the request''s
+    pooling params, and the tasks the runner supports.'
   sources:
   - vllm/v1/worker/gpu/pool/pooling_runner.py:25-200
+  state:
+    schema:
+      type: object
+      properties:
+        params:
+          type: object
+          description: slot -> pooling params (task, dimensions, use_activation, req_id)
+        supported_tasks:
+          type: array
+          items:
+            type: string
+    initial:
+      params: {}
+      supported_tasks: []
 - id: late-interaction-runner
   name: LateInteractionRunner
   kind: module
@@ -1165,9 +1206,23 @@ components:
   kind: module
   parent: gpu-model-runner
   layer: sampling
-  summary: Prompt logprobs for requests that ask for them.
+  summary: 'Prompt logprobs for requests that ask for them: per slot whether the request uses prompt logprobs and
+    how many, and the chunks computed so far for a prompt still being prefilled.'
   sources:
   - vllm/v1/worker/gpu/sample/prompt_logprob.py:31-275
+  state:
+    schema:
+      type: object
+      properties:
+        slots:
+          type: object
+          description: slot -> num_prompt_logprobs, present only when the request uses prompt logprobs
+        in_progress:
+          type: object
+          description: req_id -> LogprobsTensors chunks of a chunked prompt
+    initial:
+      slots: {}
+      in_progress: {}
 - id: sampling-mask-tensors
   name: SamplingMaskTensors
   kind: module
@@ -1950,6 +2005,16 @@ components:
     cached yet, runs the vision encoder on them and stores the outputs in the encoder cache by mm hash.'
   sources:
   - vllm/v1/worker/gpu/mm/encoder_runner.py:78-175
+- id: default-model-state
+  name: DefaultModelState
+  kind: module
+  parent: gpu-model-runner
+  layer: runner
+  summary: 'The model state of a plain decoder model: prepare_attn builds the attention metadata of the step from
+    the input batch (positions, is_prefilling, padded sizes under a FULL graph).'
+  sources:
+  - vllm/v1/worker/gpu/model_states/default.py:29-60
+  - vllm/v1/worker/gpu/model_states/default.py:169-238
 interfaces:
 - component: gpu-memory
   name: snapshot
@@ -3537,6 +3602,10 @@ interfaces:
       pipeline_model_parallel_size: 1
       is_moe: = vars.is_moe
       enable_eplb: = config['enable-eplb']
+  - title: set_random_seed(model_config.seed)
+    source: vllm/v1/worker/gpu_worker.py:520-521
+    set:
+      state.random_seed: = int(config['seed'])
   - title: Snapshot free memory after NCCL init
     source: vllm/v1/worker/gpu_worker.py:534
     call: gpu-memory.snapshot
@@ -3877,6 +3946,12 @@ interfaces:
     input:
       num_tokens: = int(config['max-num-batched-tokens'])
       uniform_decode: false
+      skip_eplb: true
+  - title: 'kernel_warmup(self): tune the kernels before CUDA graph capture'
+    source: vllm/v1/worker/gpu_worker.py:949
+    call: kernel-warmup.kernel-warmup
+    input:
+      is_pooling_model: = has(state.is_pooling_model) && state.is_pooling_model
   - title: 'V2 with JIT warmup: scheduler-realistic prefill and decode steps through the worker''s execute_model
       and sample_tokens compile the kernels before capture'
     source: vllm/v1/worker/gpu/warmup.py:218-247
@@ -3913,6 +3988,13 @@ interfaces:
       input:
         num_tokens: '= int(config[''max-num-seqs'']) < int(config[''max-num-batched-tokens'']) ? int(config[''max-num-seqs''])
           : int(config[''max-num-batched-tokens''])'
+  - title: 'Reseed after model init and profiling: set_random_seed(seed, data_parallel_index), where a non-zero
+      DP index mixes into the seed so DP engines don''t sample unseeded requests alike'
+    source: vllm/v1/worker/gpu_worker.py:1060-1064
+    set:
+      state.random_seed: = int(config['seed'])
+      state.random_seed_dp_index: '= self.startsWith(''rank'') ? (int(self.substring(4)) / int(config[''tensor-parallel-size'']))
+        % int(config[''data-parallel-size'']) : 0'
   - return:
       cuda_graph_memory_bytes: = vars.cg_bytes
       suggested_kv_cache_memory_bytes: = vars.suggested
@@ -5327,14 +5409,28 @@ interfaces:
       kv_quant_mode:
         type: string
   behavior:
+  - set:
+      vars.kvd: = config['kv-cache-dtype']
+  - if: vars.kvd == 'auto'
+    then:
+    - title: 'cache_config.cache_dtype is the resolved one: create_engine_config turned ''auto'' into a ModelOpt
+        checkpoint''s KV algorithm (a world that never built the config has only the flag)'
+      source: vllm/engine/arg_utils.py:2256-2259
+      call: vllm-config.set-current-vllm-config
+      input: {}
+      as: cur
+      on_error: continue
+    - set:
+        vars.kvd: '= vars.cur.ok && has(vars.cur.value.cache_config) && has(vars.cur.value.cache_config.cache_dtype)
+          ? vars.cur.value.cache_config.cache_dtype : vars.kvd'
   - call: attn-utils.get-kv-cache-spec
     input:
       num_hidden_layers: = state.model.num_hidden_layers
       num_kv_heads: = state.model.num_kv_heads
       head_size: = state.model.head_size
       dtype_bytes: = state.model.dtype_bytes
-      use_mla: = has(state.model.use_mla) && state.model.use_mla
-      kv_cache_dtype: = config['kv-cache-dtype']
+      use_mla: '= has(state.model.use_mla) ? state.model.use_mla : false'
+      kv_cache_dtype: = vars.kvd
     as: spec
   - return: = vars.spec.value
 - component: gpu-model-runner
@@ -5369,6 +5465,12 @@ interfaces:
       num_tokens:
         type: integer
   behavior:
+  - title: 'A multimodal model''s profile_run profiles the encoder first, unless --skip-mm-profiling: MultiModalBudget(enable_cache=False),
+      then the maximum-feature dummy items'
+    source: vllm/v1/worker/gpu/model_runner.py:993-1001
+    if: config['model-is-multimodal'] && !config['skip-mm-profiling']
+    then:
+    - call: encoder-runner.profile-encoder-cache
   - call: gpu-model-runner.dummy-run
     input:
       num_tokens: = int(config['max-num-batched-tokens'])
@@ -5479,6 +5581,9 @@ interfaces:
         type: boolean
       is_profile:
         type: boolean
+      skip_eplb:
+        type: boolean
+        default: false
   response:
     type: object
     properties:
@@ -5487,6 +5592,26 @@ interfaces:
       cg_mode:
         type: string
   behavior:
+  - set:
+      vars.comp: '= has(state.model_component) && state.model_component != '''' ? state.model_component : (!has(state.model.architecture)
+        || state.model.architecture.startsWith(''Llama'') ? ''llama-for-causal-lm'' : (state.model.architecture.startsWith(''Mixtral'')
+        ? ''mixtral-for-causal-lm'' : (state.model.architecture.startsWith(''Qwen2VL'') ? ''qwen2-vl-for-conditional-generation''
+        : '''')))'
+  - if: vars.comp == ''
+    then:
+    - title: 'A world that never ran load_model: the registry resolves the architecture to its class (an architecture
+        it refuses keeps the Llama stand-in)'
+      source: vllm/model_executor/models/registry.py:1376-1428
+      call: model-registry.resolve-model-cls
+      input:
+        architectures:
+        - = state.model.architecture
+      as: rc
+      on_error: continue
+    - set:
+        vars.comp: '= vars.rc.ok && has(vars.rc.value.component) && vars.rc.value.component in [''llama-for-causal-lm'',
+          ''mixtral-for-causal-lm'', ''qwen2-vl-for-conditional-generation'', ''qwen3-vl-for-conditional-generation'',
+          ''bert-embedding-model''] ? vars.rc.value.component : ''llama-for-causal-lm'''
   - call: cuda-graph-manager.dispatch
     input:
       num_reqs: '= input.uniform_decode ? input.num_tokens : 1'
@@ -5494,20 +5619,39 @@ interfaces:
       uniform_token_count: '= input.uniform_decode ? 1 : 0'
       need_eager: = has(input.is_profile) && input.is_profile
     as: desc
+  - title: 'execute_model(dummy_run=True): PIECEWISE and eager forwards run inside set_forward_context, with DPMetadata
+      for a MoE model under data parallelism; a FULL replay needs none'
+    source: vllm/v1/worker/gpu/model_runner.py:2008-2027
+    when: vars.desc.value.cg_mode != 'FULL'
+    call: forward-context.set-forward-context
+    input:
+      num_tokens: = vars.desc.value.num_tokens
+      cudagraph_runtime_mode: = vars.desc.value.cg_mode
+      is_moe_model: = vars.comp == 'mixtral-for-causal-lm'
+      dp_rank: '= self.startsWith(''rank'') ? (int(self.substring(4)) / int(config[''tensor-parallel-size''])) %
+        int(config[''data-parallel-size'']) : 0'
   - title: 'The loaded model''s forward (the architecture load_model built: LlamaForCausalLM, MixtralForCausalLM)'
     source: vllm/v1/worker/gpu/model_runner.py:899-901
-    call: '= (has(state.model_component) && state.model_component != '''' ? state.model_component : (has(state.model.architecture)
-      && state.model.architecture.startsWith(''Mixtral'') ? ''mixtral-for-causal-lm'' : (has(state.model.architecture)
-      && state.model.architecture.startsWith(''Qwen2VL'') ? ''qwen2-vl-for-conditional-generation'' : ''llama-for-causal-lm'')))
-      + ''.forward'''
+    call: = vars.comp + '.forward'
     targets:
     - llama-for-causal-lm.forward
     - mixtral-for-causal-lm.forward
     - qwen2-vl-for-conditional-generation.forward
+    - qwen3-vl-for-conditional-generation.forward
+    - bert-embedding-model.forward
     input:
       num_tokens: = vars.desc.value.num_tokens
       num_prefill_tokens: '= input.uniform_decode ? 0 : input.num_tokens'
       num_decode_reqs: '= input.uniform_decode ? input.num_tokens : 0'
+  - when: vars.desc.value.cg_mode != 'FULL'
+    call: forward-context.exit-forward-context
+    input: {}
+  - when: config['enable-eplb'] && !(has(input.skip_eplb) && input.skip_eplb)
+    source: vllm/v1/worker/gpu/eplb_utils.py:46-62
+    call: eplb-controller.step
+    input:
+      is_dummy: true
+      is_profile: = has(input.is_profile) && input.is_profile
   - return:
       num_tokens: = vars.desc.value.num_tokens
       cg_mode: = vars.desc.value.cg_mode
@@ -5546,13 +5690,27 @@ interfaces:
       cudagraph_mode:
         type: string
   behavior:
+  - set:
+      vars.kvd: = config['kv-cache-dtype']
+  - if: vars.kvd == 'auto'
+    then:
+    - title: 'cache_config.cache_dtype is the resolved one: create_engine_config turned ''auto'' into a ModelOpt
+        checkpoint''s KV algorithm (a world that never built the config has only the flag)'
+      source: vllm/engine/arg_utils.py:2256-2259
+      call: vllm-config.set-current-vllm-config
+      input: {}
+      as: cur
+      on_error: continue
+    - set:
+        vars.kvd: '= vars.cur.ok && has(vars.cur.value.cache_config) && has(vars.cur.value.cache_config.cache_dtype)
+          ? vars.cur.value.cache_config.cache_dtype : vars.kvd'
   - call: attn-utils.get-kv-cache-spec
     input:
       num_hidden_layers: = state.model.num_hidden_layers
       num_kv_heads: = state.model.num_kv_heads
       head_size: = state.model.head_size
       dtype_bytes: = state.model.dtype_bytes
-      kv_cache_dtype: = config['kv-cache-dtype']
+      kv_cache_dtype: = vars.kvd
     as: spec
   - title: 'The attention groups'' metadata builders report their CUDA graph support (FlashAttention: ALWAYS with
       FA3, UNIFORM_BATCH with FA2)'
@@ -5631,6 +5789,7 @@ interfaces:
   - call: cuda-graph-manager.capture
     input:
       max_full_descs_to_capture: '= has(input.max_full_descs_to_capture) ? input.max_full_descs_to_capture : null'
+      num_layers: '= has(state.model.num_hidden_layers) ? state.model.num_hidden_layers : 32'
     as: cap
   - if: '!vars.cap.value.captured'
     then:
@@ -5686,9 +5845,37 @@ interfaces:
         type: array
   behavior:
   - set:
+      vars.resolved: null
+  - title: 'self.model_config.runner_type is what ModelConfig resolved: --runner auto on *ForSequenceClassification
+      is pooling with convert classify, not the flag''s text'
+    source: vllm/v1/worker/gpu_model_runner.py:3161-3164
+    if: '!state.is_pooling_model && (!(''runner'' in config) || config[''runner''] == ''auto'')'
+    then:
+    - call: model-config.post-init
+      input:
+        model: = config['model']
+        max_model_len: = config['max-model-len']
+        runner: auto
+        quantization: null
+        enforce_eager: false
+        language_model_only: false
+        mm_processor_device: null
+        mm_processor_kwargs: null
+        mm_encoder_attn_backend: null
+        mm_tensor_ipc: direct_rpc
+        hf_overrides: null
+      as: mc
+      on_error: continue
+    - if: vars.mc.ok
+      then:
+      - set:
+          vars.resolved: = vars.mc.value
+  - set:
       vars.runner_type: '= (''runner'' in config) && config[''runner''] == ''pooling'' ? ''pooling'' : (state.is_pooling_model
-        ? ''pooling'' : ''generate'')'
-      vars.convert: '= (''convert'' in config) && config[''convert''] != ''auto'' ? config[''convert''] : ''embed'''
+        ? ''pooling'' : (vars.resolved != null && vars.resolved.runner_type == ''pooling'' ? ''pooling'' : ''generate''))'
+      vars.convert: '= (''convert'' in config) && config[''convert''] != ''auto'' ? config[''convert''] : (vars.resolved
+        != null && has(vars.resolved.convert_type) && vars.resolved.convert_type == ''classify'' ? ''classify''
+        : ''embed'')'
   - set:
       vars.tasks: '= vars.runner_type == ''generate'' ? [''generate''] : []'
   - if: vars.runner_type == 'pooling'
@@ -5986,8 +6173,18 @@ interfaces:
       - set:
           state.free_slots: = state.free_slots + [state.slots[vars.rid].slot]
           vars.freed: = vars.freed + [state.slots[vars.rid].slot]
+      - if: state.is_pooling_model
+        then:
+        - source: vllm/v1/worker/gpu/model_runner.py:1141-1142
+          call: pooling-runner.remove-request
+          input:
+            slot: = state.slots[vars.rid].slot
       - set:
           state.slots: = omit(state.slots, vars.rid)
+      - source: vllm/v1/worker/gpu/model_runner.py:1147-1148
+        call: prompt-logprobs-worker.remove-request
+        input:
+          req_id: = vars.rid
       - if: config['model-is-multimodal']
         then:
         - title: The encoder cache drops the request's multimodal features
@@ -6028,6 +6225,14 @@ interfaces:
   behavior:
   - set:
       vars.assigned: {}
+      vars.pool_tasks: []
+  - if: state.is_pooling_model && size(input.reqs) > 0
+    then:
+    - call: gpu-model-runner.get-supported-tasks
+      input: {}
+      as: st
+    - set:
+        vars.pool_tasks: = vars.st.value.tasks
   - foreach: = input.reqs
     as: r
     steps:
@@ -6090,6 +6295,17 @@ interfaces:
         input:
           req_id: = vars.r.req_id
           mm_features: '= has(vars.r.mm_features) && vars.r.mm_features != null ? vars.r.mm_features : []'
+    - if: state.is_pooling_model
+      then:
+      - title: The pooling runner validates the request's task and keeps its pooling params
+        source: vllm/v1/worker/gpu/model_runner.py:1204-1211
+        call: pooling-runner.add-request
+        input:
+          req_id: = vars.r.req_id
+          slot: = vars.slot
+          pooling_params: '= has(vars.r.pooling_params) && vars.r.pooling_params != null ? vars.r.pooling_params
+            : {}'
+          supported_tasks: = vars.pool_tasks
     - title: Copy the request's block ids into the GPU block-table row (overwrite)
       source: vllm/v1/worker/gpu/model_runner.py:1216-1218
       call: block-tables.append-block-ids
@@ -6105,6 +6321,14 @@ interfaces:
       input:
         slot: = vars.slot
         sampling_params: '= has(vars.r.sampling_params) ? vars.r.sampling_params : {}'
+    - source: vllm/v1/worker/gpu/model_runner.py:1225-1228
+      when: '!state.is_pooling_model'
+      call: prompt-logprobs-worker.add-request
+      input:
+        req_id: = vars.r.req_id
+        slot: = vars.slot
+        sampling_params: '= has(vars.r.sampling_params) && vars.r.sampling_params != null ? vars.r.sampling_params
+          : {}'
   - if: size(input.reqs) > 0
     then:
     - title: Flush the request states' staged writes to the device
@@ -6335,31 +6559,61 @@ interfaces:
       call: cp-utils.prepare-dcp-local-seq-lens
       input:
         num_reqs: = size(vars.batch)
-  - title: Build attention metadata (model_state.prepare_attn -> build_attn_metadata)
+  - title: 'Build attention metadata: model_state.prepare_attn (the hybrid Mamba state for a hybrid model, else
+      the default state) calls build_attn_metadata with the batch''s positions'
     source: vllm/v1/worker/gpu/model_runner.py:1915-1926
-    call: flash-attention-metadata-builder.build
+    call: '= state.model.is_hybrid ? ''mamba-hybrid-model-state.prepare-attn'' : ''default-model-state.prepare-attn'''
+    targets:
+    - mamba-hybrid-model-state.prepare-attn
+    - default-model-state.prepare-attn
     input:
-      fa_version: '= ''flash-attn-version'' in config && config[''flash-attn-version''] != null ? int(config[''flash-attn-version''])
-        : 3'
-      fast_build: false
-      batch_invariant: false
-      sliding_window_configs: 1
-      use_full_cuda_graph: = vars.desc.value.cg_mode == 'FULL'
-      max_cudagraph_size: = vars.desc.value.max_capture_size
-      dcp_world_size: = int(config['decode-context-parallel-size'])
-      common:
-        num_reqs: = size(vars.batch)
-        num_actual_tokens: = input.total_num_scheduled_tokens
-        query_lens: = vars.batch.map(b, b.n)
-        seq_lens: = vars.batch.map(b, b.nct + b.n)
-        max_query_len: = vars.batch.map(b, b.n).sortBy(x, -x)[0]
-        max_seq_len: = vars.batch.map(b, b.nct + b.n).sortBy(x, -x)[0]
-        block_table: = vars.bt.value.block_table
-        slot_mapping: '= lists.range(size(vars.batch)).map(i, lists.range(vars.batch[i].n).map(j, (vars.batch[i].nct
-          + j) / int(config[''block-size'']) < size(vars.bt.value.block_table[i]) ? vars.bt.value.block_table[i][(vars.batch[i].nct
-          + j) / int(config[''block-size''])] * int(config[''block-size'']) + (vars.batch[i].nct + j) % int(config[''block-size''])
-          : -1)).flatten()'
-        causal: true
+      positions: = vars.batch.map(b, lists.range(b.n).map(j, b.nct + j)).flatten()
+      is_prefilling: = vars.batch.map(b, b.nct < b.prefill_len)
+      num_scheduled_tokens: = vars.batch.map(b, b.n)
+      num_draft_tokens: = vars.batch.map(b, size(b.drafts))
+      cg_mode: = vars.desc.value.cg_mode
+      build:
+        fa_version: '= ''flash-attn-version'' in config && config[''flash-attn-version''] != null ? int(config[''flash-attn-version''])
+          : 3'
+        fast_build: false
+        batch_invariant: false
+        sliding_window_configs: 1
+        use_full_cuda_graph: = vars.desc.value.cg_mode == 'FULL'
+        max_cudagraph_size: = vars.desc.value.max_capture_size
+        dcp_world_size: = int(config['decode-context-parallel-size'])
+        common:
+          num_reqs: = size(vars.batch)
+          num_actual_tokens: = input.total_num_scheduled_tokens
+          query_lens: = vars.batch.map(b, b.n)
+          seq_lens: = vars.batch.map(b, b.nct + b.n)
+          max_query_len: = vars.batch.map(b, b.n).sortBy(x, -x)[0]
+          max_seq_len: = vars.batch.map(b, b.nct + b.n).sortBy(x, -x)[0]
+          block_table: = vars.bt.value.block_table
+          slot_mapping: '= lists.range(size(vars.batch)).map(i, lists.range(vars.batch[i].n).map(j, (vars.batch[i].nct
+            + j) / int(config[''block-size'']) < size(vars.bt.value.block_table[i]) ? vars.bt.value.block_table[i][(vars.batch[i].nct
+            + j) / int(config[''block-size''])] * int(config[''block-size'']) + (vars.batch[i].nct + j) % int(config[''block-size''])
+            : -1)).flatten()'
+          causal: true
+  - set:
+      vars.comp: '= has(state.model_component) && state.model_component != '''' ? state.model_component : (!has(state.model.architecture)
+        || state.model.architecture.startsWith(''Llama'') ? ''llama-for-causal-lm'' : (state.model.architecture.startsWith(''Mixtral'')
+        ? ''mixtral-for-causal-lm'' : (state.model.architecture.startsWith(''Qwen2VL'') ? ''qwen2-vl-for-conditional-generation''
+        : '''')))'
+  - if: vars.comp == ''
+    then:
+    - title: 'A world that never ran load_model: the registry resolves the architecture to its class (an architecture
+        it refuses keeps the Llama stand-in)'
+      source: vllm/model_executor/models/registry.py:1376-1428
+      call: model-registry.resolve-model-cls
+      input:
+        architectures:
+        - = state.model.architecture
+      as: rc
+      on_error: continue
+    - set:
+        vars.comp: '= vars.rc.ok && has(vars.rc.value.component) && vars.rc.value.component in [''llama-for-causal-lm'',
+          ''mixtral-for-causal-lm'', ''qwen2-vl-for-conditional-generation'', ''qwen3-vl-for-conditional-generation'',
+          ''bert-embedding-model''] ? vars.rc.value.component : ''llama-for-causal-lm'''
   - if: config['model-is-multimodal'] && state.is_first_pp_rank && has(input.scheduled_encoder_inputs) && size(input.scheduled_encoder_inputs)
       > 0
     then:
@@ -6374,10 +6628,7 @@ interfaces:
         scheduled_encoder_inputs: = input.scheduled_encoder_inputs
         mm_features: = vars.ec.value.mm_features
         cached: = vars.ec.value.cached
-        model_component: '= (has(state.model_component) && state.model_component != '''' ? state.model_component
-          : (has(state.model.architecture) && state.model.architecture.startsWith(''Mixtral'') ? ''mixtral-for-causal-lm''
-          : (has(state.model.architecture) && state.model.architecture.startsWith(''Qwen2VL'') ? ''qwen2-vl-for-conditional-generation''
-          : ''llama-for-causal-lm'')))'
+        model_component: = vars.comp
   - if: state.model.uses_mrope || state.model.uses_prompt_embeds
     then:
     - when: state.model.uses_mrope
@@ -6415,6 +6666,9 @@ interfaces:
         uniform: false
         has_lora: = config['enable-lora']
         num_active_loras: 0
+      is_moe_model: = vars.comp == 'mixtral-for-causal-lm'
+      dp_rank: '= self.startsWith(''rank'') ? (int(self.substring(4)) / int(config[''tensor-parallel-size''])) %
+        int(config[''data-parallel-size'']) : 0'
   - if: vars.desc.value.cg_mode == 'FULL'
     then:
     - title: Replay the captured FULL graph (inputs already in the graph's buffers)
@@ -6427,21 +6681,18 @@ interfaces:
       - title: PIECEWISE graphs through the compiled model
         source: vllm/v1/worker/gpu/model_runner.py:2034-2042
         call: cuda-graph-manager.run-pw-graph
-        input: '= merge(vars.fwd, {''model_component'': (has(state.model_component) && state.model_component !=
-          '''' ? state.model_component : (has(state.model.architecture) && state.model.architecture.startsWith(''Mixtral'')
-          ? ''mixtral-for-causal-lm'' : (has(state.model.architecture) && state.model.architecture.startsWith(''Qwen2VL'')
-          ? ''qwen2-vl-for-conditional-generation'' : ''llama-for-causal-lm'')))})'
+        input: '= merge(vars.fwd, {''num_layers'': has(state.model.num_hidden_layers) ? state.model.num_hidden_layers
+          : 32, ''model_component'': vars.comp})'
       else:
       - title: Eager forward of the loaded model
         source: vllm/v1/worker/gpu/model_runner.py:2043-2044
-        call: '= (has(state.model_component) && state.model_component != '''' ? state.model_component : (has(state.model.architecture)
-          && state.model.architecture.startsWith(''Mixtral'') ? ''mixtral-for-causal-lm'' : (has(state.model.architecture)
-          && state.model.architecture.startsWith(''Qwen2VL'') ? ''qwen2-vl-for-conditional-generation'' : ''llama-for-causal-lm'')))
-          + ''.forward'''
+        call: = vars.comp + '.forward'
         targets:
         - llama-for-causal-lm.forward
         - mixtral-for-causal-lm.forward
         - qwen2-vl-for-conditional-generation.forward
+        - qwen3-vl-for-conditional-generation.forward
+        - bert-embedding-model.forward
         input: = vars.fwd
       - title: Kernel-launch overhead of an eager step (assumption)
         wait: = int(config['worker-runner-eager-launch-overhead-ms'])
@@ -6452,6 +6703,7 @@ interfaces:
     source: vllm/v1/worker/gpu/model_runner.py:2064-2075
     set:
       state.execute_model_state:
+        model_component: = vars.comp
         batch: = vars.batch
         local_batch: = vars.local_batch
         num_drafts: = vars.num_drafts
@@ -6583,6 +6835,12 @@ interfaces:
         input:
           num_reqs: = size(vars.ems.batch)
           num_sampled_is_int: true
+    - when: config['enable-eplb']
+      source: vllm/v1/worker/gpu/eplb_utils.py:46-62
+      call: eplb-controller.step
+      input:
+        is_dummy: false
+        is_profile: false
     - title: KV-connector-only output
       source: vllm/v1/worker/gpu/model_runner.py:2125-2127
       return:
@@ -6599,6 +6857,10 @@ interfaces:
       batch: = vars.ems.batch
       num_drafts: = vars.ems.num_drafts
       new_reqs: = vars.ems.new_reqs
+      model_component: '= has(vars.ems.model_component) ? vars.ems.model_component : (has(state.model_component)
+        && state.model_component != '''' ? state.model_component : (has(state.model.architecture) && state.model.architecture.startsWith(''Mixtral'')
+        ? ''mixtral-for-causal-lm'' : (has(state.model.architecture) && state.model.architecture.startsWith(''Qwen2VL'')
+        ? ''qwen2-vl-for-conditional-generation'' : ''llama-for-causal-lm'')))'
       grammar_output: = input.grammar_output
     as: s
   - if: int(config['pipeline-parallel-size']) > 1
@@ -6613,12 +6875,15 @@ interfaces:
   - title: Prompt logprobs for requests that asked for them
     source: vllm/v1/worker/gpu/model_runner.py:2150-2159
     call: prompt-logprobs-worker.compute-prompt-logprobs
+    as: plp
     input:
-      new_reqs: = vars.ems.new_reqs
-      model_component: '= (has(state.model_component) && state.model_component != '''' ? state.model_component :
-        (has(state.model.architecture) && state.model.architecture.startsWith(''Mixtral'') ? ''mixtral-for-causal-lm''
-        : (has(state.model.architecture) && state.model.architecture.startsWith(''Qwen2VL'') ? ''qwen2-vl-for-conditional-generation''
-        : ''llama-for-causal-lm'')))'
+      rows: '= vars.ems.batch.map(b, {''req_id'': b.req_id, ''slot'': b.slot, ''nct'': b.nct, ''n'': b.n, ''prompt_len'':
+        has(state.slots[b.req_id].prompt_len) ? state.slots[b.req_id].prompt_len : b.prefill_len, ''prefill_len'':
+        b.prefill_len, ''token_ids'': has(state.slots[b.req_id].token_ids) ? state.slots[b.req_id].token_ids : []})'
+      model_component: '= (has(vars.ems.model_component) ? vars.ems.model_component : (has(state.model_component)
+        && state.model_component != '''' ? state.model_component : (has(state.model.architecture) && state.model.architecture.startsWith(''Mixtral'')
+        ? ''mixtral-for-causal-lm'' : (has(state.model.architecture) && state.model.architecture.startsWith(''Qwen2VL'')
+        ? ''qwen2-vl-for-conditional-generation'' : ''llama-for-causal-lm''))))'
   - title: Post-update num_computed_tokens, last sampled tokens and output bin counts
     source: vllm/v1/worker/gpu/model_runner.py:2217-2223
     call: input-batch.post-update-kernel
@@ -6680,9 +6945,18 @@ interfaces:
     call: runner-kv-connector.post-forward
     input:
       finished_req_ids: '= has(vars.ems.finished_req_ids) ? vars.ems.finished_req_ids : []'
-  - return:
+  - when: config['enable-eplb']
+    source: vllm/v1/worker/gpu/eplb_utils.py:46-62
+    call: eplb-controller.step
+    input:
+      is_dummy: false
+      is_profile: false
+  - source: vllm/v1/worker/gpu/async_utils.py:173-200
+    return:
       req_ids: = vars.s.value.req_ids
       sampled_token_ids: = vars.s.value.sampled_token_ids
+      logprobs: '= has(vars.s.value.logprobs) ? vars.s.value.logprobs : null'
+      prompt_logprobs_dict: = vars.plp.value.prompt_logprobs_dict
 - component: gpu-model-runner
   name: sample
   kind: function
@@ -6702,6 +6976,9 @@ interfaces:
         type:
         - object
         - 'null'
+      model_component:
+        type: string
+        description: the component execute_model ran
   response:
     type: object
     properties:
@@ -6728,14 +7005,15 @@ interfaces:
         ctx.local_sampled_reqs: = vars.shard.value.local_batch.req_ids
   - title: The loaded model's compute_logits
     source: vllm/v1/worker/gpu/model_runner.py:1610-1615
-    call: '= (has(state.model_component) && state.model_component != '''' ? state.model_component : (has(state.model.architecture)
-      && state.model.architecture.startsWith(''Mixtral'') ? ''mixtral-for-causal-lm'' : (has(state.model.architecture)
-      && state.model.architecture.startsWith(''Qwen2VL'') ? ''qwen2-vl-for-conditional-generation'' : ''llama-for-causal-lm'')))
-      + ''.compute-logits'''
+    call: '= (has(input.model_component) ? input.model_component : (has(state.model_component) && state.model_component
+      != '''' ? state.model_component : (has(state.model.architecture) && state.model.architecture.startsWith(''Mixtral'')
+      ? ''mixtral-for-causal-lm'' : (has(state.model.architecture) && state.model.architecture.startsWith(''Qwen2VL'')
+      ? ''qwen2-vl-for-conditional-generation'' : ''llama-for-causal-lm'')))) + ''.compute-logits'''
     targets:
     - llama-for-causal-lm.compute-logits
     - mixtral-for-causal-lm.compute-logits
     - qwen2-vl-for-conditional-generation.compute-logits
+    - qwen3-vl-for-conditional-generation.compute-logits
     input:
       num_tokens: = size(input.batch) + input.num_drafts
   - set:
@@ -6757,9 +7035,9 @@ interfaces:
       vars.rows0: '= input.batch.map(b, {''req_id'': b.req_id, ''slot'': b.slot, ''is_final'': b.nct + b.n >= b.prefill_len,
         ''drafts'': b.drafts, ''prompt_hash'': b.prompt_hash, ''seq_len'': b.nct + b.n, ''prompt_len'': b.prompt_len,
         ''eos_token_id'': has(state.model.eos_token_id) ? state.model.eos_token_id : 128009, ''context_token_ids'':
-        (b.req_id in input.new_reqs && has(input.new_reqs[b.req_id].prefill_token_ids) && has(input.new_reqs[b.req_id].prompt_len))
-        ? input.new_reqs[b.req_id].prefill_token_ids.slice(input.new_reqs[b.req_id].prompt_len, size(input.new_reqs[b.req_id].prefill_token_ids))
-        : []})'
+        (b.req_id in state.slots && has(state.slots[b.req_id].token_ids) && has(state.slots[b.req_id].prompt_len)
+        && size(state.slots[b.req_id].token_ids) > state.slots[b.req_id].prompt_len) ? state.slots[b.req_id].token_ids.slice(state.slots[b.req_id].prompt_len,
+        size(state.slots[b.req_id].token_ids)) : []})'
   - set:
       vars.rows: '= vars.rows0.map(r, r.req_id in vars.allowed ? merge(r, {''grammar'': vars.allowed[r.req_id]})
         : r)'
@@ -6847,11 +7125,21 @@ interfaces:
   - call: pooling-runner.pool
     input:
       req_ids: = vars.ems.batch.map(b, b.req_id)
+      rows: '= vars.ems.batch.map(b, {''req_id'': b.req_id, ''slot'': b.slot, ''prompt_len'': has(b.prompt_len)
+        ? b.prompt_len : b.prefill_len, ''n'': b.n, ''seq_len'': b.nct + b.n})'
+      seq_pooling_type: '= has(state.model.seq_pooling_type) ? state.model.seq_pooling_type : ''LAST'''
+      hidden_size: '= has(state.model.hidden_size) ? state.model.hidden_size : 4096'
     as: p
   - source: vllm/v1/worker/gpu/model_runner.py:2326
     call: input-batch.post-update-num-computed-tokens-kernel
     input:
       num_rows: = size(vars.ems.batch)
+  - when: config['enable-eplb']
+    source: vllm/v1/worker/gpu/eplb_utils.py:46-62
+    call: eplb-controller.step
+    input:
+      is_dummy: false
+      is_profile: false
   - return:
       req_ids: = vars.ems.batch.map(b, b.req_id)
       sampled_token_ids: = vars.ems.batch.map(b, [])
@@ -6909,7 +7197,7 @@ interfaces:
       source: vllm/v1/worker/gpu/attn_utils.py:149-152
       call: mla-attention.get-kv-cache-spec
       input:
-        kv_cache_dtype: = config['kv-cache-dtype']
+        kv_cache_dtype: '= has(input.kv_cache_dtype) ? input.kv_cache_dtype : config[''kv-cache-dtype'']'
         head_size: = input.head_size
         model_dtype_bytes: = input.dtype_bytes
       as: mla
@@ -7164,6 +7452,10 @@ interfaces:
         - 'null'
         default: null
         description: 'profiling only: capture this many of the largest FULL graphs'
+      num_layers:
+        type: integer
+        default: 32
+        description: the loaded model's hidden layers
   response:
     type: object
     properties:
@@ -7206,6 +7498,20 @@ interfaces:
     source: vllm/v1/worker/gpu/cudagraph_utils.py:439-472
     set:
       state.piecewise_captured: = vars.pw
+  - title: With VLLM_USE_BREAKABLE_CUDAGRAPH each PIECEWISE descriptor's capture goes through the wrapper (run_pw_graph
+      inside the forward_fn)
+    source: vllm/v1/worker/gpu/cudagraph_utils.py:752-755
+    when: config['vllm-use-breakable-cudagraph'] && size(vars.pw) > 0
+    foreach: = vars.pw
+    as: pwn
+    max: 1000
+    steps:
+    - call: breakable-cuda-graph-wrapper.call
+      input:
+        num_tokens: = vars.pwn
+        uniform_decode: false
+        runtime_mode: PIECEWISE
+        num_layers: '= has(input.num_layers) ? input.num_layers : 32'
   - title: 'Then FULL: for each descriptor a warmup, then capture_pool points NCCL''s graph allocator at the pool
       and torch.cuda.graph records the forward'
     source: vllm/v1/worker/gpu/cudagraph_utils.py:473-505
@@ -7340,6 +7646,11 @@ interfaces:
       state.graphs_captured: false
       state.full_graphs: {}
       state.piecewise_captured: []
+  - title: 'BreakableCUDAGraphWrapper.clear_all_graphs(): a captured descriptor would otherwise replay after the
+      profiling capture'
+    source: vllm/v1/worker/gpu/cudagraph_utils.py:961-962
+    when: config['vllm-use-breakable-cudagraph']
+    call: breakable-cuda-graph-wrapper.clear-all-graphs
 - component: cuda-graph-manager
   name: run-fullgraph
   kind: function
@@ -7371,9 +7682,13 @@ interfaces:
 - component: cuda-graph-manager
   name: run-pw-graph
   kind: function
-  summary: 'run_pw_graph: calls the torch-compiled model whose piecewise CUDA graphs replay between attention ops.'
+  summary: 'run_pw_graph: calls the torch-compiled model whose piecewise CUDA graphs replay between attention ops;
+    with VLLM_USE_BREAKABLE_CUDAGRAPH, the BreakableCUDAGraphWrapper instead: a new batch descriptor captures the
+    forward (the model runs), a captured one replays its segments without entering the model.'
   sources:
   - vllm/v1/worker/gpu/cudagraph_utils.py:571-576
+  - vllm/v1/worker/gpu/cudagraph_utils.py:565-569
+  - vllm/v1/worker/gpu/cudagraph_utils.py:189-194
   latency_ms: 0
   request:
     type: object
@@ -7384,11 +7699,32 @@ interfaces:
         type: integer
       num_decode_reqs:
         type: integer
+      num_layers:
+        type: integer
+        default: 32
+        description: the loaded model's hidden layers (one eager attention break each)
       model_component:
         type: string
         default: llama-for-causal-lm
         description: the loaded model's component (its architecture)
   behavior:
+  - if: config['vllm-use-breakable-cudagraph']
+    then:
+    - title: 'use_breakable_cg: self.breakable_cg_runner(**model_inputs)'
+      source: vllm/v1/worker/gpu/cudagraph_utils.py:572-576
+      call: breakable-cuda-graph-wrapper.call
+      input:
+        num_tokens: = input.num_tokens
+        uniform_decode: false
+        runtime_mode: PIECEWISE
+        num_layers: '= has(input.num_layers) ? input.num_layers : 32'
+      as: br
+    - if: vars.br.value.path == 'replay'
+      then:
+      - set:
+          ctx.last_cg_mode: PIECEWISE
+      - return:
+          path: replay
   - title: The compiled model is the loaded architecture's
     source: vllm/v1/worker/gpu/cudagraph_utils.py:571-576
     call: '= (has(input.model_component) ? input.model_component : ''llama-for-causal-lm'') + ''.forward'''
@@ -7396,6 +7732,8 @@ interfaces:
     - llama-for-causal-lm.forward
     - mixtral-for-causal-lm.forward
     - qwen2-vl-for-conditional-generation.forward
+    - qwen3-vl-for-conditional-generation.forward
+    - bert-embedding-model.forward
     input:
       num_tokens: = input.num_tokens
       num_prefill_tokens: '= has(input.num_prefill_tokens) ? input.num_prefill_tokens : 0'
@@ -7646,6 +7984,45 @@ interfaces:
       num_rows: = vars.slot.num_reqs
   - return: = vars.got
 - component: eplb-controller
+  name: step
+  kind: function
+  summary: 'EPLBController.step, run by @step_eplb_after after sample_tokens, pool and _dummy_run (unless skip_eplb):
+    nothing without enable_eplb, while suppressed, or before a model is registered; else EplbState.step with the
+    is_dummy and is_profile flags and eplb_config.log_balancedness.'
+  sources:
+  - vllm/v1/worker/gpu/eplb_utils.py:167-177
+  - vllm/v1/worker/gpu/eplb_utils.py:46-62
+  latency_ms: 0
+  request:
+    type: object
+    properties:
+      is_dummy:
+        type: boolean
+        default: false
+      is_profile:
+        type: boolean
+        default: false
+  response:
+    type: object
+    properties:
+      stepped:
+        type: boolean
+  behavior:
+  - if: '!config[''enable-eplb''] || (has(state.suppressed) && state.suppressed) || !(has(state.has_registered_models)
+      && state.has_registered_models)'
+    then:
+    - source: vllm/v1/worker/gpu/eplb_utils.py:168-174
+      return:
+        stepped: false
+  - source: vllm/v1/worker/gpu/eplb_utils.py:176-177
+    call: eplb-state.step
+    input:
+      is_dummy: = has(input.is_dummy) && input.is_dummy
+      is_profile: = has(input.is_profile) && input.is_profile
+      log_stats: = type(config['eplb-config']) == map && has(config['eplb-config'].log_balancedness) && config['eplb-config'].log_balancedness
+  - return:
+      stepped: true
+- component: eplb-controller
   name: load
   kind: function
   summary: 'EPLBController around load_model: prepare_load creates the EplbState when enable_eplb; maybe_register_model
@@ -7689,6 +8066,8 @@ interfaces:
     call: eplb-state.add-model
     input:
       model: = input.model
+  - set:
+      state.has_registered_models: true
   - if: input.model.contains('Mixtral')
     then:
     - title: 'add_model hands the model its EPLB tensors (model.set_eplb_state): initially each of the 8 logical
@@ -7778,7 +8157,10 @@ interfaces:
   kind: function
   summary: 'Sampler.add_request: stages temperature/top-k/top-p/min-p/seed/logprobs into the slot and asks each
     logits processor (logit bias, penalties, bad words, custom) and the thinking budget whether the slot needs logits
-    processing.'
+    processing. An unseeded request''s seed is drawn from np.random in the code (seeds_set false); the model stores
+    null, because no stand-in token reads it and a draw here would shift every later random token; logprobs -1 means
+    the whole vocabulary; min_tokens > 0 alone enables the logit-bias stage, because its mask keys on all_stop_token_ids,
+    which always holds the model''s EOS (update_from_generation_config adds it even under ignore_eos, sampling_params.py:781-784).'
   sources:
   - vllm/v1/worker/gpu/sample/sampler.py:96-107
   - vllm/v1/worker/gpu/sample/states.py:41-71
@@ -7815,8 +8197,8 @@ interfaces:
         && double(vars.sp.frequency_penalty) != 0.0) || (has(vars.sp.presence_penalty) && double(vars.sp.presence_penalty)
         != 0.0)
       vars.logit_bias: = (has(vars.sp.logit_bias) && size(vars.sp.logit_bias) > 0) || (has(vars.sp.allowed_token_ids)
-        && size(vars.sp.allowed_token_ids) > 0) || (has(vars.sp.min_tokens) && vars.sp.min_tokens > 0 && has(vars.sp.stop_token_ids)
-        && size(vars.sp.stop_token_ids) > 0)
+        && size(vars.sp.allowed_token_ids) > 0) || (has(vars.sp.min_tokens) && vars.sp.min_tokens != null && vars.sp.min_tokens
+        > 0)
       vars.thinking: = has(vars.sp.thinking_token_budget)
   - if: vars.penalties
     then:
@@ -7850,13 +8232,14 @@ interfaces:
   - set:
       vars.needs: = vars.base || vars.penalties || vars.logit_bias || vars.thinking || vars.bw.value.uses_bad_words
         || vars.custom_needs
-  - set:
+  - source: vllm/v1/worker/gpu/sample/states.py:53-64
+    set:
       state.slots: '= merge(state.slots, {string(input.slot): {''temperature'': vars.t, ''top_p'': vars.top_p, ''top_k'':
         vars.top_k, ''min_p'': vars.min_p, ''min_tokens'': has(vars.sp.min_tokens) && vars.sp.min_tokens != null
         ? int(vars.sp.min_tokens) : 0, ''seeded'': has(vars.sp.seed) && vars.sp.seed != null, ''seed'': has(vars.sp.seed)
-        && vars.sp.seed != null ? int(vars.sp.seed) : 0, ''logprobs'': has(vars.sp.logprobs) && vars.sp.logprobs
-        != null ? int(vars.sp.logprobs) : -1, ''penalties'': vars.penalties, ''logit_bias'': vars.logit_bias, ''thinking'':
-        vars.thinking, ''needs_processing'': vars.needs}})'
+        && vars.sp.seed != null ? dyn(int(vars.sp.seed)) : dyn(null), ''logprobs'': has(vars.sp.logprobs) && vars.sp.logprobs
+        != null ? (int(vars.sp.logprobs) == -1 ? int(state.vocab_size) : int(vars.sp.logprobs)) : -1, ''penalties'':
+        vars.penalties, ''logit_bias'': vars.logit_bias, ''thinking'': vars.thinking, ''needs_processing'': vars.needs}})'
   - return:
       needs_processing: = vars.needs
 - component: sampler
@@ -7884,6 +8267,8 @@ interfaces:
         type: array
       masked:
         type: array
+      logprobs:
+        $ref: WrLogprobsLists
   behavior:
   - if: input.rows.exists(r, !(string(r.slot) in state.slots))
     then:
@@ -7973,10 +8358,38 @@ interfaces:
     - call: sampling-mask-tensors.compact-sampling-mask-kernel
       input:
         num_rows: = size(input.rows)
-  - return:
+  - set:
+      vars.logprobs: null
+  - if: vars.p.exists(s, s.logprobs != null && s.logprobs >= 0)
+    then:
+    - title: 'LogprobsTensors for every logits row, at the batch''s largest num_logprobs: column 0 is the sampled
+        token, then the top-k ids; plus the sampled token''s rank (the scheduler slices the rows of the requests
+        that asked)'
+      detail: 'The model holds no logits, so the values are labeled stand-ins: a greedy row''s token is the argmax
+        (rank 1, so it is also the first top-k id); another row''s rank is 1 + token % 4. The other top-k ids are
+        deterministic from the token, and the logprob of rank r is -0.25 r.'
+      source: vllm/v1/worker/gpu/sample/logprob.py:122-133
+      set:
+        vars.k: '= vars.p.map(s, s.logprobs != null ? s.logprobs : -1).sortBy(x, -x)[0]'
+        vars.toks: = lists.range(size(input.rows)).map(i, vars.asp.value.tokens[i][0])
+    - set:
+        vars.ranks: '= lists.range(size(input.rows)).map(i, vars.asp.value.greedy[i] ? 1 : 1 + (vars.toks[i] < 0
+          ? 0 : vars.toks[i]) % 4)'
+    - set:
+        vars.logprobs:
+          logprob_token_ids: '= lists.range(size(input.rows)).map(i, [vars.toks[i]] + lists.range(vars.k).map(j,
+            j + 1 == vars.ranks[i] ? vars.toks[i] : ((vars.toks[i] < 0 ? 0 : vars.toks[i]) * 17 + (j + 1) * 7919)
+            % 127900 + 100))'
+          logprobs: = lists.range(size(input.rows)).map(i, [-0.25 * double(vars.ranks[i])] + lists.range(vars.k).map(j,
+            -0.25 * double(j + 1)))
+          sampled_token_ranks: = vars.ranks
+          cu_num_generated_tokens: null
+  - source: vllm/v1/worker/gpu/sample/sampler.py:212-222
+    return:
       req_ids: = input.rows.map(r, r.req_id)
       sampled_token_ids: '= lists.range(size(input.rows)).map(i, !input.rows[i].is_final ? [] : [vars.asp.value.tokens[i][0]])'
       masked: = vars.masked
+      logprobs: = vars.logprobs
 - component: sampler
   name: apply-sampling-params
   kind: function
@@ -7986,7 +8399,9 @@ interfaces:
     skipped. The rejection sampler calls it for the target''s logits too. The model holds no logits, so it returns,
     for each logits row, the token the processed logits would yield (a labeled stand-in; -1 for a chunked prefill
     that samples nothing): the model''s EOS at the request''s natural output length (masked until min_tokens), else
-    a deterministic token for greedy or seeded rows and a random one otherwise.'
+    a deterministic token for greedy or seeded rows and a random one otherwise. A token the bad-words mask set to
+    -inf cannot win the argmax (bad_words.py:165), so such a row takes the next token id outside its masked set
+    at that logits position.'
   sources:
   - vllm/v1/worker/gpu/sample/sampler.py:226-276
   - vllm/v1/worker/gpu/sample/logits_processor/interface.py:63-89
@@ -8106,8 +8521,8 @@ interfaces:
       identical outputs and a greedy target''s verdict on a draft is reproducible; an unseeded random row gets a
       seeded-per-run random token.'
     source: vllm/v1/worker/gpu/sample/gumbel.py:21-44
-    return:
-      tokens: '= lists.range(size(input.rows)).map(i, lists.range(size(vars.pos[i])).map(j, (has(input.rows[i].is_final)
+    set:
+      vars.tok0: '= lists.range(size(input.rows)).map(i, lists.range(size(vars.pos[i])).map(j, (has(input.rows[i].is_final)
         && !input.rows[i].is_final) ? -1 : (!has(input.rows[i].grammar) ? (vars.eos[i][j] ? (has(input.rows[i].eos_token_id)
         ? input.rows[i].eos_token_id : 128009) : ((vars.p[i].temperature == 0.0 || vars.p[i].seeded) ? ((has(input.rows[i].prompt_hash)
         ? input.rows[i].prompt_hash : 0) * 31 + (vars.pos[i][j] >= 0 ? vars.pos[i][j] : 0) * 7919 + (vars.p[i].temperature
@@ -8120,6 +8535,14 @@ interfaces:
         : 128009) : ((vars.p[i].temperature == 0.0 || vars.p[i].seeded) ? ((has(input.rows[i].prompt_hash) ? input.rows[i].prompt_hash
         : 0) * 31 + (vars.pos[i][j] >= 0 ? vars.pos[i][j] : 0) * 7919 + (vars.p[i].temperature != 0.0 && has(vars.p[i].seed)
         ? vars.p[i].seed % 1000003 : 0)) % 127900 + 100 : random(127900) + 100))))))))'
+  - source: vllm/v1/worker/gpu/sample/bad_words.py:160-165
+    set:
+      vars.ban: = lists.range(size(input.rows)).map(i, lists.range(size(vars.pos[i])).map(j, vars.masked.filter(m,
+        m.slot == input.rows[i].slot && m.local_pos == j).map(m, m.token)))
+  - return:
+      tokens: '= lists.range(size(input.rows)).map(i, lists.range(size(vars.tok0[i])).map(j, vars.tok0[i][j] < 0
+        || size(vars.ban[i][j]) == 0 || !(vars.tok0[i][j] in vars.ban[i][j]) ? vars.tok0[i][j] : lists.range(size(vars.ban[i][j])
+        + 1).map(d, (vars.tok0[i][j] - 100 + d + 1) % 127900 + 100).filter(c, !(c in vars.ban[i][j]))[0]))'
       greedy: = vars.p.map(s, s.temperature == 0.0)
       masked: = vars.masked
 - component: sampler
@@ -8412,16 +8835,20 @@ interfaces:
 - component: prompt-logprobs-worker
   name: compute-prompt-logprobs
   kind: function
-  summary: 'compute_prompt_logprobs: only for new requests whose sampling params ask for prompt_logprobs (computed
-    over their prefill chunk).'
+  summary: 'compute_prompt_logprobs: for each batch request that uses prompt logprobs and whose prefill still covers
+    prompt positions (not one resumed after preemption), score the next prompt token at each of this step''s positions;
+    a chunked prompt keeps its chunks until its last chunk, whose final row (it predicts the first output token)
+    is dropped. Returns req_id -> LogprobsTensors (width num_prompt_logprobs + 1, the actual prompt token first).'
   sources:
   - vllm/v1/worker/gpu/sample/prompt_logprob.py:120-230
   latency_ms: 0
   request:
     type: object
     properties:
-      new_reqs:
-        type: object
+      rows:
+        type: array
+        description: 'the batch: req_id, slot, nct (num_computed_tokens), n (scheduled tokens), prompt_len, prefill_len,
+          token_ids (all_token_ids)'
       model_component:
         type: string
         default: llama-for-causal-lm
@@ -8429,29 +8856,141 @@ interfaces:
   response:
     type: object
     properties:
+      prompt_logprobs_dict:
+        type: object
+        additionalProperties:
+          $ref: WrLogprobsTensors
       req_ids:
         type: array
+        items:
+          type: string
   behavior:
-  - set:
-      vars.ids: = input.new_reqs.map(k, k).filter(k, has(input.new_reqs[k].sampling_params) && has(input.new_reqs[k].sampling_params.prompt_logprobs)).sort()
-  - if: size(vars.ids) == 0
+  - title: 'needs_prompt_logprobs: the slot uses prompt logprobs, the step still includes prompt positions, and
+      the request was not resumed after its prompt (prompt_len < prefill_len)'
+    source: vllm/v1/worker/gpu/sample/prompt_logprob.py:131-147
+    set:
+      vars.need: = input.rows.filter(r, string(r.slot) in state.slots && r.nct < r.prompt_len && !(r.prompt_len
+        < r.prefill_len))
+  - if: size(vars.need) == 0
     then:
-    - return:
+    - source: vllm/v1/worker/gpu/sample/prompt_logprob.py:133-136
+      return:
+        prompt_logprobs_dict: {}
         req_ids: []
   - call: prompt-logprobs-worker.prompt-logprobs-token-ids-kernel
     input:
-      num_rows: = size(vars.ids)
-  - title: The loaded model's compute_logits over the prompt positions
-    source: vllm/v1/worker/gpu/sample/prompt_logprob.py:150-175
+      num_rows: = size(vars.need)
+  - title: The loaded model's compute_logits over the prompt positions (chunked)
+    source: vllm/v1/worker/gpu/sample/prompt_logprob.py:157-174
     call: '= (has(input.model_component) ? input.model_component : ''llama-for-causal-lm'') + ''.compute-logits'''
     targets:
     - llama-for-causal-lm.compute-logits
     - mixtral-for-causal-lm.compute-logits
     - qwen2-vl-for-conditional-generation.compute-logits
+    - qwen3-vl-for-conditional-generation.compute-logits
     input:
-      num_tokens: = size(vars.ids)
+      num_tokens: = sum(vars.need.map(r, r.n))
+  - title: 'Per request: rows start_idx..end_idx of this step''s positions, minus the last when the prompt ends
+      this step; the token at position p is all_token_ids[p + 1]'
+    detail: 'The model holds no logits: the actual token''s rank is a labeled stand-in, 1 + token % 3, the other
+      top ids are deterministic from the token, and rank r has logprob -0.5 r.'
+    source: vllm/v1/worker/gpu/sample/prompt_logprob.py:176-204
+    set:
+      vars.chunks: '= vars.need.map(r, {''req_id'': r.req_id, ''chunked'': r.nct + r.n < r.prompt_len, ''k'': state.slots[string(r.slot)]
+        < 0 ? 20 : state.slots[string(r.slot)], ''pos'': lists.range(r.nct + r.n - (r.nct + r.n < r.prompt_len ?
+        0 : 1) - r.nct).map(j, r.nct + j).filter(p, p + 1 < size(r.token_ids)).map(p, r.token_ids[p + 1])})'
+  - set:
+      vars.tensors: '= vars.chunks.map(c, {''req_id'': c.req_id, ''chunked'': c.chunked, ''t'': {''logprob_token_ids'':
+        c.pos.map(t, [t] + lists.range(c.k).map(j, j + 1 == 1 + t % 3 ? t : (t * 13 + (j + 1) * 7919) % 127900 +
+        100)), ''logprobs'': c.pos.map(t, [-0.5 * double(1 + t % 3)] + lists.range(c.k).map(j, -0.5 * double(j +
+        1))), ''selected_token_ranks'': c.pos.map(t, 1 + t % 3)}})'
+  - title: A chunked prompt's logprobs wait in in_progress_prompt_logprobs; the last chunk concatenates them (LogprobsTensors.cat)
+      and returns the whole prompt's rows
+    source: vllm/v1/worker/gpu/sample/prompt_logprob.py:206-228
+    set:
+      vars.merged: '= vars.tensors.map(x, x.req_id in state.in_progress ? {''req_id'': x.req_id, ''chunked'': x.chunked,
+        ''t'': {''logprob_token_ids'': state.in_progress[x.req_id].map(c, c.logprob_token_ids).flatten() + x.t.logprob_token_ids,
+        ''logprobs'': state.in_progress[x.req_id].map(c, c.logprobs).flatten() + x.t.logprobs, ''selected_token_ranks'':
+        state.in_progress[x.req_id].map(c, c.selected_token_ranks).flatten() + x.t.selected_token_ranks}} : x)'
+  - set:
+      state.in_progress: '= merge(state.in_progress.filter(k, !vars.tensors.exists(x, x.req_id == k)).transformMapEntry(i,
+        k, {k: state.in_progress[k]}), vars.tensors.filter(x, x.chunked || x.req_id in state.in_progress).transformMapEntry(i,
+        x, {x.req_id: x.chunked ? (x.req_id in state.in_progress ? state.in_progress[x.req_id] : []) + [x.t] : []}))'
+  - set:
+      vars.out: = vars.merged.filter(x, !x.chunked && size(x.t.selected_token_ranks) > 0)
   - return:
-      req_ids: = vars.ids
+      prompt_logprobs_dict: '= vars.out.transformMapEntry(i, x, {x.req_id: x.t})'
+      req_ids: = vars.out.map(x, x.req_id).sort()
+- component: prompt-logprobs-worker
+  name: add-request
+  kind: function
+  summary: 'PromptLogprobsWorker.add_request: records whether the request uses prompt logprobs (prompt_logprobs
+    is not None) and how many, and opens its in-progress list.'
+  sources:
+  - vllm/v1/worker/gpu/sample/prompt_logprob.py:49-54
+  latency_ms: 0
+  request:
+    type: object
+    required:
+    - req_id
+    - slot
+    properties:
+      req_id:
+        type: string
+      slot:
+        type: integer
+      sampling_params:
+        type: object
+        default: {}
+  response:
+    type: object
+    properties:
+      uses_prompt_logprobs:
+        type: boolean
+  behavior:
+  - set:
+      vars.uses: = has(input.sampling_params) && has(input.sampling_params.prompt_logprobs) && input.sampling_params.prompt_logprobs
+        != null
+  - if: vars.uses
+    then:
+    - set:
+        state.slots: '= merge(state.slots, {string(input.slot): int(input.sampling_params.prompt_logprobs)})'
+        state.in_progress: '= merge(state.in_progress, {input.req_id: []})'
+    else:
+    - title: The slot no longer uses prompt logprobs (a recycled slot stops computing them)
+      source: vllm/v1/worker/gpu/sample/prompt_logprob.py:50-52
+      set:
+        state.slots: = omit(state.slots, string(input.slot))
+  - return:
+      uses_prompt_logprobs: = vars.uses
+- component: prompt-logprobs-worker
+  name: remove-request
+  kind: function
+  summary: 'PromptLogprobsWorker.remove_request: drops a finished request''s in-progress chunks.'
+  sources:
+  - vllm/v1/worker/gpu/sample/prompt_logprob.py:65-66
+  latency_ms: 0
+  request:
+    type: object
+    required:
+    - req_id
+    properties:
+      req_id:
+        type: string
+  response:
+    type: object
+    properties:
+      removed:
+        type: boolean
+  behavior:
+  - set:
+      vars.had: = input.req_id in state.in_progress
+  - if: vars.had
+    then:
+    - set:
+        state.in_progress: = omit(state.in_progress, input.req_id)
+  - return:
+      removed: = vars.had
 - component: structured-outputs-worker
   name: apply-grammar-bitmask
   kind: function
@@ -9624,25 +10163,130 @@ interfaces:
     input:
       num_rows: = input.num_reqs
 - component: pooling-runner
+  name: add-request
+  kind: function
+  summary: 'PoolingRunner.add_request: the request''s task must be one the runner supports (the model pooler''s
+    tasks within embed, classify, token_embed, token_classify, embed&token_classify); its pooling params and a fresh
+    PoolingStates are kept per slot.'
+  sources:
+  - vllm/v1/worker/gpu/pool/pooling_runner.py:66-88
+  latency_ms: 0
+  errors:
+  - code: value-error
+    status: 0
+    retryable: false
+  request:
+    type: object
+    required:
+    - req_id
+    - slot
+    properties:
+      req_id:
+        type: string
+      slot:
+        type: integer
+      pooling_params:
+        type: object
+        default: {}
+        description: task, dimensions, use_activation, late_interaction
+      supported_tasks:
+        type: array
+        items:
+          type: string
+        description: the runner's supported tasks (get_supported_tasks)
+  response:
+    type: object
+    properties:
+      task:
+        type: string
+  behavior:
+  - set:
+      vars.task: '= has(input.pooling_params.task) && input.pooling_params.task != null ? string(input.pooling_params.task)
+        : ''None'''
+  - if: '!(vars.task in input.supported_tasks)'
+    then:
+    - title: An unsupported task is refused
+      source: vllm/v1/worker/gpu/pool/pooling_runner.py:73-78
+      fail:
+        code: value-error
+        status: 0
+        message: '= ''Unsupported task: '' + (vars.task == ''None'' ? ''None'' : "''" + vars.task + "''") + ''.
+          Supported tasks: ['' + input.supported_tasks.sort().map(t, "''" + t + "''").join('', '') + '']'''
+  - source: vllm/v1/worker/gpu/pool/pooling_runner.py:79-88
+    set:
+      state.params: '= merge(has(state.params) ? state.params : {}, {string(input.slot): merge(input.pooling_params,
+        {''req_id'': input.req_id, ''task'': vars.task})})'
+      state.supported_tasks: = input.supported_tasks
+  - return:
+      task: = vars.task
+- component: pooling-runner
+  name: remove-request
+  kind: function
+  summary: 'PoolingRunner.remove_request: drops the slot''s pooling params, states and prompt token ids.'
+  sources:
+  - vllm/v1/worker/gpu/pool/pooling_runner.py:90-94
+  latency_ms: 0
+  request:
+    type: object
+    required:
+    - slot
+    properties:
+      slot:
+        type: integer
+  response:
+    type: object
+    properties:
+      removed:
+        type: boolean
+  behavior:
+  - set:
+      vars.had: = has(state.params) && string(input.slot) in state.params
+  - if: vars.had
+    then:
+    - set:
+        state.params: = omit(state.params, string(input.slot))
+  - return:
+      removed: = vars.had
+- component: pooling-runner
   name: pool
   kind: function
-  summary: 'PoolingRunner.pool: runs the model''s pooler on the batch''s hidden states; late-interaction scoring
-    requests go to the LateInteractionRunner.'
+  summary: 'PoolingRunner.pool: builds the batch''s PoolingMetadata (each slot''s params, prompt lengths) and the
+    pooling cursor (scheduled tokens against seq lens), runs the model''s pooler (DispatchPooler) on the hidden
+    states, and returns the outputs with the finished mask: a request whose prompt is not fully computed after this
+    step (chunked prefill) gets no output yet. Late-interaction scoring requests go to the LateInteractionRunner.'
   sources:
-  - vllm/v1/worker/gpu/pool/pooling_runner.py:139-200
+  - vllm/v1/worker/gpu/pool/pooling_runner.py:139-170
+  - vllm/v1/worker/gpu/pool/pooling_runner.py:105-137
   latency_ms: 0
+  errors:
+  - code: key-error
+    status: 0
+    retryable: false
   request:
     type: object
     properties:
       req_ids:
         type: array
+      rows:
+        type: array
+        description: 'per request: req_id, slot, prompt_len, n (scheduled tokens), seq_len'
       late_interaction:
         type: boolean
+      seq_pooling_type:
+        type: string
+        default: LAST
+      hidden_size:
+        type: integer
+        default: 4096
   response:
     type: object
     properties:
       pooler_output:
         type: array
+      finished_mask:
+        type: array
+        items:
+          type: boolean
   behavior:
   - if: has(input.late_interaction) && input.late_interaction
     then:
@@ -9653,8 +10297,43 @@ interfaces:
       as: sc
     - return:
         pooler_output: = vars.sc.value.scores
+        finished_mask: = input.req_ids.map(r, true)
+  - if: '!has(input.rows) || size(input.rows) == 0'
+    then:
+    - return:
+        pooler_output: = input.req_ids.map(r, 'embedding')
+        finished_mask: = input.req_ids.map(r, true)
+  - if: input.rows.exists(r, !has(state.params) || !(string(r.slot) in state.params))
+    then:
+    - title: _get_pooling_metadata reads every scheduled slot's pooling params
+      source: vllm/v1/worker/gpu/pool/pooling_runner.py:111-113
+      fail:
+        code: key-error
+        status: 0
+        message: = string(input.rows.filter(r, !has(state.params) || !(string(r.slot) in state.params))[0].slot)
+  - set:
+      vars.ps: = input.rows.map(r, state.params[string(r.slot)])
+  - title: 'The model''s pooler over the batch: each request''s task, prompt length, scheduled tokens, dimensions
+      and use_activation'
+    source: vllm/v1/worker/gpu/pool/pooling_runner.py:157-158
+    call: dispatch-pooler.forward
+    input:
+      requests: '= lists.range(size(input.rows)).map(i, {''task'': vars.ps[i].task, ''prompt_len'': input.rows[i].prompt_len,
+        ''num_scheduled_tokens'': input.rows[i].n, ''dimensions'': has(vars.ps[i].dimensions) ? vars.ps[i].dimensions
+        : null, ''use_activation'': has(vars.ps[i].use_activation) && vars.ps[i].use_activation != null ? vars.ps[i].use_activation
+        : true})'
+      supported_tasks: '= has(state.supported_tasks) ? state.supported_tasks : [''embed'', ''token_embed'']'
+      seq_pooling_type: '= has(input.seq_pooling_type) ? input.seq_pooling_type : ''LAST'''
+      hidden_size: '= has(input.hidden_size) ? input.hidden_size : 4096'
+    as: po
+  - title: 'The pooling cursor''s finished mask: the request''s prompt is fully computed after this step'
+    source: vllm/v1/worker/gpu/pool/pooling_runner.py:159
+    set:
+      vars.fin: = input.rows.map(r, r.seq_len >= r.prompt_len)
   - return:
-      pooler_output: = input.req_ids.map(r, 'embedding')
+      pooler_output: '= lists.range(size(input.rows)).map(i, vars.fin[i] && i < size(vars.po.value.outputs) ? vars.po.value.outputs[i]
+        : null)'
+      finished_mask: = vars.fin
 - component: late-interaction-runner
   name: score
   kind: function
@@ -12697,6 +13376,68 @@ interfaces:
     return:
       kernel: top_k_top_p_sampling_from_logits
 - component: encoder-runner
+  name: profile-encoder-cache
+  kind: function
+  summary: 'EncoderRunner.profile_encoder_cache: with a nonzero budget and a tower modality, log the budget and
+    run the encoder over the dummy items of the maximum feature size, so the peak includes the tower and its outputs
+    (reset after the profile run).'
+  sources:
+  - vllm/v1/worker/gpu/mm/encoder_runner.py:111-147
+  - vllm/v1/worker/gpu/model_runner.py:993-1021
+  latency_ms: 0
+  response:
+    type: object
+    properties:
+      profiled:
+        type: boolean
+      modality:
+        type:
+        - string
+        - 'null'
+      num_items:
+        type: integer
+      encoder_budget:
+        type: integer
+  behavior:
+  - call: hf-hub.download-config
+    input:
+      model: = config['model']
+    as: hfc
+  - call: multi-modal-budget.init
+    input:
+      model: = config['model']
+      architectures: = vars.hfc.value.architectures
+    as: budget
+  - call: multi-modal-budget.get-dummy-encoder-profile-inputs
+    input:
+      budget: = vars.budget.value
+    as: dummy
+  - set:
+      vars.encoder_budget: = math.least(vars.budget.value.encoder_compute_budget, vars.budget.value.encoder_cache_size)
+  - if: vars.encoder_budget <= 0 || size(vars.dummy.value.items) == 0
+    then:
+    - title: 'No budget, or embedding-only (all limits 0 with enable_mm_embeds): the tower is not profiled'
+      source: vllm/v1/worker/gpu/mm/encoder_runner.py:117-125
+      return:
+        profiled: false
+        modality: null
+        num_items: 0
+        encoder_budget: = vars.encoder_budget
+  - title: 'execute_mm_encoder(dummy_mm_inputs): the model''s embed_multimodal runs the tower on the dummy batch'
+    source: vllm/v1/worker/gpu/mm/encoder_runner.py:139
+    call: '= vars.hfc.value.architectures[0] == ''Qwen3VLForConditionalGeneration'' ? ''qwen3-vl-for-conditional-generation.embed-multimodal''
+      : ''qwen2-vl-for-conditional-generation.embed-multimodal'''
+    targets:
+    - qwen2-vl-for-conditional-generation.embed-multimodal
+    - qwen3-vl-for-conditional-generation.embed-multimodal
+    input:
+      mm_kwargs: = vars.dummy.value.items
+  - return:
+      profiled: true
+      modality: = vars.dummy.value.modality
+      num_items: = size(vars.dummy.value.items)
+      encoder_budget: = vars.encoder_budget
+- component: encoder-runner
   name: execute-mm-encoder
   kind: function
   summary: 'ModelState.execute_mm_encoder (prepare_mm_inputs + the encoder forward): for each scheduled encoder
@@ -12754,13 +13495,14 @@ interfaces:
       source: vllm/v1/worker/gpu/model_states/interface.py:197
       return:
         mm_hashes: []
-  - if: has(input.model_component) && input.model_component == 'qwen2-vl-for-conditional-generation'
+  - if: has(input.model_component) && input.model_component in ['qwen2-vl-for-conditional-generation', 'qwen3-vl-for-conditional-generation']
     then:
     - title: The model's embed_multimodal runs the vision tower on the batched items (_execute_mm_encoder)
       source: vllm/v1/worker/gpu/mm/encoder_runner.py:150-175
       call: = input.model_component + '.embed-multimodal'
       targets:
       - qwen2-vl-for-conditional-generation.embed-multimodal
+      - qwen3-vl-for-conditional-generation.embed-multimodal
       input:
         mm_kwargs: '= vars.hashes.map(h, vars.feats.filter(f, f.identifier == h)[0]).map(f, {''modality'': has(f.modality)
           ? f.modality : ''image'', ''kind'': ''pixel_values'', ''grid_thw'': has(f.grid_thw) ? f.grid_thw : [1,
@@ -13173,6 +13915,203 @@ interfaces:
     return:
       settings_in_scope: = vars.scoped
       settings_after: = vars.orig
+- component: default-model-state
+  name: prepare-attn
+  kind: function
+  summary: 'DefaultModelState.prepare_attn: unpadded sizes for PIECEWISE and eager (padded under FULL), then build_attn_metadata
+    with the batch''s positions and is_prefilling.'
+  sources:
+  - vllm/v1/worker/gpu/model_states/default.py:169-238
+  latency_ms: 0
+  request:
+    type: object
+    required:
+    - build
+    properties:
+      build:
+        type: object
+        description: the builder arguments and CommonAttentionMetadata fields the runner computed
+      positions:
+        type: array
+        items:
+          type: integer
+      is_prefilling:
+        type: array
+        items:
+          type: boolean
+      num_scheduled_tokens:
+        type: array
+        items:
+          type: integer
+      num_draft_tokens:
+        type: array
+        items:
+          type: integer
+      cg_mode:
+        type: string
+        default: NONE
+  response:
+    type: object
+    properties:
+      positions:
+        type: array
+      metadata:
+        type: object
+  behavior:
+  - source: vllm/v1/worker/gpu/model_states/default.py:213-235
+    call: attn-utils.build-attn-metadata
+    input:
+      build: = input.build
+      positions: '= has(input.positions) ? input.positions : []'
+      is_prefilling: '= has(input.is_prefilling) ? input.is_prefilling : []'
+      model_specific: null
+    as: md
+  - return: = vars.md.value
+- component: mamba-hybrid-model-state
+  name: prepare-attn
+  kind: function
+  summary: 'MambaHybridModelState.prepare_attn: is_prefilling per request, and with speculative decoding the accepted-token
+    counts and per-row decode draft counts (-1 for non-decode rows); aligned state indices in align mode; then build_attn_metadata
+    with the batch''s positions and the MambaHybridAttnMetadata.'
+  sources:
+  - vllm/v1/worker/gpu/model_states/mamba_hybrid.py:230-345
+  - vllm/v1/worker/gpu/model_states/mamba_hybrid.py:41-71
+  latency_ms: 0
+  errors:
+  - code: assertion-error
+    status: 0
+    retryable: false
+  request:
+    type: object
+    required:
+    - build
+    properties:
+      build:
+        type: object
+        description: the builder arguments and CommonAttentionMetadata fields the runner computed
+      positions:
+        type: array
+        items:
+          type: integer
+      is_prefilling:
+        type: array
+        items:
+          type: boolean
+      num_scheduled_tokens:
+        type: array
+        items:
+          type: integer
+      num_draft_tokens:
+        type: array
+        items:
+          type: integer
+      cg_mode:
+        type: string
+        default: NONE
+      ubatch_idx:
+        type: integer
+        default: 0
+  response:
+    type: object
+    properties:
+      positions:
+        type: array
+      metadata:
+        type: object
+      mamba:
+        type: object
+  behavior:
+  - if: has(input.ubatch_idx) && input.ubatch_idx != 0
+    then:
+    - title: Dual-batch overlap is not supported for hybrid models
+      source: vllm/v1/worker/gpu/model_states/mamba_hybrid.py:242
+      fail:
+        code: assertion-error
+        status: 0
+        message: DBO is not supported
+  - set:
+      vars.pref: '= has(input.is_prefilling) ? input.is_prefilling : []'
+      vars.nst: '= has(input.num_scheduled_tokens) ? input.num_scheduled_tokens : []'
+      vars.nd: '= has(input.num_draft_tokens) ? input.num_draft_tokens : []'
+      vars.acc: null
+      vars.ndd: null
+  - if: int(config['num-speculative-tokens']) > 0
+    then:
+    - title: 'With speculation: num_accepted_tokens per request, and num_decode_draft_tokens = the draft count for
+        decode rows (not prefilling, 0 < scheduled <= k + 1), else -1'
+      source: vllm/v1/worker/gpu/model_states/mamba_hybrid.py:274-306
+      set:
+        vars.acc: = vars.pref.map(p, 1)
+        vars.ndd: '= lists.range(size(vars.pref)).map(i, !vars.pref[i] && vars.nst[i] > 0 && vars.nst[i] <= int(config[''num-speculative-tokens''])
+          + 1 ? (i < size(vars.nd) ? vars.nd[i] : 0) : -1)'
+  - set:
+      vars.mamba:
+        is_prefilling: = vars.pref
+        num_accepted_tokens: = vars.acc
+        num_decode_draft_tokens_cpu: = vars.ndd
+  - source: vllm/v1/worker/gpu/model_states/mamba_hybrid.py:324-341
+    call: attn-utils.build-attn-metadata
+    input:
+      build: = input.build
+      positions: '= has(input.positions) ? input.positions : []'
+      is_prefilling: = vars.pref
+      model_specific: = vars.mamba
+    as: md
+  - return:
+      positions: = vars.md.value.positions
+      metadata: = vars.md.value.metadata
+      mamba: = vars.mamba
+- component: attn-utils
+  name: build-attn-metadata
+  kind: function
+  summary: 'build_attn_metadata: for each KV cache group, a CommonAttentionMetadata carrying the batch''s query/seq
+    lengths, block table, slot mapping, positions and is_prefilling (a model-specific is_prefilling wins), handed
+    to each attention group''s metadata builder.'
+  sources:
+  - vllm/v1/worker/gpu/attn_utils.py:455-581
+  latency_ms: 0
+  request:
+    type: object
+    required:
+    - build
+    properties:
+      build:
+        type: object
+      positions:
+        type: array
+        items:
+          type: integer
+      is_prefilling:
+        type: array
+        items:
+          type: boolean
+      model_specific:
+        type:
+        - object
+        - 'null'
+        default: null
+  response:
+    type: object
+    properties:
+      positions:
+        type: array
+        items:
+          type: integer
+      metadata:
+        type: object
+  behavior:
+  - source: vllm/v1/worker/gpu/attn_utils.py:507-516
+    set:
+      vars.pref: '= has(input.model_specific) && input.model_specific != null && has(input.model_specific.is_prefilling)
+        ? input.model_specific.is_prefilling : (has(input.is_prefilling) ? input.is_prefilling : [])'
+  - source: vllm/v1/worker/gpu/attn_utils.py:523-576
+    call: flash-attention-metadata-builder.build
+    input: '= merge(input.build, {''common'': merge(input.build.common, {''positions'': has(input.positions) ? input.positions
+      : [], ''is_prefilling'': vars.pref})})'
+    as: b
+  - return:
+      positions: '= has(input.positions) ? input.positions : []'
+      metadata: = vars.b.value
 - component: input-batch
   name: prepare-prefill-inputs-kernel
   kind: kernel
@@ -15057,6 +15996,60 @@ interfaces:
         examples:
         - 4
   latency_ms: 0.005
+schemas:
+- id: WrLogprobsLists
+  summary: 'LogprobsLists (vllm/v1/outputs.py:34-45): per logits row, the sampled token then the top-k ids, their
+    logprobs, the sampled token''s rank; cu_num_generated_tokens slices rows per request under speculative decoding
+    (None otherwise).'
+  schema:
+    type:
+    - object
+    - 'null'
+    properties:
+      logprob_token_ids:
+        type: array
+        items:
+          type: array
+          items:
+            type: integer
+      logprobs:
+        type: array
+        items:
+          type: array
+          items:
+            type: number
+      sampled_token_ranks:
+        type: array
+        items:
+          type: integer
+      cu_num_generated_tokens:
+        type:
+        - array
+        - 'null'
+        items:
+          type: integer
+- id: WrLogprobsTensors
+  summary: 'LogprobsTensors of one request''s prompt (vllm/v1/outputs.py:89-101): one row per prompt position after
+    the first, the actual prompt token first, then the top num_prompt_logprobs ids.'
+  schema:
+    type: object
+    properties:
+      logprob_token_ids:
+        type: array
+        items:
+          type: array
+          items:
+            type: integer
+      logprobs:
+        type: array
+        items:
+          type: array
+          items:
+            type: number
+      selected_token_ranks:
+        type: array
+        items:
+          type: integer
 flows:
 - id: wr-init-device
   name: Worker init_device (budget check, distributed init, model runner)
@@ -17217,6 +18210,8 @@ scenarios:
         block_ids:
         - 1
         num_computed_tokens: 0
+        pooling_params:
+          task: embed
       num_scheduled_tokens:
         embd-1: 3
       total_num_scheduled_tokens: 3
@@ -17224,7 +18219,8 @@ scenarios:
     caller: gpu-worker-impl
     as: again
   expect:
-  - steps.e.result.value.req_ids == ['embd-1'] && steps.e.result.value.pooler_output == ['embedding']
+  - steps.e.result.value.req_ids == ['embd-1'] && size(steps.e.result.value.pooler_output) == 1 && steps.e.result.value.pooler_output[0]
+    != null
   - steps.again.result.value == null && state['gpu-model-runner@rank0'].execute_model_state == null
 - id: wr-pooling-late-interaction-maxsim
   name: Late-interaction scoring uses the flash-maxsim kernel; a kernel failure disables it and falls back
@@ -20530,6 +21526,628 @@ scenarios:
     == 'assertion-error'
   - steps.offn.result.value.settings_in_scope == 'x:1'
   - trace.exists(e, e.type == 'call.end' && e.interface == 'topk-topp-sampler.flashinfer-sample')
+- id: wr-r6-logprobs-returned
+  name: 'oracle4: sample_tokens returns the sampler''s top-k logprobs (sampled token first, rank 1 for greedy) and
+    prompt logprobs (one row per prompt position after the first) in the ModelRunnerOutput'
+  description: sampler.py:171-218, logprob.py:122-133, prompt_logprob.py:120-230, async_utils.py:173-200. The batch's
+    num_logprobs is the largest request's; a request without prompt_logprobs has no prompt_logprobs_dict entry.
+  fixtures:
+  - full-tp1-llama-8b
+  steps:
+  - flow: wr-execute-model
+    as: e
+    input:
+      total_num_scheduled_tokens: 8
+      num_scheduled_tokens:
+        lp: 4
+        nolp: 4
+      scheduled_new_reqs:
+      - req_id: lp
+        block_ids:
+        - 1
+        num_computed_tokens: 0
+        prompt_token_ids:
+        - 128000
+        - 4438
+        - 2362
+        - 527
+        sampling_params:
+          temperature: 0.0
+          logprobs: 2
+          prompt_logprobs: 1
+      - req_id: nolp
+        block_ids:
+        - 2
+        num_computed_tokens: 0
+        prompt_token_ids:
+        - 128000
+        - 4438
+        - 2362
+        - 528
+        sampling_params:
+          temperature: 0.0
+  - flow: wr-sample-tokens
+    as: s
+  - flow: wr-execute-model
+    as: e2
+    input:
+      total_num_scheduled_tokens: 4
+      num_scheduled_tokens:
+        plain: 4
+      scheduled_new_reqs:
+      - req_id: plain
+        block_ids:
+        - 3
+        num_computed_tokens: 0
+        prompt_token_ids:
+        - 128000
+        - 4438
+        - 2362
+        - 529
+        sampling_params:
+          temperature: 0.0
+  - flow: wr-sample-tokens
+    as: s2
+  expect:
+  - steps.e.result.ok && steps.s.result.ok && steps.s.result.value.logprobs != null
+  - size(steps.s.result.value.logprobs.logprob_token_ids) == 2 && steps.s.result.value.logprobs.logprob_token_ids.all(r,
+    size(r) == 3)
+  - steps.s.result.value.req_ids.all(id, steps.s.result.value.logprobs.logprob_token_ids[steps.s.result.value.req_ids.indexOf(id)][0]
+    == steps.s.result.value.sampled_token_ids[steps.s.result.value.req_ids.indexOf(id)][0] && steps.s.result.value.logprobs.logprob_token_ids[steps.s.result.value.req_ids.indexOf(id)][1]
+    == steps.s.result.value.sampled_token_ids[steps.s.result.value.req_ids.indexOf(id)][0])
+  - steps.s.result.value.logprobs.sampled_token_ranks == [1, 1]
+  - '''lp'' in steps.s.result.value.prompt_logprobs_dict && !(''nolp'' in steps.s.result.value.prompt_logprobs_dict)'
+  - steps.s.result.value.prompt_logprobs_dict['lp'].logprob_token_ids.map(r, r[0]) == [4438, 2362, 527] && steps.s.result.value.prompt_logprobs_dict['lp'].logprob_token_ids.all(r,
+    size(r) == 2)
+  - steps.s2.result.ok && steps.s2.result.value.logprobs == null && size(steps.s2.result.value.prompt_logprobs_dict)
+    == 0
+  - trace.exists(e, e.type == 'call.start' && e.interface == 'llama-for-causal-lm.compute-logits' && e.input.num_tokens
+    == 4)
+- id: wr-r6-chunked-prompt-logprobs
+  name: A chunked prompt's prompt logprobs are held until its last chunk, which returns every prompt position after
+    the first
+  description: 'prompt_logprob.py:186-228: is_prompt_chunked keeps the chunk in in_progress_prompt_logprobs; the
+    last chunk drops its final row and concatenates.'
+  fixtures:
+  - full-tp1-llama-8b
+  steps:
+  - flow: wr-execute-model
+    as: e1
+    input:
+      total_num_scheduled_tokens: 4
+      num_scheduled_tokens:
+        ch: 4
+      scheduled_new_reqs:
+      - req_id: ch
+        block_ids:
+        - 1
+        num_computed_tokens: 0
+        prompt_token_ids:
+        - 128000
+        - 11
+        - 12
+        - 13
+        - 14
+        - 15
+        - 16
+        - 17
+        sampling_params:
+          temperature: 0.0
+          prompt_logprobs: 0
+  - flow: wr-sample-tokens
+    as: s1
+  - flow: wr-execute-model
+    as: e2
+    input:
+      total_num_scheduled_tokens: 4
+      num_scheduled_tokens:
+        ch: 4
+      scheduled_new_reqs: []
+      scheduled_cached_reqs:
+        req_ids:
+        - ch
+        num_computed_tokens:
+        - 4
+        new_block_ids:
+        - []
+  - flow: wr-sample-tokens
+    as: s2
+  expect:
+  - steps.s1.result.ok && size(steps.s1.result.value.prompt_logprobs_dict) == 0 && steps.s1.result.value.sampled_token_ids
+    == [[]]
+  - steps.s2.result.ok && steps.s2.result.value.prompt_logprobs_dict['ch'].logprob_token_ids.map(r, r[0]) == [11,
+    12, 13, 14, 15, 16, 17]
+  - trace.exists(e, e.type == 'call.start' && e.interface == 'llama-for-causal-lm.compute-logits' && e.input.num_tokens
+    == 4)
+- id: wr-r6-bad-word-changes-sample
+  name: 'oracle4: a one-token bad word equal to the greedy token makes the row sample another token'
+  description: 'bad_words.py:79-91,165: the kernel stores -inf at the bad word''s last token before the argmax.'
+  fixtures:
+  - full-tp1-llama-8b
+  steps:
+  - flow: wr-execute-model
+    as: e1
+    input:
+      total_num_scheduled_tokens: 5
+      num_scheduled_tokens:
+        p1: 5
+      scheduled_new_reqs:
+      - req_id: p1
+        block_ids:
+        - 1
+        num_computed_tokens: 0
+        prompt_token_ids:
+        - 128000
+        - 4438
+        - 2362
+        - 527
+        - 220
+        sampling_params:
+          temperature: 0.0
+  - flow: wr-sample-tokens
+    as: s1
+  - flow: wr-execute-model
+    as: e2
+    input:
+      total_num_scheduled_tokens: 5
+      num_scheduled_tokens:
+        p2: 5
+      scheduled_new_reqs:
+      - req_id: p2
+        block_ids:
+        - 2
+        num_computed_tokens: 0
+        prompt_token_ids:
+        - 128000
+        - 4438
+        - 2362
+        - 527
+        - 220
+        sampling_params:
+          temperature: 0.0
+          bad_words_token_ids: = [[steps.s1.result.value.sampled_token_ids[0][0]]]
+  - flow: wr-sample-tokens
+    as: s2
+  expect:
+  - steps.s1.result.ok && steps.s2.result.ok
+  - steps.s2.result.value.sampled_token_ids[0][0] != steps.s1.result.value.sampled_token_ids[0][0]
+  - trace.exists(e, e.type == 'call.end' && e.interface == 'bad-words-state.apply' && size(e.output.masked) == 1)
+- id: wr-r6-prepare-attn-positions
+  name: 'oracle4: a hybrid model''s MambaHybridModelState.prepare_attn and a plain model''s DefaultModelState.prepare_attn
+    pass the batch''s positions to build_attn_metadata'
+  description: mamba_hybrid.py:230-341 (positions=input_batch.positions at :339), default.py:213-235, attn_utils.py:523-545
+    (CommonAttentionMetadata.positions).
+  fixtures:
+  - full-tp1-llama-8b
+  state:
+    gpu-model-runner:
+      model:
+        architecture: HybridTestModel
+        dtype_bytes: 2
+        head_size: 128
+        hidden_size: 4096
+        is_hybrid: true
+        num_hidden_layers: 32
+        num_kv_heads: 8
+        uses_mrope: false
+        uses_prompt_embeds: false
+        vocab_size: 128256
+  steps:
+  - flow: wr-execute-model
+    as: e
+    input:
+      total_num_scheduled_tokens: 8
+      num_scheduled_tokens:
+        hy: 8
+      scheduled_new_reqs:
+      - req_id: hy
+        block_ids:
+        - 5
+        num_computed_tokens: 0
+        prompt_token_ids:
+        - 1
+        - 2
+        - 3
+        - 4
+        - 5
+        - 6
+        - 7
+        - 8
+  - flow: wr-sample-tokens
+    as: s
+  expect:
+  - steps.e.result.ok && steps.s.result.ok
+  - trace.exists(e, e.type == 'call.end' && e.interface == 'mamba-hybrid-model-state.prepare-attn' && e.output.mamba.is_prefilling
+    == [true] && e.output.positions == [0, 1, 2, 3, 4, 5, 6, 7])
+  - trace.exists(e, e.type == 'call.start' && e.interface == 'flash-attention-metadata-builder.build' && e.input.common.positions
+    == [0, 1, 2, 3, 4, 5, 6, 7])
+- id: wr-r6-default-prepare-attn-decode-positions
+  name: 'A plain model''s decode step: DefaultModelState.prepare_attn passes the positions after the computed tokens'
+  description: default.py:213-235; positions = num_computed_tokens + j (input_batch.py prepare_pos_seq_lens).
+  fixtures:
+  - full-tp1-llama-8b
+  steps:
+  - flow: wr-execute-model
+    as: e1
+    input:
+      total_num_scheduled_tokens: 4
+      num_scheduled_tokens:
+        d: 4
+      scheduled_new_reqs:
+      - req_id: d
+        block_ids:
+        - 5
+        num_computed_tokens: 0
+        prompt_token_ids:
+        - 128000
+        - 9906
+        - 1917
+        - 13
+  - flow: wr-sample-tokens
+    as: s1
+  - flow: wr-execute-model
+    as: e2
+    input:
+      total_num_scheduled_tokens: 1
+      num_scheduled_tokens:
+        d: 1
+      scheduled_new_reqs: []
+      scheduled_cached_reqs:
+        req_ids:
+        - d
+        num_computed_tokens:
+        - 4
+        new_block_ids:
+        - []
+  - flow: wr-sample-tokens
+    as: s2
+  expect:
+  - steps.e2.result.ok && steps.s2.result.ok
+  - trace.filter(e, e.type == 'call.start' && e.interface == 'flash-attention-metadata-builder.build').map(e, e.input.common.positions)
+    == [[0, 1, 2, 3], [4]]
+- id: wr-r6-min-tokens-enables-logit-bias
+  name: 'judge4: min_tokens alone enables the logit-bias stage (all_stop_token_ids always holds EOS), even with
+    ignore_eos and no stop_token_ids'
+  description: logit_bias.py:96-112 keys on sampling_params.all_stop_token_ids; sampling_params.py:781-784 adds
+    the EOS even under ignore_eos.
+  fixtures:
+  - full-tp1-llama-8b
+  steps:
+  - interface: sampler.add-request
+    caller: gpu-model-runner
+    input:
+      slot: 5
+      sampling_params:
+        temperature: 0.0
+        min_tokens: 3
+        ignore_eos: true
+    as: mt
+  - interface: sampler.add-request
+    caller: gpu-model-runner
+    input:
+      slot: 6
+      sampling_params:
+        temperature: 0.0
+    as: plain
+  expect:
+  - steps.mt.result.value.needs_processing && !steps.plain.result.value.needs_processing
+  - state['sampler@rank0'].slots['5'].logit_bias && !state['sampler@rank0'].slots['6'].seeded
+- id: wr-r6-pooling-chunked-and-task
+  name: 'A pooling model: the runner keeps each request''s pooling params, runs the model''s pooler, and returns
+    no output for a prompt still being prefilled; an unsupported task is refused with the supported list'
+  description: pooling_runner.py:66-88 (add_request, the ValueError text), :139-170 (pool and the finished mask),
+    model_runner.py:1204-1211, 2306-2327.
+  fixtures:
+  - full-tp1-llama-8b
+  state:
+    gpu-worker-impl:
+      is_pooling_model: true
+    gpu-model-runner:
+      is_pooling_model: true
+  steps:
+  - flow: wr-execute-model
+    as: e1
+    input:
+      total_num_scheduled_tokens: 4
+      num_scheduled_tokens:
+        emb-a: 4
+      scheduled_new_reqs:
+      - req_id: emb-a
+        block_ids:
+        - 1
+        num_computed_tokens: 0
+        prompt_token_ids:
+        - 128000
+        - 11
+        - 12
+        - 13
+        - 14
+        - 15
+        - 16
+        - 17
+        pooling_params:
+          task: embed
+  - flow: wr-execute-model
+    as: e2
+    input:
+      total_num_scheduled_tokens: 4
+      num_scheduled_tokens:
+        emb-a: 4
+      scheduled_new_reqs: []
+      scheduled_cached_reqs:
+        req_ids:
+        - emb-a
+        num_computed_tokens:
+        - 4
+        new_block_ids:
+        - []
+  - interface: pooling-runner.add-request
+    caller: gpu-model-runner
+    input:
+      req_id: gen-x
+      slot: 3
+      pooling_params:
+        task: generate
+      supported_tasks:
+      - token_embed
+      - embed
+    as: bad
+  expect:
+  - steps.e1.result.ok && steps.e1.result.value.pooler_output == [null]
+  - steps.e2.result.ok && size(steps.e2.result.value.pooler_output) == 1 && steps.e2.result.value.pooler_output[0]
+    != null
+  - '!steps.bad.result.ok && steps.bad.result.error.code == ''value-error'' && steps.bad.result.error.message ==
+    "Unsupported task: ''generate''. Supported tasks: [''embed'', ''token_embed'']"'
+  - trace.exists(e, e.type == 'call.start' && e.interface == 'dispatch-pooler.forward' && e.input.requests[0].task
+    == 'embed' && e.input.requests[0].prompt_len == 8)
+- id: wr-r6-breakable-cudagraph-capture-then-replay
+  name: 'VLLM_USE_BREAKABLE_CUDAGRAPH: a PIECEWISE step goes through BreakableCUDAGraphWrapper; the first of a descriptor
+    captures and runs the model, the next replays without entering it'
+  description: cudagraph_utils.py:189-194, 565-576 (run_pw_graph), breakable_cudagraph.py:318-343; without the env
+    the compiled model runs (model_runner.py:2034-2042).
+  fixtures:
+  - full-tp1-llama-8b
+  config:
+    vllm-use-breakable-cudagraph: true
+  steps:
+  - interface: cuda-graph-manager.run-pw-graph
+    caller: gpu-model-runner
+    as: first
+    input:
+      num_tokens: 16
+      num_prefill_tokens: 16
+      num_decode_reqs: 0
+      num_layers: 32
+  - interface: cuda-graph-manager.run-pw-graph
+    caller: gpu-model-runner
+    as: second
+    input:
+      num_tokens: 16
+      num_prefill_tokens: 16
+      num_decode_reqs: 0
+      num_layers: 32
+  expect:
+  - steps.first.result.ok && steps.second.result.ok && steps.second.result.value.path == 'replay'
+  - trace.filter(e, e.type == 'call.end' && e.interface == 'breakable-cuda-graph-wrapper.call').map(e, e.output.path)
+    == ['capture', 'replay']
+  - calls['llama-for-causal-lm.forward'] == 1
+- id: wr-r6-eplb-unregistered-model-no-step
+  name: With EPLB on but no MoE model registered, a dummy run does not step EplbState; skip_eplb skips it too
+  description: eplb_utils.py:46-62, 167-174; model_runner.py:817.
+  fixtures:
+  - full-tp1-llama-8b
+  config:
+    enable-eplb: true
+  steps:
+  - interface: gpu-model-runner.dummy-run
+    caller: gpu-worker-impl
+    as: unregistered
+    input:
+      num_tokens: 1
+      uniform_decode: true
+  - interface: gpu-model-runner.dummy-run
+    caller: gpu-worker-impl
+    as: skipped
+    input:
+      num_tokens: 1
+      uniform_decode: true
+      skip_eplb: true
+  expect:
+  - steps.unregistered.result.ok && steps.skipped.result.ok
+  - '!trace.exists(e, e.type == ''call.start'' && e.interface == ''eplb-state.step'')'
+- id: wr-r6-eplb-profile-run-steps-state
+  name: The profile run's dummy forward steps EPLB with is_profile on each rank of an MoE model, (a dummy step,
+    flags from the run)
+  description: profile_run -> _dummy_run(is_profile=True) under @step_eplb_after(is_dummy=True) (model_runner.py:817,
+    1003-1008; eplb_utils.py:46-62, 167-177); EplbState.step's profile branch (eplb_state.py:587-589).
+  fixtures:
+  - full-moe-mixtral-8x7b-tp2-ep
+  config:
+    enable-eplb: true
+  steps:
+  - flow: wr-load-model
+    'on': rank0
+    as: load0
+  - flow: wr-load-model
+    'on': rank1
+    as: load1
+  - flow: wr-determine-available-memory
+    'on': rank0
+    as: prof0
+    await: false
+  - flow: wr-determine-available-memory
+    'on': rank1
+    as: prof1
+  expect:
+  - steps.prof0.result.ok && steps.prof1.result.ok
+  - trace.exists(e, e.type == 'call.start' && e.interface == 'eplb-state.step' && e.input.is_profile && e.input.is_dummy)
+- id: wr-r6-forward-dispatch-resolves-architecture
+  name: In a world that never ran load_model, the forward goes to the class the registry resolves for the architecture,
+    not to Llama
+  description: registry.py:1376-1428; model_runner.py:2043-2044 runs self.model. The Qwen3-VL class isn't loaded
+    in this world, so its forward raises; the point is which class runs.
+  fixtures:
+  - full-vl-qwen2-vl-7b
+  state:
+    gpu-model-runner:
+      model:
+        name: Qwen/Qwen3-VL-8B-Instruct
+        architecture: Qwen3VLForConditionalGeneration
+        num_hidden_layers: 36
+        num_kv_heads: 8
+        head_size: 128
+        dtype_bytes: 2
+        vocab_size: 151936
+        hidden_size: 4096
+        is_hybrid: false
+        uses_mrope: true
+        uses_prompt_embeds: false
+  steps:
+  - interface: gpu-model-runner.dummy-run
+    caller: gpu-worker-impl
+    as: d
+    input:
+      num_tokens: 1
+      uniform_decode: true
+      skip_eplb: true
+  expect:
+  - trace.exists(e, e.type == 'call.start' && e.interface == 'qwen3-vl-for-conditional-generation.forward')
+  - '!trace.exists(e, e.type == ''call.start'' && e.interface == ''llama-for-causal-lm.forward'')'
+- id: wr-r6-dummy-run-dp2-moe-forward-context
+  name: A dummy run of a MoE model under data parallelism runs its forward inside set_forward_context, which builds
+    DPMetadata with this DP rank's token count before the model runs
+  description: model_runner.py:2008-2027; forward_context.py:309-326. Each DP rank (TP 1) fills its own entry. The
+    forward then stops in moe-runner on the seeded world's missing EP group (parallel-state), so this asserts the
+    context, not a finished forward.
+  fixtures:
+  - full-moe-mixtral-8x7b-tp2-ep
+  config:
+    data-parallel-size: 2
+    tensor-parallel-size: 1
+    enable-expert-parallel: false
+  steps:
+  - flow: wr-load-model
+    'on': rank1
+    as: load1
+  - interface: gpu-model-runner.dummy-run
+    caller: gpu-worker-impl
+    'on': rank1
+    as: d1
+    input:
+      num_tokens: 16
+      uniform_decode: false
+      is_profile: true
+      skip_eplb: true
+  expect:
+  - trace.exists(e, e.type == 'call.end' && e.interface == 'forward-context.set-forward-context' && e.output.dp_metadata.num_tokens_across_dp_cpu
+    == [0, 16])
+  - trace.exists(e, e.type == 'call.start' && e.interface == 'mixtral-for-causal-lm.forward')
+- id: wr-r6-worker-seeds-from-config
+  name: A worker seeds from --seed at init_device and reseeds with its data-parallel index after warmup
+  description: gpu_worker.py:520-521, 1060-1064; torch_utils.py:542-553.
+  fixtures:
+  - full-tp1-llama-8b
+  config:
+    seed: 1234
+  steps:
+  - flow: wr-init-device
+    as: i
+  - flow: wr-load-model
+    as: l
+  - flow: wr-compile-or-warm-up
+    as: w
+  expect:
+  - steps.i.result.ok && steps.w.result.ok
+  - state['gpu-worker-impl@rank0'].random_seed == 1234 && state['gpu-worker-impl@rank0'].random_seed_dp_index ==
+    0
+- id: wr-r6-kv-spec-reads-resolved-cache-dtype
+  name: 'get_kv_cache_spec reads the resolved cache_config.cache_dtype: a config that resolved auto to fp8_e4m3
+    halves the worker''s page'
+  description: arg_utils.py:2256-2259; torch_utils.py:512-529; attention.py:323-325.
+  fixtures:
+  - full-fp8-llama-3-8b
+  state:
+    vllm-config:
+      resolved:
+        cache_config:
+          cache_dtype: fp8_e4m3
+  steps:
+  - interface: gpu-model-runner.get-kv-cache-spec
+    caller: gpu-worker-impl
+    as: spec
+  expect:
+  - steps.spec.result.value.page_size_bytes == 32768
+- id: wr-r6-breakable-cudagraph-release-clears
+  name: Dropping the graph manager with VLLM_USE_BREAKABLE_CUDAGRAPH clears the wrapper's entries, so real capture
+    doesn't replay a profiling graph
+  description: cudagraph_utils.py:403-406, 961-962; breakable_cudagraph.py:271-273, 313-314.
+  fixtures:
+  - full-tp1-llama-8b
+  config:
+    vllm-use-breakable-cudagraph: true
+  steps:
+  - interface: cuda-graph-manager.run-pw-graph
+    caller: gpu-model-runner
+    as: first
+    input:
+      num_tokens: 16
+      num_prefill_tokens: 16
+      num_decode_reqs: 0
+      num_layers: 32
+  - interface: cuda-graph-manager.release
+    caller: gpu-model-runner
+    as: rel
+  - interface: cuda-graph-manager.run-pw-graph
+    caller: gpu-model-runner
+    as: again
+    input:
+      num_tokens: 16
+      num_prefill_tokens: 16
+      num_decode_reqs: 0
+      num_layers: 32
+  expect:
+  - trace.filter(e, e.type == 'call.end' && e.interface == 'breakable-cuda-graph-wrapper.call').map(e, e.output.path)
+    == ['capture', 'capture']
+  - calls['breakable-cuda-graph-wrapper.clear-all-graphs'] == 1
+- id: wr-r6-profile-run-profiles-encoder
+  name: A multimodal model's profile_run builds the MultiModalBudget and runs the encoder tower on the largest item;
+    --skip-mm-profiling doesn't
+  description: 'model_runner.py:993-1001; encoder_budget.py:115-140, 193-218; encoder_runner.py:111-147. Qwen2-VL
+    at max_model_len 32768: one video item of 32768 tokens.'
+  fixtures:
+  - full-vl-qwen2-vl-7b
+  steps:
+  - flow: wr-load-model
+    'on': rank0
+    as: load
+  - interface: encoder-runner.profile-encoder-cache
+    caller: gpu-model-runner
+    'on': rank0
+    as: enc
+  expect:
+  - 'steps.enc.result.ok && steps.enc.result.value == {''profiled'': true, ''modality'': ''video'', ''num_items'':
+    1, ''encoder_budget'': 32768}'
+  - calls['qwen2-vl-for-conditional-generation.embed-multimodal'] == 1 && trace.exists(e, e.type == 'call.start'
+    && e.interface == 'qwen2-vl-for-conditional-generation.embed-multimodal' && e.input.mm_kwargs[0].grid_thw ==
+    [2, 256, 256])
+- id: wr-r6-skip-mm-profiling
+  name: --skip-mm-profiling leaves the encoder out of the profile run
+  description: model_runner.py:993-995.
+  fixtures:
+  - full-vl-qwen2-vl-7b
+  config:
+    skip-mm-profiling: true
+  steps:
+  - flow: wr-load-model
+    'on': rank0
+    as: load
+  - interface: gpu-model-runner.profile-run
+    caller: gpu-worker-impl
+    'on': rank0
+    as: prof
+  expect:
+  - steps.prof.result.ok && calls['encoder-runner.profile-encoder-cache'] == 0 && !trace.exists(e, e.type == 'call.start'
+    && e.interface == 'qwen2-vl-for-conditional-generation.embed-multimodal')
 - id: wr-bo-r4-1
   name: 'test_run_model_unpacks_tuple_return_for_mtp: an MTP drafter''s (logits_hidden, feedback_hidden) return
     is unpacked'

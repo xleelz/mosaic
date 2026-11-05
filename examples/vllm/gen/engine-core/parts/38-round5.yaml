@@ -53,7 +53,7 @@ interfaces:
     kind: function
     latency_ms: 0
     summary: "PrometheusStatLogger.record: from SchedulerStats set the running/waiting/KV-usage gauges and add the prefix-cache counters; from IterationStats add the token and preemption counters, observe TTFT and inter-token latency, and per finished request count vllm:request_success{finished_reason} and observe the e2e, prompt and generation histograms."
-    description: "Histograms are modeled by their _count and _sum (a row {count, sum}); bucket counts are left to a refinement."
+    description: "A histogram row is {count, sum} plus one cumulative bucket count per bound, keyed le=<bound> (and le=+Inf), with the bounds init-prometheus drew from histogram_buckets."
     sources: ["vllm/v1/metrics/loggers.py:1138-1330"]
     request:
       type: object
@@ -118,44 +118,42 @@ interfaces:
             steps:
               - call: prometheus-registry.incr
                 input: {name: "vllm:watermark_requests", labels: "= merge(vars.lbl, {'status': vars.w[0]})", label_names: [model_name, engine, status], value: "= vars.w[1]"}
-      - title: "num_preempted_reqs, prompt and generation token counters (an inc(0) leaves a counter unchanged, so zero deltas are not written)"
-        source: "vllm/v1/metrics/loggers.py:1259-1272"
-        foreach: "= [['vllm:num_preemptions', has(vars.it.num_preempted_reqs) ? vars.it.num_preempted_reqs : 0], ['vllm:prompt_tokens', has(vars.it.num_prompt_tokens) ? vars.it.num_prompt_tokens : 0], ['vllm:generation_tokens', has(vars.it.num_generation_tokens) ? vars.it.num_generation_tokens : 0]].filter(c, c[1] != 0)"
+      - set:
+          vars.pts: "= has(vars.it.prompt_token_stats) && vars.it.prompt_token_stats != null ? vars.it.prompt_token_stats : {'computed': has(vars.it.num_prompt_tokens) ? vars.it.num_prompt_tokens : 0, 'cached_tokens': 0, 'local_cache_hit': 0, 'external_kv_transfer': 0}"
+      - title: "num_preempted_reqs, prompt (and by source: local_compute, local_cache_hit, external_kv_transfer; cached) and generation token counters (an inc(0) leaves a counter unchanged, so zero deltas are not written)"
+        source: "vllm/v1/metrics/loggers.py:1259-1276"
+        foreach: "= [['vllm:num_preemptions', has(vars.it.num_preempted_reqs) ? vars.it.num_preempted_reqs : 0], ['vllm:prompt_tokens', has(vars.it.num_prompt_tokens) ? vars.it.num_prompt_tokens : 0], ['vllm:prompt_tokens_cached', has(vars.pts.cached_tokens) ? vars.pts.cached_tokens : 0], ['vllm:generation_tokens', has(vars.it.num_generation_tokens) ? vars.it.num_generation_tokens : 0]].filter(c, c[1] != 0)"
         as: c
         steps:
           - call: prometheus-registry.incr
             input: {name: "= vars.c[0]", labels: "= vars.lbl", label_names: "= vars.ln", value: "= vars.c[1]"}
-      - title: "histogram_time_to_first_token.observe(ttft) per request that produced its first token this step"
-        source: "vllm/v1/metrics/loggers.py:1284-1285"
-        foreach: "= has(vars.it.time_to_first_tokens_iter) ? vars.it.time_to_first_tokens_iter : []"
-        as: ttft
+      - title: "counter_prompt_tokens_by_source[source].inc(pts.get_by_source(source))"
+        source: "vllm/v1/metrics/loggers.py:1264-1269"
+        foreach: "= [['local_compute', has(vars.pts.computed) ? vars.pts.computed : 0], ['local_cache_hit', has(vars.pts.local_cache_hit) ? vars.pts.local_cache_hit : 0], ['external_kv_transfer', has(vars.pts.external_kv_transfer) ? vars.pts.external_kv_transfer : 0]].filter(c, c[1] != 0)"
+        as: src
         steps:
           - call: prometheus-registry.incr
-            input: {name: "vllm:time_to_first_token_seconds", labels: "= vars.lbl", label_names: "= vars.ln", value: {count: 1, sum: "= vars.ttft"}}
-      - title: "histogram_inter_token_latency.observe(itl)"
-        source: "vllm/v1/metrics/loggers.py:1286-1287"
-        foreach: "= has(vars.it.inter_token_latencies_iter) ? vars.it.inter_token_latencies_iter : []"
-        as: itl
-        steps:
-          - call: prometheus-registry.incr
-            input: {name: "vllm:inter_token_latency_seconds", labels: "= vars.lbl", label_names: "= vars.ln", value: {count: 1, sum: "= vars.itl"}}
-      - title: "Per finished request: request_success[finish_reason].inc() and the request histograms"
-        source: "vllm/v1/metrics/loggers.py:1289-1330"
+            input: {name: "vllm:prompt_tokens_by_source", labels: "= merge(vars.lbl, {'source': vars.src[0]})", label_names: [model_name, engine, source], value: "= vars.src[1]"}
+      - title: "The step's histogram observations: iteration_tokens (computed prompt + generation tokens, every iteration), max generation tokens and n per finished request group, TTFT and ITL per request"
+        source: "vllm/v1/metrics/loggers.py:1273-1287"
+        set:
+          vars.hobs: "= [['vllm:iteration_tokens_total', double((has(vars.pts.computed) ? vars.pts.computed : 0) + (has(vars.it.num_generation_tokens) ? vars.it.num_generation_tokens : 0))]] + (has(vars.it.max_num_generation_tokens_iter) ? vars.it.max_num_generation_tokens_iter.map(v, ['vllm:request_max_num_generation_tokens', double(v)]) : []) + (has(vars.it.n_params_iter) ? vars.it.n_params_iter.map(v, ['vllm:request_params_n', double(v)]) : []) + (has(vars.it.time_to_first_tokens_iter) ? vars.it.time_to_first_tokens_iter.map(v, ['vllm:time_to_first_token_seconds', double(v)]) : []) + (has(vars.it.inter_token_latencies_iter) ? vars.it.inter_token_latencies_iter.map(v, ['vllm:inter_token_latency_seconds', double(v)]) : [])"
+      - title: "Per finished request: request_success[finish_reason].inc()"
+        source: "vllm/v1/metrics/loggers.py:1289-1292"
         foreach: "= has(vars.it.finished_requests) ? vars.it.finished_requests : []"
         as: fr
         steps:
           - call: prometheus-registry.incr
             input: {name: "vllm:request_success", labels: "= merge(vars.lbl, {'finished_reason': vars.fr.finish_reason})", label_names: [model_name, engine, finished_reason], value: 1}
-          - title: "histogram_e2e_time_request.observe(e2e_latency)"
-            source: "vllm/v1/metrics/loggers.py:1293-1295"
-            call: prometheus-registry.incr
-            input: {name: "vllm:e2e_request_latency_seconds", labels: "= vars.lbl", label_names: "= vars.ln", value: {count: 1, sum: "= vars.fr.e2e_latency"}}
-          - title: "histogram_num_prompt_tokens_request / _generation_tokens_request"
-            source: "vllm/v1/metrics/loggers.py:1318-1323"
-            call: prometheus-registry.incr
-            input: {name: "vllm:request_prompt_tokens", labels: "= vars.lbl", label_names: "= vars.ln", value: {count: 1, sum: "= vars.fr.num_prompt_tokens"}}
-          - call: prometheus-registry.incr
-            input: {name: "vllm:request_generation_tokens", labels: "= vars.lbl", label_names: "= vars.ln", value: {count: 1, sum: "= vars.fr.num_generation_tokens"}}
+      - title: "Per finished request: e2e, queue, prefill, inference and decode times; num_preemptions; prefill_kv_computed = num_prompt_tokens - max(num_cached_tokens, 0); prompt and generation tokens; time per output token; max_tokens only when truthy"
+        source: "vllm/v1/metrics/loggers.py:1293-1330"
+        set:
+          vars.fobs: "= (has(vars.it.finished_requests) ? vars.it.finished_requests : []).map(fr, [['vllm:e2e_request_latency_seconds', double(fr.e2e_latency)], ['vllm:request_queue_time_seconds', has(fr.queued_time) ? double(fr.queued_time) : 0.0], ['vllm:request_prefill_time_seconds', has(fr.prefill_time) ? double(fr.prefill_time) : 0.0], ['vllm:request_inference_time_seconds', has(fr.inference_time) ? double(fr.inference_time) : 0.0], ['vllm:request_decode_time_seconds', has(fr.decode_time) ? double(fr.decode_time) : 0.0], ['vllm:request_num_preemptions', double(has(fr.num_preemptions) ? fr.num_preemptions : 0)], ['vllm:request_prefill_kv_computed_tokens', double(fr.num_prompt_tokens - int(math.greatest(has(fr.num_cached_tokens) ? fr.num_cached_tokens : 0, 0)))], ['vllm:request_prompt_tokens', double(fr.num_prompt_tokens)], ['vllm:request_generation_tokens', double(fr.num_generation_tokens)], ['vllm:request_time_per_output_token_seconds', has(fr.mean_time_per_output_token) ? double(fr.mean_time_per_output_token) : 0.0]] + (has(fr.max_tokens_param) && fr.max_tokens_param != null && fr.max_tokens_param != 0 ? [['vllm:request_params_max_tokens', double(fr.max_tokens_param)]] : [])).flatten()"
+      - title: "Histogram.observe for every observation of the step, applied to the labeled children at once"
+        source: "vllm/v1/metrics/loggers.py:1273-1330"
+        call: prometheus-registry.observe-many
+        input:
+          observations: "= (vars.hobs + vars.fobs).map(o, {'key': o[0] + '{model_name=\"' + vars.model + '\",engine=\"' + string(vars.idx) + '\"}', 'value': o[1], 'buckets': o[0] in (has(state.bucket_bounds) ? state.bucket_bounds : {}) ? (has(state.bucket_bounds) ? state.bucket_bounds : {})[o[0]] : []})"
       - return: {recorded: iteration}
 
   - component: stat-logger-manager
@@ -173,15 +171,31 @@ interfaces:
       - title: "unregister_vllm_metrics(): drop every vllm:* collector first"
         source: "vllm/v1/metrics/prometheus.py:56-69"
         call: prometheus-registry.clear
+      - title: "Bucket bounds per family from histogram_buckets (request_tokens up to max_model_len; custom_histogram_buckets overrides are not modeled here)"
+        source: "vllm/v1/metrics/loggers.py:821-842"
+        foreach: "= ['request_tokens', 'iteration_tokens', 'request_params_n', 'time_to_first_token', 'inter_token_latency', 'request_latency', 'request_num_preemptions']"
+        as: fam
+        steps:
+          - call: buckets.histogram-buckets
+            input: {family: "= vars.fam", max_model_len: "= int(config['max-model-len'])"}
+            as: bnd
+          - set: {vars.fams: "= merge(has(vars.fams) ? vars.fams : {}, {vars.fam: vars.bnd.value})"}
+      - title: "Each histogram draws its bounds from one family"
+        source: "vllm/v1/metrics/loggers.py:862-1027"
+        set:
+          state.bucket_bounds: "= {'vllm:request_prompt_tokens': vars.fams.request_tokens, 'vllm:request_generation_tokens': vars.fams.request_tokens, 'vllm:iteration_tokens_total': vars.fams.iteration_tokens, 'vllm:request_max_num_generation_tokens': vars.fams.request_tokens, 'vllm:request_params_n': vars.fams.request_params_n, 'vllm:request_params_max_tokens': vars.fams.request_tokens, 'vllm:time_to_first_token_seconds': vars.fams.time_to_first_token, 'vllm:inter_token_latency_seconds': vars.fams.inter_token_latency, 'vllm:request_time_per_output_token_seconds': vars.fams.inter_token_latency, 'vllm:e2e_request_latency_seconds': vars.fams.request_latency, 'vllm:request_queue_time_seconds': vars.fams.request_latency, 'vllm:request_inference_time_seconds': vars.fams.request_latency, 'vllm:request_prefill_time_seconds': vars.fams.request_latency, 'vllm:request_decode_time_seconds': vars.fams.request_latency, 'vllm:request_num_preemptions': vars.fams.request_num_preemptions, 'vllm:request_prefill_kv_computed_tokens': vars.fams.request_tokens}"
       - set:
-          vars.per_engine: "= vars.engines.map(e, [['vllm:num_requests_running', 0], ['vllm:num_requests_waiting', 0], ['vllm:kv_cache_usage_perc', 0.0], ['vllm:prefix_cache_queries', 0], ['vllm:prefix_cache_hits', 0], ['vllm:num_preemptions', 0], ['vllm:prompt_tokens', 0], ['vllm:generation_tokens', 0], ['vllm:time_to_first_token_seconds', {'count': 0, 'sum': 0.0}], ['vllm:inter_token_latency_seconds', {'count': 0, 'sum': 0.0}], ['vllm:e2e_request_latency_seconds', {'count': 0, 'sum': 0.0}], ['vllm:request_prompt_tokens', {'count': 0, 'sum': 0.0}], ['vllm:request_generation_tokens', {'count': 0, 'sum': 0.0}]].map(m, {'name': m[0], 'labels': {'model_name': vars.model, 'engine': string(e)}, 'label_names': ['model_name', 'engine'], 'value': m[1]})).flatten()"
+          vars.hist0: "= state.bucket_bounds.transformMap(k, v, merge({'count': 0, 'sum': 0.0, 'le=+Inf': 0}, v.transformMapEntry(i, b, {'le=' + (double(b) == double(int(b)) ? string(int(b)) + '.0' : string(double(b))): 0})))"
+      - set:
+          vars.per_engine: "= vars.engines.map(e, ([['vllm:num_requests_running', 0], ['vllm:num_requests_waiting', 0], ['vllm:kv_cache_usage_perc', 0.0], ['vllm:prefix_cache_queries', 0], ['vllm:prefix_cache_hits', 0], ['vllm:num_preemptions', 0], ['vllm:prompt_tokens', 0], ['vllm:prompt_tokens_cached', 0], ['vllm:generation_tokens', 0]] + vars.hist0.transformList(k, v, [k, v])).map(m, {'name': m[0], 'labels': {'model_name': vars.model, 'engine': string(e)}, 'label_names': ['model_name', 'engine'], 'value': m[1]})).flatten()"
+          vars.by_source: "= vars.engines.map(e, ['local_compute', 'local_cache_hit', 'external_kv_transfer'].map(src, {'name': 'vllm:prompt_tokens_by_source', 'labels': {'model_name': vars.model, 'engine': string(e), 'source': src}, 'label_names': ['model_name', 'engine', 'source'], 'value': 0})).flatten()"
           vars.success: "= vars.engines.map(e, ['stop', 'length', 'abort', 'error', 'repetition'].map(r, {'name': 'vllm:request_success', 'labels': {'model_name': vars.model, 'engine': string(e), 'finished_reason': r}, 'label_names': ['model_name', 'engine', 'finished_reason'], 'value': 0})).flatten()"
           vars.admission: "= ['max_num_queued_reqs', 'max_num_queued_tokens'].map(r, {'name': 'vllm:admission_rejections', 'labels': {'model_name': vars.model, 'reason': r}, 'label_names': ['model_name', 'reason'], 'value': 0})"
       - title: "metric.labels(...) creates each child at zero"
         source: "vllm/v1/metrics/utils.py:11-19"
-        foreach: "= vars.per_engine + vars.success + vars.admission"
+        foreach: "= vars.per_engine + vars.by_source + vars.success + vars.admission"
         as: s
-        max: 200
+        max: 400
         steps:
           - call: prometheus-registry.set
             input: "= vars.s"
@@ -190,7 +204,7 @@ interfaces:
         source: "vllm/v1/metrics/loggers.py:616-617"
         call: stat-logger-manager.record-sleep-state
         input: {sleep: 0, level: 0}
-      - return: {series: "= size(vars.per_engine) + size(vars.success) + size(vars.admission)"}
+      - return: {series: "= size(vars.per_engine) + size(vars.by_source) + size(vars.success) + size(vars.admission)"}
 
   - component: stat-logger-manager
     name: ensure-prometheus
@@ -257,6 +271,22 @@ interfaces:
     request: {type: object, properties: {name: {type: string}, labels: {type: object, default: {}}, label_names: {type: array, items: {type: string}, default: []}, value: {}}}
     sources: ["vllm/v1/metrics/loggers.py:1138-1330"]
     store: {table: metrics, op: incr, key: "= input.name + (has(input.label_names) && size(input.label_names) > 0 ? '{' + input.label_names.map(k, k + '=\"' + string(input.labels[k]) + '\"').join(',') + '}' : '')", value: "= input.value"}
+
+  - component: prometheus-registry
+    name: observe-many
+    kind: function
+    latency_ms: 0
+    summary: "Histogram.observe(value) for a batch of observations on labeled children (key name{labels}): per child count + n, sum + the values, and on every cumulative bucket le=<bound> the number of values at or below it (le=+Inf counts all)."
+    sources: ["vllm/v1/metrics/loggers.py:1273-1330"]
+    request: {type: object, required: [observations], properties: {observations: {type: array, items: {type: object, properties: {key: {type: string}, value: {type: number}, buckets: {type: array, items: {type: number}}}}}}}
+    behavior:
+      - set:
+          vars.obs: "= input.observations"
+      - set:
+          vars.keys: "= lists.range(size(vars.obs)).filter(i, !vars.obs.slice(0, i).exists(p, p.key == vars.obs[i].key)).map(i, vars.obs[i].key)"
+      - set:
+          state.metrics: "= merge(state.metrics, vars.keys.transformMapEntry(j, k, {k: [vars.obs.filter(o, o.key == k)].map(g, [g.map(o, double(o.value)), g[0].buckets, k in state.metrics ? state.metrics[k] : {}]).map(t, merge({'count': (has(t[2].count) ? t[2].count : 0) + size(t[0]), 'sum': (has(t[2].sum) ? double(t[2].sum) : 0.0) + (size(t[0]) > 0 ? sum(t[0]) : 0.0), 'le=+Inf': (('le=+Inf' in t[2]) ? t[2]['le=+Inf'] : 0) + size(t[0])}, t[1].transformMapEntry(i, b, {'le=' + (double(b) == double(int(b)) ? string(int(b)) + '.0' : string(double(b))): (('le=' + (double(b) == double(int(b)) ? string(int(b)) + '.0' : string(double(b)))) in t[2] ? t[2]['le=' + (double(b) == double(int(b)) ? string(int(b)) + '.0' : string(double(b)))] : 0) + size(t[0].filter(v, v <= double(b)))})))[0]}))"
+      - return: {observed: "= size(vars.obs)"}
 
   - component: prometheus-registry
     name: set

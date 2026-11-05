@@ -1,0 +1,272 @@
+# Round-6 regression scenarios: one per mechanism added for the round-5 blind measure (FIXES6.md item 1).
+scenarios:
+  - id: engine-core-r6-ttft-from-arrival-itl-from-engine-clock
+    name: "judge4 L4-1 (a, c): TTFT runs from the request's arrival_time (stamped before rendering), ITL from consecutive EngineCoreOutputs timestamps, not the API clock"
+    description: "The request arrived 0.25 s before the output processor registered it. Its first output gives TTFT = iteration_timestamp - arrival_time (stats.py:519-523); the next two outputs carry engine-core timestamps 0.02 s and 0.05 s later, so the ITLs are 0.02 and 0.03 whatever the API process's clock says (stats.py:548-557)."
+    fixtures: [full-tp1-llama-8b]
+    steps:
+      - {interface: output-processor.add-request, caller: async-llm, as: add, input: {request: {request_id: r1, prompt_token_ids: [128000, 9906, 11], arrival_time: "= double(now_us) / 1000000.0 - 0.25", sampling_params: {max_tokens: 3, output_kind: delta}}, has_queue: false}}
+      - {interface: output-processor.process-outputs, caller: async-llm, as: o1, input: {timestamp: 100.0, outputs: [{request_id: r1, new_token_ids: [1]}]}}
+      - {interface: output-processor.process-outputs, caller: async-llm, as: o2, at_ms: 500, input: {timestamp: 100.02, outputs: [{request_id: r1, new_token_ids: [2]}]}}
+      - {interface: output-processor.process-outputs, caller: async-llm, as: o3, at_ms: 900, input: {timestamp: 100.05, outputs: [{request_id: r1, new_token_ids: [3], finish_reason: length}]}}
+    expect:
+      - "steps.o1.result.value.iteration_stats.time_to_first_tokens_iter[0] >= 0.25 && steps.o1.result.value.iteration_stats.time_to_first_tokens_iter[0] < 0.26"
+      - "math.abs(steps.o2.result.value.iteration_stats.inter_token_latencies_iter[0] - 0.02) < 0.000001"
+      - "math.abs(steps.o3.result.value.iteration_stats.inter_token_latencies_iter[0] - 0.03) < 0.000001"
+      # decode = last token - first token on the engine clock; TPOT = decode / (3 - 1)
+      - "math.abs(steps.o3.result.value.iteration_stats.finished_requests[0].decode_time - 0.05) < 0.000001 && math.abs(steps.o3.result.value.iteration_stats.finished_requests[0].mean_time_per_output_token - 0.025) < 0.000001"
+      - "steps.o3.result.value.iteration_stats.finished_requests[0].e2e_latency > 1.1"
+      - "!('r1' in state['output-processor'].request_states)"
+
+  - id: engine-core-r6-phase-histograms-from-events
+    name: "judge4 L4-1 (b, c), L4-2 (b): QUEUED/SCHEDULED/PREEMPTED events and the step timestamps give the queue, prefill, decode, inference and TPOT histograms; the request's n, max_tokens, generation-token max and prefill KV compute are observed"
+    fixtures: [full-tp1-llama-8b]
+    steps:
+      - {interface: output-processor.add-request, caller: async-llm, as: add, input: {request: {request_id: r1, prompt_token_ids: [128000, 9906, 11, 12], arrival_time: 10.0, sampling_params: {max_tokens: 2}}, has_queue: false}}
+      - {interface: output-processor.process-outputs, caller: async-llm, as: o1, input: {timestamp: 11.0, outputs: [{request_id: r1, new_token_ids: [1], num_cached_tokens: 1, events: [{type: QUEUED, timestamp: 10.1}, {type: SCHEDULED, timestamp: 10.4}, {type: PREEMPTED, timestamp: 10.6}, {type: SCHEDULED, timestamp: 10.8}]}]}}
+      - {interface: output-processor.process-outputs, caller: async-llm, as: o2, input: {timestamp: 11.5, outputs: [{request_id: r1, new_token_ids: [2], finish_reason: length}]}}
+      - {interface: stat-logger-manager.record, caller: async-llm, as: r1, input: {iteration_stats: "= steps.o1.result.value.iteration_stats"}}
+      - {interface: stat-logger-manager.record, caller: async-llm, as: r2, input: {iteration_stats: "= steps.o2.result.value.iteration_stats"}}
+    expect:
+      - "steps.o1.result.value.iteration_stats.num_preempted_reqs == 1"
+      - "math.abs(state['prometheus-registry'].metrics['vllm:request_queue_time_seconds{model_name=\"llama-8b\",engine=\"0\"}'].sum - 0.3) < 0.000001"
+      # the re-schedule after the preemption is ignored: prefill runs from the first SCHEDULED (10.4) to the first token (11.0)
+      - "math.abs(state['prometheus-registry'].metrics['vllm:request_prefill_time_seconds{model_name=\"llama-8b\",engine=\"0\"}'].sum - 0.6) < 0.000001"
+      - "math.abs(state['prometheus-registry'].metrics['vllm:request_decode_time_seconds{model_name=\"llama-8b\",engine=\"0\"}'].sum - 0.5) < 0.000001"
+      - "math.abs(state['prometheus-registry'].metrics['vllm:request_inference_time_seconds{model_name=\"llama-8b\",engine=\"0\"}'].sum - 1.1) < 0.000001"
+      - "math.abs(state['prometheus-registry'].metrics['vllm:request_time_per_output_token_seconds{model_name=\"llama-8b\",engine=\"0\"}'].sum - 0.5) < 0.000001"
+      - "state['prometheus-registry'].metrics['vllm:request_num_preemptions{model_name=\"llama-8b\",engine=\"0\"}'].sum == 1.0"
+      - "state['prometheus-registry'].metrics['vllm:request_params_n{model_name=\"llama-8b\",engine=\"0\"}'].sum == 1.0 && state['prometheus-registry'].metrics['vllm:request_params_max_tokens{model_name=\"llama-8b\",engine=\"0\"}'].sum == 2.0"
+      - "state['prometheus-registry'].metrics['vllm:request_max_num_generation_tokens{model_name=\"llama-8b\",engine=\"0\"}'].sum == 2.0"
+      # prefill KV computed = prompt tokens - cached = 4 - 1
+      - "state['prometheus-registry'].metrics['vllm:request_prefill_kv_computed_tokens{model_name=\"llama-8b\",engine=\"0\"}'].sum == 3.0"
+      # buckets: the 0.3 s queue time lands in le=0.3 and every larger bound, not le=... below
+      - "state['prometheus-registry'].metrics['vllm:request_queue_time_seconds{model_name=\"llama-8b\",engine=\"0\"}']['le=0.3'] == 0 && state['prometheus-registry'].metrics['vllm:request_queue_time_seconds{model_name=\"llama-8b\",engine=\"0\"}']['le=0.5'] == 1 && state['prometheus-registry'].metrics['vllm:request_queue_time_seconds{model_name=\"llama-8b\",engine=\"0\"}']['le=+Inf'] == 1"
+      - "state['prometheus-registry'].metrics['vllm:iteration_tokens_total{model_name=\"llama-8b\",engine=\"0\"}'].count == 2"
+
+  - id: engine-core-r6-buckets-wired-at-startup
+    name: "judge4 L4-1 (d): PrometheusStatLogger.__init__ draws each histogram's bounds from histogram_buckets; the startup series exist at zero with their buckets"
+    fixtures: [full-tp1-llama-8b]
+    steps:
+      - {interface: stat-logger-manager.init-prometheus, caller: async-llm, as: init, input: {engine_indexes: [0]}}
+    expect:
+      - "trace.filter(e, e.type == 'call.start' && e.interface == 'buckets.histogram-buckets').size() == 7"
+      - "state['prometheus-registry'].metrics['vllm:e2e_request_latency_seconds{model_name=\"llama-8b\",engine=\"0\"}']['le=7680.0'] == 0"
+      - "state['prometheus-registry'].metrics['vllm:request_prompt_tokens{model_name=\"llama-8b\",engine=\"0\"}']['le=100000.0'] == 0 && !('le=200000.0' in state['prometheus-registry'].metrics['vllm:request_prompt_tokens{model_name=\"llama-8b\",engine=\"0\"}'])"
+      - "state['prometheus-registry'].metrics['vllm:prompt_tokens_by_source{model_name=\"llama-8b\",engine=\"0\",source=\"local_cache_hit\"}'] == 0"
+
+  - id: engine-core-r6-startup-handshake
+    name: "judge4 L4-3 (a, b): HELLO before the engine is built, the init message back, the ready response, then READY; the client syncs max_model_len and num_gpu_blocks from the ready response"
+    flow: engine-startup
+    fixtures: [full-tp1-llama-8b]
+    max_events: 400000
+    expect:
+      - "result.ok && result.value.num_gpu_blocks > 0"
+      - "trace.filter(e, e.type == 'call.start' && e.interface == 'core-engine-proc-manager.handle-handshake-message').map(e, e.input.status) == ['HELLO', 'READY']"
+      - "trace.filter(e, e.type == 'call.start' && e.interface == 'core-engine-proc-manager.handle-handshake-message' && e.input.status == 'HELLO')[0].seq < trace.filter(e, e.type == 'call.start' && e.interface == 'engine-core.init')[0].seq"
+      - "trace.filter(e, e.type == 'call.start' && e.interface == 'engine-core-proc.make-ready-response')[0].seq < trace.filter(e, e.type == 'call.start' && e.interface == 'core-engine-proc-manager.handle-handshake-message' && e.input.status == 'READY')[0].seq"
+      - "state['core-engine-proc-manager'].handshake['0'].state == 'READY' && state['async-mp-client'].num_ready == 1"
+      - "state['async-mp-client'].max_model_len == config['max-model-len']"
+
+  - id: engine-core-r6-dp-moe-handshake-hash
+    name: "judge4 L4-7 (b): DP 2 with an MoE model is coordinated: each READY carries parallel_config_hash, a mismatching one fails startup with the configuration-mismatch error"
+    fixtures: [full-moe-mixtral-8x7b-tp2-ep]
+    config: {data-parallel-size: 2, tensor-parallel-size: 1}
+    max_events: 400000
+    state:
+      core-engine-proc-manager: {handshake: {"0": {local: true, state: CONNECTED}}, coordinated_dp: true, expected_parallel_config_hash: pc-dp2-tp1-pp1}
+    steps:
+      - {interface: core-engine-proc-manager.handle-handshake-message, caller: engine-core-proc, as: bad, input: {status: READY, engine_index: 0, parallel_config_hash: pc-dp2-tp2-pp1}}
+      - {interface: core-engine-proc-manager.handle-handshake-message, caller: engine-core-proc, as: good, input: {status: READY, engine_index: 0, parallel_config_hash: pc-dp2-tp1-pp1}}
+      - {interface: core-engine-proc-manager.handle-handshake-message, caller: engine-core-proc, as: again, input: {status: READY, engine_index: 0, parallel_config_hash: pc-dp2-tp1-pp1}}
+      - {interface: core-engine-proc-manager.handle-handshake-message, caller: engine-core-proc, as: stray, input: {status: HELLO, engine_index: 5}}
+      - {interface: core-engine-proc-manager.handle-handshake-message, caller: engine-core-proc, as: remote, input: {status: HELLO, engine_index: 0, local: false}}
+    expect:
+      - "!steps.bad.result.ok && steps.bad.result.error.message == 'Configuration mismatch detected for engine 0. All DP workers must have identical configurations for parameters that affect collective communication (e.g., enable_eplb, eplb_config.log_balancedness). Worker hash: pc-dp2-tp2-pp1, Expected hash: pc-dp2-tp1-pp1. Please ensure all workers are started with the same command-line arguments.'"
+      - "steps.good.result.ok && steps.good.result.value.state == 'READY'"
+      - "!steps.again.result.ok && steps.again.result.error.message == 'Unexpected READY message for local engine 0 in CoreEngineState.READY state.'"
+      - "!steps.stray.result.ok && steps.stray.result.error.message == 'Message from engine with unexpected data parallel rank: 5'"
+      - "!steps.remote.result.ok && steps.remote.result.error.message == 'HELLO message from remote engine 0, expected it to be local'"
+
+  - id: engine-core-r6-dp-startup-all-ranks
+    name: "judge4 L4-7 (b, c): DP 2 startup launches EngineCore_DP0 and _DP1, each sends HELLO and READY with parallel_config_hash (DP > 1); the client waits for both ready responses and sums num_gpu_blocks"
+    description: "A dense model: the DP ranks are independent, so the handshake is not coordinated (no hash check). The MoE world's DP 2 profile run currently aborts inside models-layers' MoE forward (forward context), so the coordinated case is shown on the handshake interface directly (engine-core-r6-dp-moe-handshake-hash)."
+    fixtures: [full-tp1-llama-8b]
+    config: {data-parallel-size: 2}
+    max_events: 600000
+    max_iterations: 600000
+    flow: engine-startup
+    expect:
+      - "result.ok"
+      - "calls['engine-core-proc.run-engine-core'] == 2"
+      - "trace.filter(e, e.type == 'call.start' && e.interface == 'core-engine-proc-manager.handle-handshake-message' && e.input.status == 'READY').map(e, e.input.parallel_config_hash) == ['pc-dp2-tp1-pp1', 'pc-dp2-tp1-pp1']"
+      - "state['async-mp-client'].num_ready == 2 && result.value.num_gpu_blocks == trace.filter(e, e.type == 'call.end' && e.interface == 'engine-core-proc.make-ready-response').map(e, e.output.num_gpu_blocks)[0] + trace.filter(e, e.type == 'call.end' && e.interface == 'engine-core-proc.make-ready-response').map(e, e.output.num_gpu_blocks)[1]"
+      - "!state['core-engine-proc-manager'].coordinated_dp && state['core-engine-proc-manager'].handshake['1'].state == 'READY'"
+
+  - id: engine-core-r6-failed-core-procs-names-dp-ranks
+    name: "RESULTS round 5: the startup error names every core process that exited (EngineCore_DP<i> under DP) with its exit code"
+    fixtures: [full-tp1-llama-8b]
+    config: {data-parallel-size: 2}
+    max_events: 400000
+    flow: engine-startup
+    faults:
+      - {target: engine-core.init, type: error, code: runtime-error, message: "unreadable weights"}
+    expect:
+      - "!result.ok && result.error.message == \"Engine core initialization failed. See root cause above. Failed core proc(s): {'EngineCore_DP0': 1, 'EngineCore_DP1': 1}\""
+      - "trace.filter(e, e.type == 'call.start' && e.interface == 'core-engine-proc-manager.handle-handshake-message' && e.input.status == 'READY').size() == 0"
+
+  - id: engine-core-r6-multi-api-server-ready-timeout
+    name: "judge4 L4-3 (d): under run_multi_api_server the API servers poll for the ready responses while the engine loads; a 700 s load passes the 600 s VLLM_ENGINE_READY_TIMEOUT_S and the launcher fails on the dead frontend"
+    fixtures: [full-tp1-llama-8b]
+    max_events: 600000
+    max_iterations: 600000
+    max_virtual_ms: 2000000
+    faults:
+      - {target: engine-core.init, type: latency, latency_ms: 700000}
+    steps:
+      - {interface: core-engine-proc-manager.launch-core-engines, caller: api-server, as: l, input: {api_server_count: 2, iterations: 1}}
+    expect:
+      - "!steps.l.result.ok && steps.l.result.error.message.startsWith('Frontend process failed during engine core initialization. See root cause above. Failed frontend proc(s): {')"
+      - "trace.exists(e, e.type == 'call.end' && e.interface == 'async-mp-client.wait-for-ready-responses' && e.error != null && e.error.message.startsWith('Timed out waiting for engine core processes to start. This is often caused by slow weight loading for large models. Waited 600s (configured by VLLM_ENGINE_READY_TIMEOUT_S).'))"
+
+  - id: engine-core-r6-multi-api-server-startup
+    name: "judge4 L4-7 (a, d): run_multi_api_server's engine side: the engine sends its ready response to each of 2 API servers, each client syncs it, and each StatLoggerManager drops the LoggingStatLogger (client_count 2)"
+    fixtures: [full-tp1-llama-8b]
+    max_events: 600000
+    max_iterations: 600000
+    steps:
+      - {interface: core-engine-proc-manager.launch-core-engines, caller: api-server, as: l, input: {api_server_count: 2, iterations: 1}}
+    expect:
+      - "steps.l.result.ok && steps.l.result.value.api_servers == ['ApiServer_0', 'ApiServer_1']"
+      - "trace.filter(e, e.type == 'receive').size() == 2"
+      - "trace.filter(e, e.type == 'call.start' && e.interface == 'stat-logger-manager.init').all(e, e.input.client_count == 2)"
+      - "!state['stat-logger-manager'].loggers.exists(l, l == 'LoggingStatLogger') && state['stat-logger-manager'].stats_logging_disabled"
+      - "calls['core-engine-proc-manager.launch'] == 1"
+
+  - id: engine-core-r6-multiproc-prometheus-dir
+    name: "run_multi_api_server: setup_multiprocess_prometheus makes a temporary PROMETHEUS_MULTIPROC_DIR unless the user set one"
+    fixtures: [full-tp1-llama-8b]
+    steps:
+      - {interface: prometheus-registry.setup-multiprocess-prometheus, caller: api-server, as: tmp}
+      - {interface: prometheus-registry.setup-multiprocess-prometheus, caller: api-server, as: user, input: {user_dir: /tmp/prom}}
+    expect:
+      - "steps.tmp.result.ok && !steps.tmp.result.value.user_set && steps.tmp.result.value.multiproc_dir.startsWith('prometheus-multiproc-')"
+      - "steps.user.result.value.user_set && state['prometheus-registry'].multiproc_dir == '/tmp/prom'"
+
+  - id: engine-core-r6-shm-cache-no-engine-receiver
+    name: "judge4 L4-8 (c): with mm_processor_cache_type shm the engine core gets no receiver cache (the worker holds it), so add-request skips get_and_update_features"
+    fixtures: [full-vl-qwen2-vl-7b]
+    config: {mm-processor-cache-type: shm}
+    max_events: 400000
+    steps:
+      - {interface: engine-core.init, caller: engine-core, as: init}
+      - {interface: engine-core.preprocess-add-request, caller: engine-core, as: pre, input: {request_id: v1, prompt_token_ids: [1, 2, 3], sampling_params: {max_tokens: 2}, arrival_time: 0.0, mm_features: [{mm_hash: h1, modality: image, offset: 1, length: 1, num_embeds: 1}]}}
+    expect:
+      - "steps.init.result.ok && state['engine-core'].mm_receiver_cache == null"
+      - "steps.pre.result.ok && calls['lru-key-replicated-receiver-cache.get-and-update-features'] == 0"
+
+  - id: engine-core-r6-lru-cache-engine-receiver
+    name: "judge4 L4-8 (a): with the default lru type the engine core uses the LRU receiver cache on add-request"
+    fixtures: [full-vl-qwen2-vl-7b]
+    max_events: 400000
+    steps:
+      - {interface: engine-core.init, caller: engine-core, as: init}
+      - {interface: engine-core.preprocess-add-request, caller: engine-core, as: pre, input: {request_id: v1, prompt_token_ids: [1, 2, 3], sampling_params: {max_tokens: 2}, arrival_time: 0.0, mm_features: [{mm_hash: h1, modality: image, offset: 1, length: 1, num_embeds: 1, data: {modality: image, bytes: 4816896}}]}}
+    expect:
+      - "steps.init.result.ok && state['engine-core'].mm_receiver_cache == 'lru-key-replicated-receiver-cache'"
+      - "calls['lru-key-replicated-receiver-cache.get-and-update-features'] == 1"
+
+  - id: engine-core-r6-delta-logprobs-empty-list
+    name: "oracle4: a DELTA output with no new tokens carries logprobs [] (logprobs[:0]), with or without new_logprobs; a request without logprobs gets null"
+    fixtures: [full-tp1-llama-8b]
+    steps:
+      - {interface: output-processor.add-request, caller: async-llm, as: a1, input: {request: {request_id: r1, prompt_token_ids: [128000, 9906], arrival_time: 0.0, sampling_params: {output_kind: delta, logprobs: 1, max_tokens: 8}}, has_queue: false}}
+      - {interface: output-processor.add-request, caller: async-llm, as: a2, input: {request: {request_id: r2, prompt_token_ids: [128000, 9906], arrival_time: 0.0, sampling_params: {output_kind: delta, max_tokens: 8}}, has_queue: false}}
+      - {interface: output-processor.process-outputs, caller: async-llm, as: first, input: {outputs: [{request_id: r1, new_token_ids: [1], new_logprobs: {token_ids: [[1, 2]], logprobs: [[-0.5, -1.0]], ranks: [1]}}, {request_id: r2, new_token_ids: [1]}]}}
+      - {interface: output-processor.process-outputs, caller: async-llm, as: none, input: {outputs: [{request_id: r1, new_token_ids: []}]}}
+      - {interface: output-processor.process-outputs, caller: async-llm, as: cum, input: {outputs: [{request_id: r1, new_token_ids: [3], new_logprobs: {token_ids: [[3, 2]], logprobs: [[-0.1, -2.0]], ranks: [1]}}]}}
+    expect:
+      - "size(steps.first.result.value.request_outputs[0].completions[0].logprobs) == 1 && steps.first.result.value.request_outputs[1].completions[0].logprobs == null"
+      - "steps.none.result.value.request_outputs[0].completions[0].logprobs == []"
+      - "size(steps.cum.result.value.request_outputs[0].completions[0].logprobs) == 1 && steps.cum.result.value.request_outputs[0].completions[0].logprobs[0][0].token_id == 3"
+      - "math.abs(steps.cum.result.value.request_outputs[0].completions[0].cumulative_logprob + 0.6) < 0.000001"
+      - "size(state['logprobs-processor'].requests['r1'].logprobs) == 2 && !('r2' in state['logprobs-processor'].requests)"
+
+  - id: engine-core-r6-prompt-logprobs
+    name: "worker-runner oracle4 fix 5: prompt logprobs start with None, one entry per scored prompt token (the prompt token first, with its rank); DELTA hands them out once, CUMULATIVE every time"
+    fixtures: [full-tp1-llama-8b]
+    steps:
+      - {interface: output-processor.add-request, caller: llm-engine, as: a1, input: {request: {request_id: d1, prompt_token_ids: [128000, 9906, 11], arrival_time: 0.0, sampling_params: {output_kind: delta, prompt_logprobs: 1, max_tokens: 4}}, has_queue: false}}
+      - {interface: output-processor.add-request, caller: llm-engine, as: a2, input: {request: {request_id: c1, prompt_token_ids: [128000, 9906, 11], arrival_time: 0.0, sampling_params: {output_kind: cumulative, prompt_logprobs: 1, max_tokens: 4}}, has_queue: false}}
+      - {interface: output-processor.process-outputs, caller: llm-engine, as: p1, input: {outputs: [{request_id: d1, new_token_ids: [5], new_prompt_logprobs_tensors: {token_ids: [[9906, 77, 88], [11, 77, 88]], logprobs: [[-1.0, -0.5, -2.0], [-0.2, -0.3, -3.0]], ranks: [2, 1]}}, {request_id: c1, new_token_ids: [5], new_prompt_logprobs_tensors: {token_ids: [[9906, 77], [11, 77]], logprobs: [[-1.0, -0.5], [-0.2, -0.3]], ranks: [2, 1]}}]}}
+      - {interface: output-processor.process-outputs, caller: llm-engine, as: p2, input: {outputs: [{request_id: d1, new_token_ids: [6]}, {request_id: c1, new_token_ids: [6]}]}}
+    expect:
+      - "steps.p1.result.value.request_outputs[0].prompt_logprobs[0] == null && size(steps.p1.result.value.request_outputs[0].prompt_logprobs) == 3"
+      - "steps.p1.result.value.request_outputs[0].prompt_logprobs[1] == [{'token_id': 9906, 'logprob': -1.0, 'rank': 2}, {'token_id': 77, 'logprob': -0.5, 'rank': 1}]"
+      - "steps.p2.result.value.request_outputs[0].prompt_logprobs == []"
+      - "size(steps.p2.result.value.request_outputs[1].prompt_logprobs) == 3"
+      - "steps.p1.result.value.request_outputs[0].completions[0].logprobs == null"
+      - "state['logprobs-processor'].requests['d1'].prompt_logprobs == [] && size(state['logprobs-processor'].requests['c1'].prompt_logprobs) == 3"
+
+  - id: engine-core-r6-encoder-prompt-type-error
+    name: "oracle4 test_async_llm_processor_error: an encoder/decoder prompt on a decoder-only model raises TypeError in parse_dec_only_prompt, which generate wraps as EngineGenerateError; the engine stays healthy"
+    fixtures: [full-tp1-llama-8b]
+    steps:
+      - {flow: async-llm-generate, as: g, input: {request_id: e1, encoder_prompt: Hello my name is, decoder_prompt: {$null: true}, prompt_token_ids: {$absent: true}, sampling_params: {n: 1, max_tokens: 2}}}
+      - {interface: async-llm.errored, caller: api-server, as: err}
+    expect:
+      - "!steps.g.result.ok && steps.g.result.error.code == 'engine-generate-error' && steps.g.result.error.data.cause == 'type-error'"
+      - "trace.exists(e, e.type == 'call.end' && e.interface == 'input-processor.process-inputs' && e.error.message == 'Cannot pass encoder-decoder prompt to decoder-only models')"
+      - "steps.err.result.value.errored == false"
+
+  - id: engine-core-r6-bad-words-update-from-tokenizer
+    name: "RESULTS round 5: text bad_words become bad_words_token_ids through update_from_tokenizer before the request leaves the input processor; a word that tokenizes to nothing is refused"
+    fixtures: [full-tp1-llama-8b]
+    steps:
+      - {interface: input-processor.process-inputs, caller: async-llm, as: ok, input: {request_id: b1, prompt_token_ids: [128000, 9906], sampling_params: {max_tokens: 4, bad_words: [hello, " big world"]}}}
+      - {interface: input-processor.process-inputs, caller: async-llm, as: empty, input: {request_id: b2, prompt_token_ids: [128000, 9906], sampling_params: {max_tokens: 4, bad_words: ["   "]}}}
+    expect:
+      # serving-api's update_from_tokenizer over its stand-in tokenizer: one id per word; the space-prefixed form is the same tokens, so it is not added twice
+      - "steps.ok.result.ok && steps.ok.result.value.sampling_params.bad_words_token_ids == [[1005], [1003, 1917]]"
+      - "trace.exists(e, e.type == 'call.start' && e.interface == 'sampling-params.update-from-tokenizer' && e.input.bad_words == ['hello', ' big world'])"
+      - "!steps.empty.result.ok && steps.empty.result.error.code == 'vllm-validation-error' && steps.empty.result.error.message == 'bad_words entries must tokenize to at least one token.'"
+
+  - id: engine-core-r6-bad-words-too-many
+    name: "update_from_tokenizer refuses more token sequences than VLLM_MAX_NUM_BAD_WORDS"
+    fixtures: [full-tp1-llama-8b]
+    config: {vllm-max-num-bad-words: 1}
+    steps:
+      - {interface: input-processor.process-inputs, caller: async-llm, as: many, input: {request_id: b3, prompt_token_ids: [128000, 9906], sampling_params: {max_tokens: 4, bad_words: [hello, world]}}}
+    expect:
+      - "!steps.many.result.ok && steps.many.result.error.message == 'Too many bad words after tokenization: 2. The max number is 1.'"
+
+  - id: engine-core-r6-inproc-client-offline
+    name: "coverage_gaps InprocClient: with VLLM_ENABLE_V1_MULTIPROCESSING=0 LLMEngine builds EngineCore in-process (no handshake, no engine process) and step() runs the engine step itself"
+    fixtures: [full-tp1-llama-8b]
+    config: {vllm-enable-v1-multiprocessing: false}
+    max_events: 400000
+    max_iterations: 400000
+    steps:
+      - {interface: llm-engine.from-engine-args, caller: python-user, as: fe}
+      - {flow: llm-engine-add-request, as: add, input: {request_id: "0", prompt_token_ids: [128000, 9906, 11], sampling_params: {max_tokens: 2, n: 1, ignore_eos: true}}}
+      - {interface: llm-engine.step, caller: python-user, as: s1}
+      - {interface: llm-engine.step, caller: python-user, as: s2}
+      - {interface: llm-engine.step, caller: python-user, as: s3}
+      - {interface: llm-engine.step, caller: python-user, as: s4}
+    expect:
+      - "steps.fe.result.ok && state['llm-engine'].client == 'inproc' && calls['core-engine-proc-manager.launch'] == 0 && calls['core-engine-proc-manager.handle-handshake-message'] == 0"
+      - "calls['inproc-client.add-request'] == 1 && calls['sync-mp-client.add-request'] == 0 && calls['engine-core-proc.process-input-sockets'] == 0"
+      - "[steps.s1, steps.s2, steps.s3, steps.s4].exists(s, s.result.value.request_outputs.exists(o, o.finished && o.finish_reason == 'length' && size(o.token_ids) == 2))"
+  - id: engine-core-r6-collective-rpc-output-rank-fails-fast
+    name: "With an output rank, collective_rpc reads only that rank's queue: rank 0's FAILURE surfaces at once while the other ranks stay blocked in their TP collective"
+    description: "multiproc_executor.py:429-431, 444-449. judge4 P4-2 d: the other ranks' 300 s wait doesn't hold the RuntimeError."
+    fixtures: [full-tp4-llama-70b]
+    config: {model: meta-llama/Llama-3.1-8B-Instruct}
+    faults:
+      - {target: gpu-worker-impl.execute-model, type: error, code: runtime-error, message: "boom on rank 0", instance: rank0}
+    steps:
+      - {interface: async-llm.add-request, caller: api-server, input: {request_id: chatcmpl-r6, prompt_token_ids: [128000, 9906, 11, 856], sampling_params: {max_tokens: 4, n: 1}}, as: add}
+      - {flow: engine-core-busy-loop, input: {iterations: 2}, as: loop}
+    expect:
+      - "!steps.loop.result.ok && steps.loop.result.error.message == \"Worker failed with error 'boom on rank 0', please check the stack trace above for the root cause\""
+      - "trace.exists(e, e.type == 'call.end' && e.interface == 'multiproc-executor.collective-rpc' && e.error != null && e.t < 300000)"

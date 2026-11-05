@@ -24,8 +24,10 @@ interfaces:
         on_error:
           - when: "config['enable-server-load-tracking']"
             call: server-load-metrics.decrement
-          - call: exception-handling.vllm-error-handler
-            input: {code: "= error.code", status: "= error.status", message: "= error.message"}
+          - title: "The handler's ErrorResponse goes back as is (JSONResponse with its own status), param response_id included"
+            source: "vllm/entrypoints/openai/responses/api_router.py:98-102"
+            call: exception-handling.vllm-error-handler
+            input: {code: "= error.code", status: "= error.status", message: "= error.message", param: "= has(error.data) && error.data != null && 'param' in error.data ? error.data.param : null"}
       - when: "config['enable-server-load-tracking']"
         call: server-load-metrics.decrement
       - return: "= vars.r.value"
@@ -46,8 +48,10 @@ interfaces:
         input: {response_id: "= input.path.split('/')[3]"}
         as: r
         on_error:
-          - call: exception-handling.vllm-error-handler
-            input: {code: "= error.code", status: "= error.status", message: "= error.message"}
+          - title: "The handler's ErrorResponse goes back as is (JSONResponse with its own status), param response_id included"
+            source: "vllm/entrypoints/openai/responses/api_router.py:98-102"
+            call: exception-handling.vllm-error-handler
+            input: {code: "= error.code", status: "= error.status", message: "= error.message", param: "= has(error.data) && error.data != null && 'param' in error.data ? error.data.param : null"}
       - return: "= vars.r.value"
   # ------------------------------------------------------------------ tokenizer info (conditional)
   - component: serving-tokenization
@@ -89,32 +93,6 @@ interfaces:
         input: {path: /health}
         as: h
       - return: "= vars.h.value"
-  - component: sagemaker-router
-    name: post-invocations
-    kind: http
-    summary: "POST /invocations: try each enabled endpoint's request type in order (chat, completion, then pooling) and call the first that validates."
-    sources: ["vllm/entrypoints/serve/sagemaker/api_router.py:98-140"]
-    attributes: {method: POST, path: /invocations}
-    request: {type: object, properties: {path: {type: string, examples: [/invocations]}, headers: {$ref: ServingHttpHeaders}, body: {type: object, properties: {model: {type: string, examples: [llama-8b]}, messages: {type: [array, "null"], items: {type: object}, default: null}, prompt: {type: [array, "null"], items: {type: string}, default: null}, max_tokens: {type: [integer, "null"], default: null}}}}, required: [path, body]}
-    errors: [{code: BadRequestError, status: 400}]
-    behavior:
-      - title: ChatCompletionRequest validates when messages is present
-        source: "vllm/entrypoints/serve/sagemaker/api_router.py:122-131"
-        if: "has(input.body.messages) && input.body.messages != null"
-        then:
-          - call: openai-serving-chat.post-v1-chat-completions
-            input: {path: /v1/chat/completions, headers: "= input.headers", body: "= input.body"}
-            as: c
-          - return: "= vars.c.value"
-      - if: "has(input.body.prompt) && input.body.prompt != null"
-        then:
-          - call: openai-serving-completion.post-v1-completions
-            input: {path: /v1/completions, headers: "= input.headers", body: "= input.body"}
-            as: p
-          - return: "= vars.p.value"
-      - title: No request type matched
-        source: "vllm/entrypoints/serve/sagemaker/api_router.py:133-139"
-        fail: {code: BadRequestError, status: 400, message: "Cannot find suitable handler for request. Expected one of: [ChatCompletionRequest, CompletionRequest]"}
   # ------------------------------------------------------------------ dev rpc / server info
   - component: dev-rpc-router
     name: post-collective-rpc
@@ -138,20 +116,36 @@ interfaces:
   - component: server-info-router
     name: get-server-info
     kind: http
-    summary: "GET /server_info (dev mode): the VllmConfig (text or json), the VLLM_* env vars without keys, and system info."
+    summary: "GET /server_info (dev mode): config_format is Literal['text', 'json'] (anything else is a query RequestValidationError, 400 Bad Request); the reply is str(VllmConfig) or its JSON dump, every VLLM_* env value that is not None except names containing KEY, and the cached system info."
     sources: ["vllm/entrypoints/serve/dev/server_info/api_router.py:43-59"]
     attributes: {method: GET, path: /server_info}
     request: {type: object, properties: {path: {type: string, examples: [/server_info]}, query: {type: object, properties: {config_format: {type: string, default: text}}}}}
-    errors: [{code: Not Found, status: 404}]
+    errors: [{code: Not Found, status: 404}, {code: Bad Request, status: 400}]
     behavior:
       - if: "!config['vllm-server-dev-mode']"
         then: [{source: "vllm/entrypoints/launchers/api_server/routers.py:40-43", fail: {code: Not Found, status: 404, message: Not Found}}]
-      - title: Env vars whose name contains KEY are left out
-        source: "vllm/entrypoints/serve/dev/server_info/api_router.py:25-34"
-        set: {vars.env: "= {'VLLM_SERVER_DEV_MODE': config['vllm-server-dev-mode']}"}
-      - if: "has(input.query) && has(input.query.config_format) && input.query.config_format == 'json'"
-        then: [{return: {vllm_config: {max_model_len: "= config['max-model-len']", served_model_name: "= config['served-model-name']"}, vllm_env: "= vars.env", system_env: {}}}]
-      - return: {vllm_config: "= 'model=' + config['model'] + ', max_model_len=' + string(config['max-model-len'])", vllm_env: "= vars.env", system_env: {}}
+      - set:
+          vars.fmt: "= has(input.query) && input.query != null && has(input.query.config_format) && input.query.config_format != null ? input.query.config_format : 'text'"
+      - title: "config_format: Annotated[Literal['text', 'json'], Query()]: another value fails query validation, and validation_exception_handler answers 400 Bad Request with param query.config_format"
+        source: "vllm/entrypoints/serve/dev/server_info/api_router.py:44-47"
+        if: "!(vars.fmt in ['text', 'json'])"
+        then:
+          - source: "vllm/entrypoints/serve/exception_handling/handlers/validation.py:149-195"
+            fail: {code: Bad Request, status: 400, message: "= '1 validation error:\\n  {\\'type\\': \\'literal_error\\', \\'loc\\': \\'query.config_format\\', \\'msg\\': \"Input should be \\'text\\' or \\'json\\'\", \\'input\\': \\'' + vars.fmt + '\\', \\'ctx\\': {\\'expected\\': \"\\'text\\' or \\'json\\'\"}}'", data: {param: query.config_format}}
+      - title: "_get_vllm_env_vars: every attribute of vllm.envs whose name starts with VLLM_ and does not contain KEY, when its value is not None (ASSUMPTION: the env-backed values this area reads; VLLM_API_KEY stands in for the key the filter drops)"
+        source: "vllm/entrypoints/serve/dev/server_info/api_router.py:25-35"
+        set:
+          vars.all_env: "= {'VLLM_SERVER_DEV_MODE': dyn(config['vllm-server-dev-mode']), 'VLLM_ALLOW_RUNTIME_LORA_UPDATING': dyn(config['vllm-allow-runtime-lora-updating']), 'VLLM_ENABLE_RESPONSES_API_STORE': dyn(config['vllm-enable-responses-api-store']), 'VLLM_KEEP_ALIVE_ON_ENGINE_DEATH': dyn(config['vllm-keep-alive-on-engine-death']), 'VLLM_ENABLE_COHERE_API': dyn(config['vllm-enable-cohere-api']), 'VLLM_MAX_COMPLETION_PROMPTS': dyn(config['vllm-max-completion-prompts']), 'VLLM_API_KEY': 'api-key' in config ? dyn(config['api-key']) : null}"
+      - set:
+          vars.env: "= vars.all_env.transformMap(k, v, k.startsWith('VLLM_') && !k.contains('KEY') && v != null, v)"
+      - if: "vars.fmt == 'json'"
+        then:
+          - title: "PydanticVllmConfig.dump_python(mode='json', fallback=str): the config as structured JSON"
+            source: "vllm/entrypoints/serve/dev/server_info/api_router.py:50-54"
+            return: {vllm_config: {model_config: {model: "= config['model']", max_model_len: "= config['max-model-len']", served_model_name: "= config['served-model-name']"}}, vllm_env: "= vars.env", system_env: {}}
+      - title: "str(vllm_config): the one-line text form"
+        source: "vllm/entrypoints/serve/dev/server_info/api_router.py:50-52"
+        return: {vllm_config: "= 'model=' + config['model'] + ', max_model_len=' + string(config['max-model-len'])", vllm_env: "= vars.env", system_env: {}}
   # ------------------------------------------------------------------ RL routes with logic
   - component: rl-online-router
     name: post-pause
@@ -549,7 +543,7 @@ interfaces:
       - title: Default api_server_count -- headless 0, external/multi-port 1, hybrid the local DP size, else the DP size
         source: "vllm/entrypoints/cli/serve.py:76-131"
         set:
-          vars.count: "= has(input.headless) && input.headless ? 0 : (has(input.api_server_count) && input.api_server_count != null ? input.api_server_count : (vars.multi_port || vars.external_lb ? 1 : (vars.hybrid_lb ? (has(input.data_parallel_size_local) && input.data_parallel_size_local != null ? input.data_parallel_size_local : 1) : (has(input.data_parallel_size) ? input.data_parallel_size : 1))))"
+          vars.count: "= has(input.headless) && input.headless ? 0 : (has(input.api_server_count) && input.api_server_count != null ? input.api_server_count : ('api-server-count' in config && config['api-server-count'] != null ? int(config['api-server-count']) : (vars.multi_port || vars.external_lb ? 1 : (vars.hybrid_lb ? (has(input.data_parallel_size_local) && input.data_parallel_size_local != null ? input.data_parallel_size_local : 1) : (has(input.data_parallel_size) ? input.data_parallel_size : 1)))))"
       - if: "vars.multi_port"
         then: [{source: "vllm/entrypoints/cli/serve.py:151-152", return: {mode: dp-supervisor}}]
       - if: "vars.count < 1"
@@ -561,7 +555,13 @@ interfaces:
             fill: true
           - return: {mode: headless}
       - if: "vars.count > 1"
-        then: [{title: run_multi_api_server, source: "vllm/entrypoints/cli/serve.py:155-156", return: {mode: multi-api-server, api_server_count: "= vars.count"}}]
+        then:
+          - title: "run_multi_api_server; with the DP-size default the parent logs 'Defaulting api_server_count to data_parallel_size (N).'"
+            source: "vllm/entrypoints/cli/serve.py:155-156"
+            call: serve-subcommand.run-multi-api-server
+            input: {api_server_count: "= vars.count", host: "= has(input.host) ? input.host : '0.0.0.0'", port: "= has(input.port) ? input.port : 8000"}
+            as: m
+          - return: "= merge({'mode': 'multi-api-server', 'api_server_count': vars.count}, vars.m.value)"
       - title: Single API server in this process
         source: "vllm/entrypoints/cli/serve.py:157-161"
         call: api-server-entry.run-server

@@ -1,0 +1,61 @@
+schema_version: 1
+id: vllm
+scenarios:
+  - id: bench-q5-7-a-rank-spec-override
+    name: "(a) each rank: 4 KV heads, 32768 bytes/layer/block, 1 MiB/block; override log per worker; both plan 20000"
+    fixtures: [full-moe-mixtral-8x7b-tp2-ep]
+    config: {num-gpu-blocks-override: 20000}
+    steps:
+      - {interface: gpu-model-runner.get-kv-cache-spec, caller: gpu-worker, on: rank0, input: {}, as: spec0}
+      - {interface: gpu-model-runner.get-kv-cache-spec, caller: gpu-worker, on: rank1, input: {}, as: spec1}
+      - {interface: kv-cache-utils.get-kv-cache-configs, caller: engine-core, input: {available_memory: [59745650279, 59745650279], bytes_per_block: 1048576}, as: kvc}
+    expect:
+      - "steps.spec0.result.value.page_size_bytes == 32768 && steps.spec1.result.value.page_size_bytes == 32768"
+      - "steps.spec0.result.value.num_layers == 32"
+      - "steps.kvc.result.value.num_blocks == 20000"
+      - "size(trace.filter(e, e.type == 'note' && e.title.startsWith('Overriding num_gpu_blocks'))) == 2"
+  - id: bench-q5-7-a-startup
+    name: "(a) the engine-core path derives bytes per block from the workers' spec"
+    fixtures: [full-moe-mixtral-8x7b-tp2-ep]
+    config: {num-gpu-blocks-override: 20000}
+    steps:
+      - {interface: engine-core.initialize-kv-caches, caller: engine-core, input: {}, as: init}
+    expect:
+      - "steps.init.result.value.num_gpu_blocks == 20000"
+      - "trace.exists(e, e.type == 'call.start' && e.interface == 'kv-cache-utils.get-kv-cache-configs' && e.input.bytes_per_block == 1048576)"
+  - id: bench-q5-7-b-capacity-log
+    name: "(b) GPU KV cache size: 320,000 tokens, Maximum concurrency for 32,768 tokens per request: 9.77x"
+    fixtures: [full-moe-mixtral-8x7b-tp2-ep]
+    config: {num-gpu-blocks-override: 20000}
+    steps:
+      - {interface: engine-core.initialize-kv-caches, caller: engine-core, input: {}, as: init}
+    expect:
+      - "trace.exists(e, e.type == 'note' && e.title.contains('GPU KV cache size: 320,000 tokens, Maximum concurrency for 32,768 tokens per request: 9.77x'))"
+  - id: bench-q5-7-c-min-rank
+    name: "(c) rank1 profiles less: every rank allocates rank1's block count"
+    fixtures: [full-moe-mixtral-8x7b-tp2-ep]
+    steps:
+      - {interface: kv-cache-utils.get-kv-cache-configs, caller: engine-core, input: {available_memory: [59745650279, 41943040000], bytes_per_block: 1048576}, as: kvc}
+    expect:
+      - "steps.kvc.result.value.num_blocks == 40000"
+      - "state['block-pool'].num_gpu_blocks == 40000"
+  - id: bench-q5-7-c-startup
+    name: "(c) through engine-core: rank1's lower free memory decides the block count both ranks receive"
+    fixtures: [full-moe-mixtral-8x7b-tp2-ep]
+    state:
+      gpu-memory@rank1: {other_process_bytes: 21474836480}
+    steps:
+      - {interface: engine-core.initialize-kv-caches, caller: engine-core, input: {}, as: init}
+    expect:
+      - "trace.exists(e, e.type == 'call.start' && e.interface == 'kv-cache-utils.get-kv-cache-configs' && e.input.available_memory[1] < e.input.available_memory[0] && steps.init.result.value.num_gpu_blocks == e.input.available_memory[1] / e.input.bytes_per_block)"
+      - "state['block-pool'].num_gpu_blocks == steps.init.result.value.num_gpu_blocks"
+      - "trace.filter(e, e.type == 'call.start' && e.interface.contains('initialize-from-config')).all(e, e.input.num_blocks == steps.init.result.value.num_gpu_blocks) && size(trace.filter(e, e.type == 'call.start' && e.interface.contains('initialize-from-config'))) == 2"
+  - id: bench-q5-7-d-override-too-small
+    name: "(d) override 1000 plans 999 MiB against 2048 MiB: startup fails with the exact message"
+    fixtures: [full-moe-mixtral-8x7b-tp2-ep]
+    config: {num-gpu-blocks-override: 1000}
+    steps:
+      - {interface: kv-cache-utils.get-kv-cache-configs, caller: engine-core, input: {available_memory: [59745650279, 59745650279], bytes_per_block: 1048576}, as: kvc}
+    expect:
+      - "!steps.kvc.result.ok && steps.kvc.result.error.code == 'value-error'"
+      - "!steps.kvc.result.ok && steps.kvc.result.error.message.startsWith(\"To serve at least one request with the model's max seq len (32768), (2.0 GiB KV cache is needed, which is larger than the available KV cache memory (0.98 GiB). Based on the available memory, the estimated maximum model length is 15984. Try increasing\")"

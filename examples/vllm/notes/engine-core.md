@@ -365,3 +365,43 @@ New parts: `gen/engine-core/parts/38-round5.yaml` (metrics, DP coordinator, MoE 
 - `llm-engine` starts with `log_stats: false`. Serving-api's `LLM.__init__` should pass `disable_log_stats: true` unless the caller set it.
 - EngineGenerateError's message is empty; the cause is in `data.cause`.
 - `async-mp-client.shutdown` and `mark-dead` take `handler_cancelled`.
+
+## Fix round 6 (mechanism coverage)
+
+New parts: `gen/engine-core/parts/39-round6.yaml` (handshake, ready responses, multi-API-server engine side, InprocClient, logprobs processor) and `53-round6-scenarios.yaml` (18 regressions, `engine-core-r6-*`). `gen/engine-core/owner6.py` copies two owner contracts into `owner6.json`: models-layers' `multi-modal-cache-factories.engine-receiver-cache-from-config` and serving-api's `sampling-params.update-from-tokenizer`.
+
+**Mechanisms added (round-5 measure, 10).**
+- **Arrival and ITL (L4-1 a, c).** `process-inputs` keeps the rendered prompt's `arrival_time` (input_processor.py:402-415), else now. TTFT and e2e run from it. ITL uses consecutive `EngineCoreOutputs.timestamp` values (stats.py:548-557); `engine-core.step`/`step-with-batch-queue` stamp them (`__init__.py:288-290`). Units: seconds on the one virtual clock.
+- **Request histograms (L4-1 b-d, L4-2, Q4-8).** The output processor tracks the QUEUED/SCHEDULED/PREEMPTED events and phase times (stats.py:559-624) and `ParentRequest.observe_finished_request`. Prometheus now has queue, prefill, decode, inference, TPOT, num_preemptions, prefill_kv_computed, params_n, params_max_tokens, max_num_generation_tokens, iteration_tokens_total, prompt_tokens_cached and prompt_tokens_by_source. Rows carry cumulative `le=<bound>` buckets, which `init-prometheus` draws from `buckets.histogram-buckets` (loggers.py:821-1027). Observations go through one `prometheus-registry.observe-many` per step.
+- **HELLO/READY (L4-3 a, b).** run-engine-core sends HELLO before building EngineCore, then the ready response (`make-ready-response`), then READY with `parallel_config_hash` when DP > 1. `core-engine-proc-manager.handle-handshake-message` is wait_for_engine_startup's per-message state machine, with its four error texts. `async-mp-client.apply-ready-response` takes the min max_model_len and sums num_gpu_blocks.
+- **VLLM_ENGINE_READY_TIMEOUT_S (L4-3 d).** New config `vllm-engine-ready-timeout-s` (600). `async-mp-client.wait-for-ready-responses` receives on channel `engine-ready:<client>`. Only external-address clients (API servers) wait while engines load.
+- **run_multi_api_server (L4-7).** The engine side: `core-engine-proc-manager.launch-core-engines` -> `wait-for-engine-startup` (engines and `api-server-process-manager.init` in parallel), and `prometheus-registry.setup-multiprocess-prometheus`. With `client_count > 1`, `stat-logger-manager.init` drops LoggingStatLogger (loggers.py:1383-1389). DP launch starts every rank, EngineCore_DP<i>.
+- **"Failed core proc(s)".** Names every exited rank.
+- **Processor cache shm (L4-8 c), engine part.** engine-core.init asks for the receiver cache: none for shm. preprocess skips `get_and_update_features` without one (core.py:193, 1098). The `Unknown cache type: shm` bug itself is models-layers' (`processor-cache-from-config`).
+- **DELTA logprobs `[]` (oracle4).** New `logprobs-processor.from-new-request` and `update-from-output`. Completion logprobs read the accumulated list, `[:0]` on an empty step.
+- **Prompt logprobs.** New `update-prompt-logprobs`. It starts with None, and DELTA pops the list once (logprobs.py:124-208).
+- **Prompt parsing (oracle4).** An `encoder_prompt` raises TypeError (preprocess.py:129-142), which generate wraps as EngineGenerateError.
+- **Text bad words.** process-inputs calls serving-api's `sampling-params.update-from-tokenizer` (input_processor.py:493-494).
+
+**Coverage_gaps added (1):** InprocClient (`VLLM_ENABLE_V1_MULTIPROCESSING=0`): `inproc-client.init/add-request/get-output/abort-requests`, and LLMEngine picks it (core_client.py:94-133, 353-399).
+
+**Unwritten fields:** 0 findings in engine-core (the merged lint's 2 are config-platform's and worker-runner's).
+
+**Measures.** Run with only engine-core swapped: 9 newly pass, 0 regress: L4-1 phase-timing, L4-2ab, L4-2c, L4-3ab, L4-7bc, Q4-8ab, S9 and both oracle4 rows. Still failing: L4-1d, L4-3d-external and L4-7d (measure-notes), L4-7a (serving-api), and L4-8 (models-layers/config-platform).
+
+**Simulator/world gaps.** No world declares DP instances, so DP ranks share one engine-core-proc and the GPU workers. launch starts them one after another (`rank_instances: true` addresses dp<i>). The MoE world's DP 2 profile run aborts in models-layers' MoE forward (`forward-context.get-forward-context`). The parallel-config hash is a stand-in digest of DP/TP/PP. Scheduler-kv sends no `prefill_stats`, so the computed prompt tokens fall back to the whole prompt.
+
+**Breaking changes (callers).**
+- `EngineCoreClientRequest`: `prompt_token_ids` is no longer required; `arrival_time` is nullable (default null).
+- `core-engine-proc-manager.launch` returns `{num_gpu_blocks, ready_responses}` (serving-api's run-multi-api-server calls it).
+- `async-llm.init`/`async-mp-client.init` take `client_addresses`.
+- `run-engine-core` needs a handshake peer (a world with no launch accepts any local rank).
+- Finished-request stats use the external id.
+- Histogram rows gain `le=` keys.
+- `prometheus-registry.observe-many` replaces the per-sample incr for histograms.
+
+**Cross-area requests.**
+- serving-api: `run-multi-api-server` should call `core-engine-proc-manager.launch-core-engines {api_server_count}` and `prometheus-registry.setup-multiprocess-prometheus` (L4-7a). `update-from-tokenizer` reads `input.max_token_id` without has(), so I pass 128255.
+- scheduler-kv: send `prefill_stats`, `new_logprobs` and `new_prompt_logprobs_tensors` (my EngineCoreOutput schema).
+- worker-runner: return logprobs in the ModelRunnerOutput. Offline LLM.generate logprobs work end to end on my side once both land.
+- models-layers: `processor-cache-from-config` handles shm; the DP 2 MoE forward context.

@@ -312,10 +312,19 @@
         else:
           - if: "vars.name in ['xxhash', 'xxhash_cbor']"
             then:
-              - title: Non-cryptographic hash - a random per-process seed (logged as a warning)
+              - title: Non-cryptographic hash - a random per-process seed
                 detail: "A predictable seed would let an attacker precompute colliding blocks; hashes are then not reproducible across processes."
                 source: "vllm/v1/core/kv_cache_utils.py:141-142"
                 set: {vars.seed: "= id('none-hash-seed', vars.name)", vars.random: true}
+              - if: "vars.name == 'xxhash'"
+                then:
+                  - title: "Using a random per-process NONE_HASH seed because xxhash is not collision resistant. Block hashes are therefore not reproducible across processes; set PYTHONHASHSEED to a shared value to reuse the prefix cache across instances, or use sha256."
+                    detail: "logger.warning, formatted with hash_fn.__name__."
+                    source: "vllm/v1/core/kv_cache_utils.py:164-171"
+                else:
+                  - title: "Using a random per-process NONE_HASH seed because xxhash_cbor is not collision resistant. Block hashes are therefore not reproducible across processes; set PYTHONHASHSEED to a shared value to reuse the prefix cache across instances, or use sha256."
+                    detail: "logger.warning, formatted with hash_fn.__name__."
+                    source: "vllm/v1/core/kv_cache_utils.py:164-171"
             else:
               - title: SHA-256 - the fixed default seed, identical in every process
                 source: "vllm/v1/core/kv_cache_utils.py:143"
@@ -347,8 +356,18 @@
     name: get-kv-cache-config-from-groups
     kind: function
     latency_ms: 0
-    summary: "Build the KVCacheConfig: num_blocks = available memory // the largest group's bytes per block (or the override); one KVCacheTensor per distinct layer spec, laid out layer-outermost or block-outermost."
-    sources: ["vllm/v1/core/kv_cache_utils.py:1588-1687", "vllm/v1/core/kv_cache_utils.py:1520-1545", "vllm/v1/kv_cache_interface.py:1438-1494", "vllm/v1/kv_cache_interface.py:1408-1430"]
+    summary: "Build the KVCacheConfig: validate the layout against mixed page sizes; num_blocks = available memory // the largest group's bytes per block (or the override), where a block-outermost layout rounds the packed page sum up to lcm(HiSparse hot page sizes, every layer's block_stride_alignment) and a layer-outermost one pads each page to its alignment; one KVCacheTensor per distinct layer spec."
+    description: >-
+      KVCacheLayout has six members (stride permutations of [L, B, H, N, C]): LBHNC, LBNHC and
+      LHBNC put L outermost (layer-outer); BLHNC, BLNHC and BHLNC put B outermost (block-outer).
+      Block-compact layouts (L and B the two outer dims) are LBHNC, LBNHC, BLHNC and BLNHC. Mixed
+      page sizes need a block-compact layout, and with several groups not a layer-compact one.
+      A layer's alignment is its spec's block_stride_alignment (1 when unset); the model takes it
+      per group (block_stride_alignment) or per layer (layer_alignments). A hisparse_hot group is a
+      HiSparseHotSpec: its page size joins the alignments. Byte offsets inside a block are not
+      modeled.
+    sources: ["vllm/v1/core/kv_cache_utils.py:1588-1687", "vllm/v1/core/kv_cache_utils.py:1515-1551", "vllm/v1/core/kv_cache_utils.py:1554-1586", "vllm/v1/kv_cache_layout.py:15-57", "vllm/v1/kv_cache_interface.py:183-195", "vllm/v1/kv_cache_interface.py:1438-1494", "vllm/v1/kv_cache_interface.py:1408-1430"]
+    errors: [{code: value-error, status: 0, retryable: false}]
     request:
       type: object
       required: [kv_cache_groups, available_memory]
@@ -356,9 +375,16 @@
         kv_cache_groups:
           type: array
           description: "KVCacheGroupSpec: layer names and each layer's page size (a UniformTypeKVCacheSpecs group may mix page sizes)."
-          items: {type: object, properties: {layer_names: {type: array, items: {type: string}}, layer_pages: {type: object}}}
+          items:
+            type: object
+            properties:
+              layer_names: {type: array, items: {type: string}}
+              layer_pages: {type: object}
+              block_stride_alignment: {type: integer, default: 1, description: "get_block_stride_alignment() of every layer spec in the group (MultipleOf already resolved)."}
+              layer_alignments: {type: object, default: {}, description: "Per-layer block_stride_alignment, overriding the group's."}
+              hisparse_hot: {type: boolean, default: false, description: "The group's spec is a HiSparseHotSpec."}
         available_memory: {type: integer, examples: [724992]}
-        layout: {type: string, default: LBNHC, enum: [LBNHC, BLNHC], description: "LBNHC is layer-outermost; BLNHC block-outermost."}
+        layout: {type: string, default: LBNHC, enum: [LBHNC, LBNHC, LHBNC, BLHNC, BLNHC, BHLNC], description: "CacheConfig.get_resolved_kv_cache_layout(); L-first members are layer-outermost, B-first block-outermost."}
     response: {type: object, properties: {num_blocks: {type: integer}, kv_cache_tensors: {type: array}, bytes_per_block: {type: integer}}}
     behavior:
       - if: "size(input.kv_cache_groups) == 0"
@@ -367,11 +393,61 @@
             source: "vllm/v1/core/kv_cache_utils.py:1604-1614"
             return: {num_blocks: 1, kv_cache_tensors: [], bytes_per_block: 0}
       - set:
-          vars.layer_outer: "= !has(input.layout) || input.layout == 'LBNHC'"
-      - title: Bytes per block - the largest group's sum of per-layer pages
-        source: "vllm/v1/core/kv_cache_utils.py:1524-1539"
-        set:
-          vars.bpb: "= math.greatest(input.kv_cache_groups.map(g, sum(g.layer_names.map(l, g.layer_pages[l]))))"
+          vars.layout: "= has(input.layout) ? input.layout : 'LBNHC'"
+          vars.al: "= input.kv_cache_groups.map(g, g.layer_names.transformMapEntry(i, l, {l: has(g.layer_alignments) && l in g.layer_alignments ? int(g.layer_alignments[l]) : (has(g.block_stride_alignment) && g.block_stride_alignment != null && g.block_stride_alignment > 0 ? int(g.block_stride_alignment) : 1)}))"
+      - set:
+          vars.block_outer: "= vars.layout.startsWith('B')"
+          vars.layer_compact: "= vars.layout.startsWith('L')"
+          vars.block_compact: "= vars.layout in ['LBHNC', 'LBNHC', 'BLHNC', 'BLNHC']"
+          vars.pages: "= input.kv_cache_groups.map(g, g.layer_names.map(l, int(g.layer_pages[l]))).flatten()"
+      - set:
+          vars.distinct: "= lists.range(size(vars.pages)).filter(i, !lists.range(i).exists(j, vars.pages[j] == vars.pages[i])).map(i, vars.pages[i]).sort()"
+      - if: "size(vars.distinct) > 1 && (!vars.block_compact || (size(input.kv_cache_groups) > 1 && vars.layer_compact))"
+        then:
+          - title: validate_kv_cache_layout - the layout can't express mixed page sizes
+            source: "vllm/v1/core/kv_cache_utils.py:1567-1586"
+            fail: {code: value-error, status: 0, message: "= 'KV cache layout ' + vars.layout + ' cannot express this model\\'s mixed page sizes ([' + vars.distinct.map(p, string(p)).join(', ') + ']); a backend should declare block-outermost supported layouts (e.g. BLHNC), or set VLLM_KV_CACHE_LAYOUT=BLHNC.'"}
+      - if: "!vars.block_outer"
+        then:
+          - title: Layer-outer bytes per block - the largest group's sum of pages, each padded to its alignment
+            source: "vllm/v1/core/kv_cache_utils.py:1520-1533"
+            set:
+              vars.bpb: "= math.greatest(lists.range(size(input.kv_cache_groups)).map(gi, sum(input.kv_cache_groups[gi].layer_names.map(l, ((int(input.kv_cache_groups[gi].layer_pages[l]) + vars.al[gi][l] - 1) / vars.al[gi][l]) * vars.al[gi][l]))))"
+        else:
+          - title: Block-outer bytes per block - the largest group's page sum
+            source: "vllm/v1/core/kv_cache_utils.py:1534-1540"
+            set:
+              vars.raw: "= math.greatest(input.kv_cache_groups.map(g, sum(g.layer_names.map(l, int(g.layer_pages[l])))))"
+              vars.aligns: "= input.kv_cache_groups.filter(g, has(g.hisparse_hot) && g.hisparse_hot).map(g, int(g.layer_pages[g.layer_names[0]])) + lists.range(size(input.kv_cache_groups)).map(gi, input.kv_cache_groups[gi].layer_names.map(l, vars.al[gi][l])).flatten()"
+          - title: Rounded up to the lcm of the hot page sizes and every layer's stride alignment
+            source: "vllm/v1/core/kv_cache_utils.py:1541-1551"
+            foreach: "= vars.aligns"
+            as: a
+            steps:
+              - set:
+                  vars.x: "= has(vars.lcm) ? vars.lcm : 1"
+                  vars.y: "= vars.a"
+              - set:
+                  vars.g1: "= vars.x"
+                  vars.g2: "= vars.y"
+              - title: gcd by Euclid
+                source: "vllm/v1/core/kv_cache_utils.py:1551"
+                foreach: "= lists.range(64)"
+                as: it
+                steps:
+                  - if: "vars.g2 == 0"
+                    then: [{break: true}]
+                  - set:
+                      vars.t: "= vars.g1 % vars.g2"
+                  - set:
+                      vars.g1: "= vars.g2"
+                      vars.g2: "= vars.t"
+              - set:
+                  vars.lcm: "= vars.x / vars.g1 * vars.y"
+          - set:
+              vars.m: "= has(vars.lcm) ? vars.lcm : 1"
+          - set:
+              vars.bpb: "= ((vars.raw + vars.m - 1) / vars.m) * vars.m"
       - set:
           vars.n: "= input.available_memory / vars.bpb"
       - if: "'num-gpu-blocks-override' in config && config['num-gpu-blocks-override'] != null"
@@ -380,11 +456,13 @@
             source: "vllm/v1/core/kv_cache_utils.py:1230-1236"
             set: {vars.n: "= int(config['num-gpu-blocks-override'])"}
       - title: One KVCacheTensor per distinct spec (page size) of each group
-        detail: "Layer-outermost: each layer owns num_blocks x page bytes (block stride = its page). Block-outermost: every layer shares each block (block stride = bytes per block)."
+        detail: "Block-outermost: every layer shares each block (block stride = bytes per block). Layer-outermost: each layer owns num_blocks x its block stride, which is its page padded to its alignment (a padded page needs a block-compact layout)."
         source: "vllm/v1/core/kv_cache_utils.py:1642-1678"
         set:
-          vars.tensors: "= input.kv_cache_groups.map(g, lists.range(size(g.layer_names)).filter(i, !lists.range(i).exists(j, g.layer_pages[g.layer_names[j]] == g.layer_pages[g.layer_names[i]])).map(i, g.layer_pages[g.layer_names[i]]).map(p, {'layers': g.layer_names.filter(l, g.layer_pages[l] == p), 'block_stride': vars.layer_outer ? p : vars.bpb, 'layer_stride': vars.layer_outer ? vars.n * p : p, 'page_size_bytes': p}))"
-      - return: {num_blocks: "= vars.n", kv_cache_tensors: "= vars.tensors.flatten()", bytes_per_block: "= vars.bpb"}
+          vars.tensors: "= lists.range(size(input.kv_cache_groups)).map(gi, input.kv_cache_groups[gi]).map(g, lists.range(size(g.layer_names)).filter(i, !lists.range(i).exists(j, g.layer_pages[g.layer_names[j]] == g.layer_pages[g.layer_names[i]])).map(i, g.layer_names[i]).map(l0, {'layers': g.layer_names.filter(l, g.layer_pages[l] == g.layer_pages[l0]), 'page_size_bytes': int(g.layer_pages[l0]), 'padded': ((int(g.layer_pages[l0]) + (has(g.layer_alignments) && l0 in g.layer_alignments ? int(g.layer_alignments[l0]) : (has(g.block_stride_alignment) && g.block_stride_alignment != null && g.block_stride_alignment > 0 ? int(g.block_stride_alignment) : 1)) - 1) / (has(g.layer_alignments) && l0 in g.layer_alignments ? int(g.layer_alignments[l0]) : (has(g.block_stride_alignment) && g.block_stride_alignment != null && g.block_stride_alignment > 0 ? int(g.block_stride_alignment) : 1))) * (has(g.layer_alignments) && l0 in g.layer_alignments ? int(g.layer_alignments[l0]) : (has(g.block_stride_alignment) && g.block_stride_alignment != null && g.block_stride_alignment > 0 ? int(g.block_stride_alignment) : 1))})).flatten()"
+      - set:
+          vars.tensors: "= vars.tensors.map(t, {'layers': t.layers, 'page_size_bytes': t.page_size_bytes, 'block_stride': vars.block_outer ? vars.bpb : t.padded, 'layer_stride': vars.block_outer ? t.page_size_bytes : vars.n * t.padded, 'size': vars.bpb * vars.n})"
+      - return: {num_blocks: "= vars.n", kv_cache_tensors: "= vars.tensors", bytes_per_block: "= vars.bpb"}
 
   - component: simple-cpu-offload-worker
     name: register-kv-caches

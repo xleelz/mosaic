@@ -1,0 +1,461 @@
+configs:
+  - id: vllm-engine-ready-timeout-s
+    type: integer
+    value: 600
+    default: 600
+    summary: "VLLM_ENGINE_READY_TIMEOUT_S: how long an engine-core client polls its input socket for each engine's ready response. A client that launched its engines reaches the poll only after the untimed HELLO/READY handshake; a client given external engine addresses (the API server processes of run_multi_api_server) polls while the engines load, so a slow load times it out."
+    sources: ["vllm/envs.py:811-813", "vllm/v1/engine/core_client.py:735-749"]
+    attributes: {key: VLLM_ENGINE_READY_TIMEOUT_S, env: true}
+  - {id: vllm-enable-v1-multiprocessing, type: boolean, value: true, default: true, summary: "VLLM_ENABLE_V1_MULTIPROCESSING (boundary copy): LLMEngine runs EngineCore in a background process (SyncMPClient) unless it is 0 (InprocClient)", sources: ["vllm/envs.py:165", "vllm/v1/engine/llm_engine.py:174-197"], attributes: {boundary: true, owner: config-platform, key: VLLM_ENABLE_V1_MULTIPROCESSING, env: true}}
+  - {id: model-is-multimodal, type: boolean, value: false, default: false, summary: "ModelConfig.is_multimodal_model (boundary copy): with multimodal inputs supported the processor-cache factories pick a cache type; Llama-3.1 is text-only, the VL world's Qwen2-VL sets it", sources: ["vllm/config/model.py:1981-1982", "vllm/multimodal/cache/factories.py:23-28"], attributes: {boundary: true, owner: config-platform, key: is_multimodal_model}}
+
+components:
+  - id: inproc-client
+    name: InprocClient
+    kind: module
+    parent: engine-core
+    layer: api
+    summary: "The in-process engine client LLMEngine uses with VLLM_ENABLE_V1_MULTIPROCESSING=0: EngineCore is built in the caller's process (no busy loop, no ZMQ, no handshake); add_request preprocesses and adds directly, get_output steps the engine (step_fn, then post_step)."
+    sources: ["vllm/v1/engine/core_client.py:353-483"]
+  - id: api-server-process-manager
+    name: APIServerProcessManager
+    kind: service
+    parent: engine-core
+    layer: process
+    summary: "Starts the API server worker processes of run_multi_api_server (ApiServer_0..N-1, spawn context), each with its own engine-client input/output addresses, client_count N and client_index i, and watches them with the engine processes until one fails."
+    sources: ["vllm/v1/utils.py:167-260", "vllm/v1/utils.py:532-597"]
+    state:
+      schema: {type: object, properties: {processes: {type: array, items: {type: string}}, failed: {type: ["string", "null"]}}}
+      initial: {processes: [], failed: null}
+
+interfaces:
+  # ------------------------------------------------------------------ logprobs (round 6): accumulated sample and prompt logprobs
+  - component: logprobs-processor
+    name: from-new-request
+    kind: function
+    latency_ms: 0
+    summary: "LogprobsProcessor.from_new_request: cumulative_logprob 0.0 and an empty sample-logprobs list when the request asked for logprobs (None otherwise); a prompt-logprobs list that starts with None (the first prompt token has no logprob) when it asked for prompt_logprobs."
+    sources: ["vllm/v1/engine/logprobs.py:44-70", "vllm/logprobs.py:165-175"]
+    request:
+      type: object
+      required: [request_id]
+      properties:
+        request_id: {type: string}
+        num_logprobs: {type: ["integer", "null"], default: null}
+        num_prompt_logprobs: {type: ["integer", "null"], default: null}
+    response: {type: object, properties: {logprobs: {type: ["array", "null"]}, prompt_logprobs: {type: ["array", "null"]}, cumulative_logprob: {type: ["number", "null"]}}}
+    behavior:
+      - set:
+          vars.cur:
+            logprobs: "= has(input.num_logprobs) && input.num_logprobs != null ? dyn([]) : dyn(null)"
+            cumulative_logprob: "= has(input.num_logprobs) && input.num_logprobs != null ? dyn(0.0) : dyn(null)"
+            prompt_logprobs: "= has(input.num_prompt_logprobs) && input.num_prompt_logprobs != null ? dyn([null]) : dyn(null)"
+            num_prompt_logprobs: "= has(input.num_prompt_logprobs) ? input.num_prompt_logprobs : null"
+      - set: {state.requests: "= merge(state.requests, {input.request_id: vars.cur})"}
+      - return: "= vars.cur"
+
+  - component: logprobs-processor
+    name: update-from-output
+    kind: function
+    latency_ms: 0
+    summary: "LogprobsProcessor.update_from_output: new sample logprobs extend the list and the cumulative logprob, new prompt-logprobs tensors extend the prompt logprobs; then the state RequestState reads: DELTA pops the prompt logprobs (all of them at once, then an empty list), other kinds read them in place."
+    sources: ["vllm/v1/engine/logprobs.py:360-366", "vllm/v1/engine/logprobs.py:191-208", "vllm/v1/engine/output_processor.py:402-410"]
+    request:
+      type: object
+      required: [request_id]
+      properties:
+        request_id: {type: string}
+        num_logprobs: {type: ["integer", "null"], default: null}
+        new_logprobs: {type: ["object", "null"], default: null}
+        new_prompt_logprobs_tensors: {type: ["object", "null"], default: null}
+        pop_prompt_logprobs: {type: boolean, default: false}
+    response: {type: object, properties: {logprobs: {type: ["array", "null"]}, prompt_logprobs: {type: ["array", "null"]}, cumulative_logprob: {type: ["number", "null"]}}}
+    behavior:
+      - if: "has(input.new_logprobs) && input.new_logprobs != null && has(input.num_logprobs) && input.num_logprobs != null"
+        then:
+          - title: "if output.new_logprobs is not None: self._update_sample_logprobs(output.new_logprobs)"
+            source: "vllm/v1/engine/logprobs.py:361-362"
+            call: logprobs-processor.update-sample-logprobs
+            input: {request_id: "= input.request_id", num_logprobs: "= input.num_logprobs", logprobs_lists: "= input.new_logprobs"}
+      - if: "has(input.new_prompt_logprobs_tensors) && input.new_prompt_logprobs_tensors != null"
+        then:
+          - title: "if output.new_prompt_logprobs_tensors is not None: self._update_prompt_logprobs(...)"
+            source: "vllm/v1/engine/logprobs.py:363-364"
+            call: logprobs-processor.update-prompt-logprobs
+            input: {request_id: "= input.request_id", prompt_logprobs_tensors: "= input.new_prompt_logprobs_tensors"}
+      - set:
+          vars.cur: "= input.request_id in state.requests ? state.requests[input.request_id] : {'logprobs': has(input.num_logprobs) && input.num_logprobs != null ? dyn([]) : dyn(null), 'cumulative_logprob': has(input.num_logprobs) && input.num_logprobs != null ? dyn(0.0) : dyn(null), 'prompt_logprobs': null}"
+      - set:
+          vars.plp: "= has(vars.cur.prompt_logprobs) ? vars.cur.prompt_logprobs : null"
+      - if: "has(input.pop_prompt_logprobs) && input.pop_prompt_logprobs && vars.plp != null && size(vars.plp) > 0"
+        then:
+          - title: "pop_prompt_logprobs: return every prompt logprob at once and forget them (later DELTA outputs carry an empty list)"
+            source: "vllm/v1/engine/logprobs.py:191-208"
+            set: {state.requests: "= merge(state.requests, {input.request_id: merge(vars.cur, {'prompt_logprobs': []})})"}
+      - return: {logprobs: "= has(vars.cur.logprobs) ? vars.cur.logprobs : null", cumulative_logprob: "= has(vars.cur.cumulative_logprob) ? vars.cur.cumulative_logprob : null", prompt_logprobs: "= vars.plp"}
+
+  - component: logprobs-processor
+    name: update-prompt-logprobs
+    kind: function
+    latency_ms: 0
+    summary: "LogprobsProcessor._update_prompt_logprobs: per scored prompt position append one entry whose first item is the prompt token (with its rank) followed by the top num_prompt_logprobs tokens with ranks 1..k (append_logprobs_for_next_position)."
+    sources: ["vllm/v1/engine/logprobs.py:124-189", "vllm/logprobs.py:178-209"]
+    errors: [{code: assertion-error, status: 0, retryable: false}]
+    request:
+      type: object
+      required: [request_id, prompt_logprobs_tensors]
+      properties:
+        request_id: {type: string}
+        prompt_logprobs_tensors:
+          type: object
+          properties:
+            token_ids: {type: array, items: {type: array, items: {type: integer}}}
+            logprobs: {type: array, items: {type: array, items: {type: number}}}
+            ranks: {type: array, items: {type: integer}}
+    response: {type: object, properties: {prompt_logprobs: {type: array}}}
+    behavior:
+      - if: "!(input.request_id in state.requests) || !has(state.requests[input.request_id].prompt_logprobs) || state.requests[input.request_id].prompt_logprobs == null"
+        then:
+          - title: "assert self.num_prompt_logprobs is not None: prompt logprobs arrived for a request that didn't ask for them"
+            source: "vllm/v1/engine/logprobs.py:135-137"
+            fail: {code: assertion-error, message: ""}
+      - set:
+          vars.cur: "= state.requests[input.request_id]"
+          vars.t: "= input.prompt_logprobs_tensors"
+      - set:
+          vars.k: "= has(vars.cur.num_prompt_logprobs) && vars.cur.num_prompt_logprobs != null && vars.cur.num_prompt_logprobs != -1 ? vars.cur.num_prompt_logprobs + 1 : 1000000"
+      - title: "for pos in range(num_prompt_tokens): append_logprobs_for_next_position(prompt_logprobs, token_ids[pos], logprobs[pos], ..., ranks[pos], num_prompt_logprobs): ranks are (the prompt token's rank, 1..k), and zip stops at the shortest"
+        source: "vllm/v1/engine/logprobs.py:146-189"
+        set:
+          vars.added: "= lists.range(size(vars.t.token_ids)).map(p, lists.range(int(math.least(vars.k, size(vars.t.token_ids[p])))).map(j, {'token_id': vars.t.token_ids[p][j], 'logprob': double(vars.t.logprobs[p][j]), 'rank': j == 0 ? vars.t.ranks[p] : j}))"
+      - set: {state.requests: "= merge(state.requests, {input.request_id: merge(vars.cur, {'prompt_logprobs': vars.cur.prompt_logprobs + vars.added})})"}
+      - return: {prompt_logprobs: "= vars.cur.prompt_logprobs + vars.added"}
+
+  # ------------------------------------------------------------------ InprocClient (round 6, coverage_gaps)
+  - component: inproc-client
+    name: init
+    kind: function
+    summary: "InprocClient.__init__: EngineCore(vllm_config, executor_class, log_stats) in this process -- executor, model load, KV sizing, scheduler -- with no handshake; the engine is shut down when the client is collected."
+    sources: ["vllm/v1/engine/core_client.py:365-382"]
+    response: {type: object, properties: {num_gpu_blocks: {type: integer}}}
+    behavior:
+      - title: "self.engine_core = EngineCore(...)"
+        source: "vllm/v1/engine/core_client.py:372-377"
+        call: engine-core.init
+        as: eng
+      - return: {num_gpu_blocks: "= vars.eng.value.num_gpu_blocks"}
+
+  - component: inproc-client
+    name: add-request
+    kind: function
+    summary: "InprocClient.add_request: preprocess_add_request (receiver cache, Request, grammar), then EngineCore.add_request, in the caller's thread."
+    sources: ["vllm/v1/engine/core_client.py:393-395"]
+    request: EngineCoreClientRequest
+    behavior:
+      - call: engine-core.preprocess-add-request
+        input: "= input"
+        as: req
+      - call: engine-core.add-request
+        input: "= vars.req.value"
+      - return: {added: "= input.request_id"}
+
+  - component: inproc-client
+    name: get-output
+    kind: function
+    summary: "InprocClient.get_output: run one engine step in this thread (step_fn, then post_step) and return client 0's EngineCoreOutputs, or an empty EngineCoreOutputs when the step produced none."
+    sources: ["vllm/v1/engine/core_client.py:385-388"]
+    response: EngineCoreOutputs
+    behavior:
+      - call: engine-core.step-fn
+        as: st
+      - call: engine-core.post-step
+        input: {model_executed: "= vars.st.value.model_executed"}
+      - if: "vars.st.value.outputs == null"
+        then:
+          - title: "outputs and outputs.get(0) or EngineCoreOutputs(): an empty batch stamped now"
+            source: "vllm/v1/engine/core_client.py:388"
+            return: {engine_index: 0, outputs: [], timestamp: "= double(now_us) / 1000000.0"}
+      - return: "= vars.st.value.outputs"
+
+  - component: inproc-client
+    name: abort-requests
+    kind: function
+    summary: "InprocClient.abort_requests: abort in the engine core directly, only when there is something to abort."
+    sources: ["vllm/v1/engine/core_client.py:397-399"]
+    request: {type: object, properties: {request_ids: {type: array, items: {type: string}}}}
+    behavior:
+      - if: "size(input.request_ids) > 0"
+        then:
+          - call: engine-core.abort-requests
+            input: {request_ids: "= input.request_ids"}
+      - return: {aborted: "= input.request_ids"}
+
+  # ------------------------------------------------------------------ startup handshake (round 6): HELLO, init message, READY, ready response
+  - component: engine-core-proc
+    name: startup-handshake
+    kind: function
+    latency_ms: 0
+    summary: "EngineCoreProc._perform_handshake -> startup_handshake: on a DEALER socket to the front-end's handshake address, send HELLO {status, local, headless}, wait (up to 5 minutes) for the EngineHandshakeMetadata init message, and apply its DP parallel-config fields."
+    sources: ["vllm/v1/engine/core.py:1313-1335", "vllm/v1/engine/core.py:1351-1389", "vllm/v1/engine/core.py:110"]
+    errors: [{code: runtime-error, status: 0, retryable: false}]
+    request: {type: object, properties: {engine_index: {type: integer, default: 0}, local: {type: boolean, default: true}, headless: {type: boolean, default: false}}}
+    response: {type: object, properties: {addresses: {type: object}, parallel_config: {type: object}}}
+    behavior:
+      - title: "handshake_socket.send(msgpack({'status': 'HELLO', 'local': local_client, 'headless': headless})); the front-end answers with the init message"
+        source: "vllm/v1/engine/core.py:1358-1381"
+        call: core-engine-proc-manager.handle-handshake-message
+        input: {status: HELLO, local: "= has(input.local) ? input.local : true", headless: "= has(input.headless) ? input.headless : false", engine_index: "= has(input.engine_index) ? input.engine_index : 0"}
+        as: init
+        on_error:
+          - title: "The front-end rejected the message (wait_for_engine_startup raised): it never answers, so the engine's 5-minute poll gives up"
+            source: "vllm/v1/engine/core.py:1368-1373"
+            fail: {code: runtime-error, message: "Did not receive response from front-end process within 5 minutes", data: {cause: "= error.message"}}
+      - title: "for key, value in init_message.parallel_config.items(): setattr(parallel_config, key, value)"
+        source: "vllm/v1/engine/core.py:1383-1389"
+        set: {state.handshake_parallel_config: "= vars.init.value.parallel_config", state.addresses: "= vars.init.value.addresses"}
+      - return: "= vars.init.value"
+
+  - component: engine-core-proc
+    name: make-ready-response
+    kind: function
+    latency_ms: 0
+    summary: "EngineCoreProc._make_ready_response: the EngineCoreReadyResponse the input thread sends on every client input socket before the READY handshake: max_model_len, num_gpu_blocks, block sizes, dtype, parallel sizes, the batching limits and this engine's DP rank."
+    sources: ["vllm/v1/engine/core.py:1784-1815", "vllm/v1/engine/core.py:1867-1875"]
+    request: {type: object, properties: {engine_index: {type: integer, default: 0}, num_gpu_blocks: {type: integer, default: 0}}}
+    response: {type: object, properties: {max_model_len: {type: integer}, num_gpu_blocks: {type: integer}, block_size: {type: integer}, data_parallel_rank: {type: integer}}}
+    behavior:
+      - return:
+          max_model_len: "= int(config['max-model-len'])"
+          num_gpu_blocks: "= has(input.num_gpu_blocks) ? input.num_gpu_blocks : 0"
+          block_size: "= int(config['block-size'])"
+          data_parallel_size: "= int(config['data-parallel-size'])"
+          tensor_parallel_size: "= int(config['tensor-parallel-size'])"
+          pipeline_parallel_size: "= int(config['pipeline-parallel-size'])"
+          data_parallel_rank: "= has(input.engine_index) ? input.engine_index : 0"
+          max_num_seqs: "= int(config['max-num-seqs'])"
+          max_num_batched_tokens: "= int(config['max-num-batched-tokens'])"
+
+  - component: core-engine-proc-manager
+    name: handle-handshake-message
+    kind: function
+    latency_ms: 0
+    summary: "One message of wait_for_engine_startup on the front-end's ROUTER handshake socket: check the engine's rank and locality, answer HELLO from a NEW engine with the init message (the ZMQ addresses, plus the DP master fields only for coordinated DP, i.e. DP > 1 with an MoE model) and mark it CONNECTED; accept READY from a CONNECTED engine (checking the parallel-config hash under coordinated DP) and mark it READY; anything else is an error."
+    sources: ["vllm/v1/engine/utils.py:1445-1530", "vllm/v1/engine/utils.py:1409-1413"]
+    errors: [{code: runtime-error, status: 0, retryable: false}]
+    request:
+      type: object
+      required: [status, engine_index]
+      properties:
+        status: {type: string, enum: [HELLO, READY], examples: [HELLO]}
+        local: {type: boolean, default: true}
+        headless: {type: boolean, default: false}
+        engine_index: {type: integer, examples: [0]}
+        parallel_config_hash: {type: ["string", "null"], default: null}
+    response: {type: object, properties: {addresses: {type: object}, parallel_config: {type: object}, state: {type: string}}}
+    behavior:
+      - set:
+          vars.key: "= string(input.engine_index)"
+      - title: "A world that starts after the front-end bound its handshake socket and expects this engine (no launch in the run): the engine is the front-end's local rank, NEW before HELLO"
+        source: "vllm/v1/engine/utils.py:1280-1290"
+        set:
+          vars.engines: "= has(state.handshake) && size(state.handshake) > 0 ? state.handshake : {vars.key: {'local': true, 'state': input.status == 'HELLO' ? 'NEW' : 'CONNECTED'}}"
+      - if: "!(vars.key in vars.engines)"
+        then:
+          - title: "engine = next(e for e in core_engines if e.identity == eng_identity), else: unexpected rank"
+            source: "vllm/v1/engine/utils.py:1445-1451"
+            fail: {code: runtime-error, message: "= 'Message from engine with unexpected data parallel rank: ' + string(input.engine_index)"}
+      - set: {vars.eng: "= vars.engines[vars.key]"}
+      - if: "input.local != vars.eng.local"
+        then:
+          - title: "The engine's locality must match the one the front-end expects"
+            source: "vllm/v1/engine/utils.py:1452-1460"
+            fail: {code: runtime-error, message: "= input.status + ' message from ' + (input.local ? 'local' : 'remote') + ' engine ' + string(input.engine_index) + ', expected it to be ' + (vars.eng.local ? 'local' : 'remote')"}
+      - if: "input.status == 'HELLO' && vars.eng.state == 'NEW'"
+        then:
+          - title: "HELLO from a NEW engine: send EngineHandshakeMetadata(addresses, parallel_config) -- the DP master ip/port, port list, coord store port and DP size only for coordinated DP, else {}"
+            source: "vllm/v1/engine/utils.py:1478-1501"
+            set:
+              state.handshake: "= merge(vars.engines, {vars.key: merge(vars.eng, {'state': 'CONNECTED'})})"
+              vars.pc: "= has(state.coordinated_dp) && state.coordinated_dp ? {'data_parallel_size': int(config['data-parallel-size']), 'data_parallel_master_ip': '127.0.0.1'} : {}"
+          - return: {addresses: {inputs: "= has(state.client_inputs) ? state.client_inputs : ['input-0']", outputs: "= has(state.client_outputs) ? state.client_outputs : ['output-0']"}, parallel_config: "= vars.pc", state: CONNECTED}
+      - if: "input.status == 'READY' && vars.eng.state == 'CONNECTED'"
+        then:
+          - if: "has(state.coordinated_dp) && state.coordinated_dp && (!has(input.parallel_config_hash) || input.parallel_config_hash != state.expected_parallel_config_hash)"
+            then:
+              - title: "Coordinated DP (MoE): every engine's parallel_config_hash must equal the front-end's"
+                source: "vllm/v1/engine/utils.py:1503-1518"
+                fail: {code: runtime-error, message: "= 'Configuration mismatch detected for engine ' + string(input.engine_index) + '. All DP workers must have identical configurations for parameters that affect collective communication (e.g., enable_eplb, eplb_config.log_balancedness). Worker hash: ' + (has(input.parallel_config_hash) && input.parallel_config_hash != null ? input.parallel_config_hash : 'None') + ', Expected hash: ' + state.expected_parallel_config_hash + '. Please ensure all workers are started with the same command-line arguments.'"}
+          - title: "READY from a CONNECTED engine: start_pending -= 1, engine.state = READY"
+            source: "vllm/v1/engine/utils.py:1520-1521"
+            set: {state.handshake: "= merge(vars.engines, {vars.key: merge(vars.eng, {'state': 'READY'})})"}
+          - return: {addresses: {}, parallel_config: {}, state: READY}
+      - title: "Any other status/state pair (the state prints as the enum member, CoreEngineState.<NAME>)"
+        source: "vllm/v1/engine/utils.py:1518-1523"
+        fail: {code: runtime-error, message: "= 'Unexpected ' + input.status + ' message for ' + (input.local ? 'local' : 'remote') + ' engine ' + string(input.engine_index) + ' in CoreEngineState.' + vars.eng.state + ' state.'"}
+
+  - component: async-mp-client
+    name: apply-ready-response
+    kind: function
+    latency_ms: 0
+    summary: "MPClient._apply_ready_response: sync the engine's post-initialization config back to the front-end: max_model_len becomes the minimum over the engines (an auto-fitted length shrinks it), and num_gpu_blocks is summed over the DP engines."
+    sources: ["vllm/v1/engine/core_client.py:829-890"]
+    request: {type: object, properties: {response: {type: ["object", "null"], default: null}}}
+    response: {type: object, properties: {max_model_len: {type: integer}, num_gpu_blocks: {type: integer}, num_ready: {type: integer}}}
+    behavior:
+      - if: "!has(input.response) || input.response == null"
+        then:
+          - title: "An empty payload: nothing to sync"
+            source: "vllm/v1/engine/core_client.py:845-846"
+            return: {max_model_len: "= has(state.max_model_len) ? state.max_model_len : int(config['max-model-len'])", num_gpu_blocks: "= has(state.num_gpu_blocks) ? state.num_gpu_blocks : 0", num_ready: "= has(state.num_ready) ? state.num_ready : 0"}
+      - title: "max_model_len = min(frontend, engine); num_gpu_blocks += response.num_gpu_blocks"
+        source: "vllm/v1/engine/core_client.py:847-857"
+        set:
+          state.max_model_len: "= int(math.least(has(state.max_model_len) ? state.max_model_len : int(config['max-model-len']), input.response.max_model_len))"
+          state.num_gpu_blocks: "= (has(state.num_gpu_blocks) ? state.num_gpu_blocks : 0) + input.response.num_gpu_blocks"
+          state.num_ready: "= (has(state.num_ready) ? state.num_ready : 0) + 1"
+      - return: {max_model_len: "= state.max_model_len", num_gpu_blocks: "= state.num_gpu_blocks", num_ready: "= state.num_ready"}
+
+  - component: async-mp-client
+    name: wait-for-ready-responses
+    kind: function
+    summary: "MPClient.__init__'s ready wait: poll the input socket for every managed engine's ready response, each poll bounded by VLLM_ENGINE_READY_TIMEOUT_S; a silent poll raises TimeoutError. Clients given external engine addresses reach this poll while the engines are still loading."
+    sources: ["vllm/v1/engine/core_client.py:733-753"]
+    errors: [{code: timeout-error, status: 0, retryable: false}]
+    request: {type: object, properties: {client_index: {type: integer, default: 0}, num_engines: {type: integer, default: 1}}}
+    response: {type: object, properties: {num_gpu_blocks: {type: integer}, max_model_len: {type: integer}}}
+    behavior:
+      - set: {state.num_gpu_blocks: 0, state.num_ready: 0}
+      - foreach: "= lists.range(has(input.num_engines) ? input.num_engines : 1)"
+        as: e
+        steps:
+          - title: "sync_input_socket.poll(timeout=VLLM_ENGINE_READY_TIMEOUT_S * 1000)"
+            source: "vllm/v1/engine/core_client.py:738-749"
+            receive: "= 'engine-ready:' + string(has(input.client_index) ? input.client_index : 0)"
+            as: ready
+            timeout_ms: "= int(config['vllm-engine-ready-timeout-s']) * 1000"
+            on_error:
+              - title: "No ready message within the timeout"
+                source: "vllm/v1/engine/core_client.py:741-749"
+                fail: {code: timeout-error, message: "= 'Timed out waiting for engine core processes to start. This is often caused by slow weight loading for large models. Waited ' + string(config['vllm-engine-ready-timeout-s']) + 's (configured by VLLM_ENGINE_READY_TIMEOUT_S). To increase the timeout, set the environment variable: VLLM_ENGINE_READY_TIMEOUT_S=<seconds>'"}
+          - title: "identities.remove(identity); self._apply_ready_response(payload)"
+            source: "vllm/v1/engine/core_client.py:750-752"
+            call: async-mp-client.apply-ready-response
+            input: {response: "= vars.ready"}
+      - return: {num_gpu_blocks: "= state.num_gpu_blocks", max_model_len: "= has(state.max_model_len) ? state.max_model_len : int(config['max-model-len'])"}
+
+  # ------------------------------------------------------------------ run_multi_api_server's engine side (round 6)
+  - component: core-engine-proc-manager
+    name: launch-core-engines
+    kind: function
+    summary: "launch_core_engines for run_multi_api_server: bind the handshake socket, start the engine-core processes (EngineCore_DP<i> under DP), then, inside the context, the caller's APIServerProcessManager starts the API server processes; on exit wait_for_engine_startup runs the handshakes while the API servers already wait for the engines' ready responses."
+    description: "The engines and the API servers start concurrently (two parallel branches); the ready responses travel on run-wide channels engine-ready:<client_index>. An API server whose ready poll times out exits, and wait_for_engine_startup, which watches the frontend processes, fails with 'Frontend process failed during engine core initialization'."
+    sources: ["vllm/v1/engine/utils.py:1180-1359", "vllm/v1/engine/utils.py:1362-1444"]
+    errors: [{code: runtime-error, status: 0, retryable: false}]
+    request: {type: object, properties: {api_server_count: {type: integer, default: 2, examples: [4]}, iterations: {type: integer, default: 2}}}
+    response: {type: object, properties: {engines: {type: integer}, api_servers: {type: array}}}
+    behavior:
+      - set:
+          vars.n: "= has(input.api_server_count) ? input.api_server_count : 2"
+          vars.dp: "= int(config['data-parallel-size'])"
+      - set:
+          state.client_inputs: "= lists.range(vars.n).map(i, 'input-' + string(i))"
+          state.client_outputs: "= lists.range(vars.n).map(i, 'output-' + string(i))"
+      - title: "Leaving the context: wait_for_engine_startup polls the handshake socket and the watched frontend processes' sentinels"
+        source: "vllm/v1/engine/utils.py:1351-1359"
+        call: core-engine-proc-manager.wait-for-engine-startup
+        input: {api_server_count: "= vars.n", iterations: "= has(input.iterations) ? input.iterations : 2"}
+        as: started
+        on_error:
+          - title: "A frontend process exited first: 'Frontend process failed during engine core initialization'"
+            source: "vllm/v1/engine/utils.py:1409-1430"
+            fail: {code: runtime-error, message: "= has(state.frontend_failure) && state.frontend_failure != null ? state.frontend_failure : error.message"}
+      - return: {engines: "= vars.dp", api_servers: "= vars.started.value.api_servers"}
+
+  - component: core-engine-proc-manager
+    name: wait-for-engine-startup
+    kind: function
+    summary: "wait_for_engine_startup with watched frontend processes (run_multi_api_server): the engine processes load and handshake while the API server processes construct their clients; it returns when every engine is READY and fails as soon as a watched frontend process exits."
+    sources: ["vllm/v1/engine/utils.py:1362-1444"]
+    errors: [{code: runtime-error, status: 0, retryable: false}]
+    request: {type: object, properties: {api_server_count: {type: integer, default: 2}, iterations: {type: integer, default: 2}}}
+    response: {type: object, properties: {api_servers: {type: array}}}
+    behavior:
+      - set:
+          vars.n: "= has(input.api_server_count) ? input.api_server_count : 2"
+          state.frontend_failure: null
+      - title: "Engines and frontend processes start together: the engine processes load while the API server processes construct AsyncLLM"
+        source: "vllm/v1/engine/utils.py:1326-1359"
+        branches:
+            - - title: "CoreEngineProcManager (EngineCore_DP<i>) and, on leaving the context, wait_for_engine_startup"
+                source: "vllm/v1/engine/utils.py:1328-1359"
+                call: core-engine-proc-manager.launch
+                input: {num_clients: "= vars.n", iterations: "= has(input.iterations) ? input.iterations : 2"}
+                as: eng
+              - return: "= vars.eng.value"
+            - - title: "APIServerProcessManager(num_servers=api_server_count, ...) inside the launch_core_engines context"
+                source: "vllm/entrypoints/cli/serve.py:366-382"
+                call: api-server-process-manager.init
+                input: {num_servers: "= vars.n"}
+                as: api
+                on_error:
+                  - set: {state.frontend_failure: "= error.message"}
+                  - fail: "= error"
+              - return: "= vars.api.value"
+        join: {need: all}
+        as_result: started
+        on_insufficient: {code: runtime-error}
+      - return: {api_servers: "= vars.started.results[1].value.processes"}
+
+  - component: api-server-process-manager
+    name: init
+    kind: function
+    summary: "APIServerProcessManager.__init__: per server i start ApiServer_<i> (spawn) with client_config {input/output address, client_count = num_servers, client_index = i}; each builds AsyncLLM with the external engine addresses. A server that fails to start exits, which the launcher sees as a failed frontend process."
+    sources: ["vllm/v1/utils.py:174-258"]
+    errors: [{code: runtime-error, status: 0, retryable: false}]
+    request: {type: object, properties: {num_servers: {type: integer, default: 2, examples: [4]}}}
+    response: {type: object, properties: {processes: {type: array, items: {type: string}}}}
+    behavior:
+      - set: {state.processes: "= lists.range(input.num_servers).map(i, 'ApiServer_' + string(i))", state.failed: null}
+      - title: "Each process runs run_api_server_worker_proc(listen_address, sock, args, client_config), which builds the AsyncLLM client from client_config"
+        source: "vllm/v1/utils.py:226-252"
+        parallel: "= lists.range(input.num_servers)"
+        as: i
+        steps:
+          - call: async-llm.init
+            input: {executor_class: MultiprocExecutor, client_addresses: {client_index: "= vars.i", client_count: "= input.num_servers"}}
+            as: srv
+            on_error:
+              - title: "The server process raised during startup and exited with code 1"
+                source: "vllm/v1/utils.py:244-252"
+                return: {failed: true, index: "= vars.i", message: "= error.message"}
+          - return: {failed: false, index: "= vars.i", value: "= vars.srv.value"}
+        join: {need: all}
+        as_result: servers
+      - set: {vars.bad: "= vars.servers.results.map(r, r.value).filter(v, v.failed)"}
+      - if: "size(vars.bad) > 0"
+        then:
+          - set: {state.failed: "= 'ApiServer_' + string(vars.bad[0].index)"}
+          - title: "A frontend process exited while the engines were starting: wait_for_engine_startup (it watches frontend processes) raises"
+            source: "vllm/v1/engine/utils.py:1409-1430"
+            fail: {code: runtime-error, message: "= 'Frontend process failed during engine core initialization. See root cause above. Failed frontend proc(s): {' + vars.bad.map(v, \"'ApiServer_\" + string(v.index) + \"': 1\").join(', ') + '}'", data: {cause: "= vars.bad[0].message"}}
+      - return: {processes: "= state.processes"}
+
+  - component: prometheus-registry
+    name: setup-multiprocess-prometheus
+    kind: function
+    latency_ms: 0
+    summary: "setup_multiprocess_prometheus (run_multi_api_server with more than one API server): create a temporary PROMETHEUS_MULTIPROC_DIR unless the user set one (then warn that it must be wiped between runs); every process's metrics are then collected through it."
+    sources: ["vllm/v1/metrics/prometheus.py:17-38", "vllm/v1/metrics/prometheus.py:41-55"]
+    request: {type: object, properties: {user_dir: {type: ["string", "null"], default: null}}}
+    response: {type: object, properties: {multiproc_dir: {type: string}, user_set: {type: boolean}}}
+    behavior:
+      - if: "has(input.user_dir) && input.user_dir != null"
+        then:
+          - title: "PROMETHEUS_MULTIPROC_DIR was set by the user: keep it, warn"
+            source: "vllm/v1/metrics/prometheus.py:30-38"
+            set: {state.multiproc_dir: "= input.user_dir"}
+          - return: {multiproc_dir: "= input.user_dir", user_set: true}
+      - title: "A TemporaryDirectory becomes PROMETHEUS_MULTIPROC_DIR"
+        source: "vllm/v1/metrics/prometheus.py:21-29"
+        set: {state.multiproc_dir: "= 'prometheus-multiproc-' + string(seq('prometheus-multiproc'))"}
+      - return: {multiproc_dir: "= state.multiproc_dir", user_set: false}

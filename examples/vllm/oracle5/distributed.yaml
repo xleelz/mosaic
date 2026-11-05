@@ -1,0 +1,93 @@
+schema_version: 1
+id: vllm
+scenarios:
+- id: oracle-distributed-moriio-request-finished-prefill-rank
+  description: tests/v1/kv_connector/unit/test_moriio_routing.py test_request_finished_returns_prefill_rank_for_propagation. A MoRIIO prefill-side scheduler finishing a length-capped request returns its own global DP rank (11 of 16, local size 8) marked authoritative, keeps transfer_id, and frees at once when block_ids is empty (moriio_connector.py:1474-1526). Producer rank seeded on the real scheduler's state.
+  flow: distributed-kv-finished
+  fixtures: [full-tp1-llama-8b]
+  config: {kv-connector: MoRIIOConnector, kv-role: kv_producer}
+  state:
+    moriio-connector-scheduler: {is_producer: true, _global_dp_rank: 11, global_dp_rank: 11}
+  input:
+    request_id: r1
+    status: FINISHED_LENGTH_CAPPED
+    block_ids: []
+    kv_transfer_params: {do_remote_decode: true, transfer_id: t1}
+  expect:
+    - "result.ok"
+    - "result.value.kv_transfer_params != null"
+    - "result.value.kv_transfer_params.remote_dp_rank == 11"
+    - "result.value.kv_transfer_params.remote_dp_rank_override == true"
+    - "result.value.kv_transfer_params.transfer_id == 't1'"
+    - "result.value.delay_free_blocks == false"
+- id: oracle-distributed-nixl-edge-short-prompt
+  description: tests/v1/kv_connector/nixl_integration/test_edge_cases.py test_edge_cases part (1). A prompt shorter than one block goes through prefill then decode. The decode node waits for the pull, then recomputes only the last token. The text equality between routes is below the model.
+  fixtures: [full-tp1-llama-8b]
+  config: {kv-connector: NixlConnector, kv-role: kv_both}
+  steps:
+  - {flow: scheduler-add-request, as: padd, input: {request_id: short-p, prompt_segments: [{key: short, num_tokens: 4}], sampling_params: {max_tokens: 1, temperature: 0}, kv_transfer_params: {do_remote_decode: true, do_remote_prefill: false}}}
+  - {flow: scheduler-schedule, as: ps, input: {}}
+  - {flow: scheduler-update-from-output, as: pu, input: {scheduler_output: "= steps.ps.result.value", model_runner_output: {req_ids: [short-p], sampled_token_ids: [[791]]}}}
+  - {flow: scheduler-add-request, as: dadd, input: {request_id: short-d, prompt_segments: [{key: short, num_tokens: 4}], sampling_params: {max_tokens: 16, temperature: 0}, kv_transfer_params: "= steps.pu.result.value.outputs[0].kv_transfer_params"}}
+  - {flow: scheduler-schedule, as: d1, input: {}}
+  - {flow: scheduler-update-from-output, as: du, input: {scheduler_output: "= steps.d1.result.value", model_runner_output: {req_ids: [], sampled_token_ids: [], kv_connector_output: {finished_recving: [short-d], finished_sending: []}}}}
+  - {flow: scheduler-schedule, as: d2, input: {}}
+  expect:
+    - "steps.pu.result.value.outputs[0].kv_transfer_params.do_remote_prefill"
+    - "steps.d1.result.value.total_num_scheduled_tokens == 0"
+    - "trace.exists(e, e.type == 'call.start' && e.interface == 'kv-connector-base-v1.get-num-new-matched-tokens' && e.input.request_id == 'short-d')"
+    - "trace.exists(e, e.type == 'call.end' && e.interface == 'kv-connector-base-v1.get-num-new-matched-tokens' && e.output.num_external_tokens == 4 && e.output.load_async)"
+    - "steps.d2.result.value.num_scheduled_tokens == {'short-d': 1}"
+    - "steps.d2.result.value.scheduled_new_reqs[0].num_computed_tokens == 3"
+- id: oracle-distributed-nixl-edge-full-decode-hit
+  description: tests/v1/kv_connector/nixl_integration/test_edge_cases.py test_edge_cases part (2). The decode node is primed with the prompt, so the P/D request hits its local prefix cache and pulls only what the cache lacks, then recomputes the last token.
+  fixtures: [full-tp1-llama-8b]
+  config: {kv-connector: NixlConnector, kv-role: kv_both}
+  steps:
+  - {flow: scheduler-add-request, as: padd, input: {request_id: prime, prompt_segments: [{key: edge-doc, num_tokens: 40}], sampling_params: {max_tokens: 1, temperature: 0}}}
+  - {flow: scheduler-schedule, as: ps, input: {}}
+  - {flow: scheduler-update-from-output, as: pu, input: {scheduler_output: "= steps.ps.result.value", model_runner_output: {req_ids: [prime], sampled_token_ids: [[791]]}}}
+  - {flow: scheduler-add-request, as: dadd, input: {request_id: hit-d, prompt_segments: [{key: edge-doc, num_tokens: 40}], sampling_params: {max_tokens: 16, temperature: 0}, kv_transfer_params: {do_remote_decode: false, do_remote_prefill: true, remote_block_ids: [11, 12, 13], remote_engine_id: prefill-0, remote_host: 10.0.0.2, remote_port: 5600, remote_request_id: hit-p}}}
+  - {flow: scheduler-schedule, as: d1, input: {}}
+  - {flow: scheduler-update-from-output, as: du, input: {scheduler_output: "= steps.d1.result.value", model_runner_output: {req_ids: [], sampled_token_ids: [], kv_connector_output: {finished_recving: [hit-d], finished_sending: []}}}}
+  - {flow: scheduler-schedule, as: d2, input: {}}
+  expect:
+    - "steps.d1.result.value.total_num_scheduled_tokens == 0"
+    - "trace.exists(e, e.type == 'call.start' && e.interface == 'kv-connector-base-v1.get-num-new-matched-tokens' && e.input.request_id == 'hit-d' && e.input.num_computed_tokens == 32)"
+    - "trace.exists(e, e.type == 'call.end' && e.interface == 'kv-connector-base-v1.get-num-new-matched-tokens' && e.output.num_external_tokens == 8 && e.output.load_async)"
+    - "steps.d2.result.value.num_scheduled_tokens == {'hit-d': 1}"
+    - "steps.d2.result.value.scheduled_new_reqs[0].num_computed_tokens == 39"
+- id: oracle-distributed-nixl-edge-partial-decode-hit
+  description: tests/v1/kv_connector/nixl_integration/test_edge_cases.py test_edge_cases part (3). LONG_PROMPT shares a primed prefix with the decode node's cache, so the decode node pulls the rest and recomputes the last token.
+  fixtures: [full-tp1-llama-8b]
+  config: {kv-connector: NixlConnector, kv-role: kv_both}
+  steps:
+  - {flow: scheduler-add-request, as: padd, input: {request_id: prime, prompt_segments: [{key: edge-doc, num_tokens: 33}], sampling_params: {max_tokens: 1, temperature: 0}}}
+  - {flow: scheduler-schedule, as: ps, input: {}}
+  - {flow: scheduler-update-from-output, as: pu, input: {scheduler_output: "= steps.ps.result.value", model_runner_output: {req_ids: [prime], sampled_token_ids: [[791]]}}}
+  - {flow: scheduler-add-request, as: dadd, input: {request_id: long-d, prompt_segments: [{key: edge-doc, num_tokens: 32}, {key: edge-rest, num_tokens: 100}], sampling_params: {max_tokens: 16, temperature: 0}, kv_transfer_params: {do_remote_decode: false, do_remote_prefill: true, remote_block_ids: [11, 12, 13, 14, 15, 16, 17, 18, 19], remote_engine_id: prefill-0, remote_host: 10.0.0.2, remote_port: 5600, remote_request_id: long-p}}}
+  - {flow: scheduler-schedule, as: d1, input: {}}
+  - {flow: scheduler-update-from-output, as: du, input: {scheduler_output: "= steps.d1.result.value", model_runner_output: {req_ids: [], sampled_token_ids: [], kv_connector_output: {finished_recving: [long-d], finished_sending: []}}}}
+  - {flow: scheduler-schedule, as: d2, input: {}}
+  expect:
+    - "steps.d1.result.value.total_num_scheduled_tokens == 0"
+    - "trace.exists(e, e.type == 'call.start' && e.interface == 'kv-connector-base-v1.get-num-new-matched-tokens' && e.input.request_id == 'long-d' && e.input.num_computed_tokens == 32)"
+    - "trace.exists(e, e.type == 'call.end' && e.interface == 'kv-connector-base-v1.get-num-new-matched-tokens' && e.output.num_external_tokens == 100 && e.output.load_async)"
+    - "steps.d2.result.value.num_scheduled_tokens == {'long-d': 1}"
+    - "steps.d2.result.value.scheduled_new_reqs[0].num_computed_tokens == 131"
+- id: oracle-distributed-cpu-offloading-store-reset-reload
+  description: tests/v1/kv_connector/unit/test_offloading_connector.py test_cpu_offloading. With OffloadingConnector, a cold request offloads to CPU and publishes BlockStored medium CPU; after reset_prefix_cache, the same prompt loads from the CPU tier asynchronously. Latency ratios and generated text are below the model.
+  fixtures: [full-tp1-llama-8b]
+  config: {kv-connector: OffloadingConnector, kv-role: kv_both, enable-kv-cache-events: true, kv-events-publisher: zmq}
+  steps:
+  - {flow: scheduler-add-request, as: a1, input: {request_id: cold, prompt_segments: [{key: offload-doc, num_tokens: 100}], sampling_params: {max_tokens: 1}}}
+  - {flow: scheduler-schedule, as: s1, input: {}}
+  - {flow: scheduler-update-from-output, as: u1, input: {scheduler_output: "= steps.s1.result.value", model_runner_output: {req_ids: [cold], sampled_token_ids: [[791]]}}}
+  - {flow: scheduler-schedule, as: s2, input: {}}
+  - {flow: scheduler-reset-prefix-cache, as: rst, input: {}}
+  - {flow: scheduler-add-request, as: a2, input: {request_id: cpu-hit, prompt_segments: [{key: offload-doc, num_tokens: 100}], sampling_params: {max_tokens: 1}}}
+  - {flow: scheduler-schedule, as: s3, input: {}}
+  expect:
+    - "trace.exists(e, e.type == 'call.start' && e.interface == 'cpu-offloading-manager.prepare-store')"
+    - "trace.exists(e, e.type == 'call.end' && e.interface == 'kv-connector-base-v1.get-num-new-matched-tokens' && e.output.num_external_tokens > 0)"
+    - "trace.exists(e, e.type == 'call.start' && e.interface == 'cpu-offloading-manager.lookup')"

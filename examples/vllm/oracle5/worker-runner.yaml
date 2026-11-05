@@ -1,0 +1,81 @@
+schema_version: 1
+id: vllm
+scenarios:
+- id: oracle-worker-runner-cumem-default-backend
+  description: tests/v1/worker/test_sleep_mode_backend.py test_cumem_is_the_default_registered_backend. The sleep-mode backend registry resolves "cumem" to CuMemBackend, and a worker's sleep resolves its backend through that registry (gpu_worker.py:246-255, sleep_mode_backend.py:182-214).
+  flow: wr-sleep
+  fixtures: [full-tp1-llama-8b]
+  config: {enable-sleep-mode: true}
+  input: {level: 1}
+  expect:
+    - "'sleep-mode-backend' in config && config['sleep-mode-backend'] == 'cumem'"
+    - "trace.exists(e, e.type == 'call.start' && e.interface == 'cu-mem-allocator.sleep' && e.input.level == 1)"
+- id: oracle-worker-runner-ignore-eos
+  description: tests/samplers/test_ignore_eos.py test_ignore_eos. LLM.generate with ignore_eos and max_tokens=512 yields exactly 512 output tokens even though the model would sample EOS at its natural length (seeded to 3 tokens).
+  flow: serving-api-offline-generate
+  fixtures: [full-tp1-llama-8b]
+  config: {worker-runner-natural-output-tokens-base: 3, worker-runner-natural-output-tokens-spread: 1}
+  state: {engine-core-proc: {client_kind: sync}}
+  max_events: 1000000
+  max_iterations: 1000000
+  input:
+    prompts: ["Hello, my name is"]
+    sampling_params: {max_tokens: 512, ignore_eos: true}
+  expect:
+    - "result.ok && size(result.value) == 1 && result.value[0].finished"
+    - "size(result.value[0].completions[0].token_ids) == 512"
+    - "trace.filter(e, e.type == 'call.start' && e.interface == 'llm-engine.step').size() >= 512"
+- id: oracle-worker-runner-ignore-eos-control-200
+  description: Control for tests/samplers/test_ignore_eos.py test_ignore_eos. The same request at max_tokens 200, below the model's llm.run-engine loop bound of 256 steps, to separate the ignore_eos logic from that bound. Not itself a sample entry.
+  flow: serving-api-offline-generate
+  fixtures: [full-tp1-llama-8b]
+  config: {worker-runner-natural-output-tokens-base: 3, worker-runner-natural-output-tokens-spread: 1}
+  state: {engine-core-proc: {client_kind: sync}}
+  max_events: 1000000
+  max_iterations: 1000000
+  input:
+    prompts: ["Hello, my name is"]
+    sampling_params: {max_tokens: 200, ignore_eos: true}
+  expect:
+    - "result.ok && size(result.value) == 1 && result.value[0].finished"
+    - "size(result.value[0].completions[0].token_ids) == 200"
+    - "trace.filter(e, e.type == 'call.start' && e.interface == 'llm-engine.step').size() >= 200"
+- id: oracle-worker-runner-non-finite-temperature
+  description: tests/samplers/test_non_finite_params.py test_non_finite_temperature_rejected. SamplingParams(temperature=NaN, inf or -inf) raises VLLMValidationError naming temperature (sampling_params.py:653-658).
+  fixtures: [full-tp1-llama-8b]
+  steps:
+  - {interface: sampling-params.post-init, caller: api-server, as: nan, input: {params: {temperature: "= double('NaN')"}}}
+  - {interface: sampling-params.post-init, caller: api-server, as: inf, input: {params: {temperature: "= double('Infinity')"}}}
+  - {interface: sampling-params.post-init, caller: api-server, as: neg, input: {params: {temperature: "= double('-Infinity')"}}}
+  expect:
+    - "!steps.nan.result.ok && steps.nan.result.error.code == 'vllm-validation-error' && steps.nan.result.error.message.contains('temperature')"
+    - "!steps.inf.result.ok && steps.inf.result.error.code == 'vllm-validation-error' && steps.inf.result.error.message.contains('temperature')"
+    - "!steps.neg.result.ok && steps.neg.result.error.code == 'vllm-validation-error' && steps.neg.result.error.message.contains('temperature')"
+- id: oracle-worker-runner-dispatcher-keys
+  description: tests/v1/cudagraph/test_cudagraph_dispatch.py TestCudagraphDispatcher.test_dispatcher, key counts without LoRA for FULL, FULL_DECODE_ONLY and PIECEWISE with capture sizes [1, 8] and max_num_seqs 8.
+  fixtures: [full-tp1-llama-8b]
+  config: {max-num-seqs: 8}
+  steps:
+  - {interface: cudagraph-dispatcher-v1.initialize-cudagraph-keys, caller: gpu-model-runner-v1, as: full, input: {cudagraph_mode: FULL, capture_sizes: [1, 8], uniform_decode_query_len: 1}}
+  - {interface: cudagraph-dispatcher-v1.initialize-cudagraph-keys, caller: gpu-model-runner-v1, as: fdo, input: {cudagraph_mode: FULL_DECODE_ONLY, capture_sizes: [1, 8], uniform_decode_query_len: 1}}
+  - {interface: cudagraph-dispatcher-v1.initialize-cudagraph-keys, caller: gpu-model-runner-v1, as: pw, input: {cudagraph_mode: PIECEWISE, capture_sizes: [1, 8], uniform_decode_query_len: 1}}
+  expect:
+    - "size(steps.full.result.value.mixed_keys.filter(k, k.mode == 'FULL')) == 2 && size(steps.full.result.value.decode_keys) == 0"
+    - "size(steps.fdo.result.value.mixed_keys) == 0 && size(steps.fdo.result.value.decode_keys) == 2"
+    - "size(steps.pw.result.value.mixed_keys.filter(k, k.mode == 'PIECEWISE')) == 2 && size(steps.pw.result.value.decode_keys) == 0"
+- id: oracle-worker-runner-dispatcher-lora-keys
+  description: tests/v1/cudagraph/test_cudagraph_dispatch.py TestCudagraphDispatcher.test_dispatcher case 4. PIECEWISE with LoRA specialization (max_loras 4) has 2 sizes x 5 LoRA cases = 10 keys (cudagraph_dispatcher.py _get_lora_cases and initialize_cudagraph_keys).
+  fixtures: [full-tp1-llama-8b]
+  config: {max-num-seqs: 8, max-loras: 4, enable-lora: true}
+  steps:
+  - {interface: cudagraph-dispatcher-v1.initialize-cudagraph-keys, caller: gpu-model-runner-v1, as: pw, input: {cudagraph_mode: PIECEWISE, capture_sizes: [1, 8], uniform_decode_query_len: 1}}
+  expect:
+    - "size(steps.pw.result.value.mixed_keys) == 10"
+- id: oracle-worker-runner-dispatcher-piecewise-needs-compile
+  description: tests/v1/cudagraph/test_cudagraph_dispatch.py TestCudagraphDispatcher.test_dispatcher case 1. FULL_AND_PIECEWISE with compilation mode NONE trips the dispatcher's construction assertion (cudagraph_dispatcher.py __init__ assertion).
+  fixtures: [full-tp1-llama-8b]
+  config: {max-num-seqs: 8, cudagraph-mode: FULL_AND_PIECEWISE, compilation-mode: NONE}
+  steps:
+  - {interface: cudagraph-dispatcher-v1.initialize-cudagraph-keys, caller: gpu-model-runner-v1, as: fp, input: {cudagraph_mode: FULL_AND_PIECEWISE, capture_sizes: [1, 8], uniform_decode_query_len: 1}}
+  expect:
+    - "!steps.fp.result.ok && steps.fp.result.error.code == 'assertion-error'"

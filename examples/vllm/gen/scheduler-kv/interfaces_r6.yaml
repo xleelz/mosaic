@@ -1,0 +1,241 @@
+  # ===================================================== round 6: deferred block free, prefill stats
+  - component: scheduler
+    name: defer-block-free-enabled
+    kind: function
+    latency_ms: 0
+    summary: "Scheduler.defer_block_free: a KV-consumer connector (kv_role kv_consumer or kv_both) with more than one batch in flight (VllmConfig.max_concurrent_batches > 1) defers returning a freed request's blocks to the pool until the steps that may still write them have been processed."
+    description: >-
+      max_concurrent_batches is PP; with async scheduling it is PP + 1 on the V2 runner, and 2 on
+      the V1 runner without PP (the V1 runner doesn't overlap with PP, so PP stays). The flag is set
+      once in Scheduler.__init__; the model derives it from the configs on each read.
+    sources: ["vllm/v1/core/sched/scheduler.py:185-192", "vllm/config/vllm.py:577-587", "vllm/config/kv_transfer.py:12", "vllm/config/kv_transfer.py:134-136"]
+    request: {type: object}
+    response: {type: boolean, examples: [false]}
+    behavior:
+      - set:
+          vars.pp: "= 'pipeline-parallel-size' in config && config['pipeline-parallel-size'] != null ? int(config['pipeline-parallel-size']) : 1"
+      - title: max_concurrent_batches
+        source: "vllm/config/vllm.py:577-587"
+        set:
+          vars.mcb: "= config['async-scheduling'] == true ? (config['use-v2-model-runner'] ? vars.pp + 1 : (vars.pp <= 1 ? 2 : vars.pp)) : vars.pp"
+      - title: Multiple in-flight batches and a KV-consumer connector
+        source: "vllm/v1/core/sched/scheduler.py:186-192"
+        return: "= config['kv-connector'] != '' && 'kv-role' in config && config['kv-role'] in ['kv_consumer', 'kv_both'] && vars.mcb > 1"
+
+  - component: scheduler
+    name: free-request-blocks
+    kind: function
+    latency_ms: 0
+    summary: "_free_request_blocks: free a finished or preempted request's KV blocks now, or, while a step scheduled with them may still be writing them (deferred block free), pop them from the block table and park them behind the newest scheduled step's fence."
+    sources: ["vllm/v1/core/sched/scheduler.py:2759-2776", "vllm/v1/core/kv_cache_manager.py:651-663"]
+    request: {type: object, required: [request_id], properties: {request_id: {type: string}}}
+    response: {type: object, properties: {deferred: {type: boolean}, num_blocks: {type: integer}}}
+    behavior:
+      - call: scheduler.defer-block-free-enabled
+        as: dbf
+      - set:
+          vars.last: "= input.request_id in state.requests && has(state.requests[input.request_id].last_sched_seq) ? state.requests[input.request_id].last_sched_seq : 0"
+          vars.processed: "= has(state.processed_step_seq) ? state.processed_step_seq : 0"
+      - if: "!vars.dbf.value || vars.last <= vars.processed"
+        then:
+          - title: _request_blocks_can_be_freed - return the blocks to the pool now
+            source: "vllm/v1/core/sched/scheduler.py:2759-2771"
+            call: kv-cache-manager.free
+            input: {request_id: "= input.request_id"}
+            as: f
+          - return: {deferred: false, num_blocks: "= vars.f.value.freed"}
+      - title: An in-flight step may still write these blocks - pop them and defer the free to the newest scheduled step's fence
+        source: "vllm/v1/core/sched/scheduler.py:2772-2775"
+        call: kv-cache-manager.pop-blocks-for-free
+        input: {request_id: "= input.request_id"}
+        as: pop
+      - if: "size(vars.pop.value.block_ids) > 0"
+        then:
+          - set:
+              state.deferred_frees: "= (has(state.deferred_frees) ? state.deferred_frees : []) + [{'fence': has(state.sched_step_seq) ? state.sched_step_seq : 0, 'block_ids': vars.pop.value.block_ids}]"
+      - return: {deferred: true, num_blocks: "= size(vars.pop.value.block_ids)"}
+
+  - component: scheduler
+    name: drain-deferred-frees
+    kind: function
+    latency_ms: 0
+    summary: "_drain_deferred_frees: return the deferred blocks whose fence step has been processed, in fence order, stopping at the first pending fence; each entry is freed in reverse so tail blocks are evicted first."
+    sources: ["vllm/v1/core/sched/scheduler.py:2786-2801"]
+    request: {type: object}
+    response: {type: object, properties: {num_freed: {type: integer}}}
+    behavior:
+      - set:
+          vars.q: "= has(state.deferred_frees) ? state.deferred_frees : []"
+          vars.processed: "= has(state.processed_step_seq) ? state.processed_step_seq : 0"
+      - title: The leading entries whose fence passed (stop at the first pending one)
+        source: "vllm/v1/core/sched/scheduler.py:2793-2797"
+        set:
+          vars.n: "= lists.range(size(vars.q)).exists(i, vars.q[i].fence > vars.processed) ? lists.range(size(vars.q)).filter(i, vars.q[i].fence > vars.processed)[0] : size(vars.q)"
+      - foreach: "= vars.q.slice(0, vars.n)"
+        as: e
+        steps:
+          - title: Free in reverse order so that the tail blocks are evicted first
+            source: "vllm/v1/core/sched/scheduler.py:2798-2801"
+            call: block-pool.free-blocks
+            input: {block_ids: "= vars.e.block_ids.reverse()"}
+      - set:
+          state.deferred_frees: "= vars.q.slice(vars.n, size(vars.q))"
+      - return: {num_freed: "= sum(vars.q.slice(0, vars.n).map(e, size(e.block_ids)))"}
+
+  - component: full-attention-manager
+    name: pop-blocks-for-free
+    kind: function
+    latency_ms: 0
+    summary: "Pop a request's block table and cached-block count without returning the blocks to the pool; the caller frees them later, in reverse."
+    sources: ["vllm/v1/core/single_type_kv_cache_manager.py:562-580"]
+    request: {type: object, required: [request_id], properties: {request_id: {type: string}}}
+    response: {type: object, properties: {block_ids: {type: array, items: {type: integer}}}}
+    behavior:
+      - set:
+          vars.blocks: "= input.request_id in state.req_to_blocks ? state.req_to_blocks[input.request_id] : []"
+      - set:
+          state.req_to_blocks: "= omit(state.req_to_blocks, input.request_id)"
+          state.num_cached_block: "= omit(state.num_cached_block, input.request_id)"
+      - return: {block_ids: "= vars.blocks"}
+
+  - component: full-attention-manager
+    name: get-num-cached-blocks
+    kind: function
+    latency_ms: 0
+    summary: "How many of a request's blocks are cached (hashed) in the prefix cache: num_cached_block."
+    sources: ["vllm/v1/core/single_type_kv_cache_manager.py:476-534", "vllm/v1/core/kv_cache_utils.py:205-219"]
+    request: {type: object, required: [request_id], properties: {request_id: {type: string}}}
+    response: {type: object, properties: {num_cached_blocks: {type: integer}}}
+    behavior:
+      - return: {num_cached_blocks: "= input.request_id in state.num_cached_block ? state.num_cached_block[input.request_id] : 0"}
+
+  - component: kv-cache-manager
+    name: pop-blocks-for-free
+    kind: function
+    latency_ms: 0
+    summary: "KVCacheManager.pop_blocks_for_free: pop the request's bookkeeping and return its blocks (allocation order) without freeing them (coordinator -> each group's manager)."
+    sources: ["vllm/v1/core/kv_cache_manager.py:651-663", "vllm/v1/core/kv_cache_coordinator.py:410-427"]
+    request: {type: object, required: [request_id], properties: {request_id: {type: string}}}
+    response: {type: object, properties: {block_ids: {type: array, items: {type: integer}}}}
+    behavior:
+      - call: full-attention-manager.pop-blocks-for-free
+        input: {request_id: "= input.request_id"}
+        as: p
+      - set: {vars.hybrid_blocks: []}
+      - if: "size(state.kv_cache_groups) > 1"
+        then:
+          - title: "Hybrid: every single-type manager gives its blocks up too, in group order, so the Mamba state and checkpoint blocks wait behind the same fence"
+            source: "vllm/v1/core/kv_cache_coordinator.py:424-427"
+            call: mamba-manager.pop-blocks-for-free
+            input: {request_id: "= input.request_id"}
+            as: pm
+          - set: {vars.hybrid_blocks: "= vars.pm.value.block_ids"}
+      - return: {block_ids: "= vars.p.value.block_ids + vars.hybrid_blocks"}
+
+  - component: mamba-manager
+    name: pop-blocks-for-free
+    kind: function
+    latency_ms: 0
+    summary: "MambaManager.pop_blocks_for_free: in align mode drop the per-request state bookkeeping, then pop the state and checkpoint blocks without returning them to the pool (the same blocks free would return, newest first)."
+    sources: ["vllm/v1/core/single_type_kv_cache_manager.py:1935-1952"]
+    request: {type: object, required: [request_id], properties: {request_id: {type: string}}}
+    response: {type: object, properties: {block_ids: {type: array, items: {type: integer}}}}
+    behavior:
+      - set: {vars.blocks: "= input.request_id in state.req_to_blocks ? state.req_to_blocks[input.request_id] : []"}
+      - set:
+          state.req_to_blocks: "= omit(state.req_to_blocks, input.request_id)"
+          state.num_cached_block: "= omit(state.num_cached_block, input.request_id)"
+      - return: {block_ids: "= vars.blocks"}
+
+  - component: kv-cache-manager
+    name: estimate-cached-tokens
+    kind: function
+    latency_ms: 0
+    summary: "estimate_cached_tokens: the tokens the request's prefix-cacheable blocks hold in the prefix cache (the largest block_hash_num_tokens of its blocks; the minimum over groups)."
+    description: "A full-attention block's block_hash_num_tokens is the prefix length its hash covers, so the largest is num_cached_block * block_size. 0 with prefix caching off (nothing is hashed into the cache)."
+    sources: ["vllm/v1/core/kv_cache_manager.py:751-780"]
+    request: {type: object, required: [request_id], properties: {request_id: {type: string}}}
+    response: {type: object, properties: {num_cached_tokens: {type: integer}}}
+    behavior:
+      - call: full-attention-manager.get-num-cached-blocks
+        input: {request_id: "= input.request_id"}
+        as: n
+      - return: {num_cached_tokens: "= vars.n.value.num_cached_blocks * int(config['block-size'])"}
+
+  - component: block-pool
+    name: emit-cached-block-events
+    kind: function
+    latency_ms: 0
+    summary: "emit_cached_block_events: one BlockStored for blocks a request reused from the prefix cache (kv_cache_report_mode full), without touching block state; parent None (a hit is a prefix from block 0), token ids of the hit blocks."
+    sources: ["vllm/v1/core/block_pool.py:379-448", "vllm/v1/core/kv_cache_coordinator.py:379-392"]
+    request:
+      type: object
+      required: [block_hashes, num_cached_blocks]
+      properties:
+        block_hashes: {type: array, items: {type: string}, description: "request.block_hashes"}
+        num_cached_blocks: {type: integer}
+        token_ids: {type: [array, "null"], default: null}
+        lora_request: {type: [object, "null"], default: null}
+        group_idx: {type: integer, default: 0}
+    response: {type: object, properties: {emitted: {type: boolean}}}
+    behavior:
+      - if: "!config['enable-kv-cache-events'] || input.num_cached_blocks == 0"
+        then:
+          - title: Events off or no hit - nothing to announce
+            source: "vllm/v1/core/block_pool.py:399-400"
+            return: {emitted: false}
+      - set:
+          vars.n: "= math.least(input.num_cached_blocks, size(input.block_hashes))"
+      - title: Queue one BlockStored for the reused blocks
+        source: "vllm/v1/core/block_pool.py:420-448"
+        set:
+          state.kv_event_queue: "= state.kv_event_queue + [{'type': 'BlockStored', 'block_hashes': input.block_hashes.slice(0, vars.n), 'parent_block_hash': null, 'token_ids': has(input.token_ids) && input.token_ids != null ? input.token_ids.slice(0, math.least(vars.n * int(config['block-size']), size(input.token_ids))) : dyn(null), 'block_size': int(config['block-size']), 'lora_id': has(input.lora_request) && input.lora_request != null ? input.lora_request.lora_int_id : dyn(null), 'medium': 'GPU', 'lora_name': has(input.lora_request) && input.lora_request != null ? input.lora_request.lora_name : dyn(null), 'extra_keys': null, 'group_idx': has(input.group_idx) ? input.group_idx : 0, 'session_id': null}]"
+      - return: {emitted: true}
+
+  # ----------------------------------------------- round 6 (coverage_gaps): evicting blocks by id
+  - component: block-pool
+    name: evict-blocks
+    kind: function
+    latency_ms: 0
+    summary: "BlockPool.evict_blocks: drop the prefix-cache hash of each given block (a block still referenced stays allocated; a free one keeps its queue position), queueing one BlockRemoved per dropped hash; an id past the pool is a connector bug (assertion)."
+    sources: ["vllm/v1/core/block_pool.py:807-825", "vllm/v1/core/block_pool.py:729-750", "vllm/v1/core/block_pool.py:605-618"]
+    errors: [{code: assertion-error, status: 0, retryable: false}]
+    request: {type: object, required: [block_ids], properties: {block_ids: {type: array, items: {type: integer}, examples: [[3, 4]]}}}
+    response: {type: object, properties: {evicted_hashes: {type: array, items: {type: string}}}}
+    behavior:
+      - if: "input.block_ids.exists(b, b >= state.num_gpu_blocks)"
+        then:
+          - title: A block id the scheduler never allocated
+            source: "vllm/v1/core/block_pool.py:819-823"
+            fail: {code: assertion-error, status: 0, message: "= 'Invalid block_id ' + string(input.block_ids.filter(b, b >= state.num_gpu_blocks)[0]) + ' >= ' + string(state.num_gpu_blocks) + '. This indicates a bug in the KV connector - workers should only report block IDs that were allocated by the scheduler.'"}
+      - set:
+          vars.ids: "= lists.range(size(input.block_ids)).filter(i, !lists.range(i).exists(j, input.block_ids[j] == input.block_ids[i])).map(i, input.block_ids[i])"
+      - set:
+          vars.evicted: "= vars.ids.filter(b, string(b) in state.block_hash).map(b, state.block_hash[string(b)])"
+      - title: _maybe_evict_cached_block - reset each cached block's hash and drop it from the hash map
+        source: "vllm/v1/core/block_pool.py:729-750"
+        set:
+          state.cached: "= state.cached.transformMap(h, b, !(h in vars.evicted) || !(b in vars.ids), b)"
+          state.block_hash: "= state.block_hash.transformMap(k, h, !(int(k) in vars.ids), h)"
+          state.hash_tokens: "= state.hash_tokens.transformMap(k, n, !(int(k) in vars.ids), n)"
+      - if: "config['enable-kv-cache-events'] && size(vars.evicted) > 0"
+        then:
+          - title: One BlockRemoved per evicted hash
+            source: "vllm/v1/core/block_pool.py:605-618"
+            set: {state.kv_event_queue: "= state.kv_event_queue + vars.evicted.map(h, {'type': 'BlockRemoved', 'block_hashes': [h], 'medium': 'GPU', 'group_idx': 0})"}
+      - return: {evicted_hashes: "= vars.evicted"}
+
+  - component: kv-cache-manager
+    name: evict-blocks
+    kind: function
+    latency_ms: 0
+    summary: "KVCacheManager.evict_blocks: evict blocks from the prefix cache by id (the scheduler does it for blocks a KV load failed to fill, so no later request hits them)."
+    sources: ["vllm/v1/core/kv_cache_manager.py:665-672", "vllm/v1/core/sched/scheduler.py:3405-3414"]
+    errors: [{code: assertion-error, status: 0, retryable: false}]
+    request: {type: object, required: [block_ids], properties: {block_ids: {type: array, items: {type: integer}, examples: [[3, 4]]}}}
+    response: {type: object, properties: {evicted_hashes: {type: array, items: {type: string}}}}
+    behavior:
+      - call: block-pool.evict-blocks
+        input: {block_ids: "= input.block_ids"}
+        as: e
+      - return: {evicted_hashes: "= vars.e.value.evicted_hashes"}

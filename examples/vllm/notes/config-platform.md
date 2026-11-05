@@ -456,3 +456,42 @@ on the Python version (and the file is serving-api's).
 - Round-3 test 2 (`r3-config-platform-2-draft-model-engine-args-tp`): its seeded Qwen3-1.7B-FP8 quantization_config gained the
   checkpoint's real `activation_scheme: dynamic` (and fmt/weight_block_size), because Fp8Config.from_config requires the key
   (fp8.py:161, base_config.py:182-189). The scenario's steps and expectations are unchanged; it passes again.
+
+## Fix round 6 (mechanism coverage)
+
+I edited `fragments/config-platform.yaml` directly (no generator).
+
+**Mechanisms added**
+- Runner and convert resolution: `model-config.get-runner-type`, `get-convert-type` (model.py:1270-1367, 2322-2364) with the refusals at model.py:703-725. `--runner auto` goes pooling for a sentence-transformers checkpoint, a registered pooling architecture, or the suffix table.
+- Pooler config: `model-config.init-pooler-config` (user, sentence-transformers, registry default; sources recorded), `pooler-config.post-init` (removed parameters and tasks, logit_sigma, pooling_type), `model-config.get-pooling-config` with the new `hf-hub.download-pooling-config` (table `st_modules`).
+- `model-config.attn-type` (model.py:2155-2172) from the registry default; `is-prefix-caching-supported` now reads the pooling types, and both support checks receive them.
+- `model-config.get-head-size` (convertor:89-116) and `head_size` on ModelConfig; `model-config.get-and-verify-dtype` (model.py:2405-2500), so `--dtype` reaches ModelConfig.
+- Multimodal: `model-config.supports-multimodal-inputs` (model.py:912-957), and `mm_processor_cache_type`, `mm_shm_cache_max_object_size_mb`, `limit_mm_per_prompt`, `enable_mm_embeds` pass through.
+- Parallel: `eplb-config.init` (parallel.py:62-133), the EPLB communicator default (:1097-1115), `parallel-config.verify-args` with Ray (:1125-1146, ray_utils.py:272-278), `_api_process_count` checks (:519-531), `expert_placement_strategy`, `all2all_backend` forwarding, `use_batched_dp_moe` and its 256 default (arg_utils.py:3113-3117).
+- `engine-args.resolve-kv-cache-dtype-string` (torch_utils.py:457-529), online `quant_config` through `weight-utils.get-quant-config`, the backend logs and `AttentionBackendEnum.` prefix in `cuda-platform.get-attn-backend-cls`.
+- New configs: `seed`, `dtype`, `convert`, `pooler-config`, `eplb-config`, `expert-placement-strategy`, `api-server-count`, `ray-available`, `ray-import-error`, `nixl-available`, `vllm-mla-disable`, `mm-shm-cache-max-object-size-mb`, `data-parallel-external-lb`, `mm-encoder-attn-backend` (the last two read by models-layers, undefined before). `ray-available` and `nixl-available` are environment facts, not engine args.
+
+**Unwritten fields:** `has_index_topk` is now returned by `model-config.post-init` (vllm.py:1800-1835 reads `hf_text_config.index_topk`).
+
+**Approximations**
+- The generate-runner refusal (model.py:713-717) is left out: models-layers' rows give `is_text_generation: false` for multimodal generators, which would refuse Qwen2-VL.
+- ModelConfig reads the registry through `model-registry.resolve-model-cls` (same row, no subprocess): the code's `_ModelInfo` cache file is taken as warm, so the 1.5 s cold-cache subprocess and its cache write aren't charged to config resolution.
+- A registry miss continues on the suffix defaults; the code's `_normalize_arch` and Transformers lookups are models-layers'.
+- "registered" means the resolved architecture is in the list; its flags answer for every listed architecture (exact for single-architecture checkpoints).
+- A hf row's `attn_type` still stands in for the registry's `is_hybrid` / `is_attention_free`, which `ModelsModelInfo` lacks.
+- Note titles are static (simulator gap), so the backend success log is one `when`-gated note per CUDA backend; the auto-scan log with its list is in `ctx.attn_backend_log` and the note title has the placeholder.
+
+**Breaking changes** (callers)
+- `attn_type` and pooling types no longer read `seq_pooling_type` from the HF row (`build-oracle/round5` e5 passes through the registry).
+- `parallel-config.post-init` takes `eplb_config`, not `eplb_num_redundant_experts`; the ray backend now needs `ray-available: true`.
+- `config-create-engine-config` reads `runner`, `data-parallel-size` and `distributed-executor-backend` from config instead of literals.
+- `--quantization fp8` with no checkpoint config: `quant_config.quant_method` is `online`.
+
+**Coordinator: fixtures**
+- None.
+- `worlds.yaml` needs no new variant from me.
+
+**Cross-area**
+- serving-api: read `config['api-server-count']` in `serve-subcommand.cmd`.
+- models-layers: `_normalize_arch` for unregistered `*ForSequenceClassification` (oracle4 classification); `is_text_generation` for multimodal rows; read `config['expert-placement-strategy']`.
+- worker-runner: read `config['seed']`; `get-kv-cache-spec` should read the resolved `cache_config.cache_dtype` (Q4-6 d).

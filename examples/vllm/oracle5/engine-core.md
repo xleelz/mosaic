@@ -1,0 +1,25 @@
+# Oracle 5: engine-core
+
+Run: all sub-scenarios in `engine-core.yaml`, `check --no-mocks --lint hollow`: validation 0 errors, hollow lint 0 failing.
+
+| Test | Behavior | Scenario id | Verdict | Entity at fault or missing feature | Evidence |
+|---|---|---|---|---|---|
+| `tests/v1/engine/test_fast_incdec_prefix_err.py:11` | A fast tokenizer gets FastIncrementalDetokenizer, and it recovers from DecodeStream "Invalid prefix" errors with the exact expected text (`vllm/v1/engine/detokenizer.py:61`, `:235-258` `_protected_step`). | `oracle-engine-core-fast-inc-detok-invalid-utf8` | untranslatable | Below the model: the gemma vocabulary, the DecodeStream exception and the exact French output | The trigger exists only inside the tokenizers library with real gemma ids. `incremental-detokenizer.update` uses stand-in text (` t<id>`) and treats ids >= 128000 as Llama specials, so the test ids cannot be replayed; the scenario uses Llama-range ids. The translatable remainder passes: per-token updates accumulate text with no stop. Not modeled and not exercised: class selection (`uses_fast_detokenizer`, `:26`) and the stream reset. |
+| `tests/v1/shutdown/test_delete.py:76` | `del llm` (tp 1 and 2, with and without one request) leaves each device under 2 GiB (`core_client.py:617` weakref.finalize, `:509-516` BackgroundResources.__call__, `gpu_model_runner.py:6238-6253`). | `oracle-engine-core-llm-delete-{tp1,tp2}-send{0,1}; oracle-engine-core-llm-delete-driven-{tp1,tp2}-send{0,1}` | model-bug | Missing: MPClient finalizer on `sync-mp-client`. Wrong: `gpu-model-runner.shutdown` (weights), `engine-core-proc.drive-step` (stall) | All 8 fail. Plain: no finalizer entity exists, so the first real collaborator `core-engine-proc-manager.shutdown` (5 s) is driven; SIGTERM is never observed, it SIGKILLs at the grace, `engine-core.shutdown` never runs and memory stays. tp1-send1 also fails on generate (bug 2). Driven (loop_active cleared, busy loop running): clean exit and kv plus cudagraph freed on every rank, but `weights_bytes` stays, because `gpu-model-runner.shutdown` frees only kv_cache and cudagraph. |
+| `tests/v1/shutdown/test_forward_error.py:119` | A forward that raises on rank 0 after 10 good passes makes LLM.generate raise EngineDeadError and memory clear (`core.py:1508-1513` `_send_engine_dead` then shutdown; `multiproc_executor.py:459-496`). | `oracle-engine-core-llm-model-error-tp{1,2}; oracle-engine-core-llm-model-error-unstuck-tp{1,2}` | model-bug | `engine-core-proc.drive-step` / `run-busy-loop` (tp1 stall); `gpu-model-runner.shutdown` and `gpu-memory` (memory release) | All 4 fail. tp1 from LLM(): generate returns ok with no outputs after 256 empty `llm-engine.step` calls, the fault never fires. With loop_active cleared, and on tp2 unmodified: the code path is right (fault on `llama-for-causal-lm.forward@rank0`, `send-engine-dead`, `engine-core.shutdown`, `engine-dead-error`, `sync-mp-client.engine_dead`), and only memory fails: weights stay on all ranks, and on tp2 rank1 also keeps kv_cache after its worker is killed. |
+
+Count check: sample entries 3, rows 3.
+
+The test also uses the tiny-random model and the shutdown thresholds; the worlds use Llama-8B, so the 2 GiB threshold is applied to weights + kv_cache + cudagraph (non_torch_bytes excluded). `-driven` and `-unstuck` sub-scenarios use a `set` step on `engine-core-proc.loop_active` only to separate bug 1 from the memory bugs; the entry verdict counts every sub-scenario.
+
+## Fix requests
+
+### engine-core
+
+- **Sync pump stalls after LLM().** `llm.from-engine-args` then `llm.generate` on `full-tp1-llama-8b`: launch runs one emitted `engine-core-proc.run-busy-loop` with iterations 60, which leaves `state.loop_active` true; its next iteration is an emit that is not delivered while the blocking call runs, and `engine-core-proc.drive-step` returns at once while loop_active is true. Confirmed by trace: 256 `llm-engine.step`, `llm.generate` ok with `[]`, `loop_active == true`. Also, a SIGTERM after LLM() is not observed, so it is SIGKILLed at the grace. Code: `core.py:1547-1558` runs independently in its own process. `llm-engine-step` and `llm.run-engine` should also not return ok with no outputs on foreach exhaustion. Why tp2 does not stall in generate was not investigated.
+- **Missing MPClient finalizer.** Add `del llm` for the sync client: `core_client.py:617` `weakref.finalize(self, self.resources)`, `:509-516` sets engine_dead and calls `engine_manager.shutdown(VLLM_WORKER_SHUTDOWN_TIMEOUT_SECONDS)`. `sync-mp-client` has no shutdown or mark-dead interface.
+
+### worker-runner
+
+- **`gpu-model-runner.shutdown` keeps the weights.** Its summary says it releases weights, but it frees only kv_cache and cudagraph; `gpu_model_runner.py:6253` sets `self.model = None`. Add `gpu-memory.free` of kind weights.
+- **Killed workers keep their memory.** On tp2 after a rank 0 fault, rank1 is stuck in forward and killed (`multiproc_executor.py:459-496`), yet `gpu-memory@rank1` stays allocated. A process exit or kill should release that rank's `gpu-memory`.

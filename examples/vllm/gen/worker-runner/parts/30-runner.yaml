@@ -107,14 +107,24 @@ interfaces:
     latency_ms: 0
     response: {type: object, properties: {num_layers: {type: integer}, block_size: {type: integer}, page_size_bytes: {type: integer}, cache_dtype_str: {type: string}, kv_quant_mode: {type: string}}}
     behavior:
+      - set: {vars.kvd: "= config['kv-cache-dtype']"}
+      - if: "vars.kvd == 'auto'"
+        then:
+          - title: "cache_config.cache_dtype is the resolved one: create_engine_config turned 'auto' into a ModelOpt checkpoint's KV algorithm (a world that never built the config has only the flag)"
+            source: "vllm/engine/arg_utils.py:2256-2259"
+            call: vllm-config.set-current-vllm-config
+            input: {}
+            as: cur
+            on_error: continue
+          - set: {vars.kvd: "= vars.cur.ok && has(vars.cur.value.cache_config) && has(vars.cur.value.cache_config.cache_dtype) ? vars.cur.value.cache_config.cache_dtype : vars.kvd"}
       - call: attn-utils.get-kv-cache-spec
         input:
           num_hidden_layers: "= state.model.num_hidden_layers"
           num_kv_heads: "= state.model.num_kv_heads"
           head_size: "= state.model.head_size"
           dtype_bytes: "= state.model.dtype_bytes"
-          use_mla: "= has(state.model.use_mla) && state.model.use_mla"
-          kv_cache_dtype: "= config['kv-cache-dtype']"
+          use_mla: "= has(state.model.use_mla) ? state.model.use_mla : false"
+          kv_cache_dtype: "= vars.kvd"
         as: spec
       - return: "= vars.spec.value"
   - component: gpu-model-runner
@@ -135,6 +145,11 @@ interfaces:
     latency_ms: 0
     response: {type: object, properties: {peak_activation_bytes: {type: integer}, num_tokens: {type: integer}}}
     behavior:
+      - title: "A multimodal model's profile_run profiles the encoder first, unless --skip-mm-profiling: MultiModalBudget(enable_cache=False), then the maximum-feature dummy items"
+        source: "vllm/v1/worker/gpu/model_runner.py:993-1001"
+        if: "config['model-is-multimodal'] && !config['skip-mm-profiling']"
+        then:
+          - call: encoder-runner.profile-encoder-cache
       - call: gpu-model-runner.dummy-run
         input: {num_tokens: "= int(config['max-num-batched-tokens'])", is_profile: true, uniform_decode: false}
       - title: Measure the transient peak of the dummy forward and sampler run
@@ -206,9 +221,19 @@ interfaces:
     summary: "_dummy_run: a forward on padding tokens (profiling, warmup, capture, DP idle steps); dispatches like a real batch unless is_profile forces eager."
     sources: ["vllm/v1/worker/gpu/model_runner.py:818-970"]
     latency_ms: 0
-    request: {type: object, properties: {num_tokens: {type: integer, examples: [1]}, uniform_decode: {type: boolean}, is_profile: {type: boolean}}}
+    request: {type: object, properties: {num_tokens: {type: integer, examples: [1]}, uniform_decode: {type: boolean}, is_profile: {type: boolean}, skip_eplb: {type: boolean, default: false}}}
     response: {type: object, properties: {num_tokens: {type: integer}, cg_mode: {type: string}}}
     behavior:
+      - set: {vars.comp: "= has(state.model_component) && state.model_component != '' ? state.model_component : (!has(state.model.architecture) || state.model.architecture.startsWith('Llama') ? 'llama-for-causal-lm' : (state.model.architecture.startsWith('Mixtral') ? 'mixtral-for-causal-lm' : (state.model.architecture.startsWith('Qwen2VL') ? 'qwen2-vl-for-conditional-generation' : '')))"}
+      - if: "vars.comp == ''"
+        then:
+          - title: "A world that never ran load_model: the registry resolves the architecture to its class (an architecture it refuses keeps the Llama stand-in)"
+            source: "vllm/model_executor/models/registry.py:1376-1428"
+            call: model-registry.resolve-model-cls
+            input: {architectures: ["= state.model.architecture"]}
+            as: rc
+            on_error: continue
+          - set: {vars.comp: "= vars.rc.ok && has(vars.rc.value.component) && vars.rc.value.component in ['llama-for-causal-lm', 'mixtral-for-causal-lm', 'qwen2-vl-for-conditional-generation', 'qwen3-vl-for-conditional-generation', 'bert-embedding-model'] ? vars.rc.value.component : 'llama-for-causal-lm'"}
       - call: cuda-graph-manager.dispatch
         input:
           num_reqs: "= input.uniform_decode ? input.num_tokens : 1"
@@ -216,14 +241,30 @@ interfaces:
           uniform_token_count: "= input.uniform_decode ? 1 : 0"
           need_eager: "= has(input.is_profile) && input.is_profile"
         as: desc
+      - title: "execute_model(dummy_run=True): PIECEWISE and eager forwards run inside set_forward_context, with DPMetadata for a MoE model under data parallelism; a FULL replay needs none"
+        source: "vllm/v1/worker/gpu/model_runner.py:2008-2027"
+        when: "vars.desc.value.cg_mode != 'FULL'"
+        call: forward-context.set-forward-context
+        input:
+          num_tokens: "= vars.desc.value.num_tokens"
+          cudagraph_runtime_mode: "= vars.desc.value.cg_mode"
+          is_moe_model: "= vars.comp == 'mixtral-for-causal-lm'"
+          dp_rank: "= self.startsWith('rank') ? (int(self.substring(4)) / int(config['tensor-parallel-size'])) % int(config['data-parallel-size']) : 0"
       - title: "The loaded model's forward (the architecture load_model built: LlamaForCausalLM, MixtralForCausalLM)"
         source: "vllm/v1/worker/gpu/model_runner.py:899-901"
-        call: "= (has(state.model_component) && state.model_component != '' ? state.model_component : (has(state.model.architecture) && state.model.architecture.startsWith('Mixtral') ? 'mixtral-for-causal-lm' : (has(state.model.architecture) && state.model.architecture.startsWith('Qwen2VL') ? 'qwen2-vl-for-conditional-generation' : 'llama-for-causal-lm'))) + '.forward'"
-        targets: [llama-for-causal-lm.forward, mixtral-for-causal-lm.forward, qwen2-vl-for-conditional-generation.forward]
+        call: "= vars.comp + '.forward'"
+        targets: [llama-for-causal-lm.forward, mixtral-for-causal-lm.forward, qwen2-vl-for-conditional-generation.forward, qwen3-vl-for-conditional-generation.forward, bert-embedding-model.forward]
         input:
           num_tokens: "= vars.desc.value.num_tokens"
           num_prefill_tokens: "= input.uniform_decode ? 0 : input.num_tokens"
           num_decode_reqs: "= input.uniform_decode ? input.num_tokens : 0"
+      - when: "vars.desc.value.cg_mode != 'FULL'"
+        call: forward-context.exit-forward-context
+        input: {}
+      - when: "config['enable-eplb'] && !(has(input.skip_eplb) && input.skip_eplb)"
+        source: "vllm/v1/worker/gpu/eplb_utils.py:46-62"
+        call: eplb-controller.step
+        input: {is_dummy: true, is_profile: "= has(input.is_profile) && input.is_profile"}
       - return: {num_tokens: "= vars.desc.value.num_tokens", cg_mode: "= vars.desc.value.cg_mode"}
   - component: gpu-model-runner
     name: initialize-kv-cache
@@ -234,13 +275,23 @@ interfaces:
     request: {type: object, required: [num_blocks], properties: {num_blocks: {type: integer, examples: [29065]}, allocation_pool: {type: ["string", "null"], default: null, description: "the CuMem pool tag the KV tensors are allocated in (kv_cache under sleep mode), or None"}, is_profiling: {type: boolean, default: false, description: "the minimal KV cache profile_cudagraph_memory bootstraps (no KV connector)"}}}
     response: {type: object, properties: {kv_cache_bytes: {type: integer}, cudagraph_mode: {type: string}}}
     behavior:
+      - set: {vars.kvd: "= config['kv-cache-dtype']"}
+      - if: "vars.kvd == 'auto'"
+        then:
+          - title: "cache_config.cache_dtype is the resolved one: create_engine_config turned 'auto' into a ModelOpt checkpoint's KV algorithm (a world that never built the config has only the flag)"
+            source: "vllm/engine/arg_utils.py:2256-2259"
+            call: vllm-config.set-current-vllm-config
+            input: {}
+            as: cur
+            on_error: continue
+          - set: {vars.kvd: "= vars.cur.ok && has(vars.cur.value.cache_config) && has(vars.cur.value.cache_config.cache_dtype) ? vars.cur.value.cache_config.cache_dtype : vars.kvd"}
       - call: attn-utils.get-kv-cache-spec
         input:
           num_hidden_layers: "= state.model.num_hidden_layers"
           num_kv_heads: "= state.model.num_kv_heads"
           head_size: "= state.model.head_size"
           dtype_bytes: "= state.model.dtype_bytes"
-          kv_cache_dtype: "= config['kv-cache-dtype']"
+          kv_cache_dtype: "= vars.kvd"
         as: spec
       - title: "The attention groups' metadata builders report their CUDA graph support (FlashAttention: ALWAYS with FA3, UNIFORM_BATCH with FA2)"
         source: "vllm/v1/worker/gpu/model_runner.py:672-690"
@@ -287,7 +338,7 @@ interfaces:
     response: {type: object, properties: {cuda_graph_memory_bytes: {type: integer}}}
     behavior:
       - call: cuda-graph-manager.capture
-        input: {max_full_descs_to_capture: "= has(input.max_full_descs_to_capture) ? input.max_full_descs_to_capture : null"}
+        input: {max_full_descs_to_capture: "= has(input.max_full_descs_to_capture) ? input.max_full_descs_to_capture : null", num_layers: "= has(state.model.num_hidden_layers) ? state.model.num_hidden_layers : 32"}
         as: cap
       - if: "!vars.cap.value.captured"
         then:
@@ -326,9 +377,20 @@ interfaces:
     latency_ms: 0
     response: {type: object, properties: {tasks: {type: array}}}
     behavior:
+      - set: {vars.resolved: null}
+      - title: "self.model_config.runner_type is what ModelConfig resolved: --runner auto on *ForSequenceClassification is pooling with convert classify, not the flag's text"
+        source: "vllm/v1/worker/gpu_model_runner.py:3161-3164"
+        if: "!state.is_pooling_model && (!('runner' in config) || config['runner'] == 'auto')"
+        then:
+          - call: model-config.post-init
+            input: {model: "= config['model']", max_model_len: "= config['max-model-len']", runner: auto, quantization: null, enforce_eager: false, language_model_only: false, mm_processor_device: null, mm_processor_kwargs: null, mm_encoder_attn_backend: null, mm_tensor_ipc: direct_rpc, hf_overrides: null}
+            as: mc
+            on_error: continue
+          - if: "vars.mc.ok"
+            then: [{set: {vars.resolved: "= vars.mc.value"}}]
       - set:
-          vars.runner_type: "= ('runner' in config) && config['runner'] == 'pooling' ? 'pooling' : (state.is_pooling_model ? 'pooling' : 'generate')"
-          vars.convert: "= ('convert' in config) && config['convert'] != 'auto' ? config['convert'] : 'embed'"
+          vars.runner_type: "= ('runner' in config) && config['runner'] == 'pooling' ? 'pooling' : (state.is_pooling_model ? 'pooling' : (vars.resolved != null && vars.resolved.runner_type == 'pooling' ? 'pooling' : 'generate'))"
+          vars.convert: "= ('convert' in config) && config['convert'] != 'auto' ? config['convert'] : (vars.resolved != null && has(vars.resolved.convert_type) && vars.resolved.convert_type == 'classify' ? 'classify' : 'embed')"
       - set:
           vars.tasks: "= vars.runner_type == 'generate' ? ['generate'] : []"
       - if: "vars.runner_type == 'pooling'"
@@ -510,7 +572,15 @@ interfaces:
               - set:
                   state.free_slots: "= state.free_slots + [state.slots[vars.rid].slot]"
                   vars.freed: "= vars.freed + [state.slots[vars.rid].slot]"
+              - if: "state.is_pooling_model"
+                then:
+                  - source: "vllm/v1/worker/gpu/model_runner.py:1141-1142"
+                    call: pooling-runner.remove-request
+                    input: {slot: "= state.slots[vars.rid].slot"}
               - set: {state.slots: "= omit(state.slots, vars.rid)"}
+              - source: "vllm/v1/worker/gpu/model_runner.py:1147-1148"
+                call: prompt-logprobs-worker.remove-request
+                input: {req_id: "= vars.rid"}
               - if: "config['model-is-multimodal']"
                 then:
                   - title: The encoder cache drops the request's multimodal features
@@ -528,7 +598,13 @@ interfaces:
     request: {type: object, properties: {reqs: {type: array}, num_scheduled: {type: object, default: {}}}}
     response: {type: object, properties: {slots: {type: object}}}
     behavior:
-      - set: {vars.assigned: {}}
+      - set: {vars.assigned: {}, vars.pool_tasks: []}
+      - if: "state.is_pooling_model && size(input.reqs) > 0"
+        then:
+          - call: gpu-model-runner.get-supported-tasks
+            input: {}
+            as: st
+          - set: {vars.pool_tasks: "= vars.st.value.tasks"}
       - foreach: "= input.reqs"
         as: r
         steps:
@@ -569,6 +645,16 @@ interfaces:
                 source: "vllm/v1/worker/gpu/model_runner.py:1213-1214"
                 call: encoder-cache.add-request
                 input: {req_id: "= vars.r.req_id", mm_features: "= has(vars.r.mm_features) && vars.r.mm_features != null ? vars.r.mm_features : []"}
+          - if: "state.is_pooling_model"
+            then:
+              - title: The pooling runner validates the request's task and keeps its pooling params
+                source: "vllm/v1/worker/gpu/model_runner.py:1204-1211"
+                call: pooling-runner.add-request
+                input:
+                  req_id: "= vars.r.req_id"
+                  slot: "= vars.slot"
+                  pooling_params: "= has(vars.r.pooling_params) && vars.r.pooling_params != null ? vars.r.pooling_params : {}"
+                  supported_tasks: "= vars.pool_tasks"
           - title: Copy the request's block ids into the GPU block-table row (overwrite)
             source: "vllm/v1/worker/gpu/model_runner.py:1216-1218"
             call: block-tables.append-block-ids
@@ -580,6 +666,13 @@ interfaces:
             input:
               slot: "= vars.slot"
               sampling_params: "= has(vars.r.sampling_params) ? vars.r.sampling_params : {}"
+          - source: "vllm/v1/worker/gpu/model_runner.py:1225-1228"
+            when: "!state.is_pooling_model"
+            call: prompt-logprobs-worker.add-request
+            input:
+              req_id: "= vars.r.req_id"
+              slot: "= vars.slot"
+              sampling_params: "= has(vars.r.sampling_params) && vars.r.sampling_params != null ? vars.r.sampling_params : {}"
       - if: "size(input.reqs) > 0"
         then:
           - title: Flush the request states' staged writes to the device
@@ -735,27 +828,44 @@ interfaces:
             source: "vllm/v1/worker/gpu/model_runner.py:1872-1883"
             call: cp-utils.prepare-dcp-local-seq-lens
             input: {num_reqs: "= size(vars.batch)"}
-      - title: Build attention metadata (model_state.prepare_attn -> build_attn_metadata)
+      - title: "Build attention metadata: model_state.prepare_attn (the hybrid Mamba state for a hybrid model, else the default state) calls build_attn_metadata with the batch's positions"
         source: "vllm/v1/worker/gpu/model_runner.py:1915-1926"
-        call: flash-attention-metadata-builder.build
+        call: "= state.model.is_hybrid ? 'mamba-hybrid-model-state.prepare-attn' : 'default-model-state.prepare-attn'"
+        targets: [mamba-hybrid-model-state.prepare-attn, default-model-state.prepare-attn]
         input:
-          fa_version: "= 'flash-attn-version' in config && config['flash-attn-version'] != null ? int(config['flash-attn-version']) : 3"
-          fast_build: false
-          batch_invariant: false
-          sliding_window_configs: 1
-          use_full_cuda_graph: "= vars.desc.value.cg_mode == 'FULL'"
-          max_cudagraph_size: "= vars.desc.value.max_capture_size"
-          dcp_world_size: "= int(config['decode-context-parallel-size'])"
-          common:
-            num_reqs: "= size(vars.batch)"
-            num_actual_tokens: "= input.total_num_scheduled_tokens"
-            query_lens: "= vars.batch.map(b, b.n)"
-            seq_lens: "= vars.batch.map(b, b.nct + b.n)"
-            max_query_len: "= vars.batch.map(b, b.n).sortBy(x, -x)[0]"
-            max_seq_len: "= vars.batch.map(b, b.nct + b.n).sortBy(x, -x)[0]"
-            block_table: "= vars.bt.value.block_table"
-            slot_mapping: "= lists.range(size(vars.batch)).map(i, lists.range(vars.batch[i].n).map(j, (vars.batch[i].nct + j) / int(config['block-size']) < size(vars.bt.value.block_table[i]) ? vars.bt.value.block_table[i][(vars.batch[i].nct + j) / int(config['block-size'])] * int(config['block-size']) + (vars.batch[i].nct + j) % int(config['block-size']) : -1)).flatten()"
-            causal: true
+          positions: "= vars.batch.map(b, lists.range(b.n).map(j, b.nct + j)).flatten()"
+          is_prefilling: "= vars.batch.map(b, b.nct < b.prefill_len)"
+          num_scheduled_tokens: "= vars.batch.map(b, b.n)"
+          num_draft_tokens: "= vars.batch.map(b, size(b.drafts))"
+          cg_mode: "= vars.desc.value.cg_mode"
+          build:
+            fa_version: "= 'flash-attn-version' in config && config['flash-attn-version'] != null ? int(config['flash-attn-version']) : 3"
+            fast_build: false
+            batch_invariant: false
+            sliding_window_configs: 1
+            use_full_cuda_graph: "= vars.desc.value.cg_mode == 'FULL'"
+            max_cudagraph_size: "= vars.desc.value.max_capture_size"
+            dcp_world_size: "= int(config['decode-context-parallel-size'])"
+            common:
+              num_reqs: "= size(vars.batch)"
+              num_actual_tokens: "= input.total_num_scheduled_tokens"
+              query_lens: "= vars.batch.map(b, b.n)"
+              seq_lens: "= vars.batch.map(b, b.nct + b.n)"
+              max_query_len: "= vars.batch.map(b, b.n).sortBy(x, -x)[0]"
+              max_seq_len: "= vars.batch.map(b, b.nct + b.n).sortBy(x, -x)[0]"
+              block_table: "= vars.bt.value.block_table"
+              slot_mapping: "= lists.range(size(vars.batch)).map(i, lists.range(vars.batch[i].n).map(j, (vars.batch[i].nct + j) / int(config['block-size']) < size(vars.bt.value.block_table[i]) ? vars.bt.value.block_table[i][(vars.batch[i].nct + j) / int(config['block-size'])] * int(config['block-size']) + (vars.batch[i].nct + j) % int(config['block-size']) : -1)).flatten()"
+              causal: true
+      - set: {vars.comp: "= has(state.model_component) && state.model_component != '' ? state.model_component : (!has(state.model.architecture) || state.model.architecture.startsWith('Llama') ? 'llama-for-causal-lm' : (state.model.architecture.startsWith('Mixtral') ? 'mixtral-for-causal-lm' : (state.model.architecture.startsWith('Qwen2VL') ? 'qwen2-vl-for-conditional-generation' : '')))"}
+      - if: "vars.comp == ''"
+        then:
+          - title: "A world that never ran load_model: the registry resolves the architecture to its class (an architecture it refuses keeps the Llama stand-in)"
+            source: "vllm/model_executor/models/registry.py:1376-1428"
+            call: model-registry.resolve-model-cls
+            input: {architectures: ["= state.model.architecture"]}
+            as: rc
+            on_error: continue
+          - set: {vars.comp: "= vars.rc.ok && has(vars.rc.value.component) && vars.rc.value.component in ['llama-for-causal-lm', 'mixtral-for-causal-lm', 'qwen2-vl-for-conditional-generation', 'qwen3-vl-for-conditional-generation', 'bert-embedding-model'] ? vars.rc.value.component : 'llama-for-causal-lm'"}
       - if: "config['model-is-multimodal'] && state.is_first_pp_rank && has(input.scheduled_encoder_inputs) && size(input.scheduled_encoder_inputs) > 0"
         then:
           - call: encoder-cache.get-state
@@ -768,7 +878,7 @@ interfaces:
               scheduled_encoder_inputs: "= input.scheduled_encoder_inputs"
               mm_features: "= vars.ec.value.mm_features"
               cached: "= vars.ec.value.cached"
-              model_component: "= (has(state.model_component) && state.model_component != '' ? state.model_component : (has(state.model.architecture) && state.model.architecture.startsWith('Mixtral') ? 'mixtral-for-causal-lm' : (has(state.model.architecture) && state.model.architecture.startsWith('Qwen2VL') ? 'qwen2-vl-for-conditional-generation' : 'llama-for-causal-lm')))"
+              model_component: "= vars.comp"
       - if: "state.model.uses_mrope || state.model.uses_prompt_embeds"
         then:
           - when: "state.model.uses_mrope"
@@ -797,6 +907,8 @@ interfaces:
           num_tokens: "= vars.desc.value.num_tokens"
           cudagraph_runtime_mode: "= vars.desc.value.cg_mode"
           batch_descriptor: {num_tokens: "= vars.desc.value.num_tokens", num_reqs: null, uniform: false, has_lora: "= config['enable-lora']", num_active_loras: 0}
+          is_moe_model: "= vars.comp == 'mixtral-for-causal-lm'"
+          dp_rank: "= self.startsWith('rank') ? (int(self.substring(4)) / int(config['tensor-parallel-size'])) % int(config['data-parallel-size']) : 0"
       - if: "vars.desc.value.cg_mode == 'FULL'"
         then:
           - title: Replay the captured FULL graph (inputs already in the graph's buffers)
@@ -809,12 +921,12 @@ interfaces:
               - title: PIECEWISE graphs through the compiled model
                 source: "vllm/v1/worker/gpu/model_runner.py:2034-2042"
                 call: cuda-graph-manager.run-pw-graph
-                input: "= merge(vars.fwd, {'model_component': (has(state.model_component) && state.model_component != '' ? state.model_component : (has(state.model.architecture) && state.model.architecture.startsWith('Mixtral') ? 'mixtral-for-causal-lm' : (has(state.model.architecture) && state.model.architecture.startsWith('Qwen2VL') ? 'qwen2-vl-for-conditional-generation' : 'llama-for-causal-lm')))})"
+                input: "= merge(vars.fwd, {'num_layers': has(state.model.num_hidden_layers) ? state.model.num_hidden_layers : 32, 'model_component': vars.comp})"
             else:
               - title: Eager forward of the loaded model
                 source: "vllm/v1/worker/gpu/model_runner.py:2043-2044"
-                call: "= (has(state.model_component) && state.model_component != '' ? state.model_component : (has(state.model.architecture) && state.model.architecture.startsWith('Mixtral') ? 'mixtral-for-causal-lm' : (has(state.model.architecture) && state.model.architecture.startsWith('Qwen2VL') ? 'qwen2-vl-for-conditional-generation' : 'llama-for-causal-lm'))) + '.forward'"
-                targets: [llama-for-causal-lm.forward, mixtral-for-causal-lm.forward, qwen2-vl-for-conditional-generation.forward]
+                call: "= vars.comp + '.forward'"
+                targets: [llama-for-causal-lm.forward, mixtral-for-causal-lm.forward, qwen2-vl-for-conditional-generation.forward, qwen3-vl-for-conditional-generation.forward, bert-embedding-model.forward]
                 input: "= vars.fwd"
               - title: Kernel-launch overhead of an eager step (assumption)
                 wait: "= int(config['worker-runner-eager-launch-overhead-ms'])"
@@ -825,6 +937,7 @@ interfaces:
         source: "vllm/v1/worker/gpu/model_runner.py:2064-2075"
         set:
           state.execute_model_state:
+            model_component: "= vars.comp"
             batch: "= vars.batch"
             local_batch: "= vars.local_batch"
             num_drafts: "= vars.num_drafts"
@@ -913,6 +1026,10 @@ interfaces:
                 source: "vllm/v1/worker/gpu/model_runner.py:2120-2123"
                 call: mamba-hybrid-model-state.postprocess-state
                 input: {num_reqs: "= size(vars.ems.batch)", num_sampled_is_int: true}
+          - when: "config['enable-eplb']"
+            source: "vllm/v1/worker/gpu/eplb_utils.py:46-62"
+            call: eplb-controller.step
+            input: {is_dummy: false, is_profile: false}
           - title: KV-connector-only output
             source: "vllm/v1/worker/gpu/model_runner.py:2125-2127"
             return: {req_ids: [], sampled_token_ids: []}
@@ -927,6 +1044,7 @@ interfaces:
           batch: "= vars.ems.batch"
           num_drafts: "= vars.ems.num_drafts"
           new_reqs: "= vars.ems.new_reqs"
+          model_component: "= has(vars.ems.model_component) ? vars.ems.model_component : (has(state.model_component) && state.model_component != '' ? state.model_component : (has(state.model.architecture) && state.model.architecture.startsWith('Mixtral') ? 'mixtral-for-causal-lm' : (has(state.model.architecture) && state.model.architecture.startsWith('Qwen2VL') ? 'qwen2-vl-for-conditional-generation' : 'llama-for-causal-lm')))"
           grammar_output: "= input.grammar_output"
         as: s
       - if: "int(config['pipeline-parallel-size']) > 1"
@@ -941,7 +1059,8 @@ interfaces:
       - title: Prompt logprobs for requests that asked for them
         source: "vllm/v1/worker/gpu/model_runner.py:2150-2159"
         call: prompt-logprobs-worker.compute-prompt-logprobs
-        input: {new_reqs: "= vars.ems.new_reqs", model_component: "= (has(state.model_component) && state.model_component != '' ? state.model_component : (has(state.model.architecture) && state.model.architecture.startsWith('Mixtral') ? 'mixtral-for-causal-lm' : (has(state.model.architecture) && state.model.architecture.startsWith('Qwen2VL') ? 'qwen2-vl-for-conditional-generation' : 'llama-for-causal-lm')))"}
+        as: plp
+        input: {rows: "= vars.ems.batch.map(b, {'req_id': b.req_id, 'slot': b.slot, 'nct': b.nct, 'n': b.n, 'prompt_len': has(state.slots[b.req_id].prompt_len) ? state.slots[b.req_id].prompt_len : b.prefill_len, 'prefill_len': b.prefill_len, 'token_ids': has(state.slots[b.req_id].token_ids) ? state.slots[b.req_id].token_ids : []})", model_component: "= (has(vars.ems.model_component) ? vars.ems.model_component : (has(state.model_component) && state.model_component != '' ? state.model_component : (has(state.model.architecture) && state.model.architecture.startsWith('Mixtral') ? 'mixtral-for-causal-lm' : (has(state.model.architecture) && state.model.architecture.startsWith('Qwen2VL') ? 'qwen2-vl-for-conditional-generation' : 'llama-for-causal-lm'))))"}
       - title: Post-update num_computed_tokens, last sampled tokens and output bin counts
         source: "vllm/v1/worker/gpu/model_runner.py:2217-2223"
         call: input-batch.post-update-kernel
@@ -985,14 +1104,23 @@ interfaces:
         when: "config['kv-connector'] != ''"
         call: runner-kv-connector.post-forward
         input: {finished_req_ids: "= has(vars.ems.finished_req_ids) ? vars.ems.finished_req_ids : []"}
-      - return: {req_ids: "= vars.s.value.req_ids", sampled_token_ids: "= vars.s.value.sampled_token_ids"}
+      - when: "config['enable-eplb']"
+        source: "vllm/v1/worker/gpu/eplb_utils.py:46-62"
+        call: eplb-controller.step
+        input: {is_dummy: false, is_profile: false}
+      - source: "vllm/v1/worker/gpu/async_utils.py:173-200"
+        return:
+          req_ids: "= vars.s.value.req_ids"
+          sampled_token_ids: "= vars.s.value.sampled_token_ids"
+          logprobs: "= has(vars.s.value.logprobs) ? vars.s.value.logprobs : null"
+          prompt_logprobs_dict: "= vars.plp.value.prompt_logprobs_dict"
   - component: gpu-model-runner
     name: sample
     kind: function
     summary: "GPUModelRunner.sample: logits for the sampled rows, grammar bitmask, then the sampler (no drafts) or the rejection sampler (drafts)."
     sources: ["vllm/v1/worker/gpu/model_runner.py:1592-1677"]
     latency_ms: 0
-    request: {type: object, properties: {batch: {type: array}, num_drafts: {type: integer}, grammar_output: {type: ["object", "null"]}}}
+    request: {type: object, properties: {batch: {type: array}, num_drafts: {type: integer}, grammar_output: {type: ["object", "null"]}, model_component: {type: string, description: "the component execute_model ran"}}}
     response: {type: object, properties: {req_ids: {type: array}, sampled_token_ids: {type: array}}}
     behavior:
       - if: "config['enable-batch-sharded-sampling']"
@@ -1011,8 +1139,8 @@ interfaces:
             set: {ctx.local_sampled_reqs: "= vars.shard.value.local_batch.req_ids"}
       - title: The loaded model's compute_logits
         source: "vllm/v1/worker/gpu/model_runner.py:1610-1615"
-        call: "= (has(state.model_component) && state.model_component != '' ? state.model_component : (has(state.model.architecture) && state.model.architecture.startsWith('Mixtral') ? 'mixtral-for-causal-lm' : (has(state.model.architecture) && state.model.architecture.startsWith('Qwen2VL') ? 'qwen2-vl-for-conditional-generation' : 'llama-for-causal-lm'))) + '.compute-logits'"
-        targets: [llama-for-causal-lm.compute-logits, mixtral-for-causal-lm.compute-logits, qwen2-vl-for-conditional-generation.compute-logits]
+        call: "= (has(input.model_component) ? input.model_component : (has(state.model_component) && state.model_component != '' ? state.model_component : (has(state.model.architecture) && state.model.architecture.startsWith('Mixtral') ? 'mixtral-for-causal-lm' : (has(state.model.architecture) && state.model.architecture.startsWith('Qwen2VL') ? 'qwen2-vl-for-conditional-generation' : 'llama-for-causal-lm')))) + '.compute-logits'"
+        targets: [llama-for-causal-lm.compute-logits, mixtral-for-causal-lm.compute-logits, qwen2-vl-for-conditional-generation.compute-logits, qwen3-vl-for-conditional-generation.compute-logits]
         input: {num_tokens: "= size(input.batch) + input.num_drafts"}
       - set: {vars.allowed: {}}
       - if: "input.grammar_output != null && has(input.grammar_output.structured_output_request_ids)"
@@ -1028,7 +1156,7 @@ interfaces:
             as: gm
           - set: {vars.allowed: "= has(vars.gm.value.allowed) ? vars.gm.value.allowed : {}"}
       - set:
-          vars.rows0: "= input.batch.map(b, {'req_id': b.req_id, 'slot': b.slot, 'is_final': b.nct + b.n >= b.prefill_len, 'drafts': b.drafts, 'prompt_hash': b.prompt_hash, 'seq_len': b.nct + b.n, 'prompt_len': b.prompt_len, 'eos_token_id': has(state.model.eos_token_id) ? state.model.eos_token_id : 128009, 'context_token_ids': (b.req_id in input.new_reqs && has(input.new_reqs[b.req_id].prefill_token_ids) && has(input.new_reqs[b.req_id].prompt_len)) ? input.new_reqs[b.req_id].prefill_token_ids.slice(input.new_reqs[b.req_id].prompt_len, size(input.new_reqs[b.req_id].prefill_token_ids)) : []})"
+          vars.rows0: "= input.batch.map(b, {'req_id': b.req_id, 'slot': b.slot, 'is_final': b.nct + b.n >= b.prefill_len, 'drafts': b.drafts, 'prompt_hash': b.prompt_hash, 'seq_len': b.nct + b.n, 'prompt_len': b.prompt_len, 'eos_token_id': has(state.model.eos_token_id) ? state.model.eos_token_id : 128009, 'context_token_ids': (b.req_id in state.slots && has(state.slots[b.req_id].token_ids) && has(state.slots[b.req_id].prompt_len) && size(state.slots[b.req_id].token_ids) > state.slots[b.req_id].prompt_len) ? state.slots[b.req_id].token_ids.slice(state.slots[b.req_id].prompt_len, size(state.slots[b.req_id].token_ids)) : []})"
       - set:
           vars.rows: "= vars.rows0.map(r, r.req_id in vars.allowed ? merge(r, {'grammar': vars.allowed[r.req_id]}) : r)"
       - if: "input.num_drafts == 0"
@@ -1089,11 +1217,19 @@ interfaces:
       - set: {vars.ems: "= state.execute_model_state"}
       - set: {state.execute_model_state: null}
       - call: pooling-runner.pool
-        input: {req_ids: "= vars.ems.batch.map(b, b.req_id)"}
+        input:
+          req_ids: "= vars.ems.batch.map(b, b.req_id)"
+          rows: "= vars.ems.batch.map(b, {'req_id': b.req_id, 'slot': b.slot, 'prompt_len': has(b.prompt_len) ? b.prompt_len : b.prefill_len, 'n': b.n, 'seq_len': b.nct + b.n})"
+          seq_pooling_type: "= has(state.model.seq_pooling_type) ? state.model.seq_pooling_type : 'LAST'"
+          hidden_size: "= has(state.model.hidden_size) ? state.model.hidden_size : 4096"
         as: p
       - source: "vllm/v1/worker/gpu/model_runner.py:2326"
         call: input-batch.post-update-num-computed-tokens-kernel
         input: {num_rows: "= size(vars.ems.batch)"}
+      - when: "config['enable-eplb']"
+        source: "vllm/v1/worker/gpu/eplb_utils.py:46-62"
+        call: eplb-controller.step
+        input: {is_dummy: false, is_profile: false}
       - return: {req_ids: "= vars.ems.batch.map(b, b.req_id)", sampled_token_ids: "= vars.ems.batch.map(b, [])", pooler_output: "= vars.p.value.pooler_output"}
 
   # ================= attn_utils, CUDA graphs, KV zeroing =================
@@ -1111,7 +1247,7 @@ interfaces:
           - title: "Each layer's own get_kv_cache_spec: an MLA layer builds an MLAAttentionSpec with its cache dtype (attention's MLAAttention)"
             source: "vllm/v1/worker/gpu/attn_utils.py:149-152"
             call: mla-attention.get-kv-cache-spec
-            input: {kv_cache_dtype: "= config['kv-cache-dtype']", head_size: "= input.head_size", model_dtype_bytes: "= input.dtype_bytes"}
+            input: {kv_cache_dtype: "= has(input.kv_cache_dtype) ? input.kv_cache_dtype : config['kv-cache-dtype']", head_size: "= input.head_size", model_dtype_bytes: "= input.dtype_bytes"}
             as: mla
           - return:
               num_layers: "= input.num_hidden_layers"
@@ -1237,7 +1373,7 @@ interfaces:
     summary: "Captures every descriptor (largest first) through dummy runs and records the graph pool's memory."
     sources: ["vllm/v1/worker/gpu/cudagraph_utils.py:419-510", "vllm/v1/worker/gpu/cudagraph_utils.py:606-665"]
     latency_ms: 0
-    request: {type: object, properties: {max_full_descs_to_capture: {type: ["integer", "null"], default: null, description: "profiling only: capture this many of the largest FULL graphs"}}}
+    request: {type: object, properties: {max_full_descs_to_capture: {type: ["integer", "null"], default: null, description: "profiling only: capture this many of the largest FULL graphs"}, num_layers: {type: integer, default: 32, description: "the loaded model's hidden layers"}}}
     response: {type: object, properties: {captured: {type: boolean}, bytes: {type: integer}, num_sizes: {type: integer}, num_full_captured: {type: integer}, num_piecewise_captured: {type: integer}}}
     behavior:
       - if: "!has(state.mode) || state.mode == 'NONE' || size(state.capture_sizes) == 0"
@@ -1257,6 +1393,19 @@ interfaces:
       - title: "PIECEWISE first (larger activations), each a warmup then a capture through the compiled model's piecewise wrappers"
         source: "vllm/v1/worker/gpu/cudagraph_utils.py:439-472"
         set: {state.piecewise_captured: "= vars.pw"}
+      - title: "With VLLM_USE_BREAKABLE_CUDAGRAPH each PIECEWISE descriptor's capture goes through the wrapper (run_pw_graph inside the forward_fn)"
+        source: "vllm/v1/worker/gpu/cudagraph_utils.py:752-755"
+        when: "config['vllm-use-breakable-cudagraph'] && size(vars.pw) > 0"
+        foreach: "= vars.pw"
+        as: pwn
+        max: 1000
+        steps:
+          - call: breakable-cuda-graph-wrapper.call
+            input:
+              num_tokens: "= vars.pwn"
+              uniform_decode: false
+              runtime_mode: PIECEWISE
+              num_layers: "= has(input.num_layers) ? input.num_layers : 32"
       - title: "Then FULL: for each descriptor a warmup, then capture_pool points NCCL's graph allocator at the pool and torch.cuda.graph records the forward"
         source: "vllm/v1/worker/gpu/cudagraph_utils.py:473-505"
         foreach: "= vars.full"
@@ -1324,6 +1473,10 @@ interfaces:
           state.graphs_captured: false
           state.full_graphs: {}
           state.piecewise_captured: []
+      - title: "BreakableCUDAGraphWrapper.clear_all_graphs(): a captured descriptor would otherwise replay after the profiling capture"
+        source: "vllm/v1/worker/gpu/cudagraph_utils.py:961-962"
+        when: "config['vllm-use-breakable-cudagraph']"
+        call: breakable-cuda-graph-wrapper.clear-all-graphs
   - component: cuda-graph-manager
     name: run-fullgraph
     kind: function
@@ -1338,15 +1491,30 @@ interfaces:
   - component: cuda-graph-manager
     name: run-pw-graph
     kind: function
-    summary: "run_pw_graph: calls the torch-compiled model whose piecewise CUDA graphs replay between attention ops."
-    sources: ["vllm/v1/worker/gpu/cudagraph_utils.py:571-576"]
+    summary: "run_pw_graph: calls the torch-compiled model whose piecewise CUDA graphs replay between attention ops; with VLLM_USE_BREAKABLE_CUDAGRAPH, the BreakableCUDAGraphWrapper instead: a new batch descriptor captures the forward (the model runs), a captured one replays its segments without entering the model."
+    sources: ["vllm/v1/worker/gpu/cudagraph_utils.py:571-576", "vllm/v1/worker/gpu/cudagraph_utils.py:565-569", "vllm/v1/worker/gpu/cudagraph_utils.py:189-194"]
     latency_ms: 0
-    request: {type: object, properties: {num_tokens: {type: integer}, num_prefill_tokens: {type: integer}, num_decode_reqs: {type: integer}, model_component: {type: string, default: llama-for-causal-lm, description: "the loaded model's component (its architecture)"}}}
+    request: {type: object, properties: {num_tokens: {type: integer}, num_prefill_tokens: {type: integer}, num_decode_reqs: {type: integer}, num_layers: {type: integer, default: 32, description: "the loaded model's hidden layers (one eager attention break each)"}, model_component: {type: string, default: llama-for-causal-lm, description: "the loaded model's component (its architecture)"}}}
     behavior:
+      - if: "config['vllm-use-breakable-cudagraph']"
+        then:
+          - title: "use_breakable_cg: self.breakable_cg_runner(**model_inputs)"
+            source: "vllm/v1/worker/gpu/cudagraph_utils.py:572-576"
+            call: breakable-cuda-graph-wrapper.call
+            input:
+              num_tokens: "= input.num_tokens"
+              uniform_decode: false
+              runtime_mode: PIECEWISE
+              num_layers: "= has(input.num_layers) ? input.num_layers : 32"
+            as: br
+          - if: "vars.br.value.path == 'replay'"
+            then:
+              - set: {ctx.last_cg_mode: PIECEWISE}
+              - return: {path: replay}
       - title: The compiled model is the loaded architecture's
         source: "vllm/v1/worker/gpu/cudagraph_utils.py:571-576"
         call: "= (has(input.model_component) ? input.model_component : 'llama-for-causal-lm') + '.forward'"
-        targets: [llama-for-causal-lm.forward, mixtral-for-causal-lm.forward, qwen2-vl-for-conditional-generation.forward]
+        targets: [llama-for-causal-lm.forward, mixtral-for-causal-lm.forward, qwen2-vl-for-conditional-generation.forward, qwen3-vl-for-conditional-generation.forward, bert-embedding-model.forward]
         input: {num_tokens: "= input.num_tokens", num_prefill_tokens: "= has(input.num_prefill_tokens) ? input.num_prefill_tokens : 0", num_decode_reqs: "= has(input.num_decode_reqs) ? input.num_decode_reqs : 0"}
       - title: Launch overhead left between piecewise graphs (assumption)
         wait: "= int(config['worker-runner-piecewise-launch-overhead-ms'])"
@@ -1475,6 +1643,26 @@ interfaces:
 
   # ================= EPLB =================
   - component: eplb-controller
+    name: step
+    kind: function
+    summary: "EPLBController.step, run by @step_eplb_after after sample_tokens, pool and _dummy_run (unless skip_eplb): nothing without enable_eplb, while suppressed, or before a model is registered; else EplbState.step with the is_dummy and is_profile flags and eplb_config.log_balancedness."
+    sources: ["vllm/v1/worker/gpu/eplb_utils.py:167-177", "vllm/v1/worker/gpu/eplb_utils.py:46-62"]
+    latency_ms: 0
+    request: {type: object, properties: {is_dummy: {type: boolean, default: false}, is_profile: {type: boolean, default: false}}}
+    response: {type: object, properties: {stepped: {type: boolean}}}
+    behavior:
+      - if: "!config['enable-eplb'] || (has(state.suppressed) && state.suppressed) || !(has(state.has_registered_models) && state.has_registered_models)"
+        then:
+          - source: "vllm/v1/worker/gpu/eplb_utils.py:168-174"
+            return: {stepped: false}
+      - source: "vllm/v1/worker/gpu/eplb_utils.py:176-177"
+        call: eplb-state.step
+        input:
+          is_dummy: "= has(input.is_dummy) && input.is_dummy"
+          is_profile: "= has(input.is_profile) && input.is_profile"
+          log_stats: "= type(config['eplb-config']) == map && has(config['eplb-config'].log_balancedness) && config['eplb-config'].log_balancedness"
+      - return: {stepped: true}
+  - component: eplb-controller
     name: load
     kind: function
     summary: "EPLBController around load_model: prepare_load creates the EplbState when enable_eplb; maybe_register_model adds the MoE model; maybe_start_async_loop starts the async rebalancer unless loading dummy weights."
@@ -1497,6 +1685,7 @@ interfaces:
         source: "vllm/v1/worker/gpu/eplb_utils.py:149-154"
         call: eplb-state.add-model
         input: {model: "= input.model"}
+      - set: {state.has_registered_models: true}
       - if: "input.model.contains('Mixtral')"
         then:
           - title: "add_model hands the model its EPLB tensors (model.set_eplb_state): initially each of the 8 logical experts maps to one physical expert"

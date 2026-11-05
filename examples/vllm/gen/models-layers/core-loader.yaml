@@ -194,7 +194,7 @@ interfaces:
       - title: The parameters are allocated on this rank's GPU (target_device context)
         source: "vllm/model_executor/model_loader/base_loader.py:72-80"
         call: gpu-memory.allocate
-        input: {kind: weights, bytes: "= vars.hf.weights_bytes / config['tensor-parallel-size']"}
+        input: {kind: weights, bytes: "= vars.init.value.weights_bytes_per_rank >= 0 ? vars.init.value.weights_bytes_per_rank : vars.hf.weights_bytes / config['tensor-parallel-size']"}
       - title: self.load_weights(model, model_config)
         source: "vllm/model_executor/model_loader/base_loader.py:87-88"
         call: "= input.loader + '.load-weights'"
@@ -209,7 +209,17 @@ interfaces:
           kv_quant_method: "= vars.init.value.kv_quant_method"
           checkpoint_kv_scales: "= has(vars.hf.kv_scales) && vars.hf.kv_scales != null ? vars.hf.kv_scales : (has(vars.hf.quantization_config) && vars.hf.quantization_config != null && has(vars.hf.quantization_config.kv_cache_scheme) && vars.hf.quantization_config.kv_cache_scheme != null ? {'k_scale': 'checkpoint', 'v_scale': 'checkpoint'} : {})"
         as: post
+      - set: {vars.qsum: null}
+      - title: "Online quantization (no checkpoint scheme): the load logs which layers it quantized"
+        source: "vllm/model_executor/layers/quantization/online/base.py:172-198"
+        if: "vars.init.value.quant == 'fp8_per_tensor' && !(has(vars.hf.quantization_config) && vars.hf.quantization_config != null)"
+        then:
+          - call: online-quantization-config.quantized-layer-summary
+            input: {num_layers: "= vars.hf.num_hidden_layers", quant_key: fp8_per_tensor_static}
+            as: qs
+          - set: {vars.qsum: "= vars.qs.value.summary"}
       - return:
+          online_quant_summary: "= vars.qsum"
           model: "= input.model"
           arch: "= vars.init.value.arch"
           model_cls: "= vars.init.value.model_cls"
@@ -219,6 +229,7 @@ interfaces:
           weights_bytes_per_rank: "= vars.weights.value.weights_bytes_per_rank"
           kv_quant_method: "= vars.init.value.kv_quant_method"
           kv_scales: "= vars.post.value.kv_scales"
+          layers: "= vars.init.value.layers"
 
   - component: model-loader-utils
     name: initialize-model
@@ -279,9 +290,17 @@ interfaces:
         source: "vllm/model_executor/model_loader/utils.py:90-97"
         when: "vars.arch.value.component != 'auto-weights-loader'"
         call: "= vars.arch.value.component + '.init'"
-        targets: [llama-for-causal-lm.init, mixtral-for-causal-lm.init, qwen2-vl-for-conditional-generation.init]
+        targets: [llama-for-causal-lm.init, mixtral-for-causal-lm.init, qwen2-vl-for-conditional-generation.init, qwen3-vl-for-conditional-generation.init, embedding-gemma2-model.init, bert-embedding-model.init]
         input: {hf_config: "= input.hf_config", quant: "= vars.quant", kv_quant_method: "= vars.kvm"}
-      - return: {component: "= vars.arch.value.component", arch: "= vars.arch.value.arch", model_cls: "= vars.arch.value.class_name", quant: "= vars.quant", kv_quant_method: "= vars.kvm"}
+        as: mdl
+      - return:
+          component: "= vars.arch.value.component"
+          arch: "= vars.arch.value.arch"
+          model_cls: "= vars.arch.value.class_name"
+          quant: "= vars.quant"
+          kv_quant_method: "= vars.kvm"
+          layers: "= vars.arch.value.component != 'auto-weights-loader' && vars.mdl.value != null && has(vars.mdl.value.layers) ? vars.mdl.value.layers : []"
+          weights_bytes_per_rank: "= vars.arch.value.component != 'auto-weights-loader' && vars.mdl.value != null && has(vars.mdl.value.weights_bytes_per_rank) ? vars.mdl.value.weights_bytes_per_rank : -1"
 
   - component: model-loader-utils
     name: get-model-architecture
@@ -371,7 +390,7 @@ interfaces:
       - title: model.load_weights(self.get_all_weights(model_config, model))
         source: "vllm/model_executor/model_loader/default_loader.py:498"
         call: "= input.component + '.load-weights'"
-        targets: [llama-for-causal-lm.load-weights, mixtral-for-causal-lm.load-weights, qwen2-vl-for-conditional-generation.load-weights, auto-weights-loader.load-weights]
+        targets: [llama-for-causal-lm.load-weights, mixtral-for-causal-lm.load-weights, qwen2-vl-for-conditional-generation.load-weights, qwen3-vl-for-conditional-generation.load-weights, embedding-gemma2-model.load-weights, bert-embedding-model.load-weights, auto-weights-loader.load-weights]
         input: {model: "= input.model", hf_config: "= input.hf_config", quant: "= input.quant", weights_bytes: "= vars.files.value.weights_bytes", missing_params: "= vars.files.value.missing_params"}
         as: loaded
       - title: Strict check for unquantized models - every parameter must come from the checkpoint
@@ -435,10 +454,10 @@ interfaces:
       properties: {model: {type: string}, hf_config: ModelsHfConfig, component: {type: string}, quant: {type: string}}
     response: {type: object, properties: {weights_bytes_per_rank: {type: integer}}}
     behavior:
-      - title: initialize_single_dummy_weight for every local tensor
+      - title: initialize_single_dummy_weight for every local tensor (uniform in (-1e-3, 1e-3), generator seeded 1234)
         source: "vllm/model_executor/model_loader/dummy_loader.py:35-48"
         call: "= input.component + '.load-weights'"
-        targets: [llama-for-causal-lm.load-weights, mixtral-for-causal-lm.load-weights, qwen2-vl-for-conditional-generation.load-weights, auto-weights-loader.load-weights]
+        targets: [llama-for-causal-lm.load-weights, mixtral-for-causal-lm.load-weights, qwen2-vl-for-conditional-generation.load-weights, qwen3-vl-for-conditional-generation.load-weights, embedding-gemma2-model.load-weights, bert-embedding-model.load-weights, auto-weights-loader.load-weights]
         input: {model: "= input.model", hf_config: "= input.hf_config", quant: "= input.quant", weights_bytes: "= input.hf_config.weights_bytes", missing_params: []}
         as: loaded
       - return: {weights_bytes_per_rank: "= vars.loaded.value.weights_bytes_per_rank"}
@@ -681,7 +700,7 @@ interfaces:
         as: init
       - when: "vars.init.value.component != 'auto-weights-loader'"
         call: "= vars.init.value.component + '.load-weights'"
-        targets: [llama-for-causal-lm.load-weights, mixtral-for-causal-lm.load-weights, qwen2-vl-for-conditional-generation.load-weights]
+        targets: [llama-for-causal-lm.load-weights, mixtral-for-causal-lm.load-weights, qwen2-vl-for-conditional-generation.load-weights, qwen3-vl-for-conditional-generation.load-weights, embedding-gemma2-model.load-weights, bert-embedding-model.load-weights]
         input: {model: "= input.model", hf_config: "= input.hf_config", quant: "= vars.init.value.quant", weights_bytes: "= input.hf_config.weights_bytes", missing_params: []}
       - set: {ctx.ipc_fallback: none}
       - return: {model: "= input.model", arch: "= vars.init.value.arch", model_cls: "= vars.init.value.model_cls", component: "= vars.init.value.component", quant: "= vars.init.value.quant", loader: ipc-model-loader, weights_bytes_per_rank: "= input.hf_config.weights_bytes / config['tensor-parallel-size']"}

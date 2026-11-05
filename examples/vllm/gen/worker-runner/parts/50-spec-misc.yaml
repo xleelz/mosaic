@@ -363,21 +363,97 @@ interfaces:
 
   # ================= pooling =================
   - component: pooling-runner
+    name: add-request
+    kind: function
+    summary: "PoolingRunner.add_request: the request's task must be one the runner supports (the model pooler's tasks within embed, classify, token_embed, token_classify, embed&token_classify); its pooling params and a fresh PoolingStates are kept per slot."
+    sources: ["vllm/v1/worker/gpu/pool/pooling_runner.py:66-88"]
+    latency_ms: 0
+    errors: [{code: value-error, status: 0, retryable: false}]
+    request:
+      type: object
+      required: [req_id, slot]
+      properties:
+        req_id: {type: string}
+        slot: {type: integer}
+        pooling_params: {type: object, default: {}, description: "task, dimensions, use_activation, late_interaction"}
+        supported_tasks: {type: array, items: {type: string}, description: "the runner's supported tasks (get_supported_tasks)"}
+    response: {type: object, properties: {task: {type: string}}}
+    behavior:
+      - set:
+          vars.task: "= has(input.pooling_params.task) && input.pooling_params.task != null ? string(input.pooling_params.task) : 'None'"
+      - if: "!(vars.task in input.supported_tasks)"
+        then:
+          - title: An unsupported task is refused
+            source: "vllm/v1/worker/gpu/pool/pooling_runner.py:73-78"
+            fail: {code: value-error, status: 0, message: "= 'Unsupported task: ' + (vars.task == 'None' ? 'None' : \"'\" + vars.task + \"'\") + '. Supported tasks: [' + input.supported_tasks.sort().map(t, \"'\" + t + \"'\").join(', ') + ']'"}
+      - source: "vllm/v1/worker/gpu/pool/pooling_runner.py:79-88"
+        set:
+          state.params: "= merge(has(state.params) ? state.params : {}, {string(input.slot): merge(input.pooling_params, {'req_id': input.req_id, 'task': vars.task})})"
+          state.supported_tasks: "= input.supported_tasks"
+      - return: {task: "= vars.task"}
+  - component: pooling-runner
+    name: remove-request
+    kind: function
+    summary: "PoolingRunner.remove_request: drops the slot's pooling params, states and prompt token ids."
+    sources: ["vllm/v1/worker/gpu/pool/pooling_runner.py:90-94"]
+    latency_ms: 0
+    request: {type: object, required: [slot], properties: {slot: {type: integer}}}
+    response: {type: object, properties: {removed: {type: boolean}}}
+    behavior:
+      - set: {vars.had: "= has(state.params) && string(input.slot) in state.params"}
+      - if: "vars.had"
+        then:
+          - set: {state.params: "= omit(state.params, string(input.slot))"}
+      - return: {removed: "= vars.had"}
+  - component: pooling-runner
     name: pool
     kind: function
-    summary: "PoolingRunner.pool: runs the model's pooler on the batch's hidden states; late-interaction scoring requests go to the LateInteractionRunner."
-    sources: ["vllm/v1/worker/gpu/pool/pooling_runner.py:139-200"]
+    summary: "PoolingRunner.pool: builds the batch's PoolingMetadata (each slot's params, prompt lengths) and the pooling cursor (scheduled tokens against seq lens), runs the model's pooler (DispatchPooler) on the hidden states, and returns the outputs with the finished mask: a request whose prompt is not fully computed after this step (chunked prefill) gets no output yet. Late-interaction scoring requests go to the LateInteractionRunner."
+    sources: ["vllm/v1/worker/gpu/pool/pooling_runner.py:139-170", "vllm/v1/worker/gpu/pool/pooling_runner.py:105-137"]
     latency_ms: 0
-    request: {type: object, properties: {req_ids: {type: array}, late_interaction: {type: boolean}}}
-    response: {type: object, properties: {pooler_output: {type: array}}}
+    errors: [{code: key-error, status: 0, retryable: false}]
+    request:
+      type: object
+      properties:
+        req_ids: {type: array}
+        rows: {type: array, description: "per request: req_id, slot, prompt_len, n (scheduled tokens), seq_len"}
+        late_interaction: {type: boolean}
+        seq_pooling_type: {type: string, default: LAST}
+        hidden_size: {type: integer, default: 4096}
+    response: {type: object, properties: {pooler_output: {type: array}, finished_mask: {type: array, items: {type: boolean}}}}
     behavior:
       - if: "has(input.late_interaction) && input.late_interaction"
         then:
           - call: late-interaction-runner.score
             input: {num_docs: "= size(input.req_ids)", shared_query: true}
             as: sc
-          - return: {pooler_output: "= vars.sc.value.scores"}
-      - return: {pooler_output: "= input.req_ids.map(r, 'embedding')"}
+          - return: {pooler_output: "= vars.sc.value.scores", finished_mask: "= input.req_ids.map(r, true)"}
+      - if: "!has(input.rows) || size(input.rows) == 0"
+        then:
+          - return: {pooler_output: "= input.req_ids.map(r, 'embedding')", finished_mask: "= input.req_ids.map(r, true)"}
+      - if: "input.rows.exists(r, !has(state.params) || !(string(r.slot) in state.params))"
+        then:
+          - title: "_get_pooling_metadata reads every scheduled slot's pooling params"
+            source: "vllm/v1/worker/gpu/pool/pooling_runner.py:111-113"
+            fail: {code: key-error, status: 0, message: "= string(input.rows.filter(r, !has(state.params) || !(string(r.slot) in state.params))[0].slot)"}
+      - set:
+          vars.ps: "= input.rows.map(r, state.params[string(r.slot)])"
+      - title: "The model's pooler over the batch: each request's task, prompt length, scheduled tokens, dimensions and use_activation"
+        source: "vllm/v1/worker/gpu/pool/pooling_runner.py:157-158"
+        call: dispatch-pooler.forward
+        input:
+          requests: "= lists.range(size(input.rows)).map(i, {'task': vars.ps[i].task, 'prompt_len': input.rows[i].prompt_len, 'num_scheduled_tokens': input.rows[i].n, 'dimensions': has(vars.ps[i].dimensions) ? vars.ps[i].dimensions : null, 'use_activation': has(vars.ps[i].use_activation) && vars.ps[i].use_activation != null ? vars.ps[i].use_activation : true})"
+          supported_tasks: "= has(state.supported_tasks) ? state.supported_tasks : ['embed', 'token_embed']"
+          seq_pooling_type: "= has(input.seq_pooling_type) ? input.seq_pooling_type : 'LAST'"
+          hidden_size: "= has(input.hidden_size) ? input.hidden_size : 4096"
+        as: po
+      - title: "The pooling cursor's finished mask: the request's prompt is fully computed after this step"
+        source: "vllm/v1/worker/gpu/pool/pooling_runner.py:159"
+        set:
+          vars.fin: "= input.rows.map(r, r.seq_len >= r.prompt_len)"
+      - return:
+          pooler_output: "= lists.range(size(input.rows)).map(i, vars.fin[i] && i < size(vars.po.value.outputs) ? vars.po.value.outputs[i] : null)"
+          finished_mask: "= vars.fin"
   - component: late-interaction-runner
     name: score
     kind: function

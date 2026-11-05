@@ -34,7 +34,7 @@ interfaces:
     kind: function
     summary: "AsyncLLM.__init__: load stat-logger plugins, build the input/output processors, create the AsyncMPClient (launching the engine core), and create the StatLoggerManager."
     sources: ["vllm/v1/engine/async_llm.py:87-226"]
-    request: {type: object, properties: {executor_class: {type: string}}}
+    request: {type: object, properties: {executor_class: {type: string}, client_addresses: {type: ["object", "null"], default: null, description: "run_multi_api_server's client_config {client_index, client_count}; null when AsyncLLM launches its own engines"}}}
     behavior:
       - title: "Ensure we can serialize custom transformer configs: register the VllmConfig by-value reducer"
         source: "vllm/v1/engine/async_llm.py:131-132"
@@ -47,52 +47,111 @@ interfaces:
       - title: "EngineCoreClient.make_async_mp_client starts the engine in a background process"
         source: "vllm/v1/engine/async_llm.py:182-190"
         call: async-mp-client.init
+        input: {client_addresses: "= has(input.client_addresses) ? input.client_addresses : null"}
         as: client
       - if: "!config['disable-log-stats'] || size(vars.plugins.value) > 0"
         then:
-          - call: stat-logger-manager.init
-            input: {custom: "= vars.plugins.value", enable_default_loggers: "= !config['disable-log-stats']"}
+          - title: "StatLoggerManager(..., client_count=client_count): client_count comes from client_config (1 without one)"
+            source: "vllm/v1/engine/async_llm.py:195-205"
+            call: stat-logger-manager.init
+            input: {custom: "= vars.plugins.value", enable_default_loggers: "= !config['disable-log-stats']", client_count: "= has(input.client_addresses) && input.client_addresses != null && has(input.client_addresses.client_count) ? input.client_addresses.client_count : 1", engine_indexes: "= lists.range(int(config['data-parallel-size']))"}
       - return: {num_gpu_blocks: "= vars.client.value.num_gpu_blocks", executor_class: "= input.executor_class"}
 
   - component: async-mp-client
     name: init
     kind: function
-    summary: "MPClient.__init__: launch the engine-core process(es) through CoreEngineProcManager, wait for the startup handshake (READY carries num_gpu_blocks), then start the engine-core liveness monitor."
+    summary: "MPClient.__init__: with no client addresses, launch the engine-core process(es) (CoreEngineProcManager, untimed HELLO/READY handshake); with external addresses (an API server of run_multi_api_server) only bind the sockets. Then wait for every engine's ready response on the input socket (VLLM_ENGINE_READY_TIMEOUT_S per poll), sync max_model_len and num_gpu_blocks from them, and start the engine-core liveness monitor."
     sources: ["vllm/v1/engine/core_client.py:595-764", "vllm/v1/engine/utils.py:94-109"]
-    response: {type: object, properties: {num_gpu_blocks: {type: integer}}}
+    request: {type: object, properties: {client_addresses: {type: ["object", "null"], default: null, description: "run_multi_api_server's client_config: client_index, client_count"}}}
+    response: {type: object, properties: {num_gpu_blocks: {type: integer}, max_model_len: {type: integer}}}
+    errors: [{code: timeout-error, status: 0, retryable: false}, {code: runtime-error, status: 0, retryable: false}]
     behavior:
-      - set: {state.engine_dead: false}
-      - call: core-engine-proc-manager.launch
+      - set: {state.engine_dead: false, state.num_gpu_blocks: 0, state.num_ready: 0}
+      - if: "has(input.client_addresses) && input.client_addresses != null"
+        then:
+          - title: "Engines are managed externally: bind the input ROUTER and output PULL sockets from client_addresses, no launch"
+            source: "vllm/v1/engine/core_client.py:630-655"
+            call: async-mp-client.wait-for-ready-responses
+            input: {client_index: "= has(input.client_addresses.client_index) ? input.client_addresses.client_index : 0", num_engines: "= int(config['data-parallel-size'])"}
+            as: rr
+          - return: {num_gpu_blocks: "= vars.rr.value.num_gpu_blocks", max_model_len: "= vars.rr.value.max_model_len"}
+      - title: "Engines are managed by this client: launch_core_engines (its exit waits for the HELLO/READY handshakes)"
+        source: "vllm/v1/engine/core_client.py:681-697"
+        call: core-engine-proc-manager.launch
         as: launch
+      - title: "Wait for the ready messages on the input socket: they were sent before READY, so each poll returns at once"
+        source: "vllm/v1/engine/core_client.py:733-753"
+        foreach: "= vars.launch.value.ready_responses"
+        as: resp
+        steps:
+          - call: async-mp-client.apply-ready-response
+            input: {response: "= vars.resp"}
       - if: "config['enable-kv-cache-events']"
         then:
           - title: "_apply_ready_response: an engine whose READY carries kv_events_config is recorded as a KV-event source, keyed by its DP rank"
             source: "vllm/v1/engine/core_client.py:883-886"
             set: {state.kv_event_sources: "= {'0': {'enable_kv_cache_events': true, 'publisher': config['kv-events-publisher'] == null ? 'zmq' : config['kv-events-publisher']}}"}
-      - return: {num_gpu_blocks: "= vars.launch.value.num_gpu_blocks"}
+      - return: {num_gpu_blocks: "= state.num_gpu_blocks", max_model_len: "= has(state.max_model_len) ? state.max_model_len : int(config['max-model-len'])"}
 
   - component: core-engine-proc-manager
     name: launch
     kind: function
-    summary: "CoreEngineProcManager: start a process per local engine with target EngineCoreProc.run_engine_core; wait_for_engine_startup waits for every engine's handshake."
-    sources: ["vllm/v1/engine/utils.py:242-333", "vllm/v1/engine/utils.py:1361-1400"]
-    request: {type: object, properties: {client_kind: {type: string, enum: [async, sync], default: async}}}
+    summary: "launch_core_engines with a CoreEngineProcManager: bind the ROUTER handshake socket, start one process per local engine (EngineCore, or EngineCore_DP<i> under DP) with target EngineCoreProc.run_engine_core, then wait_for_engine_startup until every engine sent HELLO and READY; a process that exits first fails the launch with its exit code."
+    description: "The engine processes start together in the code; the model starts them one after another because the DP ranks share the world's GPU worker instances (their forward passes would interleave on one worker). Without a DP topology in the world (instances dp0.. of engine-core-proc) every rank runs on the one engine-core-proc instance; rank_instances: true addresses dp<i>."
+    sources: ["vllm/v1/engine/utils.py:242-333", "vllm/v1/engine/utils.py:1280-1359", "vllm/v1/engine/utils.py:1362-1444"]
+    errors: [{code: runtime-error, status: 0, retryable: false}]
+    request: {type: object, properties: {client_kind: {type: string, enum: [async, sync], default: async}, num_clients: {type: integer, default: 0, description: "external API server clients (run_multi_api_server); 0 = the launching client"}, iterations: {type: integer, default: 60}, rank_instances: {type: boolean, default: false, description: "run each DP rank on engine-core-proc instance dp<i> (the scenario declares that topology)"}}}
+    response: {type: object, properties: {num_gpu_blocks: {type: integer}, ready_responses: {type: array}}}
     behavior:
       - set: {state.started: true, state.killed: false, state.failed_proc_name: null, state.manager_stopped: false}
-      - title: "The engine process builds EngineCore and signals READY over the handshake socket"
-        source: "vllm/v1/engine/utils.py:1361-1400"
-        call: engine-core-proc.run-engine-core
-        input: {client_kind: "= has(input.client_kind) ? input.client_kind : 'async'"}
-        as: core
-        on_error:
-          - title: "An engine process exits during startup: 'Engine core initialization failed'"
-            source: "vllm/v1/engine/utils.py:1431-1437"
-            fail: {code: runtime-error, message: "= 'Engine core initialization failed. See root cause above. Failed core proc(s): {' + (int(config['data-parallel-size']) > 1 ? \"'EngineCore_DP0'\" : \"'EngineCore'\") + ': 1}'"}
+      - set:
+          vars.dp: "= int(config['data-parallel-size'])"
+          vars.coordinated: false
+      - if: "vars.dp > 1"
+        then:
+          - title: "coordinated DP = dp_size > 1 and model_config.is_moe: the init message carries the DP master fields and READY must carry a matching config hash"
+            source: "vllm/v1/engine/utils.py:1354-1358"
+            call: engine-core.model-is-moe
+            as: moe
+          - set: {vars.coordinated: "= vars.moe.value"}
+      - title: "rank 0 (or offline mode) handshakes with every engine: CoreEngine(index=i, local=True) in state NEW"
+        source: "vllm/v1/engine/utils.py:1280-1290"
+        set:
+          state.coordinated_dp: "= vars.coordinated"
+          state.expected_parallel_config_hash: "= 'pc-dp' + string(vars.dp) + '-tp' + string(config['tensor-parallel-size']) + '-pp' + string(config['pipeline-parallel-size'])"
+          state.handshake: "= lists.range(vars.dp).transformMapEntry(i, r, {string(r): {'local': true, 'state': 'NEW'}})"
+      - title: "CoreEngineProcManager: context.Process(target=EngineCoreProc.run_engine_core, name=EngineCore_DP<i> if DP else EngineCore, dp_rank=i) for each local engine, all started before the handshake wait"
+        source: "vllm/v1/engine/utils.py:269-286"
+        foreach: "= lists.range(vars.dp)"
+        as: r
+        steps:
+          - if: "vars.dp > 1 && has(input.rank_instances) && input.rank_instances"
+            then:
+              - call: engine-core-proc.run-engine-core
+                on: "= 'dp' + string(vars.r)"
+                input: {client_kind: "= has(input.client_kind) ? input.client_kind : 'async'", dp_rank: "= vars.r", num_clients: "= has(input.num_clients) ? input.num_clients : 0", iterations: "= has(input.iterations) ? input.iterations : 60"}
+                as: core
+                on_error: continue
+            else:
+              - call: engine-core-proc.run-engine-core
+                input: {client_kind: "= has(input.client_kind) ? input.client_kind : 'async'", dp_rank: "= vars.r", num_clients: "= has(input.num_clients) ? input.num_clients : 0", iterations: "= has(input.iterations) ? input.iterations : 60"}
+                as: core
+                on_error: continue
+          - set: {vars.procs: "= (has(vars.procs) ? vars.procs : []) + [has(vars.core) && vars.core.ok ? {'failed': false, 'rank': vars.r, 'value': vars.core.value} : {'failed': true, 'rank': vars.r, 'message': has(vars.core) && !vars.core.ok ? vars.core.error.message : ''}]"}
+      - set: {vars.bad: "= vars.procs.filter(v, v.failed)"}
+      - if: "size(vars.bad) > 0"
+        then:
+          - set: {state.failed_proc_name: "= vars.dp > 1 ? 'EngineCore_DP' + string(vars.bad[0].rank) : 'EngineCore'"}
+          - title: "A local core process exited during startup: finished_procs() names it with its exit code (1 after an exception)"
+            source: "vllm/v1/engine/utils.py:1409-1441"
+            fail: {code: runtime-error, message: "= 'Engine core initialization failed. See root cause above. Failed core proc(s): {' + vars.bad.map(v, (vars.dp > 1 ? \"'EngineCore_DP\" + string(v.rank) + \"'\" : \"'EngineCore'\") + ': 1').join(', ') + '}'", data: {cause: "= vars.bad[0].message"}}
       - title: "MPClient.__init__ -> start_engine_core_monitor: a daemon MPClientEngineMonitor thread blocks on the engine processes' sentinels"
         source: "vllm/v1/engine/core_client.py:758-759"
         emit: core-engine-proc-manager.monitor-engine-liveness
         input: {}
-      - return: "= vars.core.value"
+      - return:
+          num_gpu_blocks: "= vars.procs[0].value.num_gpu_blocks"
+          ready_responses: "= vars.procs.map(x, x.value.ready_response)"
 
   - component: core-engine-proc-manager
     name: monitor-engine-liveness
@@ -512,11 +571,20 @@ interfaces:
       - title: "log_stats = not engine_args.disable_log_stats; the offline LLM passes disable_log_stats=True unless the caller set it (llm.py:226-227)"
         source: "vllm/v1/engine/llm_engine.py:189-197"
         set: {state.log_stats: "= !(has(input.disable_log_stats) && input.disable_log_stats != null ? input.disable_log_stats : config['disable-log-stats'])"}
+      - if: "!config['vllm-enable-v1-multiprocessing']"
+        then:
+          - title: "make_client(multiprocess_mode=False, asyncio_mode=False): an InprocClient builds EngineCore in this process"
+            source: "vllm/v1/engine/core_client.py:133"
+            call: inproc-client.init
+            as: ip
+          - set: {state.client: inproc}
+          - return: {executor_class: "= vars.cls.value.executor_class", num_gpu_blocks: "= vars.ip.value.num_gpu_blocks"}
       - title: "make_client(multiprocess_mode=True, asyncio_mode=False): a SyncMPClient connects to the engine-core process"
         source: "vllm/v1/engine/llm_engine.py:174-197"
         call: core-engine-proc-manager.launch
         input: {client_kind: sync}
         as: core
+      - set: {state.client: mp}
       - return: {executor_class: "= vars.cls.value.executor_class", num_gpu_blocks: "= vars.core.value.num_gpu_blocks"}
 
   - component: llm-engine
@@ -556,7 +624,8 @@ interfaces:
         then:
           - call: output-processor.add-request
             input: {request: "= vars.request", parent_request_id: null, has_queue: false}
-          - call: sync-mp-client.add-request
+          - call: "= has(state.client) && state.client == 'inproc' ? 'inproc-client.add-request' : 'sync-mp-client.add-request'"
+            targets: [sync-mp-client.add-request, inproc-client.add-request]
             input: "= vars.request"
           - return: "= vars.request.request_id"
       - title: "Fan out child requests (for n>1)"
@@ -567,7 +636,8 @@ interfaces:
           - set: {vars.child: "= merge(vars.request, {'request_id': string(vars.idx) + '_' + vars.request.request_id, 'sampling_params': merge(vars.request.sampling_params, {'n': 1})})"}
           - call: output-processor.add-request
             input: {request: "= vars.child", parent_request_id: "= vars.request.request_id", has_queue: false}
-          - call: sync-mp-client.add-request
+          - call: "= has(state.client) && state.client == 'inproc' ? 'inproc-client.add-request' : 'sync-mp-client.add-request'"
+            targets: [sync-mp-client.add-request, inproc-client.add-request]
             input: "= vars.child"
       - return: "= vars.request.request_id"
 
@@ -589,12 +659,13 @@ interfaces:
           - return: {request_outputs: []}
       - title: "1) Get EngineCoreOutputs from the engine core"
         source: "vllm/v1/engine/llm_engine.py:326-327"
-        call: sync-mp-client.get-output
+        call: "= has(state.client) && state.client == 'inproc' ? 'inproc-client.get-output' : 'sync-mp-client.get-output'"
+        targets: [sync-mp-client.get-output, inproc-client.get-output]
         as: outs
       - title: "2) Process EngineCoreOutputs"
         source: "vllm/v1/engine/llm_engine.py:330-339"
         call: output-processor.process-outputs
-        input: {outputs: "= has(vars.outs.value.outputs) ? vars.outs.value.outputs : []"}
+        input: {outputs: "= has(vars.outs.value.outputs) ? vars.outs.value.outputs : []", timestamp: "= has(vars.outs.value.timestamp) ? vars.outs.value.timestamp : null"}
         as: proc
       - title: "Recover from P0/P1 cache drift: invalidate every mm_cache_miss_hashes entry in the renderer's mm processor cache, in order"
         source: "vllm/v1/engine/llm_engine.py:341-346"
@@ -605,7 +676,8 @@ interfaces:
             input: {mm_hash: "= vars.mmh"}
       - title: "3) Abort any requests that finished due to stop strings"
         source: "vllm/v1/engine/llm_engine.py:349-351"
-        call: sync-mp-client.abort-requests
+        call: "= has(state.client) && state.client == 'inproc' ? 'inproc-client.abort-requests' : 'sync-mp-client.abort-requests'"
+        targets: [sync-mp-client.abort-requests, inproc-client.abort-requests]
         input: {request_ids: "= vars.proc.value.reqs_to_abort"}
       - if: "state.log_stats"
         then:
@@ -648,7 +720,8 @@ interfaces:
       - call: output-processor.abort-requests
         input: {request_ids: "= input.request_ids", internal: "= has(input.internal) ? input.internal : false"}
         as: ids
-      - call: sync-mp-client.abort-requests
+      - call: "= has(state.client) && state.client == 'inproc' ? 'inproc-client.abort-requests' : 'sync-mp-client.abort-requests'"
+        targets: [sync-mp-client.abort-requests, inproc-client.abort-requests]
         input: {request_ids: "= vars.ids.value"}
       - return: {aborted: "= vars.ids.value"}
 
@@ -804,10 +877,15 @@ interfaces:
     kind: function
     summary: "StatLoggerManager.__init__: custom loggers, plus LoggingStatLogger for a single API server, plus PrometheusStatLogger unless a custom one replaces it."
     sources: ["vllm/v1/metrics/loggers.py:1370-1419"]
-    request: {type: object, properties: {custom: {type: array, items: {type: string}}, enable_default_loggers: {type: boolean}, engine_indexes: {type: array, items: {type: integer}, default: [0]}}}
+    request: {type: object, properties: {custom: {type: array, items: {type: string}}, enable_default_loggers: {type: boolean}, engine_indexes: {type: array, items: {type: integer}, default: [0]}, client_count: {type: integer, default: 1}}}
     behavior:
+      - if: "input.enable_default_loggers && has(input.client_count) && input.client_count > 1"
+        then:
+          - title: "client_count > 1: warn 'AsyncLLM created with api_server_count more than 1; disabling stats logging to avoid incomplete stats.' and add no LoggingStatLogger"
+            source: "vllm/v1/metrics/loggers.py:1383-1389"
+            set: {state.stats_logging_disabled: true}
       - set:
-          state.loggers: "= input.custom + (input.enable_default_loggers ? ['LoggingStatLogger'] : []) + (input.custom.exists(c, c == 'PrometheusStatLogger') ? [] : ['PrometheusStatLogger'])"
+          state.loggers: "= input.custom + (input.enable_default_loggers && !(has(input.client_count) && input.client_count > 1) ? ['LoggingStatLogger'] : []) + (input.custom.exists(c, c == 'PrometheusStatLogger') ? [] : ['PrometheusStatLogger'])"
       - if: "!input.custom.exists(c, c == 'PrometheusStatLogger')"
         then:
           - title: "PrometheusStatLogger(vllm_config, self.engine_indexes) registers its series"

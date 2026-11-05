@@ -197,6 +197,9 @@ for _cid in ("lru-key-replicated-receiver-cache", "lru-key-replicated-sender-cac
 
 # Round 5: contracts copied by owner5.py into owner5.json (owner fragment named per entry).
 _R5 = json.load(open(os.path.join(os.path.dirname(os.path.abspath(__file__)), "owner5.json")))
+# Round 6: owner6.py copies the round's new owner contracts into owner6.json; merged with round 5's.
+_R6 = json.load(open(os.path.join(os.path.dirname(os.path.abspath(__file__)), "owner6.json")))
+_R5 = {"ifaces": {**_R5["ifaces"], **_R6["ifaces"]}, "components": {**_R5["components"], **_R6["components"]}}
 for _key, _c in sorted(_R5["ifaces"].items()):
     _comp, _name = _key.split(".", 1)
     _own = (_c.get("attributes") or {}).get("owner") or _c["owner"]

@@ -611,12 +611,15 @@ interfaces:
   - component: engine-core-proc
     name: run-engine-core
     kind: function
-    summary: "EngineCoreProc.run_engine_core: the engine-core process target: install signal handlers, build EngineCoreProc (and so EngineCore), run the busy loop; a startup failure is logged, a later fatal error sends ENGINE_CORE_DEAD."
-    sources: ["vllm/v1/engine/core.py:1391-1529"]
-    request: {type: object, properties: {iterations: {type: integer, default: 60}, client_kind: {type: string, enum: [async, sync], default: async}}}
+    summary: "EngineCoreProc.run_engine_core: the engine-core process target: install signal handlers, build EngineCoreProc -- HELLO handshake with the front-end, EngineCore construction (model load, KV sizing), the input thread's ready response on every client input socket, then READY -- and run the busy loop; a startup failure is logged and ends the process, a later fatal error sends ENGINE_CORE_DEAD."
+    sources: ["vllm/v1/engine/core.py:1391-1529", "vllm/v1/engine/core.py:1128-1250"]
+    request: {type: object, properties: {iterations: {type: integer, default: 60}, client_kind: {type: string, enum: [async, sync], default: async}, dp_rank: {type: ["integer", "null"], default: null, description: "the process's DP rank (dp_rank kwarg); null takes the instance's dp<i> suffix, else 0"}, num_clients: {type: integer, default: 0, description: "external client input sockets to send the ready response to (run_multi_api_server's API servers); 0 = the launching client, which reads the ready response from the result"}, parallel_config_hash: {type: ["string", "null"], default: null, description: "override of this process's ParallelConfig.compute_hash() (a mismatching command line)"}}}
     errors: [{code: runtime-error, status: 0}]
     behavior:
-      - if: "int(config['data-parallel-size']) > 1"
+      - set:
+          vars.idx: "= has(input.dp_rank) && input.dp_rank != null ? input.dp_rank : (self.startsWith('dp') ? int(self.substring(2)) : 0)"
+          vars.dp: "= int(config['data-parallel-size'])"
+      - if: "vars.dp > 1"
         then:
           - call: engine-core.model-is-moe
             as: moe
@@ -626,15 +629,42 @@ interfaces:
       - title: "data_parallel and model_config.is_moe: a DPEngineCoreProc (waves, dummy batches, the DP all-reduce); otherwise a plain EngineCoreProc, since dense DP ranks are independent (reconfigure_for_independent_dp_rank)"
         source: "vllm/v1/engine/core.py:1472-1482"
         set: {state.dp_moe: "= vars.dp_moe"}
+      - title: "EngineCoreProc.__init__ -> _perform_handshakes: register with the front-end (HELLO) and receive the init message before building the engine"
+        source: "vllm/v1/engine/core.py:1163-1169"
+        call: engine-core-proc.startup-handshake
+        input: {engine_index: "= vars.idx", local: true, headless: false}
       - title: "Construct the engine: EngineCore.__init__ builds the executor, profiles memory and sizes the KV cache, creates the scheduler"
-        source: "vllm/v1/engine/core.py:118-258"
+        source: "vllm/v1/engine/core.py:1194-1200"
         call: engine-core.init
         as: eng
         on_error:
-          - title: "EngineCore failed to start: the exception ends the process before any handshake"
+          - title: "EngineCore failed to start: logger.exception('EngineCore failed to start.') and the process exits with code 1 before READY"
             source: "vllm/v1/engine/core.py:1508-1510"
             fail: "= error"
       - set: {state.shutdown_state: RUNNING, state.dead: false, state.exited: false, state.client_kind: "= has(input.client_kind) ? input.client_kind : 'async'"}
+      - title: "The input thread sends the EngineCoreReadyResponse on each client input socket first (required before the ROUTER can send to this engine)"
+        source: "vllm/v1/engine/core.py:1867-1875"
+        call: engine-core-proc.make-ready-response
+        input: {engine_index: "= vars.idx", num_gpu_blocks: "= vars.eng.value.num_gpu_blocks"}
+        as: rr
+      - if: "has(input.num_clients) && input.num_clients > 0"
+        then:
+          - title: "One ready payload per front-end input socket (one per API server process)"
+            source: "vllm/v1/engine/core.py:1871-1875"
+            foreach: "= lists.range(input.num_clients)"
+            as: c
+            steps:
+              - put: "= 'engine-ready:' + string(vars.c)"
+                value: "= vars.rr.value"
+      - title: "Leaving the handshake context sends READY {status, local, headless} (plus parallel_config_hash when data_parallel_size > 1) on the handshake socket"
+        source: "vllm/v1/engine/core.py:1336-1349"
+        call: core-engine-proc-manager.handle-handshake-message
+        input:
+          status: READY
+          local: true
+          headless: false
+          engine_index: "= vars.idx"
+          parallel_config_hash: "= vars.dp > 1 ? (has(input.parallel_config_hash) && input.parallel_config_hash != null ? input.parallel_config_hash : 'pc-dp' + string(vars.dp) + '-tp' + string(config['tensor-parallel-size']) + '-pp' + string(config['pipeline-parallel-size'])) : null"
       - title: Start the busy loop
         source: "vllm/v1/engine/core.py:1496"
         if: "vars.dp_moe"
@@ -644,12 +674,12 @@ interfaces:
             emit: dp-engine-core-proc.run-busy-loop
             on: "= self"
             after_ms: 0
-            input: {dp_rank: "= self.startsWith('dp') ? int(self.substring(2)) : 0", iterations: "= has(input.iterations) ? input.iterations : 60"}
+            input: {dp_rank: "= vars.idx", iterations: "= has(input.iterations) ? input.iterations : 60"}
         else:
           - emit: engine-core-proc.run-busy-loop
             after_ms: 0
             input: {iterations: "= has(input.iterations) ? input.iterations : 60"}
-      - return: "= vars.eng.value"
+      - return: "= merge(vars.eng.value, {'ready_response': vars.rr.value, 'engine_index': vars.idx})"
 
   # ------------------------------------------------------------------ EngineCore
   - component: engine-core
@@ -667,6 +697,12 @@ interfaces:
         source: "vllm/v1/engine/core.py:157"
         call: engine-core.initialize-kv-caches
         as: kv
+      - title: "self.mm_receiver_cache = engine_receiver_cache_from_config(vllm_config): the LRU receiver only for cache type lru; none for shm (the worker holds the receiver), processor_only or no cache"
+        source: "vllm/v1/engine/core.py:193"
+        call: multi-modal-cache-factories.engine-receiver-cache-from-config
+        input: {supports_multimodal_inputs: "= config['model-is-multimodal']"}
+        as: mmrc
+      - set: {state.mm_receiver_cache: "= vars.mmrc.value.component"}
       - title: "scheduler_config.async_scheduling as VllmConfig.__post_init__ resolved it: --no-async-scheduling stays off; unset turns off for ngram and other non-EAGLE drafters, a Ray executor, or PP on the V1 runner"
         source: "vllm/config/vllm.py:1545-1644"
         call: vllm-config.resolve-async-scheduling
@@ -806,9 +842,9 @@ interfaces:
     request: EngineCoreClientRequest
     response: EngineCoreClientRequest
     behavior:
-      - if: "has(input.mm_features) && input.mm_features != null && size(input.mm_features) > 0"
+      - if: "(!has(state.mm_receiver_cache) || state.mm_receiver_cache != null) && has(input.mm_features) && input.mm_features != null && size(input.mm_features) > 0"
         then:
-          - title: "mm_receiver_cache.get_and_update_features: store the items P0 sent, fill the ones it left out from the P1 cache (a miss raises MultiModalCacheMissError)"
+          - title: "if self.mm_receiver_cache is not None and request.mm_features: mm_receiver_cache.get_and_update_features: store the items P0 sent, fill the ones it left out from the P1 cache (a miss raises MultiModalCacheMissError)"
             source: "vllm/v1/engine/core.py:1095-1101"
             call: lru-key-replicated-receiver-cache.get-and-update-features
             input: {mm_features: "= input.mm_features"}
@@ -891,7 +927,9 @@ interfaces:
         as: up
       - call: engine-core.get-weight-version
         as: wv
-      - return: {outputs: "= merge(vars.up.value, {'weight_version': vars.wv.value.weight_version})", model_executed: "= vars.so.value.total_num_scheduled_tokens > 0", batch_queue_len: 0}
+      - title: "EngineCoreOutputs.__post_init__: timestamp = time.monotonic() when update_from_output builds the step's outputs"
+        source: "vllm/v1/engine/__init__.py:288-290"
+        return: {outputs: "= merge(vars.up.value, {'weight_version': vars.wv.value.weight_version, 'timestamp': double(now_us) / 1000000.0})", model_executed: "= vars.so.value.total_num_scheduled_tokens > 0", batch_queue_len: 0}
 
   - component: engine-core
     name: post-step
@@ -1018,7 +1056,9 @@ interfaces:
               - {table: batch_queue, op: put, key: "= string(1000000000 + seq('batch'))", value: {scheduler_output: "= vars.deferred", model_output: "= vars.dsmp.value"}, if_absent: true}
       - call: engine-core.get-weight-version
         as: wv
-      - return: {outputs: "= merge(vars.up.value, {'weight_version': vars.wv.value.weight_version})", model_executed: "= vars.executed", batch_queue_len: "= size(state.batch_queue)"}
+      - title: "EngineCoreOutputs.__post_init__: timestamp = time.monotonic() when update_from_output builds the step's outputs"
+        source: "vllm/v1/engine/__init__.py:288-290"
+        return: {outputs: "= merge(vars.up.value, {'weight_version': vars.wv.value.weight_version, 'timestamp': double(now_us) / 1000000.0})", model_executed: "= vars.executed", batch_queue_len: "= size(state.batch_queue)"}
 
   - component: engine-core
     name: finish-pause

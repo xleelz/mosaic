@@ -52,13 +52,16 @@ interfaces:
     kind: function
     summary: "create_chat_completion: render, compute max_tokens and the sampling params, then the full generator (await AsyncLLM.generate) or the SSE generator (iterate it)."
     sources: ["vllm/entrypoints/openai/chat_completion/serving.py:281-431"]
-    request: {type: object, properties: {body: {$ref: ServingChatCompletionRequest}, x_request_id: {type: [string, "null"], examples: [req-1]}}, required: [body]}
+    request: {type: object, properties: {body: {$ref: ServingChatCompletionRequest}, x_request_id: {type: [string, "null"], examples: [req-1]}, priority_header: {type: [string, "null"], default: null, description: "the X-Vllm-Priority request header"}}, required: [body]}
     behavior:
       - title: "The body is parsed into a ChatCompletionRequest first; its model validators refuse inconsistent fields"
         source: "vllm/entrypoints/openai/chat_completion/api_router.py:41-60"
         call: openai-serving-chat.validate-request
         input: {body: "= input.body"}
         as: parsed
+      - title: "arrival_time = time.time() is taken when rendering starts (render_chat), so TTFT and e2e latency include the chat template and tokenization; it rides on the engine request"
+        source: "vllm/renderers/base.py:1296"
+        set: {vars.arrival_time: "= double(now) / 1000.0"}
       - call: openai-serving-chat.render-chat-request
         input: {body: "= vars.parsed.value.body"}
         as: r
@@ -96,8 +99,12 @@ interfaces:
         call: base-serving.maybe-get-adapters
         input: {model: "= has(vars.body.model) ? vars.body.model : ''"}
         as: lora
+      - title: "_get_priority: an X-Vllm-Priority header that int() parses wins over the body's priority; an unparsable one is ignored"
+        source: "vllm/entrypoints/generate/base/serving.py:257-269"
+        set:
+          vars.priority: "= has(input.priority_header) && input.priority_header != null && input.priority_header.matches('^\\\\s*[-+]?[0-9]+\\\\s*$') ? int(input.priority_header.trim()) : (has(vars.body.priority) && vars.body.priority != null ? vars.body.priority : 0)"
       - set:
-          vars.engine_req: "= merge(merge({'request_id': vars.request_id, 'prompt_token_ids': vars.r.value.prompt_token_ids, 'sampling_params': vars.sp.value, 'priority': has(vars.body.priority) && vars.body.priority != null ? vars.body.priority : 0}, merge(vars.r.value.multi_modal_data != null ? {'multi_modal_data': vars.r.value.multi_modal_data} : {}, vars.r.value.prompt_embeds != null ? {'prompt_embeds': vars.r.value.prompt_embeds} : {})), merge(vars.lora.value.lora_request != null ? {'lora_request': vars.lora.value.lora_request} : {}, has(vars.body.cache_salt) && vars.body.cache_salt != null ? {'cache_salt': vars.body.cache_salt} : {}))"
+          vars.engine_req: "= merge(merge({'request_id': vars.request_id, 'prompt_token_ids': vars.r.value.prompt_token_ids, 'sampling_params': vars.sp.value, 'priority': vars.priority, 'arrival_time': vars.arrival_time}, merge(vars.r.value.multi_modal_data != null ? {'multi_modal_data': vars.r.value.multi_modal_data} : {}, vars.r.value.prompt_embeds != null ? {'prompt_embeds': vars.r.value.prompt_embeds} : {})), merge(vars.lora.value.lora_request != null ? {'lora_request': vars.lora.value.lora_request} : {}, has(vars.body.cache_salt) && vars.body.cache_salt != null ? {'cache_salt': vars.body.cache_salt} : {}))"
       - if: "has(vars.body.stream) && vars.body.stream == true"
         then:
           - title: "stream=true: the SSE generator iterates engine_client.generate itself, one chunk per engine output"
@@ -133,7 +140,7 @@ interfaces:
             source: "vllm/entrypoints/openai/chat_completion/serving.py:317-319"
             fail: "= merge(error, {'data': merge(has(error.data) && error.data != null ? error.data : {}, {'request_id': vars.request_id})})"
       - call: openai-serving-chat.chat-completion-full-generator
-        input: {request_id: "= vars.request_id", model_name: "= vars.r.value.model_name", output: "= vars.gen.value", final: "= has(vars.final) ? vars.final : null", prompt_len: "= size(vars.r.value.prompt_token_ids)", body: "= vars.body", parser: "= vars.pc.value.parser_class == null ? null : vars.pc.value"}
+        input: {request_id: "= vars.request_id", model_name: "= vars.r.value.model_name", output: "= vars.gen.value", final: "= has(vars.final) ? vars.final : null", prompt_len: "= size(vars.r.value.prompt_token_ids)", mm_token_counts: "= has(vars.r.value.mm_token_counts) ? vars.r.value.mm_token_counts : null", body: "= vars.body", parser: "= vars.pc.value.parser_class == null ? null : vars.pc.value"}
         as: full
       - return: "= vars.full.value"
   - component: openai-serving-chat
@@ -141,7 +148,7 @@ interfaces:
     kind: function
     summary: "chat_completion_full_generator: take the final RequestOutput, and for each sample (n) raise on finish_reason error, run the reasoning and tool parsers and build a choice with finish_reason, stop_reason and logprobs; then the ChatCompletionResponse with usage."
     sources: ["vllm/entrypoints/openai/chat_completion/serving.py:935-1206"]
-    request: {type: object, properties: {request_id: {type: string}, model_name: {type: string}, output: {$ref: EngineCoreGenerateResult}, final: {type: [object, "null"], default: null}, prompt_len: {type: integer}, body: {type: object}, parser: {type: [object, "null"], default: null}}, required: [output]}
+    request: {type: object, properties: {request_id: {type: string}, model_name: {type: string}, output: {$ref: EngineCoreGenerateResult}, final: {type: [object, "null"], default: null}, prompt_len: {type: integer}, mm_token_counts: {type: [object, "null"], default: null}, body: {type: object}, parser: {type: [object, "null"], default: null}}, required: [output]}
     behavior:
       - set:
           vars.prompt_tokens: "= has(input.prompt_len) ? input.prompt_len : 0"
@@ -211,24 +218,49 @@ interfaces:
                   vars.text: "= vars.rp.value.content == null ? '' : vars.rp.value.content"
           - title: "Auto tool choice with a tool parser: extract tool calls from the content"
             source: "vllm/entrypoints/openai/chat_completion/serving.py:1053-1090"
-            if: "!vars.engine_parser && config['enable-auto-tool-choice'] && ('tool-call-parser' in config) && config['tool-call-parser'] == 'llama3_json' && has(vars.body.tools) && vars.body.tools != null && size(vars.body.tools) > 0 && (!has(vars.body.tool_choice) || vars.body.tool_choice == null || vars.body.tool_choice != 'none')"
+            if: "!vars.engine_parser && config['enable-auto-tool-choice'] && ('tool-call-parser' in config) && config['tool-call-parser'] in ['llama3_json', 'hermes', 'qwen3_json'] && has(vars.body.tools) && vars.body.tools != null && size(vars.body.tools) > 0 && (!has(vars.body.tool_choice) || vars.body.tool_choice == null || vars.body.tool_choice != 'none')"
             then:
-              - call: llama3-json-tool-parser.extract-tool-calls
-                input: {model_output: "= vars.text"}
-                as: tc
+              - if: "config['tool-call-parser'] == 'llama3_json'"
+                then:
+                  - call: llama3-json-tool-parser.extract-tool-calls
+                    input: {model_output: "= vars.text"}
+                    as: tcl
+                  - set: {vars.tcv: "= vars.tcl.value"}
+                else:
+                  - call: hermes2-pro-tool-parser.extract-tool-calls
+                    input: {model_output: "= vars.text"}
+                    as: tch
+                  - set: {vars.tcv: "= vars.tch.value"}
+              - set: {vars.tc: "= {'value': vars.tcv}"}
               - set:
                   vars.tool_calls: "= vars.tc.value.tool_calls"
                   vars.text: "= vars.tc.value.content == null ? '' : vars.tc.value.content"
-          - title: "logprobs=true: _create_chat_logprobs serializes each sampled token's logprob (null when the engine returned none)"
+          - set: {vars.lp: null}
+          - title: "logprobs=true: _create_chat_logprobs over the output's token ids and per-position logprob dicts, with top_logprobs (a missing logprobs list raises in the code; the model leaves logprobs null)"
             source: "vllm/entrypoints/openai/chat_completion/serving.py:980-995"
-            set:
-              vars.lp: "= has(vars.body.logprobs) && vars.body.logprobs == true && vars.out.logprobs != null ? dyn({'content': vars.out.logprobs}) : dyn(null)"
+            if: "has(vars.body.logprobs) && vars.body.logprobs == true && vars.out.logprobs != null"
+            then:
+              - call: openai-serving-chat.create-chat-logprobs
+                input: {token_ids: "= vars.out.token_ids", logprobs: "= vars.out.logprobs", top_logprobs: "= has(vars.body.top_logprobs) && vars.body.top_logprobs != null ? vars.body.top_logprobs : 0"}
+                as: clp
+              - set: {vars.lp: "= vars.clp.value"}
           - title: "ChatCompletionResponseChoice: tool calls give finish_reason tool_calls, a missing finish_reason reports stop; stop_reason is the engine's (the matched stop string or stop token id, null for EOS or length)"
             source: "vllm/entrypoints/openai/chat_completion/serving.py:1111-1130"
             set:
               vars.choices: "= vars.choices + [{'index': vars.out.index, 'message': {'role': 'assistant', 'content': (size(vars.tool_calls) > 0 && vars.text == '') || (vars.content_none && size(vars.tool_calls) == 0) ? null : vars.text, 'reasoning': vars.reasoning, 'tool_calls': vars.tool_calls}, 'logprobs': vars.lp, 'finish_reason': size(vars.tool_calls) > 0 ? 'tool_calls' : (vars.out.finish_reason == null ? 'stop' : vars.out.finish_reason), 'stop_reason': vars.out.stop_reason}]"
       - set:
           vars.completion_tokens: "= sum(vars.outs.map(o, size(o.token_ids)))"
+      - title: "self.system_fingerprint (computed once when the serving class is built) is stamped on the full response"
+        source: "vllm/entrypoints/openai/chat_completion/serving.py:1192-1199"
+        call: system-fingerprint.build-system-fingerprint
+        as: fp
+      - title: "_make_prompt_tokens_details: only with --enable-prompt-tokens-details; cached_tokens is the final output's num_cached_tokens, multimodal_tokens the per-modality placeholder lengths; None when every count is None"
+        source: "vllm/entrypoints/openai/chat_completion/serving.py:90-109"
+        set:
+          vars.cached: "= has(input.final) && input.final != null && has(input.final.num_cached_tokens) ? dyn(input.final.num_cached_tokens) : (has(input.output.num_cached_tokens) ? dyn(input.output.num_cached_tokens) : null)"
+          vars.mm_counts: "= has(input.mm_token_counts) && input.mm_token_counts != null && size(input.mm_token_counts) > 0 ? dyn(input.mm_token_counts) : null"
+      - set:
+          vars.ptd: "= !config['enable-prompt-tokens-details'] || (vars.cached == null && vars.mm_counts == null) ? dyn(null) : dyn({'cached_tokens': vars.cached, 'created_cache_tokens': null, 'multimodal_tokens': vars.mm_counts})"
       - title: "UsageInfo: completion tokens over every sample; total = prompt + completion"
         source: "vllm/entrypoints/openai/chat_completion/serving.py:1153-1165"
         return:
@@ -236,11 +268,13 @@ interfaces:
           object: chat.completion
           created: "= now / 1000"
           model: "= input.model_name"
+          system_fingerprint: "= vars.fp.value.system_fingerprint"
           choices: "= vars.choices"
           usage:
             prompt_tokens: "= vars.prompt_tokens"
             completion_tokens: "= vars.completion_tokens"
             total_tokens: "= vars.prompt_tokens + vars.completion_tokens"
+            prompt_tokens_details: "= vars.ptd"
   - component: openai-serving-chat
     name: chat-completion-stream-generator
     kind: function
@@ -271,6 +305,10 @@ interfaces:
           vars.events: []
           vars.n: 0
           vars.tokens: 0
+      - call: system-fingerprint.build-system-fingerprint
+        as: fp
+      - set:
+          vars.fp_on_finish: "= !(has(input.include_usage) && input.include_usage) && vars.fp.value.system_fingerprint != null"
       - title: "async for res in result_generator: one delta chunk per engine output; the last carries finish_reason"
         source: "vllm/entrypoints/openai/chat_completion/serving.py:526-805"
         call: async-llm.generate
@@ -302,6 +340,10 @@ interfaces:
             source: "vllm/entrypoints/openai/chat_completion/serving.py:780-829"
             set:
               vars.chunk: "= merge({'id': input.request_id, 'object': 'chat.completion.chunk', 'created': now / 1000, 'model': input.model_name, 'choices': [merge({'index': 0, 'delta': vars.delta, 'logprobs': null, 'finish_reason': has(vars.item.finished) && vars.item.finished ? (has(vars.item.finish_reason) && vars.item.finish_reason != null ? vars.item.finish_reason : 'stop') : null}, has(vars.item.finished) && vars.item.finished ? {'stop_reason': has(vars.item.stop_reason) ? vars.item.stop_reason : null} : {})]}, vars.cont ? {'usage': {'prompt_tokens': vars.plen, 'completion_tokens': vars.tokens, 'total_tokens': vars.plen + vars.tokens}} : {})"
+          - title: "The fingerprint goes on terminal chunks only (finish_reason set), and not at all when include_usage puts it on the usage chunk"
+            source: "vllm/entrypoints/openai/chat_completion/serving.py:802-811"
+            if: "vars.fp_on_finish && has(vars.item.finished) && vars.item.finished"
+            then: [{set: {vars.chunk: "= merge(vars.chunk, {'system_fingerprint': vars.fp.value.system_fingerprint})"}}]
           - set: {vars.events: "= vars.events + [vars.chunk]"}
           - {yield: "= vars.chunk"}
         on_error:
@@ -347,6 +389,8 @@ interfaces:
           - set:
               vars.chunk: "= {'id': input.request_id, 'object': 'chat.completion.chunk', 'created': now / 1000, 'model': input.model_name, 'choices': [{'index': 0, 'delta': {'content': vars.gen.value.text}, 'finish_reason': vars.gen.value.finish_reason == null ? 'stop' : vars.gen.value.finish_reason}]}"
               vars.tokens: "= size(vars.gen.value.token_ids)"
+          - if: "vars.fp_on_finish"
+            then: [{set: {vars.chunk: "= merge(vars.chunk, {'system_fingerprint': vars.fp.value.system_fingerprint})"}}]
           - set: {vars.events: "= vars.events + [vars.chunk]"}
           - {yield: "= vars.chunk"}
       - title: stream_options.include_usage adds a final usage chunk
@@ -354,6 +398,10 @@ interfaces:
         if: "input.include_usage"
         then:
           - set: {vars.usage: "= {'id': input.request_id, 'object': 'chat.completion.chunk', 'created': now / 1000, 'model': input.model_name, 'choices': [], 'usage': {'prompt_tokens': has(input.prompt_len) ? input.prompt_len : 0, 'completion_tokens': vars.tokens, 'total_tokens': (has(input.prompt_len) ? input.prompt_len : 0) + vars.tokens}}"}
+          - title: "final_usage_chunk carries system_fingerprint (dropped by exclude_none when it is None)"
+            source: "vllm/entrypoints/openai/chat_completion/serving.py:879-891"
+            if: "vars.fp.value.system_fingerprint != null"
+            then: [{set: {vars.usage: "= merge(vars.usage, {'system_fingerprint': vars.fp.value.system_fingerprint})"}}]
           - set: {vars.events: "= vars.events + [vars.usage]"}
           - {yield: "= vars.usage"}
       - title: "data: [DONE]"
@@ -539,11 +587,25 @@ interfaces:
       - title: "echo: max_tokens 0 returns the prompt text and ids alone; otherwise the prompt text precedes the output (completion_tokens still count only the generated ids)"
         source: "vllm/entrypoints/openai/completion/serving.py:534-557"
         set:
-          vars.flat: "= vars.outs_sorted.map(o, (o.value.final != null && has(o.value.final.completions) ? o.value.final.completions.map(c, {'text': c.text, 'token_ids': c.token_ids, 'finish_reason': c.finish_reason, 'stop_reason': has(c.stop_reason) ? c.stop_reason : null}) : [{'text': o.value.text, 'token_ids': o.value.token_ids, 'finish_reason': o.value.finish_reason, 'stop_reason': null}]).map(c, merge(c, {'prompt': has(vars.r.value.engine_inputs[o.index].prompt) && vars.r.value.engine_inputs[o.index].prompt != null ? vars.r.value.engine_inputs[o.index].prompt : ''}))).flatten()"
+          vars.flat: "= vars.outs_sorted.map(o, (o.value.final != null && has(o.value.final.completions) ? o.value.final.completions.map(c, {'text': c.text, 'token_ids': c.token_ids, 'finish_reason': c.finish_reason, 'stop_reason': has(c.stop_reason) ? c.stop_reason : null, 'logprobs': has(c.logprobs) ? c.logprobs : null}) : [{'text': o.value.text, 'token_ids': o.value.token_ids, 'finish_reason': o.value.finish_reason, 'stop_reason': null, 'logprobs': null}]).map(c, merge(c, {'prompt': has(vars.r.value.engine_inputs[o.index].prompt) && vars.r.value.engine_inputs[o.index].prompt != null ? vars.r.value.engine_inputs[o.index].prompt : ''}))).flatten()"
       - set:
           vars.choices: "= lists.range(size(vars.flat)).map(i, {'index': i, 'text': vars.echo ? (vars.body.max_tokens == 0 ? vars.flat[i].prompt : vars.flat[i].prompt + vars.flat[i].text) : vars.flat[i].text, 'logprobs': null, 'finish_reason': vars.flat[i].finish_reason, 'stop_reason': vars.flat[i].stop_reason})"
           vars.prompt_tokens: "= sum(vars.r.value.engine_inputs.map(e, size(e.prompt_token_ids)))"
           vars.completion_tokens: "= sum(vars.flat.map(c, size(c.token_ids)))"
+      - title: "request.logprobs is not None: _create_completion_logprobs per choice (top logprobs + 1 per position; with echo the offsets start after the prompt text)"
+        source: "vllm/entrypoints/openai/completion/serving.py:557-575"
+        if: "has(vars.body.logprobs) && vars.body.logprobs != null"
+        then:
+          - foreach: "= lists.range(size(vars.flat))"
+            as: ci
+            max: 64
+            steps:
+              - if: "vars.flat[vars.ci].logprobs != null"
+                then:
+                  - call: openai-serving-completion.create-completion-logprobs
+                    input: {token_ids: "= vars.flat[vars.ci].token_ids", logprobs: "= vars.flat[vars.ci].logprobs", num_logprobs: "= vars.body.logprobs", initial_text_offset: "= vars.echo && vars.flat[vars.ci].prompt != null ? size(vars.flat[vars.ci].prompt) : 0"}
+                    as: clp
+                  - set: {vars.choices: "= lists.range(size(vars.choices)).map(k, k == vars.ci ? merge(vars.choices[k], {'logprobs': vars.clp.value}) : vars.choices[k])"}
       - if: "has(vars.body.stream) && vars.body.stream"
         then:
           - title: completion_stream_generator -- text chunks then [DONE]
@@ -579,11 +641,15 @@ interfaces:
     behavior:
       - set:
           vars.served: "= config['served-model-name'] != null ? config['served-model-name'] : [config['model']]"
+      - title: "ModelCard / ModelPermission defaults: created int(time.time()), parent None, one permission each (modelperm-<uuid>, sampling and logprobs allowed, no engine creation or fine-tuning, organization *)"
+        source: "vllm/entrypoints/serve/engine/protocol.py:88-112"
+        set:
+          vars.perm: "= {'object': 'model_permission', 'created': now / 1000, 'allow_create_engine': false, 'allow_sampling': true, 'allow_logprobs': true, 'allow_search_indices': false, 'allow_view': true, 'allow_fine_tuning': false, 'organization': '*', 'group': null, 'is_blocking': false}"
       - title: Base model cards, then LoRA cards parented to the first base model
         source: "vllm/entrypoints/openai/models/serving.py:153-164"
         return:
           object: list
-          data: "= vars.served.map(n, {'id': n, 'object': 'model', 'owned_by': 'vllm', 'root': config['model'], 'max_model_len': config['max-model-len']}) + state.lora_requests.map(k, {'id': k, 'object': 'model', 'owned_by': 'vllm', 'root': state.lora_requests[k].lora_path, 'parent': vars.served[0]})"
+          data: "= vars.served.map(n, {'id': n, 'object': 'model', 'created': now / 1000, 'owned_by': 'vllm', 'root': config['model'], 'parent': null, 'max_model_len': config['max-model-len'], 'permission': [merge(vars.perm, {'id': 'modelperm-' + id('random-uuid', seq('random-uuid'))})]}) + state.lora_requests.map(k, {'id': k, 'object': 'model', 'created': now / 1000, 'owned_by': 'vllm', 'root': state.lora_requests[k].lora_path, 'parent': vars.served[0], 'max_model_len': null, 'permission': [merge(vars.perm, {'id': 'modelperm-' + id('random-uuid', seq('random-uuid'))})]})"
   - component: openai-serving-models
     name: load-lora-adapter
     kind: function
@@ -668,7 +734,7 @@ interfaces:
         source: "vllm/entrypoints/openai/responses/serving.py:352-359"
         set:
           vars.store: "= vars.store_req && config['vllm-enable-responses-api-store']"
-          vars.rid: "= has(input.body.request_id) ? input.body.request_id : 'resp_' + string(state.seq + 1)"
+          vars.rid: "= has(input.body.request_id) && input.body.request_id != null ? input.body.request_id : 'resp_' + string(state.seq + 1)"
           state.seq: "= state.seq + 1"
       - set:
           vars.prev_messages: null
@@ -733,10 +799,10 @@ interfaces:
             fail: "= error"
       - call: generate-base-serving.raise-if-error
         input: {finish_reason: "= vars.gen.value.finish_reason", request_id: "= input.rid"}
-      - title: completed is the catch-all; length gives incomplete
+      - title: "completed is the catch-all; length gives incomplete; ResponsesResponse.from_request adds incomplete_details (reason max_output_tokens) and max_output_tokens = sampling_params.max_tokens"
         source: "vllm/entrypoints/openai/responses/serving.py:775-842"
         set:
-          vars.response: "= {'id': input.rid, 'object': 'response', 'status': vars.gen.value.finish_reason == 'length' ? 'incomplete' : 'completed', 'model': input.model_name, 'output': [{'type': 'message', 'role': 'assistant', 'status': 'completed', 'content': [{'type': 'output_text', 'text': vars.gen.value.text}]}], 'usage': {'input_tokens': size(input.prompt_token_ids), 'output_tokens': size(vars.gen.value.token_ids)}}"
+          vars.response: "= {'id': input.rid, 'object': 'response', 'created_at': now / 1000, 'status': vars.gen.value.finish_reason == 'length' ? 'incomplete' : 'completed', 'incomplete_details': vars.gen.value.finish_reason == 'length' ? dyn({'reason': 'max_output_tokens'}) : dyn(null), 'max_output_tokens': has(input.max_tokens) ? input.max_tokens : null, 'model': input.model_name, 'output': [{'type': 'message', 'role': 'assistant', 'status': 'completed', 'content': [{'type': 'output_text', 'text': vars.gen.value.text}]}], 'usage': {'input_tokens': size(input.prompt_token_ids), 'output_tokens': size(vars.gen.value.token_ids)}}"
       - if: "input.store && (!(input.rid in state.response_store) || state.response_store[input.rid].status != 'cancelled')"
         then:
           - title: Store the response unless it was cancelled meanwhile
@@ -801,7 +867,7 @@ interfaces:
     kind: function
     summary: "create_tokenize: a TokenizeChatRequest (messages; its validator refuses continue_final_message with add_generation_prompt) goes through preprocess_chat with its own template flags and tools; a TokenizeCompletionRequest through preprocess_completion. Both build TokenizeParams with max_total_tokens=None, so no length check; returns tokens, count and max_model_len."
     sources: ["vllm/entrypoints/serve/tokenize/serving.py:57-124", "vllm/entrypoints/serve/tokenize/protocol.py:20-148"]
-    request: {type: object, properties: {body: {type: object, properties: {model: {type: string, examples: [llama-8b]}, prompt: {type: string, examples: [Hello world]}, messages: {type: [array, "null"], items: {type: object}}, add_generation_prompt: {type: boolean}, continue_final_message: {type: boolean}, add_special_tokens: {type: boolean}, return_token_strs: {type: [boolean, "null"]}, chat_template: {type: [string, "null"]}, tools: {type: [array, "null"], items: {type: object}}}}}, required: [body]}
+    request: {type: object, properties: {body: {type: object, properties: {model: {type: string, examples: [llama-8b]}, prompt: {type: string, examples: [Hello world]}, messages: {type: [array, "null"], items: {type: object}}, add_generation_prompt: {type: boolean}, continue_final_message: {type: boolean}, add_special_tokens: {type: [boolean, "null"], description: "null: the request type's default (true for a prompt, false for messages)"}, return_token_strs: {type: [boolean, "null"]}, chat_template: {type: [string, "null"]}, tools: {type: [array, "null"], items: {type: object}}}}}, required: [body]}
     errors: [{code: vllm-validation-error, status: 0, retryable: false}]
     behavior:
       - set:
@@ -889,62 +955,6 @@ interfaces:
       - source: "vllm/entrypoints/anthropic/serving.py:1253-1266"
         return: {input_tokens: "= size(vars.r.value.prompt_token_ids)", context_management: {original_input_tokens: "= size(vars.r.value.prompt_token_ids)"}}
   # ------------------------------------------------------------------ pooling
-  - component: pooling-base-serving
-    name: serve
-    kind: function
-    summary: "PoolingBaseServing.__call__: model check, preprocessing, one encode per input (merged), collect with error mapping, build the response."
-    sources: ["vllm/entrypoints/pooling/base/serving.py:65-220"]
-    request: {type: object, properties: {task: {type: string, examples: [embed]}, prefix: {type: string, examples: [embd]}, body: {type: object, properties: {model: {type: string, examples: [llama-8b]}, input: {type: array, items: {type: string}, default: [hello world]}}}, x_request_id: {type: [string, "null"]}}, required: [task, body]}
-    errors: [{code: value-error, status: 0}, {code: generation-error, status: 0}]
-    behavior:
-      - call: base-serving.check-model
-        input: {model: "= has(input.body.model) ? input.body.model : ''"}
-        as: model
-      - set:
-          vars.inputs: "= type(input.body.input) == string ? [input.body.input] : input.body.input"
-          vars.request_id: "= input.prefix + '-' + (has(input.x_request_id) && input.x_request_id != null ? input.x_request_id : id('random-uuid', seq('random-uuid')))"
-      - if: "size(vars.inputs) == 0"
-        then: [{source: "vllm/entrypoints/pooling/base/serving.py:83-85", fail: {code: value-error, message: You must pass at least one prompt}}]
-      - title: One encode per input, merged (merge_async_iterators)
-        source: "vllm/entrypoints/pooling/base/serving.py:134-180"
-        parallel: "= vars.inputs"
-        as: text
-        steps:
-          - call: base-renderer.tokenize-prompt
-            input: {prompt: "= vars.text"}
-            as: tok
-          - call: async-llm.encode
-            input: {request_id: "= vars.request_id + '-' + string(vars.index)", prompt_token_ids: "= vars.tok.value.prompt_token_ids", pooling_params: {task: "= input.task"}}
-            as: e
-            on_error: continue
-          - return: "= {'error': vars.e.ok ? null : vars.e.error, 'data': !vars.e.ok || vars.e.value == null || !has(vars.e.value.outputs) ? [] : vars.e.value.outputs.data, 'prompt_tokens': size(vars.tok.value.prompt_token_ids)}"
-        join: {need: all}
-        as_result: outs
-        on_insufficient: {code: generation-error}
-      - title: The first exception out of merge_async_iterators propagates (a validation error stays a 400)
-        source: "vllm/entrypoints/pooling/base/serving.py:189-200"
-        foreach: "= vars.outs.results"
-        as: o
-        max: 16
-        steps:
-          - if: "vars.o.value.error != null"
-            then: [{fail: "= vars.o.value.error"}]
-      - title: "Each PoolingRequestOutput carries the pooled data and its prompt token ids (usage counts them)"
-        source: "vllm/outputs.py:280-319"
-        set:
-          vars.ptoks: "= sum(vars.outs.results.map(r, r.value.prompt_tokens))"
-      - if: "input.task == 'pooling'"
-        then:
-          - title: "PoolingResponse: id pool-<id>, object list, one PoolingResponseData per input"
-            source: "vllm/entrypoints/pooling/pooling/protocol.py:108-114"
-            return: {id: "= vars.request_id", object: list, created: "= now / 1000", model: "= vars.model.value.model_name", data: "= vars.outs.results.map(r, {'index': r.index, 'object': 'pooling', 'data': r.value.data})", usage: {prompt_tokens: "= vars.ptoks", total_tokens: "= vars.ptoks"}}
-      - return:
-          id: "= vars.request_id"
-          object: list
-          created: "= now / 1000"
-          model: "= vars.model.value.model_name"
-          data: "= vars.outs.results.map(r, {'index': r.index, 'object': input.task == 'embed' ? 'embedding' : input.task, 'embedding': r.value.data})"
-          usage: {prompt_tokens: "= vars.ptoks", total_tokens: "= vars.ptoks"}
   # ------------------------------------------------------------------ health and basic
   - component: instrumentator-health
     name: get-health

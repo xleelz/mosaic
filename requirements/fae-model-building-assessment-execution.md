@@ -7,7 +7,7 @@
 | Scope | The execution model only: fan-out, branches, sub-workflows, messages, resumes, concurrency caps, quota pauses, read isolation, file ownership and long runs. Artifact formats, gate content and UI are out of scope. |
 | Builds on | `requirements/fae-hierarchical-workflows.md` (2026-11-01) and `requirements/fae-host-workflow-limit.md` (2026-10-30) |
 | New proposals | FAE-RT-020 to -022, FAE-SEC-010, FAE-OPS-040 to -042, FAE-SCH-030 to -032, FAE-WF-110 and -111 |
-| Updated proposals | FAE-WF-095, FAE-WF-096, FAE-WF-097, FAE-WF-102, FAE-SCH-023 |
+| Updated proposals | FAE-WF-097, FAE-WF-098, FAE-WF-099, FAE-WF-104, FAE-SCH-024 |
 
 Every claim cites the fae working tree as `path:line`. Paths are relative to `~/workplace/fae`
 unless they start with `mosaic/`. Nothing in fae was edited, built or run for this assessment.
@@ -31,7 +31,7 @@ The fan-out gaps found on 2026-11-01 are all still present. None of the files in
 changed since 2026-10-31 (`workflow/fan.go`, `workflow/subworkflow.go`, `engine/subworkflow.go`,
 `daemon/subworkflow.go`, `daemon/rpc.go`). The fae work since then went into Linear/Symphony intake
 (`symphony/`, `daemon/linear_sync.go`), the terminal UI and cleanup. None of the host-workflow-limit
-proposals (FAE-SCH-015 to -022) is implemented: a search of `*.go` and `*.md` for workflow slots,
+proposals (FAE-SCH-016 to -022) is implemented: a search of `*.go` and `*.md` for workflow slots,
 `workflow-limit` and `host_capacity` found nothing.
 
 ### Top blockers
@@ -78,7 +78,7 @@ only part of the need is met), **Missing**.
 | Fan-out width decided at run time | **Missing** in a template. **Partly** through a controller | `workflow/fan.go:147-148` (2 to 16 branches); `workflow/GRAMMAR.md:230`. Batch admission of items with blocking edges: `daemon/backlog.go:29-33`, `REQUIREMENTS.md:1080-1088` (FAE-CLI-014) | The mosaic coordinator, acting as a controller, can admit one task per area. The width then lives in the controller, not in the workflow, so `workflow simulate` can't see it. |
 | Fan-out branches run in parallel | **Missing** inside a FanOut. **Supported** across tasks | Sequential: `engine/README.md:213-214`, `workflow/GRAMMAR.md:251`, `HANDOFF.md:287`. Still only planned: `HANDOFF.md:1649`. Across tasks: tasks in flight are unbounded by default (`REQUIREMENTS.md:582`), and each round dispatches every eligible stage (`REQUIREMENTS.md:602`) | One task keeps one dispatch in flight, so parallelism has to come from separate tasks. |
 | A fan-out branch can hold a SubWorkflow | **Missing** | `workflow/fan.go:191-192` | Unchanged since 2026-10-23. |
-| A fan-out branch can produce changes | **Missing** (new finding) | `workflow/fan.go:194-195`: "a fan-out branch holds no change producers" | Even with parallel branches, area agents (which write fragments) couldn't sit in one. FAE-WF-096 is updated below. |
+| A fan-out branch can produce changes | **Missing** (new finding) | `workflow/fan.go:194-195`: "a fan-out branch holds no change producers" | Even with parallel branches, area agents (which write fragments) couldn't sit in one. FAE-WF-098 is updated below. |
 | Nesting deeper than 4; a workflow selecting itself | **Missing** | `daemon/subworkflow.go:18`, `daemon/subworkflow.go:35-36`; `workflow/subworkflow.go:30-31` | Unchanged. |
 | `Admit` takes a parent | **Missing** | `daemon/rpc.go:20-53` has no parent field | Unchanged. Only SubWorkflow children get parent links. |
 | Template parameters or typed inputs | **Missing**. **Partly** through task classes | `daemon/rpc.go:36` (`Content`, free text), `daemon/rpc.go:42-52` (`TaskClass`, `DeclaredFiles`, test fields); task-class overlays change effort and briefs only (`workflow/GRAMMAR.md:67-72`) | The area id, profile path and round number would travel as free text. |
@@ -104,7 +104,7 @@ only part of the need is met), **Missing**.
 | File ownership per agent | **Supported** | Edits only to files in scope (`provider/README.md:126-131`). Per-task declared files at admission (`daemon/rpc.go:47-52`; `LIVE.md:66-75`). Changes to declared files apply from the next dispatch (`HANDOFF.md:42`) | Fits mosaic's disjoint `fragments/<area>.yaml`, `notes/<area>.md` and `skips/<area>*.json`. Edits are allowed only in `test-first` and `implement` stages (`provider/README.md:126-129`), so an area turn must be declared an implementing change producer. Paths under `.claude/` are protected (`LIVE.md:103`). Mosaic's agents only run the `mcheck` script there and don't edit it. |
 | Long runs (hours per round, 45 min per turn) | **Partly** | Durable plane and stage-aware resume (`REQUIREMENTS.md:771`). The bridge `--timeout` defaults to 5 min and is set once per bridge command (`cmd/fae-claude-bridge/main.go:22`). Agent-start bound 180 s (`provider/start_bound.go:14`). Loops expire after 7 days (`REQUIREMENTS.md:689`) | A multi-hour task graph is fine. The turn timeout can't differ per role (45 min for a build, 15 min for a judge). Nothing counts turns, because a turn is a single reply. |
 | Coordinator acts as a controller | **Supported** | Authenticated RPC, events, backlog admission, edges, reprioritize, cancel (`HANDOFF.md:23`; `REQUIREMENTS.md:966-985`) | Every mutating verb needs an authorizing operator message id. |
-| Artifact-only (non-commit) workflows | **Partly** | Non-code-bearing task classes skip the RED floor (`workflow/GRAMMAR.md:67-72`). Landing gates are Go-only (`HANDOFF.md:1626`) | See the FAE-WF-102 update. |
+| Artifact-only (non-commit) workflows | **Partly** | Non-code-bearing task classes skip the RED floor (`workflow/GRAMMAR.md:67-72`). Landing gates are Go-only (`HANDOFF.md:1626`) | See the FAE-WF-104 update. |
 
 **Tally (25 rows):**
 
@@ -174,7 +174,7 @@ B1 to B3 make the round impossible. B4 to B10 make it lossy or manual.
 
 These are written in REQUIREMENTS.md's form. The IDs avoid fae's current maxima (WF-094, SCH-014,
 RT-014, SEC-007, OPS-032, API-033, CLI-054) and the ranges already proposed in `mosaic/requirements/`
-(WF-095 to -104, SCH-015 to -023, API-034 to -036, CLI-044, -055, -056). They are spaced (WF-110,
+(WF-097 to -106, SCH-016 to -024, API-034 to -036, CLI-044, -055, -056). They are spaced (WF-110,
 SCH-030, RT-020, OPS-040, SEC-010) so that sibling assessments can take the IDs right after the
 existing ranges.
 
@@ -373,14 +373,14 @@ in an instance-level store.
 
 ### 3.2 Updates to existing proposals
 
-**FAE-WF-095 (update to `fae-hierarchical-workflows.md`).** Append:
+**FAE-WF-097 (update to `fae-hierarchical-workflows.md`).** Append:
 - Each list element MAY carry per-branch `declared_files` and a read policy (FAE-SEC-010). They
   bind the branch instance's write and read scope.
 - The validator MUST refuse a branch template whose write scope isn't parameterized by the item, so
   that branch instances can't share writable files.
 - *Rationale:* mosaic's areas each own disjoint files named by the area id.
 
-**FAE-WF-096 (update).** Replace the limit that branches hold no change producers
+**FAE-WF-098 (update).** Replace the limit that branches hold no change producers
 (`workflow/fan.go:194-195`), for `parallel: true` FanOuts whose branch write scopes are disjoint:
 - each branch instance MAY hold change producers, runs in its own worktree forked at the visit's
   tree, and commits to its own ref;
@@ -392,17 +392,17 @@ branch order.
 - *Rationale:* area agents are change producers, so parallel branches without changes don't cover
   mosaic's main fan-out.
 
-**FAE-WF-097 (update).** Append: a SubWorkflow inside a parallel branch draws its sessions from the
-parent's provider pool (FAE-SCH-030) and counts in the parent's footprint (FAE-SCH-019), so that N
+**FAE-WF-099 (update).** Append: a SubWorkflow inside a parallel branch draws its sessions from the
+parent's provider pool (FAE-SCH-030) and counts in the parent's footprint (FAE-SCH-020), so that N
 children can't exceed the provider cap.
 
-**FAE-WF-102 (update).** Append: tasks of a `produces: artifacts` template land through
+**FAE-WF-104 (update).** Append: tasks of a `produces: artifacts` template land through
 HostCommand gates the template declares, with no `go test`, formatter or RED evidence floors and no
 test-filter syntax. Their gates assert `exit_code == 0` on a named HostCommand without
 `executed_count` (`workflow/GRAMMAR.md:25` applies to test-run evidence only).
 - *Rationale:* landing gates are still Go-only (`HANDOFF.md:1626`).
 
-**FAE-SCH-023 (update).** Add a `cap_scope` value `pool:<id>`. The role's cap is then enforced
+**FAE-SCH-024 (update).** Add a `cap_scope` value `pool:<id>`. The role's cap is then enforced
 against the provider pool (FAE-SCH-030) shared across workflow ids, rather than against a
 per-workflow pool.
 
@@ -415,8 +415,8 @@ per-workflow pool.
 2. FAE-SCH-030 and FAE-SCH-031: the shared cap and quota pauses that every long run hits.
 3. FAE-RT-021, FAE-RT-022, FAE-OPS-040 and FAE-OPS-041: budgets, checkpoints, live messages and
    follow-ups.
-4. FAE-WF-110 and the FAE-WF-102 update: joint accept, and artifact landing.
-5. FAE-WF-095 to -097 as updated: in-template dynamic, parallel and change-producing fan-out. Until
+4. FAE-WF-110 and the FAE-WF-104 update: joint accept, and artifact landing.
+5. FAE-WF-097 to -097 as updated: in-template dynamic, parallel and change-producing fan-out. Until
    then, a controller-admitted task graph (section 2) covers the fan-out.
 
 Until then, mosaic keeps running rounds with its own coordinator and `mosaic compose`

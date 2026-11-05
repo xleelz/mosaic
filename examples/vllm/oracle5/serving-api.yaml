@@ -1,0 +1,577 @@
+schema_version: 1
+id: vllm
+scenarios:
+- id: oracle-serving-api-llm-reranker-nonbinding-doc-limit
+  name: A max_tokens_per_doc that does not bind leaves the pair's token ids unchanged
+  description: 'tests/entrypoints/pooling/scoring/test_io_processor_unit.py:66 test_llm_reranker_tokenization_is_independent_of_nonbinding_doc_limit:
+    the prompt_token_ids equality between the uncapped and the nonbinding call.'
+  fixtures:
+  - full-tp1-llama-8b
+  state: &id001
+    app-state:
+      supported_tasks:
+      - classify
+      - token_classify
+    async-llm:
+      supported_tasks:
+      - classify
+      - token_classify
+  config: &id002
+    max-model-len: 100
+    model: BAAI/bge-reranker-v2-gemma
+    runner: pooling
+    served-model-name:
+    - BAAI/bge-reranker-v2-gemma
+    hf-overrides:
+      architectures:
+      - GemmaForSequenceClassification
+      classifier_from_token:
+      - 'Yes'
+      method: no_post_processing
+  steps:
+  - interface: serving-scores.post-rerank
+    caller: api-client
+    as: uncapped
+    input:
+      path: /rerank
+      body:
+        model: BAAI/bge-reranker-v2-gemma
+        query: a
+        documents:
+        - bc
+  - interface: serving-scores.post-rerank
+    caller: api-client
+    as: nonbinding
+    input:
+      path: /rerank
+      body:
+        model: BAAI/bge-reranker-v2-gemma
+        query: a
+        documents:
+        - bc
+        max_tokens_per_doc: 10
+  expect:
+  - steps.uncapped.result.ok && steps.nonbinding.result.ok
+  - trace.filter(e, e.type == 'call.start' && e.interface == 'base-renderer.tokenize-prompt').size() == 2 && trace.filter(e,
+    e.type == 'call.start' && e.interface == 'base-renderer.tokenize-prompt')[0].input.prompt == trace.filter(e, e.type ==
+    'call.start' && e.interface == 'base-renderer.tokenize-prompt')[1].input.prompt
+  - trace.filter(e, e.type == 'call.end' && e.interface == 'base-renderer.tokenize-prompt')[0].output.prompt_token_ids ==
+    trace.filter(e, e.type == 'call.end' && e.interface == 'base-renderer.tokenize-prompt')[1].output.prompt_token_ids
+  - steps.uncapped.result.value.usage.prompt_tokens == steps.nonbinding.result.value.usage.prompt_tokens
+  - trace.filter(e, e.type == 'call.end' && e.interface == 'scoring-io-processor.truncate-text-to-tokens').size() == 1
+  - trace.filter(e, e.type == 'call.end' && e.interface == 'scoring-io-processor.truncate-text-to-tokens')[0].output.text
+    == 'bc'
+- id: oracle-serving-api-llm-reranker-pair-no-separator
+  name: 'use_sep_token False (LLM as reranker): the tokenizer gets prompt_1 + prompt_2 with no separator, one sequence ''abc'''
+  description: 'tests/entrypoints/pooling/scoring/test_io_processor_unit.py:66 test_llm_reranker_tokenization_is_independent_of_nonbinding_doc_limit:
+    expected ids [1,3,5,6,2] are [CLS] a ##b ##c [SEP], which only the concatenation ''abc'' yields (''a bc'' would be [1,3,4,2]).
+    The ids themselves are tokenizer internals; the text handed to the tokenizer is the control-level claim. The test sets
+    use_sep_token False by hand; in production adapters.py:443 defaults it to False for as_seq_cls_model LLMs.'
+  fixtures:
+  - full-tp1-llama-8b
+  state: *id001
+  config: *id002
+  steps:
+  - interface: serving-scores.post-rerank
+    caller: api-client
+    as: uncapped
+    input:
+      path: /rerank
+      body:
+        model: BAAI/bge-reranker-v2-gemma
+        query: a
+        documents:
+        - bc
+  - interface: serving-scores.post-rerank
+    caller: api-client
+    as: nonbinding
+    input:
+      path: /rerank
+      body:
+        model: BAAI/bge-reranker-v2-gemma
+        query: a
+        documents:
+        - bc
+        max_tokens_per_doc: 10
+  expect:
+  - trace.filter(e, e.type == 'call.start' && e.interface == 'base-renderer.tokenize-prompt').size() == 2
+  - trace.filter(e, e.type == 'call.start' && e.interface == 'base-renderer.tokenize-prompt')[0].input.prompt == 'abc'
+  - trace.filter(e, e.type == 'call.start' && e.interface == 'base-renderer.tokenize-prompt')[1].input.prompt == 'abc'
+- id: oracle-serving-api-harmony-previous-input-empty-content
+  name: A previous_input_messages user message with empty content becomes exactly one Harmony message with one empty text
+    part
+  description: 'tests/entrypoints/openai/responses/test_harmony_utils.py:26 TestResponsePreviousInputToHarmony.test_message_with_empty_content:
+    driven through POST /v1/responses on a gpt_oss model (online_renderer.py:429 -> construct_harmony_previous_input_messages
+    -> response_previous_input_to_harmony).'
+  fixtures:
+  - full-tp1-llama-8b
+  config:
+    model: openai/gpt-oss-20b
+    served-model-name:
+    - openai/gpt-oss-20b
+    hf-overrides:
+      model_type: gpt_oss
+  steps:
+  - interface: openai-serving-responses.post-v1-responses
+    caller: api-client
+    as: r
+    input:
+      path: /v1/responses
+      body:
+        model: openai/gpt-oss-20b
+        input: hi
+        max_output_tokens: 4
+        previous_input_messages:
+        - role: user
+          content: ''
+  expect:
+  - steps.r.result.ok
+  - trace.exists(e, e.type == 'call.start' && !e.interface.startsWith('openai-serving-responses.') && json(e.input).contains('"content":""')
+    && json(e.input).contains('"role":"user"'))
+- id: oracle-serving-api-cohere-streaming-3-single-tool-call
+  name: 'cohere_command3, single-tool-call: streamed parse_delta accumulates the expected tool calls'
+  description: tests/parser/cohere/test_tool_calls.py:180 TestExtractToolCalls.test_streaming [cohere_command3-single-tool-call].
+    CohereCommandParser.parse_delta is the code under test; delegating-parser.parse-delta is the only streaming parser interface
+    the model has, given the class ParserManager resolved.
+  fixtures:
+  - full-tp1-llama-8b
+  steps:
+  - interface: parser-manager.get-parser
+    caller: api-server
+    as: pm
+    input:
+      tool_parser_name: cohere_command3
+      reasoning_parser_name: cohere_command3
+      enable_auto_tools: true
+  - interface: delegating-parser.parse-delta
+    caller: api-server
+    as: d1
+    input:
+      parser: = steps.pm.result.value
+      delta_text: "<|START_THINKING|> i will call foo with query1<|END_THINKING|><|START_ACTION|>\n[\n    {\"to"
+      previous_text: ''
+      finished: false
+  - interface: delegating-parser.parse-delta
+    caller: api-server
+    as: d2
+    input:
+      parser: = steps.pm.result.value
+      delta_text: 'ol_call_id": "0", "tool_name": "foo", "parameters": {"query": "query1"}}
+
+        ]
+
+        <|END_ACTION|>'
+      previous_text: "<|START_THINKING|> i will call foo with query1<|END_THINKING|><|START_ACTION|>\n[\n    {\"to"
+      finished: true
+  expect:
+  - steps.pm.result.value.base == 'CohereCommandParser'
+  - steps.d1.result.ok && steps.d2.result.ok
+  - 'size((steps.d1.result.value.delta == null || !has(steps.d1.result.value.delta.tool_calls) ? [] : steps.d1.result.value.delta.tool_calls)
+    + (steps.d2.result.value.delta == null || !has(steps.d2.result.value.delta.tool_calls) ? [] : steps.d2.result.value.delta.tool_calls))
+    == 1'
+  - '((steps.d1.result.value.delta == null || !has(steps.d1.result.value.delta.tool_calls) ? [] : steps.d1.result.value.delta.tool_calls)
+    + (steps.d2.result.value.delta == null || !has(steps.d2.result.value.delta.tool_calls) ? [] : steps.d2.result.value.delta.tool_calls))[0].id
+    == ''0'' && ((steps.d1.result.value.delta == null || !has(steps.d1.result.value.delta.tool_calls) ? [] : steps.d1.result.value.delta.tool_calls)
+    + (steps.d2.result.value.delta == null || !has(steps.d2.result.value.delta.tool_calls) ? [] : steps.d2.result.value.delta.tool_calls))[0].function.name
+    == ''foo'''
+  - 'jsonParse(((steps.d1.result.value.delta == null || !has(steps.d1.result.value.delta.tool_calls) ? [] : steps.d1.result.value.delta.tool_calls)
+    + (steps.d2.result.value.delta == null || !has(steps.d2.result.value.delta.tool_calls) ? [] : steps.d2.result.value.delta.tool_calls))[0].function.arguments)
+    == {''query'': ''query1''}'
+- id: oracle-serving-api-cohere-streaming-3-citations-no-tool-calls
+  name: 'cohere_command3, citations-no-tool-calls: streamed parse_delta accumulates the expected tool calls'
+  description: tests/parser/cohere/test_tool_calls.py:180 TestExtractToolCalls.test_streaming [cohere_command3-citations-no-tool-calls].
+    CohereCommandParser.parse_delta is the code under test; delegating-parser.parse-delta is the only streaming parser interface
+    the model has, given the class ParserManager resolved.
+  fixtures:
+  - full-tp1-llama-8b
+  steps:
+  - interface: parser-manager.get-parser
+    caller: api-server
+    as: pm
+    input:
+      tool_parser_name: cohere_command3
+      reasoning_parser_name: cohere_command3
+      enable_auto_tools: true
+  - interface: delegating-parser.parse-delta
+    caller: api-server
+    as: d1
+    input:
+      parser: = steps.pm.result.value
+      delta_text: '<|START_THINKING|>This is a rainbow <co>emoji: 🌈</co: 0:[1]><|END_THINKI'
+      previous_text: ''
+      finished: false
+  - interface: delegating-parser.parse-delta
+    caller: api-server
+    as: d2
+    input:
+      parser: = steps.pm.result.value
+      delta_text: 'NG|>
+
+        <|START_RESPONSE|>foo <co>bar</co: 0:[1,2],1:[3,4]><|END_RESPONSE|>'
+      previous_text: '<|START_THINKING|>This is a rainbow <co>emoji: 🌈</co: 0:[1]><|END_THINKI'
+      finished: true
+  expect:
+  - steps.pm.result.value.base == 'CohereCommandParser'
+  - steps.d1.result.ok && steps.d2.result.ok
+  - 'size((steps.d1.result.value.delta == null || !has(steps.d1.result.value.delta.tool_calls) ? [] : steps.d1.result.value.delta.tool_calls)
+    + (steps.d2.result.value.delta == null || !has(steps.d2.result.value.delta.tool_calls) ? [] : steps.d2.result.value.delta.tool_calls))
+    == 0'
+- id: oracle-serving-api-cohere-streaming-3-multiple-tool-calls
+  name: 'cohere_command3, multiple-tool-calls: streamed parse_delta accumulates the expected tool calls'
+  description: tests/parser/cohere/test_tool_calls.py:180 TestExtractToolCalls.test_streaming [cohere_command3-multiple-tool-calls].
+    CohereCommandParser.parse_delta is the code under test; delegating-parser.parse-delta is the only streaming parser interface
+    the model has, given the class ParserManager resolved.
+  fixtures:
+  - full-tp1-llama-8b
+  steps:
+  - interface: parser-manager.get-parser
+    caller: api-server
+    as: pm
+    input:
+      tool_parser_name: cohere_command3
+      reasoning_parser_name: cohere_command3
+      enable_auto_tools: true
+  - interface: delegating-parser.parse-delta
+    caller: api-server
+    as: d1
+    input:
+      parser: = steps.pm.result.value
+      delta_text: "<|START_THINKING|>first I think about foo<|END_THINKING|><|START_ACTION|>\n[\n    {\"tool_call_id\": \"\
+        0\", \"tool_name\": \"foo\", "
+      previous_text: ''
+      finished: false
+  - interface: delegating-parser.parse-delta
+    caller: api-server
+    as: d2
+    input:
+      parser: = steps.pm.result.value
+      delta_text: "\"parameters\": {\"query\": \"query1\"}},\n    {\"tool_call_id\": \"1\", \"tool_name\": \"bar\", \"parameters\"\
+        : {\"x\": 42}}\n]\n<|END_ACTION|>"
+      previous_text: "<|START_THINKING|>first I think about foo<|END_THINKING|><|START_ACTION|>\n[\n    {\"tool_call_id\"\
+        : \"0\", \"tool_name\": \"foo\", "
+      finished: true
+  expect:
+  - steps.pm.result.value.base == 'CohereCommandParser'
+  - steps.d1.result.ok && steps.d2.result.ok
+  - 'size((steps.d1.result.value.delta == null || !has(steps.d1.result.value.delta.tool_calls) ? [] : steps.d1.result.value.delta.tool_calls)
+    + (steps.d2.result.value.delta == null || !has(steps.d2.result.value.delta.tool_calls) ? [] : steps.d2.result.value.delta.tool_calls))
+    == 2'
+  - '((steps.d1.result.value.delta == null || !has(steps.d1.result.value.delta.tool_calls) ? [] : steps.d1.result.value.delta.tool_calls)
+    + (steps.d2.result.value.delta == null || !has(steps.d2.result.value.delta.tool_calls) ? [] : steps.d2.result.value.delta.tool_calls))[0].id
+    == ''0'' && ((steps.d1.result.value.delta == null || !has(steps.d1.result.value.delta.tool_calls) ? [] : steps.d1.result.value.delta.tool_calls)
+    + (steps.d2.result.value.delta == null || !has(steps.d2.result.value.delta.tool_calls) ? [] : steps.d2.result.value.delta.tool_calls))[0].function.name
+    == ''foo'''
+  - 'jsonParse(((steps.d1.result.value.delta == null || !has(steps.d1.result.value.delta.tool_calls) ? [] : steps.d1.result.value.delta.tool_calls)
+    + (steps.d2.result.value.delta == null || !has(steps.d2.result.value.delta.tool_calls) ? [] : steps.d2.result.value.delta.tool_calls))[0].function.arguments)
+    == {''query'': ''query1''}'
+  - '((steps.d1.result.value.delta == null || !has(steps.d1.result.value.delta.tool_calls) ? [] : steps.d1.result.value.delta.tool_calls)
+    + (steps.d2.result.value.delta == null || !has(steps.d2.result.value.delta.tool_calls) ? [] : steps.d2.result.value.delta.tool_calls))[1].id
+    == ''1'' && ((steps.d1.result.value.delta == null || !has(steps.d1.result.value.delta.tool_calls) ? [] : steps.d1.result.value.delta.tool_calls)
+    + (steps.d2.result.value.delta == null || !has(steps.d2.result.value.delta.tool_calls) ? [] : steps.d2.result.value.delta.tool_calls))[1].function.name
+    == ''bar'''
+  - 'jsonParse(((steps.d1.result.value.delta == null || !has(steps.d1.result.value.delta.tool_calls) ? [] : steps.d1.result.value.delta.tool_calls)
+    + (steps.d2.result.value.delta == null || !has(steps.d2.result.value.delta.tool_calls) ? [] : steps.d2.result.value.delta.tool_calls))[1].function.arguments)
+    == {''x'': 42}'
+- id: oracle-serving-api-cohere-streaming-3-reasoning-only
+  name: 'cohere_command3, reasoning-only: streamed parse_delta accumulates the expected tool calls'
+  description: tests/parser/cohere/test_tool_calls.py:180 TestExtractToolCalls.test_streaming [cohere_command3-reasoning-only].
+    CohereCommandParser.parse_delta is the code under test; delegating-parser.parse-delta is the only streaming parser interface
+    the model has, given the class ParserManager resolved.
+  fixtures:
+  - full-tp1-llama-8b
+  steps:
+  - interface: parser-manager.get-parser
+    caller: api-server
+    as: pm
+    input:
+      tool_parser_name: cohere_command3
+      reasoning_parser_name: cohere_command3
+      enable_auto_tools: true
+  - interface: delegating-parser.parse-delta
+    caller: api-server
+    as: d1
+    input:
+      parser: = steps.pm.result.value
+      delta_text: <|START_THINKING|>just think
+      previous_text: ''
+      finished: false
+  - interface: delegating-parser.parse-delta
+    caller: api-server
+    as: d2
+    input:
+      parser: = steps.pm.result.value
+      delta_text: ', no response<|END_THINKING|>'
+      previous_text: <|START_THINKING|>just think
+      finished: true
+  expect:
+  - steps.pm.result.value.base == 'CohereCommandParser'
+  - steps.d1.result.ok && steps.d2.result.ok
+  - 'size((steps.d1.result.value.delta == null || !has(steps.d1.result.value.delta.tool_calls) ? [] : steps.d1.result.value.delta.tool_calls)
+    + (steps.d2.result.value.delta == null || !has(steps.d2.result.value.delta.tool_calls) ? [] : steps.d2.result.value.delta.tool_calls))
+    == 0'
+- id: oracle-serving-api-cohere-streaming-4-single-tool-call
+  name: 'cohere_command4, single-tool-call: streamed parse_delta accumulates the expected tool calls'
+  description: tests/parser/cohere/test_tool_calls.py:180 TestExtractToolCalls.test_streaming [cohere_command4-single-tool-call].
+    CohereCommandParser.parse_delta is the code under test; delegating-parser.parse-delta is the only streaming parser interface
+    the model has, given the class ParserManager resolved.
+  fixtures:
+  - full-tp1-llama-8b
+  steps:
+  - interface: parser-manager.get-parser
+    caller: api-server
+    as: pm
+    input:
+      tool_parser_name: cohere_command4
+      reasoning_parser_name: cohere_command4
+      enable_auto_tools: true
+  - interface: delegating-parser.parse-delta
+    caller: api-server
+    as: d1
+    input:
+      parser: = steps.pm.result.value
+      delta_text: "<|START_THINKING|> i will call foo with query1<|END_THINKING|><|START_ACTION|>\n[\n    {\"to"
+      previous_text: ''
+      finished: false
+  - interface: delegating-parser.parse-delta
+    caller: api-server
+    as: d2
+    input:
+      parser: = steps.pm.result.value
+      delta_text: 'ol_call_id": "0", "tool_name": "foo", "parameters": {"query": "query1"}}
+
+        ]
+
+        <|END_ACTION|>'
+      previous_text: "<|START_THINKING|> i will call foo with query1<|END_THINKING|><|START_ACTION|>\n[\n    {\"to"
+      finished: true
+  expect:
+  - steps.pm.result.value.base == 'CohereCommandParser'
+  - steps.d1.result.ok && steps.d2.result.ok
+  - 'size((steps.d1.result.value.delta == null || !has(steps.d1.result.value.delta.tool_calls) ? [] : steps.d1.result.value.delta.tool_calls)
+    + (steps.d2.result.value.delta == null || !has(steps.d2.result.value.delta.tool_calls) ? [] : steps.d2.result.value.delta.tool_calls))
+    == 1'
+  - '((steps.d1.result.value.delta == null || !has(steps.d1.result.value.delta.tool_calls) ? [] : steps.d1.result.value.delta.tool_calls)
+    + (steps.d2.result.value.delta == null || !has(steps.d2.result.value.delta.tool_calls) ? [] : steps.d2.result.value.delta.tool_calls))[0].id
+    == ''0'' && ((steps.d1.result.value.delta == null || !has(steps.d1.result.value.delta.tool_calls) ? [] : steps.d1.result.value.delta.tool_calls)
+    + (steps.d2.result.value.delta == null || !has(steps.d2.result.value.delta.tool_calls) ? [] : steps.d2.result.value.delta.tool_calls))[0].function.name
+    == ''foo'''
+  - 'jsonParse(((steps.d1.result.value.delta == null || !has(steps.d1.result.value.delta.tool_calls) ? [] : steps.d1.result.value.delta.tool_calls)
+    + (steps.d2.result.value.delta == null || !has(steps.d2.result.value.delta.tool_calls) ? [] : steps.d2.result.value.delta.tool_calls))[0].function.arguments)
+    == {''query'': ''query1''}'
+- id: oracle-serving-api-cohere-streaming-4-citations-no-tool-calls
+  name: 'cohere_command4, citations-no-tool-calls: streamed parse_delta accumulates the expected tool calls'
+  description: tests/parser/cohere/test_tool_calls.py:180 TestExtractToolCalls.test_streaming [cohere_command4-citations-no-tool-calls].
+    CohereCommandParser.parse_delta is the code under test; delegating-parser.parse-delta is the only streaming parser interface
+    the model has, given the class ParserManager resolved.
+  fixtures:
+  - full-tp1-llama-8b
+  steps:
+  - interface: parser-manager.get-parser
+    caller: api-server
+    as: pm
+    input:
+      tool_parser_name: cohere_command4
+      reasoning_parser_name: cohere_command4
+      enable_auto_tools: true
+  - interface: delegating-parser.parse-delta
+    caller: api-server
+    as: d1
+    input:
+      parser: = steps.pm.result.value
+      delta_text: '<|START_THINKING|>This is a rainbow <co>emoji: 🌈</co: 0:[1]><|END_TH'
+      previous_text: ''
+      finished: false
+  - interface: delegating-parser.parse-delta
+    caller: api-server
+    as: d2
+    input:
+      parser: = steps.pm.result.value
+      delta_text: 'INKING|>
+
+        <|START_TEXT|>foo <co>bar</co: 0:[1,2],1:[3,4]><|END_TEXT|>'
+      previous_text: '<|START_THINKING|>This is a rainbow <co>emoji: 🌈</co: 0:[1]><|END_TH'
+      finished: true
+  expect:
+  - steps.pm.result.value.base == 'CohereCommandParser'
+  - steps.d1.result.ok && steps.d2.result.ok
+  - 'size((steps.d1.result.value.delta == null || !has(steps.d1.result.value.delta.tool_calls) ? [] : steps.d1.result.value.delta.tool_calls)
+    + (steps.d2.result.value.delta == null || !has(steps.d2.result.value.delta.tool_calls) ? [] : steps.d2.result.value.delta.tool_calls))
+    == 0'
+- id: oracle-serving-api-cohere-streaming-4-multiple-tool-calls
+  name: 'cohere_command4, multiple-tool-calls: streamed parse_delta accumulates the expected tool calls'
+  description: tests/parser/cohere/test_tool_calls.py:180 TestExtractToolCalls.test_streaming [cohere_command4-multiple-tool-calls].
+    CohereCommandParser.parse_delta is the code under test; delegating-parser.parse-delta is the only streaming parser interface
+    the model has, given the class ParserManager resolved.
+  fixtures:
+  - full-tp1-llama-8b
+  steps:
+  - interface: parser-manager.get-parser
+    caller: api-server
+    as: pm
+    input:
+      tool_parser_name: cohere_command4
+      reasoning_parser_name: cohere_command4
+      enable_auto_tools: true
+  - interface: delegating-parser.parse-delta
+    caller: api-server
+    as: d1
+    input:
+      parser: = steps.pm.result.value
+      delta_text: "<|START_THINKING|>first I think about foo<|END_THINKING|><|START_ACTION|>\n[\n    {\"tool_call_id\": \"\
+        0\", \"tool_name\": \"foo\", "
+      previous_text: ''
+      finished: false
+  - interface: delegating-parser.parse-delta
+    caller: api-server
+    as: d2
+    input:
+      parser: = steps.pm.result.value
+      delta_text: "\"parameters\": {\"query\": \"query1\"}},\n    {\"tool_call_id\": \"1\", \"tool_name\": \"bar\", \"parameters\"\
+        : {\"x\": 42}}\n]\n<|END_ACTION|>"
+      previous_text: "<|START_THINKING|>first I think about foo<|END_THINKING|><|START_ACTION|>\n[\n    {\"tool_call_id\"\
+        : \"0\", \"tool_name\": \"foo\", "
+      finished: true
+  expect:
+  - steps.pm.result.value.base == 'CohereCommandParser'
+  - steps.d1.result.ok && steps.d2.result.ok
+  - 'size((steps.d1.result.value.delta == null || !has(steps.d1.result.value.delta.tool_calls) ? [] : steps.d1.result.value.delta.tool_calls)
+    + (steps.d2.result.value.delta == null || !has(steps.d2.result.value.delta.tool_calls) ? [] : steps.d2.result.value.delta.tool_calls))
+    == 2'
+  - '((steps.d1.result.value.delta == null || !has(steps.d1.result.value.delta.tool_calls) ? [] : steps.d1.result.value.delta.tool_calls)
+    + (steps.d2.result.value.delta == null || !has(steps.d2.result.value.delta.tool_calls) ? [] : steps.d2.result.value.delta.tool_calls))[0].id
+    == ''0'' && ((steps.d1.result.value.delta == null || !has(steps.d1.result.value.delta.tool_calls) ? [] : steps.d1.result.value.delta.tool_calls)
+    + (steps.d2.result.value.delta == null || !has(steps.d2.result.value.delta.tool_calls) ? [] : steps.d2.result.value.delta.tool_calls))[0].function.name
+    == ''foo'''
+  - 'jsonParse(((steps.d1.result.value.delta == null || !has(steps.d1.result.value.delta.tool_calls) ? [] : steps.d1.result.value.delta.tool_calls)
+    + (steps.d2.result.value.delta == null || !has(steps.d2.result.value.delta.tool_calls) ? [] : steps.d2.result.value.delta.tool_calls))[0].function.arguments)
+    == {''query'': ''query1''}'
+  - '((steps.d1.result.value.delta == null || !has(steps.d1.result.value.delta.tool_calls) ? [] : steps.d1.result.value.delta.tool_calls)
+    + (steps.d2.result.value.delta == null || !has(steps.d2.result.value.delta.tool_calls) ? [] : steps.d2.result.value.delta.tool_calls))[1].id
+    == ''1'' && ((steps.d1.result.value.delta == null || !has(steps.d1.result.value.delta.tool_calls) ? [] : steps.d1.result.value.delta.tool_calls)
+    + (steps.d2.result.value.delta == null || !has(steps.d2.result.value.delta.tool_calls) ? [] : steps.d2.result.value.delta.tool_calls))[1].function.name
+    == ''bar'''
+  - 'jsonParse(((steps.d1.result.value.delta == null || !has(steps.d1.result.value.delta.tool_calls) ? [] : steps.d1.result.value.delta.tool_calls)
+    + (steps.d2.result.value.delta == null || !has(steps.d2.result.value.delta.tool_calls) ? [] : steps.d2.result.value.delta.tool_calls))[1].function.arguments)
+    == {''x'': 42}'
+- id: oracle-serving-api-cohere-streaming-4-reasoning-only
+  name: 'cohere_command4, reasoning-only: streamed parse_delta accumulates the expected tool calls'
+  description: tests/parser/cohere/test_tool_calls.py:180 TestExtractToolCalls.test_streaming [cohere_command4-reasoning-only].
+    CohereCommandParser.parse_delta is the code under test; delegating-parser.parse-delta is the only streaming parser interface
+    the model has, given the class ParserManager resolved.
+  fixtures:
+  - full-tp1-llama-8b
+  steps:
+  - interface: parser-manager.get-parser
+    caller: api-server
+    as: pm
+    input:
+      tool_parser_name: cohere_command4
+      reasoning_parser_name: cohere_command4
+      enable_auto_tools: true
+  - interface: delegating-parser.parse-delta
+    caller: api-server
+    as: d1
+    input:
+      parser: = steps.pm.result.value
+      delta_text: <|START_THINKING|>just think
+      previous_text: ''
+      finished: false
+  - interface: delegating-parser.parse-delta
+    caller: api-server
+    as: d2
+    input:
+      parser: = steps.pm.result.value
+      delta_text: ', no response<|END_THINKING|>'
+      previous_text: <|START_THINKING|>just think
+      finished: true
+  expect:
+  - steps.pm.result.value.base == 'CohereCommandParser'
+  - steps.d1.result.ok && steps.d2.result.ok
+  - 'size((steps.d1.result.value.delta == null || !has(steps.d1.result.value.delta.tool_calls) ? [] : steps.d1.result.value.delta.tool_calls)
+    + (steps.d2.result.value.delta == null || !has(steps.d2.result.value.delta.tool_calls) ? [] : steps.d2.result.value.delta.tool_calls))
+    == 0'
+- id: oracle-serving-api-cohere-stream-flow-3
+  name: '--tool-call-parser cohere_command3 --reasoning-parser cohere_command3: a streamed chat goes through the Cohere parser''s
+    parse_delta'
+  description: 'tests/parser/cohere/test_tool_calls.py:180 TestExtractToolCalls.test_streaming integration form: chat_completion/serving.py
+    makes the resolved parser and calls parse_delta per output; the model''s stream generator gates parsing on Inkling classes
+    only.'
+  fixtures:
+  - full-tp1-llama-8b
+  config:
+    enable-auto-tool-choice: true
+    reasoning-parser: cohere_command3
+    tool-call-parser: cohere_command3
+    worker-runner-natural-output-tokens-base: 3
+    worker-runner-natural-output-tokens-spread: 1
+  steps:
+  - flow: serving-api-chat-stream
+    as: s
+    input:
+      body:
+        max_tokens: 8
+        stream: true
+        tools:
+        - &id003
+          type: function
+          function:
+            name: foo
+            parameters:
+              type: object
+  expect:
+  - steps.s.result.ok
+  - trace.exists(e, e.type == 'call.end' && e.interface == 'parser-manager.get-parser' && e.output.base == 'CohereCommandParser')
+  - trace.exists(e, e.type == 'call.start' && (e.interface == 'delegating-parser.parse-delta' || e.interface == 'cohere-command-parser.parse-delta'))
+- id: oracle-serving-api-cohere-stream-flow-4
+  name: '--tool-call-parser cohere_command4 --reasoning-parser cohere_command4: a streamed chat goes through the Cohere parser''s
+    parse_delta'
+  description: 'tests/parser/cohere/test_tool_calls.py:180 TestExtractToolCalls.test_streaming integration form: chat_completion/serving.py
+    makes the resolved parser and calls parse_delta per output; the model''s stream generator gates parsing on Inkling classes
+    only.'
+  fixtures:
+  - full-tp1-llama-8b
+  config:
+    enable-auto-tool-choice: true
+    reasoning-parser: cohere_command4
+    tool-call-parser: cohere_command4
+    worker-runner-natural-output-tokens-base: 3
+    worker-runner-natural-output-tokens-spread: 1
+  steps:
+  - flow: serving-api-chat-stream
+    as: s
+    input:
+      body:
+        max_tokens: 8
+        stream: true
+        tools:
+        - *id003
+  expect:
+  - steps.s.result.ok
+  - trace.exists(e, e.type == 'call.end' && e.interface == 'parser-manager.get-parser' && e.output.base == 'CohereCommandParser')
+  - trace.exists(e, e.type == 'call.start' && (e.interface == 'delegating-parser.parse-delta' || e.interface == 'cohere-command-parser.parse-delta'))
+- id: oracle-serving-api-embeddings-float-observable-json-array
+  name: 'The observable effect around encode_pooling_output_float_or_ndarray: an embedding response carries a numeric vector
+    per prompt'
+  description: 'tests/entrypoints/pooling/test_utils.py:19 test_encode_pooling_output_float_or_ndarray_returns_numpy_array:
+    the ndarray return type and allclose values are below the model; this scenario only checks the wire-level shape that the
+    helper feeds (embed/serving.py:114-130).'
+  fixtures:
+  - full-tp1-llama-8b
+  state:
+    app-state:
+      supported_tasks:
+      - embed
+    async-llm:
+      supported_tasks:
+      - embed
+  config:
+    runner: pooling
+  steps:
+  - flow: serving-api-embeddings
+    as: emb
+  expect:
+  - steps.emb.result.ok && size(steps.emb.result.value.data) == 1
+  - type(steps.emb.result.value.data[0].embedding) == list
+  - size(steps.emb.result.value.data[0].embedding) > 0
+  - trace.exists(e, e.type == 'call.end' && e.interface == 'async-llm.encode')
+  - steps.emb.result.value.data[0].object == 'embedding'

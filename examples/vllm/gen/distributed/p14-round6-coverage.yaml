@@ -1,0 +1,837 @@
+# distributed area, part 14 (fix round 6, mechanism coverage): MoRIIOConfig.from_vllm_config and
+# the timeout validator feeding the MoRIIO wrapper and writer; the pipeline-parallel point-to-point
+# path of GroupCoordinator (rank properties, send/recv of tensor dicts with the all-gather slice
+# optimization, send/recv of objects); MultiConnector's request_finished and
+# update_connector_output; and parallel startup (the TP 2 process-group setup scenarios).
+schema_version: 1
+id: vllm
+
+configs:
+  - id: vllm-moriio-transfer-timeout-s
+    type: string
+    value: null
+    default: null
+    summary: "VLLM_MORIIO_TRANSFER_TIMEOUT_S (deprecated): read with os.environ.get as the fallback recv_abort_timeout when kv_connector_extra_config has none; unset in every world"
+    sources: ["vllm/distributed/kv_transfer/kv_connector/v1/moriio/moriio_common.py:355-367"]
+    attributes: {key: VLLM_MORIIO_TRANSFER_TIMEOUT_S, env: true}
+
+components:
+  - id: moriio-config
+    name: MoRIIOConfig
+    kind: module
+    layer: kv-transfer
+    parent: moriio-connector-worker
+    summary: "The MoRIIO connector's per-worker configuration, built from kv_connector_extra_config: ports (the notify port offset by DP and TP rank), the backend (rdma or xgmi), the RDMA knobs, and three timeouts that must be finite and positive."
+    sources: ["vllm/distributed/kv_transfer/kv_connector/v1/moriio/moriio_common.py:273-293"]
+
+  - id: transfer-topology
+    name: TransferTopology
+    kind: module
+    layer: kv-transfer
+    parent: gpu-worker
+    summary: "The NIXL/Mooncake connectors' local TP identity and per-remote-engine view for heterogeneous P/D: the TP ratio between the sides, which remote ranks a local rank handshakes with and reads from, how many readers a producer rank waits for, and whether the KV cache is replicated."
+    sources: ["vllm/distributed/kv_transfer/kv_connector/utils.py:428-447"]
+
+fixtures:
+  - id: distributed-tp2-llama-8b
+    summary: "Two H100s (rank0, rank1) serving Llama-3-8B at --tensor-parallel-size 2, for distributed's parallel-startup scenarios (the process-group setup of a TP 2 deployment). Only the distributed components' view: the shared worlds have no dense TP 2 deployment."
+    extends: [tp1-llama-8b]
+    topology: {gpu-worker: [rank0, rank1]}
+    config: {tensor-parallel-size: 2}
+
+interfaces:
+  # ---------------------------------------------------------------- MoRIIO configuration
+  - component: moriio-config
+    name: positive-finite-timeout
+    kind: function
+    latency_ms: 0
+    summary: "_positive_finite_timeout(name, value): float(value), refused unless finite and greater than zero."
+    sources: ["vllm/distributed/kv_transfer/kv_connector/v1/moriio/moriio_common.py:49-53"]
+    request:
+      type: object
+      required: [name, value]
+      properties:
+        name: {type: string, examples: [kv_connector_extra_config.transfer_timeout]}
+        value: {type: [number, string, boolean, "null"], description: "a number, or a string float() parses ('inf', 'nan' and 'infinity' in any case, with a sign, are not finite)", examples: [30]}
+    response: {type: object, properties: {timeout: {type: number}}}
+    errors:
+      - {code: value-error, status: 0, retryable: false}
+      - {code: type-error, status: 0, retryable: false}
+    behavior:
+      - if: "input.value == null"
+        then:
+          - title: float(None)
+            source: "vllm/distributed/kv_transfer/kv_connector/v1/moriio/moriio_common.py:50"
+            fail: {code: type-error, status: 0, message: "float() argument must be a string or a real number, not 'NoneType'"}
+      - if: "type(input.value) == bool"
+        then:
+          - set: {vars.t: "= input.value ? 1.0 : 0.0", vars.finite: true}
+        else:
+          - if: "type(input.value) == string"
+            then:
+              - set: {vars.s: "= input.value.trim().lowerAscii()"}
+              - if: "vars.s.matches('^[+-]?(inf|infinity|nan)$')"
+                then:
+                  - set: {vars.t: 0.0, vars.finite: false}
+                else:
+                  - if: "!vars.s.matches('^[+-]?([0-9]+[.]?[0-9]*|[.][0-9]+)(e[+-]?[0-9]+)?$')"
+                    then:
+                      - title: float() of a string that isn't a number
+                        source: "vllm/distributed/kv_transfer/kv_connector/v1/moriio/moriio_common.py:50"
+                        fail: {code: value-error, status: 0, message: "= \"could not convert string to float: '\" + input.value + \"'\""}
+                  - set: {vars.t: "= double(vars.s)", vars.finite: true}
+            else:
+              - set: {vars.t: "= double(input.value)", vars.finite: true}
+      - if: "!vars.finite || vars.t <= 0.0"
+        then:
+          - source: "vllm/distributed/kv_transfer/kv_connector/v1/moriio/moriio_common.py:51-52"
+            fail: {code: value-error, status: 0, message: "= input.name + ' must be finite and greater than zero'"}
+      - return: {timeout: "= vars.t"}
+
+  - component: moriio-config
+    name: from-vllm-config
+    kind: function
+    latency_ms: 0
+    summary: "MoRIIOConfig.from_vllm_config: fold the DP rank to the pod-local rank, read the notify port, validate the backend (rdma or xgmi), validate transfer_timeout (30 s), defer_timeout (60 s) and recv_abort_timeout (120 s, or the deprecated VLLM_MORIIO_TRANSFER_TIMEOUT_S), then read the HTTP and handshake ports and the RDMA knobs."
+    sources: ["vllm/distributed/kv_transfer/kv_connector/v1/moriio/moriio_common.py:295-407", "vllm/distributed/kv_transfer/kv_connector/v1/moriio/moriio_common.py:205-237", "vllm/distributed/kv_transfer/kv_connector/v1/moriio/moriio_common.py:408-425"]
+    request:
+      type: object
+      properties:
+        extra_config: {type: object, description: "kv_transfer_config.kv_connector_extra_config"}
+        kv_transfer_config_set: {type: boolean, default: true}
+        data_parallel_rank: {type: integer, default: 0}
+        data_parallel_size_local: {type: integer, default: 1}
+        data_parallel_size: {type: integer, default: 1}
+    response:
+      type: object
+      properties:
+        notify_port: {type: integer}
+        http_port: {type: integer}
+        handshake_port: {type: integer}
+        proxy_ip: {type: string}
+        proxy_ping_port: {type: integer}
+        local_ip: {type: [string, "null"], description: "host_ip, else null for get_ip()"}
+        tp_rank: {type: integer}
+        tp_size: {type: integer}
+        dp_rank: {type: integer}
+        dp_size: {type: integer}
+        backend: {type: string}
+        read_mode: {type: boolean}
+        qp_per_transfer: {type: integer}
+        post_batch_size: {type: integer}
+        num_workers: {type: integer}
+        transfer_timeout: {type: number}
+        defer_timeout: {type: number}
+        recv_abort_timeout: {type: number}
+    errors:
+      - {code: assertion-error, status: 0, retryable: false}
+      - {code: key-error, status: 0, retryable: false}
+      - {code: value-error, status: 0, retryable: false}
+      - {code: type-error, status: 0, retryable: false}
+    behavior:
+      - set:
+          vars.args: "= merge({'extra_config': {}, 'kv_transfer_config_set': true, 'data_parallel_rank': 0, 'data_parallel_size_local': 1, 'data_parallel_size': 1}, input)"
+      - if: "!vars.args.kv_transfer_config_set"
+        then:
+          - source: "vllm/distributed/kv_transfer/kv_connector/v1/moriio/moriio_common.py:331-333"
+            fail: {code: assertion-error, status: 0, message: "kv_transfer_config must be set for MoRIIOConnector"}
+      - set: {vars.x: "= vars.args.extra_config"}
+      - call: parallel-state.get-tp-group
+        as: tp
+      - title: "fold_local_rank: the global DP rank modulo data_parallel_size_local (0 = external DP, unchanged)"
+        source: "vllm/distributed/kv_transfer/kv_connector/v1/moriio/moriio_common.py:220-230,340-341"
+        set:
+          vars.dp_rank: "= vars.args.data_parallel_size_local != 0 ? vars.args.data_parallel_rank % vars.args.data_parallel_size_local : vars.args.data_parallel_rank"
+      - if: "!('notify_port' in vars.x)"
+        then:
+          - title: "int(extra_config['notify_port'])"
+            source: "vllm/distributed/kv_transfer/kv_connector/v1/moriio/moriio_common.py:342"
+            fail: {code: key-error, status: 0, message: "'notify_port'"}
+      - title: "get_port_offset(dp_rank, tp_rank) with its default tp_size 1: dp_rank + tp_rank"
+        source: "vllm/distributed/kv_transfer/kv_connector/v1/moriio/moriio_common.py:216-217,344"
+        set:
+          vars.offset: "= vars.dp_rank + vars.tp.value.rank_in_group"
+          vars.backend: "= ('backend' in vars.x && vars.x.backend != null ? string(vars.x.backend) : 'rdma').lowerAscii()"
+      - if: "!(vars.backend in ['rdma', 'xgmi'])"
+        then:
+          - source: "vllm/distributed/kv_transfer/kv_connector/v1/moriio/moriio_common.py:345-350"
+            fail: {code: value-error, status: 0, message: "= \"Invalid MoRIIO backend '\" + vars.backend + \"' in kv_connector_extra_config; must be one of 'rdma' or 'xgmi'.\""}
+      - source: "vllm/distributed/kv_transfer/kv_connector/v1/moriio/moriio_common.py:352-357"
+        call: moriio-config.positive-finite-timeout
+        input: {name: kv_connector_extra_config.transfer_timeout, value: "= 'transfer_timeout' in vars.x ? vars.x.transfer_timeout : 30.0"}
+        as: tt
+      - source: "vllm/distributed/kv_transfer/kv_connector/v1/moriio/moriio_common.py:358-361"
+        call: moriio-config.positive-finite-timeout
+        input: {name: kv_connector_extra_config.defer_timeout, value: "= 'defer_timeout' in vars.x ? vars.x.defer_timeout : 60.0"}
+        as: dt
+      - title: "VLLM_MORIIO_TRANSFER_TIMEOUT_S is deprecated. Set 'recv_abort_timeout' inside kv_transfer_config.kv_connector_extra_config instead."
+        source: "vllm/distributed/kv_transfer/kv_connector/v1/moriio/moriio_common.py:362-368"
+        when: "('vllm-moriio-transfer-timeout-s' in config && config['vllm-moriio-transfer-timeout-s'] != null)"
+      - source: "vllm/distributed/kv_transfer/kv_connector/v1/moriio/moriio_common.py:369-375"
+        call: moriio-config.positive-finite-timeout
+        input:
+          name: kv_connector_extra_config.recv_abort_timeout
+          value: "= 'recv_abort_timeout' in vars.x ? vars.x.recv_abort_timeout : (('vllm-moriio-transfer-timeout-s' in config && config['vllm-moriio-transfer-timeout-s'] != null) && config['vllm-moriio-transfer-timeout-s'] != '' ? config['vllm-moriio-transfer-timeout-s'] : 120.0)"
+        as: rt
+      - if: "!('http_port' in vars.x)"
+        then:
+          - source: "vllm/distributed/kv_transfer/kv_connector/v1/moriio/moriio_common.py:383"
+            fail: {code: key-error, status: 0, message: "'http_port'"}
+      - if: "!('handshake_port' in vars.x)"
+        then:
+          - source: "vllm/distributed/kv_transfer/kv_connector/v1/moriio/moriio_common.py:384"
+            fail: {code: key-error, status: 0, message: "'handshake_port'"}
+      - title: "read_mode: 'true' or '1' (any case); the RDMA knobs default to 1 QP per transfer, post batch -1 (backend's choice), 1 worker"
+        source: "vllm/distributed/kv_transfer/kv_connector/v1/moriio/moriio_common.py:205-213,377-407"
+        return:
+          notify_port: "= int(vars.x.notify_port) + vars.offset"
+          http_port: "= int(vars.x.http_port)"
+          handshake_port: "= int(vars.x.handshake_port)"
+          proxy_ip: "= 'proxy_ip' in vars.x ? string(vars.x.proxy_ip) : ''"
+          proxy_ping_port: "= 'proxy_ping_port' in vars.x ? int(vars.x.proxy_ping_port) : 0"
+          local_ip: "= 'host_ip' in vars.x && vars.x.host_ip != null && vars.x.host_ip != '' ? vars.x.host_ip : null"
+          tp_rank: "= vars.tp.value.rank_in_group"
+          tp_size: "= vars.tp.value.world_size"
+          dp_rank: "= vars.dp_rank"
+          dp_size: "= vars.args.data_parallel_size"
+          backend: "= vars.backend"
+          read_mode: "= 'read_mode' in vars.x && string(vars.x.read_mode).lowerAscii().trim() in ['true', '1']"
+          qp_per_transfer: "= 'qp_per_transfer' in vars.x ? int(vars.x.qp_per_transfer) : 1"
+          post_batch_size: "= 'post_batch_size' in vars.x ? int(vars.x.post_batch_size) : -1"
+          num_workers: "= 'num_workers' in vars.x ? int(vars.x.num_workers) : 1"
+          transfer_timeout: "= vars.tt.value.timeout"
+          defer_timeout: "= vars.dt.value.timeout"
+          recv_abort_timeout: "= vars.rt.value.timeout"
+
+  - component: moriio-connector-worker
+    name: init
+    kind: function
+    latency_ms: 0
+    summary: "MoRIIOConnectorWorker.__init__: requires the mori package, builds MoRIIOConfig (READ or WRITE mode from it), then the wrapper with the transfer timeout and, on a WRITE-mode producer, the writer with the defer timeout."
+    sources: ["vllm/distributed/kv_transfer/kv_connector/v1/moriio/moriio_connector.py:1613-1630", "vllm/distributed/kv_transfer/kv_connector/v1/moriio/moriio_connector.py:1722-1735"]
+    request:
+      type: object
+      properties:
+        engine_id: {type: string, examples: [engine-p0]}
+        extra_config: {type: object}
+        mori_available: {type: boolean, default: true}
+        data_parallel_rank: {type: integer, default: 0}
+    response: {type: object, properties: {mode: {type: string}, transfer_timeout: {type: number}, defer_timeout: {type: number}, recv_abort_timeout: {type: number}}}
+    errors:
+      - {code: runtime-error, status: 0, retryable: false}
+      - {code: value-error, status: 0, retryable: false}
+      - {code: key-error, status: 0, retryable: false}
+      - {code: type-error, status: 0, retryable: false}
+      - {code: assertion-error, status: 0, retryable: false}
+    behavior:
+      - set:
+          vars.args: "= merge({'extra_config': {}, 'mori_available': true, 'data_parallel_rank': 0, 'engine_id': 'engine-p0'}, input)"
+      - if: "!vars.args.mori_available"
+        then:
+          - source: "vllm/distributed/kv_transfer/kv_connector/v1/moriio/moriio_connector.py:1619-1623"
+            fail: {code: runtime-error, status: 0, message: "MoRIIO is not available. Please ensure the 'mori' package is installed and properly configured."}
+      - source: "vllm/distributed/kv_transfer/kv_connector/v1/moriio/moriio_connector.py:1625-1629"
+        call: moriio-config.from-vllm-config
+        input: {extra_config: "= vars.args.extra_config", data_parallel_rank: "= vars.args.data_parallel_rank"}
+        as: cfg
+      - set:
+          state.moriio_config: "= vars.cfg.value"
+          state.mode: "= vars.cfg.value.read_mode ? 'READ' : 'WRITE'"
+      - title: "Initializing MoRIIO worker <engine_id>"
+        source: "vllm/distributed/kv_transfer/kv_connector/v1/moriio/moriio_connector.py:1631"
+      - source: "vllm/distributed/kv_transfer/kv_connector/v1/moriio/moriio_connector.py:1722-1726"
+        call: moriio-wrapper.init
+        input: {transfer_timeout: "= vars.cfg.value.transfer_timeout"}
+      - title: The writer reads the worker's defer_timeout when it is built
+        source: "vllm/distributed/kv_transfer/kv_connector/v1/moriio/moriio_engine.py:85-101"
+        call: moriio-writer.init
+        input: {defer_timeout: "= vars.cfg.value.defer_timeout"}
+      - return: {mode: "= state.mode", transfer_timeout: "= vars.cfg.value.transfer_timeout", defer_timeout: "= vars.cfg.value.defer_timeout", recv_abort_timeout: "= vars.cfg.value.recv_abort_timeout"}
+
+  - component: moriio-wrapper
+    name: init
+    kind: function
+    latency_ms: 0
+    summary: "MoRIIOWrapper.__init__: keeps the transfer timeout that bounds waiting_for_transfer_complete."
+    sources: ["vllm/distributed/kv_transfer/kv_connector/v1/moriio/moriio_engine.py:524-545"]
+    request: {type: object, required: [transfer_timeout], properties: {transfer_timeout: {type: number, examples: [30.0]}}}
+    response: {type: object, properties: {transfer_timeout_ms: {type: integer}}}
+    behavior:
+      - set: {state.transfer_timeout_ms: "= int(input.transfer_timeout * 1000.0)"}
+      - return: {transfer_timeout_ms: "= state.transfer_timeout_ms"}
+
+  - component: moriio-writer
+    name: init
+    kind: function
+    latency_ms: 0
+    summary: "MoRIIOWriter.__init__: takes defer_timeout from the worker's MoRIIOConfig; deferred write tasks older than it are reaped."
+    sources: ["vllm/distributed/kv_transfer/kv_connector/v1/moriio/moriio_engine.py:85-101"]
+    request: {type: object, required: [defer_timeout], properties: {defer_timeout: {type: number, examples: [60.0]}}}
+    response: {type: object, properties: {defer_timeout_ms: {type: integer}}}
+    behavior:
+      - set: {state.defer_timeout_ms: "= int(input.defer_timeout * 1000.0)"}
+      - return: {defer_timeout_ms: "= state.defer_timeout_ms"}
+
+  # ---------------------------------------------------------------- PP point-to-point
+  - component: group-coordinator
+    name: rank-info
+    kind: function
+    latency_ms: 0
+    summary: "GroupCoordinator's rank properties: first_rank/last_rank (the group's first and last global ranks), is_first_rank/is_last_rank, and next_rank/prev_rank (wrapping around), as pipeline stages use them."
+    sources: ["vllm/distributed/parallel_state.py:637-670"]
+    request:
+      type: object
+      required: [ranks, rank]
+      properties:
+        ranks: {type: array, items: {type: integer}, description: "the group's global ranks", examples: [[0, 1]]}
+        rank: {type: integer, description: "this process's global rank", examples: [0]}
+    response: {type: object, properties: {rank_in_group: {type: integer}, first_rank: {type: integer}, last_rank: {type: integer}, is_first_rank: {type: boolean}, is_last_rank: {type: boolean}, next_rank: {type: integer}, prev_rank: {type: integer}}}
+    behavior:
+      - set:
+          vars.i: "= input.ranks.indexOf(input.rank)"
+          vars.n: "= size(input.ranks)"
+      - return:
+          rank_in_group: "= vars.i"
+          first_rank: "= input.ranks[0]"
+          last_rank: "= input.ranks[vars.n - 1]"
+          is_first_rank: "= input.rank == input.ranks[0]"
+          is_last_rank: "= input.rank == input.ranks[vars.n - 1]"
+          next_rank: "= input.ranks[(vars.i + 1) % vars.n]"
+          prev_rank: "= input.ranks[(vars.i - 1 + vars.n) % vars.n]"
+
+  - component: group-coordinator
+    name: send-tensor-dict
+    kind: function
+    latency_ms: 0
+    summary: "GroupCoordinator.send_tensor_dict (the PP stage handoff of intermediate tensors): bypass at world size 1; dst defaults to the next rank; the metadata goes on the CPU group, then each non-empty tensor, sliced to this rank's 1/N share when an all-gather group is given and the tensor divides evenly (unless all_gather_tensors says otherwise)."
+    sources: ["vllm/distributed/parallel_state.py:1081-1124", "vllm/distributed/parallel_state.py:1162-1244", "vllm/distributed/parallel_state.py:1067-1079"]
+    request:
+      type: object
+      required: [world_size, rank_in_group]
+      properties:
+        group_name: {type: string, default: "pp:0"}
+        world_size: {type: integer, examples: [2]}
+        rank_in_group: {type: integer, examples: [0]}
+        dst: {type: [integer, "null"], default: null}
+        tensors: {type: object, default: {}, description: "tensor name -> numel", examples: [{hidden_states: 8192, residual: 8192}]}
+        metadata: {type: object, default: {}, description: "the non-tensor entries"}
+        all_gather_size: {type: [integer, "null"], default: null, description: "the all-gather group's world size (usually the TP group); null for none"}
+        all_gather_rank: {type: integer, default: 0}
+        all_gather_tensors: {type: [object, "null"], default: null}
+    response: {type: [object, "null"], properties: {sent: {type: object}, dst: {type: integer}}}
+    errors:
+      - {code: assertion-error, status: 0, retryable: false}
+    behavior:
+      - set:
+          vars.args: "= merge({'group_name': 'pp:0', 'dst': null, 'tensors': {}, 'metadata': {}, 'all_gather_size': null, 'all_gather_rank': 0, 'all_gather_tensors': null}, input)"
+      - if: "vars.args.world_size == 1"
+        then:
+          - title: Bypass at world size 1 (the tensor dict comes back)
+            source: "vllm/distributed/parallel_state.py:1105-1107"
+            return: {sent: "= vars.args.tensors", dst: 0}
+      - set: {vars.dst: "= vars.args.dst != null ? vars.args.dst : (vars.args.rank_in_group + 1) % vars.args.world_size"}
+      - if: "vars.dst >= vars.args.world_size"
+        then:
+          - source: "vllm/distributed/parallel_state.py:1183"
+            fail: {code: assertion-error, status: 0, message: "= 'Invalid dst rank (' + string(vars.dst) + ')'"}
+      - title: "_should_use_all_gather: numel divisible by the all-gather group's size, overridable per tensor"
+        source: "vllm/distributed/parallel_state.py:1067-1079,1216-1222"
+        set:
+          vars.sent: "= vars.args.tensors.filter(k, vars.args.tensors[k] > 0).transformMapEntry(i, k, {k: {'numel': vars.args.all_gather_size != null && (vars.args.all_gather_tensors != null && k in vars.args.all_gather_tensors ? vars.args.all_gather_tensors[k] : vars.args.tensors[k] % vars.args.all_gather_size == 0) ? vars.args.tensors[k] / vars.args.all_gather_size : vars.args.tensors[k], 'sliced': vars.args.all_gather_size != null && (vars.args.all_gather_tensors != null && k in vars.args.all_gather_tensors ? vars.args.all_gather_tensors[k] : vars.args.tensors[k] % vars.args.all_gather_size == 0)}})"
+      - title: "isend_object(metadata) on the CPU group, then an isend per tensor; send_tensor_dict waits on every handle"
+        source: "vllm/distributed/parallel_state.py:1108-1123,1206-1232"
+        put: "= 'p2p:' + vars.args.group_name + ':' + string(vars.args.rank_in_group) + '->' + string(vars.dst)"
+        value: "= {'metadata': vars.args.metadata, 'tensors': vars.sent, 'keys': vars.args.tensors.map(k, k)}"
+      - return: {sent: "= vars.sent", dst: "= vars.dst"}
+
+  - component: group-coordinator
+    name: recv-tensor-dict
+    kind: function
+    latency_ms: 0
+    summary: "GroupCoordinator.recv_tensor_dict: None at world size 1; src defaults to the previous rank; receive the metadata, then each tensor, all-gathering the sliced ones back to full size over the all-gather group."
+    sources: ["vllm/distributed/parallel_state.py:1246-1340"]
+    request:
+      type: object
+      required: [world_size, rank_in_group]
+      properties:
+        group_name: {type: string, default: "pp:0"}
+        world_size: {type: integer, examples: [2]}
+        rank_in_group: {type: integer, examples: [1]}
+        src: {type: [integer, "null"], default: null}
+        all_gather_size: {type: [integer, "null"], default: null}
+        timeout_ms: {type: integer, default: 600000}
+    response: {type: [object, "null"], properties: {tensors: {type: object}, metadata: {type: object}, src: {type: integer}}}
+    errors:
+      - {code: assertion-error, status: 0, retryable: false}
+      - {code: dist-backend-error, status: 0, retryable: false}
+    behavior:
+      - set:
+          vars.args: "= merge({'group_name': 'pp:0', 'src': null, 'all_gather_size': null, 'timeout_ms': 600000}, input)"
+      - if: "vars.args.world_size == 1"
+        then:
+          - source: "vllm/distributed/parallel_state.py:1268-1269"
+            return: null
+      - set: {vars.src: "= vars.args.src != null ? vars.args.src : (vars.args.rank_in_group - 1 + vars.args.world_size) % vars.args.world_size"}
+      - if: "vars.src >= vars.args.world_size"
+        then:
+          - source: "vllm/distributed/parallel_state.py:1297"
+            fail: {code: assertion-error, status: 0, message: "= 'Invalid src rank (' + string(vars.src) + ')'"}
+      - title: Block on the sender's metadata and tensors
+        source: "vllm/distributed/parallel_state.py:1299-1340"
+        receive: "= 'p2p:' + vars.args.group_name + ':' + string(vars.src) + '->' + string(vars.args.rank_in_group)"
+        timeout_ms: "= vars.args.timeout_ms"
+        as: msg
+        on_error:
+          - fail: {code: dist-backend-error, status: 0, message: "= 'recv from rank ' + string(vars.src) + ' timed out'"}
+      - title: "Sliced tensors are all-gathered back to full size (numel x all-gather size); empty tensors arrive as empty"
+        source: "vllm/distributed/parallel_state.py:1318-1338"
+        return:
+          tensors: "= vars.msg.keys.transformMapEntry(i, k, {k: k in vars.msg.tensors ? (vars.msg.tensors[k].sliced ? vars.msg.tensors[k].numel * (vars.args.all_gather_size != null ? vars.args.all_gather_size : 1) : vars.msg.tensors[k].numel) : 0})"
+          metadata: "= vars.msg.metadata"
+          src: "= vars.src"
+
+  - component: group-coordinator
+    name: send-object
+    kind: function
+    latency_ms: 0
+    summary: "GroupCoordinator.send_object: pickle the object and send its size, then its bytes, to a peer on the CPU group; the destination must be in the group and not this rank."
+    sources: ["vllm/distributed/parallel_state.py:895-920"]
+    request: {type: object, required: [world_size, rank_in_group, dst], properties: {group_name: {type: string, default: "pp:0"}, world_size: {type: integer}, rank_in_group: {type: integer}, dst: {type: integer}, obj: {description: "any picklable value"}}}
+    response: {type: "null"}
+    errors:
+      - {code: assertion-error, status: 0, retryable: false}
+    behavior:
+      - set: {vars.g: "= has(input.group_name) ? input.group_name : 'pp:0'"}
+      - if: "input.dst >= input.world_size"
+        then:
+          - source: "vllm/distributed/parallel_state.py:899"
+            fail: {code: assertion-error, status: 0, message: "= 'Invalid dst rank (' + string(input.dst) + ')'"}
+      - if: "input.dst == input.rank_in_group"
+        then:
+          - source: "vllm/distributed/parallel_state.py:901-904"
+            fail: {code: assertion-error, status: 0, message: "Invalid destination rank. Destination rank is the same as the current rank."}
+      - source: "vllm/distributed/parallel_state.py:906-918"
+        put: "= 'obj:' + vars.g + ':' + string(input.rank_in_group) + '->' + string(input.dst)"
+        value: "= has(input.obj) ? input.obj : null"
+      - return: null
+
+  - component: group-coordinator
+    name: recv-object
+    kind: function
+    latency_ms: 0
+    summary: "GroupCoordinator.recv_object: receive the size, then the pickled bytes, from a peer on the CPU group and unpickle them; the source must be in the group and not this rank."
+    sources: ["vllm/distributed/parallel_state.py:922-960"]
+    request: {type: object, required: [world_size, rank_in_group, src], properties: {group_name: {type: string, default: "pp:0"}, world_size: {type: integer}, rank_in_group: {type: integer}, src: {type: integer}, timeout_ms: {type: integer, default: 600000}}}
+    response: {}
+    errors:
+      - {code: assertion-error, status: 0, retryable: false}
+      - {code: dist-backend-error, status: 0, retryable: false}
+    behavior:
+      - set: {vars.g: "= has(input.group_name) ? input.group_name : 'pp:0'"}
+      - if: "input.src >= input.world_size"
+        then:
+          - source: "vllm/distributed/parallel_state.py:926"
+            fail: {code: assertion-error, status: 0, message: "= 'Invalid src rank (' + string(input.src) + ')'"}
+      - if: "input.src == input.rank_in_group"
+        then:
+          - source: "vllm/distributed/parallel_state.py:928-930"
+            fail: {code: assertion-error, status: 0, message: "Invalid source rank. Source rank is the same as the current rank."}
+      - source: "vllm/distributed/parallel_state.py:932-958"
+        receive: "= 'obj:' + vars.g + ':' + string(input.src) + '->' + string(input.rank_in_group)"
+        timeout_ms: "= has(input.timeout_ms) ? input.timeout_ms : 600000"
+        as: obj
+        on_error:
+          - fail: {code: dist-backend-error, status: 0, message: "= 'recv from rank ' + string(input.src) + ' timed out'"}
+      - return: "= vars.obj"
+
+  # ---------------------------------------------------------------- heterogeneous-TP transfer topology
+  - component: transfer-topology
+    name: handshake-target-ranks
+    kind: function
+    latency_ms: 0
+    summary: "TransferTopology.handshake_target_ranks (and target_remote_ranks): with a sharded remote (DCP > 1) the remote ranks whose DCP slice overlaps this rank's; else by tp_ratio, local TP >= remote TP reads remote rank tp_rank // ratio, local TP < remote TP reads |ratio| consecutive remote ranks. Indivisible TP sizes are refused."
+    sources: ["vllm/distributed/kv_transfer/kv_connector/utils.py:564-586", "vllm/distributed/kv_transfer/kv_connector/utils.py:494-512", "vllm/distributed/kv_transfer/kv_connector/utils.py:542-562", "vllm/distributed/kv_transfer/kv_connector/utils.py:606-619"]
+    request:
+      type: object
+      required: [tp_rank, tp_size, remote_tp_size]
+      properties:
+        tp_rank: {type: integer, examples: [1]}
+        tp_size: {type: integer, examples: [4]}
+        remote_tp_size: {type: integer, examples: [2]}
+        dcp_size: {type: integer, default: 1}
+        remote_dcp_size: {type: integer, default: 1}
+    response: {type: object, properties: {tp_ratio: {type: integer}, ranks: {type: array, items: {type: integer}}}}
+    errors:
+      - {code: assertion-error, status: 0, retryable: false}
+    behavior:
+      - set:
+          vars.args: "= merge({'dcp_size': 1, 'remote_dcp_size': 1}, input)"
+      - if: "vars.args.remote_dcp_size > 1"
+        then:
+          - set: {vars.dcp_rank: "= vars.args.tp_rank % vars.args.dcp_size"}
+          - title: "dcp_source_ranks: every remote rank inside my slice when mine is coarser, else the one remote rank covering it"
+            source: "vllm/distributed/kv_transfer/kv_connector/utils.py:542-562"
+            return:
+              tp_ratio: 0
+              ranks: "= vars.args.dcp_size <= vars.args.remote_dcp_size ? lists.range(vars.args.remote_tp_size).filter(r, r % vars.args.dcp_size == vars.dcp_rank) : [vars.dcp_rank % vars.args.remote_dcp_size]"
+      - if: "vars.args.tp_size >= vars.args.remote_tp_size && vars.args.tp_size % vars.args.remote_tp_size != 0"
+        then:
+          - source: "vllm/distributed/kv_transfer/kv_connector/utils.py:501-505"
+            fail: {code: assertion-error, status: 0, message: "= 'Local tensor parallel size ' + string(vars.args.tp_size) + ' is not divisible by remote tensor parallel size ' + string(vars.args.remote_tp_size) + '.'"}
+      - if: "vars.args.tp_size < vars.args.remote_tp_size && vars.args.remote_tp_size % vars.args.tp_size != 0"
+        then:
+          - source: "vllm/distributed/kv_transfer/kv_connector/utils.py:507-511"
+            fail: {code: assertion-error, status: 0, message: "= 'Remote tensor parallel size ' + string(vars.args.remote_tp_size) + ' is not divisible by local tensor parallel size ' + string(vars.args.tp_size) + '.'"}
+      - set:
+          vars.ratio: "= vars.args.tp_size >= vars.args.remote_tp_size ? vars.args.tp_size / vars.args.remote_tp_size : -(vars.args.remote_tp_size / vars.args.tp_size)"
+      - return:
+          tp_ratio: "= vars.ratio"
+          ranks: "= vars.ratio > 0 ? [vars.args.tp_rank / vars.ratio] : lists.range(-vars.ratio).map(i, vars.args.tp_rank * (-vars.ratio) + i)"
+
+  - component: transfer-topology
+    name: dcp-consumer-count
+    kind: function
+    latency_ms: 0
+    summary: "TransferTopology.dcp_consumer_count: how many local readers a producer rank waits for before freeing a request's blocks: tp_ratio (at least 1) with an unsharded remote; with a sharded remote, every local rank when local is replicated, else dcp_size // remote_dcp_size."
+    sources: ["vllm/distributed/kv_transfer/kv_connector/utils.py:588-604"]
+    request:
+      type: object
+      required: [tp_size, remote_tp_size]
+      properties:
+        tp_size: {type: integer}
+        remote_tp_size: {type: integer}
+        dcp_size: {type: integer, default: 1}
+        remote_dcp_size: {type: integer, default: 1}
+    response: {type: object, properties: {count: {type: integer}}}
+    errors:
+      - {code: assertion-error, status: 0, retryable: false}
+    behavior:
+      - set:
+          vars.args: "= merge({'dcp_size': 1, 'remote_dcp_size': 1}, input)"
+      - if: "vars.args.remote_dcp_size > 1"
+        then:
+          - return: {count: "= vars.args.dcp_size == 1 ? vars.args.tp_size : math.greatest(1, vars.args.dcp_size / vars.args.remote_dcp_size)"}
+      - call: transfer-topology.handshake-target-ranks
+        input: {tp_rank: 0, tp_size: "= vars.args.tp_size", remote_tp_size: "= vars.args.remote_tp_size"}
+        as: r
+      - return: {count: "= math.greatest(1, vars.r.value.tp_ratio)"}
+
+  - component: transfer-topology
+    name: block-size-ratio
+    kind: function
+    latency_ms: 0
+    summary: "TransferTopology.block_size_ratio: local block size // remote block size; the local size must be a multiple."
+    sources: ["vllm/distributed/kv_transfer/kv_connector/utils.py:514-520"]
+    request: {type: object, required: [block_size, remote_block_size], properties: {block_size: {type: integer, examples: [16]}, remote_block_size: {type: integer, examples: [16]}}}
+    response: {type: object, properties: {ratio: {type: integer}}}
+    errors:
+      - {code: assertion-error, status: 0, retryable: false}
+    behavior:
+      - if: "input.block_size % input.remote_block_size != 0"
+        then:
+          - source: "vllm/distributed/kv_transfer/kv_connector/utils.py:516-519"
+            fail: {code: assertion-error, status: 0, message: "= 'Local block size ' + string(input.block_size) + ' is not divisible by remote block size ' + string(input.remote_block_size) + ' or vice versa.'"}
+      - return: {ratio: "= input.block_size / input.remote_block_size"}
+
+  - component: transfer-topology
+    name: replicates-kv-cache
+    kind: function
+    latency_ms: 0
+    summary: "TransferTopology.replicates_kv_cache: MLA always replicates; otherwise a side replicates when its TP size exceeds the KV heads (local_physical_heads is then 1)."
+    sources: ["vllm/distributed/kv_transfer/kv_connector/utils.py:522-540", "vllm/distributed/kv_transfer/kv_connector/utils.py:443-444"]
+    request: {type: object, required: [total_num_kv_heads, tp_size, remote_tp_size], properties: {total_num_kv_heads: {type: integer, examples: [8]}, tp_size: {type: integer}, remote_tp_size: {type: integer}, is_mla: {type: boolean, default: false}}}
+    response: {type: object, properties: {remote_replicates: {type: boolean}, local_replicates: {type: boolean}, local_physical_heads: {type: integer}}}
+    behavior:
+      - set: {vars.mla: "= has(input.is_mla) && input.is_mla"}
+      - return:
+          remote_replicates: "= vars.mla || input.remote_tp_size > input.total_num_kv_heads"
+          local_replicates: "= vars.mla || input.tp_size > input.total_num_kv_heads"
+          local_physical_heads: "= math.greatest(1, input.total_num_kv_heads / input.tp_size)"
+
+  # ---------------------------------------------------------------- MultiConnector
+  - component: multi-connector
+    name: request-finished
+    kind: function
+    latency_ms: 0
+    summary: "MultiConnector.request_finished: ask every child; the request waits on an async save if any child says so (extra async saves beyond the first are counted for the workers), the children's kv_transfer_params are merged and a key two children both set is a RuntimeError; the request's load assignment is dropped."
+    sources: ["vllm/distributed/kv_transfer/kv_connector/v1/multi_connector.py:541-580"]
+    request: DistKvRequest
+    response: DistKvFinished
+    errors:
+      - {code: runtime-error, status: 0, retryable: false}
+    behavior:
+      - set:
+          vars.impl: "= {'NixlConnector': 'nixl-pull-connector-scheduler', 'NixlPullConnector': 'nixl-pull-connector-scheduler', 'NixlPushConnector': 'nixl-push-connector-scheduler', 'SimpleCPUOffloadConnector': 'simple-cpu-offload-connector'}"
+          vars.saves: 0
+          vars.params: null
+      - foreach: "= state.connectors"
+        as: c
+        steps:
+          - if: "!(vars.c in vars.impl)"
+            then:
+              - title: "Children without their own request_finished (ExampleConnector, ...) answer the base (False, None)"
+                source: "vllm/distributed/kv_transfer/kv_connector/v1/base.py:632-635"
+                continue: true
+          - call: "= vars.impl[vars.c] + '.request-finished'"
+            targets: [nixl-pull-connector-scheduler.request-finished, nixl-push-connector-scheduler.request-finished, simple-cpu-offload-connector.request-finished]
+            input: "= input"
+            as: f
+          - if: "vars.f.value.delay_free_blocks"
+            then:
+              - set: {vars.saves: "= vars.saves + 1"}
+          - if: "vars.f.value.kv_transfer_params != null"
+            then:
+              - if: "vars.params != null && vars.params.exists(k, k in vars.f.value.kv_transfer_params)"
+                then:
+                  - source: "vllm/distributed/kv_transfer/kv_connector/v1/multi_connector.py:556-562"
+                    fail: {code: runtime-error, status: 0, message: "= 'Key clash in kv_transfer_params from multiple connectors: {' + vars.params.filter(k, k in vars.f.value.kv_transfer_params).map(k, \"'\" + k + \"'\").join(', ') + '}'"}
+              - set: {vars.params: "= vars.params == null ? vars.f.value.kv_transfer_params : merge(vars.params, vars.f.value.kv_transfer_params)"}
+      - if: "vars.saves > 1"
+        then:
+          - title: The workers must see one finished_sending per async save
+            source: "vllm/distributed/kv_transfer/kv_connector/v1/multi_connector.py:565-566"
+            set: {state.extra_async_saves: "= merge(state.extra_async_saves, {input.request_id: vars.saves - 1})"}
+      - source: "vllm/distributed/kv_transfer/kv_connector/v1/multi_connector.py:568"
+        set: {state.requests_to_connector: "= state.requests_to_connector.filter(k, k != input.request_id).transformMapEntry(i, k, {k: state.requests_to_connector[k]})"}
+      - return: {delay_free_blocks: "= vars.saves > 0", kv_transfer_params: "= vars.params"}
+
+  - component: multi-connector
+    name: update-connector-output
+    kind: function
+    latency_ms: 0
+    summary: "MultiConnector.update_connector_output: hand the output to every child in order, each with its own slice of the MultiKVConnectorWorkerMetadata when there is one; the combined metadata is put back afterwards, even on error."
+    sources: ["vllm/distributed/kv_transfer/kv_connector/v1/multi_connector.py:496-515"]
+    request: {type: object, properties: {finished_store_events: {type: array, items: {type: integer}}, finished_sending: {type: array, items: {type: string}}, finished_recving: {type: array, items: {type: string}}, kv_connector_worker_meta: {type: [object, "null"], description: "MultiKVConnectorWorkerMetadata: {metadata: [one per child]}"}}}
+    response: {type: object, properties: {children: {type: array}, kv_connector_worker_meta: {type: [object, "null"]}}}
+    behavior:
+      - set:
+          vars.meta: "= has(input.kv_connector_worker_meta) ? input.kv_connector_worker_meta : null"
+          vars.children: []
+      - foreach: "= lists.range(size(state.connectors))"
+        as: i
+        steps:
+          - set: {vars.child_meta: "= vars.meta != null ? vars.meta.metadata[vars.i] : null"}
+          - if: "state.connectors[vars.i] == 'SimpleCPUOffloadConnector'"
+            then:
+              - call: simple-cpu-offload-connector.update-connector-output
+                input: "= merge(input, {'kv_connector_worker_meta': vars.child_meta})"
+                as: u
+              - set: {vars.children: "= vars.children + [{'connector': state.connectors[vars.i], 'worker_meta': vars.child_meta, 'cached': vars.u.value.cached}]"}
+            else:
+              - title: The base update_connector_output does nothing
+                source: "vllm/distributed/kv_transfer/kv_connector/v1/base.py:606-614"
+                set: {vars.children: "= vars.children + [{'connector': state.connectors[vars.i], 'worker_meta': vars.child_meta, 'cached': 0}]"}
+      - title: "finally: restore the combined worker metadata"
+        source: "vllm/distributed/kv_transfer/kv_connector/v1/multi_connector.py:513-515"
+        return: {children: "= vars.children", kv_connector_worker_meta: "= vars.meta"}
+
+scenarios:
+  # ---- MoRIIO (tests/v1/kv_connector/unit/test_moriio_transfer_completion.py:40)
+  - id: distributed-moriio-timeout-must-be-positive-and-finite
+    name: "_positive_finite_timeout refuses 0, -1, inf and nan with the code's message, and accepts 2.5"
+    fixtures: [tp1-llama-8b]
+    steps:
+      - {interface: moriio-config.positive-finite-timeout, caller: gpu-worker, as: zero, input: {name: kv_connector_extra_config.transfer_timeout, value: 0}}
+      - {interface: moriio-config.positive-finite-timeout, caller: gpu-worker, as: neg, input: {name: kv_connector_extra_config.defer_timeout, value: -1}}
+      - {interface: moriio-config.positive-finite-timeout, caller: gpu-worker, as: inf, input: {name: kv_connector_extra_config.recv_abort_timeout, value: inf}}
+      - {interface: moriio-config.positive-finite-timeout, caller: gpu-worker, as: nan, input: {name: x, value: NaN}}
+      - {interface: moriio-config.positive-finite-timeout, caller: gpu-worker, as: ok, input: {name: x, value: 2.5}}
+      - {interface: moriio-config.positive-finite-timeout, caller: gpu-worker, as: str, input: {name: x, value: "abc"}}
+    expect:
+      - "!steps.zero.result.ok && steps.zero.result.error.code == 'value-error' && steps.zero.result.error.message == 'kv_connector_extra_config.transfer_timeout must be finite and greater than zero'"
+      - "steps.neg.result.error.message == 'kv_connector_extra_config.defer_timeout must be finite and greater than zero'"
+      - "steps.inf.result.error.message == 'kv_connector_extra_config.recv_abort_timeout must be finite and greater than zero'"
+      - "steps.nan.result.error.message == 'x must be finite and greater than zero' && steps.ok.result.value.timeout == 2.5"
+      - "steps.str.result.error.message == \"could not convert string to float: 'abc'\""
+
+  - id: distributed-moriio-config-from-extra-config
+    name: "MoRIIOConfig.from_vllm_config: defaults 30/60/120 s, the notify port offset by DP rank + TP rank, and a bad timeout refused while the config is built"
+    fixtures: [tp4-llama-70b]
+    steps:
+      - {interface: moriio-config.from-vllm-config, caller: gpu-worker, on: rank1, as: d, input: {extra_config: {notify_port: 61005, http_port: "20005", handshake_port: 6301, proxy_ip: "10.0.0.9", read_mode: "True"}, data_parallel_rank: 3, data_parallel_size_local: 2, data_parallel_size: 4}}
+      - {interface: moriio-config.from-vllm-config, caller: gpu-worker, on: rank0, as: bad, input: {extra_config: {notify_port: 61005, http_port: 20005, handshake_port: 6301, defer_timeout: 0}}}
+      - {interface: moriio-config.from-vllm-config, caller: gpu-worker, on: rank0, as: be, input: {extra_config: {notify_port: 61005, backend: IB}}}
+      - {interface: moriio-config.from-vllm-config, caller: gpu-worker, on: rank0, as: np, input: {extra_config: {http_port: 20005}}}
+    expect:
+      - "steps.d.result.value.transfer_timeout == 30.0 && steps.d.result.value.defer_timeout == 60.0 && steps.d.result.value.recv_abort_timeout == 120.0"
+      - "steps.d.result.value.dp_rank == 1 && steps.d.result.value.tp_rank == 1 && steps.d.result.value.notify_port == 61007 && steps.d.result.value.http_port == 20005 && steps.d.result.value.dp_size == 4 && steps.d.result.value.tp_size == 4"
+      - "steps.d.result.value.read_mode && steps.d.result.value.backend == 'rdma' && steps.d.result.value.qp_per_transfer == 1 && steps.d.result.value.post_batch_size == -1"
+      - "steps.bad.result.error.code == 'value-error' && steps.bad.result.error.message == 'kv_connector_extra_config.defer_timeout must be finite and greater than zero'"
+      - "steps.be.result.error.message == \"Invalid MoRIIO backend 'ib' in kv_connector_extra_config; must be one of 'rdma' or 'xgmi'.\""
+      - "steps.np.result.error.code == 'key-error' && steps.np.result.error.message == \"'notify_port'\""
+
+  - id: distributed-moriio-legacy-recv-abort-env
+    name: "The deprecated VLLM_MORIIO_TRANSFER_TIMEOUT_S supplies recv_abort_timeout (and is validated) when extra_config has none"
+    fixtures: [tp1-llama-8b]
+    config: {vllm-moriio-transfer-timeout-s: "inf"}
+    steps:
+      - {interface: moriio-config.from-vllm-config, caller: gpu-worker, as: c, input: {extra_config: {notify_port: 61005, http_port: 20005, handshake_port: 6301}}}
+      - {interface: moriio-config.from-vllm-config, caller: gpu-worker, as: o, input: {extra_config: {notify_port: 61005, http_port: 20005, handshake_port: 6301, recv_abort_timeout: 45}}}
+    expect:
+      - "steps.c.result.error.message == 'kv_connector_extra_config.recv_abort_timeout must be finite and greater than zero'"
+      - "steps.o.result.value.recv_abort_timeout == 45.0"
+      - "trace.exists(e, e.type == 'note' && e.title.startsWith('VLLM_MORIIO_TRANSFER_TIMEOUT_S is deprecated'))"
+
+  - id: distributed-moriio-worker-init-feeds-timeouts
+    name: "MoRIIOConnectorWorker.__init__ feeds the validated timeouts to the wrapper (transfer) and the writer (defer), whose loop then reaps on it; without mori it refuses"
+    fixtures: [tp1-llama-8b]
+    steps:
+      - {interface: moriio-connector-worker.init, caller: gpu-worker, as: w, input: {extra_config: {notify_port: 61005, http_port: 20005, handshake_port: 6301, transfer_timeout: 12, defer_timeout: 0.005}}}
+      - {interface: moriio-connector-worker.init, caller: gpu-worker, as: nomori, input: {mori_available: false}}
+    expect:
+      - "steps.w.result.value.mode == 'WRITE' && steps.w.result.value.transfer_timeout == 12.0 && steps.w.result.value.defer_timeout == 0.005"
+      - "state['moriio-writer@rank0'].defer_timeout_ms == 5 && state['moriio-wrapper@rank0'].transfer_timeout_ms == 12000"
+      - "steps.nomori.result.error.code == 'runtime-error' && steps.nomori.result.error.message == \"MoRIIO is not available. Please ensure the 'mori' package is installed and properly configured.\""
+
+  # ---- parallel startup: TP 2 process groups
+  - id: distributed-tp2-startup-process-groups
+    name: "TP 2 startup: each worker logs its world (world_size=2, tcp:// init method, nccl), then initialize_model_parallel assigns DP 0, PP 0, PCP 0, TP 0/1, ETP 0/1, no EP"
+    fixtures: [distributed-tp2-llama-8b]
+    state:
+      "parallel-state@rank0": {world_initialized: false, mp_initialized: false, world_size: 0, groups: {}}
+      "parallel-state@rank1": {world_initialized: false, mp_initialized: false, world_size: 0, groups: {}}
+    steps:
+      - {interface: parallel-state.init-distributed-environment, caller: gpu-worker, on: rank0, as: w0, input: {world_size: 2, rank: 0, local_rank: 0, distributed_init_method: "tcp://127.0.0.1:41235"}}
+      - {interface: parallel-state.init-distributed-environment, caller: gpu-worker, on: rank1, as: w1, input: {world_size: 2, rank: 1, local_rank: 1, distributed_init_method: "tcp://127.0.0.1:41235"}}
+      - {interface: parallel-state.initialize-model-parallel, caller: gpu-worker, on: rank0, as: m0, input: {tensor_model_parallel_size: 2, pipeline_model_parallel_size: 1}}
+      - {interface: parallel-state.initialize-model-parallel, caller: gpu-worker, on: rank1, as: m1, input: {tensor_model_parallel_size: 2, pipeline_model_parallel_size: 1}}
+      - {interface: parallel-state.ensure-model-parallel-initialized, caller: gpu-worker, on: rank1, as: e1, input: {tensor_model_parallel_size: 2, pipeline_model_parallel_size: 1}}
+      - {interface: parallel-state.init-distributed-environment, caller: gpu-worker, on: rank1, as: again, input: {world_size: 2, rank: 1}}
+    expect:
+      - "trace.filter(e, e.type == 'note' && e.title == 'init_process_group and the world GroupCoordinator').size() == 2"
+      - "steps.w0.result.value.log == 'world_size=2 rank=0 local_rank=0 distributed_init_method=tcp://127.0.0.1:41235 backend=nccl' && !steps.w0.result.value.already_initialized"
+      - "steps.w1.result.value.log == 'world_size=2 rank=1 local_rank=1 distributed_init_method=tcp://127.0.0.1:41235 backend=nccl'"
+      - "steps.m0.result.value.log == 'rank 0 in world size 2 is assigned as DP rank 0, PP rank 0, PCP rank 0, TP rank 0, ETP rank 0, EP rank N/A, EPLB rank N/A'"
+      - "steps.m1.result.value.log == 'rank 1 in world size 2 is assigned as DP rank 0, PP rank 0, PCP rank 0, TP rank 1, ETP rank 1, EP rank N/A, EPLB rank N/A'"
+      - "!steps.e1.result.value.created && steps.e1.result.value.tp_world_size == 2 && steps.again.result.value.already_initialized && steps.again.result.value.log == null"
+
+  - id: distributed-tp2-startup-moe-eplb-ranks
+    name: "Mixtral TP 2 with EP and EPLB: the rank log gives EP rank and EPLB rank equal to the TP rank"
+    fixtures: [full-moe-mixtral-8x7b-tp2-ep]
+    config: {enable-eplb: true}
+    state:
+      "parallel-state@rank1": {world_initialized: true, mp_initialized: false, world_size: 2, groups: {}}
+    steps:
+      - {interface: parallel-state.initialize-model-parallel, caller: gpu-worker, on: rank1, as: m1, input: {tensor_model_parallel_size: 2, pipeline_model_parallel_size: 1, is_moe: true, enable_eplb: true}}
+    expect:
+      - "trace.exists(e, e.type == 'note' && e.title.startsWith('rank %s in world size %s'))"
+      - "steps.m1.result.value.log == 'rank 1 in world size 2 is assigned as DP rank 0, PP rank 0, PCP rank 0, TP rank 1, ETP rank 1, EP rank 1, EPLB rank 1'"
+
+  - id: distributed-dp2-startup-world-adjusted
+    name: "With data_parallel_size 2 the worker's world widens: DP rank 1's TP rank 0 is global rank 1 of 2 on tcp://127.0.0.1:29500, and the gloo fallback warns"
+    fixtures: [tp1-llama-8b]
+    config: {data-parallel-size: 2}
+    state:
+      "parallel-state": {world_initialized: false, mp_initialized: false, world_size: 0, groups: {}}
+    steps:
+      - {interface: parallel-state.init-distributed-environment, caller: gpu-worker, as: w, input: {world_size: 1, rank: 0, local_rank: 0, data_parallel_rank: 1, backend_available: false}}
+      - {interface: parallel-state.initialize-model-parallel, caller: gpu-worker, as: m, input: {tensor_model_parallel_size: 1, pipeline_model_parallel_size: 1}}
+    expect:
+      - "steps.w.result.value.log == 'world_size=2 rank=1 local_rank=0 distributed_init_method=tcp://127.0.0.1:29500 backend=nccl' && steps.w.result.value.backend == 'gloo'"
+      - "trace.exists(e, e.type == 'note' && e.title == 'Distributed backend <backend> is not available; falling back to gloo.')"
+      - "steps.m.result.value.log == 'rank 1 in world size 2 is assigned as DP rank 1, PP rank 0, PCP rank 0, TP rank 0, ETP rank 0, EP rank N/A, EPLB rank N/A'"
+
+  # ---- pipeline-parallel point-to-point
+  - id: distributed-pp-send-recv-tensor-dict
+    name: "PP 2 x TP 2 handoff: stage 0 sends hidden_states and residual sliced over the TP group (residual opted out), stage 1 all-gathers them back to full size"
+    fixtures: [tp4-llama-70b]
+    steps:
+      - {interface: group-coordinator.rank-info, caller: gpu-worker, on: rank0, as: ri0, input: {ranks: [0, 2], rank: 0}}
+      - {interface: group-coordinator.rank-info, caller: gpu-worker, on: rank2, as: ri2, input: {ranks: [0, 2], rank: 2}}
+      - {interface: group-coordinator.send-tensor-dict, caller: gpu-worker, on: rank0, as: s, input: {world_size: 2, rank_in_group: 0, tensors: {hidden_states: 8192, residual: 8192, empty: 0}, metadata: {num_tokens: 2}, all_gather_size: 2, all_gather_rank: 0, all_gather_tensors: {residual: false}}}
+      - {interface: group-coordinator.recv-tensor-dict, caller: gpu-worker, on: rank2, as: r, input: {world_size: 2, rank_in_group: 1, all_gather_size: 2}}
+      - {interface: group-coordinator.send-tensor-dict, caller: gpu-worker, on: rank0, as: bad, input: {world_size: 2, rank_in_group: 0, dst: 2}}
+      - {interface: group-coordinator.send-tensor-dict, caller: gpu-worker, on: rank0, as: one, input: {world_size: 1, rank_in_group: 0, tensors: {x: 4}}}
+    expect:
+      - "steps.ri0.result.value.is_first_rank && !steps.ri0.result.value.is_last_rank && steps.ri0.result.value.next_rank == 2 && steps.ri2.result.value.is_last_rank && steps.ri2.result.value.prev_rank == 0 && steps.ri2.result.value.next_rank == 0"
+      - "steps.s.result.value.sent.hidden_states.numel == 4096 && steps.s.result.value.sent.residual.numel == 8192 && !('empty' in steps.s.result.value.sent)"
+      - "steps.r.result.value.tensors == {'hidden_states': 8192, 'residual': 8192, 'empty': 0} && steps.r.result.value.metadata.num_tokens == 2 && steps.r.result.value.src == 0"
+      - "steps.bad.result.error.code == 'assertion-error' && steps.bad.result.error.message == 'Invalid dst rank (2)' && steps.one.result.value.sent == {'x': 4}"
+
+  - id: distributed-pp-send-recv-object
+    name: "send_object/recv_object between two ranks, and the self-destination refusal"
+    fixtures: [tp4-llama-70b]
+    steps:
+      - {interface: group-coordinator.send-object, caller: gpu-worker, on: rank0, as: s, input: {world_size: 2, rank_in_group: 0, dst: 1, obj: {step: 7}}}
+      - {interface: group-coordinator.recv-object, caller: gpu-worker, on: rank1, as: r, input: {world_size: 2, rank_in_group: 1, src: 0}}
+      - {interface: group-coordinator.send-object, caller: gpu-worker, on: rank0, as: me, input: {world_size: 2, rank_in_group: 0, dst: 0}}
+      - {interface: group-coordinator.recv-object, caller: gpu-worker, on: rank1, as: oob, input: {world_size: 2, rank_in_group: 1, src: 5}}
+    expect:
+      - "steps.s.result.ok && steps.r.result.value == {'step': 7}"
+      - "steps.me.result.error.message == 'Invalid destination rank. Destination rank is the same as the current rank.' && steps.oob.result.error.message == 'Invalid src rank (5)'"
+
+  # ---- MultiConnector
+  - id: distributed-multi-connector-request-finished
+    name: "MultiConnector.request_finished: two children saving asynchronously count one extra async save; the load assignment is dropped"
+    fixtures: [tp1-llama-8b]
+    config: {kv-connector: MultiConnector, kv-role: kv_both}
+    state:
+      multi-connector: {connectors: [SimpleCPUOffloadConnector, ExampleConnector], requests_to_connector: {chatcmpl-m1: 0}, extra_async_saves: {}}
+    steps:
+      - {interface: kv-connector-base-v1.request-finished, caller: engine-core, as: f, input: {request_id: chatcmpl-m1, status: FINISHED_STOPPED, block_ids: [[1, 2]]}}
+    expect:
+      - "steps.f.result.ok && calls['multi-connector.request-finished'] == 1 && calls['simple-cpu-offload-connector.request-finished'] == 1"
+      - "steps.f.result.value.kv_transfer_params == null"
+      - "!('chatcmpl-m1' in state['multi-connector'].requests_to_connector)"
+
+  - id: distributed-multi-connector-update-output
+    name: "MultiConnector.update_connector_output hands each child its slice of the worker metadata and restores the combined one"
+    fixtures: [tp1-llama-8b]
+    config: {kv-connector: MultiConnector, kv-role: kv_both}
+    state:
+      multi-connector: {connectors: [ExampleConnector, SimpleCPUOffloadConnector], requests_to_connector: {}, extra_async_saves: {}}
+    steps:
+      - {interface: kv-connector-base-v1.update-connector-output, caller: engine-core, as: u, input: {finished_sending: [], finished_recving: [], finished_store_events: [], kv_connector_worker_meta: {metadata: [null, {stored: []}]}}}
+    expect:
+      - "trace.filter(e, e.type == 'note' && e.title == 'The base update_connector_output does nothing').size() == 1"
+      - "steps.u.result.ok && steps.u.result.value.children.map(c, c.connector) == ['ExampleConnector', 'SimpleCPUOffloadConnector']"
+      - "steps.u.result.value.children[1].worker_meta == {'stored': []} && steps.u.result.value.kv_connector_worker_meta == {'metadata': [null, {'stored': []}]}"
+
+  # ---- heterogeneous TP P/D (TransferTopology)
+  - id: distributed-transfer-topology-hetero-tp
+    name: "Decode TP 4 reading from prefill TP 2: ratio 2, rank 3 reads remote rank 1, each prefill rank waits for 2 readers; TP 2 reading TP 4 reads two ranks; 3 vs 2 is refused"
+    fixtures: [tp1-llama-8b]
+    steps:
+      - {interface: transfer-topology.handshake-target-ranks, caller: gpu-worker, as: d, input: {tp_rank: 3, tp_size: 4, remote_tp_size: 2}}
+      - {interface: transfer-topology.handshake-target-ranks, caller: gpu-worker, as: u, input: {tp_rank: 1, tp_size: 2, remote_tp_size: 4}}
+      - {interface: transfer-topology.handshake-target-ranks, caller: gpu-worker, as: bad, input: {tp_rank: 0, tp_size: 3, remote_tp_size: 2}}
+      - {interface: transfer-topology.handshake-target-ranks, caller: gpu-worker, as: dcp, input: {tp_rank: 1, tp_size: 2, dcp_size: 1, remote_tp_size: 4, remote_dcp_size: 4}}
+      - {interface: transfer-topology.dcp-consumer-count, caller: gpu-worker, as: n, input: {tp_size: 4, remote_tp_size: 2}}
+      - {interface: transfer-topology.block-size-ratio, caller: gpu-worker, as: b, input: {block_size: 16, remote_block_size: 32}}
+      - {interface: transfer-topology.replicates-kv-cache, caller: gpu-worker, as: rep, input: {total_num_kv_heads: 8, tp_size: 4, remote_tp_size: 16}}
+    expect:
+      - "steps.d.result.value.tp_ratio == 2 && steps.d.result.value.ranks == [1]"
+      - "steps.u.result.value.tp_ratio == -2 && steps.u.result.value.ranks == [2, 3]"
+      - "steps.bad.result.error.code == 'assertion-error' && steps.bad.result.error.message == 'Local tensor parallel size 3 is not divisible by remote tensor parallel size 2.'"
+      - "steps.dcp.result.value.ranks == [0, 1, 2, 3] && steps.n.result.value.count == 2"
+      - "steps.b.result.error.message == 'Local block size 16 is not divisible by remote block size 32 or vice versa.'"
+      - "steps.rep.result.value.remote_replicates && !steps.rep.result.value.local_replicates && steps.rep.result.value.local_physical_heads == 2"
+
+  # ---- KV events publisher (judge4 Q4-3 a)
+  - id: distributed-kv-events-publisher-defaults
+    name: "--kv-events-config with only enable_kv_cache_events: the publisher resolves to zmq on tcp://*:5557, hwm 100000; DP rank 1 binds 5558"
+    fixtures: [tp1-llama-8b]
+    config: {enable-kv-cache-events: true}
+    steps:
+      - {flow: distributed-kv-events-create, as: c0, input: {data_parallel_rank: 0}}
+      - {flow: distributed-kv-events-create, as: c1, input: {data_parallel_rank: 1}}
+      - {interface: zmq-event-publisher.offset-endpoint-port, caller: engine-core, as: inp, input: {endpoint: "inproc://cache", data_parallel_rank: 2}}
+      - {interface: zmq-event-publisher.offset-endpoint-port, caller: engine-core, as: zero, input: {endpoint: "tcp://*:0", data_parallel_rank: 2}}
+      - {interface: zmq-event-publisher.offset-endpoint-port, caller: engine-core, as: bad, input: {endpoint: "ipc://x", data_parallel_rank: 2}}
+    expect:
+      - "steps.c0.result.value.publisher == 'zmq' && steps.c0.result.value.endpoint == 'tcp://*:5557' && steps.c0.result.value.hwm == 100000 && steps.c0.result.value.topic == ''"
+      - "steps.c1.result.value.endpoint == 'tcp://*:5558'"
+      - "steps.inp.result.value.endpoint == 'inproc://cache_dp2' && steps.zero.result.value.endpoint == 'tcp://*:0'"
+      - "steps.bad.result.error.code == 'value-error' && steps.bad.result.error.message == \"Invalid endpoint: must contain 'inproc' or 'tcp'\""
+      - "trace.filter(e, e.type == 'note' && e.title == 'Starting ZMQ publisher thread').size() == 2"
+  - id: distributed-r6-moe-init-device-builds-ep-on-seeded-world
+    name: "init_device on a MoE checkpoint in a world whose model-parallel groups aren't built yet creates them, with an EP group spanning DP x TP that uses all2all under DP"
+    description: "parallel_state.py:2383-2390, 2289-2302; gpu_worker.py:1673. DP 2 x TP 1."
+    fixtures: [full-moe-mixtral-8x7b-tp2-ep]
+    config: {data-parallel-size: 2, tensor-parallel-size: 1, enable-expert-parallel: true}
+    steps:
+      - {flow: wr-init-device, on: rank0, as: i0}
+      - {interface: parallel-state.get-ep-group, caller: gpu-worker, on: rank0, as: ep}
+    expect:
+      - "steps.i0.result.ok && steps.ep.result.ok && steps.ep.result.value.world_size == 2 && steps.ep.result.value.use_all2all"
+      - "'tp' in state['parallel-state@rank0'].groups && state['parallel-state@rank0'].mp_initialized"

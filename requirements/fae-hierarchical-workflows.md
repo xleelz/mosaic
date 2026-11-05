@@ -5,9 +5,9 @@
 | Status | Proposed. Not implemented, and not applied to fae. |
 | Target | `~/workplace/fae/REQUIREMENTS.md` (fae HEAD `e547c03`, with about 1,145 uncommitted changes as of 2026-11-01) |
 | Prepared | 2026-11-01, for mosaic's hierarchical ontology pipeline (mosaic `docs/DESIGN.md` §14) |
-| New | FAE-WF-095 to FAE-WF-104, FAE-SCH-023, FAE-API-034 to FAE-API-036, FAE-CLI-055 to FAE-CLI-056, five glossary terms, four defaults, two escalation kinds |
+| New | FAE-WF-097 to FAE-WF-106, FAE-SCH-024, FAE-API-034 to FAE-API-036, FAE-CLI-055 to FAE-CLI-056, five glossary terms, four defaults, two escalation kinds |
 | Amended | FAE-WF-030 (FanOut/FanIn and SubWorkflow rows), FAE-SCH-005, FAE-API-001, the `workflow-simulate` requirement |
-| Depends on | `requirements/fae-host-workflow-limit.md` (FAE-SCH-015 to -022): recursion multiplies running molecules, and the host workflow limit bounds them |
+| Depends on | `requirements/fae-host-workflow-limit.md` (FAE-SCH-016 to -022): recursion multiplies running molecules, and the host workflow limit bounds them |
 
 Another process owns fae's working tree, so this amendment lives here. It is written in
 REQUIREMENTS.md's form so that it can be pasted in.
@@ -60,8 +60,8 @@ workflow today:
 | Part | Location in REQUIREMENTS.md |
 |---|---|
 | Glossary rows | §1.2, after **Workflow slot** (from the host-limit amendment) |
-| FAE-WF-095 to -104 | §4, after FAE-WF-094 |
-| FAE-SCH-023 | §5, after FAE-SCH-022 |
+| FAE-WF-097 to -104 | §4, after FAE-WF-094 |
+| FAE-SCH-024 | §5, after FAE-SCH-023 |
 | FAE-API-034 to -036 | the API section, after FAE-API-033 |
 | FAE-CLI-055, -056 | §11, after FAE-CLI-054 |
 | Amendments | replace the quoted text in place |
@@ -82,7 +82,7 @@ workflow today:
 
 ## 2. New requirements (§4, after FAE-WF-094)
 
-**FAE-WF-095 (MUST)** A FanOut MUST accept `branches_from`: a binding to a list-typed artifact
+**FAE-WF-097 (MUST)** A FanOut MUST accept `branches_from`: a binding to a list-typed artifact
 recorded earlier in the task. Instead of fixed branches, it then declares one `branch` sub-graph.
 - At the stage's visit, the engine MUST create one branch instance per list element, in list
   order, binding the element as the branch's input `item` (typed by the list's item schema).
@@ -104,10 +104,10 @@ recorded earlier in the task. Instead of fixed branches, it then declares one `b
     artifact present;
   - (e) a template with fixed `branches` validates, and runs as before.
 
-**FAE-WF-096 (MUST)** FanOut branch instances MUST be able to run concurrently.
+**FAE-WF-098 (MUST)** FanOut branch instances MUST be able to run concurrently.
 - A FanOut MAY declare `parallel: true`. Its branch instances are then dispatched concurrently,
   bounded only by role caps (FAE-SCH-005, -006, -023), tasks in flight (FAE-SCH-004), launch
-  admission (§14.1) and the host workflow limit (FAE-SCH-017) where it applies.
+  admission (§14.1) and the host workflow limit (FAE-SCH-018) where it applies.
 - The join MUST be evaluated once every branch instance is terminal, or as soon as the join rule
   is decided (`any` passing, or `all` failing). The remaining instances are then cancelled, and
   their cancellation recorded.
@@ -122,8 +122,8 @@ recorded earlier in the task. Instead of fixed branches, it then declares one `b
   - (c) an `any` join cancels the others once one branch passes, and records the cancellations;
   - (d) the join artifact lists outputs in branch order when branches finish in reverse order.
 
-**FAE-WF-097 (MUST)** A FanOut branch MUST be able to contain a SubWorkflow stage. With
-FAE-WF-095 and -096, one stage visit can then start N child tasks concurrently.
+**FAE-WF-099 (MUST)** A FanOut branch MUST be able to contain a SubWorkflow stage. With
+FAE-WF-097 and -096, one stage visit can then start N child tasks concurrently.
 - Each child MUST get the id `<parent>.<stage>.<visit>.<branch-index>` and a parent link. Each
   child's outputs MUST map into its own branch's outputs.
 - `workflow/fan.go:191`'s refusal MUST be removed.
@@ -133,12 +133,12 @@ FAE-WF-095 and -096, one stage visit can then start N child tasks concurrently.
     branch order;
   - (b) one child failing routes only its own branch through the SubWorkflow failure route.
 
-**FAE-WF-098 (MUST)** A workflow MUST be able to select its own workflow id in a SubWorkflow stage
+**FAE-WF-100 (MUST)** A workflow MUST be able to select its own workflow id in a SubWorkflow stage
 (self-recursion), when its template declares a `recursion` budget:
 `{max_depth, max_descendants, max_children_per_visit}`.
 - Admission MUST refuse a child that would exceed any bound, and route the parent's stage through
   its failure route with the reason `recursion_budget`.
-- `max_depth` MUST NOT exceed the instance ceiling (default 8; FAE-SCH-023 bounds caps across the
+- `max_depth` MUST NOT exceed the instance ceiling (default 8; FAE-SCH-024 bounds caps across the
   tree). For recursive templates, it replaces the hard-coded nesting limit of 4.
 - Mutual recursion between templates MUST be refused, unless each declares a budget. The depth and
   descendant counts are then counted across the whole run tree.
@@ -153,7 +153,7 @@ FAE-WF-095 and -096, one stage visit can then start N child tasks concurrently.
   - (c) a template without `recursion` that selects itself is refused by the validator, as today;
   - (d) the validator refuses `max_depth` above the instance ceiling.
 
-**FAE-WF-099 (MUST)** A template MAY declare a workflow signature: `inputs` and `outputs`, each a
+**FAE-WF-101 (MUST)** A template MAY declare a workflow signature: `inputs` and `outputs`, each a
 map of names to JSON Schemas.
 - `Admit` (FAE-API-034) and SubWorkflow input mappings MUST bind every required input, and the
   values MUST validate against the schemas before any stage runs. A failure refuses admission,
@@ -170,7 +170,7 @@ map of names to JSON Schemas.
     the validator;
   - (c) a stage reads an input as an artifact with provenance `input:scope`.
 
-**FAE-WF-100 (MUST)** A controller MUST be able to admit a **detached child**: a task with
+**FAE-WF-102 (MUST)** A controller MUST be able to admit a **detached child**: a task with
 `parent_task` set to an existing task in any state, Done included.
 - The link MUST be recorded at admission, and MUST appear in the run tree, in events and in task
   history.
@@ -178,7 +178,7 @@ map of names to JSON Schemas.
   (`from_parent: <artifact name>`), with provenance pointing at the parent's artifact ids.
 - The child's outputs MUST be recorded as artifacts in the run tree's lineage. They MUST NOT
   mutate the parent's recorded artifacts or state.
-- Recursion budgets (FAE-WF-098) MUST count detached children.
+- Recursion budgets (FAE-WF-100) MUST count detached children.
 - *Rationale:* an operator zooms into a component after the parent run has finished, often much
   later. The parent can't be kept waiting in a SubWorkflow stage for that.
 - *Acceptance:* tests:
@@ -187,7 +187,7 @@ map of names to JSON Schemas.
   - (b) the parent's artifacts are byte-identical before and after the child runs;
   - (c) a detached child that exceeds the parent template's `max_depth` is refused.
 
-**FAE-WF-101 (MUST)** A child MUST be able to address a **change request** to an ancestor: an
+**FAE-WF-103 (MUST)** A child MUST be able to address a **change request** to an ancestor: an
 artifact of a declared schema, with `target: {task, artifact}`.
 - Recording one MUST emit an event and appear in the target's task history.
 - It MUST NOT change the target.
@@ -203,7 +203,7 @@ artifact of a declared schema, with `target: {task, artifact}`.
   - (b) a controller admits a new run of the parent's workflow with the request bound as an input,
     and the tree records both links.
 
-**FAE-WF-102 (MUST)** A template MAY declare `produces: artifacts`. Its tasks then produce only
+**FAE-WF-104 (MUST)** A template MAY declare `produces: artifacts`. Its tasks then produce only
 artifacts, written under a declared output directory, and no commits.
 - Such templates MUST NOT need VcsCommit, Merge or Integrate stages.
 - Kernel floors for code-bearing classes (protected commit, test first) MUST NOT apply to them.
@@ -219,7 +219,7 @@ artifacts, written under a declared output directory, and no commits.
   - (b) a turn that writes outside the output directory is refused;
   - (c) a child's outputs land under `<parent output dir>/<child task id>/`.
 
-**FAE-WF-103 (MUST)** `workflow-simulate` MUST simulate SubWorkflow children, recursive and
+**FAE-WF-105 (MUST)** `workflow-simulate` MUST simulate SubWorkflow children, recursive and
 detached included, and dynamic FanOuts.
 - Child outputs, list widths and change requests come from scripted values in the scenario.
 - The simulation MUST report the run tree it would create, and every budget refusal.
@@ -227,15 +227,15 @@ detached included, and dynamic FanOuts.
   simulated tree of 1 root, 3 parallel branches and 1 child, with the child's mapped outputs in the
   root's join artifact.
 
-**FAE-WF-104 (SHOULD)** The engine SHOULD expose the run tree's recursion depth to gates and briefs
+**FAE-WF-106 (SHOULD)** The engine SHOULD expose the run tree's recursion depth to gates and briefs
 as a read-only value (`tree.depth`), and the remaining budget (`tree.remaining_descendants`), so
 that a template can stop zooming deeper by itself.
 - *Acceptance:* a gate on `tree.depth < 2` stops a recursive template from admitting a child at
   depth 2, through its routed arm, without a budget refusal.
 
-## 3. New requirement (§5, after FAE-SCH-022)
+## 3. New requirement (§5, after FAE-SCH-023)
 
-**FAE-SCH-023 (MUST)** A recursive or detached template MAY declare a `cap_scope` per
+**FAE-SCH-024 (MUST)** A recursive or detached template MAY declare a `cap_scope` per
 workflow-global role:
 - `workflow`: as today, shared by every molecule of the workflow id across revisions;
 - `tree`: shared within one run tree;
@@ -245,7 +245,7 @@ The default MUST stay `workflow`.
 
 Whatever the declared scope, the sum of concurrent sessions MUST stay bounded by tasks in flight,
 launch admission and the host workflow limit.
-- *Rationale:* every scope of a hierarchy runs the same workflow id (FAE-WF-098). With
+- *Rationale:* every scope of a hierarchy runs the same workflow id (FAE-WF-100). With
   `workflow`-scoped caps of oracle 1 and QA 1, every component zoomed anywhere on the host would
   queue behind one oracle. `tree` keeps the deliberate bottleneck within one hierarchy, and lets
   separate hierarchies proceed.
@@ -257,8 +257,8 @@ launch admission and the host workflow limit.
 ## 4. API and CLI
 
 **FAE-API-034 (MUST)** `Admit` MUST accept:
-- `inputs` (an object, validated against the workflow signature, FAE-WF-099);
-- `parent_task` (FAE-WF-100);
+- `inputs` (an object, validated against the workflow signature, FAE-WF-101);
+- `parent_task` (FAE-WF-102);
 - `from_parent` (a map of input names to parent artifact names).
 
 Refusals MUST list every signature and budget error.
@@ -282,15 +282,15 @@ requests per node.
 ## 5. Amendments
 
 - **FAE-WF-030, the FanOut / FanIn row.** Required configuration becomes: "branches, or
-  `branches_from` with one `branch` sub-graph and `max_branches` (FAE-WF-095); `parallel`
-  (FAE-WF-096); join rule (all, any, k-of-n)."
+  `branches_from` with one `branch` sub-graph and `max_branches` (FAE-WF-097); `parallel`
+  (FAE-WF-098); join rule (all, any, k-of-n)."
 - **FAE-WF-030, the SubWorkflow row.** Required configuration becomes: "workflow selector (the
-  workflow's own id allowed under FAE-WF-098); input mapping (checked against the child's
-  signature, FAE-WF-099); output mapping; may appear inside a FanOut branch (FAE-WF-097)."
-- **FAE-SCH-005.** Append: "unless the role declares another `cap_scope` (FAE-SCH-023)."
+  workflow's own id allowed under FAE-WF-100); input mapping (checked against the child's
+  signature, FAE-WF-101); output mapping; may appear inside a FanOut branch (FAE-WF-099)."
+- **FAE-SCH-005.** Append: "unless the role declares another `cap_scope` (FAE-SCH-024)."
 - **FAE-API-001.** Add `Tree` to the read RPCs, and add the new `Admit` fields.
 - **The `workflow-simulate` requirement** (REQUIREMENTS.md:550). Append: "including SubWorkflow
-  children, recursion and dynamic FanOuts (FAE-WF-103)."
+  children, recursion and dynamic FanOuts (FAE-WF-105)."
 
 ## 6. Appendix additions
 

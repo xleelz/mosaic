@@ -144,6 +144,10 @@ interfaces:
           max_position: "= vars.hf.max_position_embeddings"
           rope_parameters: "= has(vars.hf.rope_scaling) && vars.hf.rope_scaling != null && has(vars.hf.rope_scaling.mrope_section) ? {'rope_type': 'default', 'mrope_section': vars.hf.rope_scaling.mrope_section} : {}"
         as: rope
+      - title: "Attention.__init__ selects the backend (get_attn_backend) while the model is built: an unsupported --attention-backend fails here"
+        source: "vllm/model_executor/layers/attention/attention.py:350-360"
+        call: attention-layer.init
+        input: {num_heads: "= vars.hf.num_attention_heads / vars.tp", head_size: "= vars.hf.hidden_size / vars.hf.num_attention_heads", num_kv_heads: "= math.greatest(1, vars.hf.num_key_value_heads / vars.tp)"}
       - title: "Each attention layer initializes its KV-cache scales and quant method"
         source: "vllm/model_executor/layers/attention/attention.py:157-226"
         call: attention-layer.init-kv-cache-quant
@@ -249,11 +253,19 @@ interfaces:
         steps:
           - set:
               vars.pix: "= vars.group.filter(m, !has(m.kind) || m.kind == 'pixel_values')"
-          - title: "Pixel inputs: self.visual(pixel_values, grid_thw) once for the modality (embeddings inputs skip the tower)"
-            source: "vllm/model_executor/models/qwen2_vl.py:1489-1501"
-            when: "size(vars.pix) > 0"
-            call: qwen2-vision-transformer.forward
-            input: {grid_thw: "= vars.pix.map(m, m.grid_thw)", vision: "= state.cfg.vision", tp: "= config['tensor-parallel-size']"}
+          - if: "size(vars.pix) > 0"
+            then:
+              - title: "Pixel inputs: self.visual(pixel_values, grid_thw) once for the modality (embeddings inputs skip the tower)"
+                source: "vllm/model_executor/models/qwen2_vl.py:1489-1501"
+                if: "config['mm-encoder-tp-mode'] != 'data'"
+                then:
+                  - call: qwen2-vision-transformer.forward
+                    input: {grid_thw: "= vars.pix.map(m, m.grid_thw)", vision: "= state.cfg.vision", tp: "= config['tensor-parallel-size']"}
+                else:
+                  - title: "use_data_parallel: run_dp_sharded_mrope_vision_model(rope_3d)"
+                    source: "vllm/model_executor/models/qwen2_vl.py:1491-1497"
+                    call: vision-utils.run-dp-sharded-mrope-vision-model
+                    input: {grid_thw_list: "= vars.pix.map(m, m.grid_thw)", tower: qwen2-vision-transformer.forward, vision: "= state.cfg.vision", out_hidden_size: "= state.cfg.hidden_size", spatial_merge_size: "= vars.merge", tp_rank: "= self.startsWith('rank') ? int(self.substring(4)) % config['tensor-parallel-size'] : 0", tp_size: "= config['tensor-parallel-size']"}
           - title: "Split per item: grid_thw.prod(-1) // merge_size // merge_size"
             source: "vllm/model_executor/models/qwen2_vl.py:1503-1505"
             set:
@@ -500,6 +512,16 @@ interfaces:
       - set:
           vars.params: "= double(vars.v.depth) * double(vars.v.embed_dim) * double(vars.v.embed_dim) * (4.0 + 2.0 * double(vars.v.mlp_ratio)) / double(input.tp)"
           vars.attn_flops: "= double(vars.v.depth) * 4.0 * double(vars.v.embed_dim) * double(sum(input.grid_thw.map(g, g[0] * g[1] * g[2] * g[1] * g[2]))) / double(input.tp)"
+      - title: "self.attn_backend = get_vit_attn_backend(head_dim, dtype); one launch stands for the depth blocks"
+        source: "vllm/model_executor/models/qwen2_vl.py:575-580"
+        call: vision-utils.get-vit-attn-backend
+        input: {head_size: "= input.vision.embed_dim / input.vision.num_heads"}
+        as: vb
+      - if: "vars.vb.value.backend == 'FLASH_ATTN'"
+        then:
+          - call: vit-attn-wrappers.vit-flash-attn-wrapper
+            fill: true
+            input: {shape: {num_tokens: "= sum(input.grid_thw.map(g, g[0] * g[1] * g[2]))", num_heads: "= input.vision.num_heads / input.tp", num_kv_heads: "= input.vision.num_heads / input.tp", head_size: "= input.vision.embed_dim / input.vision.num_heads", num_seqs: "= size(input.grid_thw)"}}
       - title: "cu_seqlens: one attention sequence per frame (h x w patches), repeated t times"
         source: "vllm/model_executor/models/qwen2_vl.py:681-687"
         wait: "= math.greatest(2.0 * vars.params / (double(config['gpu-hbm-bandwidth-gbps']) * 1000000.0), (2.0 * vars.params * double(vars.patches) + vars.attn_flops) / (double(config['gpu-dense-bf16-tflops']) * 1000000000.0))"
@@ -917,7 +939,7 @@ interfaces:
         image_url: {type: string, examples: ["https://vllm-public-assets.s3.us-west-2.amazonaws.com/vision_model_images/stop_sign.jpg"]}
         allowed_media_domains: {type: array, items: {type: string}, default: []}
         allowed_local_media_path: {type: string, default: ""}
-    response: {type: object, properties: {source: {type: string}, bytes: {type: integer}, media_type: {type: string}}}
+    response: {type: object, properties: {source: {type: string}, bytes: {type: integer}, media_type: {type: string}, width: {type: integer}, height: {type: integer}}}
     errors:
       - {code: value-error, status: 0, retryable: false}
       - {code: not-implemented-error, status: 0, retryable: false}
@@ -941,7 +963,7 @@ interfaces:
             if: "!vars.spec.contains(';') || vars.spec.split(';')[size(vars.spec.split(';')) - 1] != 'base64'"
             then:
               - fail: {code: not-implemented-error, status: 0, message: "Only base64 data URLs are supported for now."}
-          - return: {source: data, bytes: "= (vars.url.size() - vars.url.indexOf(',') - 1) * 3 / 4", media_type: "= vars.spec.split(';')[0]"}
+          - return: {source: data, width: "= config['media-stand-in-image-width']", height: "= config['media-stand-in-image-height']", bytes: "= (vars.url.size() - vars.url.indexOf(',') - 1) * 3 / 4", media_type: "= vars.spec.split(';')[0]"}
       - set:
           vars.scheme: "= vars.url.contains('://') ? vars.url.split('://')[0].lowerAscii() : ''"
           vars.host: "= vars.url.contains('://') ? vars.url.split('://')[1].split('/')[0].split(':')[0].lowerAscii() : ''"
@@ -952,31 +974,53 @@ interfaces:
             if: "size(input.allowed_media_domains) > 0 && !(vars.host in input.allowed_media_domains)"
             then:
               - fail: {code: value-error, status: 0, message: "= 'The URL must be from one of the allowed domains: [' + input.allowed_media_domains.map(d, '\\'' + d + '\\'').join(', ') + ']. Input URL domain: ' + vars.host"}
-          - title: "connection.get_bytes(url, timeout=VLLM_IMAGE_FETCH_TIMEOUT): the public-assets bucket, or another host"
-            source: "vllm/multimodal/media/connector.py:388-399"
-            if: "vars.host == 'vllm-public-assets.s3.us-west-2.amazonaws.com'"
-            then:
-              - call: vllm-public-assets-s3.get-object
-                input: {key: "= vars.url.split('://')[1].substring(vars.url.split('://')[1].indexOf('/') + 1)"}
-                timeout_ms: "= config['vllm-image-fetch-timeout-s'] * 1000"
-                as: obj
-                on_error:
+          - set:
+              vars.public: "= vars.host == 'vllm-public-assets.s3.us-west-2.amazonaws.com'"
+              vars.max_tries: "= math.greatest(int(config['vllm-media-fetch-max-retries']), 1)"
+              vars.obj: null
+          - title: "connection.async_get_bytes under _async_retry: attempt N waits VLLM_IMAGE_FETCH_TIMEOUT x 4^N; a retryable failure (timeout, connection error, 5xx) sleeps 4^N s and tries again, up to VLLM_MEDIA_FETCH_MAX_RETRIES attempts"
+            source: "vllm/connections.py:278-318"
+            foreach: "= lists.range(vars.max_tries)"
+            as: k
+            max: 16
+            steps:
+              - if: "vars.public"
+                then:
+                  - title: "the public-assets bucket"
+                    source: "vllm/multimodal/media/connector.py:388-399"
+                    call: vllm-public-assets-s3.get-object
+                    input: {key: "= vars.url.split('://')[1].substring(vars.url.split('://')[1].indexOf('/') + 1)"}
+                    timeout_ms: "= config['vllm-image-fetch-timeout-s'] * 1000 * [1, 4, 16, 64, 256, 1024, 4096, 16384][math.least(vars.k, 7)]"
+                    as: r
+                    on_error: continue
+                else:
+                  - call: remote-media-host.get
+                    input: {url: "= vars.url"}
+                    timeout_ms: "= config['vllm-image-fetch-timeout-s'] * 1000 * [1, 4, 16, 64, 256, 1024, 4096, 16384][math.least(vars.k, 7)]"
+                    as: r
+                    on_error: continue
+              - if: "vars.r.ok"
+                then:
+                  - set: {vars.obj: "= vars.r.value"}
+                  - break: true
+              - set:
+                  vars.e: "= vars.r.error"
+              - title: "_is_retryable: timeouts, connection failures and 5xx; never 4xx or programming errors"
+                source: "vllm/connections.py:154-200"
+                set:
+                  vars.retryable: "= (has(vars.e.status) && vars.e.status >= 500) || vars.e.code.contains('timeout') || vars.e.code.contains('connection')"
+              - if: "!vars.retryable || vars.k + 1 >= vars.max_tries"
+                then:
                   - title: "_wrap_media_fetch_error: a 4xx other than 408/429 is a 422 naming image_url"
                     source: "vllm/multimodal/media/connector.py:80-89"
-                    when: "error.status >= 400 && error.status < 500 && !(error.status in [408, 429])"
-                    fail: {code: vllm-unprocessable-entity-error, status: 422, message: "= 'Failed to fetch media from URL: HTTP ' + string(error.status) + ' error'", data: {param: image_url, value: "= vars.url"}}
-                  - fail: "= error"
-              - return: {source: http, bytes: "= has(vars.obj.value.size) ? vars.obj.value.size : 0", media_type: "= has(vars.obj.value.content_type) ? vars.obj.value.content_type : 'image/jpeg'"}
-          - call: remote-media-host.get
-            input: {url: "= vars.url"}
-            timeout_ms: "= config['vllm-image-fetch-timeout-s'] * 1000"
-            as: obj
-            on_error:
-              - source: "vllm/multimodal/media/connector.py:80-89"
-                when: "error.status >= 400 && error.status < 500 && !(error.status in [408, 429])"
-                fail: {code: vllm-unprocessable-entity-error, status: 422, message: "= 'Failed to fetch media from URL: HTTP ' + string(error.status) + ' error'", data: {param: image_url, value: "= vars.url"}}
-              - fail: "= error"
-          - return: {source: http, bytes: "= has(vars.obj.value.size) ? vars.obj.value.size : 0", media_type: "= has(vars.obj.value.content_type) ? vars.obj.value.content_type : 'image/jpeg'"}
+                    if: "has(vars.e.status) && vars.e.status >= 400 && vars.e.status < 500 && !(vars.e.status in [408, 429])"
+                    then:
+                      - fail: {code: vllm-unprocessable-entity-error, status: 422, message: "= 'Failed to fetch media from URL: HTTP ' + string(vars.e.status) + ' error'", data: {param: image_url, value: "= vars.url"}}
+                  - fail: "= vars.e"
+              - title: "await asyncio.sleep(4 ** attempt)"
+                source: "vllm/connections.py:310"
+                wait: "= double([1, 4, 16, 64, 256, 1024, 4096, 16384][math.least(vars.k, 7)]) * 1000.0"
+          - return: {source: http, width: "= config['media-stand-in-image-width']", height: "= config['media-stand-in-image-height']", bytes: "= has(vars.obj.size) ? vars.obj.size : 0", media_type: "= has(vars.obj.content_type) ? vars.obj.content_type : 'image/jpeg'"}
       - if: "vars.scheme == 'file'"
         then:
           - title: "_load_file_url needs --allowed-local-media-path"
@@ -992,7 +1036,7 @@ interfaces:
           - call: local-disk.read-file
             input: {path: "= vars.path"}
             as: f
-          - return: {source: file, bytes: "= has(vars.f.value.size) ? vars.f.value.size : 0", media_type: image}
+          - return: {source: file, width: "= config['media-stand-in-image-width']", height: "= config['media-stand-in-image-height']", bytes: "= has(vars.f.value.size) ? vars.f.value.size : 0", media_type: image}
       - source: "vllm/multimodal/media/connector.py:407-408"
         fail: {code: value-error, status: 0, message: "The URL must be either a HTTP, data or file URL."}
 

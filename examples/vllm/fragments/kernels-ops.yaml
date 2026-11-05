@@ -384,6 +384,42 @@ configs:
   attributes:
     key: CUDA_VERSION
   default: 13000
+- id: vllm-use-breakable-cudagraph
+  type: boolean
+  value: false
+  summary: "VLLM_USE_BREAKABLE_CUDAGRAPH: capture the whole forward in one BreakableCUDAGraphCapture, ending the stream capture at each @eager_break_during_capture op (attention, KV-cache writes) and running\
+    \ it eagerly, instead of FX graph splitting."
+  sources:
+  - "vllm/envs.py:184"
+  - "vllm/envs.py:776-778"
+  - "vllm/compilation/breakable_cudagraph.py:55"
+  attributes:
+    key: VLLM_USE_BREAKABLE_CUDAGRAPH
+    env: true
+  default: false
+- id: vllm-rocm-aiter-moe-dispatch-policy
+  type: integer
+  value: 0
+  summary: "VLLM_ROCM_AITER_MOE_DISPATCH_POLICY: the AITER fused-MoE sorting dispatch policy, read once by rocm_aiter_ops.get_moe_dispatch_policy (and by refresh_env_variables)."
+  sources:
+  - "vllm/envs.py:143"
+  - "vllm/envs.py:1315-1316"
+  attributes:
+    key: VLLM_ROCM_AITER_MOE_DISPATCH_POLICY
+    env: true
+  default: 0
+- id: vllm-use-standalone-compile
+  type: boolean
+  value: true
+  summary: "VLLM_USE_STANDALONE_COMPILE: with the inductor backend, compile through torch._inductor.standalone_compile (InductorStandaloneAdaptor) when torch has it; else InductorAdaptor."
+  sources:
+  - "vllm/envs.py:182"
+  - "vllm/envs.py:763-765"
+  - "vllm/compilation/backends.py:105"
+  attributes:
+    key: VLLM_USE_STANDALONE_COMPILE
+    env: true
+  default: true
 schemas:
 - id: KernelsOpsTokenShape
   summary: "Token-major activation shape: elementwise, norm, activation, quantization, rope and cache-write kernels."
@@ -647,6 +683,18 @@ schemas:
         - "null"
         default: null
         description: "VllmConfig.compute_hash() of the deployment; null: the backend computes it (config-platform's vllm-config.compute-hash)"
+      module:
+        type:
+        - string
+        - "null"
+        default: null
+        examples:
+        - LlamaModel
+        description: "the decorated module (class name) being called; null: the model built last"
+      skip_compiled:
+        type: boolean
+        default: false
+        description: forward_context.skip_compiled (encoder-decoder models bypass the compiled graph)
 - id: KernelsOpsCompileCall
   summary: "A compile request: the model's layer count decides how many pieces the split graph has."
   schema:
@@ -689,6 +737,12 @@ schemas:
         type: string
         default: inductor
         description: CompilerManager.compute_hash (torch/Inductor version and config)
+      module:
+        type:
+        - string
+        - "null"
+        default: null
+        description: "the decorated module whose wrapper owns this backend; null: LlamaModel"
       cache_dir:
         type: string
         default: ''
@@ -957,6 +1011,14 @@ components:
           type: string
         flags:
           type: object
+        moe_dispatch_policy:
+          type:
+          - object
+          - array
+          - string
+          - boolean
+          - integer
+          - "null"
     initial:
       aiter_found: false
       gcn_arch: ''
@@ -969,6 +1031,7 @@ components:
         _SHUFFLE_KV_CACHE_ENABLED: false
         _TRITON_ROTARY_EMBED: false
         _MOE_SHARED_EXPERTS_ENABLED: false
+      moe_dispatch_policy: null
 - id: xpu-ops
   name: XPU ops
   kind: module
@@ -2450,20 +2513,34 @@ components:
     schema:
       type: object
       properties:
+        modules:
+          type: object
+          description: "per decorated module instance (by class): its do_not_compile, decided in __init__"
         compiled:
-          type: boolean
+          type: object
+          description: "module -> self.compiled (absent: False, as __init__ sets it)"
         aot_compiled_fn:
-          type: boolean
+          type: object
+          description: "module -> it holds an AOT-compiled function"
         was_aot_compile_fn_loaded_from_disk:
-          type: boolean
+          type: object
+          description: "module -> the AOT function came from disk"
+        current:
+          type:
+          - string
+          - "null"
+          description: the module built last (the one the model runner calls)
         num_compiles:
           type: integer
+          description: "first-call compilations on this rank, all modules"
         ignored:
           type: object
     initial:
-      compiled: false
-      aot_compiled_fn: false
-      was_aot_compile_fn_loaded_from_disk: false
+      modules: {}
+      current: null
+      compiled: {}
+      aot_compiled_fn: {}
+      was_aot_compile_fn_loaded_from_disk: {}
       num_compiles: 0
       ignored: {}
   capacity:
@@ -2484,9 +2561,10 @@ components:
       type: object
       properties:
         compiled_bytecode:
-          type: boolean
+          type: object
+          description: "per decorated module: its wrapper has compiled code"
     initial:
-      compiled_bytecode: false
+      compiled_bytecode: {}
   capacity:
     concurrency: 1
   description: "Capacity 1: each GPU worker process runs compilation and model execution on a single thread (Worker.execute_model), so calls never overlap."
@@ -2505,9 +2583,10 @@ components:
       type: object
       properties:
         called:
-          type: boolean
+          type: object
+          description: "per decorated module: its backend instance was called (self._called)"
     initial:
-      called: false
+      called: {}
   capacity:
     concurrency: 1
   description: "Capacity 1: each GPU worker process runs compilation and model execution on a single thread (Worker.execute_model), so calls never overlap."
@@ -2531,10 +2610,13 @@ components:
           type: boolean
         disable_cache:
           type: boolean
+        compiler:
+          type: string
     initial:
       cache: {}
       is_cache_updated: false
       disable_cache: false
+      compiler: inductor_standalone
   capacity:
     concurrency: 1
   description: "Capacity 1: each GPU worker process runs compilation and model execution on a single thread (Worker.execute_model), so calls never overlap."
@@ -2548,6 +2630,14 @@ components:
   - "vllm/compilation/compiler_interface.py:246"
   attributes:
     owner: kernels-ops
+  state:
+    schema:
+      type: object
+      properties:
+        cache_dir:
+          type: string
+    initial:
+      cache_dir: ''
 - id: piecewise-backend
   name: PiecewiseBackend
   kind: module
@@ -2847,6 +2937,23 @@ components:
   - "vllm/utils/deep_gemm.py:111"
   attributes:
     owner: kernels-ops
+  state:
+    schema:
+      type: object
+      properties:
+        oracle_cache:
+          type:
+          - object
+          - array
+          - string
+          - boolean
+          - integer
+          - "null"
+    initial:
+      oracle_cache: null
+  capacity:
+    concurrency: 1
+  description: "Capacity 1: each GPU worker process runs compilation and model execution on a single thread (Worker.execute_model), so calls never overlap."
 - id: network-utils
   name: Network utils
   kind: module
@@ -2939,6 +3046,123 @@ components:
   - "vllm/compilation/passes/fusion/rocm_aiter_fusion.py:1209"
   attributes:
     owner: kernels-ops
+- id: breakable-cuda-graph-wrapper
+  name: BreakableCUDAGraphWrapper
+  kind: module
+  layer: kernels
+  parent: compilation
+  summary: "Drop-in for CUDAGraphWrapper: per batch descriptor, captures the forward once in a BreakableCUDAGraphCapture and replays its segments."
+  sources:
+  - "vllm/compilation/breakable_cudagraph.py:249"
+  attributes:
+    owner: kernels-ops
+  state:
+    schema:
+      type: object
+      properties:
+        entries:
+          type: object
+          description: "batch descriptor -> {num_graphs, num_eager_breaks, segments, input_addresses}"
+        cleared_generation:
+          type: integer
+          description: "bumped by clear_all_graphs: entries of an earlier generation no longer match"
+    initial:
+      entries: {}
+      cleared_generation: 0
+  capacity:
+    concurrency: 1
+  description: "Capacity 1: each GPU worker process runs compilation and model execution on a single thread (Worker.execute_model), so calls never overlap."
+- id: breakable-cuda-graph-capture
+  name: BreakableCUDAGraphCapture
+  kind: module
+  layer: kernels
+  parent: compilation
+  summary: "The thread-local stream-capture context: a list of segments, each a captured CUDA graph or an eager op recorded for replay."
+  sources:
+  - "vllm/compilation/breakable_cudagraph.py:128"
+  attributes:
+    owner: kernels-ops
+  state:
+    schema:
+      type: object
+      properties:
+        active:
+          type: boolean
+          description: BreakableCUDAGraphCapture._tls.active is set
+        capturing:
+          type: boolean
+        num_graphs:
+          type: integer
+        num_eager_breaks:
+          type: integer
+        segments:
+          type: array
+          items:
+            type: string
+    initial:
+      active: false
+      capturing: false
+      num_graphs: 0
+      num_eager_breaks: 0
+      segments: []
+  capacity:
+    concurrency: 1
+  description: "Capacity 1: each GPU worker process runs compilation and model execution on a single thread (Worker.execute_model), so calls never overlap."
+- id: triton-kernel-dispatcher
+  name: Triton kernel overrides
+  kind: module
+  layer: kernels
+  parent: kernels-ops
+  summary: "vllm/triton_utils/dispatcher.py: platforms register replacements for named Triton kernels; every holder of the kernel is rebound to a KernelOverride that routes launches to the replacement."
+  sources:
+  - "vllm/triton_utils/dispatcher.py:147"
+  attributes:
+    owner: kernels-ops
+  state:
+    schema:
+      type: object
+      properties:
+        registry:
+          type: object
+          description: "kernel name -> {impl, arg_names, forward_by_name}"
+    initial:
+      registry: {}
+  capacity:
+    concurrency: 1
+  description: "Capacity 1: each GPU worker process runs compilation and model execution on a single thread (Worker.execute_model), so calls never overlap."
+- id: inductor-adaptor
+  name: InductorAdaptor
+  kind: module
+  layer: kernels
+  parent: compilation
+  summary: "The Inductor compiler for torch without standalone_compile (or VLLM_USE_STANDALONE_COMPILE=0): redirects Inductor's and Triton's caches under the vLLM cache dir."
+  sources:
+  - "vllm/compilation/compiler_interface.py:443"
+  attributes:
+    owner: kernels-ops
+  state:
+    schema:
+      type: object
+      properties:
+        cache_dir:
+          type: string
+        base_cache_dir:
+          type: string
+        env:
+          type: object
+          description: TORCHINDUCTOR_CACHE_DIR / TRITON_CACHE_DIR this process sets
+        last_triton_cache_dir:
+          type:
+          - string
+          - "null"
+    initial:
+      cache_dir: ''
+      base_cache_dir: ''
+      env: {}
+      last_triton_cache_dir: null
+  capacity:
+    concurrency: 1
+  description: "Capacity 1: each GPU worker process runs compilation and model execution on a single thread (Worker.execute_model), so calls never overlap."
 interfaces:
 - component: activation-quant-fusion-pass
   name: call
@@ -3088,6 +3312,46 @@ interfaces:
   - return:
       op: "vllm::rocm_aiter_group_fp8_quant.default"
     source: "vllm/_aiter_ops.py:3067"
+- component: aiter-ops
+  name: get-moe-dispatch-policy
+  kind: function
+  summary: "rocm_aiter_ops.get_moe_dispatch_policy (@if_aiter_supported): None off supported ROCm, else the cached VLLM_ROCM_AITER_MOE_DISPATCH_POLICY that AiterExperts passes as moe_sorting_dispatch_policy."
+  sources:
+  - "vllm/_aiter_ops.py:2004-2011"
+  response:
+    type: object
+    properties:
+      policy:
+        type:
+        - integer
+        - "null"
+      cached:
+        type: boolean
+  latency_ms: 0
+  behavior:
+  - call: aiter-ops.is-aiter-found-and-supported
+    input: {}
+    as: s
+    title: if_aiter_supported
+    source: "vllm/_aiter_ops.py:285"
+  - if: "!vars.s.value.supported"
+    then:
+    - return:
+        policy: null
+        cached: false
+  - if: "state.moe_dispatch_policy != null"
+    title: Read once per process
+    source: "vllm/_aiter_ops.py:2006"
+    then:
+    - return:
+        policy: "= state.moe_dispatch_policy"
+        cached: true
+  - set:
+      state.moe_dispatch_policy: "= config['vllm-rocm-aiter-moe-dispatch-policy']"
+    source: "vllm/_aiter_ops.py:2009"
+  - return:
+      policy: "= state.moe_dispatch_policy"
+      cached: false
 - component: aiter-ops
   name: group-fp8-quant
   kind: function
@@ -4081,6 +4345,26 @@ interfaces:
       layout: "= input.layout"
     title: "tuple(shuffle_weight(t, layout=layout) for t in tensors)"
     source: "vllm/_aiter_ops.py:4050"
+- component: aiter-ops
+  name: topk-softmax
+  kind: function
+  summary: "rocm_aiter_ops.topk_softmax: torch.ops.vllm.rocm_aiter_topk_softmax writes topk_weights / topk_indices in place (aiter.topk_softmax, with optional fused shared experts)."
+  sources:
+  - "vllm/_aiter_ops.py:3329-3348"
+  request: KernelsOpsMoeShape
+  response:
+    type: object
+    properties:
+      op:
+        type: string
+  latency_ms: 0
+  behavior:
+  - call: aiter-ops.rocm-aiter-topk-softmax
+    input: "= input"
+    title: torch.ops.vllm.rocm_aiter_topk_softmax(...)
+    source: "vllm/_aiter_ops.py:3338"
+  - return:
+      op: "vllm::rocm_aiter_topk_softmax"
 - component: all-reduce-fusion-pass
   name: call
   kind: function
@@ -4125,6 +4409,294 @@ interfaces:
   request: KernelsOpsCollectiveShape
   latency_ms: "= (double(config['kernel-launch-overhead-us']) + 2.0 * double(input.world_size - 1) / double(input.world_size) * double(input.num_bytes) / (double(config['gpu-nvlink-bandwidth-gbps']) * 1000.0))\
     \ / 1000.0"
+- component: breakable-cuda-graph-capture
+  name: capture
+  kind: function
+  summary: "with BreakableCUDAGraphCapture(pool): set the thread-local capture, begin a segment, run the forward (each break-point op splits the capture), end the last segment."
+  sources:
+  - "vllm/compilation/breakable_cudagraph.py:163-175"
+  - "vllm/compilation/breakable_cudagraph.py:178-196"
+  request:
+    type: object
+    properties:
+      break_ops:
+        type: integer
+        examples:
+        - 32
+        description: break-point op calls in the forward (one attention per layer)
+      runtime_mode:
+        type: string
+        default: PIECEWISE
+  response:
+    type: object
+    properties:
+      num_graphs:
+        type: integer
+      num_eager_breaks:
+        type: integer
+      num_segments:
+        type: integer
+  errors:
+  - code: runtime-error
+    status: 0
+    retryable: false
+  latency_ms: "= config['cudagraph-capture-overhead-ms']"
+  behavior:
+  - if: state.active
+    title: Only one capture per thread
+    source: "vllm/compilation/breakable_cudagraph.py:165"
+    then:
+    - fail:
+        code: runtime-error
+        message: Nested BreakableCUDAGraphCapture is not supported.
+  - set:
+      state.active: true
+      state.capturing: true
+      state.segments: []
+      state.num_graphs: 0
+      state.num_eager_breaks: 0
+    title: _tls.active = self; _begin_segment()
+    source: "vllm/compilation/breakable_cudagraph.py:166"
+  - foreach: "= [0,1,2,3,4,5,6,7,8,9,10,11,12,13,14,15,16,17,18,19,20,21,22,23,24,25,26,27,28,29,30,31,32,33,34,35,36,37,38,39,40,41,42,43,44,45,46,47,48,49,50,51,52,53,54,55,56,57,58,59,60,61,62,63,64,65,66,67,68,69,70,71,72,73,74,75,76,77,78,79].slice(0,\
+      \ input.break_ops)"
+    as: i
+    max: 80
+    title: "output = self.runnable(*args): the forward reaches each break-point op in turn"
+    source: "vllm/compilation/breakable_cudagraph.py:388"
+    steps:
+    - call: breakable-cuda-graph-capture.eager-break
+      input:
+        runtime_mode: "= input.runtime_mode"
+  - if: state.capturing
+    title: "_end_segment: capture_end, append graph.replay, num_graphs += 1"
+    source: "vllm/compilation/breakable_cudagraph.py:192"
+    then:
+    - set:
+        state.segments: "= state.segments + ['graph']"
+        state.num_graphs: "= state.num_graphs + 1"
+        state.capturing: false
+  - set:
+      state.active: false
+    title: "__exit__: _end_segment(), then clear the thread-local"
+    source: "vllm/compilation/breakable_cudagraph.py:174"
+  - return:
+      num_graphs: "= state.num_graphs"
+      num_eager_breaks: "= state.num_eager_breaks"
+      num_segments: "= size(state.segments)"
+- component: breakable-cuda-graph-capture
+  name: eager-break
+  kind: function
+  summary: "@eager_break_during_capture: inside an active capture (and not FULL mode) end the segment, run the op eagerly, record it, and begin a new segment; otherwise run the op."
+  sources:
+  - "vllm/compilation/breakable_cudagraph.py:67-120"
+  - "vllm/compilation/breakable_cudagraph.py:198-211"
+  request:
+    type: object
+    properties:
+      op:
+        type: string
+        default: unified_attention_with_output
+        examples:
+        - unified_attention_with_output
+      runtime_mode:
+        type:
+        - string
+        - "null"
+        default: null
+        enum:
+        - NONE
+        - PIECEWISE
+        - FULL
+        - null
+        description: "the forward context's cudagraph_runtime_mode; null: no forward context"
+  response:
+    type: object
+    properties:
+      path:
+        type: string
+  latency_ms: 0
+  behavior:
+  - if: "!config['vllm-use-breakable-cudagraph']"
+    title: "Breakable graphs off: the decorator returns the op unchanged"
+    source: "vllm/compilation/breakable_cudagraph.py:98"
+    then:
+    - return:
+        path: undecorated
+  - if: "!state.active || !state.capturing"
+    title: "No capture (or between segments): run the op"
+    source: "vllm/compilation/breakable_cudagraph.py:104"
+    then:
+    - return:
+        path: direct
+  - if: "has(input.runtime_mode) && input.runtime_mode == 'FULL'"
+    title: "FULL mode: the op is captured into the single graph"
+    source: "vllm/compilation/breakable_cudagraph.py:110"
+    then:
+    - return:
+        path: captured
+  - if: state.capturing
+    title: "_end_segment: capture_end, append graph.replay, num_graphs += 1"
+    source: "vllm/compilation/breakable_cudagraph.py:192"
+    then:
+    - set:
+        state.segments: "= state.segments + ['graph']"
+        state.num_graphs: "= state.num_graphs + 1"
+        state.capturing: false
+  - set:
+      state.segments: "= state.segments + ['eager:' + (has(input.op) ? input.op : 'unified_attention_with_output')]"
+      state.num_eager_breaks: "= state.num_eager_breaks + 1"
+    title: "add_eager: run fn now on the capture stream, record it for replay (weak-ref arguments)"
+    source: "vllm/compilation/breakable_cudagraph.py:209"
+  - set:
+      state.capturing: true
+    title: "_begin_segment: a new CUDAGraph.capture_begin(pool)"
+    source: "vllm/compilation/breakable_cudagraph.py:186"
+  - return:
+      path: eager-break
+- component: breakable-cuda-graph-wrapper
+  name: call
+  kind: function
+  summary: "BreakableCUDAGraphWrapper.__call__: eager without a forward context or in NONE / another wrapper's mode; else capture once per batch descriptor and replay afterwards."
+  sources:
+  - "vllm/compilation/breakable_cudagraph.py:318-343"
+  - "vllm/compilation/breakable_cudagraph.py:363-409"
+  - "vllm/compilation/breakable_cudagraph.py:411-429"
+  request:
+    type: object
+    properties:
+      num_tokens:
+        type: integer
+        examples:
+        - 16
+      uniform_decode:
+        type: boolean
+        default: true
+      runtime_mode:
+        type: string
+        enum:
+        - NONE
+        - PIECEWISE
+        - FULL
+        examples:
+        - PIECEWISE
+      wrapper_runtime_mode:
+        type:
+        - string
+        - "null"
+        default: null
+        description: "the wrapper's runtime_mode; null matches any non-NONE mode"
+      forward_context:
+        type: boolean
+        default: true
+      debug:
+        type: boolean
+        default: false
+      input_addresses:
+        type: array
+        items:
+          type: integer
+        examples:
+        - - 140000000
+      num_layers:
+        type: integer
+        examples:
+        - 32
+        description: one break-point attention op per layer
+  response:
+    type: object
+    properties:
+      path:
+        type: string
+      num_graphs:
+        type: integer
+      num_eager_breaks:
+        type: integer
+  errors:
+  - code: runtime-error
+    status: 0
+    retryable: false
+  - code: assertion-error
+    status: 0
+    retryable: false
+  latency_ms: 0
+  behavior:
+  - if: "has(input.forward_context) && !input.forward_context"
+    title: "No forward context: run the model eagerly"
+    source: "vllm/compilation/breakable_cudagraph.py:319"
+    then:
+    - return:
+        path: eager
+  - if: "input.runtime_mode == 'NONE' || (has(input.wrapper_runtime_mode) && input.wrapper_runtime_mode != null && input.runtime_mode != input.wrapper_runtime_mode)"
+    title: "Mode NONE, or a mode another wrapper handles: eager"
+    source: "vllm/compilation/breakable_cudagraph.py:329"
+    then:
+    - return:
+        path: eager
+  - set:
+      vars.key: "= string(input.num_tokens) + (has(input.uniform_decode) && !input.uniform_decode ? '' : '-uniform') + (state.cleared_generation == 0 ? '' : '-gen' + string(state.cleared_generation))"
+    title: entries keyed by the BatchDescriptor
+    source: "vllm/compilation/breakable_cudagraph.py:336"
+  - if: "!(vars.key in state.entries)"
+    title: "First use of this descriptor: _capture"
+    source: "vllm/compilation/breakable_cudagraph.py:342"
+    then:
+    - call: compilation-monitor.validate-cudagraph-capturing-enabled
+      input: {}
+      title: validate_cudagraph_capturing_enabled()
+      source: "vllm/compilation/breakable_cudagraph.py:369"
+    - call: breakable-cuda-graph-capture.capture
+      input:
+        break_ops: "= input.num_layers"
+        runtime_mode: "= input.runtime_mode"
+      as: cap
+      title: "with capture_pool(...), BreakableCUDAGraphCapture(pool=pool) as capture: output = self.runnable(...)"
+      source: "vllm/compilation/breakable_cudagraph.py:386"
+    - set:
+        "= 'state.entries.' + vars.key": "= {'num_graphs': vars.cap.value.num_graphs, 'num_eager_breaks': vars.cap.value.num_eager_breaks, 'segments': vars.cap.value.num_segments, 'input_addresses': has(input.input_addresses)\
+          \ ? input.input_addresses : []}"
+      title: entry.capture = capture; entry.output = weak_ref_tensors(output)
+      source: "vllm/compilation/breakable_cudagraph.py:399"
+    - return:
+        path: capture
+        num_graphs: "= vars.cap.value.num_graphs"
+        num_eager_breaks: "= vars.cap.value.num_eager_breaks"
+  - set:
+      vars.e: "= state.entries[vars.key]"
+  - if: "has(input.debug) && input.debug && has(input.input_addresses) && input.input_addresses != vars.e.input_addresses"
+    title: "DEBUG: input addresses must not move between capture and replay"
+    source: "vllm/compilation/breakable_cudagraph.py:420"
+    then:
+    - fail:
+        code: assertion-error
+        message: "= 'Input tensor addresses changed between capture and replay for BatchDescriptor(num_tokens=' + string(input.num_tokens) + '). Expected ' + string(vars.e.input_addresses) + ', got ' +\
+          \ string(input.input_addresses) + '.'"
+  - title: "capture.replay(): every segment in order (graph replays and the recorded eager ops)"
+    source: "vllm/compilation/breakable_cudagraph.py:216"
+    wait: "= double(vars.e.segments) * double(config['kernel-launch-overhead-us']) / 1000.0"
+  - return:
+      path: replay
+      num_graphs: "= vars.e.num_graphs"
+      num_eager_breaks: "= vars.e.num_eager_breaks"
+- component: breakable-cuda-graph-wrapper
+  name: clear-all-graphs
+  kind: function
+  summary: "BreakableCUDAGraphWrapper.clear_all_graphs: clear every instance's captured entries, so the next use of a batch descriptor captures again."
+  sources:
+  - "vllm/compilation/breakable_cudagraph.py:271-274"
+  - "vllm/compilation/breakable_cudagraph.py:313-315"
+  response:
+    type: object
+    properties:
+      cleared:
+        type: boolean
+  latency_ms: 0
+  behavior:
+  - set:
+      state.cleared_generation: "= seq('breakable-graph-clear')"
+    title: "self.entries.clear(): every captured descriptor is forgotten (a new generation, so the single-threaded capture path needs no second writer of the entries)"
+    source: "vllm/compilation/breakable_cudagraph.py:313-315"
+  - return:
+      cleared: true
 - component: compilation-counter
   name: clone
   kind: function
@@ -4376,6 +4948,9 @@ interfaces:
         type: string
         examples:
         - rank_0_0/backbone
+      prefix:
+        type: string
+        default: backbone
   latency_ms: 0
   behavior:
   - set:
@@ -4396,6 +4971,69 @@ interfaces:
       then:
       - set:
           state.cache: "= vars.f.value.content"
+  - title: "self.compiler.initialize_cache(cache_dir, disable_cache, prefix)"
+    source: "vllm/compilation/backends.py:214"
+    call: "= state.compiler == 'inductor' ? 'inductor-adaptor.initialize-cache' : 'inductor-standalone-adaptor.initialize-cache'"
+    targets:
+    - inductor-adaptor.initialize-cache
+    - inductor-standalone-adaptor.initialize-cache
+    input:
+      cache_dir: "= input.cache_dir"
+      disable_cache: "= input.disable_cache"
+      prefix: "= has(input.prefix) ? input.prefix : 'backbone'"
+- component: compiler-manager
+  name: make-compiler
+  kind: function
+  summary: "make_compiler(compilation_config) in CompilerManager.__init__: inductor backend -> InductorStandaloneAdaptor when VLLM_USE_STANDALONE_COMPILE and torch has standalone_compile, else InductorAdaptor;\
+    \ eager -> EagerAdaptor."
+  sources:
+  - "vllm/compilation/backends.py:97-122"
+  request:
+    type: object
+    properties:
+      backend:
+        type: string
+        default: inductor
+        enum:
+        - inductor
+        - eager
+      torch_has_standalone_compile:
+        type: boolean
+        default: true
+        description: "hasattr(torch._inductor, 'standalone_compile') (torch 2.8+)"
+  response:
+    type: object
+    properties:
+      compiler:
+        type: string
+  errors:
+  - code: assertion-error
+    status: 0
+    retryable: false
+  latency_ms: 0
+  behavior:
+  - if: "(!has(input.backend) || input.backend == 'inductor') && config['vllm-use-standalone-compile'] && (!has(input.torch_has_standalone_compile) || input.torch_has_standalone_compile)"
+    title: InductorStandaloneAdaptor(compile_cache_save_format)
+    source: "vllm/compilation/backends.py:109"
+    then:
+    - set:
+        state.compiler: inductor_standalone
+    - return:
+        compiler: inductor_standalone
+  - if: "!has(input.backend) || input.backend == 'inductor'"
+    title: InductorAdaptor
+    source: "vllm/compilation/backends.py:114"
+    then:
+    - set:
+        state.compiler: inductor
+    - return:
+        compiler: inductor
+  - set:
+      state.compiler: eager
+    title: EagerAdaptor
+    source: "vllm/compilation/backends.py:117"
+  - return:
+      compiler: eager
 - component: compiler-manager
   name: save-to-file
   kind: function
@@ -7981,17 +8619,44 @@ interfaces:
 - component: custom-ops
   name: gptq-marlin-repack
   kind: function
-  summary: "Python wrapper gptq_marlin_repack -> torch.ops._C.gptq_marlin_repack"
+  summary: "gptq_marlin_repack(b_q_weight, size_k, size_n, num_bits, is_a_8bit) -> torch.ops._C.gptq_marlin_repack"
   sources:
   - "vllm/_custom_ops.py:1091-1100"
-  request: KernelsOpsGemmShape
+  request:
+    type: object
+    required:
+    - k
+    - n
+    - num_bits
+    properties:
+      k:
+        type: integer
+        examples:
+        - 4096
+      n:
+        type: integer
+        examples:
+        - 6144
+      num_bits:
+        type: integer
+        examples:
+        - 8
+        description: 4 (GPTQ int4) or 8 (int8 / FP8 weights)
+      is_a_8bit:
+        type: boolean
+        default: false
+  errors:
+  - code: runtime-error
+    status: 0
+    retryable: false
   latency_ms: 0
   behavior:
-  - title: Call torch.ops._C.gptq_marlin_repack
-    source: "vllm/_custom_ops.py:1098"
-    call: torch-bindings.gptq-marlin-repack
+  - call: torch-bindings.gptq-marlin-repack
     input: "= input"
-    fill: true
+    as: r
+    title: "torch.ops._C.gptq_marlin_repack(b_q_weight, size_k, size_n, num_bits, is_a_8bit)"
+    source: "vllm/_custom_ops.py:1098"
+  - return: "= vars.r.value"
 - component: custom-ops
   name: gptq-shuffle
   kind: function
@@ -8261,17 +8926,112 @@ interfaces:
 - component: custom-ops
   name: marlin-gemm
   kind: function
-  summary: "Python wrapper marlin_gemm -> torch.ops._C.marlin_gemm"
+  summary: "marlin_gemm(a, c, b_q_weight, ..., b_q_type, size_m, size_n, size_k, ...) -> torch.ops._C.marlin_gemm with b_q_type.id"
   sources:
   - "vllm/_custom_ops.py:1204-1239"
-  request: KernelsOpsGemmShape
+  request:
+    type: object
+    required:
+    - m
+    - n
+    - k
+    properties:
+      m:
+        type: integer
+        minimum: 0
+        examples:
+        - 16
+        description: size_m (rows of a)
+      n:
+        type: integer
+        minimum: 1
+        examples:
+        - 6144
+        description: size_n (padded output features)
+      k:
+        type: integer
+        minimum: 1
+        examples:
+        - 4096
+        description: size_k (padded input features)
+      dtype_bytes:
+        type: integer
+        enum:
+        - 1
+        - 2
+        - 4
+        default: 1
+        examples:
+        - 1
+        description: "weight element size in bytes, for the latency (1: 8-bit weights)"
+      a_dtype:
+        type: string
+        enum:
+        - float16
+        - bfloat16
+        - float8_e4m3fn
+        - int8
+        default: bfloat16
+      b_type:
+        type:
+        - string
+        - "null"
+        default: null
+        examples:
+        - float8_e4m3fn
+        - uint4b8
+        description: "the vllm ScalarType of b_q_weight (b_type_id); null: float8_e4m3fn for 1-byte weights, else uint4b8 (GPTQ 4-bit)"
+      b_scales_dtype:
+        type:
+        - string
+        - "null"
+        default: null
+        description: "null: the activation dtype for 16-bit a, bfloat16 otherwise"
+      has_a_scales:
+        type: boolean
+        default: false
+      has_c:
+        type: boolean
+        default: false
+      has_global_scale:
+        type: boolean
+        default: false
+      has_zp:
+        type: boolean
+        default: false
+      num_groups:
+        type: integer
+        default: 1
+        description: "b_scales.size(0): 1 for per-channel scales"
+  response:
+    type: object
+    properties:
+      kernel:
+        type: string
+      a_type:
+        type: string
+      b_type:
+        type: string
+      c_type:
+        type: string
+      group_size:
+        type: integer
+      stages:
+        type: integer
+      launched:
+        type: boolean
+  errors:
+  - code: runtime-error
+    status: 0
+    retryable: false
   latency_ms: 0
   behavior:
-  - title: Call torch.ops._C.marlin_gemm
-    source: "vllm/_custom_ops.py:1222"
-    call: torch-bindings.marlin-gemm
+  - call: torch-bindings.marlin-gemm
     input: "= input"
-    fill: true
+    as: r
+    title: "torch.ops._C.marlin_gemm(a, c, b_q_weight, ..., b_q_type.id, size_m, size_n, size_k, ...)"
+    source: "vllm/_custom_ops.py:1222"
+  - return: "= vars.r.value"
 - component: custom-ops
   name: marlin-int4-fp8-preprocess
   kind: function
@@ -9712,6 +10472,69 @@ interfaces:
   - return:
       supported: "= vars.arch && config['vllm-use-deep-gemm'] && vars.h.value.available"
     source: "vllm/utils/deep_gemm.py:116"
+- component: deep-gemm-utils
+  name: quant-scale-fmt-from-oracle
+  kind: function
+  summary: "DeepGemmQuantScaleFMT.from_oracle: the cached block-FP8 scale format: FLOAT32 without E8M0; UE8M0 (packed int32) on the Blackwell families SM100/SM120; FLOAT32_CEIL_UE8M0 otherwise (Hopper)."
+  sources:
+  - "vllm/utils/deep_gemm.py:55-107"
+  request:
+    type: object
+    properties:
+      installed:
+        type: array
+        items:
+          type: string
+        default:
+        - deep_gemm
+      device_capability:
+        type: integer
+        default: 90
+      fp8_gemm_nt_found:
+        type: boolean
+        default: true
+        description: _lazy_init resolved deep_gemm.fp8_gemm_nt
+  response:
+    type: object
+    properties:
+      fmt:
+        type: string
+      cached:
+        type: boolean
+  latency_ms: 0
+  behavior:
+  - if: "state.oracle_cache != null"
+    title: The decision is made once per process
+    source: "vllm/utils/deep_gemm.py:102"
+    then:
+    - return:
+        fmt: "= state.oracle_cache"
+        cached: true
+  - call: deep-gemm-utils.is-deep-gemm-supported
+    input:
+      installed: "= has(input.installed) ? input.installed : ['deep_gemm']"
+      device_capability: "= has(input.device_capability) ? input.device_capability : 90"
+    as: s
+    title: _lazy_init(); init_oracle_cache()
+    source: "vllm/utils/deep_gemm.py:105"
+  - if: "!(config['vllm-use-deep-gemm-e8m0'] && vars.s.value.supported && (!has(input.fp8_gemm_nt_found) || input.fp8_gemm_nt_found))"
+    title: use_e8m0 = VLLM_USE_DEEP_GEMM_E8M0 and is_deep_gemm_supported() and fp8_gemm_nt resolved; else FLOAT32
+    source: "vllm/utils/deep_gemm.py:78"
+    then:
+    - set:
+        state.oracle_cache: FLOAT32
+    - return:
+        fmt: FLOAT32
+        cached: false
+  - set:
+      vars.cap: "= has(input.device_capability) ? input.device_capability : 90"
+  - set:
+      state.oracle_cache: "= (vars.cap / 10 == 10 || vars.cap / 10 == 12) ? 'UE8M0' : 'FLOAT32_CEIL_UE8M0'"
+    title: "is_device_capability_family(100) or (120): capability // 10 matches"
+    source: "vllm/utils/deep_gemm.py:85"
+  - return:
+      fmt: "= state.oracle_cache"
+      cached: false
 - component: fix-functionalization-pass
   name: call
   kind: function
@@ -10420,12 +11243,16 @@ interfaces:
 - component: import-utils
   name: has-module
   kind: function
-  summary: "_has_module(name): find_spec, then a trial import; any failure counts as unavailable. has_deep_gemm (external or vendored), has_deep_ep and has_triton_kernels are built on it."
+  summary: "_has_module(name): find_spec, then a trial import; any failure counts as unavailable. has_deep_gemm (external or vendored), has_deep_ep and has_triton_kernels are built on it. Also the MoE all2all\
+    \ backends' packages: nixl_ep, mori, and deep_ep v2 (ElasticBuffer); and the triton_kernels API generation."
   sources:
   - "vllm/utils/import_utils.py:403-422"
   - "vllm/utils/import_utils.py:512-520"
   - "vllm/utils/import_utils.py:439-441"
   - "vllm/utils/import_utils.py:560-567"
+  - "vllm/utils/import_utils.py:501-509"
+  - "vllm/utils/import_utils.py:522-524"
+  - "vllm/utils/import_utils.py:637-639"
   request:
     type: object
     required:
@@ -10437,6 +11264,9 @@ interfaces:
         - deep_gemm
         - deep_ep
         - triton_kernels
+        - deep_ep_v2
+        - nixl_ep
+        - mori
       installed:
         type: array
         items:
@@ -10461,6 +11291,12 @@ interfaces:
       device_capability:
         type: integer
         default: 90
+      deep_ep_v2_reason:
+        type:
+        - string
+        - "null"
+        default: null
+        description: "deep_ep_v2_unavailable_reason(): null when deep_ep has ElasticBuffer and a new-enough NCCL"
   response:
     type: object
     properties:
@@ -10468,6 +11304,23 @@ interfaces:
         type: boolean
   latency_ms: 0
   behavior:
+  - if: "input.probe == 'nixl_ep' || input.probe == 'mori'"
+    title: "has_nixl_ep / has_mori: _has_module(name)"
+    source: "vllm/utils/import_utils.py:524"
+    then:
+    - return:
+        available: "= input.probe in input.installed"
+  - if: "input.probe == 'deep_ep_v2'"
+    title: "has_deep_ep_v2: deep_ep v2 API with no unavailability reason (the reason is logged when deep_ep itself is installed)"
+    source: "vllm/utils/import_utils.py:509"
+    then:
+    - if: "has(input.deep_ep_v2_reason) && input.deep_ep_v2_reason != null && 'deep_ep' in input.installed"
+      source: "vllm/utils/import_utils.py:508"
+      then:
+      - set:
+          ctx.log: "= 'deepep_v2 backend will not be available: ' + input.deep_ep_v2_reason"
+    - return:
+        available: "= 'deep_ep' in input.installed && (!has(input.deep_ep_v2_reason) || input.deep_ep_v2_reason == null)"
   - if: "input.probe == 'deep_gemm'"
     title: "deep_gemm: an external install wins, else the vendored copy"
     source: "vllm/utils/import_utils.py:519"
@@ -10485,6 +11338,78 @@ interfaces:
     source: "vllm/utils/import_utils.py:562"
   - return:
       available: "= vars.a"
+- component: inductor-adaptor
+  name: initialize-cache
+  kind: function
+  summary: "InductorAdaptor.initialize_cache: base dir = cache_dir minus the prefix; unless the cache is disabled, point TORCHINDUCTOR_CACHE_DIR at <base>/inductor_cache and TRITON_CACHE_DIR at <base>/triton_cache,\
+    \ keeping a caller's own TRITON_CACHE_DIR."
+  sources:
+  - "vllm/compilation/compiler_interface.py:455-477"
+  request:
+    type: object
+    properties:
+      cache_dir:
+        type: string
+        examples:
+        - ~/.cache/vllm/torch_compile_cache/h/rank_0_0/backbone
+      disable_cache:
+        type: boolean
+        default: false
+      prefix:
+        type: string
+        default: backbone
+      triton_cache_dir_env:
+        type:
+        - string
+        - "null"
+        default: null
+        description: TRITON_CACHE_DIR in the environment before the call
+  response:
+    type: object
+    properties:
+      inductor_cache:
+        type:
+        - string
+        - "null"
+      triton_cache:
+        type:
+        - string
+        - "null"
+  latency_ms: 0
+  behavior:
+  - set:
+      vars.p: "= has(input.prefix) ? input.prefix : ''"
+  - set:
+      state.cache_dir: "= input.cache_dir"
+      state.base_cache_dir: "= vars.p != '' && input.cache_dir.endsWith(vars.p) ? input.cache_dir.substring(0, size(input.cache_dir) - size(vars.p)) : input.cache_dir"
+    title: "base_cache_dir = cache_dir[:-len(prefix)]: all prefixes of one model share Inductor and Triton caches"
+    source: "vllm/compilation/compiler_interface.py:461"
+  - if: "has(input.disable_cache) && input.disable_cache"
+    title: "Cache disabled: leave Inductor's and Triton's dirs alone"
+    source: "vllm/compilation/compiler_interface.py:462"
+    then:
+    - return:
+        inductor_cache: null
+        triton_cache: null
+  - set:
+      state.env.TORCHINDUCTOR_CACHE_DIR: "= state.base_cache_dir + 'inductor_cache'"
+    source: "vllm/compilation/compiler_interface.py:467"
+  - set:
+      vars.t: "= has(input.triton_cache_dir_env) ? input.triton_cache_dir_env : null"
+  - if: "vars.t == null || vars.t == state.last_triton_cache_dir"
+    title: "No caller-set TRITON_CACHE_DIR (or one an earlier adaptor set): model-local triton_cache"
+    source: "vllm/compilation/compiler_interface.py:471"
+    then:
+    - set:
+        vars.t: "= state.base_cache_dir + 'triton_cache'"
+    - set:
+        state.last_triton_cache_dir: "= vars.t"
+  - set:
+      state.env.TRITON_CACHE_DIR: "= vars.t"
+    source: "vllm/compilation/compiler_interface.py:475"
+  - return:
+      inductor_cache: "= state.env.TORCHINDUCTOR_CACHE_DIR"
+      triton_cache: "= vars.t"
 - component: inductor-pass
   name: get-pass-context
   kind: function
@@ -10600,6 +11525,31 @@ interfaces:
       title: compilation_counter.num_compiled_artifacts_saved += 1
   - return:
       handle: "= input.key"
+- component: inductor-standalone-adaptor
+  name: initialize-cache
+  kind: function
+  summary: "InductorStandaloneAdaptor.initialize_cache: remember the cache dir; artifacts are saved under it by compile()."
+  sources:
+  - "vllm/compilation/compiler_interface.py:269-272"
+  request:
+    type: object
+    properties:
+      cache_dir:
+        type: string
+      disable_cache:
+        type: boolean
+        default: false
+      prefix:
+        type: string
+        default: ''
+  latency_ms: 0
+  behavior:
+  - set:
+      state.cache_dir: "= input.cache_dir"
+    title: self.cache_dir = cache_dir
+    source: "vllm/compilation/compiler_interface.py:272"
+  - return:
+      cache_dir: "= state.cache_dir"
 - component: inductor-standalone-adaptor
   name: load
   kind: function
@@ -12989,7 +13939,8 @@ interfaces:
 - component: support-torch-compile
   name: call
   kind: function
-  summary: "The @support_torch_compile __call__: eager when compilation is off, else load an AOT artifact, run the compiled code, or compile on first call."
+  summary: "The @support_torch_compile __call__ of one decorated module: eager when the module's do_not_compile is set (or the forward context skips compiled code), else call its AOT function, load an AOT\
+    \ artifact, run the compiled code, or compile on first call. compiled / aot_compiled_fn are per module (decorators.py:415)."
   sources:
   - "vllm/compilation/decorators.py:524-624"
   request: KernelsOpsGraphCall
@@ -12998,10 +13949,19 @@ interfaces:
     properties:
       path:
         type: string
+      module:
+        type: string
   latency_ms: 0
   behavior:
-  - if: "config['compilation-mode'] == 0 || config['compilation-mode'] == 1"
-    title: "do_not_compile (mode NONE or STOCK_TORCH_COMPILE): plain forward"
+  - set:
+      vars.cls: "= has(input.module) && input.module != null ? input.module : (state.current != null ? state.current : 'LlamaModel')"
+    title: "self: the module the runner calls (by default the model built last)"
+  - set:
+      vars.m: "= vars.cls in state.modules ? state.modules[vars.cls] : {'do_not_compile': config['compilation-mode'] == 0 || config['compilation-mode'] == 1}"
+    title: "The module's do_not_compile, set by its decorated __init__ (a model built without a recorded __init__ has only the mode check)"
+    source: "vllm/compilation/decorators.py:434"
+  - if: vars.m.do_not_compile
+    title: "self.do_not_compile (mode NONE or STOCK_TORCH_COMPILE, @ignore_torch_compile, or enable_if false): plain forward"
     source: "vllm/compilation/decorators.py:528"
     then:
     - set:
@@ -13010,7 +13970,19 @@ interfaces:
       source: "vllm/compilation/decorators.py:529"
     - return:
         path: eager
-  - if: state.aot_compiled_fn
+        module: "= vars.cls"
+  - if: "has(input.skip_compiled) && input.skip_compiled"
+    title: "forward_context.skip_compiled (enc-dec shapes vary per call): bypass the compiled model"
+    source: "vllm/compilation/decorators.py:534"
+    then:
+    - set:
+        ctx.forward: eager
+    - return:
+        path: skip-compiled
+        module: "= vars.cls"
+  - set:
+      vars.gin: "= merge(input, {'module': vars.cls})"
+  - if: vars.cls in state.aot_compiled_fn
     title: "AOT-compiled function already loaded: call it"
     source: "vllm/compilation/decorators.py:540"
     then:
@@ -13018,8 +13990,11 @@ interfaces:
       input: "= input"
     - return:
         path: aot
+        module: "= vars.cls"
   - set:
-      vars.aot_path: "= 'torch_aot_compile/' + string(input.num_layers) + '/rank_0_0/model'"
+      vars.aot_path: "= 'torch_aot_compile/' + string(input.num_layers) + '-' + vars.cls + '/rank_0_0/model'"
+    title: "AOT hash: aot_compile_hash_factors(vllm_config) + _model_hash_key(self.forward) (qualname and first line of the module's forward)"
+    source: "vllm/compilation/decorators.py:563"
   - if: "config['vllm-use-aot-compile'] && !config['vllm-disable-compile-cache']"
     title: "AOT mode: try the artifact on disk"
     source: "vllm/compilation/decorators.py:586"
@@ -13034,20 +14009,22 @@ interfaces:
       source: "vllm/compilation/decorators.py:590"
       then:
       - set:
-          state.aot_compiled_fn: true
-          state.was_aot_compile_fn_loaded_from_disk: true
+          "= 'state.aot_compiled_fn.' + vars.cls": true
+          "= 'state.was_aot_compile_fn_loaded_from_disk.' + vars.cls": true
       - call: piecewise-backend.call
         input: "= input"
       - return:
           path: aot-loaded
-  - if: state.compiled
+          module: "= vars.cls"
+  - if: vars.cls in state.compiled
     title: "Already compiled: guard-free dispatch"
     source: "vllm/compilation/decorators.py:603"
     then:
     - call: torch-compile-with-no-guards-wrapper.call
-      input: "= input"
+      input: "= vars.gin"
     - return:
         path: compiled
+        module: "= vars.cls"
   - title: "First call: mark dynamic dims and compile"
     source: "vllm/compilation/decorators.py:605"
     set:
@@ -13064,6 +14041,7 @@ interfaces:
         prefix: backbone
         graph_patterns: []
         config_hash: "= has(input.config_hash) ? input.config_hash : null"
+        module: "= vars.cls"
       as: be
     - call: torch-compile-cache.save-aot-artifact
       input:
@@ -13072,22 +14050,24 @@ interfaces:
       title: save_aot_compiled_function
       source: "vllm/compilation/decorators.py:700"
     - set:
-        state.aot_compiled_fn: true
-        state.compiled: true
+        "= 'state.aot_compiled_fn.' + vars.cls": true
+        "= 'state.compiled.' + vars.cls": true
     - call: piecewise-backend.call
       input: "= input"
     - return:
         path: aot-compiled
-  - title: "JIT: torch.compile through the guard-free wrapper"
+        module: "= vars.cls"
+  - title: "JIT: torch.compile through the module's guard-free wrapper"
     source: "vllm/compilation/decorators.py:712"
     call: torch-compile-with-no-guards-wrapper.call
-    input: "= input"
+    input: "= vars.gin"
   - set:
-      state.compiled: true
+      "= 'state.compiled.' + vars.cls": true
     source: "vllm/compilation/decorators.py:718"
-    title: Mark compiled
+    title: Mark this module compiled
   - return:
       path: jit-compiled
+      module: "= vars.cls"
 - component: support-torch-compile
   name: decorate
   kind: function
@@ -13181,11 +14161,17 @@ interfaces:
       - fail:
           code: value-error
           message: "= 'Argument ' + vars.k + ' not found in the forward method of ' + (has(input.cls) ? input.cls : \"<class 'vllm.model_executor.models.llama.LlamaModel'>\")"
+  - set:
+      vars.cn: "= has(input.cls) && input.cls.startsWith(\"<class '\") ? input.cls.substring(input.cls.lastIndexOf('.') + 1).replace(\"'>\", '') : (has(input.cls) ? input.cls : 'LlamaModel')"
+    title: Wrap the class (_support_torch_compile)
+    source: "vllm/compilation/decorators.py:240"
+  - set:
+      "= 'state.ignored.' + vars.cn": false
+    title: "setattr(cls, IGNORE_COMPILE_KEY, False): a decorated subclass of an @ignore_torch_compile class compiles again"
+    source: "vllm/compilation/decorators.py:363"
   - return:
       dynamic_args: "= vars.names"
       is_encoder: "= input.is_encoder"
-    title: Wrap the class (_support_torch_compile)
-    source: "vllm/compilation/decorators.py:240"
 - component: support-torch-compile
   name: ignore-torch-compile
   kind: function
@@ -13213,15 +14199,23 @@ interfaces:
 - component: support-torch-compile
   name: init
   kind: function
-  summary: "The decorated __init__: run the model's __init__, then decide do_not_compile (mode NONE/STOCK_TORCH_COMPILE, @ignore_torch_compile, or enable_if false); otherwise count the model."
+  summary: "The decorated __init__ of one module instance: run the model's __init__, then decide this module's do_not_compile (mode NONE/STOCK_TORCH_COMPILE, IGNORE_COMPILE_KEY found along the MRO, or enable_if\
+    \ false); otherwise count the model and start it uncompiled (self.compiled = False)."
   sources:
-  - "vllm/compilation/decorators.py:399-411"
+  - "vllm/compilation/decorators.py:399-419"
+  - "vllm/compilation/decorators.py:80-82"
   request:
     type: object
     properties:
       cls:
         type: string
         default: LlamaModel
+      bases:
+        type: array
+        items:
+          type: string
+        default: []
+        description: "the class's bases in MRO order (getattr finds IGNORE_COMPILE_KEY on the nearest class that set it)"
       enable_if:
         type: boolean
         default: true
@@ -13234,9 +14228,17 @@ interfaces:
   latency_ms: 0
   behavior:
   - set:
-      vars.dnc: "= config['compilation-mode'] == 0 || config['compilation-mode'] == 1 || (input.cls in state.ignored && state.ignored[input.cls]) || !input.enable_if"
+      vars.hits: "= ([input.cls] + (has(input.bases) ? input.bases : [])).filter(c, c in state.ignored)"
+    title: "getattr(cls, IGNORE_COMPILE_KEY, False): the nearest class in the MRO that set the key decides"
+    source: "vllm/compilation/decorators.py:82"
+  - set:
+      vars.dnc: "= config['compilation-mode'] == 0 || config['compilation-mode'] == 1 || (size(vars.hits) > 0 && state.ignored[vars.hits[0]]) || (has(input.enable_if) && !input.enable_if)"
     title: "do_not_compile = mode in [NONE, STOCK_TORCH_COMPILE] or ignored or not enable_compile"
     source: "vllm/compilation/decorators.py:402"
+  - set:
+      "= 'state.modules.' + input.cls": "= {'do_not_compile': vars.dnc}"
+      state.current: "= input.cls"
+    title: "A new module instance: nothing compiled yet; the runner calls the model built last"
   - if: vars.dnc
     title: Nothing else to set up
     source: "vllm/compilation/decorators.py:408"
@@ -13249,7 +14251,9 @@ interfaces:
       by: 1
     source: "vllm/compilation/decorators.py:414"
     title: compilation_counter.num_models_seen += 1
-  - return:
+  - title: self.compiled = False; TorchCompileWithNoGuardsWrapper.__init__ gives the module its own wrapper and backend
+    source: "vllm/compilation/decorators.py:415"
+    return:
       do_not_compile: false
 - component: system-utils
   name: update-environment-variables
@@ -15008,8 +16012,68 @@ interfaces:
     latency_model: weightprep
     kernels:
     - gptq_marlin_repack_kernel
-  request: KernelsOpsGemmShape
-  latency_ms: "= (double(config['kernel-launch-overhead-us']) + 2.0 * double(input.n) * double(input.k) * double(input.dtype_bytes) / (double(config['gpu-hbm-bandwidth-gbps']) * 1000.0)) / 1000.0"
+  request:
+    type: object
+    required:
+    - k
+    - n
+    - num_bits
+    properties:
+      k:
+        type: integer
+        examples:
+        - 4096
+      n:
+        type: integer
+        examples:
+        - 6144
+      num_bits:
+        type: integer
+        examples:
+        - 8
+        description: 4 (GPTQ int4) or 8 (int8 / FP8 weights)
+      is_a_8bit:
+        type: boolean
+        default: false
+  response:
+    type: object
+    properties:
+      repacked_rows:
+        type: integer
+      repacked_cols:
+        type: integer
+  errors:
+  - code: runtime-error
+    status: 0
+    retryable: false
+  latency_ms: "= (double(config['kernel-launch-overhead-us']) + 2.0 * double(input.n) * double(input.k) * double(input.num_bits) / 8.0 / (double(config['gpu-hbm-bandwidth-gbps']) * 1000.0)) / 1000.0"
+  behavior:
+  - if: "input.k % 16 != 0"
+    title: size_k divisible by tile_k_size (16)
+    source: "csrc/quantization/marlin/gptq_marlin_repack.cu:224"
+    then:
+    - fail:
+        code: runtime-error
+        message: "= 'size_k = ' + string(input.k) + ' is not divisible by tile_k_size = 16'"
+  - if: "input.n % 64 != 0"
+    title: size_n divisible by tile_n_size (64)
+    source: "csrc/quantization/marlin/gptq_marlin_repack.cu:226"
+    then:
+    - fail:
+        code: runtime-error
+        message: "= 'size_n = ' + string(input.n) + ' is not divisible by tile_n_size = 64'"
+  - if: "input.num_bits != 4 && input.num_bits != 8"
+    title: 4 or 8 bits
+    source: "csrc/quantization/marlin/gptq_marlin_repack.cu:229"
+    then:
+    - fail:
+        code: runtime-error
+        message: "= 'num_bits must be 4 or 8. Got = ' + string(input.num_bits)"
+  - title: "Launch gptq_marlin_repack_kernel: output [size_k / 16, size_n * 16 / pack_factor] int32"
+    source: "csrc/quantization/marlin/gptq_marlin_repack.cu:254"
+    return:
+      repacked_rows: "= input.k / 16"
+      repacked_cols: "= input.n * 16 / (32 / input.num_bits)"
 - component: torch-bindings
   name: gptq-shuffle
   kind: kernel
@@ -15269,9 +16333,240 @@ interfaces:
     - Marlin
     - MarlinDefault
     - Marlin
-  request: KernelsOpsGemmShape
-  latency_ms: "= (double(config['kernel-launch-overhead-us']) + math.greatest(2.0 * double(input.m) * double(input.n) * double(input.k) / (double(config['gpu-bf16-dense-tflops']) * (input.dtype_bytes ==\
-    \ 1 ? 2.0 : 1.0) * 1000000.0), double(input.n) * double(input.k) * double(input.dtype_bytes) / (double(config['gpu-hbm-bandwidth-gbps']) * 1000.0))) / 1000.0"
+  request:
+    type: object
+    required:
+    - m
+    - n
+    - k
+    properties:
+      m:
+        type: integer
+        minimum: 0
+        examples:
+        - 16
+        description: size_m (rows of a)
+      n:
+        type: integer
+        minimum: 1
+        examples:
+        - 6144
+        description: size_n (padded output features)
+      k:
+        type: integer
+        minimum: 1
+        examples:
+        - 4096
+        description: size_k (padded input features)
+      dtype_bytes:
+        type: integer
+        enum:
+        - 1
+        - 2
+        - 4
+        default: 1
+        examples:
+        - 1
+        description: "weight element size in bytes, for the latency (1: 8-bit weights)"
+      a_dtype:
+        type: string
+        enum:
+        - float16
+        - bfloat16
+        - float8_e4m3fn
+        - int8
+        default: bfloat16
+      b_type:
+        type:
+        - string
+        - "null"
+        default: null
+        examples:
+        - float8_e4m3fn
+        - uint4b8
+        description: "the vllm ScalarType of b_q_weight (b_type_id); null: float8_e4m3fn for 1-byte weights, else uint4b8 (GPTQ 4-bit)"
+      b_scales_dtype:
+        type:
+        - string
+        - "null"
+        default: null
+        description: "null: the activation dtype for 16-bit a, bfloat16 otherwise"
+      has_a_scales:
+        type: boolean
+        default: false
+      has_c:
+        type: boolean
+        default: false
+      has_global_scale:
+        type: boolean
+        default: false
+      has_zp:
+        type: boolean
+        default: false
+      num_groups:
+        type: integer
+        default: 1
+        description: "b_scales.size(0): 1 for per-channel scales"
+  response:
+    type: object
+    properties:
+      kernel:
+        type: string
+      a_type:
+        type: string
+      b_type:
+        type: string
+      c_type:
+        type: string
+      group_size:
+        type: integer
+      stages:
+        type: integer
+      launched:
+        type: boolean
+  errors:
+  - code: runtime-error
+    status: 0
+    retryable: false
+  latency_ms: "= (double(config['kernel-launch-overhead-us']) + math.greatest(2.0 * double(input.m) * double(input.n) * double(input.k) / (double(config['gpu-bf16-dense-tflops']) * 1000000.0), double(input.n)\
+    \ * double(input.k) * (has(input.dtype_bytes) ? double(input.dtype_bytes) : 1.0) / (double(config['gpu-hbm-bandwidth-gbps']) * 1000.0))) / 1000.0"
+  behavior:
+  - set:
+      vars.a: "= (has(input.a_dtype) && input.a_dtype != null ? input.a_dtype : 'bfloat16')"
+      vars.b: "= (has(input.b_type) && input.b_type != null ? input.b_type : (has(input.dtype_bytes) && input.dtype_bytes != 1 ? 'uint4b8' : 'float8_e4m3fn'))"
+      vars.a16: "= (has(input.a_dtype) && input.a_dtype != null ? input.a_dtype : 'bfloat16') in ['float16', 'bfloat16']"
+      vars.as: "= (has(input.has_a_scales) && input.has_a_scales != null ? input.has_a_scales : false)"
+      vars.zp: "= (has(input.has_zp) && input.has_zp != null ? input.has_zp : false)"
+      vars.gs: "= (has(input.has_global_scale) && input.has_global_scale != null ? input.has_global_scale : false)"
+      vars.ng: "= (has(input.num_groups) && input.num_groups != null ? input.num_groups : 1)"
+  - set:
+      vars.s: "= (has(input.b_scales_dtype) && input.b_scales_dtype != null ? input.b_scales_dtype : (vars.a16 ? vars.a : 'bfloat16'))"
+    title: "c and scale types follow a for 16-bit activations, else b_scales' dtype"
+    source: "csrc/quantization/marlin/marlin.cu:435"
+  - if: "!vars.a16 && !(vars.s in ['float16', 'bfloat16']) && !(has(input.has_c) && input.has_c != null ? input.has_c : false)"
+    title: 8-bit a with non-16-bit scales (W4A8-FP4) needs an explicit c
+    source: "csrc/quantization/marlin/marlin.cu:452"
+    then:
+    - fail:
+        code: runtime-error
+        message: c must be passed for W4A8-FP4
+  - if: "vars.b == 'float4_e2m1f' && !(vars.s in ['float8_e4m3fn', 'float8_e8m0fnu'])"
+    title: FP4 weights need FP8 (NVFP4) or E8M0 (MXFP4) scales
+    source: "csrc/quantization/marlin/marlin.cu:484"
+    then:
+    - fail:
+        code: runtime-error
+        message: "When b_type = float4_e2m1f, b_scale scalar type must befloat8_e4m3fn (for NVFP4) or float8_e8m0fnu (for MXFP4)."
+  - if: "input.k % 16 != 0"
+    title: size_k divisible by tile_size (16)
+    source: "csrc/quantization/marlin/marlin.cu:510"
+    then:
+    - fail:
+        code: runtime-error
+        message: "= 'size_k = ' + string(input.k) + ' is not divisible by tile_size = 16'"
+  - if: "vars.as && vars.a16"
+    title: a_scales only for 8-bit activations
+    source: "csrc/quantization/marlin/marlin.cu:546"
+    then:
+    - fail:
+        code: runtime-error
+        message: a_scales can only be used for 8bit activation.
+  - if: "!vars.as && !vars.a16"
+    title: 8-bit activations need a_scales
+    source: "csrc/quantization/marlin/marlin.cu:552"
+    then:
+    - fail:
+        code: runtime-error
+        message: the a_scales parameter must be passed for 8bit activation.
+  - if: input.m == 0
+    title: "size_m == 0: return the empty output without launching"
+    source: "csrc/quantization/marlin/marlin.cu:583"
+    then:
+    - return:
+        kernel: ''
+        a_type: "= vars.a"
+        b_type: "= vars.b"
+        c_type: "= vars.a16 ? vars.a : vars.s"
+        group_size: -1
+        stages: 0
+        launched: false
+  - if: "vars.ng > 1 && input.k % vars.ng != 0"
+    title: "Grouped scales: size_k divisible by the number of groups"
+    source: "csrc/quantization/marlin/marlin.cu:613"
+    then:
+    - fail:
+        code: runtime-error
+        message: "= 'size_k = ' + string(input.k) + ', is not divisible by b_scales.size(0) = ' + string(vars.ng)"
+  - if: "vars.gs != (vars.b == 'float4_e2m1f' && vars.s == 'float8_e4m3fn')"
+    title: global_scale exactly for NVFP4
+    source: "csrc/quantization/marlin/marlin.cu:624"
+    then:
+    - fail:
+        code: runtime-error
+        message: "= vars.gs ? 'global_scale can only be used for nvfp4 format.' : 'the global_scale parameter must be passed for nvfp4 format.'"
+  - if: "vars.zp && !(vars.b in ['uint4', 'uint8'])"
+    title: Zero points only with u4 / u8 weights
+    source: "csrc/quantization/marlin/marlin.cu:657"
+    then:
+    - fail:
+        code: runtime-error
+        message: "= 'b_type must be u4 or u8 when has_zp = True. Got = ' + vars.b"
+  - if: "!vars.zp && !(vars.b in ['uint4b8', 'uint8b128', 'int4', 'int8', 'float8_e4m3fn', 'float4_e2m1f'])"
+    title: "Without zero points: GPTQ (u4b8, u8b128), int4/int8, FP8 or FP4 weights"
+    source: "csrc/quantization/marlin/marlin.cu:659"
+    then:
+    - fail:
+        code: runtime-error
+        message: "= 'b_type must be uint4b8, uint8b128, int4, int8, float8_e4m3fn or float4_e2m1f when has_zp = False. Got = ' + vars.b"
+  - if: "input.n % 64 != 0"
+    title: size_n divisible by min_thread_n (64)
+    source: "csrc/quantization/marlin/marlin.cu:697"
+    then:
+    - fail:
+        code: runtime-error
+        message: "= 'size_n = ' + string(input.n) + ', is not divisible by min_thread_n = 64'"
+  - set:
+      vars.cap: "= state.device_capability.major * 10 + state.device_capability.minor"
+    title: "marlin_mm: compute capability of the device (cudaDeviceGetAttribute)"
+    source: "csrc/quantization/marlin/marlin.cu:287"
+  - if: vars.cap < 75
+    title: Marlin needs Turing or newer
+    source: "csrc/quantization/marlin/marlin.cu:288"
+    then:
+    - fail:
+        code: runtime-error
+        message: marlin kernel only support Turing or newer GPUs.
+  - if: "vars.cap == 75 && !(vars.a in ['float16', 'int8'])"
+    title: "SM75: 2 stages, FP16 or INT8 activations only"
+    source: "csrc/quantization/marlin/marlin.cu:293"
+    then:
+    - fail:
+        code: runtime-error
+        message: Turing only support FP16 or INT8 activation.
+  - if: "vars.a == 'float8_e4m3fn' && vars.cap < 89"
+    title: FP8 activations (W4A8/W8A8-FP8) need SM89+
+    source: "csrc/quantization/marlin/marlin.cu:297"
+    then:
+    - fail:
+        code: runtime-error
+        message: FP8 only support Ada Lovelace or newer GPUs.
+  - if: "vars.a == 'float8_e4m3fn' && vars.cap != 89 && state.device_capability.major != 12"
+    title: FP8 activations only on SM89 or SM12x
+    source: "csrc/quantization/marlin/marlin.cu:301"
+    then:
+    - fail:
+        code: runtime-error
+        message: Marlin W4A8-FP8 only support SM89 or SM12x device (It is slower than Marlin W4A16 on other devices).
+  - title: "Pick the Marlin template instance for (a, b, c, s) types and the thread config, then launch"
+    source: "csrc/quantization/marlin/marlin.cu:228"
+    return:
+      kernel: Marlin
+      a_type: "= vars.a"
+      b_type: "= vars.b"
+      c_type: "= vars.a16 ? vars.a : vars.s"
+      group_size: "= vars.ng > 1 ? input.k / vars.ng : -1"
+      stages: "= vars.cap == 75 ? 2 : 4"
+      launched: true
 - component: torch-bindings
   name: marlin-int4-fp8-preprocess
   kind: kernel
@@ -16603,13 +17898,20 @@ interfaces:
 - component: torch-compile-with-no-guards-wrapper
   name: call
   kind: function
-  summary: "TorchCompileWithNoGuardsWrapper.__call__: first call compiles through Dynamo and the vLLM backend; later calls jump to the compiled bytecode."
+  summary: "TorchCompileWithNoGuardsWrapper.__call__ of one module: its first call compiles through Dynamo and its own VllmBackend; later calls jump to the compiled bytecode. Each decorated module has its\
+    \ own wrapper (wrapper.py:93, self.compiled = False)."
   sources:
   - "vllm/compilation/wrapper.py:187-219"
   request: KernelsOpsGraphCall
   latency_ms: 0
   behavior:
-  - if: "state.compiled_bytecode && config['vllm-use-bytecode-hook']"
+  - set:
+      vars.mod: "= has(input.module) && input.module != null ? input.module : 'LlamaModel'"
+  - set:
+      vars.cb: "= vars.mod in state.compiled_bytecode && state.compiled_bytecode[vars.mod]"
+    title: self.compiled starts False for every wrapped module
+    source: "vllm/compilation/wrapper.py:93"
+  - if: "vars.cb && config['vllm-use-bytecode-hook']"
     title: "Bytecode hook: dispatch straight to the compiled code, no guards"
     source: "vllm/compilation/wrapper.py:203"
     then:
@@ -16617,7 +17919,7 @@ interfaces:
       input: "= input"
     - return:
         path: compiled
-  - if: state.compiled_bytecode
+  - if: vars.cb
     title: "No bytecode hook: the torch.compile frame reuses the compiled code (fail_on_recompile after the first compile)"
     source: "vllm/compilation/wrapper.py:211"
     then:
@@ -16637,8 +17939,9 @@ interfaces:
       prefix: backbone
       graph_patterns: []
       config_hash: "= has(input.config_hash) ? input.config_hash : null"
+      module: "= vars.mod"
   - set:
-      state.compiled_bytecode: true
+      "= 'state.compiled_bytecode.' + vars.mod": true
     title: Record the compiled code (bytecode hook)
     source: "vllm/compilation/wrapper.py:226"
   - call: piecewise-backend.call
@@ -16735,6 +18038,160 @@ interfaces:
     source: "vllm/utils/torch_utils.py:890"
     return:
       weak: false
+- component: triton-kernel-dispatcher
+  name: launch
+  kind: function
+  summary: "kernel[grid](...) on a Triton kernel: the original Triton kernel when no override is registered, else KernelOverride._launch: positional, by keyword, or keyword arguments reordered into the\
+    \ kernel's parameter order."
+  sources:
+  - "vllm/triton_utils/dispatcher.py:66-78"
+  request:
+    type: object
+    required:
+    - name
+    properties:
+      name:
+        type: string
+      positional:
+        type: boolean
+        default: false
+      kwargs:
+        type: array
+        items:
+          type: string
+        default: []
+  response:
+    type: object
+    properties:
+      runs:
+        type: string
+      binding:
+        type: string
+  errors:
+  - code: runtime-error
+    status: 0
+    retryable: false
+  latency_ms: 0
+  behavior:
+  - set:
+      vars.k: "= input.name.replace('.', '__')"
+  - if: "!(vars.k in state.registry)"
+    title: "No override: the Triton JIT kernel launches"
+    then:
+    - return:
+        runs: triton
+        binding: native
+  - set:
+      vars.o: "= state.registry[vars.k]"
+  - if: "has(input.positional) && input.positional"
+    title: Positional launch arguments go straight to impl
+    source: "vllm/triton_utils/dispatcher.py:67"
+    then:
+    - return:
+        runs: "= vars.o.impl"
+        binding: positional
+  - if: vars.o.forward_by_name
+    title: "Same parameter names: forward by keyword"
+    source: "vllm/triton_utils/dispatcher.py:69"
+    then:
+    - return:
+        runs: "= vars.o.impl"
+        binding: keyword
+  - set:
+      vars.bad: "= (has(input.kwargs) ? input.kwargs : []).filter(n, !(n in vars.o.arg_names))"
+  - if: "size(vars.bad) > 0"
+    title: A launch keyword the kernel does not declare
+    source: "vllm/triton_utils/dispatcher.py:74"
+    then:
+    - fail:
+        code: runtime-error
+        message: "= \"Override for '\" + vars.o.impl + \"' received unexpected launch arguments: ['\" + vars.bad.join(\"', '\") + \"']\""
+  - return:
+      runs: "= vars.o.impl"
+      binding: reordered
+    title: "Keyword arguments reordered into the kernel's parameter order"
+    source: "vllm/triton_utils/dispatcher.py:77"
+- component: triton-kernel-dispatcher
+  name: register-kernels
+  kind: function
+  summary: "register_kernels(overrides): resolve each fully qualified kernel name, wrap it in a KernelOverride, rebind every module attribute and JIT warmup owner holding it, then the defining attribute."
+  sources:
+  - "vllm/triton_utils/dispatcher.py:147-175"
+  - "vllm/triton_utils/dispatcher.py:83-94"
+  request:
+    type: object
+    required:
+    - overrides
+    properties:
+      overrides:
+        type: array
+        items:
+          type: object
+          properties:
+            name:
+              type: string
+              examples:
+              - vllm.v1.sample.rejection_sampler.expand_kernel
+            impl:
+              type: string
+              examples:
+              - expand_kernel_impl
+            kernel_params:
+              type: array
+              items:
+                type: string
+            impl_params:
+              type: array
+              items:
+                type: string
+            found:
+              type: boolean
+              default: true
+              description: the module (or class) defines the attribute
+  response:
+    type: object
+    properties:
+      registered:
+        type: array
+        items:
+          type: string
+      overwritten:
+        type: array
+        items:
+          type: string
+  errors:
+  - code: value-error
+    status: 0
+    retryable: false
+  latency_ms: 0
+  behavior:
+  - set:
+      vars.over: "= input.overrides.filter(o, o.name.replace('.', '__') in state.registry).map(o, o.name)"
+    title: An already registered name is overwritten with a warning
+    source: "vllm/triton_utils/dispatcher.py:164"
+  - foreach: "= input.overrides"
+    as: o
+    title: "_resolve_kernel(name): the module (or class) must hold the attribute"
+    source: "vllm/triton_utils/dispatcher.py:165"
+    steps:
+    - if: "has(vars.o.found) && !vars.o.found"
+      source: "vllm/triton_utils/dispatcher.py:94"
+      then:
+      - fail:
+          code: value-error
+          message: "= \"Kernel '\" + vars.o.name + \"' not found for override\""
+  - foreach: "= input.overrides"
+    as: o
+    title: "KernelOverride(original, impl): keep the kernel's arg names; forward by keyword when the impl's parameters match"
+    source: "vllm/triton_utils/dispatcher.py:60"
+    steps:
+    - set:
+        "= 'state.registry.' + vars.o.name.replace('.', '__')": "= {'name': vars.o.name, 'impl': vars.o.impl, 'arg_names': vars.o.kernel_params, 'forward_by_name': vars.o.impl_params == vars.o.kernel_params}"
+  - title: "_rebind_kernels then setattr(host, attr, wrapper): every holder now launches the override"
+    source: "vllm/triton_utils/dispatcher.py:172"
+    return:
+      registered: "= input.overrides.map(o, o.name)"
+      overwritten: "= vars.over"
 - component: unsafe-clone-elimination-pass
   name: call
   kind: function
@@ -16816,7 +18273,11 @@ interfaces:
     input:
       disable_cache: "= config['vllm-disable-compile-cache']"
       cache_dir: "= vars.cache_dir"
-  - if: state.called
+  - set:
+      vars.mod: "= has(input.module) && input.module != null ? input.module : 'LlamaModel'"
+    title: "Each decorated module's wrapper builds its own VllmBackend (compilation_config.init_backend)"
+    source: "vllm/compilation/wrapper.py:59"
+  - if: "vars.mod in state.called && state.called[vars.mod]"
     title: Each backend instance compiles once
     source: "vllm/compilation/backends.py:1180"
     then:
@@ -16857,7 +18318,7 @@ interfaces:
     input:
       cache_dir: "= vars.cache_dir"
   - set:
-      state.called: true
+      "= 'state.called.' + vars.mod": true
     title: Mark the backend used
     source: "vllm/compilation/backends.py:1287"
   - if: "config['cudagraph-mode'] == 'NONE' || !config['cudagraph-copy-inputs']"
@@ -18058,6 +19519,74 @@ flows:
       out_dtype: bfloat16
   sources:
   - "vllm/_custom_ops.py:771"
+- id: kernels-ops-breakable-cuda-graph
+  name: Breakable CUDA graph capture and replay
+  tags:
+  - writes
+  - "feature:cuda-graphs"
+  description: "With VLLM_USE_BREAKABLE_CUDAGRAPH the model runner wraps the model in BreakableCUDAGraphWrapper (gpu_model_runner.py): a new batch descriptor captures the whole forward, splitting the stream\
+    \ capture at each attention op; later steps replay the segments."
+  entry:
+    caller: gpu-worker
+    interface: breakable-cuda-graph-wrapper.call
+    input:
+      num_tokens: 16
+      uniform_decode: true
+      runtime_mode: PIECEWISE
+      forward_context: true
+      debug: false
+      input_addresses:
+      - 140000000
+      num_layers: 32
+  sources:
+  - "vllm/compilation/breakable_cudagraph.py:318"
+- id: kernels-ops-breakable-cuda-graph-replay
+  name: Breakable CUDA graph replay during serving
+  tags:
+  - "feature:cuda-graphs"
+  description: A serving step whose batch descriptor was captured replays the recorded segments (graph replays and eager attention) through the same wrapper.
+  entry:
+    caller: gpu-worker
+    interface: breakable-cuda-graph-wrapper.call
+    input:
+      num_tokens: 16
+      uniform_decode: true
+      runtime_mode: PIECEWISE
+      forward_context: true
+      debug: false
+      input_addresses:
+      - 140000000
+      num_layers: 32
+  sources:
+  - "vllm/compilation/breakable_cudagraph.py:428"
+- id: kernels-ops-triton-kernel-override
+  name: Platform Triton kernel overrides
+  tags:
+  - writes
+  description: An out-of-tree platform registers replacements for named Triton kernels at startup; later launches of those kernels run the replacement.
+  entry:
+    caller: gpu-worker
+    interface: triton-kernel-dispatcher.register-kernels
+    input:
+      overrides:
+      - name: vllm.v1.sample.rejection_sampler.expand_kernel
+        impl: expand_kernel_xpu
+        kernel_params:
+        - output_ptr
+        - input_ptr
+        - cu_num_tokens_ptr
+        - replace_from
+        - replace_to
+        - MAX_NUM_TOKENS
+        impl_params:
+        - out
+        - inp
+        - cu_num_tokens
+        - replace_from
+        - replace_to
+        - max_num_tokens
+  sources:
+  - "vllm/triton_utils/dispatcher.py:147"
 scenarios:
 - id: kernels-ops-ir-op-dispatch-deployed-native
   flow: kernels-ops-ir-op-dispatch
@@ -18414,7 +19943,7 @@ scenarios:
       num_layers: 1
   expect:
   - "steps.a.result.ok && !steps.b.result.ok && steps.b.result.error.code == 'assertion-error'"
-  - "state['vllm-backend@rank0'].called"
+  - "state['vllm-backend@rank0'].called['LlamaModel']"
 - id: kernels-ops-vllm-backend-compile-inductor-partition
   flow: kernels-ops-vllm-backend-compile
   name: "use_inductor_graph_partition: no FX split, one graph"
@@ -18513,7 +20042,7 @@ scenarios:
   expect:
   - "steps.cold.result.value.path == 'aot-compiled' && steps.warm.result.value.path == 'aot-loaded'"
   - "calls['vllm-backend.call'] == 1 && calls['inductor-standalone-adaptor.compile'] == 33"
-  - "state['support-torch-compile@rank0'].was_aot_compile_fn_loaded_from_disk"
+  - "state['support-torch-compile@rank0'].was_aot_compile_fn_loaded_from_disk['LlamaModel']"
   - "size(state['torch-compile-cache@rank0'].aot) == 1"
   - steps.warm.duration_ms < steps.cold.duration_ms
 - id: kernels-ops-support-torch-compile-eager
@@ -18527,7 +20056,7 @@ scenarios:
   - "result.ok && result.value.path == 'eager'"
   - "ctx.forward == 'eager'"
   - "!trace.exists(e, e.type == 'call.start' && e.interface == 'vllm-backend.call')"
-  - "!state['support-torch-compile@rank0'].compiled"
+  - "!('LlamaModel' in state['support-torch-compile@rank0'].compiled)"
 - id: kernels-ops-support-torch-compile-jit
   flow: kernels-ops-support-torch-compile
   name: "Without AOT: first call compiles through the guard-free wrapper, the second dispatches to bytecode"
@@ -18546,7 +20075,7 @@ scenarios:
       num_layers: 1
   expect:
   - "steps.a.result.value.path == 'jit-compiled' && steps.b.result.value.path == 'compiled'"
-  - "state['torch-compile-with-no-guards-wrapper@rank0'].compiled_bytecode"
+  - "state['torch-compile-with-no-guards-wrapper@rank0'].compiled_bytecode['LlamaModel']"
 - id: kernels-ops-support-torch-compile-aot-in-process
   flow: kernels-ops-support-torch-compile
   name: Within one process the loaded AOT function is reused
@@ -18564,7 +20093,7 @@ scenarios:
   expect:
   - "steps.a.result.value.path == 'aot-compiled' && steps.b.result.value.path == 'aot'"
   - "calls['vllm-backend.call'] == 1"
-  - "state['support-torch-compile@rank0'].aot_compiled_fn"
+  - "state['support-torch-compile@rank0'].aot_compiled_fn['LlamaModel']"
 - id: kernels-ops-support-torch-compile-bytecode-hook-off
   flow: kernels-ops-support-torch-compile
   name: "With VLLM_USE_BYTECODE_HOOK=0 every call goes back through torch.compile's frame"
@@ -18585,7 +20114,7 @@ scenarios:
   expect:
   - "steps.a.result.ok && steps.b.result.value.path == 'compiled'"
   - "calls['vllm-backend.call'] == 1"
-  - "state['torch-compile-with-no-guards-wrapper@rank0'].compiled_bytecode"
+  - "state['torch-compile-with-no-guards-wrapper@rank0'].compiled_bytecode['LlamaModel']"
   - "ctx.guard_stance == 'fail_on_recompile'"
 - id: kernels-ops-post-grad-pass-manager-deployed
   flow: kernels-ops-post-grad-pass-manager
@@ -20101,6 +21630,7 @@ scenarios:
   expect:
   - steps.i.result.value.do_not_compile
   - steps.cnt.result.value.counters.num_models_seen == 0
+  - "state['support-torch-compile@rank0'].modules['LlamaModel'].do_not_compile"
 - id: kernels-ops-ir-generate-inputs-supports-args
   name: "vllm.ir: generated gelu_and_mul_sparse inputs are [T, 2H] tanh; Triton supports them on CUDA up to 32768, refuses exact GELU; set_priority dispatches and restores"
   fixtures:
@@ -20994,6 +22524,971 @@ scenarios:
   - "!steps.f32.result.ok && steps.f32.result.error.message == 'Input must be FP16 or BF16'"
   - "!steps.odd.result.ok && steps.odd.result.error.message == 'Expected input.size(-1) % 2 == 0 to be true, but got false.'"
   - "!steps.bf16out.result.ok && steps.bf16out.result.error.code == 'runtime-error'"
+- id: kernels-ops-r6-decorator-per-module-jit
+  name: "Two @support_torch_compile modules each compile once; an @ignore_torch_compile subclass between them runs eager"
+  description: "oracle4 fix request (test_decorator.py::test_ignore_torch_compile_decorator): do_not_compile is decided per module in the decorated __init__ (decorators.py:399-406) and __call__ honours\
+    \ it (:528); every module starts with compiled = False (:415) and its own wrapper and VllmBackend."
+  fixtures:
+  - full-tp1-llama-8b
+  config:
+    vllm-use-aot-compile: false
+    vllm-disable-compile-cache: true
+  steps:
+  - interface: support-torch-compile.decorate
+    caller: gpu-worker
+    as: da
+    input:
+      cls: Backbone
+      forward_params:
+      - name: x
+        annotation: torch.Tensor
+  - interface: support-torch-compile.init
+    caller: gpu-worker
+    as: ia
+    input:
+      cls: Backbone
+  - interface: compilation-counter.clone
+    caller: gpu-worker
+    as: c0
+  - flow: kernels-ops-support-torch-compile
+    as: ra
+    input:
+      num_layers: 1
+      num_tokens: 32
+      runtime_mode: NONE
+  - flow: kernels-ops-support-torch-compile
+    as: ra2
+    input:
+      num_layers: 1
+      num_tokens: 32
+      runtime_mode: NONE
+  - interface: compilation-counter.clone
+    caller: gpu-worker
+    as: c1
+  - interface: support-torch-compile.ignore-torch-compile
+    caller: gpu-worker
+    as: ig
+    input:
+      cls: DraftHead
+  - interface: support-torch-compile.init
+    caller: gpu-worker
+    as: ib
+    input:
+      cls: DraftHead
+      bases:
+      - Backbone
+  - flow: kernels-ops-support-torch-compile
+    as: rb
+    input:
+      num_layers: 1
+      num_tokens: 32
+      runtime_mode: NONE
+  - interface: compilation-counter.clone
+    caller: gpu-worker
+    as: c2
+  - interface: support-torch-compile.decorate
+    caller: gpu-worker
+    as: dc
+    input:
+      cls: EagleHead
+      forward_params:
+      - name: x
+        annotation: torch.Tensor
+  - interface: support-torch-compile.init
+    caller: gpu-worker
+    as: ic
+    input:
+      cls: EagleHead
+      bases:
+      - DraftHead
+      - Backbone
+  - flow: kernels-ops-support-torch-compile
+    as: rc
+    input:
+      num_layers: 1
+      num_tokens: 32
+      runtime_mode: NONE
+  - interface: compilation-counter.clone
+    caller: gpu-worker
+    as: c3
+  expect:
+  - "!steps.ia.result.value.do_not_compile && steps.ib.result.value.do_not_compile && !steps.ic.result.value.do_not_compile"
+  - "steps.ra.result.value.path == 'jit-compiled' && steps.ra2.result.value.path == 'compiled' && steps.rb.result.value.path == 'eager' && steps.rc.result.value.path == 'jit-compiled'"
+  - steps.c1.result.value.counters.num_graphs_seen - steps.c0.result.value.counters.num_graphs_seen == 1
+  - steps.c2.result.value.counters.num_graphs_seen == steps.c1.result.value.counters.num_graphs_seen
+  - steps.c3.result.value.counters.num_graphs_seen - steps.c2.result.value.counters.num_graphs_seen == 1
+  - "state['support-torch-compile@rank0'].compiled['Backbone'] && state['support-torch-compile@rank0'].compiled['EagleHead'] && !('DraftHead' in state['support-torch-compile@rank0'].compiled)"
+  - "state['vllm-backend@rank0'].called['Backbone'] && state['vllm-backend@rank0'].called['EagleHead'] && !('DraftHead' in state['vllm-backend@rank0'].called)"
+- id: kernels-ops-r6-decorator-ignore-inherited
+  name: "A subclass of an @ignore_torch_compile class that is not re-decorated inherits the ignore (getattr walks the MRO)"
+  description: "_should_ignore_torch_compile is getattr(cls, IGNORE_COMPILE_KEY, False) (decorators.py:80-82): the nearest class in the MRO that set the key decides."
+  fixtures:
+  - tp1-llama-8b
+  steps:
+  - interface: support-torch-compile.decorate
+    caller: gpu-worker
+    as: d
+    input:
+      cls: Base
+      forward_params:
+      - name: x
+        annotation: torch.Tensor
+  - interface: support-torch-compile.ignore-torch-compile
+    caller: gpu-worker
+    as: ig
+    input:
+      cls: Mid
+  - interface: support-torch-compile.init
+    caller: gpu-worker
+    as: leaf
+    input:
+      cls: Leaf
+      bases:
+      - Mid
+      - Base
+  - interface: support-torch-compile.init
+    caller: gpu-worker
+    as: base
+    input:
+      cls: Base
+  - interface: support-torch-compile.init
+    caller: gpu-worker
+    as: "off"
+    input:
+      cls: Gated
+      enable_if: false
+  expect:
+  - "steps.leaf.result.value.do_not_compile && !steps.base.result.value.do_not_compile && steps.off.result.value.do_not_compile"
+  - "state['support-torch-compile@rank0'].modules['Leaf'].do_not_compile && state['support-torch-compile@rank0'].current == 'Gated'"
+- id: kernels-ops-r6-decorator-skip-compiled
+  name: forward_context.skip_compiled bypasses the compiled model of a module that would compile
+  fixtures:
+  - tp1-llama-8b
+  config:
+    vllm-use-aot-compile: false
+  steps:
+  - flow: kernels-ops-support-torch-compile
+    as: skip
+    input:
+      num_layers: 1
+      num_tokens: 32
+      runtime_mode: NONE
+      skip_compiled: true
+  - interface: compilation-counter.clone
+    caller: gpu-worker
+    as: c
+  expect:
+  - "steps.skip.result.ok && steps.skip.result.value.path == 'skip-compiled' && steps.skip.result.value.module == 'LlamaModel'"
+  - steps.c.result.value.counters.num_graphs_seen == 0
+  - "!('LlamaModel' in state['support-torch-compile@rank0'].compiled) && state['support-torch-compile@rank0'].num_compiles == 0"
+- id: kernels-ops-r6-decorator-aot-per-module
+  name: "AOT: two decorated modules save two artifacts (the hash includes each forward's qualname)"
+  description: "decorators.py:557-581: factors + _model_hash_key(self.forward) pick the AOT directory, so a second model (e.g. an EAGLE head) gets its own artifact."
+  fixtures:
+  - tp1-llama-8b
+  steps:
+  - interface: support-torch-compile.init
+    caller: gpu-worker
+    as: i1
+    input:
+      cls: LlamaModel
+  - flow: kernels-ops-support-torch-compile
+    as: a
+    input:
+      num_layers: 1
+      num_tokens: 32
+      runtime_mode: NONE
+  - interface: support-torch-compile.init
+    caller: gpu-worker
+    as: i2
+    input:
+      cls: EagleLlamaModel
+  - flow: kernels-ops-support-torch-compile
+    as: b
+    input:
+      num_layers: 1
+      num_tokens: 32
+      runtime_mode: NONE
+  - flow: kernels-ops-support-torch-compile
+    as: a2
+    input:
+      num_layers: 1
+      num_tokens: 32
+      runtime_mode: NONE
+      module: LlamaModel
+  expect:
+  - "steps.a.result.value.path == 'aot-compiled' && steps.b.result.value.path == 'aot-compiled' && steps.a2.result.value.path == 'aot'"
+  - "size(state['torch-compile-cache@rank0'].aot) == 2 && state['support-torch-compile@rank0'].num_compiles == 2"
+- id: kernels-ops-r6-marlin-fp8-weight-only-a100
+  name: "FP8 checkpoint on an A100: no CUTLASS FP8 (SM80), the weight-only FP8 Marlin GEMM runs with BF16 activations"
+  description: "judge4 P4-3(c), the kernels-ops half: cutlass_scaled_mm_supports_fp8(80) is false (scaled_mm_entry.cu:145-159) and _C::cutlass_scaled_mm on SM80 is INT8 only; the Marlin path (marlin_utils_fp8.py:86-101\
+    \ -> marlin_utils.py:458 -> _C::marlin_gemm) repacks the FP8 weight with num_bits 8 and runs a W8A16 GEMM, which needs only SM75+ (marlin.cu:287-301). The fallback choice itself is models-layers' (kernels/linear/__init__.py)."
+  fixtures:
+  - full-fp8-llama-3-8b
+  state:
+    torch-bindings:
+      device_capability:
+        major: 8
+        minor: 0
+  steps:
+  - interface: custom-ops.cutlass-scaled-mm-supports-fp8
+    caller: gpu-worker
+    as: sup
+    input:
+      cuda_device_capability: 80
+  - interface: torch-bindings.cutlass-scaled-mm
+    caller: gpu-worker
+    as: cutlass
+    input:
+      m: 16
+      n: 6144
+      k: 4096
+      dtype_bytes: 1
+  - interface: custom-ops.gptq-marlin-repack
+    caller: gpu-worker
+    as: rep
+    input:
+      k: 4096
+      n: 6144
+      num_bits: 8
+  - interface: custom-ops.marlin-gemm
+    caller: gpu-worker
+    as: mm
+    input:
+      m: 16
+      n: 6144
+      k: 4096
+      dtype_bytes: 1
+      a_dtype: bfloat16
+      b_type: float8_e4m3fn
+  - interface: custom-ops.marlin-gemm
+    caller: gpu-worker
+    as: decode
+    input:
+      m: 1
+      n: 6144
+      k: 4096
+      dtype_bytes: 1
+      a_dtype: bfloat16
+      b_type: float8_e4m3fn
+  expect:
+  - "!steps.sup.result.value.supported"
+  - "!steps.cutlass.result.ok && steps.cutlass.result.error.code == 'runtime-error'"
+  - "steps.rep.result.ok && steps.rep.result.value.repacked_rows == 256 && steps.rep.result.value.repacked_cols == 24576"
+  - "steps.mm.result.ok && steps.mm.result.value.kernel == 'Marlin' && steps.mm.result.value.b_type == 'float8_e4m3fn' && steps.mm.result.value.c_type == 'bfloat16' && steps.mm.result.value.stages == 4"
+  - "steps.decode.result.ok && steps.decode.duration_us > 0 && steps.decode.duration_us < steps.mm.duration_us + 1"
+- id: kernels-ops-r6-marlin-capability-checks
+  name: "Marlin refuses FP8 activations before Ada, BF16 activations on Turing, and anything before Turing"
+  fixtures:
+  - full-fp8-llama-3-8b
+  state:
+    torch-bindings:
+      device_capability:
+        major: 8
+        minor: 0
+  steps:
+  - interface: custom-ops.marlin-gemm
+    caller: gpu-worker
+    as: w8a8
+    input:
+      m: 16
+      n: 6144
+      k: 4096
+      dtype_bytes: 1
+      a_dtype: float8_e4m3fn
+      b_type: float8_e4m3fn
+      has_a_scales: true
+  expect:
+  - "!steps.w8a8.result.ok && steps.w8a8.result.error.code == 'runtime-error' && steps.w8a8.result.error.message == 'FP8 only support Ada Lovelace or newer GPUs.'"
+- id: kernels-ops-r6-marlin-turing
+  name: On SM75 Marlin runs FP16 activations with 2 stages and refuses BF16
+  fixtures:
+  - full-fp8-llama-3-8b
+  state:
+    torch-bindings:
+      device_capability:
+        major: 7
+        minor: 5
+  steps:
+  - interface: custom-ops.marlin-gemm
+    caller: gpu-worker
+    as: fp16
+    input:
+      m: 16
+      n: 6144
+      k: 4096
+      dtype_bytes: 1
+      a_dtype: float16
+      b_type: float8_e4m3fn
+  - interface: custom-ops.marlin-gemm
+    caller: gpu-worker
+    as: bf16
+    input:
+      m: 16
+      n: 6144
+      k: 4096
+      dtype_bytes: 1
+      a_dtype: bfloat16
+      b_type: float8_e4m3fn
+  expect:
+  - "steps.fp16.result.ok && steps.fp16.result.value.stages == 2"
+  - "!steps.bf16.result.ok && steps.bf16.result.error.message == 'Turing only support FP16 or INT8 activation.'"
+- id: kernels-ops-r6-marlin-volta
+  name: On SM70 Marlin is refused outright
+  fixtures:
+  - full-fp8-llama-3-8b
+  state:
+    torch-bindings:
+      device_capability:
+        major: 7
+        minor: 0
+  steps:
+  - interface: custom-ops.marlin-gemm
+    caller: gpu-worker
+    as: v100
+    input:
+      m: 16
+      n: 6144
+      k: 4096
+      dtype_bytes: 1
+      a_dtype: float16
+      b_type: float8_e4m3fn
+  expect:
+  - "!steps.v100.result.ok && steps.v100.result.error.message == 'marlin kernel only support Turing or newer GPUs.'"
+- id: kernels-ops-r6-marlin-fp8-act-sm89
+  name: W4A8-FP8 Marlin runs on an L40S (SM89) but not on an H100 (SM90)
+  fixtures:
+  - full-fp8-llama-3-8b
+  state:
+    torch-bindings:
+      device_capability:
+        major: 8
+        minor: 9
+  steps:
+  - interface: custom-ops.marlin-gemm
+    caller: gpu-worker
+    as: l40s
+    input:
+      m: 16
+      n: 6144
+      k: 4096
+      dtype_bytes: 1
+      a_dtype: float8_e4m3fn
+      b_type: uint4b8
+      has_a_scales: true
+      b_scales_dtype: bfloat16
+      num_groups: 32
+  expect:
+  - "steps.l40s.result.ok && steps.l40s.result.value.a_type == 'float8_e4m3fn' && steps.l40s.result.value.group_size == 128"
+- id: kernels-ops-r6-marlin-fp8-act-sm90-refused
+  name: W4A8-FP8 Marlin on SM90 is refused (slower than W4A16 there)
+  fixtures:
+  - full-fp8-llama-3-8b
+  steps:
+  - interface: custom-ops.marlin-gemm
+    caller: gpu-worker
+    as: h100
+    input:
+      m: 16
+      n: 6144
+      k: 4096
+      dtype_bytes: 1
+      a_dtype: float8_e4m3fn
+      b_type: uint4b8
+      has_a_scales: true
+      b_scales_dtype: bfloat16
+  expect:
+  - "!steps.h100.result.ok && steps.h100.result.error.message == 'Marlin W4A8-FP8 only support SM89 or SM12x device (It is slower than Marlin W4A16 on other devices).'"
+- id: kernels-ops-r6-marlin-shape-checks
+  name: "Marlin shape and argument checks, in the code's order"
+  fixtures:
+  - full-fp8-llama-3-8b
+  state:
+    torch-bindings:
+      device_capability:
+        major: 8
+        minor: 0
+  steps:
+  - interface: custom-ops.marlin-gemm
+    caller: gpu-worker
+    as: k
+    input:
+      m: 16
+      n: 6144
+      k: 4104
+      dtype_bytes: 1
+      a_dtype: bfloat16
+      b_type: float8_e4m3fn
+  - interface: custom-ops.marlin-gemm
+    caller: gpu-worker
+    as: ascale
+    input:
+      m: 16
+      n: 6144
+      k: 4096
+      dtype_bytes: 1
+      a_dtype: bfloat16
+      b_type: float8_e4m3fn
+      has_a_scales: true
+  - interface: custom-ops.marlin-gemm
+    caller: gpu-worker
+    as: noascale
+    input:
+      m: 16
+      n: 6144
+      k: 4096
+      dtype_bytes: 1
+      a_dtype: int8
+      b_type: float8_e4m3fn
+  - interface: custom-ops.marlin-gemm
+    caller: gpu-worker
+    as: n
+    input:
+      m: 16
+      n: 6150
+      k: 4096
+      dtype_bytes: 1
+      a_dtype: bfloat16
+      b_type: float8_e4m3fn
+  - interface: custom-ops.marlin-gemm
+    caller: gpu-worker
+    as: groups
+    input:
+      m: 16
+      n: 6144
+      k: 4096
+      dtype_bytes: 1
+      a_dtype: bfloat16
+      b_type: float8_e4m3fn
+      num_groups: 3
+  - interface: custom-ops.marlin-gemm
+    caller: gpu-worker
+    as: zp
+    input:
+      m: 16
+      n: 6144
+      k: 4096
+      dtype_bytes: 1
+      a_dtype: bfloat16
+      b_type: float8_e4m3fn
+      has_zp: true
+  - interface: custom-ops.marlin-gemm
+    caller: gpu-worker
+    as: btype
+    input:
+      m: 16
+      n: 6144
+      k: 4096
+      dtype_bytes: 1
+      a_dtype: bfloat16
+      b_type: float16
+  - interface: custom-ops.marlin-gemm
+    caller: gpu-worker
+    as: empty
+    input:
+      m: 0
+      n: 6144
+      k: 4096
+      dtype_bytes: 1
+      a_dtype: bfloat16
+      b_type: float8_e4m3fn
+  - interface: custom-ops.marlin-gemm
+    caller: gpu-worker
+    as: fp4
+    input:
+      m: 16
+      n: 6144
+      k: 4096
+      dtype_bytes: 1
+      a_dtype: bfloat16
+      b_type: float4_e2m1f
+      b_scales_dtype: bfloat16
+  - interface: custom-ops.marlin-gemm
+    caller: gpu-worker
+    as: nvfp4
+    input:
+      m: 16
+      n: 6144
+      k: 4096
+      dtype_bytes: 1
+      a_dtype: bfloat16
+      b_type: float4_e2m1f
+      b_scales_dtype: float8_e4m3fn
+  - interface: custom-ops.marlin-gemm
+    caller: gpu-worker
+    as: w4a8fp4
+    input:
+      m: 16
+      n: 6144
+      k: 4096
+      dtype_bytes: 1
+      a_dtype: float8_e4m3fn
+      b_type: float4_e2m1f
+      has_a_scales: true
+      b_scales_dtype: float8_e8m0fnu
+  - interface: custom-ops.gptq-marlin-repack
+    caller: gpu-worker
+    as: rep3
+    input:
+      k: 4096
+      n: 6144
+      num_bits: 3
+  - interface: custom-ops.gptq-marlin-repack
+    caller: gpu-worker
+    as: repk
+    input:
+      k: 4100
+      n: 6144
+      num_bits: 8
+  - interface: custom-ops.gptq-marlin-repack
+    caller: gpu-worker
+    as: repn
+    input:
+      k: 4096
+      n: 100
+      num_bits: 8
+  expect:
+  - "steps.k.result.error.message == 'size_k = 4104 is not divisible by tile_size = 16'"
+  - "steps.ascale.result.error.message == 'a_scales can only be used for 8bit activation.'"
+  - "steps.noascale.result.error.message == 'the a_scales parameter must be passed for 8bit activation.'"
+  - "steps.n.result.error.message == 'size_n = 6150, is not divisible by min_thread_n = 64'"
+  - "steps.groups.result.error.message == 'size_k = 4096, is not divisible by b_scales.size(0) = 3'"
+  - "steps.zp.result.error.message == 'b_type must be u4 or u8 when has_zp = True. Got = float8_e4m3fn'"
+  - "steps.btype.result.error.message == 'b_type must be uint4b8, uint8b128, int4, int8, float8_e4m3fn or float4_e2m1f when has_zp = False. Got = float16'"
+  - "steps.empty.result.ok && !steps.empty.result.value.launched"
+  - "steps.fp4.result.error.message.startsWith('When b_type = float4_e2m1f')"
+  - "steps.nvfp4.result.error.message == 'the global_scale parameter must be passed for nvfp4 format.'"
+  - "steps.w4a8fp4.result.error.message == 'c must be passed for W4A8-FP4'"
+  - "steps.rep3.result.error.message == 'num_bits must be 4 or 8. Got = 3'"
+  - "steps.repk.result.error.message == 'size_k = 4100 is not divisible by tile_k_size = 16'"
+  - "steps.repn.result.error.message == 'size_n = 100 is not divisible by tile_n_size = 64'"
+- id: kernels-ops-r6-breakable-capture-then-replay
+  name: "Llama-8B decode batch of 16: capture splits at the 32 attention ops (33 graphs, 32 eager breaks), the next step replays"
+  flow: kernels-ops-breakable-cuda-graph
+  fixtures:
+  - tp1-llama-8b
+  config:
+    vllm-use-breakable-cudagraph: true
+  steps:
+  - flow: kernels-ops-breakable-cuda-graph
+    as: cap
+  - flow: kernels-ops-breakable-cuda-graph-replay
+    as: rep
+  expect:
+  - "steps.cap.result.value.path == 'capture' && steps.cap.result.value.num_graphs == 33 && steps.cap.result.value.num_eager_breaks == 32"
+  - "steps.rep.result.value.path == 'replay' && steps.rep.result.value.num_graphs == 33"
+  - "state['breakable-cuda-graph-wrapper@rank0'].entries['16-uniform'].segments == 65 && !state['breakable-cuda-graph-capture@rank0'].active"
+- id: kernels-ops-r6-breakable-full-mode
+  name: "FULL runtime mode: break-point ops are captured inline, one graph"
+  flow: kernels-ops-breakable-cuda-graph
+  fixtures:
+  - tp1-llama-8b
+  config:
+    vllm-use-breakable-cudagraph: true
+  input:
+    runtime_mode: FULL
+  expect:
+  - "result.ok && result.value.path == 'capture' && result.value.num_graphs == 1 && result.value.num_eager_breaks == 0"
+  - "state['breakable-cuda-graph-wrapper@rank0'].entries['16-uniform'].segments == 1"
+- id: kernels-ops-r6-breakable-eager-modes
+  name: "No forward context, mode NONE, or a mode the wrapper is not for: eager, nothing captured"
+  flow: kernels-ops-breakable-cuda-graph
+  fixtures:
+  - tp1-llama-8b
+  config:
+    vllm-use-breakable-cudagraph: true
+  steps:
+  - flow: kernels-ops-breakable-cuda-graph
+    as: noctx
+    input:
+      forward_context: false
+  - flow: kernels-ops-breakable-cuda-graph
+    as: none
+    input:
+      runtime_mode: NONE
+  - flow: kernels-ops-breakable-cuda-graph
+    as: other
+    input:
+      runtime_mode: FULL
+      wrapper_runtime_mode: PIECEWISE
+  expect:
+  - "steps.noctx.result.value.path == 'eager' && steps.none.result.value.path == 'eager' && steps.other.result.value.path == 'eager'"
+  - "size(state['breakable-cuda-graph-wrapper@rank0'].entries) == 0"
+- id: kernels-ops-r6-breakable-capture-disabled
+  name: Capture after the capture phase ended is refused by the compilation monitor
+  flow: kernels-ops-breakable-cuda-graph
+  fixtures:
+  - tp1-llama-8b
+  config:
+    vllm-use-breakable-cudagraph: true
+  state:
+    compilation-monitor:
+      cudagraph_capturing_enabled: false
+  expect:
+  - "!result.ok && result.error.code == 'runtime-error' && result.error.message == 'CUDA graph capturing detected at an inappropriate time. This operation is currently disabled.'"
+  - "size(state['breakable-cuda-graph-wrapper@rank0'].entries) == 0"
+- id: kernels-ops-r6-breakable-nested
+  name: A capture while another is active on the thread is refused
+  fixtures:
+  - tp1-llama-8b
+  config:
+    vllm-use-breakable-cudagraph: true
+  state:
+    breakable-cuda-graph-capture:
+      active: true
+  steps:
+  - interface: breakable-cuda-graph-capture.capture
+    caller: gpu-worker
+    as: n
+    input:
+      break_ops: 2
+  expect:
+  - "!steps.n.result.ok && steps.n.result.error.message == 'Nested BreakableCUDAGraphCapture is not supported.'"
+- id: kernels-ops-r6-breakable-off
+  name: With VLLM_USE_BREAKABLE_CUDAGRAPH unset the decorated op is the plain op; outside a capture it runs directly
+  fixtures:
+  - tp1-llama-8b
+  steps:
+  - interface: breakable-cuda-graph-capture.eager-break
+    caller: gpu-worker
+    as: "off"
+    input:
+      runtime_mode: PIECEWISE
+  expect:
+  - "steps.off.result.value.path == 'undecorated'"
+- id: kernels-ops-r6-breakable-direct-and-debug
+  name: Outside a capture the op runs directly; in DEBUG a replay with moved inputs fails the address check
+  flow: kernels-ops-breakable-cuda-graph
+  fixtures:
+  - tp1-llama-8b
+  config:
+    vllm-use-breakable-cudagraph: true
+  steps:
+  - interface: breakable-cuda-graph-capture.eager-break
+    caller: gpu-worker
+    as: direct
+    input:
+      runtime_mode: PIECEWISE
+  - flow: kernels-ops-breakable-cuda-graph
+    as: cap
+    input:
+      num_layers: 2
+  - flow: kernels-ops-breakable-cuda-graph
+    as: moved
+    input:
+      num_layers: 2
+      debug: true
+      input_addresses:
+      - 150000000
+  expect:
+  - "steps.direct.result.value.path == 'direct' && steps.cap.result.value.num_graphs == 3"
+  - "!steps.moved.result.ok && steps.moved.result.error.message == 'Input tensor addresses changed between capture and replay for BatchDescriptor(num_tokens=16). Expected [140000000], got [150000000].'"
+  - "state['breakable-cuda-graph-wrapper@rank0'].entries['16-uniform'].num_eager_breaks == 2"
+- id: kernels-ops-r6-deep-gemm-scale-fmt
+  name: "DeepGEMM scale format: Hopper ceils FP32 scales to UE8M0, the answer is cached for the process"
+  fixtures:
+  - tp1-llama-8b
+  steps:
+  - interface: deep-gemm-utils.quant-scale-fmt-from-oracle
+    caller: gpu-worker
+    as: h100
+    input:
+      installed:
+      - deep_gemm
+      device_capability: 90
+  - interface: deep-gemm-utils.quant-scale-fmt-from-oracle
+    caller: gpu-worker
+    as: again
+    input:
+      installed:
+      - deep_gemm
+      device_capability: 100
+  expect:
+  - "steps.h100.result.value.fmt == 'FLOAT32_CEIL_UE8M0' && !steps.h100.result.value.cached"
+  - "steps.again.result.value.fmt == 'FLOAT32_CEIL_UE8M0' && steps.again.result.value.cached"
+  - "state['deep-gemm-utils@rank0'].oracle_cache == 'FLOAT32_CEIL_UE8M0'"
+- id: kernels-ops-r6-deep-gemm-scale-fmt-blackwell
+  name: DeepGEMM scale format on a B200 packs UE8M0; without DeepGEMM or with E8M0 off it is FLOAT32
+  fixtures:
+  - tp1-llama-8b
+  steps:
+  - interface: deep-gemm-utils.quant-scale-fmt-from-oracle
+    caller: gpu-worker
+    as: b200
+    input:
+      installed:
+      - vllm.third_party.deep_gemm
+      device_capability: 100
+  expect:
+  - "steps.b200.result.value.fmt == 'UE8M0'"
+  - "state['deep-gemm-utils@rank0'].oracle_cache == 'UE8M0'"
+- id: kernels-ops-r6-deep-gemm-scale-fmt-float32
+  name: "No DeepGEMM package (or VLLM_USE_DEEP_GEMM_E8M0=0): FLOAT32 scales"
+  fixtures:
+  - tp1-llama-8b
+  steps:
+  - interface: deep-gemm-utils.quant-scale-fmt-from-oracle
+    caller: gpu-worker
+    as: none
+    input:
+      installed: []
+      device_capability: 90
+  expect:
+  - "steps.none.result.value.fmt == 'FLOAT32'"
+  - "state['deep-gemm-utils@rank0'].oracle_cache == 'FLOAT32'"
+- id: kernels-ops-r6-triton-override-launch
+  name: "A registered override takes the expand kernel's launches; keyword launches are reordered; an unknown keyword fails"
+  flow: kernels-ops-triton-kernel-override
+  fixtures:
+  - tp1-llama-8b
+  steps:
+  - interface: triton-kernel-dispatcher.launch
+    caller: gpu-worker
+    as: before
+    input:
+      name: vllm.v1.sample.rejection_sampler.expand_kernel
+      kwargs:
+      - output_ptr
+  - flow: kernels-ops-triton-kernel-override
+    as: reg
+  - interface: triton-kernel-dispatcher.launch
+    caller: gpu-worker
+    as: kw
+    input:
+      name: vllm.v1.sample.rejection_sampler.expand_kernel
+      kwargs:
+      - output_ptr
+      - input_ptr
+      - MAX_NUM_TOKENS
+  - interface: triton-kernel-dispatcher.launch
+    caller: gpu-worker
+    as: pos
+    input:
+      name: vllm.v1.sample.rejection_sampler.expand_kernel
+      positional: true
+  - interface: triton-kernel-dispatcher.launch
+    caller: gpu-worker
+    as: bad
+    input:
+      name: vllm.v1.sample.rejection_sampler.expand_kernel
+      kwargs:
+      - output_ptr
+      - BLOCK
+  - flow: kernels-ops-triton-kernel-override
+    as: again
+  expect:
+  - "steps.before.result.value.runs == 'triton'"
+  - "steps.kw.result.value.runs == 'expand_kernel_xpu' && steps.kw.result.value.binding == 'reordered' && steps.pos.result.value.binding == 'positional'"
+  - "!steps.bad.result.ok && steps.bad.result.error.message == \"Override for 'expand_kernel_xpu' received unexpected launch arguments: ['BLOCK']\""
+  - "steps.reg.result.value.overwritten == [] && steps.again.result.value.overwritten == ['vllm.v1.sample.rejection_sampler.expand_kernel']"
+  - "state['triton-kernel-dispatcher@rank0'].registry['vllm__v1__sample__rejection_sampler__expand_kernel'].impl == 'expand_kernel_xpu'"
+- id: kernels-ops-r6-triton-override-by-name
+  name: "An override with the kernel's own parameter names is called by keyword; an unknown kernel name is a ValueError"
+  flow: kernels-ops-triton-kernel-override
+  fixtures:
+  - tp1-llama-8b
+  steps:
+  - flow: kernels-ops-triton-kernel-override
+    as: reg
+    input:
+      overrides:
+      - name: vllm.v1.sample.rejection_sampler.expand_kernel
+        impl: expand_same
+        kernel_params:
+        - output_ptr
+        - input_ptr
+        - cu_num_tokens_ptr
+        - replace_from
+        - replace_to
+        - MAX_NUM_TOKENS
+        impl_params:
+        - output_ptr
+        - input_ptr
+        - cu_num_tokens_ptr
+        - replace_from
+        - replace_to
+        - MAX_NUM_TOKENS
+  - interface: triton-kernel-dispatcher.launch
+    caller: gpu-worker
+    as: kw
+    input:
+      name: vllm.v1.sample.rejection_sampler.expand_kernel
+      kwargs:
+      - output_ptr
+      - BLOCK
+  - flow: kernels-ops-triton-kernel-override
+    as: missing
+    input:
+      overrides:
+      - name: vllm.v1.sample.rejection_sampler.no_such_kernel
+        impl: expand_kernel_xpu
+        kernel_params:
+        - output_ptr
+        - input_ptr
+        - cu_num_tokens_ptr
+        - replace_from
+        - replace_to
+        - MAX_NUM_TOKENS
+        impl_params:
+        - out
+        - inp
+        - cu_num_tokens
+        - replace_from
+        - replace_to
+        - max_num_tokens
+        found: false
+  expect:
+  - "steps.kw.result.value.binding == 'keyword'"
+  - "!steps.missing.result.ok && steps.missing.result.error.code == 'value-error' && steps.missing.result.error.message == \"Kernel 'vllm.v1.sample.rejection_sampler.no_such_kernel' not found for override\""
+  - "state['triton-kernel-dispatcher@rank0'].registry['vllm__v1__sample__rejection_sampler__expand_kernel'].forward_by_name"
+- id: kernels-ops-r6-aiter-moe-dispatch-policy
+  name: On an MI300X with AITER the MoE sorting dispatch policy is read once from the env; on CUDA it is None
+  fixtures:
+  - tp1-llama-8b
+  config:
+    vllm-target-device: rocm
+    vllm-rocm-aiter-moe-dispatch-policy: 1
+  state:
+    aiter-ops:
+      aiter_found: true
+      gcn_arch: gfx942
+  steps:
+  - interface: aiter-ops.get-moe-dispatch-policy
+    caller: gpu-worker
+    as: p
+  - interface: aiter-ops.get-moe-dispatch-policy
+    caller: gpu-worker
+    as: p2
+  - interface: aiter-ops.topk-softmax
+    caller: gpu-worker
+    as: tk
+    input:
+      num_tokens: 16
+      num_experts: 8
+      topk: 2
+      k: 4096
+      n: 14336
+      dtype_bytes: 2
+  expect:
+  - "steps.p.result.value.policy == 1 && !steps.p.result.value.cached && steps.p2.result.value.cached"
+  - "steps.tk.result.ok && steps.tk.result.value.op == 'vllm::rocm_aiter_topk_softmax'"
+  - "state['aiter-ops@rank0'].moe_dispatch_policy == 1"
+- id: kernels-ops-r6-aiter-moe-dispatch-policy-cuda
+  name: "Off ROCm the @if_aiter_supported gate returns None"
+  fixtures:
+  - tp1-llama-8b
+  steps:
+  - interface: aiter-ops.get-moe-dispatch-policy
+    caller: gpu-worker
+    as: p
+  expect:
+  - "steps.p.result.ok && steps.p.result.value.policy == null"
+- id: kernels-ops-r6-moe-backend-probes
+  name: "MoE all2all backend probes: nixl_ep and mori by package; deep_ep v2 needs deep_ep without an unavailability reason"
+  fixtures:
+  - tp1-llama-8b
+  steps:
+  - interface: import-utils.has-module
+    caller: gpu-worker
+    as: nixl
+    input:
+      probe: nixl_ep
+      installed:
+      - nixl_ep
+  - interface: import-utils.has-module
+    caller: gpu-worker
+    as: mori
+    input:
+      probe: mori
+      installed: []
+  - interface: import-utils.has-module
+    caller: gpu-worker
+    as: v2
+    input:
+      probe: deep_ep_v2
+      installed:
+      - deep_ep
+  - interface: import-utils.has-module
+    caller: gpu-worker
+    as: v2old
+    input:
+      probe: deep_ep_v2
+      installed:
+      - deep_ep
+      deep_ep_v2_reason: NCCL too old
+  expect:
+  - "steps.nixl.result.value.available && !steps.mori.result.value.available"
+  - "steps.v2.result.value.available && !steps.v2old.result.value.available"
+- id: kernels-ops-r6-compiler-choice-and-cache-dirs
+  name: "make_compiler picks the standalone adaptor by default; with VLLM_USE_STANDALONE_COMPILE=0 InductorAdaptor moves Inductor and Triton caches under the model's dir"
+  fixtures:
+  - tp1-llama-8b
+  config:
+    vllm-use-standalone-compile: false
+  steps:
+  - interface: compiler-manager.make-compiler
+    caller: gpu-worker
+    as: mk
+  - interface: compiler-manager.initialize-cache
+    caller: gpu-worker
+    as: init
+    input:
+      cache_dir: ~/.cache/vllm/torch_compile_cache/h1/rank_0_0/backbone
+      disable_cache: false
+      prefix: backbone
+  - interface: inductor-adaptor.initialize-cache
+    caller: gpu-worker
+    as: eagle
+    input:
+      cache_dir: ~/.cache/vllm/torch_compile_cache/h1/rank_0_0/eagle_head
+      prefix: eagle_head
+      triton_cache_dir_env: ~/.cache/vllm/torch_compile_cache/h1/rank_0_0/triton_cache
+  - interface: inductor-adaptor.initialize-cache
+    caller: gpu-worker
+    as: user
+    input:
+      cache_dir: ~/.cache/vllm/torch_compile_cache/h1/rank_0_0/backbone
+      prefix: backbone
+      triton_cache_dir_env: /scratch/triton
+  expect:
+  - "steps.mk.result.value.compiler == 'inductor'"
+  - "state['inductor-adaptor@rank0'].base_cache_dir == '~/.cache/vllm/torch_compile_cache/h1/rank_0_0/'"
+  - "steps.eagle.result.value.triton_cache == '~/.cache/vllm/torch_compile_cache/h1/rank_0_0/triton_cache'"
+  - "steps.user.result.value.triton_cache == '/scratch/triton' && state['inductor-adaptor@rank0'].env.TORCHINDUCTOR_CACHE_DIR == '~/.cache/vllm/torch_compile_cache/h1/rank_0_0/inductor_cache'"
+- id: kernels-ops-r6-compiler-choice-default
+  name: "Deployed: InductorStandaloneAdaptor; the eager backend uses EagerAdaptor; a disabled cache leaves Inductor's dirs alone"
+  fixtures:
+  - tp1-llama-8b
+  steps:
+  - interface: compiler-manager.make-compiler
+    caller: gpu-worker
+    as: eager
+    input:
+      backend: eager
+  - interface: compiler-manager.make-compiler
+    caller: gpu-worker
+    as: old
+    input:
+      torch_has_standalone_compile: false
+  - interface: compiler-manager.make-compiler
+    caller: gpu-worker
+    as: mk
+  - interface: compiler-manager.initialize-cache
+    caller: gpu-worker
+    as: init
+    input:
+      cache_dir: ~/.cache/vllm/torch_compile_cache/h1/rank_0_0/backbone
+      disable_cache: false
+  - interface: inductor-adaptor.initialize-cache
+    caller: gpu-worker
+    as: "off"
+    input:
+      cache_dir: ~/.cache/vllm/torch_compile_cache/h1/rank_0_0/backbone
+      disable_cache: true
+  expect:
+  - "steps.eager.result.value.compiler == 'eager' && steps.old.result.value.compiler == 'inductor' && steps.mk.result.value.compiler == 'inductor_standalone'"
+  - "state['inductor-standalone-adaptor@rank0'].cache_dir == '~/.cache/vllm/torch_compile_cache/h1/rank_0_0/backbone'"
+  - "steps.off.result.value.inductor_cache == null && size(state['inductor-adaptor@rank0'].env) == 0"
 - id: kernels-ops-opcheck-cuda-1
   name: "opcheck (cuda build): call each entry point of aiter-ops, allreduce-rms-fusion, custom-ops once (60 calls)"
   description: "Mirrors tests/kernels opcheck-style tests: every op or wrapper is called once with the canonical Llama-3.1-8B shapes; each wrapper must reach its registered op."
@@ -21075,109 +23570,109 @@ scenarios:
   - interface: aiter-ops.rocm-aiter-topk-sigmoid
     caller: gpu-worker
     as: s24
-  - interface: aiter-ops.rocm-aiter-topk-softmax
-    caller: gpu-worker
-    as: s25
   - interface: aiter-ops.rocm-aiter-triton-add-rmsnorm-pad
     caller: gpu-worker
-    as: s26
+    as: s25
   - interface: aiter-ops.rocm-aiter-triton-gemm-a8w8-blockscale
     caller: gpu-worker
-    as: s27
+    as: s26
   - interface: aiter-ops.rocm-aiter-triton-rotary-embedding
     caller: gpu-worker
-    as: s28
+    as: s27
   - interface: aiter-ops.rocm-aiter-w8a8-gemm
     caller: gpu-worker
-    as: s29
+    as: s28
   - interface: allreduce-rms-fusion.flashinfer-trtllm-fused-allreduce-norm
     caller: gpu-worker
-    as: s30
+    as: s29
   - interface: custom-ops.all-reduce
     caller: gpu-worker
-    as: s31
+    as: s30
   - interface: custom-ops.allocate-shared-buffer-and-handle
     caller: gpu-worker
-    as: s32
+    as: s31
   - interface: custom-ops.amx-mla-concat-and-cache
     caller: gpu-worker
-    as: s33
+    as: s32
   - interface: custom-ops.apply-repetition-penalties-cuda
     caller: gpu-worker
-    as: s34
+    as: s33
   - interface: custom-ops.awq-dequantize
     caller: gpu-worker
-    as: s35
+    as: s34
   - interface: custom-ops.awq-gemm
     caller: gpu-worker
-    as: s36
+    as: s35
   - interface: custom-ops.awq-marlin-moe-repack
     caller: gpu-worker
-    as: s37
+    as: s36
   - interface: custom-ops.awq-marlin-repack
     caller: gpu-worker
-    as: s38
+    as: s37
   - interface: custom-ops.batched-moe-align-block-size
     caller: gpu-worker
-    as: s39
+    as: s38
   - interface: custom-ops.biased-topk-cpu
     caller: gpu-worker
-    as: s40
+    as: s39
   - interface: custom-ops.bmm-cpu
     caller: gpu-worker
-    as: s41
+    as: s40
   - interface: custom-ops.causal-conv1d-fwd-cpu
     caller: gpu-worker
-    as: s42
+    as: s41
   - interface: custom-ops.causal-conv1d-update-cpu
     caller: gpu-worker
-    as: s43
+    as: s42
   - interface: custom-ops.causal-conv1d-update-cpu-vec
     caller: gpu-worker
-    as: s44
+    as: s43
   - interface: custom-ops.causal-conv1d-weight-pack
     caller: gpu-worker
-    as: s45
+    as: s44
   - interface: custom-ops.chunk-gated-delta-rule-cpu
     caller: gpu-worker
-    as: s46
+    as: s45
   - interface: custom-ops.compress-norm-rope-store-cpu
     caller: gpu-worker
-    as: s47
+    as: s46
   - interface: custom-ops.compress-norm-rope-store-indexer-cpu
     caller: gpu-worker
-    as: s48
+    as: s47
   - interface: custom-ops.concat-and-cache-mla
     caller: gpu-worker
-    as: s49
+    as: s48
   - interface: custom-ops.concat-and-cache-mla-grouped
     caller: gpu-worker
-    as: s50
+    as: s49
   - interface: custom-ops.concat-and-cache-mla-rope-fused
     caller: gpu-worker
-    as: s51
+    as: s50
   - interface: custom-ops.concat-mla-q
     caller: gpu-worker
-    as: s52
+    as: s51
   - interface: custom-ops.convert-fp8
     caller: gpu-worker
-    as: s53
+    as: s52
   - interface: custom-ops.cp-gather-and-upconvert-fp8-kv-cache
     caller: gpu-worker
-    as: s54
+    as: s53
   - interface: custom-ops.cp-gather-and-upconvert-nvfp4-kv-cache
     caller: gpu-worker
-    as: s55
+    as: s54
   - interface: custom-ops.cp-gather-cache
     caller: gpu-worker
-    as: s56
+    as: s55
   - interface: custom-ops.cp-gather-indexer-k-quant-cache
     caller: gpu-worker
-    as: s57
+    as: s56
   - interface: custom-ops.cpu-attention-with-kv-cache
     caller: gpu-worker
-    as: s58
+    as: s57
   - interface: custom-ops.cpu-attn-get-scheduler-metadata
+    caller: gpu-worker
+    as: s58
+  - interface: custom-ops.cpu-attn-reshape-and-cache
     caller: gpu-worker
     as: s59
   expect:
@@ -21195,184 +23690,184 @@ scenarios:
   fixtures:
   - tp1-llama-8b
   steps:
-  - interface: custom-ops.cpu-attn-reshape-and-cache
-    caller: gpu-worker
-    as: s0
   - interface: custom-ops.cpu-fused-moe
     caller: gpu-worker
-    as: s1
+    as: s0
   - interface: custom-ops.cpu-fused-moe-int8
     caller: gpu-worker
-    as: s2
+    as: s1
   - interface: custom-ops.cpu-gemm-wna16
     caller: gpu-worker
-    as: s3
+    as: s2
   - interface: custom-ops.cpu-has-amx-fp8
     caller: gpu-worker
-    as: s4
+    as: s3
   - interface: custom-ops.cpu-mla-decode
     caller: gpu-worker
-    as: s5
+    as: s4
   - interface: custom-ops.cpu-mla-extend
     caller: gpu-worker
-    as: s6
+    as: s5
   - interface: custom-ops.cpu-prepack-moe-weight
     caller: gpu-worker
-    as: s7
+    as: s6
   - interface: custom-ops.cpu-prepack-moe-weight-int8
     caller: gpu-worker
-    as: s8
+    as: s7
   - interface: custom-ops.create-onednn-mm
     caller: gpu-worker
-    as: s9
+    as: s8
   - interface: custom-ops.create-onednn-scaled-mm
     caller: gpu-worker
-    as: s10
+    as: s9
   - interface: custom-ops.custom-all-gather
     caller: gpu-worker
-    as: s11
+    as: s10
   - interface: custom-ops.custom-reduce-scatter
     caller: gpu-worker
-    as: s12
+    as: s11
   - interface: custom-ops.cutlass-encode-and-reorder-int4b
     caller: gpu-worker
-    as: s13
+    as: s12
   - interface: custom-ops.cutlass-encode-and-reorder-int4b-grouped
     caller: gpu-worker
-    as: s14
+    as: s13
   - interface: custom-ops.cutlass-fp4-moe-mm
     caller: gpu-worker
-    as: s15
+    as: s14
   - interface: custom-ops.cutlass-moe-mm
     caller: gpu-worker
-    as: s16
+    as: s15
   - interface: custom-ops.cutlass-mxfp4-moe-mm
     caller: gpu-worker
-    as: s17
+    as: s16
   - interface: custom-ops.cutlass-pack-scale-fp8
     caller: gpu-worker
-    as: s18
+    as: s17
   - interface: custom-ops.cutlass-scaled-fp4-mm
     caller: gpu-worker
-    as: s19
+    as: s18
   - interface: custom-ops.cutlass-scaled-mm-azp
     caller: gpu-worker
-    as: s20
+    as: s19
   - interface: custom-ops.cutlass-scaled-mm-supports-fp4
     caller: gpu-worker
-    as: s21
+    as: s20
   - interface: custom-ops.cutlass-w4a8-mm
     caller: gpu-worker
-    as: s22
+    as: s21
   - interface: custom-ops.cutlass-w4a8-moe-mm
     caller: gpu-worker
-    as: s23
+    as: s22
   - interface: custom-ops.dispose
     caller: gpu-worker
-    as: s24
+    as: s23
   - interface: custom-ops.dsv3-fused-a-gemm
     caller: gpu-worker
-    as: s25
+    as: s24
   - interface: custom-ops.flash-mla-with-kvcache-cpu
     caller: gpu-worker
-    as: s26
+    as: s25
   - interface: custom-ops.fp32-router-gemm
     caller: gpu-worker
-    as: s27
+    as: s26
   - interface: custom-ops.fp8-paged-mqa-logits-cpu
     caller: gpu-worker
-    as: s28
+    as: s27
   - interface: custom-ops.fp8-scaled-mm-cpu
     caller: gpu-worker
-    as: s29
+    as: s28
   - interface: custom-ops.fp8-scaled-mm-with-quant
     caller: gpu-worker
-    as: s30
+    as: s29
   - interface: custom-ops.free-shared-buffer
     caller: gpu-worker
-    as: s31
+    as: s30
   - interface: custom-ops.fused-add-rms-norm
     caller: gpu-worker
-    as: s32
+    as: s31
   - interface: custom-ops.fused-experts-cpu
     caller: gpu-worker
-    as: s33
+    as: s32
   - interface: custom-ops.fused-gdn-decode-post-conv-mtp
     caller: gpu-worker
-    as: s34
+    as: s33
   - interface: custom-ops.fused-gdn-gating-cpu
     caller: gpu-worker
-    as: s35
+    as: s34
   - interface: custom-ops.fused-indexer-q-rope-quant-cpu
     caller: gpu-worker
-    as: s36
+    as: s35
   - interface: custom-ops.fused-kda-decode
     caller: gpu-worker
-    as: s37
+    as: s36
   - interface: custom-ops.fused-minimax-m3-qknorm-rope-kv-insert
     caller: gpu-worker
-    as: s38
+    as: s37
   - interface: custom-ops.fused-qk-norm-rope
     caller: gpu-worker
-    as: s39
+    as: s38
   - interface: custom-ops.fused-qnorm-rope-kv-insert-cpu
     caller: gpu-worker
-    as: s40
+    as: s39
   - interface: custom-ops.fused-sigmoid-gating-delta-rule-update-cpu
     caller: gpu-worker
-    as: s41
+    as: s40
   - interface: custom-ops.fused-sigmoid-gating-delta-rule-update-spec-cpu
     caller: gpu-worker
-    as: s42
+    as: s41
   - interface: custom-ops.gather-and-maybe-dequant-cache
     caller: gpu-worker
-    as: s43
+    as: s42
   - interface: custom-ops.get-cutlass-batched-moe-mm-data
     caller: gpu-worker
-    as: s44
+    as: s43
   - interface: custom-ops.get-cutlass-moe-mm-data
     caller: gpu-worker
-    as: s45
+    as: s44
   - interface: custom-ops.get-cutlass-moe-mm-problem-sizes-from-expert-offsets
     caller: gpu-worker
-    as: s46
+    as: s45
   - interface: custom-ops.get-device-attribute
     caller: gpu-worker
-    as: s47
+    as: s46
   - interface: custom-ops.get-graph-buffer-ipc-meta
     caller: gpu-worker
-    as: s48
+    as: s47
   - interface: custom-ops.get-max-shared-memory-per-block-device-attribute
     caller: gpu-worker
-    as: s49
+    as: s48
   - interface: custom-ops.gptq-gemm
     caller: gpu-worker
-    as: s50
+    as: s49
   - interface: custom-ops.gptq-gemm-rdna3
     caller: gpu-worker
-    as: s51
+    as: s50
   - interface: custom-ops.gptq-marlin-moe-repack
     caller: gpu-worker
-    as: s52
-  - interface: custom-ops.gptq-marlin-repack
-    caller: gpu-worker
-    as: s53
+    as: s51
   - interface: custom-ops.gptq-shuffle
     caller: gpu-worker
-    as: s54
+    as: s52
   - interface: custom-ops.grouped-topk
     caller: gpu-worker
-    as: s55
+    as: s53
   - interface: custom-ops.hadacore-transform
     caller: gpu-worker
-    as: s56
+    as: s54
   - interface: custom-ops.hash-topk-cpu
     caller: gpu-worker
-    as: s57
+    as: s55
   - interface: custom-ops.hc-head-fused-cpu
     caller: gpu-worker
-    as: s58
+    as: s56
   - interface: custom-ops.hc-post-fused-cpu
+    caller: gpu-worker
+    as: s57
+  - interface: custom-ops.hc-pre-fused-cpu
+    caller: gpu-worker
+    as: s58
+  - interface: custom-ops.indexer-k-quant-and-cache
     caller: gpu-worker
     as: s59
   expect:
@@ -21390,184 +23885,184 @@ scenarios:
   fixtures:
   - tp1-llama-8b
   steps:
-  - interface: custom-ops.hc-pre-fused-cpu
-    caller: gpu-worker
-    as: s0
-  - interface: custom-ops.indexer-k-quant-and-cache
-    caller: gpu-worker
-    as: s1
   - interface: custom-ops.init-custom-ar
     caller: gpu-worker
-    as: s2
+    as: s0
   - interface: custom-ops.init-custom-qr
     caller: gpu-worker
-    as: s3
+    as: s1
   - interface: custom-ops.int4-scaled-mm-cpu
     caller: gpu-worker
-    as: s4
+    as: s2
   - interface: custom-ops.inverse-gptj-rope-o-proj-cpu
     caller: gpu-worker
-    as: s5
+    as: s3
   - interface: custom-ops.is-onednn-acl-supported
     caller: gpu-worker
-    as: s6
+    as: s4
   - interface: custom-ops.kimi-k3-attn-res
     caller: gpu-worker
-    as: s7
+    as: s5
   - interface: custom-ops.llmm1
     caller: gpu-worker
-    as: s8
+    as: s6
   - interface: custom-ops.machete-mm
     caller: gpu-worker
-    as: s9
+    as: s7
   - interface: custom-ops.machete-prepack-b
     caller: gpu-worker
-    as: s10
+    as: s8
   - interface: custom-ops.machete-supported-schedules
     caller: gpu-worker
-    as: s11
+    as: s9
   - interface: custom-ops.mamba-chunk-scan-fwd-cpu
     caller: gpu-worker
-    as: s12
-  - interface: custom-ops.marlin-gemm
-    caller: gpu-worker
-    as: s13
+    as: s10
   - interface: custom-ops.marlin-int4-fp8-preprocess
     caller: gpu-worker
-    as: s14
+    as: s11
   - interface: custom-ops.matmul-mxf4-bf16-tn
     caller: gpu-worker
-    as: s15
+    as: s12
   - interface: custom-ops.merge-attn-states
     caller: gpu-worker
-    as: s16
+    as: s13
   - interface: custom-ops.meta-size
     caller: gpu-worker
-    as: s17
+    as: s14
   - interface: custom-ops.mla-decode-kvcache-cpu
     caller: gpu-worker
-    as: s18
+    as: s15
   - interface: custom-ops.mnnvl-lamport-all-gather
     caller: gpu-worker
-    as: s19
+    as: s16
   - interface: custom-ops.mnnvl-lamport-reduce-scatter
     caller: gpu-worker
-    as: s20
+    as: s17
   - interface: custom-ops.mnnvl-multimem-reduce-scatter
     caller: gpu-worker
-    as: s21
+    as: s18
   - interface: custom-ops.moe-gptq-gemm-rdna3
     caller: gpu-worker
-    as: s22
+    as: s19
   - interface: custom-ops.moe-lora-align-block-size
     caller: gpu-worker
-    as: s23
+    as: s20
   - interface: custom-ops.moe-sum
     caller: gpu-worker
-    as: s24
+    as: s21
   - interface: custom-ops.moe-wna16-gemm
     caller: gpu-worker
-    as: s25
+    as: s22
   - interface: custom-ops.moe-wna16-marlin-gemm
     caller: gpu-worker
-    as: s26
+    as: s23
   - interface: custom-ops.mxfp4-experts-quant
     caller: gpu-worker
-    as: s27
+    as: s24
   - interface: custom-ops.mxfp4-experts-quant-supported
     caller: gpu-worker
-    as: s28
+    as: s25
   - interface: custom-ops.ngram-compute-n-gram-ids
     caller: gpu-worker
-    as: s29
+    as: s26
   - interface: custom-ops.onednn-mm
     caller: gpu-worker
-    as: s30
+    as: s27
   - interface: custom-ops.onednn-scaled-mm
     caller: gpu-worker
-    as: s31
+    as: s28
   - interface: custom-ops.open-mem-handle
     caller: gpu-worker
-    as: s32
+    as: s29
   - interface: custom-ops.paged-attention-rocm
     caller: gpu-worker
-    as: s33
+    as: s30
   - interface: custom-ops.qr-all-reduce
     caller: gpu-worker
-    as: s34
+    as: s31
   - interface: custom-ops.qr-destroy
     caller: gpu-worker
-    as: s35
+    as: s32
   - interface: custom-ops.qr-get-handle
     caller: gpu-worker
-    as: s36
+    as: s33
   - interface: custom-ops.qr-max-size
     caller: gpu-worker
-    as: s37
+    as: s34
   - interface: custom-ops.qr-open-handles
     caller: gpu-worker
-    as: s38
+    as: s35
   - interface: custom-ops.register-buffer
     caller: gpu-worker
-    as: s39
+    as: s36
   - interface: custom-ops.register-graph-buffers
     caller: gpu-worker
-    as: s40
+    as: s37
   - interface: custom-ops.reshape-and-cache
     caller: gpu-worker
-    as: s41
+    as: s38
   - interface: custom-ops.reshape-and-cache-flash
     caller: gpu-worker
-    as: s42
+    as: s39
   - interface: custom-ops.rms-norm
     caller: gpu-worker
-    as: s43
+    as: s40
   - interface: custom-ops.rms-norm-dynamic-per-token-quant
     caller: gpu-worker
-    as: s44
+    as: s41
   - interface: custom-ops.rms-norm-per-block-quant
     caller: gpu-worker
-    as: s45
+    as: s42
   - interface: custom-ops.rotary-embedding
     caller: gpu-worker
-    as: s46
+    as: s43
   - interface: custom-ops.safe-fused-quantize-nv
     caller: gpu-worker
-    as: s47
+    as: s44
   - interface: custom-ops.save-partial-states-cpu
     caller: gpu-worker
-    as: s48
+    as: s45
   - interface: custom-ops.scaled-fp4-experts-quant
     caller: gpu-worker
-    as: s49
+    as: s46
   - interface: custom-ops.scaled-fp4-quant
     caller: gpu-worker
-    as: s50
+    as: s47
   - interface: custom-ops.selective-scan-fwd
     caller: gpu-worker
-    as: s51
+    as: s48
   - interface: custom-ops.selective-state-update-cpu
     caller: gpu-worker
-    as: s52
+    as: s49
   - interface: custom-ops.shuffle-rows
     caller: gpu-worker
-    as: s53
+    as: s50
   - interface: custom-ops.silu-and-mul-mxfp4-experts-quant
     caller: gpu-worker
-    as: s54
+    as: s51
   - interface: custom-ops.silu-and-mul-per-block-quant
     caller: gpu-worker
-    as: s55
+    as: s52
   - interface: custom-ops.silu-and-mul-scaled-fp4-experts-quant
     caller: gpu-worker
-    as: s56
+    as: s53
   - interface: custom-ops.sm100-cutlass-mla-decode
     caller: gpu-worker
-    as: s57
+    as: s54
   - interface: custom-ops.sm100-cutlass-mla-get-workspace-size
     caller: gpu-worker
-    as: s58
+    as: s55
   - interface: custom-ops.swap-blocks-batch
+    caller: gpu-worker
+    as: s56
+  - interface: custom-ops.top-k-per-row-decode
+    caller: gpu-worker
+    as: s57
+  - interface: custom-ops.top-k-per-row-prefill
+    caller: gpu-worker
+    as: s58
+  - interface: custom-ops.topk-hash-softplus-sqrt
     caller: gpu-worker
     as: s59
   expect:
@@ -21586,184 +24081,184 @@ scenarios:
   fixtures:
   - tp1-llama-8b
   steps:
-  - interface: custom-ops.top-k-per-row-decode
-    caller: gpu-worker
-    as: s0
-  - interface: custom-ops.top-k-per-row-prefill
-    caller: gpu-worker
-    as: s1
-  - interface: custom-ops.topk-hash-softplus-sqrt
-    caller: gpu-worker
-    as: s2
   - interface: custom-ops.topk-transform-512-cpu
     caller: gpu-worker
-    as: s3
+    as: s0
   - interface: custom-ops.vocab-parallel-embedding
     caller: gpu-worker
-    as: s4
+    as: s1
   - interface: custom-ops.weight-packed-linear-cpu
     caller: gpu-worker
-    as: s5
+    as: s2
   - interface: custom-ops.wv-split-k
     caller: gpu-worker
-    as: s6
+    as: s3
   - interface: custom-ops.wv-split-k-int4-g
     caller: gpu-worker
-    as: s7
+    as: s4
   - interface: custom-ops.wv-split-kq
     caller: gpu-worker
-    as: s8
+    as: s5
   - interface: custom-ops.wv-split-krc
     caller: gpu-worker
-    as: s9
+    as: s6
   - interface: flashinfer.bmm-fp8
     caller: gpu-worker
-    as: s10
+    as: s7
   - interface: flashinfer.flashinfer-concat-mla-k
     caller: gpu-worker
-    as: s11
+    as: s8
   - interface: flashinfer.flashinfer-mm-bf16-fp4
     caller: gpu-worker
-    as: s12
+    as: s9
   - interface: flashinfer.flashinfer-mm-fp4
     caller: gpu-worker
-    as: s13
+    as: s10
   - interface: flashinfer.flashinfer-mxfp4-quantize
     caller: gpu-worker
-    as: s14
+    as: s11
   - interface: flashinfer.flashinfer-mxfp8-quantize-8x4
     caller: gpu-worker
-    as: s15
+    as: s12
   - interface: flashinfer.flashinfer-nvfp4-quantize
     caller: gpu-worker
-    as: s16
+    as: s13
   - interface: flashinfer.mm-mxfp8
     caller: gpu-worker
-    as: s17
+    as: s14
   - interface: flashkda-registration.fwd
     caller: gpu-worker
-    as: s18
+    as: s15
   - interface: flashkda-registration.get-workspace-size
     caller: gpu-worker
-    as: s19
+    as: s16
   - interface: mla-rope-kvcache-cat-fusion.fused-rope-unified-mla-kv-cache-update
     caller: gpu-worker
-    as: s20
+    as: s17
   - interface: moe-torch-bindings.moe-permute
     caller: gpu-worker
-    as: s21
+    as: s18
   - interface: moe-torch-bindings.moe-permute-sort-workspace-size
     caller: gpu-worker
-    as: s22
+    as: s19
   - interface: moe-torch-bindings.moe-permute-unpermute-supported
     caller: gpu-worker
-    as: s23
+    as: s20
   - interface: moe-torch-bindings.moe-permute-with-scratch
     caller: gpu-worker
-    as: s24
+    as: s21
   - interface: moe-torch-bindings.moe-prepare-scatter
     caller: gpu-worker
-    as: s25
+    as: s22
   - interface: moe-torch-bindings.moe-unpermute
     caller: gpu-worker
-    as: s26
+    as: s23
   - interface: qk-norm-rope-kvcache-fusion.fused-qk-norm-mrope-and-unified-kv-cache-update
     caller: gpu-worker
-    as: s27
+    as: s24
   - interface: qk-norm-rope-kvcache-fusion.fused-qk-norm-rope-and-unified-kv-cache-update
     caller: gpu-worker
-    as: s28
+    as: s25
   - interface: rms-quant-fusion.flashinfer-fused-add-rms-norm-nvfp4-quant
     caller: gpu-worker
-    as: s29
+    as: s26
   - interface: rocm-torch-bindings.gptq-gemm-rdna3-wmma
     caller: gpu-worker
-    as: s30
+    as: s27
   - interface: rope-kvcache-fusion.fused-rope-and-unified-kv-cache-update
     caller: gpu-worker
-    as: s31
+    as: s28
   - interface: silu-mul-fp8.silu-mul-fp8-baseline
     caller: gpu-worker
-    as: s32
+    as: s29
   - interface: torch-bindings.all-reduce
     caller: gpu-worker
-    as: s33
+    as: s30
   - interface: torch-bindings.fatrelu-and-mul
     caller: gpu-worker
-    as: s34
+    as: s31
   - interface: torch-bindings.fused-add-rms-norm-static-fp8-quant
     caller: gpu-worker
-    as: s35
+    as: s32
   - interface: torch-bindings.fused-deepseek-v4-kv-rope-insert
     caller: gpu-worker
-    as: s36
+    as: s33
   - interface: torch-bindings.fused-deepseek-v4-qnorm-rope-kv-rope-full-cache-bf16-insert
     caller: gpu-worker
-    as: s37
+    as: s34
   - interface: torch-bindings.fused-deepseek-v4-qnorm-rope-kv-rope-full-cache-fp8-insert
     caller: gpu-worker
-    as: s38
+    as: s35
   - interface: torch-bindings.fused-deepseek-v4-qnorm-rope-kv-rope-quant-insert
     caller: gpu-worker
-    as: s39
+    as: s36
   - interface: torch-bindings.fused-kda-chunk
     caller: gpu-worker
-    as: s40
+    as: s37
   - interface: torch-bindings.fused-kda-prologue
     caller: gpu-worker
-    as: s41
+    as: s38
   - interface: torch-bindings.fused-kimi-k3-mla-decode-q-concat-ds-mla-insert
     caller: gpu-worker
-    as: s42
+    as: s39
   - interface: torch-bindings.fused-kimi-k3-mla-decode-q-concat-kv-cache-fp8-insert
     caller: gpu-worker
-    as: s43
+    as: s40
   - interface: torch-bindings.fused-kimi-k3-mla-decode-q-concat-kv-cache-insert
     caller: gpu-worker
-    as: s44
+    as: s41
   - interface: torch-bindings.fused-kimi-k3-mla-key-concat-ds-mla-insert
     caller: gpu-worker
-    as: s45
+    as: s42
   - interface: torch-bindings.fused-kimi-k3-mla-key-concat-kv-cache-insert
     caller: gpu-worker
-    as: s46
+    as: s43
   - interface: torch-bindings.fused-kimi-k3-mla-kv-concat
     caller: gpu-worker
-    as: s47
+    as: s44
   - interface: torch-bindings.fused-kimi-k3-mla-kv-concat-quant-fp8
     caller: gpu-worker
-    as: s48
+    as: s45
   - interface: torch-bindings.fused-kimi-k3-mla-qkv-quant-kv-cache-fp8-insert
     caller: gpu-worker
-    as: s49
+    as: s46
   - interface: torch-bindings.gelu-and-mul
     caller: gpu-worker
-    as: s50
+    as: s47
   - interface: torch-bindings.gelu-fast
     caller: gpu-worker
-    as: s51
+    as: s48
   - interface: torch-bindings.gelu-new
     caller: gpu-worker
-    as: s52
+    as: s49
   - interface: torch-bindings.gelu-quick
     caller: gpu-worker
-    as: s53
+    as: s50
   - interface: torch-bindings.gelu-tanh-and-mul
     caller: gpu-worker
-    as: s54
+    as: s51
   - interface: torch-bindings.hisparse-gather-compact
     caller: gpu-worker
-    as: s55
+    as: s52
   - interface: torch-bindings.hisparse-gather-plan
     caller: gpu-worker
-    as: s56
+    as: s53
   - interface: torch-bindings.hisparse-invalidate-written-slots
     caller: gpu-worker
-    as: s57
+    as: s54
   - interface: torch-bindings.hisparse-resolve-residency
     caller: gpu-worker
-    as: s58
+    as: s55
   - interface: torch-bindings.masked-moe-activation
+    caller: gpu-worker
+    as: s56
+  - interface: torch-bindings.masked-situ-and-mul
+    caller: gpu-worker
+    as: s57
+  - interface: torch-bindings.minimax-allreduce-rms-qk
+    caller: gpu-worker
+    as: s58
+  - interface: torch-bindings.mul-and-silu
     caller: gpu-worker
     as: s59
   expect:
@@ -21776,180 +24271,171 @@ scenarios:
     \ x)"
   - "!trace.exists(e, e.type == 'call.end' && has(e.error) && e.error != null)"
 - id: kernels-ops-opcheck-cuda-5
-  name: "opcheck (cuda build): call each entry point of torch-bindings, vllm-c, vllm-xpu-kernels, xpu-ops once (54 calls)"
+  name: "opcheck (cuda build): call each entry point of torch-bindings, vllm-c, vllm-xpu-kernels, xpu-ops once (51 calls)"
   description: "Mirrors tests/kernels opcheck-style tests: every op or wrapper is called once with the canonical Llama-3.1-8B shapes; each wrapper must reach its registered op."
   fixtures:
   - tp1-llama-8b
   steps:
-  - interface: torch-bindings.masked-situ-and-mul
-    caller: gpu-worker
-    as: s0
-  - interface: torch-bindings.minimax-allreduce-rms-qk
-    caller: gpu-worker
-    as: s1
-  - interface: torch-bindings.mul-and-silu
-    caller: gpu-worker
-    as: s2
   - interface: torch-bindings.per-token-group-fp8-quant-packed
     caller: gpu-worker
-    as: s3
+    as: s0
   - interface: torch-bindings.per-token-group-quant-int8
     caller: gpu-worker
-    as: s4
+    as: s1
   - interface: torch-bindings.persistent-masked-m-silu-mul-quant
     caller: gpu-worker
-    as: s5
+    as: s2
   - interface: torch-bindings.relu-squared
     caller: gpu-worker
-    as: s6
+    as: s3
   - interface: torch-bindings.rms-norm-static-fp8-quant
     caller: gpu-worker
-    as: s7
+    as: s4
   - interface: torch-bindings.scaled-fp4-quant-out
     caller: gpu-worker
-    as: s8
+    as: s5
   - interface: torch-bindings.silu-and-mul
     caller: gpu-worker
-    as: s9
+    as: s6
   - interface: torch-bindings.silu-and-mul-nvfp4-quant
     caller: gpu-worker
-    as: s10
+    as: s7
   - interface: torch-bindings.silu-and-mul-with-clamp
     caller: gpu-worker
-    as: s11
+    as: s8
   - interface: torch-bindings.situ-and-mul
     caller: gpu-worker
-    as: s12
+    as: s9
   - interface: torch-bindings.situ-and-mul-quant
     caller: gpu-worker
-    as: s13
+    as: s10
   - interface: torch-bindings.swigluoai-and-mul
     caller: gpu-worker
-    as: s14
+    as: s11
   - interface: vllm-c.fused-add-rms-norm
     caller: gpu-worker
-    as: s15
+    as: s12
   - interface: vllm-c.rms-norm
     caller: gpu-worker
-    as: s16
+    as: s13
   - interface: vllm-xpu-kernels.xpu-host-register
     caller: gpu-worker
-    as: s17
+    as: s14
   - interface: vllm-xpu-kernels.xpu-host-unregister
     caller: gpu-worker
-    as: s18
+    as: s15
   - interface: xpu-ops.fused-add-gemma-rms-norm-impl
     caller: gpu-worker
-    as: s19
+    as: s16
   - interface: xpu-ops.fused-add-layer-norm-impl
     caller: gpu-worker
-    as: s20
+    as: s17
   - interface: xpu-ops.fused-add-nemotron-layer-norm-impl
     caller: gpu-worker
-    as: s21
+    as: s18
   - interface: xpu-ops.gdn-attention-core-xpu
     caller: gpu-worker
-    as: s22
+    as: s19
   - interface: xpu-ops.gdn-attention-core-xpu-impl
     caller: gpu-worker
-    as: s23
+    as: s20
   - interface: xpu-ops.gemma-rms-norm-impl
     caller: gpu-worker
-    as: s24
+    as: s21
   - interface: xpu-ops.layer-norm-impl
     caller: gpu-worker
-    as: s25
+    as: s22
   - interface: xpu-ops.nemotron-layer-norm-impl
     caller: gpu-worker
-    as: s26
+    as: s23
   - interface: xpu-ops.topk-topp-sample-impl
     caller: gpu-worker
-    as: s27
+    as: s24
   - interface: xpu-ops.xpu-apply-rotary-emb
     caller: gpu-worker
-    as: s28
+    as: s25
   - interface: xpu-ops.xpu-deepseek-fused-indexer-q-rope-fp8
     caller: gpu-worker
-    as: s29
+    as: s26
   - interface: xpu-ops.xpu-deepseek-fused-indexer-q-rope-fp8-impl
     caller: gpu-worker
-    as: s30
+    as: s27
   - interface: xpu-ops.xpu-deepseek-fused-indexer-q-rope-mxfp4
     caller: gpu-worker
-    as: s31
+    as: s28
   - interface: xpu-ops.xpu-deepseek-fused-indexer-q-rope-mxfp4-impl
     caller: gpu-worker
-    as: s32
+    as: s29
   - interface: xpu-ops.xpu-fp8-bmm
     caller: gpu-worker
-    as: s33
+    as: s30
   - interface: xpu-ops.xpu-fp8-bmm-impl
     caller: gpu-worker
-    as: s34
+    as: s31
   - interface: xpu-ops.xpu-fp8-mqa-logits
     caller: gpu-worker
-    as: s35
+    as: s32
   - interface: xpu-ops.xpu-fp8-mqa-logits-impl
     caller: gpu-worker
-    as: s36
+    as: s33
   - interface: xpu-ops.xpu-fp8-paged-mqa-logits
     caller: gpu-worker
-    as: s37
+    as: s34
   - interface: xpu-ops.xpu-fp8-paged-mqa-logits-impl
     caller: gpu-worker
-    as: s38
+    as: s35
   - interface: xpu-ops.xpu-fused-add-gemma-rms-norm
     caller: gpu-worker
-    as: s39
+    as: s36
   - interface: xpu-ops.xpu-fused-add-layer-norm
     caller: gpu-worker
-    as: s40
+    as: s37
   - interface: xpu-ops.xpu-fused-add-nemotron-layer-norm
     caller: gpu-worker
-    as: s41
+    as: s38
   - interface: xpu-ops.xpu-fused-input-norm
     caller: gpu-worker
-    as: s42
+    as: s39
   - interface: xpu-ops.xpu-fused-input-norm-impl
     caller: gpu-worker
-    as: s43
+    as: s40
   - interface: xpu-ops.xpu-gemma-rms-norm
     caller: gpu-worker
-    as: s44
+    as: s41
   - interface: xpu-ops.xpu-layer-norm
     caller: gpu-worker
-    as: s45
+    as: s42
   - interface: xpu-ops.xpu-mxfp4-quantize
     caller: gpu-worker
-    as: s46
+    as: s43
   - interface: xpu-ops.xpu-mxfp4-quantize-impl
     caller: gpu-worker
-    as: s47
+    as: s44
   - interface: xpu-ops.xpu-mxfp8-quantize
     caller: gpu-worker
-    as: s48
+    as: s45
   - interface: xpu-ops.xpu-mxfp8-quantize-impl
     caller: gpu-worker
-    as: s49
+    as: s46
   - interface: xpu-ops.xpu-nemotron-layer-norm
     caller: gpu-worker
-    as: s50
+    as: s47
   - interface: xpu-ops.xpu-ops-deepseek-scaling-rope
     caller: gpu-worker
-    as: s51
+    as: s48
   - interface: xpu-ops.xpu-ops-deepseek-scaling-rope-impl
     caller: gpu-worker
-    as: s52
+    as: s49
   - interface: xpu-ops.xpu-topk-topp-sampler
     caller: gpu-worker
-    as: s53
+    as: s50
   expect:
   - "[steps.s0.result.ok, steps.s1.result.ok, steps.s2.result.ok, steps.s3.result.ok, steps.s4.result.ok, steps.s5.result.ok, steps.s6.result.ok, steps.s7.result.ok, steps.s8.result.ok, steps.s9.result.ok,\
     \ steps.s10.result.ok, steps.s11.result.ok, steps.s12.result.ok, steps.s13.result.ok, steps.s14.result.ok, steps.s15.result.ok, steps.s16.result.ok, steps.s17.result.ok, steps.s18.result.ok, steps.s19.result.ok,\
     \ steps.s20.result.ok, steps.s21.result.ok, steps.s22.result.ok, steps.s23.result.ok, steps.s24.result.ok, steps.s25.result.ok, steps.s26.result.ok, steps.s27.result.ok, steps.s28.result.ok, steps.s29.result.ok,\
     \ steps.s30.result.ok, steps.s31.result.ok, steps.s32.result.ok, steps.s33.result.ok, steps.s34.result.ok, steps.s35.result.ok, steps.s36.result.ok, steps.s37.result.ok, steps.s38.result.ok, steps.s39.result.ok,\
     \ steps.s40.result.ok, steps.s41.result.ok, steps.s42.result.ok, steps.s43.result.ok, steps.s44.result.ok, steps.s45.result.ok, steps.s46.result.ok, steps.s47.result.ok, steps.s48.result.ok, steps.s49.result.ok,\
-    \ steps.s50.result.ok, steps.s51.result.ok, steps.s52.result.ok, steps.s53.result.ok].all(x, x)"
+    \ steps.s50.result.ok].all(x, x)"
   - "!trace.exists(e, e.type == 'call.end' && has(e.error) && e.error != null)"
 - id: kernels-ops-opcheck-cpu-1
   name: "opcheck (cpu build): call each entry point of cpu-torch-bindings, cpu-triton-utils once (36 calls)"

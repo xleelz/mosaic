@@ -73,7 +73,7 @@ def variants():
                    "lru-cache-lora-model-manager": {"is_moe": True, "modules": {EXPERTS: "FusedMoEWithLoRA"}}}},
         {"id": "models-layers-" + VL, "attributes": {"variant_of": VL},
          "summary": "models-layers in the Qwen2-VL world: Qwen2-VL-7B loaded on rank0 (vision tower + Qwen2 language model with M-RoPE); Llama is not loaded.",
-         "state": {"llama-for-causal-lm": {"loaded": False}, "qwen2-vl-for-conditional-generation": qwen}},
+         "state": {"llama-for-causal-lm": {"loaded": False}, "qwen2-vl-for-conditional-generation": qwen, "qwen3-vl-for-conditional-generation": {**qwen, "model": "Qwen/Qwen3-VL-8B-Instruct", "cfg": {**qwen["cfg"], "num_layers": 36, "hidden_size": 4096, "vision": {"device": "cuda", "patch_size": 16, "temporal_patch_size": 2, "spatial_merge_size": 2, "hidden_size": 1152, "num_heads": 16, "num_position_embeddings": 2304, "out_hidden_size": 4096}}}}},
         {"id": "models-layers-" + FP8, "attributes": {"variant_of": FP8},
          "summary": "models-layers in the FP8 world: the FP8 checkpoint loaded on rank0 (Fp8LinearMethod layers, Fp8KVCacheMethod attention with the checkpoint's k/v scales).",
          "state": {"llama-for-causal-lm": nm,

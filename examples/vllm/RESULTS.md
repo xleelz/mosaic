@@ -415,6 +415,64 @@ coverage of what no measure has named yet.
 EPLB or expert placement, no `api-server-count`; a config can't be unset; integers beyond int64
 arrive as strings; 8k-token prompts need `max_cel_cost` raised.
 
+## Round 6 (mechanism coverage, `FIXES6.md`) and its blind measure
+
+**The build.** 659 components, 2,645 interfaces, 276 flows, 1,805 scenarios, all passing; full gate
+exit 0 (citations 11,193/11,193; hollow, racy and unwritten-fields at 0); all 9 areas accepted with one
+joint stage; internal-assertions gate 0.217 -> 0.204. Each area added the absent mechanisms the
+round-5 blind measure named, plus others from `coverage_gaps.py`. Multimodal processing moved to the
+API process, as the code runs it (`renderers/base.py:192-199`).
+
+Earlier measures, round 5 -> round 6 (scenarios): judge4 70 -> 128 / 148, oracle4 13 -> 35 / 38, judge3
+92 -> 93 / 113, judge2 52 -> 53 / 58, oracle3 21 -> 22 / 29; judge, oracle, oracle2 and build-oracle
+unchanged. Nothing newly fails.
+
+**The blind measure** (`BENCHMARK5.md`, `judge5/`, `oracle5/`; fresh agents, new cases and tests).
+
+| Measure | Round 5 (BENCHMARK4, oracle4) | Round 6 (BENCHMARK5, oracle5) |
+|---|---|---|
+| Test oracle | 7 / 36 (7 of 27); 20 model bugs, 9 untranslatable | **2 / 36** (2 of 30); 28 model bugs, 6 untranslatable |
+| Benchmark, steps | 38 / 136 (28%) | **34 / 144 (24%)**: scheduling-kv 12/37, lifecycle 9/34, execution 8/34, serving 5/39 |
+| Benchmark, whole cases | 2 / 32 | 0 / 32 |
+
+Scoring got stricter this round (one oracle verdict per entry, the worst sub-result).
+
+**Reading.** The fixes stick (judge4 and oracle4 nearly doubled) and the blind numbers don't follow.
+Round 6 also shows a new failure: **mechanisms added as a shell.** The pooling endpoints exist, but
+`async-llm.encode` returns no vectors, so embeddings are `[]` and scores constant (found independently
+by the serving judge and the serving oracle); `spec-decoding-prom.observe` claims to feed counters and
+has no caller; `peft-helper.validate-legal` claims `rank_pattern` and reads only `r` and `bias`;
+`use-v2-model-runner` claims a fallback and is a constant. Gates pass because each piece has its own
+scenario. A next round needs end-to-end checks that a mechanism's result reaches the boundary, and a
+list of mechanisms enumerated from the code, not the last benchmark's misses.
+
+**Wrong claims to fix** (judge5, oracle5; owners are the coordinator's reading where a report didn't name one, so check the judge's file):
+- *engine-core:* `async-llm.encode` returns no vectors; the sync pump stalls after `LLM()` on TP 1; no
+  MPClient finalizer; `llm.embed` returns text.
+- *serving-api:* `use_sep_token` False concat; `previous_input_messages` and Harmony; Cohere Command's
+  `parse_delta` (the stream generator parses Inkling only); stream role and index hard-coded, child
+  seeds 7, 7, 7, stream interval ignored; `render-completion`'s prompt-embeds checks; `llm.run-engine`
+  stops at 256 steps; NaN temperature accepted; `check-model`'s LoRA resolver branch; `/pooling`
+  refusing `token_embed` on an embed server.
+- *worker-runner:* `SleepModeBackendFactory`; the v1 CUDA-graph dispatcher (`dispatch`, LoRA keys, its
+  assertion); weights never freed, killed workers keep memory, KV-sharing group expansion; warm-up and
+  generate bypass torch-compile; `use-v2-model-runner` fallback; `load_inplace` dropped.
+- *scheduler-kv:* `find-longest-cache-hit` caps at 1000 blocks; `schedule` clamps with -1, ignoring
+  pooling's 0; `get-kv-cache-configs` checks memory before the override; draft validation
+  (`validate_tokens`), per-row bitmask, reasoning gating, guidance and residency metrics.
+- *models-layers:* `DecoderReplayLayers`, Gemma4 and generic TensorSchema; `RocmDotScaledMxfp8LinearKernel`,
+  `count_expert_num_tokens`; `peft-helper`'s `rank_pattern` and required fields.
+- *config-platform:* `try_verify_and_update_config` and `MODELS_CONFIG_MAP`; Nemotron's properties;
+  knobs `--stream-interval`, `--enable-log-requests`, `--lora-modules`,
+  `VLLM_DISABLE_REQUEST_ID_RANDOMIZATION`.
+- *attention:* GDN's prefill checkpoint; `customize_spec` alignment; the MXFP4 planner.
+- *kernels-ops:* Helion's hard-coded picker and `dynamic_shapes_config.type`; grammar bitmask `num_rows`
+  counts requests, not rows.
+- *distributed:* MoRIIO `request_finished`; `OffloadingConnector` routing; the metrics `spec-decoding-prom`
+  (no caller) and `vllm:lora_requests_info`, whose owner needs confirming.
+
+**Simulator gaps.** No grammar-constrained text; no vector semantics; scenario YAML rejects `-.inf`.
+
 ## Files
 
 - **Contracts and build:** `profile.yaml`, `skeleton.yaml`, `fixtures.yaml`, `worlds.yaml`,

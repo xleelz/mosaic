@@ -392,3 +392,75 @@ Checked and already exact: peek errors, duplicate request id, preemption assert,
 
 ### Round-5 unit tests
 6/6 pass (`build-oracle/round5/scheduler-kv.md`).
+
+## Round 6 (FIXES6: mechanism coverage)
+
+New sources: `gen/scheduler-kv/interfaces_r6.yaml` (9 interfaces) and `round6.py` ->
+`round6_scenarios.yaml` (14 regressions, `scheduler-kv-r6-*`). `build.sh` takes `OUT=` to build
+elsewhere.
+
+### Mechanisms added (round-5 measure)
+- **Deferred block free** (oracle4 `gate-enabled-for-async-consumer`): `scheduler.defer-block-free-enabled`
+  (kv_consumer/kv_both and max_concurrent_batches > 1, vllm.py:577-587), `sched_step_seq` /
+  `processed_step_seq` fences, `scheduler.free-request-blocks` (free now or pop and park,
+  scheduler.py:2759-2776), `scheduler.drain-deferred-frees`, `kv-cache-manager.pop-blocks-for-free`,
+  `full-attention-manager.pop-blocks-for-free`. Preemption, `free-request` and finished_sending all
+  go through it, as `_free_request_blocks` does. Hybrid (Mamba) groups are not popped (only the
+  full-attention group). Note from the code: a request not scheduled in the in-flight step is freed at
+  once even with the gate on (`last_sched_seq <= processed_step_seq`).
+- **Block stride alignment and layouts** (oracle4 `packed-alignment-hot-pages-stride`):
+  `get-kv-cache-config-from-groups` takes all six `KVCacheLayout` members, `block_stride_alignment`
+  per group or `layer_alignments` per layer, `hisparse_hot` groups; block-outer rounds to the lcm,
+  layer-outer pads each page; `validate_kv_cache_layout`'s ValueError word for word.
+- **Stop check** (judge4 Q4-2 b, d): `sched-utils.check-stop` adds the min_tokens gate (only before the
+  repetition check, after EOS/stop/length) and `check_sequence_repetition`; FINISHED_REPETITION gives
+  finish_reason `repetition`, stop_reason `repetition_detected`.
+- **KV events** (judge4 Q4-3 b, c, d): BlockStored carries `parent_block_hash`, `token_ids`,
+  `block_size`, `lora_id`/`lora_name`, `medium` GPU, `extra_keys` (None), `session_id`; BlockRemoved has
+  `medium`; `block-pool.emit-cached-block-events` for `kv_cache_report_mode: full`;
+  `AllBlocksCleared` on a prefix-cache reset. ASSUMPTION/stand-in: a prompt given as segments has no
+  token ids, so its positions appear as `'<key>#<offset>'` strings (the count is exact).
+- **NONE_HASH warning** (judge4 Q4-4 d): the xxhash/xxhash_cbor warning text as a note.
+- **Forwarding logprobs and PrefillStats** (oracle4 worker-runner fix 4; engine-core's request):
+  `update-from-output` slices the runner's `logprobs` per request (`slice_request`, with
+  `cu_num_generated_tokens`), only for requests whose `logprobs`/`logprob_token_ids` make num_logprobs
+  non-None, after the stop trim; passes `prompt_logprobs_dict[req_id]`; emits finalized `prefill_stats`
+  once (set at the first non-preempted scheduling, finalized with `kv-cache-manager.estimate-cached-tokens`).
+  **Agreed shape:** the runner sends code names, `ModelRunnerOutput.logprobs = {logprob_token_ids,
+  logprobs, sampled_token_ranks, cu_num_generated_tokens}` (rows across the batch) and
+  `prompt_logprobs_dict = {req_id: {logprob_token_ids, logprobs, selected_token_ranks}}`; the scheduler
+  hands both on under engine-core's EngineCoreOutput names `{token_ids, logprobs, ranks}` (short names
+  are accepted as input too). oracle4 `get-logprobs-and-prompt-logprobs` passes end to end.
+
+### Other mechanisms (coverage_gaps)
+1 added: `kv-cache-manager.evict-blocks` / `block-pool.evict-blocks` (evict by id, BlockRemoved, the
+connector-bug assertion). Declined: CrossAttentionManager (no encoder-decoder world), HiSparse managers
+(attention/distributed's sparse path), offload tier internals (byte-level, rows 9-18).
+
+### Unwritten fields
+None in this fragment (the merged lint's 2 findings are config-platform's and worker-runner's).
+
+### Breaking changes (callers)
+- `get-kv-cache-config-from-groups.layout` enum grows to six members; tensors gain `size`; a mixed-page
+  model under LHBNC/BHLNC (or two groups under an L-first layout) now fails. No caller outside this area.
+- `sched-utils.check-stop` takes `output_token_ids` and `repetition_detection`.
+- `update-from-output` outputs gain `new_logprobs`, `new_prompt_logprobs_tensors`, `prefill_stats`.
+  serving-api's `serving-api-r5-online-beam-search` asserted that no beam extends without logprobs;
+  with logprobs flowing beams now extend, so its `-beam-0` expectation fails (serving-api to update).
+- `cache-full-blocks`, `cache-blocks`, `allocate-slots`, `get-computed-blocks` take optional
+  `token_ids`/`lora_request` (KV events only).
+
+### Cross-area needs
+- distributed: KV events publisher defaults to zmq (`KVEventsConfig.__post_init__`, kv_events.py:50-52);
+  `event-publisher-factory.create` (Q4-3 a).
+- config-platform: batched-DP-MoE 256 default and forwarding `all2all_backend` (Q4-7 b,
+  arg_utils.py:3113-3117); ModelOpt `kv_cache_quant_algo` resolution (Q4-6 d).
+- serving-api: `RepetitionDetectionParams.__post_init__` validation (Q4-2 d min_count 1, 400).
+- models-layers: mm uuid used verbatim as the hash (Q4-4 c).
+- worker-runner: keep the code field names above in ModelRunnerOutput.
+
+### Round 6: limits of the evidence and open items
+- The accept gate (1644/1644) ran against last-good peers, 5 of them stale. The last-good worker-runner has no `logprobs` in its ModelRunnerOutput, so that gate doesn't exercise logprobs end to end. The oracle4 logprobs pass comes from working copies, with config-platform at HEAD.
+- `serving-api-r5-online-beam-search` passes in the accept gate but fails on working copies with this fragment.
+- The old-vs-new measure diff ran on a build before `evict-blocks` and the sampling-params schema additions.
+- Open in this area (judge4 Q4-4 a-d): `kv-cache-utils.request-block-hasher` ignores the chosen hash algorithm and its key is a stand-in (segment keys + end offset), not `("mm", id, offset-block_start)` in LoRA/mm/salt order. Hash factors are not modeled.

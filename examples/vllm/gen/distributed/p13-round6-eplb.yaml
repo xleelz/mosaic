@@ -1,0 +1,1351 @@
+# distributed area, part 13 (fix round 6, mechanism coverage): expert-parallel load balancing.
+# EplbState (add_model, step, rearrange, the async worker), the EPLB communicator factory and its
+# per-peer send/recv/execute, rebalance_execute (the transfer plan, move_to_buffer and
+# move_from_buffer, rearrange_expert_weights_inplace) and the default policy (balanced packing,
+# replication, intra-GPU slot preservation). Expert weights are modeled as the identity of the
+# logical expert a local slot holds, so a scenario can assert where each expert's weights went.
+schema_version: 1
+id: vllm
+
+configs:
+  # config-platform owns both (vllm/config/parallel.py, the nixl probe); copies for the standalone check.
+  - {id: eplb-config, type: object, value: {}, default: {}, summary: "--eplb-config (EPLBConfig): {} is the defaults (window_size 1000, step_interval 3000, num_redundant_experts 0, log_balancedness off, use_async on, policy default, communicator None = auto)", sources: ["vllm/config/parallel.py:207", "vllm/engine/arg_utils.py:569"], attributes: {key: eplb_config, boundary: true, owner: config-platform}}
+  - {id: nixl-available, type: boolean, value: false, default: false, summary: "Whether the NIXL package is importable (is_nixl_available); it ships with the KV-connector extras, not the base CUDA install, so EPLB's auto communicator falls back to torch_gloo", sources: ["vllm/distributed/nixl_utils.py:86-91"], attributes: {key: "nixl importable", env: true, boundary: true, owner: config-platform}}
+
+components:
+  - id: eplb-state
+    name: EplbState
+    kind: module
+    layer: distributed
+    parent: gpu-worker
+    capacity: {concurrency: 1}   # the model runner's thread drives it, once per forward (gpu_model_runner.py:3187-3200)
+    summary: "Expert-parallel load balancer of one worker: per registered MoE model the physical-to-logical expert map, the experts each local slot holds, the per-step expert load and its sliding window; every step_interval steps it rebalances (synchronously, or through the async worker one layer per step)."
+    sources: ["vllm/distributed/eplb/eplb_state.py:234-300"]
+    state:
+      schema:
+        type: object
+        properties:
+          is_async: {type: boolean}
+          expert_rearrangement_step: {type: integer}
+          expert_rearrangement_step_interval: {type: integer}
+          expert_load_window_size: {type: integer}
+          expert_load_window_step: {type: integer}
+          async_worker: {type: boolean}
+          communicator: {type: [string, "null"]}
+          models: {type: object, description: "model name -> {num_logical_experts, num_physical_experts, num_local_physical_experts, num_moe_layers, num_redundant_experts, num_expert_groups, model_class, physical_to_logical_map [layer][physical], logical_replica_count [layer][logical], expert_weights [layer][local slot] (the logical expert whose weights the slot holds), expert_load_pass [layer][physical], expert_load_window {slot: [layer][physical]}, last_expert_load, rebalanced, pending}"}
+      initial: {is_async: false, expert_rearrangement_step: 0, expert_rearrangement_step_interval: 0, expert_load_window_size: 0, expert_load_window_step: 0, async_worker: false, communicator: null, models: {}}
+  - id: eplb-communicator
+    name: EplbCommunicator
+    kind: module
+    layer: distributed
+    parent: eplb-state
+    capacity: {concurrency: 1}   # one rearrangement at a time per rank: the main thread or the async worker (eplb_state.py:758-978)
+    summary: "The EPLB expert-weight transport of one rank (torch_nccl, torch_gloo with CPU staging, torch_xccl, pynccl or nixl): add_send/add_recv queue one peer transfer per expert, execute completes them all."
+    sources: ["vllm/distributed/eplb/eplb_communicator.py:46-97"]
+    state:
+      schema:
+        type: object
+        properties:
+          backend: {type: [string, "null"]}
+          class_name: {type: [string, "null"]}
+          group_size: {type: integer}
+          group_name: {type: string}
+          needs_profile_buffer_reservation: {type: boolean}
+          sends: {type: array}
+          recvs: {type: array}
+      initial: {backend: null, class_name: null, group_size: 1, group_name: "eplb:0", needs_profile_buffer_reservation: true, sends: [], recvs: []}
+  - id: rebalance-execute
+    name: rebalance_execute (module)
+    kind: module
+    layer: distributed
+    parent: eplb-state
+    summary: "The execution of a rearrangement: per MoE layer, which ranks send and receive each expert, local copies into the buffer, peer transfers through the communicator, and the copy back into the expert weights."
+    sources: ["vllm/distributed/eplb/rebalance_execute.py:1-24"]
+  - id: eplb-policy
+    name: DefaultEplbPolicy
+    kind: module
+    layer: distributed
+    parent: eplb-state
+    summary: "The default (DeepSeek) EPLB policy: pack expert groups to nodes, replicate the hottest experts into the redundant slots, pack physical experts to GPUs by load, then keep experts that stay on a GPU in their old slots."
+    sources: ["vllm/distributed/eplb/policy/default.py:20-332"]
+
+interfaces:
+  # ---------------------------------------------------------------- the EPLB group
+  - component: parallel-state
+    name: get-eplb-group
+    kind: function
+    latency_ms: 0
+    summary: "get_eplb_group: the EPLB GroupCoordinator, built by initialize_model_parallel over the EP ranks when EPLB is enabled for an MoE model. A started world whose recorded groups omit it has it when enable-eplb (its size is the EP size, DP x TP)."
+    sources: ["vllm/distributed/parallel_state.py:1666-1672", "vllm/distributed/parallel_state.py:2324-2346"]
+    request: {type: object, properties: {}}
+    response: {type: object, properties: {world_size: {type: integer}, unique_name: {type: string}, rank_in_group: {type: integer}}}
+    errors:
+      - {code: assertion-error, status: 0, retryable: false}
+    behavior:
+      - if: "'eplb' in state.groups"
+        then:
+          - set: {vars.g: "= state.groups.eplb"}
+        else:
+          - if: "!(state.mp_initialized && config['enable-eplb'])"
+            then:
+              - source: "vllm/distributed/parallel_state.py:1667-1671"
+                fail: {code: assertion-error, status: 0, message: "EPLB group is not initialized. EPLB group is only created for MoE models when EPLB is enabled. Ensure parallel_config.enable_eplb is True."}
+          - title: The startup group the world's recorded groups leave out spans the EP ranks (DP x TP)
+            source: "vllm/distributed/parallel_state.py:2324-2346"
+            set:
+              vars.g: "= {'world_size': ('ep' in state.groups ? state.groups.ep.world_size : config['data-parallel-size'] * config['tensor-parallel-size']), 'unique_name': 'eplb:0'}"
+      - return: {world_size: "= vars.g.world_size", unique_name: "= vars.g.unique_name", rank_in_group: "= int(self.replace('rank', '')) % vars.g.world_size"}
+
+  # ---------------------------------------------------------------- EplbState
+  - component: eplb-state
+    name: add-model
+    kind: function
+    latency_ms: 0
+    summary: "EplbState.add_model: check the model's expert configuration against already-registered models, lay out the initial map (routed experts, then redundant replicas round-robin), set the rearrangement step to 3/4 of the interval, and build the model's EPLB communicator on the EPLB group."
+    sources: ["vllm/distributed/eplb/eplb_state.py:362-526", "vllm/distributed/eplb/eplb_state.py:300-360"]
+    request:
+      type: object
+      properties:
+        model: {type: string, examples: [mistralai/Mixtral-8x7B-Instruct-v0.1]}
+        model_name: {type: [string, "null"], default: null}
+        model_class: {type: string, default: vllm.model_executor.models.mixtral.MixtralForCausalLM}
+        num_routed_experts: {type: integer, default: 8, description: "MixtureOfExperts.num_routed_experts (Mixtral's num_local_experts)"}
+        num_redundant_experts: {type: [integer, "null"], default: null, description: "null reads eplb_config.num_redundant_experts (config num-redundant-experts)"}
+        num_moe_layers: {type: integer, default: 32}
+        num_expert_groups: {type: integer, default: 1}
+    response:
+      type: object
+      properties:
+        model: {type: string}
+        num_physical_experts: {type: integer}
+        num_local_physical_experts: {type: integer}
+        expert_rearrangement_step: {type: integer}
+        communicator: {type: string}
+        is_async: {type: boolean}
+    errors:
+      - {code: runtime-error, status: 0, retryable: false}
+      - {code: assertion-error, status: 0, retryable: false}
+      - {code: value-error, status: 0, retryable: false}
+    behavior:
+      - set: {vars.args: "= merge({'model_name': null, 'model_class': 'vllm.model_executor.models.mixtral.MixtralForCausalLM', 'num_routed_experts': 8, 'num_redundant_experts': null, 'num_moe_layers': 32, 'num_expert_groups': 1}, input)"}
+      - set:
+          vars.cfg: "= config['eplb-config'] == null ? {} : config['eplb-config']"
+          vars.name: "= vars.args.model_name != null ? vars.args.model_name : vars.args.model"
+          vars.red: "= vars.args.num_redundant_experts != null ? vars.args.num_redundant_experts : config['num-redundant-experts']"
+      - set:
+          vars.phys: "= vars.args.num_routed_experts + vars.red"
+          vars.window: "= has(vars.cfg.window_size) ? vars.cfg.window_size : 1000"
+          vars.interval: "= has(vars.cfg.step_interval) ? vars.cfg.step_interval : 3000"
+          vars.use_async: "= has(vars.cfg.use_async) ? vars.cfg.use_async : true"
+      - title: validate_ep_configuration against the first registered model (the drafter must match the main model)
+        source: "vllm/distributed/eplb/eplb_state.py:320-360"
+        if: "size(state.models) > 0"
+        then:
+          - set: {vars.m0: "= state.models[state.models.map(k, k)[0]]"}
+          - if: "vars.m0.num_routed_experts != vars.args.num_routed_experts || vars.m0.num_redundant_experts != vars.red || vars.m0.num_physical_experts != vars.phys || vars.m0.num_logical_experts != vars.args.num_routed_experts || vars.m0.num_expert_groups != vars.args.num_expert_groups"
+            then:
+              - fail: {code: runtime-error, status: 0, message: "= \"Model: <class '\" + vars.m0.model_class + \"'> with config \" + string(vars.m0.num_routed_experts) + ' ' + string(vars.m0.num_redundant_experts) + ' ' + string(vars.m0.num_physical_experts) + ' ' + string(vars.m0.num_logical_experts) + ' ' + string(vars.m0.num_expert_groups) + \" mismatch with new model <class '\" + vars.args.model_class + \"'> with config \" + string(vars.args.num_routed_experts) + ' ' + string(vars.red) + ' ' + string(vars.phys) + ' ' + string(vars.args.num_routed_experts) + ' ' + string(vars.args.num_expert_groups)"}
+      - title: "MAX_EXPERT_REDUNDANCY = 1023"
+        source: "vllm/distributed/eplb/eplb_state.py:398-404"
+        if: "vars.red > 1023"
+        then:
+          - fail: {code: assertion-error, status: 0, message: "= 'num_redundant_experts ' + string(vars.red) + ' must be less than or equal to 1023'"}
+      - title: Every EP rank holds the same number of physical experts
+        source: "vllm/distributed/eplb/rebalance_execute.py:715"
+        call: parallel-state.get-eplb-group
+        as: g
+      - set:
+          vars.size: "= vars.g.value.world_size"
+          vars.rank: "= vars.g.value.rank_in_group"
+          vars.nle: "= vars.phys / vars.g.value.world_size"
+      - title: "Initial map: [routed experts..., redundant i -> logical i % num_routed], the same for every MoE layer"
+        source: "vllm/distributed/eplb/eplb_state.py:300-318"
+        set:
+          vars.p2l: "= lists.range(vars.phys).map(p, p < vars.args.num_routed_experts ? p : (p - vars.args.num_routed_experts) % vars.args.num_routed_experts)"
+      - set:
+          vars.counts: "= lists.range(vars.args.num_routed_experts).map(e, vars.p2l.filter(x, x == e).size())"
+          vars.local: "= lists.range(vars.nle).map(s, vars.p2l[vars.rank * vars.nle + s])"
+      - title: The communicator backend ParallelConfig resolved (auto prefers nixl, else torch_gloo for static EP)
+        source: "vllm/config/parallel.py:1097-1115"
+        set:
+          vars.backend: "= has(vars.cfg.communicator) && vars.cfg.communicator != null ? vars.cfg.communicator : (config['nixl-available'] ? 'nixl' : 'torch_gloo')"
+      - title: "is_async, window size and the first rearrangement 3/4 of the interval in: max(0, step_interval - step_interval // 4)"
+        source: "vllm/distributed/eplb/eplb_state.py:370-371,455-469"
+        set:
+          state.is_async: "= vars.use_async"
+          state.expert_load_window_size: "= vars.window"
+          state.expert_rearrangement_step: "= math.greatest(0, vars.interval - vars.interval / 4)"
+          state.expert_rearrangement_step_interval: "= vars.interval"
+      - title: create_eplb_communicator on the EPLB group with the model's expert weights and buffer
+        source: "vllm/distributed/eplb/eplb_state.py:493-502"
+        call: eplb-communicator.create
+        input: {backend: "= vars.backend"}
+        as: comm
+      - source: "vllm/distributed/eplb/eplb_state.py:504-526"
+        set:
+          state.communicator: "= vars.comm.value.class_name"
+          state.models: "= merge(state.models, {vars.name: {'model_class': vars.args.model_class, 'num_routed_experts': vars.args.num_routed_experts, 'num_redundant_experts': vars.red, 'num_logical_experts': vars.args.num_routed_experts, 'num_physical_experts': vars.phys, 'num_local_physical_experts': vars.nle, 'num_moe_layers': vars.args.num_moe_layers, 'num_expert_groups': vars.args.num_expert_groups, 'physical_to_logical_map': lists.range(vars.args.num_moe_layers).map(l, vars.p2l), 'logical_replica_count': lists.range(vars.args.num_moe_layers).map(l, vars.counts), 'expert_weights': lists.range(vars.args.num_moe_layers).map(l, vars.local), 'expert_load_pass': lists.range(vars.args.num_moe_layers).map(l, lists.range(vars.phys).map(p, 0)), 'expert_load_window': {}, 'last_expert_load': lists.range(vars.args.num_moe_layers).map(l, lists.range(vars.args.num_routed_experts).map(e, 1)), 'rebalanced': false, 'pending': null}})"
+      - return:
+          model: "= vars.name"
+          num_physical_experts: "= vars.phys"
+          num_local_physical_experts: "= vars.nle"
+          expert_rearrangement_step: "= state.expert_rearrangement_step"
+          communicator: "= vars.comm.value.class_name"
+          is_async: "= vars.use_async"
+
+  - component: eplb-state
+    name: start-async-loop
+    kind: function
+    latency_ms: 0
+    summary: "EplbState.start_async_loop: in async mode start the daemon thread (once) that waits for rearrange_event and transfers the new expert weights layer by layer; a no-op in sync mode."
+    sources: ["vllm/distributed/eplb/eplb_state.py:980-991", "vllm/distributed/eplb/async_worker.py:23-46"]
+    request: {type: object, properties: {is_profile: {type: boolean, default: false}}}
+    response: {type: object, properties: {started: {type: boolean}}}
+    behavior:
+      - if: "!state.is_async"
+        then:
+          - source: "vllm/distributed/eplb/eplb_state.py:985-986"
+            return: {started: false}
+      - if: "state.async_worker"
+        then:
+          - return: {started: false}
+      - title: "start_async_worker: threading.Thread(target=transfer_run_periodically, daemon=True)"
+        source: "vllm/distributed/eplb/async_worker.py:44-46"
+        set: {state.async_worker: true}
+      - return: {started: true}
+
+  - component: eplb-state
+    name: record-expert-load
+    kind: function
+    latency_ms: 0
+    summary: "The MoE layers' load recording that EplbState reads: during a forward each layer adds the tokens routed to each physical expert to expert_load_pass (layers record only while should_record_tensor is set)."
+    sources: ["vllm/distributed/eplb/eplb_state.py:1192-1225", "vllm/distributed/eplb/eplb_state.py:528-559"]
+    request:
+      type: object
+      required: [load]
+      properties:
+        model: {type: [string, "null"], default: null}
+        load: {type: array, description: "[layer][physical expert] tokens routed in this forward on this rank", examples: [[[3, 1, 0, 0, 2, 2, 0, 0]]]}
+    response: {type: object, properties: {recorded: {type: boolean}}}
+    behavior:
+      - set: {vars.args: "= merge({'model': null}, input)"}
+      - if: "size(state.models) == 0"
+        then:
+          - return: {recorded: false}
+      - set: {vars.name: "= vars.args.model != null ? vars.args.model : state.models.map(k, k)[0]"}
+      - set: {vars.m: "= state.models[vars.name]"}
+      - set:
+          vars.pass: "= lists.range(vars.m.num_moe_layers).map(l, lists.range(vars.m.num_physical_experts).map(p, vars.m.expert_load_pass[l][p] + (l < size(vars.args.load) && p < size(vars.args.load[l]) ? vars.args.load[l][p] : 0)))"
+      - set:
+          state.models: "= merge(state.models, {vars.name: merge(vars.m, {'expert_load_pass': vars.pass})})"
+      - return: {recorded: true}
+
+  - component: eplb-state
+    name: step
+    kind: function
+    latency_ms: 0
+    summary: "EplbState.step, once per forward: a profile step runs a dummy rearrangement; otherwise record the load pass into the sliding window when close to a rearrangement, advance the step, consume the async worker's finished layer when every rank has one, and rearrange when the step reaches step_interval."
+    sources: ["vllm/distributed/eplb/eplb_state.py:561-695"]
+    request:
+      type: object
+      properties:
+        is_dummy: {type: boolean, default: false}
+        is_profile: {type: boolean, default: false}
+        log_stats: {type: boolean, default: false}
+    response:
+      type: object
+      properties:
+        expert_rearrangement_step: {type: integer}
+        rearranged: {type: boolean}
+        layer_committed: {type: [integer, "null"]}
+        log: {type: [string, "null"]}
+    errors:
+      - {code: dist-backend-error, status: 0, retryable: false}
+      - {code: assertion-error, status: 0, retryable: false}
+    behavior:
+      - set: {vars.args: "= merge({'is_dummy': false, 'is_profile': false, 'log_stats': false}, input)"}
+      - if: "vars.args.is_profile"
+        then:
+          - title: "A profile step performs a dummy rearrangement with maximum communication cost to reserve the buffers"
+            source: "vllm/distributed/eplb/eplb_state.py:587-589"
+            call: eplb-state.rearrange
+            input: {is_profile: true}
+            as: prof
+          - return: {expert_rearrangement_step: "= state.expert_rearrangement_step", rearranged: false, layer_committed: null, log: "= vars.prof.value.log"}
+      - set:
+          vars.cfg: "= config['eplb-config'] == null ? {} : config['eplb-config']"
+          vars.log: null
+          vars.committed: null
+      - set:
+          vars.log_interval: "= has(vars.cfg.log_balancedness_interval) ? vars.cfg.log_balancedness_interval : 1"
+      - if: "vars.args.is_dummy"
+        then:
+          - title: Dummy steps don't count their load
+            source: "vllm/distributed/eplb/eplb_state.py:591-594"
+            set:
+              state.models: "= state.models.transformMap(k, m, merge(m, {'expert_load_pass': m.expert_load_pass.map(row, row.map(x, 0))}))"
+      - if: "vars.args.log_stats && state.expert_rearrangement_step % vars.log_interval == 0 && size(state.models) > 0"
+        then:
+          - call: parallel-state.get-eplb-group
+            as: lg
+          - title: "_sync_load_pass: all-reduce every model's expert_load_pass over the EP group"
+            source: "vllm/distributed/eplb/eplb_state.py:1078-1086"
+            rendezvous: "= 'eplb-load-pass:' + vars.lg.value.unique_name"
+            count: "= vars.lg.value.world_size"
+            value: "= state.models.map(k, state.models[k].expert_load_pass)"
+            timeout_ms: "= !('distributed-timeout-seconds' in config) || config['distributed-timeout-seconds'] == null ? 600000 : config['distributed-timeout-seconds'] * 1000"
+            as: lp
+            on_error:
+              - fail: {code: dist-backend-error, status: 0, message: "= 'all_reduce timed out: ' + string(error.data.arrived) + ' of ' + string(error.data.count) + ' ranks arrived'"}
+          - set:
+              vars.name0: "= state.models.map(k, k)[0]"
+              vars.m0: "= state.models[state.models.map(k, k)[0]]"
+          - set:
+              vars.sum: "= lists.range(vars.m0.num_moe_layers).map(l, lists.range(vars.m0.num_physical_experts).map(p, sum(vars.lp.values.map(v, v[0][l][p]))))"
+              vars.n: "= vars.lg.value.world_size"
+          - title: "Per layer, tokens per rank; avg_tokens sums the per-layer means, max_tokens the per-layer maxima"
+            source: "vllm/distributed/eplb/eplb_state.py:600-628"
+            set:
+              vars.per_rank: "= vars.sum.map(row, lists.range(vars.n).map(r, sum(row.slice(r * (size(row) / vars.n), (r + 1) * (size(row) / vars.n)))))"
+          - set:
+              vars.avg: "= sum(vars.per_rank.map(rr, double(sum(rr)) / double(vars.n)))"
+              vars.max: "= sum(vars.per_rank.map(rr, math.greatest(rr)))"
+          - if: "vars.lg.value.rank_in_group == 0"
+            then:
+              - title: "EPLB step: %d for model %s: avg_tokens=%.2f, max_tokens=%d, balancedness=%.4f, steps until the next rearrangement: %d"
+                source: "vllm/distributed/eplb/eplb_state.py:630-642"
+                set:
+                  vars.log: "= 'EPLB step: ' + string(state.expert_rearrangement_step) + ' for model ' + vars.name0 + ': avg_tokens=' + '%.2f'.format([vars.avg]) + ', max_tokens=' + string(int(vars.max)) + ', balancedness=' + '%.4f'.format([vars.max > 0 ? vars.avg / double(vars.max) : 0.0]) + ', steps until the next rearrangement: ' + string(state.expert_rearrangement_step_interval - state.expert_rearrangement_step)"
+      - if: "!vars.args.is_dummy"
+        then:
+          - title: "Record the pass into the window only within window_size steps of the next rearrangement (or of the next balancedness log)"
+            source: "vllm/distributed/eplb/eplb_state.py:645-656,697-717"
+            set:
+              vars.should_record: "= (state.expert_rearrangement_step_interval - state.expert_rearrangement_step <= state.expert_load_window_size) || (vars.args.log_stats && ((vars.log_interval - state.expert_rearrangement_step % vars.log_interval) % vars.log_interval) <= state.expert_load_window_size)"
+          - if: "vars.should_record"
+            then:
+              - set:
+                  state.models: "= state.models.transformMap(k, m, merge(m, {'expert_load_window': merge(m.expert_load_window, {string(state.expert_load_window_step): m.expert_load_pass}), 'expert_load_pass': m.expert_load_pass.map(row, row.map(x, 0))}))"
+                  state.expert_load_window_step: "= (state.expert_load_window_step + 1) >= state.expert_load_window_size ? 0 : state.expert_load_window_step + 1"
+      - title: "The step advances even for dummy steps, so every rank takes part in the same collectives"
+        source: "vllm/distributed/eplb/eplb_state.py:658-662"
+        set: {state.expert_rearrangement_step: "= state.expert_rearrangement_step + 1"}
+      - if: "state.is_async"
+        then:
+          - foreach: "= state.models.map(k, k)"
+            as: mk
+            steps:
+              - if: "state.models[vars.mk].rebalanced && state.models[vars.mk].pending != null"
+                then:
+                  - call: eplb-state.consume-async-layer
+                    input: {model: "= vars.mk"}
+                    as: cons
+                  - set: {vars.committed: "= vars.cons.value.layer_committed"}
+      - if: "state.expert_rearrangement_step >= state.expert_rearrangement_step_interval"
+        then:
+          - if: "state.is_async && state.models.exists(k, state.models[k].rebalanced)"
+            then:
+              - title: Still rearranging asynchronously; the step counter is not reset
+                source: "vllm/distributed/eplb/eplb_state.py:678-688"
+                return: {expert_rearrangement_step: "= state.expert_rearrangement_step", rearranged: false, layer_committed: "= vars.committed", log: "= vars.log"}
+          - source: "vllm/distributed/eplb/eplb_state.py:689-690"
+            set: {state.expert_rearrangement_step: "= state.expert_rearrangement_step >= state.expert_rearrangement_step_interval ? 0 : state.expert_rearrangement_step"}
+          - call: eplb-state.rearrange
+            input: {is_profile: false}
+            as: re
+          - return: {expert_rearrangement_step: 0, rearranged: true, layer_committed: "= vars.committed", log: "= vars.re.value.log"}
+      - return: {expert_rearrangement_step: "= state.expert_rearrangement_step", rearranged: false, layer_committed: "= vars.committed", log: "= vars.log"}
+
+  - component: eplb-state
+    name: rearrange
+    kind: function
+    latency_ms: 0
+    summary: "EplbState.rearrange: all-reduce every model's logical expert load over the window across the EP group; in sync mode (or for the profile run) run the policy and rearrange_expert_weights_inplace now, committing the new maps unless profiling; in async mode snapshot the stats, mark the model rebalanced and wake the async worker."
+    sources: ["vllm/distributed/eplb/eplb_state.py:758-978"]
+    request:
+      type: object
+      properties:
+        is_profile: {type: boolean, default: false}
+        use_last_expert_load: {type: boolean, default: false}
+    response:
+      type: object
+      properties:
+        log: {type: [string, "null"]}
+        new_physical_to_logical_map: {type: [array, "null"]}
+        committed: {type: boolean}
+    errors:
+      - {code: dist-backend-error, status: 0, retryable: false}
+      - {code: assertion-error, status: 0, retryable: false}
+    behavior:
+      - set: {vars.args: "= merge({'is_profile': false, 'use_last_expert_load': false}, input)"}
+      - call: parallel-state.get-eplb-group
+        as: g
+      - set:
+          vars.rank: "= vars.g.value.rank_in_group"
+          vars.size: "= vars.g.value.world_size"
+          vars.t0: "= now"
+          vars.newmap: null
+      - title: "Rearranging experts (async mode) (profile)..."
+        source: "vllm/distributed/eplb/eplb_state.py:785-790"
+        when: "vars.rank == 0 && state.is_async && vars.args.is_profile"
+      - title: "Rearranging experts (async mode) ..."
+        source: "vllm/distributed/eplb/eplb_state.py:785-790"
+        when: "vars.rank == 0 && state.is_async && !vars.args.is_profile"
+      - title: "Rearranging experts sync mode (profile)..."
+        source: "vllm/distributed/eplb/eplb_state.py:785-790"
+        when: "vars.rank == 0 && !state.is_async && vars.args.is_profile"
+      - title: "Rearranging experts sync mode ..."
+        source: "vllm/distributed/eplb/eplb_state.py:785-790"
+        when: "vars.rank == 0 && !state.is_async && !vars.args.is_profile"
+      - title: "Map the window's physical load to logical experts (summed over the window), or use rank 0's last totals"
+        source: "vllm/distributed/eplb/eplb_state.py:792-822"
+        set:
+          vars.local_loads: "= state.models.map(k, vars.args.use_last_expert_load ? (vars.rank == 0 ? state.models[k].last_expert_load : state.models[k].last_expert_load.map(row, row.map(x, 0))) : lists.range(state.models[k].num_moe_layers).map(l, lists.range(state.models[k].num_logical_experts).map(e, sum(state.models[k].expert_load_window.map(w, sum(lists.range(state.models[k].num_physical_experts).filter(p, state.models[k].physical_to_logical_map[l][p] == e).map(p, state.models[k].expert_load_window[w][l][p])))))))"
+      - title: "_allreduce_list: the logical loads summed over the EP group"
+        source: "vllm/distributed/eplb/eplb_state.py:823-824,1053-1076"
+        rendezvous: "= 'eplb-load:' + vars.g.value.unique_name"
+        count: "= vars.size"
+        value: "= vars.local_loads"
+        timeout_ms: "= !('distributed-timeout-seconds' in config) || config['distributed-timeout-seconds'] == null ? 600000 : config['distributed-timeout-seconds'] * 1000"
+        as: ar
+        on_error:
+          - fail: {code: dist-backend-error, status: 0, message: "= 'all_reduce timed out: ' + string(error.data.arrived) + ' of ' + string(error.data.count) + ' ranks arrived'"}
+      - set:
+          vars.names: "= state.models.map(k, k)"
+          vars.committed: false
+      - set:
+          vars.global: "= lists.range(size(vars.names)).map(i, lists.range(size(vars.local_loads[i])).map(l, lists.range(size(vars.local_loads[i][l])).map(e, sum(vars.ar.values.map(v, v[i][l][e])))))"
+      - title: "num_nodes = get_node_count() (one node in every world), num_gpus = the EP size; num_replicas and num_groups from the first model"
+        source: "vllm/distributed/eplb/eplb_state.py:826-855"
+      - foreach: "= lists.range(size(vars.names))"
+        as: i
+        steps:
+          - set:
+              vars.mk: "= vars.names[vars.i]"
+              vars.m: "= state.models[vars.names[vars.i]]"
+          - if: "!vars.args.is_profile"
+            then:
+              - source: "vllm/distributed/eplb/eplb_state.py:861-862"
+                set:
+                  state.models: "= merge(state.models, {vars.mk: merge(vars.m, {'last_expert_load': vars.global[vars.i]})})"
+          - if: "!state.is_async || vars.args.is_profile"
+            then:
+              - title: The policy runs on the host with the load window and the current map
+                source: "vllm/distributed/eplb/eplb_state.py:863-874"
+                call: eplb-policy.rebalance-experts
+                input:
+                  weight: "= vars.global[vars.i]"
+                  num_replicas: "= vars.m.num_physical_experts"
+                  num_groups: "= vars.m.num_expert_groups"
+                  num_nodes: 1
+                  num_ranks: "= vars.size"
+                  old_global_expert_indices: "= vars.m.physical_to_logical_map"
+                as: pol
+              - title: "(The ROCm skip-if-no-material-gain check applies only on ROCm; the worlds are CUDA)"
+                source: "vllm/distributed/eplb/eplb_state.py:876-935"
+              - source: "vllm/distributed/eplb/eplb_state.py:937-947"
+                call: rebalance-execute.rearrange-expert-weights-inplace
+                input:
+                  old_global_expert_indices: "= vars.m.physical_to_logical_map"
+                  new_global_expert_indices: "= vars.pol.value.phy2log"
+                  expert_weights: "= vars.m.expert_weights"
+                  is_profile: "= vars.args.is_profile"
+                  ep_rank: "= vars.rank"
+                  ep_size: "= vars.size"
+                as: rw
+              - if: "!vars.args.is_profile"
+                then:
+                  - title: "_commit_eplb_maps: the new map (and the logical maps derived from it) becomes current"
+                    source: "vllm/distributed/eplb/eplb_state.py:949-953,1388-1424"
+                    set:
+                      state.models: "= merge(state.models, {vars.mk: merge(state.models[vars.mk], {'physical_to_logical_map': vars.pol.value.phy2log, 'logical_replica_count': vars.pol.value.phy2log.map(row, lists.range(state.models[vars.mk].num_logical_experts).map(e, row.filter(x, x == e).size())), 'expert_weights': vars.rw.value.expert_weights})})"
+                      vars.committed: true
+              - set: {vars.newmap: "= vars.pol.value.phy2log"}
+            else:
+              - title: "Async: snapshot the global load window (EplbStats) and mark the model rebalanced for the async worker"
+                source: "vllm/distributed/eplb/eplb_state.py:965-976"
+                set:
+                  state.models: "= merge(state.models, {vars.mk: merge(state.models[vars.mk], {'rebalanced': true})})"
+              - title: "The async worker, woken by rearrange_event, snapshots the current map and runs the policy (run_rebalance_experts); it then transfers one layer per forward"
+                source: "vllm/distributed/eplb/async_worker.py:49-73,79-97"
+                call: eplb-policy.rebalance-experts
+                input:
+                  weight: "= vars.global[vars.i]"
+                  num_replicas: "= vars.m.num_physical_experts"
+                  num_groups: "= vars.m.num_expert_groups"
+                  num_nodes: 1
+                  num_ranks: "= vars.size"
+                  old_global_expert_indices: "= vars.m.physical_to_logical_map"
+                as: apol
+              - set:
+                  state.models: "= merge(state.models, {vars.mk: merge(state.models[vars.mk], {'pending': {'new_physical_to_logical_map': vars.apol.value.phy2log, 'old_physical_to_logical_map': state.models[vars.mk].physical_to_logical_map, 'layer_idx': 0}})})"
+                  vars.newmap: "= vars.apol.value.phy2log"
+      - if: "vars.rank == 0 && (!state.is_async || vars.args.is_profile)"
+        then:
+          - title: "Rearranged experts %s in %.2f s. (' (profile) ' when profiling, else ' ')"
+            source: "vllm/distributed/eplb/eplb_state.py:954-962"
+            set:
+              vars.log: "= 'Rearranged experts ' + (vars.args.is_profile ? ' (profile) ' : ' ') + ' in ' + '%.2f'.format([double(now - vars.t0) / 1000.0]) + ' s.'"
+        else:
+          - set: {vars.log: null}
+      - title: "rearrange_event.record(): signal the async worker"
+        source: "vllm/distributed/eplb/eplb_state.py:963-964,976-977"
+        when: "state.is_async && !vars.args.is_profile"
+      - return: {log: "= vars.log", new_physical_to_logical_map: "= vars.newmap", committed: "= vars.committed"}
+
+  - component: eplb-state
+    name: consume-async-layer
+    kind: function
+    latency_ms: 0
+    summary: "One layer of an async rearrangement: the async worker's transfer_layer of the pending layer into the buffer (P2P through the communicator), _all_ranks_result_ready (an all-reduce of has_result over the EP group), then _move_to_workspace: move_from_buffer and commit that layer's map; the last layer clears rebalanced."
+    sources: ["vllm/distributed/eplb/async_worker.py:99-176", "vllm/distributed/eplb/eplb_state.py:664-676", "vllm/distributed/eplb/eplb_state.py:1032-1051", "vllm/distributed/eplb/eplb_state.py:1426-1451"]
+    request: {type: object, required: [model], properties: {model: {type: string}}}
+    response: {type: object, properties: {layer_committed: {type: [integer, "null"]}, done: {type: boolean}}}
+    errors:
+      - {code: dist-backend-error, status: 0, retryable: false}
+    behavior:
+      - set: {vars.m: "= state.models[input.model]"}
+      - set:
+          vars.l: "= vars.m.pending.layer_idx"
+          vars.p: "= vars.m.pending"
+      - call: parallel-state.get-eplb-group
+        as: g
+      - title: "transfer_layer on the async worker's stream: the layer's experts go into the expert buffer"
+        source: "vllm/distributed/eplb/async_worker.py:134-152"
+        call: rebalance-execute.move-to-buffer
+        input:
+          num_local_experts: "= vars.m.num_local_physical_experts"
+          old_indices: "= vars.p.old_physical_to_logical_map[vars.l]"
+          new_indices: "= vars.p.new_physical_to_logical_map[vars.l]"
+          expert_weights: "= vars.m.expert_weights[vars.l]"
+          ep_rank: "= vars.g.value.rank_in_group"
+          layer_idx: "= vars.l"
+        as: mt
+      - title: "_all_ranks_result_ready: all-reduce has_result over the EP group's CPU group"
+        source: "vllm/distributed/eplb/eplb_state.py:1032-1040"
+        rendezvous: "= 'eplb-ready:' + vars.g.value.unique_name"
+        count: "= vars.g.value.world_size"
+        value: 1
+        timeout_ms: "= !('distributed-timeout-seconds' in config) || config['distributed-timeout-seconds'] == null ? 600000 : config['distributed-timeout-seconds'] * 1000"
+        as: ready
+        on_error:
+          - fail: {code: dist-backend-error, status: 0, message: "= 'all_reduce timed out: ' + string(error.data.arrived) + ' of ' + string(error.data.count) + ' ranks arrived'"}
+      - source: "vllm/distributed/eplb/eplb_state.py:1432-1438"
+        call: rebalance-execute.move-from-buffer
+        input:
+          expert_weights: "= vars.m.expert_weights[vars.l]"
+          expert_weights_buffers: "= vars.mt.value.buffer"
+          transfer_metadata: "= vars.mt.value"
+          new_indices: "= vars.p.new_physical_to_logical_map[vars.l]"
+          ep_rank: "= vars.g.value.rank_in_group"
+        as: mf
+      - set:
+          vars.last: "= vars.l == vars.m.num_moe_layers - 1"
+          vars.row: "= vars.p.new_physical_to_logical_map[vars.l]"
+      - title: "_commit_eplb_maps_for_layer; the last layer ends the rebalance"
+        source: "vllm/distributed/eplb/eplb_state.py:1352-1386,1440-1447"
+        set:
+          state.models: "= merge(state.models, {input.model: merge(state.models[input.model], {'physical_to_logical_map': lists.range(size(state.models[input.model].physical_to_logical_map)).map(i, i == vars.l ? vars.row : state.models[input.model].physical_to_logical_map[i]), 'logical_replica_count': lists.range(size(state.models[input.model].logical_replica_count)).map(i, i == vars.l ? lists.range(state.models[input.model].num_logical_experts).map(e, vars.row.filter(x, x == e).size()) : state.models[input.model].logical_replica_count[i]), 'expert_weights': lists.range(size(state.models[input.model].expert_weights)).map(i, i == vars.l ? vars.mf.value.expert_weights : state.models[input.model].expert_weights[i]), 'rebalanced': !vars.last, 'pending': vars.last ? null : merge(vars.p, {'layer_idx': vars.l + 1})})})"
+      - return: {layer_committed: "= vars.l", done: "= vars.last"}
+
+  # ---------------------------------------------------------------- the communicator
+  - component: eplb-communicator
+    name: create
+    kind: function
+    latency_ms: 0
+    summary: "create_eplb_communicator: build the backend's communicator on the EPLB group (torch_nccl on the device group, torch_gloo with CPU staging, torch_xccl, pynccl, nixl); stateless elastic-EP groups need torch_nccl (promoted to pynccl), pynccl or nixl. Unknown backends and unavailable transports raise."
+    sources: ["vllm/distributed/eplb/eplb_communicator.py:702-818", "vllm/distributed/eplb/eplb_communicator.py:94-97"]
+    request:
+      type: object
+      required: [backend]
+      properties:
+        backend: {type: string, examples: [torch_gloo]}
+        tensor_device_type: {type: string, default: cuda}
+        is_stateless: {type: boolean, default: false, description: "the EPLB group is a StatelessGroupCoordinator (elastic EP)"}
+        unsupported_dtypes: {type: array, default: [], items: {type: string}, description: "expert-weight dtypes NCCL can't carry (pynccl only)"}
+        pynccl_available: {type: boolean, default: true}
+        is_xpu: {type: boolean, default: false}
+    response: {type: object, properties: {backend: {type: string}, class_name: {type: string}, needs_profile_buffer_reservation: {type: boolean}}}
+    errors:
+      - {code: runtime-error, status: 0, retryable: false}
+      - {code: value-error, status: 0, retryable: false}
+    behavior:
+      - set: {vars.args: "= merge({'tensor_device_type': 'cuda', 'is_stateless': false, 'unsupported_dtypes': [], 'pynccl_available': true, 'is_xpu': false}, input)"}
+      - call: parallel-state.get-eplb-group
+        as: g
+      - set: {vars.backend: "= vars.args.backend"}
+      - if: "vars.args.is_stateless && vars.backend != 'nixl'"
+        then:
+          - if: "!(vars.backend in ['torch_nccl', 'pynccl'])"
+            then:
+              - source: "vllm/distributed/eplb/eplb_communicator.py:771-775"
+                fail: {code: value-error, status: 0, message: "= \"Elastic EP requires 'torch_nccl', 'pynccl', or 'nixl' EPLB communicator (got '\" + vars.backend + \"').\""}
+          - if: "vars.backend == 'torch_nccl'"
+            then:
+              - title: "Stateless elastic EP requires PyNCCL backend. Forcing EPLB communicator to 'pynccl'."
+                source: "vllm/distributed/eplb/eplb_communicator.py:776-781"
+                set: {vars.backend: pynccl}
+      - if: "vars.backend == 'nixl'"
+        then:
+          - if: "!config['nixl-available']"
+            then:
+              - source: "vllm/distributed/eplb/eplb_communicator.py:785-788"
+                fail: {code: runtime-error, status: 0, message: "EPLB communicator 'nixl' requested but NIXL is unavailable."}
+          - if: "vars.args.is_xpu || vars.args.tensor_device_type == 'cpu'"
+            then:
+              - source: "vllm/distributed/eplb/eplb_communicator.py:789-793"
+                fail: {code: runtime-error, status: 0, message: "= \"EPLB communicator 'nixl' supports only cuda-like devices (got \" + vars.args.tensor_device_type + ').'"}
+          - set: {vars.cls: NixlEplbCommunicator}
+        else:
+          - if: "vars.backend == 'pynccl'"
+            then:
+              - if: "vars.args.tensor_device_type == 'cpu'"
+                then:
+                  - source: "vllm/distributed/eplb/eplb_communicator.py:735-739"
+                    fail: {code: runtime-error, status: 0, message: "EPLB communicator 'pynccl' supports only cuda-like devices (got cpu)."}
+              - if: "size(vars.args.unsupported_dtypes) > 0"
+                then:
+                  - source: "vllm/distributed/eplb/eplb_communicator.py:740-753"
+                    fail: {code: runtime-error, status: 0, message: "= \"EPLB communicator 'pynccl' requested but expert weights contain unsupported dtypes: (\" + vars.args.unsupported_dtypes.sort().join(', ') + ').'"}
+              - if: "!vars.args.pynccl_available"
+                then:
+                  - source: "vllm/distributed/eplb/eplb_communicator.py:755-762"
+                    fail: {code: runtime-error, status: 0, message: "EPLB communicator 'pynccl' requested but unavailable."}
+              - set: {vars.cls: PyNcclEplbCommunicator}
+            else:
+              - if: "!(vars.backend in ['torch_gloo', 'torch_xccl', 'torch_nccl'])"
+                then:
+                  - source: "vllm/distributed/eplb/eplb_communicator.py:818"
+                    fail: {code: value-error, status: 0, message: "= 'Unknown EPLB communicator backend: ' + vars.backend"}
+              - set: {vars.cls: "= {'torch_gloo': 'TorchDistGlooStagedEplbCommunicator', 'torch_xccl': 'TorchDistXCCLStagedEplbCommunicator', 'torch_nccl': 'TorchDistNcclEplbCommunicator'}[vars.backend]"}
+      - title: "Initialized EPLB communicator: <class name>. (logged on the node's first local rank)"
+        source: "vllm/distributed/eplb/eplb_communicator.py:94-97"
+        when: "vars.g.value.rank_in_group == 0"
+      - title: "NIXL pre-allocates its transfer buffers, so it skips the profile run's buffer reservation"
+        source: "vllm/distributed/eplb/eplb_communicator.py:386-389"
+        set:
+          state.backend: "= vars.backend"
+          state.class_name: "= vars.cls"
+          state.group_size: "= vars.g.value.world_size"
+          state.group_name: "= vars.g.value.unique_name"
+          state.needs_profile_buffer_reservation: "= vars.cls != 'NixlEplbCommunicator'"
+          state.sends: []
+          state.recvs: []
+      - return: {backend: "= vars.backend", class_name: "= vars.cls", needs_profile_buffer_reservation: "= vars.cls != 'NixlEplbCommunicator'"}
+
+  - component: eplb-communicator
+    name: add-send
+    kind: function
+    latency_ms: 0
+    summary: "EplbCommunicator.add_send: queue this expert's weight tensors for one peer rank (torch backends build P2POp isends, gloo stages them on the CPU, NIXL exposes them for the peer's read)."
+    sources: ["vllm/distributed/eplb/eplb_communicator.py:50-57", "vllm/distributed/eplb/eplb_communicator.py:112-127"]
+    request: {type: object, required: [dst_rank, expert_id], properties: {tensors: {description: "the expert's weight tensors"}, dst_rank: {type: integer}, expert_id: {type: integer}}}
+    response: {type: object, properties: {queued: {type: integer}}}
+    behavior:
+      - set: {state.sends: "= state.sends + [{'dst_rank': input.dst_rank, 'expert_id': input.expert_id, 'tensors': input.tensors}]"}
+      - return: {queued: "= size(state.sends)"}
+
+  - component: eplb-communicator
+    name: add-recv
+    kind: function
+    latency_ms: 0
+    summary: "EplbCommunicator.add_recv: queue a receive of an expert from one peer rank into a buffer row (NIXL issues its RDMA read here; the others at execute)."
+    sources: ["vllm/distributed/eplb/eplb_communicator.py:59-66", "vllm/distributed/eplb/eplb_communicator.py:128-143"]
+    request: {type: object, required: [src_rank, expert_id, dst_row], properties: {src_rank: {type: integer}, expert_id: {type: integer}, dst_row: {type: integer}}}
+    response: {type: object, properties: {queued: {type: integer}}}
+    behavior:
+      - set: {state.recvs: "= state.recvs + [{'src_rank': input.src_rank, 'expert_id': input.expert_id, 'dst_row': input.dst_row}]"}
+      - return: {queued: "= size(state.recvs)"}
+
+  - component: eplb-communicator
+    name: execute
+    kind: function
+    latency_ms: 0
+    summary: "EplbCommunicator.execute: complete every queued transfer (batch_isend_irecv, the gloo staged exchange, the PyNccl group, or waiting on NIXL reads). Every EP rank executes once per layer; on return each receive's buffer row holds the sender's expert."
+    sources: ["vllm/distributed/eplb/eplb_communicator.py:67-75", "vllm/distributed/eplb/eplb_communicator.py:144-155"]
+    request: {type: object, properties: {}}
+    response: {type: object, properties: {received: {type: array}, sent: {type: integer}}}
+    errors:
+      - {code: dist-backend-error, status: 0, retryable: false}
+    behavior:
+      - set: {vars.me: "= int(self.replace('rank', '')) % state.group_size"}
+      - title: The peers' matching sends and receives complete together
+        source: "vllm/distributed/eplb/eplb_communicator.py:144-155"
+        rendezvous: "= 'eplb-p2p:' + state.group_name"
+        count: "= state.group_size"
+        value: "= {'rank': vars.me, 'sends': state.sends}"
+        timeout_ms: "= !('distributed-timeout-seconds' in config) || config['distributed-timeout-seconds'] == null ? 600000 : config['distributed-timeout-seconds'] * 1000"
+        as: xfer
+        on_error:
+          - fail: {code: dist-backend-error, status: 0, message: "= 'EPLB transfer timed out: ' + string(error.data.arrived) + ' of ' + string(error.data.count) + ' ranks arrived'"}
+      - set:
+          vars.received: "= state.recvs.map(r, {'dst_row': r.dst_row, 'expert_id': r.expert_id, 'src_rank': r.src_rank, 'tensors': vars.xfer.values.exists(v, v.rank == r.src_rank && v.sends.exists(s, s.dst_rank == vars.me && s.expert_id == r.expert_id)) ? vars.xfer.values.filter(v, v.rank == r.src_rank)[0].sends.filter(s, s.dst_rank == vars.me && s.expert_id == r.expert_id)[0].tensors : null})"
+          vars.sent: "= size(vars.xfer.values.filter(v, v.rank == vars.me)[0].sends)"
+          state.sends: "= state.sends.slice(size(vars.xfer.values.filter(v, v.rank == vars.me)[0].sends), size(state.sends))"
+          state.recvs: []
+      - return: {received: "= vars.received", sent: "= vars.sent"}
+
+  # ---------------------------------------------------------------- rebalance_execute
+  - component: rebalance-execute
+    name: get-ep-ranks-with-experts-batch
+    kind: function
+    latency_ms: 0
+    summary: "get_ep_ranks_with_experts_batch: for each queried expert, the ranks holding it in the old map (senders, in order of first position) and the ranks needing it in the new map that don't already hold it (receivers)."
+    sources: ["vllm/distributed/eplb/rebalance_execute.py:67-170"]
+    request:
+      type: object
+      required: [expert_ids, num_local_experts, old_indices, new_indices]
+      properties:
+        expert_ids: {type: array, items: {type: integer}}
+        num_local_experts: {type: integer}
+        old_indices: {type: array, items: {type: integer}}
+        new_indices: {type: array, items: {type: integer}}
+    response: {type: object, properties: {ranks_to_send: {type: object}, ranks_to_recv: {type: object}}}
+    behavior:
+      - set:
+          vars.u: "= input.expert_ids.distinct().sort()"
+          vars.n: "= size(input.old_indices)"
+      - set:
+          vars.send: "= vars.u.map(e, lists.range(vars.n).filter(p, input.old_indices[p] == e).map(p, p / input.num_local_experts).distinct())"
+      - set:
+          vars.recv: "= lists.range(size(vars.u)).map(i, lists.range(vars.n).filter(p, input.new_indices[p] == vars.u[i]).map(p, p / input.num_local_experts).distinct().filter(r, !(r in vars.send[i])))"
+      - return:
+          ranks_to_send: "= lists.range(size(vars.u)).transformMapEntry(i, x, {string(vars.u[i]): vars.send[i]})"
+          ranks_to_recv: "= lists.range(size(vars.u)).transformMapEntry(i, x, {string(vars.u[i]): vars.recv[i]})"
+
+  - component: rebalance-execute
+    name: move-to-buffer
+    kind: function
+    latency_ms: 0
+    summary: "move_to_buffer for one layer on this rank: experts unchanged stay; experts already present locally are copied into the buffer; each locally held expert is sent to its share of the receiving ranks and each missing expert is received from its assigned sender (senders split the receivers evenly, remainder in order); then the communicator executes."
+    sources: ["vllm/distributed/eplb/rebalance_execute.py:275-473"]
+    request:
+      type: object
+      required: [num_local_experts, old_indices, new_indices, expert_weights, ep_rank]
+      properties:
+        num_local_experts: {type: integer}
+        old_indices: {type: array, items: {type: integer}}
+        new_indices: {type: array, items: {type: integer}}
+        expert_weights: {type: array, description: "this layer's local slots (the logical expert each holds)"}
+        expert_weights_buffers: {type: [array, "null"], default: null}
+        ep_rank: {type: integer}
+        layer_idx: {type: integer, default: 0}
+    response:
+      type: object
+      properties:
+        is_unchanged: {type: array}
+        is_received_locally: {type: array}
+        recv_primary_mask: {type: array}
+        recv_count: {type: integer}
+        recv_expert_ids: {type: array}
+        recv_dst_rows: {type: array}
+        buffer: {type: array}
+        sends: {type: array}
+    errors:
+      - {code: assertion-error, status: 0, retryable: false}
+    behavior:
+      - set: {vars.args: "= merge({'expert_weights_buffers': null, 'layer_idx': 0}, input)"}
+      - if: "size(vars.args.old_indices) != size(vars.args.new_indices)"
+        then:
+          - source: "vllm/distributed/eplb/rebalance_execute.py:310"
+            fail: {code: assertion-error, status: 0, message: ""}
+      - set:
+          vars.nle: "= vars.args.num_local_experts"
+          vars.base: "= vars.args.ep_rank * vars.args.num_local_experts"
+      - set:
+          vars.ol: "= lists.range(vars.nle).map(r, vars.args.old_indices[vars.base + r])"
+          vars.nl: "= lists.range(vars.nle).map(r, vars.args.new_indices[vars.base + r])"
+      - title: "is_unchanged, and is_received_locally (unchanged, or the new expert is already on this rank)"
+        source: "vllm/distributed/eplb/rebalance_execute.py:318-334"
+        set:
+          vars.unch: "= lists.range(vars.nle).map(r, vars.ol[r] == vars.nl[r])"
+          vars.rloc: "= lists.range(vars.nle).map(r, vars.ol[r] == vars.nl[r] || (vars.nl[r] != -1 && vars.nl[r] in vars.ol))"
+      - title: "Send map: the first local row of each distinct locally held expert; receive map: the first row of each distinct expert needed from a peer (the primary rows)"
+        source: "vllm/distributed/eplb/rebalance_execute.py:336-360"
+        set:
+          vars.send_experts: "= vars.ol.filter(x, x != -1).distinct().sort()"
+          vars.need: "= lists.range(vars.nle).filter(r, !(vars.ol[r] == vars.nl[r] || (vars.nl[r] != -1 && vars.nl[r] in vars.ol)) && vars.nl[r] != -1)"
+      - set:
+          vars.recv_experts: "= vars.need.map(r, vars.nl[r]).distinct().sort()"
+      - set:
+          vars.recv_rows: "= vars.recv_experts.map(x, vars.need.filter(r, vars.nl[r] == x)[0])"
+          vars.buf0: "= vars.args.expert_weights_buffers != null ? vars.args.expert_weights_buffers : vars.args.expert_weights"
+      - set:
+          vars.primary: "= lists.range(vars.nle).map(r, r in vars.recv_rows)"
+      - title: "1. Local moves into the buffer"
+        source: "vllm/distributed/eplb/rebalance_execute.py:362-376"
+        set:
+          vars.buf: "= lists.range(vars.nle).map(r, !vars.unch[r] && vars.rloc[r] && vars.ol.indexOf(vars.nl[r]) >= 0 ? vars.args.expert_weights[vars.ol.indexOf(vars.nl[r])] : vars.buf0[r])"
+          vars.sends: []
+      - title: "2. Post sends: sender k of S takes receivers [k*(R/S), (k+1)*(R/S)) plus remainder receiver S*(R/S)+k"
+        source: "vllm/distributed/eplb/rebalance_execute.py:400-430"
+        if: "size(vars.send_experts) > 0"
+        then:
+          - call: rebalance-execute.get-ep-ranks-with-experts-batch
+            input: {expert_ids: "= vars.send_experts", num_local_experts: "= vars.nle", old_indices: "= vars.args.old_indices", new_indices: "= vars.args.new_indices"}
+            as: sm
+          - foreach: "= vars.send_experts"
+            as: e
+            steps:
+              - set:
+                  vars.ts: "= vars.sm.value.ranks_to_send[string(vars.e)]"
+                  vars.tr: "= vars.sm.value.ranks_to_recv[string(vars.e)]"
+              - if: "size(vars.ts) == 0 || size(vars.tr) == 0"
+                then:
+                  - continue: true
+              - set:
+                  vars.per: "= size(vars.tr) / size(vars.ts)"
+                  vars.pos: "= vars.ts.indexOf(vars.args.ep_rank)"
+              - set:
+                  vars.dsts: "= vars.tr.slice(vars.pos * vars.per, vars.pos * vars.per + vars.per) + (size(vars.ts) * vars.per + vars.pos < size(vars.tr) ? [vars.tr[size(vars.ts) * vars.per + vars.pos]] : [])"
+              - foreach: "= vars.dsts"
+                as: d
+                steps:
+                  - call: eplb-communicator.add-send
+                    input: {tensors: "= vars.args.expert_weights[vars.ol.indexOf(vars.e)]", dst_rank: "= vars.d", expert_id: "= vars.e"}
+                  - set: {vars.sends: "= vars.sends + [{'expert_id': vars.e, 'dst_rank': vars.d}]"}
+      - title: "3. Post receives: receiver j takes sender j/(R/S) below the remainder, else sender j - S*(R/S)"
+        source: "vllm/distributed/eplb/rebalance_execute.py:432-469"
+        if: "size(vars.recv_experts) > 0"
+        then:
+          - call: rebalance-execute.get-ep-ranks-with-experts-batch
+            input: {expert_ids: "= vars.recv_experts", num_local_experts: "= vars.nle", old_indices: "= vars.args.old_indices", new_indices: "= vars.args.new_indices"}
+            as: rm
+          - foreach: "= lists.range(size(vars.recv_experts))"
+            as: k
+            steps:
+              - set:
+                  vars.ts: "= vars.rm.value.ranks_to_send[string(vars.recv_experts[vars.k])]"
+                  vars.tr: "= vars.rm.value.ranks_to_recv[string(vars.recv_experts[vars.k])]"
+              - if: "size(vars.ts) == 0 || size(vars.tr) == 0"
+                then:
+                  - continue: true
+              - set:
+                  vars.per: "= size(vars.tr) / size(vars.ts)"
+                  vars.rp: "= vars.tr.indexOf(vars.args.ep_rank)"
+              - call: eplb-communicator.add-recv
+                input:
+                  src_rank: "= vars.rp < size(vars.ts) * vars.per ? vars.ts[vars.rp / vars.per] : vars.ts[vars.rp - size(vars.ts) * vars.per]"
+                  expert_id: "= vars.recv_experts[vars.k]"
+                  dst_row: "= vars.recv_rows[vars.k]"
+      - title: "4. Execute the transfers and wait for completion"
+        source: "vllm/distributed/eplb/rebalance_execute.py:471-472"
+        call: eplb-communicator.execute
+        as: ex
+      - set:
+          vars.buf: "= lists.range(vars.nle).map(r, vars.ex.value.received.exists(x, x.dst_row == r) ? vars.ex.value.received.filter(x, x.dst_row == r)[0].tensors : vars.buf[r])"
+      - return:
+          is_unchanged: "= vars.unch"
+          is_received_locally: "= vars.rloc"
+          recv_primary_mask: "= vars.primary"
+          recv_count: "= size(vars.recv_experts)"
+          recv_expert_ids: "= vars.recv_experts"
+          recv_dst_rows: "= vars.recv_rows"
+          buffer: "= vars.buf"
+          sends: "= vars.sends"
+
+  - component: rebalance-execute
+    name: move-from-buffer
+    kind: function
+    latency_ms: 0
+    summary: "move_from_buffer: copy every changed row that was received locally or as a primary remote receive back from the buffer into the expert weights, then copy each received expert into its duplicate rows."
+    sources: ["vllm/distributed/eplb/rebalance_execute.py:474-548"]
+    request:
+      type: object
+      required: [expert_weights, expert_weights_buffers, transfer_metadata, new_indices, ep_rank]
+      properties:
+        expert_weights: {type: array}
+        expert_weights_buffers: {type: array}
+        transfer_metadata: {type: object}
+        new_indices: {type: array, items: {type: integer}}
+        ep_rank: {type: integer}
+    response: {type: object, properties: {expert_weights: {type: array}}}
+    behavior:
+      - set:
+          vars.t: "= input.transfer_metadata"
+          vars.nle: "= size(input.transfer_metadata.is_unchanged)"
+      - title: "Rows to copy back: changed and (received locally or a primary remote receive)"
+        source: "vllm/distributed/eplb/rebalance_execute.py:503-511"
+        set:
+          vars.w: "= lists.range(vars.nle).map(r, !vars.t.is_unchanged[r] && (vars.t.is_received_locally[r] || vars.t.recv_primary_mask[r]) ? input.expert_weights_buffers[r] : input.expert_weights[r])"
+      - if: "vars.t.recv_count == 0"
+        then:
+          - return: {expert_weights: "= vars.w"}
+      - set:
+          vars.local: "= lists.range(vars.nle).map(r, input.new_indices[input.ep_rank * vars.nle + r])"
+      - title: "Duplicates of a remotely received expert copy from its primary row"
+        source: "vllm/distributed/eplb/rebalance_execute.py:516-548"
+        set:
+          vars.w: "= lists.range(vars.nle).map(r, !vars.t.is_unchanged[r] && !vars.t.is_received_locally[r] && !vars.t.recv_primary_mask[r] && vars.local[r] != -1 && vars.local[r] in vars.t.recv_expert_ids ? vars.w[vars.t.recv_dst_rows[vars.t.recv_expert_ids.indexOf(vars.local[r])]] : vars.w[r])"
+      - return: {expert_weights: "= vars.w"}
+
+  - component: rebalance-execute
+    name: rearrange-expert-weights-inplace
+    kind: function
+    latency_ms: 0
+    summary: "rearrange_expert_weights_inplace: check the shapes (num_physical_experts == ep_size x local experts), then either reserve the communication buffers for profiling (a barrier and a dummy all_gather of the first layer's weights, skipped by NIXL) or move every layer: move_to_buffer then move_from_buffer."
+    sources: ["vllm/distributed/eplb/rebalance_execute.py:642-749"]
+    request:
+      type: object
+      required: [old_global_expert_indices, new_global_expert_indices, expert_weights]
+      properties:
+        old_global_expert_indices: {type: array, description: "[layer][physical] logical expert ids"}
+        new_global_expert_indices: {type: array}
+        expert_weights: {type: array, description: "[layer][local slot] the expert weights (here: what each slot holds)"}
+        num_weight_tensors: {type: integer, default: 2, description: "weight tensors per expert in a layer (w13 and w2)"}
+        is_profile: {type: boolean, default: false}
+        ep_rank: {type: [integer, "null"], default: null, description: "null reads the EP group"}
+        ep_size: {type: [integer, "null"], default: null}
+    response: {type: object, properties: {expert_weights: {type: array}, profile: {type: boolean}, transfers: {type: array}}}
+    errors:
+      - {code: assertion-error, status: 0, retryable: false}
+      - {code: dist-backend-error, status: 0, retryable: false}
+    behavior:
+      - set: {vars.args: "= merge({'num_weight_tensors': 2, 'is_profile': false, 'ep_rank': null, 'ep_size': null}, input)"}
+      - if: "vars.args.ep_rank == null || vars.args.ep_size == null"
+        then:
+          - title: "The caller's EP group (EplbState passes the EP group; its ranks are the EPLB group's)"
+            source: "vllm/distributed/eplb/eplb_state.py:937-947"
+            call: parallel-state.get-eplb-group
+            as: g
+          - set:
+              vars.rank: "= vars.args.ep_rank != null ? vars.args.ep_rank : vars.g.value.rank_in_group"
+              vars.size: "= vars.args.ep_size != null ? vars.args.ep_size : vars.g.value.world_size"
+        else:
+          - set:
+              vars.rank: "= vars.args.ep_rank"
+              vars.size: "= vars.args.ep_size"
+      - set:
+          vars.layers: "= size(vars.args.old_global_expert_indices)"
+          vars.phys: "= size(vars.args.old_global_expert_indices) > 0 ? size(vars.args.old_global_expert_indices[0]) : 0"
+      - title: "Shape checks (bare asserts)"
+        source: "vllm/distributed/eplb/rebalance_execute.py:695-715"
+        if: "vars.layers == 0 || size(vars.args.new_global_expert_indices) == 0 || size(vars.args.new_global_expert_indices[0]) != vars.phys || size(vars.args.expert_weights) != vars.layers || size(vars.args.new_global_expert_indices) != vars.layers || vars.phys != vars.size * size(vars.args.expert_weights[0])"
+        then:
+          - fail: {code: assertion-error, status: 0, message: ""}
+      - if: "vars.args.is_profile"
+        then:
+          - call: eplb-communicator.info
+            as: ci
+          - if: "vars.ci.value.needs_profile_buffer_reservation"
+            then:
+              - title: "Reserve NCCL buffers: per weight tensor of the first layer, a barrier then a dummy all_gather over the EP group"
+                source: "vllm/distributed/eplb/rebalance_execute.py:719-733"
+                foreach: "= lists.range(vars.args.num_weight_tensors)"
+                as: wi
+                steps:
+                  - rendezvous: "= 'eplb-profile-barrier:' + vars.ci.value.group_name"
+                    count: "= vars.size"
+                    value: "= vars.rank"
+                    timeout_ms: "= !('distributed-timeout-seconds' in config) || config['distributed-timeout-seconds'] == null ? 600000 : config['distributed-timeout-seconds'] * 1000"
+                    on_error:
+                      - fail: {code: dist-backend-error, status: 0, message: "= 'barrier timed out: ' + string(error.data.arrived) + ' of ' + string(error.data.count) + ' ranks arrived'"}
+                  - rendezvous: "= 'eplb-profile-all-gather:' + vars.ci.value.group_name"
+                    count: "= vars.size"
+                    value: "= vars.args.expert_weights[0]"
+                    timeout_ms: "= !('distributed-timeout-seconds' in config) || config['distributed-timeout-seconds'] == null ? 600000 : config['distributed-timeout-seconds'] * 1000"
+                    on_error:
+                      - fail: {code: dist-backend-error, status: 0, message: "= 'all_gather timed out: ' + string(error.data.arrived) + ' of ' + string(error.data.count) + ' ranks arrived'"}
+          - return: {expert_weights: "= vars.args.expert_weights", profile: true, transfers: []}
+      - set:
+          vars.out: []
+          vars.transfers: []
+      - title: "Per layer: move_to_buffer (the P2P exchange), then move_from_buffer"
+        source: "vllm/distributed/eplb/rebalance_execute.py:735-749"
+        foreach: "= lists.range(vars.layers)"
+        as: l
+        steps:
+          - call: rebalance-execute.move-to-buffer
+            input:
+              num_local_experts: "= size(vars.args.expert_weights[0])"
+              old_indices: "= vars.args.old_global_expert_indices[vars.l]"
+              new_indices: "= vars.args.new_global_expert_indices[vars.l]"
+              expert_weights: "= vars.args.expert_weights[vars.l]"
+              ep_rank: "= vars.rank"
+              layer_idx: "= vars.l"
+            as: mt
+          - call: rebalance-execute.move-from-buffer
+            input:
+              expert_weights: "= vars.args.expert_weights[vars.l]"
+              expert_weights_buffers: "= vars.mt.value.buffer"
+              transfer_metadata: "= vars.mt.value"
+              new_indices: "= vars.args.new_global_expert_indices[vars.l]"
+              ep_rank: "= vars.rank"
+            as: mf
+          - set:
+              vars.out: "= vars.out + [vars.mf.value.expert_weights]"
+              vars.transfers: "= vars.transfers + [vars.mt.value.sends]"
+      - return: {expert_weights: "= vars.out", profile: false, transfers: "= vars.transfers"}
+
+  - component: eplb-communicator
+    name: info
+    kind: function
+    latency_ms: 0
+    summary: "The communicator's backend, EPLB group and needs_profile_buffer_reservation property (False only for NIXL, which pre-allocates its transfer buffers)."
+    sources: ["vllm/distributed/eplb/eplb_communicator.py:85-91", "vllm/distributed/eplb/eplb_communicator.py:386-389"]
+    request: {type: object, properties: {}}
+    response: {type: object, properties: {backend: {type: [string, "null"]}, group_name: {type: string}, needs_profile_buffer_reservation: {type: boolean}}}
+    behavior:
+      - return: {backend: "= state.backend", group_name: "= state.group_name", needs_profile_buffer_reservation: "= state.needs_profile_buffer_reservation"}
+
+  # ---------------------------------------------------------------- the default policy
+  - component: eplb-policy
+    name: rebalance-experts
+    kind: function
+    latency_ms: 0
+    summary: "DefaultEplbPolicy.rebalance_experts on one node: per layer pack the expert groups (heaviest first), replicate the hottest logical experts (load / replicas) into the redundant slots, pack the physical experts to GPUs (heaviest first onto the lightest non-full GPU), then keep experts that stay on a GPU in their old slots."
+    sources: ["vllm/distributed/eplb/policy/default.py:273-332", "vllm/distributed/eplb/policy/default.py:103-188", "vllm/distributed/eplb/policy/default.py:22-100", "vllm/distributed/eplb/policy/default.py:191-270"]
+    request:
+      type: object
+      required: [weight, num_replicas, num_ranks]
+      properties:
+        weight: {type: array, description: "[layer][logical expert] load"}
+        num_replicas: {type: integer}
+        num_groups: {type: integer, default: 1}
+        num_nodes: {type: integer, default: 1}
+        num_ranks: {type: integer}
+        old_global_expert_indices: {type: [array, "null"], default: null}
+    response: {type: object, properties: {phy2log: {type: array}}}
+    errors:
+      - {code: assertion-error, status: 0, retryable: false}
+    behavior:
+      - set: {vars.args: "= merge({'num_groups': 1, 'num_nodes': 1, 'old_global_expert_indices': null}, input)"}
+      - set:
+          vars.L: "= size(vars.args.weight[0])"
+          vars.R: "= vars.args.num_replicas"
+          vars.P: "= vars.args.num_ranks"
+          vars.G: "= vars.args.num_groups % vars.args.num_nodes == 0 ? vars.args.num_groups : 1"
+      - title: "Hierarchical asserts: logical experts divisible by groups, replicas by GPUs, at least as many replicas as logical experts"
+        source: "vllm/distributed/eplb/policy/default.py:93-94,126-131"
+        if: "vars.L % vars.G != 0 || vars.R % vars.P != 0 || vars.R < vars.L"
+        then:
+          - fail: {code: assertion-error, status: 0, message: ""}
+      - title: "(One node: the group packing puts every group on node 0, heaviest first)"
+        source: "vllm/distributed/eplb/policy/default.py:301-309"
+      - set:
+          vars.gs: "= vars.L / vars.G"
+          vars.per: "= vars.R / vars.P"
+          vars.out: []
+      - foreach: "= lists.range(size(vars.args.weight))"
+        as: li
+        steps:
+          - set: {vars.w: "= vars.args.weight[vars.li].map(x, double(x))"}
+          - title: "Step 1: groups to the node; rank_in_pack is the group's place in descending load (stable)"
+            source: "vllm/distributed/eplb/policy/default.py:22-72,140-155"
+            set:
+              vars.tpg: "= lists.range(vars.G).map(g, sum(vars.w.slice(g * vars.gs, (g + 1) * vars.gs)))"
+          - set:
+              vars.rip: "= lists.range(vars.G).map(g, vars.G == 1 ? 0 : lists.range(vars.G).filter(h, vars.tpg[h] > vars.tpg[g] || (vars.tpg[h] == vars.tpg[g] && h < g)).size())"
+          - set:
+              vars.log2mlog: "= lists.range(vars.L).map(e, vars.rip[e / vars.gs] * vars.gs + e % vars.gs)"
+          - set:
+              vars.mlog2log: "= lists.range(vars.L).map(m, vars.log2mlog.indexOf(m))"
+          - set:
+              vars.tpm: "= lists.range(vars.L).map(m, vars.w[vars.mlog2log[m]])"
+              vars.p2m: "= lists.range(vars.L)"
+              vars.cnt: "= lists.range(vars.L).map(m, 1)"
+          - title: "Step 2: each redundant slot replicates argmax(load / replica count) (the first maximum)"
+            source: "vllm/distributed/eplb/policy/default.py:75-100,157-164"
+            foreach: "= lists.range(vars.R - vars.L)"
+            as: ri
+            steps:
+              - set: {vars.ratio: "= lists.range(vars.L).map(m, vars.tpm[m] / double(vars.cnt[m]))"}
+              - set: {vars.best: "= vars.ratio.indexOf(math.greatest(vars.ratio))"}
+              - set:
+                  vars.p2m: "= vars.p2m + [vars.best]"
+                  vars.cnt: "= lists.range(vars.L).map(m, m == vars.best ? vars.cnt[m] + 1 : vars.cnt[m])"
+          - set:
+              vars.tpp: "= lists.range(vars.R).map(p, vars.tpm[vars.p2m[p]] / double(vars.cnt[vars.p2m[p]]))"
+          - title: "Step 3: physical experts to GPUs; with one slot per GPU the packing is the identity, else heaviest first onto the lightest GPU that isn't full"
+            source: "vllm/distributed/eplb/policy/default.py:40-72,166-173"
+            if: "vars.per == 1"
+            then:
+              - set:
+                  vars.pack: "= lists.range(vars.R)"
+                  vars.rin: "= lists.range(vars.R).map(p, 0)"
+            else:
+              - set:
+                  vars.order: "= lists.range(vars.R).map(k, lists.range(vars.R).filter(p, lists.range(vars.R).filter(q, vars.tpp[q] > vars.tpp[p] || (vars.tpp[q] == vars.tpp[p] && q < p)).size() == k)[0])"
+                  vars.pw: "= lists.range(vars.P).map(k, 0.0)"
+                  vars.items: "= lists.range(vars.P).map(k, 0)"
+                  vars.pack: "= lists.range(vars.R).map(p, -1)"
+                  vars.rin: "= lists.range(vars.R).map(p, -1)"
+              - foreach: "= vars.order"
+                as: it
+                steps:
+                  - set: {vars.avail: "= lists.range(vars.P).filter(k, vars.items[k] < vars.per)"}
+                  - set: {vars.k: "= vars.avail.filter(k, vars.pw[k] == math.least(vars.avail.map(j, vars.pw[j])))[0]"}
+                  - set:
+                      vars.pack: "= lists.range(vars.R).map(p, p == vars.it ? vars.k : vars.pack[p])"
+                      vars.rin: "= lists.range(vars.R).map(p, p == vars.it ? vars.items[vars.k] : vars.rin[p])"
+                      vars.pw: "= lists.range(vars.P).map(j, j == vars.k ? vars.pw[j] + vars.tpp[vars.it] : vars.pw[j])"
+                      vars.items: "= lists.range(vars.P).map(j, j == vars.k ? vars.items[j] + 1 : vars.items[j])"
+          - set:
+              vars.phy2pphy: "= lists.range(vars.R).map(p, vars.pack[p] * vars.per + vars.rin[p])"
+          - set:
+              vars.row: "= lists.range(vars.R).map(q, vars.mlog2log[vars.p2m[vars.phy2pphy.indexOf(q)]])"
+          - if: "vars.args.old_global_expert_indices != null"
+            then:
+              - title: "preserve_intragpu_slots: experts staying on a GPU keep their old slot; incoming experts fill the free slots in order"
+                source: "vllm/distributed/eplb/policy/default.py:191-270"
+                set: {vars.old: "= vars.args.old_global_expert_indices[vars.li]", vars.post: "= vars.row"}
+              - foreach: "= lists.range(vars.P)"
+                as: gi
+                steps:
+                  - set:
+                      vars.ol: "= vars.old.slice(vars.gi * vars.per, (vars.gi + 1) * vars.per)"
+                      vars.nl: "= vars.row.slice(vars.gi * vars.per, (vars.gi + 1) * vars.per)"
+                      vars.used: "= lists.range(vars.per).map(j, false)"
+                      vars.kept: "= lists.range(vars.per).map(j, false)"
+                      vars.slots: "= lists.range(vars.per).map(j, -2)"
+                  - foreach: "= lists.range(vars.per)"
+                    as: s
+                    steps:
+                      - set: {vars.cand: "= lists.range(vars.per).filter(j, !vars.used[j] && vars.nl[j] == vars.ol[vars.s])"}
+                      - if: "size(vars.cand) > 0"
+                        then:
+                          - set:
+                              vars.slots: "= lists.range(vars.per).map(j, j == vars.s ? vars.nl[vars.cand[0]] : vars.slots[j])"
+                              vars.used: "= lists.range(vars.per).map(j, j == vars.cand[0] ? true : vars.used[j])"
+                              vars.kept: "= lists.range(vars.per).map(j, j == vars.s ? true : vars.kept[j])"
+                  - set:
+                      vars.rem: "= lists.range(vars.per).filter(j, !vars.used[j])"
+                      vars.fill: "= lists.range(vars.per).filter(j, !vars.kept[j])"
+                  - set:
+                      vars.slots: "= lists.range(vars.per).map(j, vars.kept[j] ? vars.slots[j] : (vars.fill.indexOf(j) < size(vars.rem) ? vars.nl[vars.rem[vars.fill.indexOf(j)]] : vars.nl[j]))"
+                  - set:
+                      vars.post: "= lists.range(vars.R).map(q, q / vars.per == vars.gi ? vars.slots[q % vars.per] : vars.post[q])"
+              - set: {vars.row: "= vars.post"}
+          - set: {vars.out: "= vars.out + [vars.row]"}
+      - return: {phy2log: "= vars.out"}
+
+scenarios:
+  # ---- rearrange_expert_weights_inplace (tests/distributed/test_eplb_fused_moe_layer.py:265 test_eplb_fml)
+  - id: distributed-eplb-rearrange-inplace-two-ranks
+    name: "rearrange_expert_weights_inplace over 2 EP ranks (4 layers, 16 experts, identity -> a permutation per layer): rank r's slot e then holds expert new[r*8+e]"
+    description: >-
+      The oracle4 test: each rank builds a torch_nccl communicator on the EPLB group and calls
+      rearrange_expert_weights_inplace(identity, perm). Layer 0 reverses the experts, layer 1 swaps
+      the two halves, layer 2 keeps them, layer 3 shuffles. Each rank's slots are the identity of
+      the expert whose weights they hold, so the check is the test's: slot e of rank r holds
+      new[layer][r * num_local_experts + e].
+    fixtures: [full-moe-mixtral-8x7b-tp2-ep]
+    config: {enable-eplb: true}
+    steps:
+      - {interface: eplb-communicator.create, caller: gpu-worker, on: rank0, as: c0, input: {backend: torch_nccl}}
+      - {interface: eplb-communicator.create, caller: gpu-worker, on: rank1, as: c1, input: {backend: torch_nccl}}
+      - interface: rebalance-execute.rearrange-expert-weights-inplace
+        caller: gpu-worker
+        on: rank0
+        as: r0
+        await: false
+        input:
+          old_global_expert_indices: [[0,1,2,3,4,5,6,7,8,9,10,11,12,13,14,15],[0,1,2,3,4,5,6,7,8,9,10,11,12,13,14,15],[0,1,2,3,4,5,6,7,8,9,10,11,12,13,14,15],[0,1,2,3,4,5,6,7,8,9,10,11,12,13,14,15]]
+          new_global_expert_indices: [[15,14,13,12,11,10,9,8,7,6,5,4,3,2,1,0],[8,9,10,11,12,13,14,15,0,1,2,3,4,5,6,7],[0,1,2,3,4,5,6,7,8,9,10,11,12,13,14,15],[3,12,7,0,9,14,1,6,11,2,15,8,5,10,13,4]]
+          expert_weights: [[0,1,2,3,4,5,6,7],[0,1,2,3,4,5,6,7],[0,1,2,3,4,5,6,7],[0,1,2,3,4,5,6,7]]
+      - interface: rebalance-execute.rearrange-expert-weights-inplace
+        caller: gpu-worker
+        on: rank1
+        as: r1
+        input:
+          old_global_expert_indices: [[0,1,2,3,4,5,6,7,8,9,10,11,12,13,14,15],[0,1,2,3,4,5,6,7,8,9,10,11,12,13,14,15],[0,1,2,3,4,5,6,7,8,9,10,11,12,13,14,15],[0,1,2,3,4,5,6,7,8,9,10,11,12,13,14,15]]
+          new_global_expert_indices: [[15,14,13,12,11,10,9,8,7,6,5,4,3,2,1,0],[8,9,10,11,12,13,14,15,0,1,2,3,4,5,6,7],[0,1,2,3,4,5,6,7,8,9,10,11,12,13,14,15],[3,12,7,0,9,14,1,6,11,2,15,8,5,10,13,4]]
+          expert_weights: [[8,9,10,11,12,13,14,15],[8,9,10,11,12,13,14,15],[8,9,10,11,12,13,14,15],[8,9,10,11,12,13,14,15]]
+    expect:
+      - "steps.c0.result.value.class_name == 'TorchDistNcclEplbCommunicator' && steps.c0.result.value.needs_profile_buffer_reservation"
+      - "steps.r0.result.ok && steps.r1.result.ok && !steps.r0.result.value.profile"
+      - "steps.r0.result.value.expert_weights == [[15,14,13,12,11,10,9,8],[8,9,10,11,12,13,14,15],[0,1,2,3,4,5,6,7],[3,12,7,0,9,14,1,6]]"
+      - "steps.r1.result.value.expert_weights == [[7,6,5,4,3,2,1,0],[0,1,2,3,4,5,6,7],[8,9,10,11,12,13,14,15],[11,2,15,8,5,10,13,4]]"
+      - "steps.r0.result.value.transfers[2] == [] && steps.r0.result.value.transfers[1].map(t, t.dst_rank).all(d, d == 1) && size(steps.r0.result.value.transfers[1]) == 8"
+      - "trace.filter(e, e.type == 'rendezvous' && e.key == 'eplb-p2p:eplb:0').size() == 8"
+
+  - id: distributed-eplb-rearrange-with-redundancy
+    name: "With redundant experts: local copies, a remote primary receive and its duplicate row (test_rearrange_expert_weights_with_redundancy)"
+    description: >-
+      10 physical slots over 2 ranks. Rank0 [0,1,2,3,4] becomes [2,2,0,6,6]: slot 0 takes expert 2
+      from its own slot 2, slot 1 is a duplicate of it, slot 2 takes 0 locally, and expert 6 comes
+      once from rank1 into slot 3 and is copied into slot 4. Rank1 [5,6,7,0,1] becomes [1,7,5,3,3]:
+      expert 3 comes from rank0 into its primary slot 3 and is duplicated into slot 4.
+    fixtures: [full-moe-mixtral-8x7b-tp2-ep]
+    config: {enable-eplb: true}
+    steps:
+      - {interface: eplb-communicator.create, caller: gpu-worker, on: rank0, input: {backend: torch_gloo}}
+      - {interface: eplb-communicator.create, caller: gpu-worker, on: rank1, input: {backend: torch_gloo}}
+      - {interface: rebalance-execute.rearrange-expert-weights-inplace, caller: gpu-worker, on: rank0, as: r0, await: false, input: {old_global_expert_indices: [[0,1,2,3,4,5,6,7,0,1]], new_global_expert_indices: [[2,2,0,6,6,1,7,5,3,3]], expert_weights: [[0,1,2,3,4]]}}
+      - {interface: rebalance-execute.rearrange-expert-weights-inplace, caller: gpu-worker, on: rank1, as: r1, input: {old_global_expert_indices: [[0,1,2,3,4,5,6,7,0,1]], new_global_expert_indices: [[2,2,0,6,6,1,7,5,3,3]], expert_weights: [[5,6,7,0,1]]}}
+    expect:
+      - "trace.filter(e, e.type == 'rendezvous' && e.key == 'eplb-p2p:eplb:0').size() == 2"
+      - "steps.r0.result.value.expert_weights == [[2,2,0,6,6]] && steps.r1.result.value.expert_weights == [[1,7,5,3,3]]"
+      - "steps.r0.result.value.transfers == [[{'expert_id': 3, 'dst_rank': 1}]] && steps.r1.result.value.transfers == [[{'expert_id': 6, 'dst_rank': 0}]]"
+
+  - id: distributed-eplb-rearrange-shape-mismatch
+    name: "num_physical_experts must equal ep_size x local experts (a bare assert)"
+    fixtures: [full-moe-mixtral-8x7b-tp2-ep]
+    config: {enable-eplb: true}
+    steps:
+      - {interface: rebalance-execute.rearrange-expert-weights-inplace, caller: gpu-worker, on: rank0, as: r, input: {old_global_expert_indices: [[0,1,2,3,4,5,6,7]], new_global_expert_indices: [[0,1,2,3,4,5,6,7]], expert_weights: [[0,1,2]], ep_rank: 0, ep_size: 2}}
+    expect:
+      - "!steps.r.result.ok && steps.r.result.error.code == 'assertion-error' && steps.r.result.error.message == ''"
+      - "trace.filter(e, e.type == 'rendezvous').size() == 0"
+
+  - id: distributed-eplb-ranks-with-experts
+    name: "get_ep_ranks_with_experts_batch: senders in order of position; receivers exclude ranks that already hold the expert"
+    fixtures: [tp1-llama-8b]
+    steps:
+      - {interface: rebalance-execute.get-ep-ranks-with-experts-batch, caller: gpu-worker, as: m, input: {expert_ids: [3, 0, 3], num_local_experts: 2, old_indices: [0, 1, 2, 3, 0, 3], new_indices: [3, 3, 0, 1, 2, 0]}}
+    expect:
+      - "steps.m.result.value.ranks_to_send == {'0': [0, 2], '3': [1, 2]}"
+      - "steps.m.result.value.ranks_to_recv == {'0': [1], '3': [0]}"
+
+  # ---- the communicator factory
+  - id: distributed-eplb-communicator-backends
+    name: "create_eplb_communicator: classes per backend, NIXL unavailable, pynccl on CPU, an unknown backend, elastic EP's refusal and its pynccl promotion"
+    fixtures: [full-moe-mixtral-8x7b-tp2-ep]
+    config: {enable-eplb: true}
+    steps:
+      - {interface: eplb-communicator.create, caller: gpu-worker, on: rank0, as: gloo, input: {backend: torch_gloo}}
+      - {interface: eplb-communicator.create, caller: gpu-worker, on: rank0, as: nixl, input: {backend: nixl}}
+      - {interface: eplb-communicator.create, caller: gpu-worker, on: rank0, as: pycpu, input: {backend: pynccl, tensor_device_type: cpu}}
+      - {interface: eplb-communicator.create, caller: gpu-worker, on: rank0, as: pydt, input: {backend: pynccl, unsupported_dtypes: [torch.float8_e8m0fnu, torch.complex64]}}
+      - {interface: eplb-communicator.create, caller: gpu-worker, on: rank0, as: bogus, input: {backend: mpi}}
+      - {interface: eplb-communicator.create, caller: gpu-worker, on: rank0, as: eep, input: {backend: torch_gloo, is_stateless: true}}
+      - {interface: eplb-communicator.create, caller: gpu-worker, on: rank0, as: eepn, input: {backend: torch_nccl, is_stateless: true}}
+    expect:
+      - "trace.exists(e, e.type == 'note' && e.title == \"Stateless elastic EP requires PyNCCL backend. Forcing EPLB communicator to 'pynccl'.\")"
+      - "steps.gloo.result.value.class_name == 'TorchDistGlooStagedEplbCommunicator' && steps.gloo.result.value.needs_profile_buffer_reservation"
+      - "!steps.nixl.result.ok && steps.nixl.result.error.code == 'runtime-error' && steps.nixl.result.error.message == \"EPLB communicator 'nixl' requested but NIXL is unavailable.\""
+      - "steps.pycpu.result.error.message == \"EPLB communicator 'pynccl' supports only cuda-like devices (got cpu).\""
+      - "steps.pydt.result.error.message == \"EPLB communicator 'pynccl' requested but expert weights contain unsupported dtypes: (torch.complex64, torch.float8_e8m0fnu).\""
+      - "steps.bogus.result.error.code == 'value-error' && steps.bogus.result.error.message == 'Unknown EPLB communicator backend: mpi'"
+      - "steps.eep.result.error.code == 'value-error' && steps.eep.result.error.message == \"Elastic EP requires 'torch_nccl', 'pynccl', or 'nixl' EPLB communicator (got 'torch_gloo').\""
+      - "steps.eepn.result.value.backend == 'pynccl' && steps.eepn.result.value.class_name == 'PyNcclEplbCommunicator'"
+
+  - id: distributed-eplb-communicator-nixl-skips-reservation
+    name: "With NIXL installed the auto communicator is NIXL, which skips the profile run's buffer reservation"
+    fixtures: [full-moe-mixtral-8x7b-tp2-ep]
+    config: {enable-eplb: true, nixl-available: true}
+    steps:
+      - {interface: eplb-state.add-model, caller: gpu-worker, on: rank0, as: a0, input: {model: mistralai/Mixtral-8x7B-Instruct-v0.1, num_moe_layers: 1}}
+      - {interface: eplb-state.add-model, caller: gpu-worker, on: rank1, as: a1, input: {model: mistralai/Mixtral-8x7B-Instruct-v0.1, num_moe_layers: 1}}
+      - {interface: eplb-state.step, caller: gpu-worker, on: rank0, as: p0, await: false, input: {is_profile: true}}
+      - {interface: eplb-state.step, caller: gpu-worker, on: rank1, as: p1, input: {is_profile: true}}
+    expect:
+      - "steps.a0.result.value.communicator == 'NixlEplbCommunicator'"
+      - "steps.p0.result.ok && steps.p1.result.ok && steps.p0.result.value.log == 'Rearranged experts  (profile)  in 0.00 s.'"
+      - "!trace.exists(e, e.type == 'rendezvous' && e.key.startsWith('eplb-profile-'))"
+
+  - id: distributed-eplb-group-missing
+    name: "get_eplb_group without EPLB asserts with the code's message"
+    fixtures: [full-moe-mixtral-8x7b-tp2-ep]
+    steps:
+      - {interface: parallel-state.get-eplb-group, caller: gpu-worker, on: rank0, as: g}
+    expect:
+      - "!steps.g.result.ok && steps.g.result.error.code == 'assertion-error' && steps.g.result.error.message == 'EPLB group is not initialized. EPLB group is only created for MoE models when EPLB is enabled. Ensure parallel_config.enable_eplb is True.'"
+
+  # ---- EplbState
+  - id: distributed-eplb-add-model-defaults
+    name: "add_model on Mixtral TP 2 with 2 redundant experts: 10 physical, 5 per rank, first rearrangement 2250 steps in (3/4 of 3000), async, torch_gloo without NIXL"
+    fixtures: [full-moe-mixtral-8x7b-tp2-ep]
+    config: {enable-eplb: true, num-redundant-experts: 2}
+    steps:
+      - {interface: eplb-state.add-model, caller: gpu-worker, on: rank1, as: a1, input: {model: mistralai/Mixtral-8x7B-Instruct-v0.1, num_moe_layers: 2}}
+      - {interface: eplb-state.start-async-loop, caller: gpu-worker, on: rank1, as: s1}
+      - {interface: eplb-state.start-async-loop, caller: gpu-worker, on: rank1, as: s2}
+    expect:
+      - "steps.a1.result.value.num_physical_experts == 10 && steps.a1.result.value.num_local_physical_experts == 5 && steps.a1.result.value.expert_rearrangement_step == 2250"
+      - "steps.a1.result.value.is_async && steps.a1.result.value.communicator == 'TorchDistGlooStagedEplbCommunicator'"
+      - "steps.s1.result.value.started && !steps.s2.result.value.started"
+      - "state['eplb-state@rank1'].models['mistralai/Mixtral-8x7B-Instruct-v0.1'].physical_to_logical_map[0] == [0,1,2,3,4,5,6,7,0,1] && state['eplb-state@rank1'].models['mistralai/Mixtral-8x7B-Instruct-v0.1'].expert_weights[1] == [5,6,7,0,1]"
+
+  - id: distributed-eplb-add-model-mismatch
+    name: "A second model with a different expert configuration is refused (validate_ep_configuration), and more than 1023 redundant experts trip the assert"
+    fixtures: [full-moe-mixtral-8x7b-tp2-ep]
+    config: {enable-eplb: true}
+    steps:
+      - {interface: eplb-state.add-model, caller: gpu-worker, on: rank0, as: main, input: {model: mistralai/Mixtral-8x7B-Instruct-v0.1, num_moe_layers: 1}}
+      - {interface: eplb-state.add-model, caller: gpu-worker, on: rank0, as: drafter, input: {model: drafter, model_class: vllm.model_executor.models.deepseek_mtp.DeepSeekMTP, num_routed_experts: 16, num_moe_layers: 1}}
+      - {interface: eplb-state.add-model, caller: gpu-worker, on: rank1, as: big, input: {model: m, num_redundant_experts: 1024, num_moe_layers: 1}}
+    expect:
+      - "trace.exists(e, e.type == 'note' && e.title.startsWith('validate_ep_configuration'))"
+      - "steps.main.result.ok"
+      - "!steps.drafter.result.ok && steps.drafter.result.error.code == 'runtime-error' && steps.drafter.result.error.message == \"Model: <class 'vllm.model_executor.models.mixtral.MixtralForCausalLM'> with config 8 0 8 8 1 mismatch with new model <class 'vllm.model_executor.models.deepseek_mtp.DeepSeekMTP'> with config 16 0 16 16 1\""
+      - "steps.big.result.error.code == 'assertion-error' && steps.big.result.error.message == 'num_redundant_experts 1024 must be less than or equal to 1023'"
+
+  - id: distributed-eplb-profile-step
+    name: "The profile run's EPLB step: a dummy rearrangement (async mode, profile) that reserves buffers with a barrier and all_gather per weight tensor and commits nothing"
+    fixtures: [full-moe-mixtral-8x7b-tp2-ep]
+    config: {enable-eplb: true}
+    steps:
+      - {interface: eplb-state.add-model, caller: gpu-worker, on: rank0, input: {model: mistralai/Mixtral-8x7B-Instruct-v0.1, num_moe_layers: 2}}
+      - {interface: eplb-state.add-model, caller: gpu-worker, on: rank1, input: {model: mistralai/Mixtral-8x7B-Instruct-v0.1, num_moe_layers: 2}}
+      - {interface: eplb-state.step, caller: gpu-worker, on: rank0, as: p0, await: false, input: {is_profile: true}}
+      - {interface: eplb-state.step, caller: gpu-worker, on: rank1, as: p1, input: {is_profile: true}}
+    expect:
+      - "steps.p0.result.ok && steps.p1.result.ok && steps.p0.result.value.log == 'Rearranged experts  (profile)  in 0.00 s.' && steps.p1.result.value.log == null"
+      - "trace.exists(e, e.type == 'note' && e.title == 'Rearranging experts (async mode) (profile)...')"
+      - "trace.filter(e, e.type == 'rendezvous' && e.key == 'eplb-profile-barrier:eplb:0').size() == 4 && trace.filter(e, e.type == 'rendezvous' && e.key == 'eplb-profile-all-gather:eplb:0').size() == 4"
+      - "steps.p0.result.value.expert_rearrangement_step == 2250 && calls['rebalance-execute.move-to-buffer'] == 0"
+
+  - id: distributed-eplb-sync-rearrangement
+    name: "Sync EPLB (use_async false, step_interval 4, window 4): the step that reaches the interval rebalances; expert 0's load gets both redundant slots and experts 2, 3, 6, 7 move between the ranks"
+    description: >-
+      Rank0 routes 80 tokens to expert 0 and 10 to each other expert. The policy replicates expert 0
+      twice (load 80/3 each), packs [0, 0, 4, 6, 7] and [0, 1, 2, 3, 5] by load, and
+      preserve_intragpu_slots keeps what stays on each GPU in place: [0, 0, 6, 7, 4] and
+      [5, 2, 3, 0, 1]. Rank0 copies expert 0 into slot 1 locally and receives 6 and 7 from rank1;
+      rank1 receives 2 and 3 from rank0.
+    fixtures: [full-moe-mixtral-8x7b-tp2-ep]
+    config: {enable-eplb: true, num-redundant-experts: 2, eplb-config: {use_async: false, step_interval: 4, window_size: 4}}
+    steps:
+      - {interface: eplb-state.add-model, caller: gpu-worker, on: rank0, as: a0, input: {model: mistralai/Mixtral-8x7B-Instruct-v0.1, num_moe_layers: 1}}
+      - {interface: eplb-state.add-model, caller: gpu-worker, on: rank1, input: {model: mistralai/Mixtral-8x7B-Instruct-v0.1, num_moe_layers: 1}}
+      - {interface: eplb-state.record-expert-load, caller: gpu-worker, on: rank0, input: {load: [[80, 10, 10, 10, 10, 10, 10, 10, 0, 0]]}}
+      - {interface: eplb-state.step, caller: gpu-worker, on: rank0, as: s0, await: false}
+      - {interface: eplb-state.step, caller: gpu-worker, on: rank1, as: s1}
+    expect:
+      - "steps.a0.result.value.expert_rearrangement_step == 3 && !steps.a0.result.value.is_async"
+      - "steps.s0.result.value.rearranged && steps.s1.result.value.rearranged && steps.s0.result.value.expert_rearrangement_step == 0"
+      - "steps.s0.result.value.log == 'Rearranged experts   in 0.00 s.' && steps.s1.result.value.log == null"
+      - "trace.exists(e, e.type == 'note' && e.title == 'Rearranging experts sync mode ...')"
+      - "state['eplb-state@rank0'].models['mistralai/Mixtral-8x7B-Instruct-v0.1'].physical_to_logical_map == [[0,0,6,7,4,5,2,3,0,1]]"
+      - "state['eplb-state@rank0'].models['mistralai/Mixtral-8x7B-Instruct-v0.1'].expert_weights == [[0,0,6,7,4]] && state['eplb-state@rank1'].models['mistralai/Mixtral-8x7B-Instruct-v0.1'].expert_weights == [[5,2,3,0,1]]"
+      - "state['eplb-state@rank1'].models['mistralai/Mixtral-8x7B-Instruct-v0.1'].logical_replica_count == [[3,1,1,1,1,1,1,1]]"
+
+  - id: distributed-eplb-async-one-layer-per-step
+    name: "Async EPLB: the rearrangement step only marks the model rebalanced; each later step transfers and commits one layer, the last clears rebalanced"
+    fixtures: [full-moe-mixtral-8x7b-tp2-ep]
+    config: {enable-eplb: true, num-redundant-experts: 2, eplb-config: {step_interval: 4, window_size: 4}}
+    steps:
+      - {interface: eplb-state.add-model, caller: gpu-worker, on: rank0, input: {model: mistralai/Mixtral-8x7B-Instruct-v0.1, num_moe_layers: 2}}
+      - {interface: eplb-state.add-model, caller: gpu-worker, on: rank1, input: {model: mistralai/Mixtral-8x7B-Instruct-v0.1, num_moe_layers: 2}}
+      - {interface: eplb-state.start-async-loop, caller: gpu-worker, on: rank0}
+      - {interface: eplb-state.start-async-loop, caller: gpu-worker, on: rank1}
+      - {interface: eplb-state.record-expert-load, caller: gpu-worker, on: rank0, input: {load: [[80, 10, 10, 10, 10, 10, 10, 10, 0, 0], [0, 0, 0, 0, 0, 0, 0, 0, 0, 0]]}}
+      - {interface: eplb-state.step, caller: gpu-worker, on: rank0, as: a0, await: false}
+      - {interface: eplb-state.step, caller: gpu-worker, on: rank1, as: a1}
+      - {interface: eplb-state.step, caller: gpu-worker, on: rank0, as: b0, await: false}
+      - {interface: eplb-state.step, caller: gpu-worker, on: rank1, as: b1}
+      - {interface: eplb-state.step, caller: gpu-worker, on: rank0, as: c0, await: false}
+      - {interface: eplb-state.step, caller: gpu-worker, on: rank1, as: c1}
+    expect:
+      - "steps.a0.result.value.rearranged && steps.a0.result.value.log == null && steps.a0.result.value.layer_committed == null"
+      - "trace.exists(e, e.type == 'note' && e.title == 'Rearranging experts (async mode) ...')"
+      - "steps.b0.result.value.layer_committed == 0 && steps.b1.result.value.layer_committed == 0 && steps.c0.result.value.layer_committed == 1"
+      - "state['eplb-state@rank0'].models['mistralai/Mixtral-8x7B-Instruct-v0.1'].physical_to_logical_map == [[0,0,6,7,4,5,2,3,0,1],[0,1,2,3,4,5,6,7,0,0]]"
+      - "state['eplb-state@rank1'].models['mistralai/Mixtral-8x7B-Instruct-v0.1'].expert_weights == [[5,2,3,0,1],[5,6,7,0,0]] && !state['eplb-state@rank1'].models['mistralai/Mixtral-8x7B-Instruct-v0.1'].rebalanced"
+
+  - id: distributed-eplb-log-balancedness
+    name: "log_balancedness: rank 0 logs the EPLB step with avg_tokens, max_tokens and balancedness summed over layers"
+    fixtures: [full-moe-mixtral-8x7b-tp2-ep]
+    config: {enable-eplb: true, num-redundant-experts: 2, eplb-config: {log_balancedness: true}}
+    steps:
+      - {interface: eplb-state.add-model, caller: gpu-worker, on: rank0, input: {model: mistralai/Mixtral-8x7B-Instruct-v0.1, num_moe_layers: 1}}
+      - {interface: eplb-state.add-model, caller: gpu-worker, on: rank1, input: {model: mistralai/Mixtral-8x7B-Instruct-v0.1, num_moe_layers: 1}}
+      - {interface: eplb-state.record-expert-load, caller: gpu-worker, on: rank0, input: {load: [[80, 10, 10, 10, 10, 10, 10, 10, 0, 0]]}}
+      - {interface: eplb-state.record-expert-load, caller: gpu-worker, on: rank1, input: {load: [[0, 0, 0, 0, 0, 10, 10, 10, 0, 0]]}}
+      - {interface: eplb-state.step, caller: gpu-worker, on: rank0, as: s0, await: false, input: {log_stats: true}}
+      - {interface: eplb-state.step, caller: gpu-worker, on: rank1, as: s1, input: {log_stats: true}}
+    expect:
+      - "trace.filter(e, e.type == 'rendezvous' && e.key == 'eplb-load-pass:eplb:0').size() == 2"
+      - "steps.s0.result.value.log == 'EPLB step: 2250 for model mistralai/Mixtral-8x7B-Instruct-v0.1: avg_tokens=90.00, max_tokens=120, balancedness=0.7500, steps until the next rearrangement: 750'"
+      - "steps.s1.result.value.log == null && steps.s0.result.value.expert_rearrangement_step == 2251"

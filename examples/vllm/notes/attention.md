@@ -432,3 +432,90 @@ Corrected:
   FP8-checkpoint ValueError (attention.py:205-219), judge3 P3-7c/d.
 - kernels-ops: `has_flashinfer_sparse_mla_sm120_config` (vllm/utils/flashinfer.py:460-473) for the
   round-5 test.
+
+## Fix round 6 (mechanism coverage)
+
+New generator module `gen/attention/round6.py`: 4 components, 17 interfaces, 11 scenarios.
+
+### Round-5 absent mechanisms (RESULTS.md, oracle4/attention.md, judge4)
+
+- **Local-attention virtual batches** (oracle4 model-bug): `attention-backend-utils.make-local-attention-virtual-batches`
+  (utils.py:509-650) computes the per-request first-chunk tokens, the last-chunk tokens
+  (`attn_chunk_size + seq_len % -attn_chunk_size`), the local block counts, the virtual q/k lengths and
+  the local block table, with `chunk // block` pages per row clipped to the table's last column. It
+  returns the gather (`make_block_table`) too. The assert message and the ZeroDivisionError for the
+  default `block_size=0` are modeled. All six `test_local_attention_virtual_batches` cases pass, in
+  `attention-r6-local-attention-virtual-batches`. The oracle had no scenario to re-run, because no
+  entity existed.
+- **ChunkedLocalAttention builder**: `chunked-local-attention.init` (selection with only head size,
+  dtype and cache dtype), `chunked-local-attention-builder.create-backend`
+  (`ChunkedLocalAttention_<chunk>_<Backend>`), `.build` (virtual batches, then FlashAttention's build),
+  `.update-block-table` and `.get-cudagraph-support` (NEVER). The file is under
+  `model_executor/layers/attention/` (models-layers' path). oracle4 assigns it to attention.
+- **FLASHINFER_MLA error prefix and startup refusal** (judge4 P4-8 c): both sit outside this fragment, so
+  `bench-p4-8-c-flashinfer-mla` still fails. The message is built in config-platform's
+  `cuda-platform.get-attn-backend-cls` (cuda.py:437-444 interpolates the enum, giving
+  `AttentionBackendEnum.FLASHINFER_MLA`). The refusal needs models-layers' Attention layer init to call
+  `selector.get-attn-backend` (attention.py:350-360), so that the selector's ValueError fails the model
+  load. The selector already propagates the platform's error. Routed below.
+
+### Mechanisms added from coverage_gaps (5)
+
+1. **Encoder-only attention** (BERT, ModernBERT, BERT-with-RoPE pooling models;
+   encoder_only_attention.py). Selection runs for ENCODER_ONLY, the backend is
+   `EncoderOnlyAttention_<Backend>`, and there is no KV cache spec. The build is non-causal (a copy with
+   `causal = False`). FlashInfer refuses encoder-only, so `--attention-backend FLASHINFER` fails such a
+   layer.
+2. **Cross attention** (encoder-decoder, Whisper; cross_attention.py). `create-backend` overrides the
+   builder, the impl and `forward_includes_kv_cache_update`. The build is non-causal: seq_lens become
+   the encoder lengths, and `_get_cross_slot_mapping` runs only for requests whose cross K/V isn't
+   cached (decode rows get encoder length 0). The impl writes K/V through that slot mapping before it
+   attends.
+3. **Preferred KV block size**: `attention-backend.get-preferred-block-size` and `.supports-block-size`
+   (backend.py:119-160, flash_attn.py:300-377). FlashAttention takes 64 for SM90 FP8 KV with FA4 at
+   head 512, and 128 for FA4's hd256 kernel on SM100/110. Otherwise the default is kept when it is
+   supported, else the smallest kernel size applies (FlashMLA 64, CUTLASS MLA 128). The caller would be
+   config-platform's `update_block_size_for_backend` (interface.py:750-795), which isn't modeled.
+4. **Mamba-family backends**: `selector.get-mamba-attn-backend`. It uses the override-aware class and
+   raises a RuntimeError under `VLLM_BATCH_INVARIANT`, because no mamba backend supports batch
+   invariance. `attention-backend-utils.mamba-get-block-table-tensor` covers the none and align cache
+   modes.
+5. **TritonAttentionImpl.__init__** (oracle4/models-layers.md request 3): the sliding window is
+   `(W-1, W-1)` for encoder and encoder-only layers. FP8 KV below SM89 and bfloat16 KV below SM80 are
+   refused with the exact messages. The sinks shape is asserted.
+
+No world variant was added.
+
+### Unwritten fields
+
+`--lint unwritten-fields` on the merged set reports 2 findings, both in other fragments
+(worker-runner `state.model.use_mla`, config-platform `vars.mc.has_index_topk`). None are in attention.
+
+### Breaking changes
+
+- `attention-backend.validate-configuration`: the attention-type reason is now
+  `attention type AttentionType.<NAME> not supported`. `AttentionType` is a `(str, Enum)`, and on
+  Python >= 3.11 (vLLM requires it) an f-string formats it with the class name (backend.py:36, 328).
+  Callers that match on the old text: config-platform's `cuda-platform.get-attn-backend-cls` copies
+  the reasons into its ValueError text and doesn't match on them. No scenario in other fragments
+  matches it.
+
+### Cross-area requests
+
+- config-platform, `cuda-platform.get-attn-backend-cls` (cuda.py:437-447):
+  - Format the selected backend as `'AttentionBackendEnum.' + input.selected_backend` in both
+    ValueErrors (judge4 P4-8 c).
+  - Note the success log `Using AttentionBackendEnum.<NAME> backend.` (P4-8 b), and
+    `Using <NAME> attention backend out of potential backends: ['<NAME>', ...].` after a scan (P4-8 a,
+    cuda.py:501-509).
+  - In `AttentionSelectorConfig.__repr__`, give `attn_type=AttentionType.DECODER`, not
+    `attn_type=decoder` (selector.py:52).
+- models-layers, `attention-layer` init (attention.py:350-360): call `selector.get-attn-backend` with
+  head_size, dtype, kv_cache_dtype, has_sink, use_mm_prefix, attn_type and has_sliding_window. An
+  invalid `--attention-backend` then fails the model load, and engine-core's
+  `Engine core initialization failed` follows (P4-8 c).
+  - Llama 4's RoPE layers should construct `chunked-local-attention.init`.
+  - BERT-family pooling models should construct `encoder-only-attention.init`.
+  - Whisper should construct `cross-attention.init`.
+  - EmbeddingGemma2's sliding layers should pass `sliding_window + 1` to the impl init
+    (`flash-attention-impl.init` / `triton-attention-impl.init` give `(512, 512)` for 513).

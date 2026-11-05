@@ -159,7 +159,8 @@ configs[-1]["attributes"]["none_is"] = ""
 # ---------------------------------------------------------------------------
 HEADERS = obj({"Authorization": {"type": "string", "examples": ["Bearer token-abc123"]},
                "X-Request-Id": {"type": "string", "examples": ["req-1"]},
-               "Content-Type": {"type": "string", "default": "application/json", "description": "validate_json_request reads it; JSON clients send application/json"}})
+               "Content-Type": {"type": "string", "default": "application/json", "description": "validate_json_request reads it; JSON clients send application/json"},
+               "X-Vllm-Priority": {"type": ["string", "null"], "default": None, "description": "PRIORITY_HEADER: an int() it overrides the body's priority (generate/base/serving.py:41, 257-269)"}})
 schemas.append({"id": "ServingHttpHeaders", "summary": "The request headers the routes read (Authorization for --api-key, X-Request-Id for the request id).",
                 "schema": HEADERS})
 schemas.append({"id": "ServingErrorResponse", "summary": "ErrorResponse{error: ErrorInfo{message, type, param, code}} (serve/engine/protocol.py:79-87).",
@@ -171,8 +172,8 @@ MSG = obj({"role": {"type": "string", "examples": ["user"]},
 schemas.append({"id": "ServingChatCompletionRequest",
                 "summary": "ChatCompletionRequest body fields the model reads (openai/chat_completion/protocol.py). Branch fields (chat_template, tool_choice, ...) come from scenario input only.",
                 "schema": obj({"model": {"type": "string", "examples": ["llama-8b"]},
-                               "messages": {"type": "array", "items": MSG, "default": [{"role": "user", "content": "What is the capital of France?"}]},
-                               "max_tokens": {"type": "integer", "examples": [16]},
+                               "messages": {"type": ["array", "string", "object", "null"], "items": MSG, "default": [{"role": "user", "content": "What is the capital of France?"}], "description": "the raw JSON value; field validation refuses anything but a list"},
+                               "max_tokens": {"type": ["integer", "string", "null"], "examples": [16], "description": "the raw JSON value; a string that is not an integer fails field validation"},
                                "max_completion_tokens": {"type": ["integer", "null"], "default": None},
                                "stream": {"type": "boolean", "default": False},
                                "n": {"type": "integer", "default": 1},
@@ -180,7 +181,7 @@ schemas.append({"id": "ServingChatCompletionRequest",
                                "top_p": {"type": ["number", "null"], "default": None},
                                "top_k": {"type": ["integer", "null"], "default": None},
                                "min_p": {"type": ["number", "null"], "default": None},
-                               "seed": {"type": ["integer", "null"], "default": None},
+                               "seed": {"type": ["integer", "string", "null"], "default": None, "description": "a decimal string stands for an integer past int64 ({$bigint}), which field validation refuses"},
                                "stop": {"type": ["string", "array", "null"], "items": STR, "default": None},
                                "stop_token_ids": {"type": ["array", "null"], "items": INT, "default": None},
                                "include_stop_str_in_output": {"type": "boolean", "default": False},
@@ -197,7 +198,7 @@ schemas.append({"id": "ServingChatCompletionRequest",
                                "chat_template": {"type": ["string", "null"], "default": None},
                                "media_io_kwargs": {"type": ["object", "null"], "default": None},
                                "mm_processor_kwargs": {"type": ["object", "null"], "default": None},
-                               "priority": {"type": ["integer", "null"], "default": None},
+                               "priority": {"type": ["integer", "string", "null"], "default": None, "description": "a decimal string stands for an integer past int64 ({$bigint}), which field validation refuses"},
                                "min_tokens": {"type": ["integer", "null"], "default": 0},
                                "logprobs": {"type": ["boolean", "null"], "default": False},
                                "top_logprobs": {"type": ["integer", "null"], "default": 0},
@@ -213,10 +214,13 @@ schemas.append({"id": "ServingChatCompletionRequest",
                                "chat_template_kwargs": {"type": ["object", "null"], "default": None},
                                "use_beam_search": {"type": "boolean", "default": False},
                                "request_id": {"type": ["string", "null"], "default": None},
-                               "cache_salt": {"type": ["string", "null"], "default": None}}, ["messages"])})
+                               "truncate_prompt_tokens": {"type": ["integer", "null"], "default": None},
+                               "truncation_side": {"type": ["string", "null"], "default": None},
+                               "guided_json": {"type": ["object", "string", "null"], "default": None, "description": "a removed guided-decoding field: an ignored extra field that only logs a warning"},
+                               "cache_salt": {"type": ["string", "null"], "default": None}})})
 schemas.append({"id": "ServingCompletionRequest", "summary": "CompletionRequest body fields the model reads (openai/completion/protocol.py).",
                 "schema": obj({"model": {"type": "string", "examples": ["llama-8b"]},
-                               "prompt": {"type": ["string", "array"], "items": {"type": ["string", "integer", "array"]}, "default": ["The capital of France is"]},
+                               "prompt": {"type": ["string", "array", "integer", "null"], "items": {"type": ["string", "integer", "array"]}, "default": ["The capital of France is"], "description": "list[int] | list[list[int]] | str | list[str] | None; a bare integer fails field validation"},
                                "max_tokens": {"type": ["integer", "null"], "examples": [16]},
                                "stream": {"type": "boolean", "default": False},
                                "stream_options": {"type": ["object", "null"], "default": None},
@@ -241,7 +245,9 @@ schemas.append({"id": "ServingCompletionRequest", "summary": "CompletionRequest 
                                "stream_interval": {"type": ["integer", "null"], "default": None},
                                "prompt_logprobs": {"type": ["integer", "null"], "default": None},
                                "length_penalty": {"type": "number", "default": 1.0},
-                               "use_beam_search": {"type": "boolean", "default": False}}, ["prompt"])})
+                               "truncate_prompt_tokens": {"type": ["integer", "null"], "default": None},
+                               "truncation_side": {"type": ["string", "null"], "default": None},
+                               "use_beam_search": {"type": "boolean", "default": False}})})
 schemas.append({"id": "ServingResponsesRequest", "summary": "ResponsesRequest body fields the model reads (openai/responses/protocol.py: store defaults to true, background to false).",
                 "schema": obj({"model": {"type": "string", "examples": ["llama-8b"]},
                                "input": {"type": ["string", "array"], "items": {"type": "object"}, "examples": ["Hello!"]},
@@ -250,6 +256,7 @@ schemas.append({"id": "ServingResponsesRequest", "summary": "ResponsesRequest bo
                                "stream": {"type": "boolean", "default": False},
                                "max_output_tokens": {"type": "integer", "examples": [16]},
                                "previous_response_id": {"type": ["string", "null"], "default": None},
+                               "request_id": {"type": ["string", "null"], "default": None, "description": "the client's id (resp_<id>), else a random one"},
                                "previous_input_messages": {"type": ["array", "null"], "items": {"type": "object"}, "default": None}}, ["input"])})
 COMPLETION_OUTPUT = obj({"index": {"type": "integer", "default": 0},
                          "text": {"type": "string", "examples": ["The capital of France is Paris."]},
@@ -287,6 +294,19 @@ boundary_comp("llm-engine", "LLMEngine", "engine-core", "engine-core", ["vllm/v1
               "The synchronous engine the offline LLM class drives (owned by engine-core).")
 boundary_comp("engine-args", "EngineArgs", "control", "config-platform", ["vllm/engine/arg_utils.py"],
               "Engine arguments and VllmConfig resolution (owned by config-platform).", layer="control")
+
+boundary_comp("model-config", "ModelConfig", "control", "config-platform", ["vllm/config/model.py:561-811"],
+              "The resolved model config (owned by config-platform); LLM.encode reads its runner_type.", layer="control")
+stub("model-config", "post-init", "config-platform", ["vllm/config/model.py:561-811"],
+     "ModelConfig.__post_init__: resolve the runner (and the rest of the model config) from the checkpoint and the engine args.",
+     request=obj({"model": STR, "runner": {"type": "string", "default": "auto"}}), response=obj({"runner_type": STR}),
+     errors=[{"code": "value-error", "status": 0, "retryable": False}], kind="function")
+
+boundary_comp("core-engine-proc-manager", "CoreEngineProcManager", "engine-core", "engine-core", ["vllm/v1/engine/utils.py:1300-1420"],
+              "Starts and supervises the engine-core processes (owned by engine-core); run_multi_api_server launches it before the API servers.")
+stub("core-engine-proc-manager", "launch-core-engines", "engine-core", ["vllm/v1/engine/utils.py:1300-1420"],
+     "launch_core_engines for run_multi_api_server: start the engine-core processes; the API servers start inside the context, the handshakes run on exit.",
+     request=obj({"api_server_count": {"type": "integer", "examples": [4]}}), response=obj({"engines": INT, "api_servers": {"type": "array"}}), kind="function")
 
 AL = "vllm/v1/engine/async_llm.py"
 DEAD = {"code": "engine-dead-error", "status": 500, "retryable": False}
@@ -648,6 +668,8 @@ def main_route(component, method, path, src, handler, handler_input, summary, bo
     if load:
         beh.append({"when": "config['enable-server-load-tracking']", "title": "The response's BackgroundTask decrements the counter",
                     "source": s(APIU, 124, 139), "call": "server-load-metrics.decrement"})
+    beh.append({"title": "The HTTP instrumentator counts the response by method, handler and status class", "source": s(E + "serve/instrumentator/metrics.py", 72, 74),
+                "call": "instrumentator-metrics.observe-request", "input": {"method": method, "handler": path, "status": "2xx"}})
     beh.append({"set": {"vars.out": "= vars.res.value"}})
     beh.append(REQUEST_ID_HEADER)
     beh.append({"return": "= vars.out"})
@@ -658,8 +680,64 @@ def main_route(component, method, path, src, handler, handler_input, summary, bo
 
 
 CHAT_R = E + "openai/chat_completion/api_router.py"
+CHAT_P = E + "openai/chat_completion/protocol.py"
+
+
+def _fmt_err(typ, loc, msg, inp, ctx=None):
+    """one pydantic error as validation_exception_handler prints it (str of the error dict)"""
+    out = "'{\\'type\\': \\'" + typ + "\\', \\'loc\\': \\'" + loc + "\\', \\'msg\\': \\'" + msg + "\\', \\'input\\': ' + " + inp
+    if ctx:
+        out += " + ', \\'ctx\\': {" + ctx + "}'"
+    return out + " + '}'"
+
+
+# integers past int64 reach behaviors as decimal strings ({$bigint}); compare them by length, then digit by digit
+BIG_POS = "(type({x}) == string && {x}.matches('^[0-9]+$') && (size({x}) > 19 || (size({x}) == 19 && {x} > '9223372036854775807')))"
+BIG_NEG = "(type({x}) == string && {x}.matches('^-[0-9]+$') && (size({x}) > 20 || (size({x}) == 20 && {x} > '-9223372036854775808')))"
+def _chat_defaults():
+    sch = [x for x in schemas if x["id"] == "ServingChatCompletionRequest"][0]["schema"]["properties"]
+    return {k: v["default"] for k, v in sch.items() if "default" in v and k != "messages"}
+
+
+def _cel_lit(v):
+    if v is None:
+        return "null"
+    if v is True:
+        return "true"
+    if v is False:
+        return "false"
+    if isinstance(v, (int, float)):
+        return repr(v)
+    if isinstance(v, str):
+        return "'" + v + "'"
+    if isinstance(v, list):
+        return "[" + ", ".join(_cel_lit(x) for x in v) + "]"
+    raise ValueError(v)
+
+
+CHAT_DEFAULTS = "{" + ", ".join(f"'{k}': {_cel_lit(v)}" for k, v in _chat_defaults().items()) + "}"
+GUIDED_WARNING = {"title": "OpenAIBaseModel.__log_extra_fields__: extra fields are allowed and ignored; the removed guided-decoding fields (guided_json, guided_regex, guided_choice, guided_grammar, guided_decoding_backend, guided_whitespace_pattern) log warning_once 'Request contains the removed guided-decoding field(s) [...], which are ignored; output will NOT be constrained.'",
+                  "source": s(E + "serve/engine/protocol.py", 43, 76),
+                  "when": "['guided_json', 'guided_regex', 'guided_choice', 'guided_grammar', 'guided_decoding_backend', 'guided_whitespace_pattern'].exists(k, k in input.body && input.body[k] != null)"}
+CHAT_FIELD_CHECKS = [
+    {"title": "Field validation of ChatCompletionRequest (after its before validators): every field error is collected in field order, and validation_exception_handler answers 400 Bad Request, '<n> validation error(s):' plus each error, param from the first error's loc",
+     "source": s(CHAT_P, 223, 238),
+     "set": {"vars.ferrs": "= (!has(input.body.messages) ? [" + _fmt_err("missing", "body.messages", "Field required", "'\\'<dict of ' + string(size(input.body.filter(k, !(k in " + CHAT_DEFAULTS + ") || input.body[k] != " + CHAT_DEFAULTS + "[k]))) + ' items>\\''") + "] : (type(input.body.messages) != list ? [" + _fmt_err("list_type", "body.messages", "Input should be a valid list", "(type(input.body.messages) == string ? '\\'' + input.body.messages + '\\'' : string(input.body.messages))") + "] : []))"
+                    " + (has(input.body.max_tokens) && type(input.body.max_tokens) == string && !input.body.max_tokens.matches('^\\\\s*[-+]?[0-9]+\\\\s*$') ? [" + _fmt_err("int_parsing", "body.max_tokens", "Input should be a valid integer, unable to parse string as an integer", "'\\'' + input.body.max_tokens + '\\''") + "] : [])"
+                    " + (has(input.body.seed) && input.body.seed != null && " + BIG_NEG.format(x="input.body.seed") + " ? [" + _fmt_err("greater_than_equal", "body.seed", "Input should be greater than or equal to -9223372036854775808", "string(input.body.seed)", "\\'ge\\': -9223372036854775808") + "] : [])"
+                    " + (has(input.body.seed) && input.body.seed != null && " + BIG_POS.format(x="input.body.seed") + " ? [" + _fmt_err("less_than_equal", "body.seed", "Input should be less than or equal to 9223372036854775807", "string(input.body.seed)", "\\'le\\': 9223372036854775807") + "] : [])"
+                    " + (has(input.body.truncate_prompt_tokens) && type(input.body.truncate_prompt_tokens) == int && input.body.truncate_prompt_tokens < -1 ? [" + _fmt_err("greater_than_equal", "body.truncate_prompt_tokens", "Input should be greater than or equal to -1", "string(input.body.truncate_prompt_tokens)", "\\'ge\\': -1") + "] : [])"
+                    " + (has(input.body.priority) && input.body.priority != null && " + BIG_POS.format(x="input.body.priority") + " ? [" + _fmt_err("less_than_equal", "body.priority", "Input should be less than or equal to 9223372036854775807", "string(input.body.priority)", "\\'le\\': 9223372036854775807") + "] : [])"
+                    " + (has(input.body.priority) && input.body.priority != null && " + BIG_NEG.format(x="input.body.priority") + " ? [" + _fmt_err("greater_than_equal", "body.priority", "Input should be greater than or equal to -9223372036854775808", "string(input.body.priority)", "\\'ge\\': -9223372036854775808") + "] : [])"}},
+    {"if": "size(vars.ferrs) > 0",
+     "then": [{"title": "validation_exception_handler: the message lists the errors; param is the first error's cleaned loc",
+               "source": s(E + "serve/exception_handling/handlers/validation.py", 149, 195),
+               "fail": {"code": "Bad Request", "status": 400,
+                        "message": "= string(size(vars.ferrs)) + ' validation ' + (size(vars.ferrs) == 1 ? 'error' : 'errors') + ':\\n  ' + vars.ferrs.join('\\n  ')",
+                        "data": {"param": "= vars.ferrs[0].split('\\'loc\\': \\'')[1].split('\\'')[0]"}}}]},
+]
 main_route("openai-serving-chat", "POST", "/v1/chat/completions", s(CHAT_R, 41, 80), "openai-serving-chat.create-chat-completion",
-           {"body": "= input.body", "x_request_id": XRID}, "POST /v1/chat/completions: an OpenAI chat completion, JSON or SSE", body="ServingChatCompletionRequest",
+           {"body": "= input.body", "x_request_id": XRID, "priority_header": "= has(input.headers) && input.headers != null && 'X-Vllm-Priority' in input.headers ? input.headers['X-Vllm-Priority'] : null"}, "POST /v1/chat/completions: an OpenAI chat completion, JSON or SSE", body="ServingChatCompletionRequest",
            token_prefix="chatcmpl-", streams=True)
 main_route("openai-serving-chat-batch", "POST", "/v1/chat/completions/batch", s(CHAT_R, 83, 108), "openai-serving-chat-batch.create-batch-chat-completion",
            {"body": "= input.body", "x_request_id": XRID}, "POST /v1/chat/completions/batch: several conversations in one request",
@@ -677,11 +755,15 @@ main_route("openai-serving-responses", "POST", "/v1/responses", s(RESP_R, 48, 77
 MODELS_R = E + "openai/models/api_router.py"
 iface("openai-serving-models", "get-v1-models", "http", [s(MODELS_R, 20, 25)], "GET /v1/models: the served model(s) and loaded LoRA adapters",
       attributes={"method": "GET", "path": "/v1/models"}, request=http_req(path="/v1/models"),
-      errors=[{"code": "unauthorized", "status": 401}, {"code": "ConnectionRefusedError", "status": 0, "retryable": True}],
+      errors=[{"code": "unauthorized", "status": 401}, {"code": "ConnectionRefusedError", "status": 0, "retryable": True}, {"code": "Not Found", "status": 404}],
       behavior=[{"call": "launcher.accept-connection"},
                 {"call": "scaling-middleware.call", "input": {"path": "= input.path"}},
                 {"title": "/v1/models is under a guarded prefix", "source": s(E + "serve/middleware/authenticate.py", 11),
                  "call": "authentication-middleware.call", "input": {"path": "= input.path", "headers": "= has(input.headers) ? input.headers : {}"}},
+                {"title": "Starlette's router matches the path exactly: /v1/models/<id> has no route, so the framework answers 404 {\"detail\": \"Not Found\"} (FastAPI's default handler, not vLLM's ErrorResponse)",
+                 "source": s(MODELS_R, 20),
+                 "if": "has(input.path) && input.path != null && input.path.split('?')[0] != '/v1/models'",
+                 "then": [{"fail": {"code": "Not Found", "status": 404, "message": "Not Found"}}]},
                 {"call": "openai-serving-models.show-available-models", "as": "m"},
                 {"return": "= vars.m.value"}])
 LORA_R = E + "serve/lora/api_router.py"
@@ -734,7 +816,9 @@ main_route("cohere-serving-chat-v2", "POST", "/cohere/v2/chat/render", s(COH, 15
 EMB_R, CLS_R, POOL_R, SCO_R = (E + "pooling/embed/api_router.py", E + "pooling/classify/api_router.py",
                                E + "pooling/pooling/api_router.py", E + "pooling/scoring/api_router.py")
 FAC = E + "pooling/factories.py"
-POOL_BODY = obj({"model": {"type": "string", "examples": ["llama-8b"]}, "input": {"type": "array", "items": {"type": "string"}, "default": ["hello world"]}})
+POOL_BODY = obj({"model": {"type": "string", "examples": ["llama-8b"]}, "input": {"type": ["string", "array"], "items": {"type": ["string", "integer", "array"]}, "default": ["hello world"]},
+                 "truncate_prompt_tokens": {"type": ["integer", "null"], "default": None}, "truncation_side": {"type": ["string", "null"], "default": None},
+                 "dimensions": {"type": ["integer", "null"], "default": None}, "use_activation": {"type": ["boolean", "null"], "default": None}})
 
 
 def task_gate(tasks, src):
@@ -748,7 +832,7 @@ for comp_id, method, path, src, task, prefix, tasks, gsrc in [
     ("serving-embedding", "POST", "/v1/embeddings", s(EMB_R, 28, 43), "embed", "embd", ["embed"], s(FAC, 132, 135)),
     ("serving-embedding", "POST", "/v2/embed", s(EMB_R, 46, 61), "embed", "embd", ["embed"], s(FAC, 132, 135)),
     ("serving-classification", "POST", "/classify", s(CLS_R, 26, 33), "classify", "classify", ["classify"], s(FAC, 125, 130)),
-    ("serving-pooling", "POST", "/pooling", s(POOL_R, 27, 39), "embed", "pooling", ["embed", "classify", "token_embed", "token_classify"], s(FAC, 118, 123)),
+    ("serving-pooling", "POST", "/pooling", s(POOL_R, 27, 39), "embed", "pooling", ["embed", "classify", "token_embed", "token_classify", "plugin", "embed&token_classify"], s(FAC, 118, 123)),
     ("serving-scores", "POST", "/score", s(SCO_R, 37, 49), "score", "score", ["embed", "score", "classify"], s(FAC, 137, 140)),
     ("serving-scores", "POST", "/v1/score", s(SCO_R, 52, 66), "score", "score", ["embed", "score", "classify"], s(FAC, 137, 140)),
     ("serving-scores", "POST", "/rerank", s(SCO_R, 69, 81), "score", "rerank", ["embed", "score", "classify"], s(FAC, 137, 140)),
@@ -756,13 +840,39 @@ for comp_id, method, path, src, task, prefix, tasks, gsrc in [
     ("serving-scores", "POST", "/v2/rerank", s(SCO_R, 102, 111), "score", "rerank", ["embed", "score", "classify"], s(FAC, 137, 140)),
 ]:
     if comp_id == "serving-scores":
+        SCORE_EXTRA = {"truncate_prompt_tokens": {"type": ["integer", "null"], "default": None},
+                       "max_tokens_per_query": {"type": ["integer", "null"], "default": 0},
+                       "max_tokens_per_doc": {"type": ["integer", "null"], "default": 0}}
+        if prefix == "rerank":
+            sbody = obj({"model": {"type": "string", "examples": ["llama-8b"]},
+                         "query": {"type": ["string", "object"], "examples": ["What is the capital of France?"]},
+                         "documents": {"type": ["string", "array"], "examples": [["The capital of France is Paris."]]},
+                         "top_n": {"type": ["integer", "null"], "default": None}, **SCORE_EXTRA})
+        else:
+            sbody = obj({"model": {"type": "string", "examples": ["llama-8b"]},
+                         "queries": {"type": ["string", "array"], "examples": ["What is the capital of France?"]},
+                         "documents": {"type": ["string", "array"], "examples": ["The capital of France is Paris."]},
+                         "items": {"type": ["string", "array", "null"], "default": None},
+                         "data_1": {"type": ["string", "array", "object", "null"], "default": None},
+                         "data_2": {"type": ["string", "array", "object", "null"], "default": None},
+                         "text_1": {"type": ["string", "array", "object", "null"], "default": None},
+                         "text_2": {"type": ["string", "array", "object", "null"], "default": None},
+                         "top_n": {"type": ["integer", "null"], "default": None}, **SCORE_EXTRA})
         main_route(comp_id, method, path, src, "serving-scores.serve-score",
                    {"prefix": prefix, "body": "= input.body", "x_request_id": XRID},
                    f"{method} {path}: score (queries, documents) pairs with the model's scoring IO processor",
-                   body=obj({"model": {"type": "string", "examples": ["llama-8b"]},
-                             "queries": {"type": ["string", "array"], "examples": ["What is the capital of France?"]},
-                             "documents": {"type": ["string", "array"], "examples": ["The capital of France is Paris."]},
-                             "top_n": {"type": ["integer", "null"], "default": None}}),
+                   body=sbody,
+                   pre=[{"title": "The scoring router is included only when enable_scoring_api(supported_tasks, model_config)", "source": gsrc,
+                         "call": "pooling-factories.get-pooling-task", "as": "pt"},
+                        {"if": "!vars.pt.value.enable_scoring_api", "then": [{"fail": {"code": "Not Found", "status": 404, "message": "Not Found"}}]}])
+        continue
+    if path == "/pooling":
+        main_route(comp_id, method, path, src, "serving-pooling.serve-pooling",
+                   {"body": "= input.body", "x_request_id": XRID},
+                   f"{method} {path}: a pooling request for the model's pooling task (or the request's task, when supported)",
+                   body=obj({"model": {"type": "string", "examples": ["llama-8b"]}, "input": {"type": ["string", "array"], "items": {"type": ["string", "integer", "array"]}, "default": ["hello world"]},
+                             "task": {"type": ["string", "null"], "default": None}, "dimensions": {"type": ["integer", "null"], "default": None},
+                             "truncate_prompt_tokens": {"type": ["integer", "null"], "default": None}}),
                    pre=task_gate(tasks, gsrc))
         continue
     if path == "/v2/embed":
@@ -777,6 +887,14 @@ for comp_id, method, path, src, task, prefix, tasks, gsrc in [
     main_route(comp_id, method, path, src, "pooling-base-serving.serve",
                {"task": task, "prefix": prefix, "body": "= input.body", "x_request_id": XRID},
                f"{method} {path}: pooling request ({task})", body=POOL_BODY, pre=task_gate(tasks, gsrc))
+
+main_route("serving-generative-scoring", "POST", "/generative_scoring", s(E + "generate/generative_scoring/api_router.py", 30, 57),
+           "serving-generative-scoring.create-generative-scoring", {"body": "= input.body", "x_request_id": XRID},
+           "POST /generative_scoring: next-token label probabilities for query+item prompts on a generate model",
+           body=obj({"model": {"type": "string", "examples": ["llama-8b"]}, "query": {"type": ["string", "array"], "examples": ["Is Paris the capital of France? Answer:"]},
+                     "items": {"type": "array", "items": {"type": ["string", "array"]}, "examples": [[" Yes", " No"]]},
+                     "label_token_ids": {"type": "array", "items": {"type": "integer"}, "examples": [[9642, 2822]]},
+                     "apply_softmax": {"type": "boolean", "default": True}, "item_first": {"type": "boolean", "default": False}}))
 
 # scale-out routes: 403 unless enabled
 SO_GATE = [{"title": "Scale-out routes answer 403 unless --enable-scale-out (or render / tokens-only mode)", "source": s(E + "scale_out/factories.py", 82, 110),
@@ -873,6 +991,18 @@ if ec_ifaces:
         else:
             i.pop("errors", None)
         i["summary"] = i["summary"] + f" (contract copied from {i['attributes']['owner']}'s fragment)"
+
+# ChatCompletionRequest field validation runs after its before validators, in validate-request (the parse step)
+for _i in ifaces:
+    if _i["component"] == "openai-serving-chat" and _i["name"] == "validate-request":
+        _ret = _i["behavior"].pop()
+        _i["behavior"].extend(CHAT_FIELD_CHECKS)
+        _i["behavior"].append(_ret)
+        _i["errors"] = _i.get("errors", []) + [{"code": "Bad Request", "status": 400, "retryable": False}]
+    if _i["component"] in ("openai-serving-chat", "openai-serving-completion") and _i["name"] == "validate-request":
+        _ret = _i["behavior"].pop()
+        _i["behavior"].append(GUIDED_WARNING)
+        _i["behavior"].append(_ret)
 
 # ---------------------------------------------------------------------------
 # Emit
