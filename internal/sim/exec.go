@@ -340,12 +340,16 @@ func (r *run) invokeCall(c callSpec, ac *activeCall) (res callResult, err error)
 	r.checkSchema(f.Request, c.input, target+" request")
 
 	skey := model.StateKey(f.Component, c.inst)
-	slot, refused, err := r.acquire(f, skey, span, c)
-	if err != nil {
-		return callResult{}, err
-	}
-	if refused != nil {
-		return end(callResult{err: refused}, false)
+	disabled, off := r.lim.DisabledInterfaces[target]
+	var slot slot
+	if !off {
+		var refused *Error
+		if slot, refused, err = r.acquire(f, skey, span, c); err != nil {
+			return callResult{}, err
+		}
+		if refused != nil {
+			return end(callResult{err: refused}, false)
+		}
 	}
 	// A killed task unwinds through here: free its slot for the others.
 	defer func() {
@@ -356,7 +360,7 @@ func (r *run) invokeCall(c callSpec, ac *activeCall) (res callResult, err error)
 	// Limits (§13.1 item 27) are checked after capacity, before the
 	// behavior; a concurrency lease they take is released when the call
 	// ends, whatever the outcome.
-	if len(f.Limits) > 0 {
+	if len(f.Limits) > 0 && !off {
 		refused, leases, lerr := r.interfaceLimits(f, c, skey, span)
 		if lerr != nil {
 			return callResult{}, lerr
@@ -433,9 +437,9 @@ func (r *run) invokeCall(c callSpec, ac *activeCall) (res callResult, err error)
 	default:
 		// With latency_by_outcome (§14.13) the service time depends on the
 		// outcome, so it is spent when the behavior ends (outcomeLatency).
-		byOutcome := len(f.LatencyByOutcome) > 0
+		byOutcome := len(f.LatencyByOutcome) > 0 && !off
 		var lat int64
-		if !byOutcome {
+		if !byOutcome && !off {
 			if lat, err = r.latency(f, c.input, c.inst, c.deadline); err != nil {
 				return callResult{}, err
 			}
@@ -466,12 +470,17 @@ func (r *run) invokeCall(c callSpec, ac *activeCall) (res callResult, err error)
 			fr.crash = newCrash(ft, target)
 		}
 		var m *callResult
-		if len(r.mocks) > 0 {
+		if len(r.mocks) > 0 && !off {
 			if m, err = r.matchMock(fr); err != nil {
 				return callResult{}, err
 			}
 		}
-		if m != nil {
+		if off {
+			res = disabled.callResult()
+			if fr.stream != nil && !fr.stream.live && res.ok {
+				res.value = collected(fr.stream, res.value)
+			}
+		} else if m != nil {
 			res, mock = *m, true
 		} else if res, err = r.execute(fr, c.depth); err != nil {
 			return callResult{}, err

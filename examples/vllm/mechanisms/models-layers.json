@@ -1,0 +1,1940 @@
+{
+  "area": "models-layers",
+  "mechanisms": [
+    {
+      "id": "models-layers.model-load-pipeline",
+      "kind": "pipeline",
+      "name": "Model load: construct, load weights, post-process",
+      "trigger": "once per worker rank at startup (GPUModelRunner.load_model -> get_model)",
+      "observable": "the model class is built under the model dtype on the target device, weights stream into it, every quant method and deferred attention layer post-processes its tensors, and an eval-mode model is returned; one module whose quant method cannot take pre-processed weights raises RuntimeError under the IPC loader",
+      "citations": [
+        "vllm/model_executor/model_loader/__init__.py:131-143",
+        "vllm/model_executor/model_loader/base_loader.py:62-115",
+        "vllm/model_executor/model_loader/utils.py:74-130",
+        "vllm/model_executor/model_loader/utils.py:133-208"
+      ],
+      "interfaces": [
+        "model-loader.get-model",
+        "base-model-loader.load-model",
+        "model-loader-utils.initialize-model",
+        "model-loader-utils.process-weights-after-loading"
+      ],
+      "fidelity": "partial",
+      "note": "Main path runs, but post-processing only covers FP8 linear and KV scales; finalize_layerwise_processing, model-level process_weights_after_loading, device_loading_context for offloaded modules and the pre-processed-weights refusal are not modeled."
+    },
+    {
+      "id": "models-layers.architecture-resolution",
+      "kind": "dispatch",
+      "name": "Architecture to model class resolution",
+      "trigger": "model_config.registry.resolve_model_cls during get_model_architecture and config resolution",
+      "observable": "model_impl transformers or terratorch forces those classes, auto with no registered arch and no conversion falls back to Transformers, otherwise the first arch that normalizes and imports wins, and nothing resolved raises with a previously-supported or OOT hint",
+      "citations": [
+        "vllm/model_executor/models/registry.py:1376-1428",
+        "vllm/model_executor/models/registry.py:1297-1321",
+        "vllm/model_executor/models/registry.py:1177-1208",
+        "vllm/model_executor/models/registry.py:72-212",
+        "vllm/model_executor/models/registry.py:799-855",
+        "vllm/model_executor/model_loader/utils.py:299-332"
+      ],
+      "interfaces": [
+        "model-registry.resolve-model-cls",
+        "model-registry.raise-for-unsupported",
+        "model-registry.load-model-cls",
+        "model-loader-utils.get-model-architecture"
+      ],
+      "fidelity": "partial",
+      "note": "The order and refusals are read against the code, but the terratorch branch and convert_type gating are missing, and transformers class lookup is an authored choice."
+    },
+    {
+      "id": "models-layers.decoder-forward-llama-family",
+      "kind": "pipeline",
+      "name": "Decoder forward (Llama-style family)",
+      "trigger": "every forward step of LlamaForCausalLM and classes built on its decoder layer",
+      "observable": "tokens are embedded, each decoder layer runs qkv, rotary, attention, o_proj and SwiGLU MLP with residuals, the final norm applies, and hidden states return for the runner to take logits from; layer time scales with layer count and TP",
+      "citations": [
+        "vllm/model_executor/models/llama.py:224-234",
+        "vllm/model_executor/models/llama.py:406-457",
+        "vllm/model_executor/models/llama.py:541-543",
+        "vllm/model_executor/models/qwen2.py:324-340"
+      ],
+      "interfaces": [
+        "llama-for-causal-lm.forward",
+        "llama-model.forward",
+        "llama-decoder-layer.forward",
+        "llama-attention.forward",
+        "llama-mlp.forward",
+        "qwen2-model.forward",
+        "rms-norm.forward-cuda",
+        "silu-and-mul.forward-cuda"
+      ],
+      "fidelity": "partial",
+      "note": "Layer 0 runs and the rest are extrapolated from its duration, which holds for uniform layers. Aux hidden states (Eagle) and the hc_sp, DBO and FP8 variants are not modeled."
+    },
+    {
+      "id": "models-layers.moe-forward-pipeline",
+      "kind": "pipeline",
+      "name": "MoE layer forward",
+      "trigger": "every forward of an MoE decoder layer",
+      "observable": "the gate gives router logits, the moe_forward op dispatches, routes and runs experts, optional shared experts add, routed scale and transform apply, and the sum reduces once across TP; padding to hidden_dim is trimmed after the experts",
+      "citations": [
+        "vllm/model_executor/layers/fused_moe/runner/moe_runner.py:688-798",
+        "vllm/model_executor/layers/fused_moe/runner/moe_runner.py:868-944",
+        "vllm/model_executor/layers/fused_moe/runner/moe_runner.py:598-651",
+        "vllm/model_executor/layers/fused_moe/runner/moe_runner.py:483-517",
+        "vllm/model_executor/layers/fused_moe/runner/moe_runner.py:530-587",
+        "vllm/model_executor/models/mixtral.py:93-131"
+      ],
+      "interfaces": [
+        "mixtral-moe.forward",
+        "moe-runner.forward",
+        "moe-runner.moe-forward",
+        "moe-runner.moe-forward-shared",
+        "moe-runner.forward-impl",
+        "routed-experts.forward-modular",
+        "gate-linear.forward"
+      ],
+      "fidelity": "partial",
+      "note": "Modular route-then-experts with reduction is modeled. Monolithic kernels, runner-held gate, padding, routed input and output transforms, and PCP dispatch are not."
+    },
+    {
+      "id": "models-layers.tensor-parallel-linear-layers",
+      "kind": "pipeline",
+      "name": "Tensor-parallel linear layers",
+      "trigger": "any ColumnParallelLinear or RowParallelLinear forward",
+      "observable": "a column layer runs its output shard and all-gathers only with gather_output; a row layer runs its input shard, adds bias on rank 0 and all-reduces partial sums when reduce_results is set; the quant method does the GEMM",
+      "citations": [
+        "vllm/model_executor/layers/linear.py:603-621",
+        "vllm/model_executor/layers/linear.py:1762-1788",
+        "vllm/model_executor/layers/linear.py:411-422",
+        "vllm/model_executor/layers/linear.py:154-164"
+      ],
+      "interfaces": [
+        "column-parallel-linear.forward",
+        "row-parallel-linear.forward",
+        "unquantized-linear-method.apply",
+        "tensor-model-parallel.all-reduce",
+        "tensor-model-parallel.all-gather"
+      ],
+      "fidelity": "partial",
+      "note": "Shards and collectives match for the forward paths read; the input_is_parallel split and the DCP group column variant are not modeled."
+    },
+    {
+      "id": "models-layers.vocab-embedding-and-lm-head",
+      "kind": "pipeline",
+      "name": "Vocabulary embedding and LM head",
+      "trigger": "embedding on first stage; compute_logits after the last stage, for sampled positions",
+      "observable": "a TP rank masks ids outside its vocab shard and all-reduces; the LM head GEMMs the shard, gathers across TP, strips vocab padding, applies soft cap and scale; platforms with use_all_gather produce logits on every rank, others only on rank 0",
+      "citations": [
+        "vllm/model_executor/layers/vocab_parallel_embedding.py:522-565",
+        "vllm/model_executor/layers/logits_processor.py:98-134",
+        "vllm/model_executor/layers/logits_processor.py:136-199",
+        "vllm/model_executor/layers/logits_processor.py:201-318"
+      ],
+      "interfaces": [
+        "vocab-parallel-embedding.forward",
+        "unquantized-embedding-method.apply",
+        "logits-processor.forward",
+        "llama-for-causal-lm.compute-logits"
+      ],
+      "fidelity": "partial",
+      "note": "Only all-gather is modeled, so the rank-0-only gather is unreachable; get_top_tokens and get_top_k_tokens (logprobs fusion) are absent."
+    },
+    {
+      "id": "models-layers.attention-layer-kv-binding",
+      "kind": "pipeline",
+      "name": "Attention layer KV write and op binding",
+      "trigger": "every Attention.forward",
+      "observable": "q, k, v are reshaped by heads; K/V are written to the paged cache unless the backend writes in forward or the layer shares a cache; the unified_attention_with_output op reads the layer metadata and KV cache from the forward context and calls the backend",
+      "citations": [
+        "vllm/model_executor/layers/attention/attention.py:229-300",
+        "vllm/model_executor/layers/attention/attention.py:680-722",
+        "vllm/model_executor/layers/attention/attention.py:724-747",
+        "vllm/model_executor/layers/attention/attention.py:767-795"
+      ],
+      "interfaces": [
+        "attention-layer.init",
+        "attention-layer.forward",
+        "attention-layer.get-attention-context",
+        "attention-layer.unified-kv-cache-update",
+        "attention-layer.unified-attention-with-output"
+      ],
+      "fidelity": "partial",
+      "note": "Skimmed: the backend path is flash-attention only here; other layers such as MMEncoderAttention and static sink are not modeled."
+    },
+    {
+      "id": "models-layers.quantization-config-resolution",
+      "kind": "pipeline",
+      "name": "Quantization config resolution",
+      "trigger": "get_quant_config at model init, when model_config.quantization is set",
+      "observable": "the method selects a config class; settings come from checkpoint quantization_config or text_config or compression_config, then hf_overrides, then a named file; online shorthands build OnlineQuantizationConfig; online args compose onto a checkpoint config; a missing or duplicated config file is ValueError",
+      "citations": [
+        "vllm/model_executor/model_loader/weight_utils.py:192-396",
+        "vllm/model_executor/layers/quantization/__init__.py:112-197",
+        "vllm/model_executor/layers/quantization/__init__.py:61-110",
+        "vllm/model_executor/model_loader/utils.py:361-380"
+      ],
+      "interfaces": [
+        "weight-utils.get-quant-config",
+        "quantization.get-quantization-config",
+        "fp8-config.from-config",
+        "model-opt-quant-config-base.override-quantization-method"
+      ],
+      "fidelity": "partial",
+      "note": "Checkpoint config and online shorthands are modeled; hf_overrides file and JSON, modelopt-specific file reading, and the compressed-tensors head counts are not."
+    },
+    {
+      "id": "models-layers.layer-quant-method-selection",
+      "kind": "dispatch",
+      "name": "Per-layer quant method selection",
+      "trigger": "each linear, routed experts or attention layer at construction, via quant_config.get_quant_method",
+      "observable": "each layer gets a linear, MoE or KV-cache method by its prefix and kind, unquantized when ignored",
+      "citations": [
+        "vllm/model_executor/layers/quantization/fp8.py:177-209",
+        "vllm/model_executor/layers/quantization/base_config.py:292-320",
+        "vllm/model_executor/layers/linear.py:259-306",
+        "vllm/model_executor/layers/quantization/utils/quant_utils.py:617-650"
+      ],
+      "interfaces": [
+        "fp8-config.get-quant-method",
+        "quant-config-utils.find-matching-patterns",
+        "quant-utils.group-shape-kind"
+      ],
+      "fidelity": "partial",
+      "note": "Only FP8 config selection is modeled."
+    },
+    {
+      "id": "models-layers.linear-kernel-selection",
+      "kind": "dispatch",
+      "name": "Scaled-mm linear kernel selection",
+      "trigger": "quant method init, per format",
+      "observable": "a platform-ordered list of kernels is tried and the first supported wins; a forced linear backend filters the list; none left raises ValueError listing each kernel reason, then a log names the chosen kernel",
+      "citations": [
+        "vllm/model_executor/kernels/linear/__init__.py:443-504",
+        "vllm/model_executor/kernels/linear/__init__.py:630-724",
+        "vllm/model_executor/kernels/linear/__init__.py:726-813",
+        "vllm/model_executor/kernels/linear/__init__.py:378-430",
+        "vllm/model_executor/kernels/linear/__init__.py:1249-1270"
+      ],
+      "interfaces": [
+        "fp8-linear-method.select-kernel"
+      ],
+      "fidelity": "partial",
+      "note": "FP8 per-tensor and block on CUDA are modeled in detail; INT8, MXFP4, MXFP8, NVFP4, MXFP6 and other platforms lists, and register_linear_kernel, are not."
+    },
+    {
+      "id": "models-layers.quantized-linear-apply",
+      "kind": "pipeline",
+      "name": "FP8 linear weights and GEMM",
+      "trigger": "FP8 checkpoint linear: process_weights_after_loading at load, apply every forward",
+      "observable": "weights are transposed and scales canonicalized per kernel format at load, then the chosen scaled-mm kernel quantizes activations and multiplies; block format keeps 128x128 scales",
+      "citations": [
+        "vllm/model_executor/layers/quantization/fp8.py:282-356",
+        "vllm/model_executor/layers/quantization/fp8.py:358-416",
+        "vllm/model_executor/layers/quantization/fp8.py:418-461",
+        "vllm/model_executor/kernels/linear/scaled_mm/cutlass.py:245-275",
+        "vllm/model_executor/kernels/linear/scaled_mm/BlockScaledMMLinearKernel.py:100-140"
+      ],
+      "interfaces": [
+        "fp8-linear-method.apply",
+        "fp8-linear-method.process-weights-after-loading",
+        "cutlass-fp8-scaled-mm-linear-kernel.apply-scaled-mm",
+        "custom-ops.cutlass-scaled-mm",
+        "triton-fp8-block-scaled-mm-kernel.apply-weights",
+        "scaled-mm-triton.w8a8-triton-block-scaled-mm-func",
+        "fp8-utils.per-token-group-quant-fp8",
+        "model-opt-linear-method.apply",
+        "model-opt-quant-config-base.override-quantization-method"
+      ],
+      "fidelity": "partial",
+      "note": "Skimmed: FP8 and ModelOpt are modeled as latency rooflines; the other formats are not."
+    },
+    {
+      "id": "models-layers.multimodal-processor-pipeline",
+      "kind": "pipeline",
+      "name": "Multimodal prompt processing",
+      "trigger": "each request with media, in the frontend renderer",
+      "observable": "the data is parsed and validated against limits, hashed, items not in the processor cache go through the HF processor, cached items reuse prompt updates, and output is token ids with placeholder ranges, kwargs and hashes; passthrough or uncached data takes the whole path",
+      "citations": [
+        "vllm/multimodal/processing/processor.py:1811-1848",
+        "vllm/multimodal/processing/processor.py:1497-1567",
+        "vllm/multimodal/processing/processor.py:1315-1332",
+        "vllm/multimodal/processing/processor.py:1345-1384",
+        "vllm/multimodal/processing/processor.py:1411-1460",
+        "vllm/multimodal/registry.py:150-167",
+        "vllm/multimodal/parse.py:1-60",
+        "vllm/multimodal/processing/context.py:402-406"
+      ],
+      "interfaces": [
+        "base-multi-modal-processor.apply",
+        "base-multi-modal-processor.apply-hf-processor-main",
+        "multi-modal-registry.create-processor",
+        "multi-modal-data-parser.parse-mm-data",
+        "base-processing-info.parse-mm-data",
+        "base-processing-info.validate-num-items",
+        "base-processing-info.get-hf-processor",
+        "base-processing-info.get-tokenizer",
+        "base-processing-info.get-hf-config",
+        "input-processing-context.get-hf-processor",
+        "input-processing-context.get-tokenizer",
+        "input-processing-context.get-hf-config"
+      ],
+      "fidelity": "partial",
+      "note": "The cached path is read against the code and runs; the passthrough bypass, encoder-decoder apply and modalities beyond Qwen images are not."
+    },
+    {
+      "id": "models-layers.multimodal-embedding-merge",
+      "kind": "pipeline",
+      "name": "Multimodal embedding merge",
+      "trigger": "each forward of a multimodal model with encoder outputs",
+      "observable": "text embeddings are computed, then item embeddings overwrite placeholder positions; a count mismatch is ValueError naming the items and placeholder count, and no embeddings means text only",
+      "citations": [
+        "vllm/model_executor/models/interfaces.py:494-516",
+        "vllm/model_executor/models/utils.py:717-751",
+        "vllm/model_executor/models/utils.py:688-707"
+      ],
+      "interfaces": [
+        "qwen2-vl-for-conditional-generation.embed-input-ids",
+        "vocab-parallel-embedding.forward"
+      ],
+      "fidelity": "modeled"
+    },
+    {
+      "id": "models-layers.lora-two-tier-lru",
+      "kind": "cache",
+      "name": "LoRA CPU and GPU LRU slots",
+      "trigger": "add_lora and every step with LoRA requests (set_active_adapters)",
+      "observable": "a request adds the adapter (loaded and validated before anything is evicted, then the oldest unpinned CPU copy goes when over max_cpu_loras) and activates it in a GPU slot, evicting the least recently active when max_loras are full; more distinct adapters than slots in a step is RuntimeError; pins exempt from eviction, all pinned is an error",
+      "citations": [
+        "vllm/lora/worker_manager.py:274-287",
+        "vllm/lora/worker_manager.py:289-325",
+        "vllm/lora/model_manager.py:346-404",
+        "vllm/lora/model_manager.py:1381-1433",
+        "vllm/lora/model_manager.py:62-71"
+      ],
+      "interfaces": [
+        "lru-cache-worker-lora-manager.set-active-adapters",
+        "lru-cache-worker-lora-manager.add-adapter",
+        "lru-cache-lora-model-manager.add-adapter",
+        "lru-cache-lora-model-manager.activate-adapter",
+        "lru-cache-lora-model-manager.remove-adapter",
+        "lru-cache-lora-model-manager.pin-adapter",
+        "lru-cache-lora-model-manager.list-adapters",
+        "lru-cache-worker-lora-manager.list-adapters",
+        "lru-cache-worker-lora-manager.remove-adapter",
+        "lru-cache-worker-lora-manager.pin-adapter"
+      ],
+      "fidelity": "modeled"
+    },
+    {
+      "id": "models-layers.lora-adapter-load-validation",
+      "kind": "pipeline",
+      "name": "LoRA adapter load and validation",
+      "trigger": "first use of an adapter on a worker",
+      "observable": "adapter_config.json is read, rank and bias are checked against max_lora_rank, tensors load on CPU after filtering to expected modules (an unexpected one raises), MoE format and modules_to_save are checked, and a missing path becomes LoRAAdapterNotFoundError",
+      "citations": [
+        "vllm/lora/worker_manager.py:106-174",
+        "vllm/lora/peft_helper.py:176-202",
+        "vllm/lora/lora_model.py:120-195",
+        "vllm/lora/lora_model.py:197-260",
+        "vllm/lora/model_manager.py:1252-1336",
+        "vllm/lora/utils.py:329-383"
+      ],
+      "interfaces": [
+        "lru-cache-worker-lora-manager.load-adapter",
+        "peft-helper.from-local-dir",
+        "peft-helper.validate-legal",
+        "lru-cache-lora-model-manager.validate-moe-lora-format",
+        "lru-cache-lora-model-manager.validate-modules-to-save",
+        "lora-request.init",
+        "lora-request.equals"
+      ],
+      "fidelity": "partial",
+      "note": "Validation order is modeled; the expected-module filter, weight mapper, token classification check and HF path resolution are not."
+    },
+    {
+      "id": "models-layers.lora-punica-forward",
+      "kind": "pipeline",
+      "name": "LoRA Punica forward (shrink and expand)",
+      "trigger": "every forward with active adapters, through wrapped layers",
+      "observable": "the step mapping selects a slot per token; the base GEMM runs, then per-token shrink and expand add A then B, or both overlap on two streams with VLLM_LORA_ENABLE_DUAL_STREAM; full-module and logits forms also exist",
+      "citations": [
+        "vllm/lora/layers/base_linear.py:198-235",
+        "vllm/lora/punica_wrapper/punica_gpu.py:206-269",
+        "vllm/lora/punica_wrapper/punica_gpu.py:74-89",
+        "vllm/lora/model_manager.py:424-457",
+        "vllm/lora/punica_wrapper/punica_gpu.py:271-331"
+      ],
+      "interfaces": [
+        "base-linear-layer-with-lora.apply",
+        "base-linear-layer-with-lora.lora-linear-async",
+        "punica-wrapper-gpu.add-lora-linear",
+        "lora-shrink-op.lora-shrink",
+        "lora-expand-op.lora-expand"
+      ],
+      "fidelity": "partial",
+      "note": "The linear path is modeled; set_adapter_mapping, logits and full-module paths are not."
+    },
+    {
+      "id": "models-layers.checkpoint-file-resolution",
+      "kind": "pipeline",
+      "name": "Checkpoint file resolution and download",
+      "trigger": "download_model on the engine side, then get_all_weights on each rank",
+      "observable": "load_format picks the file patterns (auto: mistral consolidated files, else HF), a non-local model is downloaded under a per-model file lock, the safetensors index de-duplicates shards, non-inference files are dropped, and no matching file is a RuntimeError",
+      "citations": [
+        "vllm/model_executor/model_loader/default_loader.py:147-263",
+        "vllm/model_executor/model_loader/weight_utils.py:432-538",
+        "vllm/model_executor/model_loader/weight_utils.py:585-630",
+        "vllm/model_executor/model_loader/weight_utils.py:91-103"
+      ],
+      "interfaces": [
+        "default-model-loader.prepare-weights",
+        "default-model-loader.download-model",
+        "weight-utils.download-weights-from-hf",
+        "hf-hub.download-weights"
+      ],
+      "fidelity": "partial",
+      "note": "Download and no-files refusal are modeled; the index de-duplication, ModelScope path and inference-file filter are not."
+    },
+    {
+      "id": "models-layers.weights-completeness-check",
+      "kind": "gate",
+      "name": "Loaded-weights completeness check",
+      "trigger": "after model.load_weights, default on for unquantized models that return their loaded set; forced by enable_weights_track",
+      "observable": "any parameter neither loaded nor exempted fails the load with \"Following weights were not initialized\"; quantized models exempt only online-quant, KV-cache, empty-placeholder and config-built parameters",
+      "citations": [
+        "vllm/model_executor/model_loader/default_loader.py:485-518",
+        "vllm/model_executor/model_loader/default_loader.py:520-567"
+      ],
+      "interfaces": [
+        "default-model-loader.load-weights"
+      ],
+      "fidelity": "partial",
+      "note": "The unquantized failure is modeled from a seeded missing_params list; the per-module exemptions and the enable_weights_track override are not."
+    },
+    {
+      "id": "models-layers.hf-to-module-weight-mapping",
+      "kind": "pipeline",
+      "name": "Checkpoint name mapping and TP shard loading",
+      "trigger": "every (name, tensor) of model.load_weights, for models using AutoWeightsLoader",
+      "observable": "names are remapped or dropped by WeightsMapper, stacked q/k/v and gate/up tensors land in fused parameters by shard id, each rank keeps its column or row slice, and an unknown name fails with the missing module",
+      "citations": [
+        "vllm/model_executor/models/utils.py:49-164",
+        "vllm/model_executor/models/utils.py:216-500",
+        "vllm/model_executor/layers/linear.py:759-867",
+        "vllm/model_executor/layers/linear.py:1198-1324",
+        "vllm/model_executor/layers/linear.py:1735-1751",
+        "vllm/model_executor/parameter.py:127-199"
+      ],
+      "interfaces": [
+        "auto-weights-loader.load-weights",
+        "weights-mapper.apply",
+        "weights-mapper.map-name",
+        "qkv-parallel-linear.weight-loader",
+        "qkv-parallel-linear.load-weights",
+        "merged-column-parallel-linear.weight-loader",
+        "merged-column-parallel-linear.load-weights",
+        "column-parallel-linear.weight-loader",
+        "row-parallel-linear.weight-loader",
+        "replicated-linear.weight-loader"
+      ],
+      "fidelity": "partial",
+      "note": "Mapping and shard-id validation run; slices are represented by shape checks and byte counts, not the v2 loaders on BasevLLMParameter or packed/Marlin paths."
+    },
+    {
+      "id": "models-layers.load-format-dispatch",
+      "kind": "dispatch",
+      "name": "Load format to loader class",
+      "trigger": "get_model_loader, from load_config.load_format",
+      "observable": "auto/hf/safetensors/pt/npcache/mistral/fastsafetensors/instanttensor go to the default loader; dummy, ipc_cache, tensorizer, sharded_state, runai_streamer and modelexpress go to their own loaders; an unknown format is a ValueError and a plugin can register a new one",
+      "citations": [
+        "vllm/model_executor/model_loader/__init__.py:33-66",
+        "vllm/model_executor/model_loader/__init__.py:69-128",
+        "vllm/model_executor/model_loader/dummy_loader.py:35-48"
+      ],
+      "interfaces": [
+        "model-loader.get-model",
+        "dummy-model-loader.load-weights"
+      ],
+      "fidelity": "partial",
+      "note": "Only the default, dummy and ipc loaders are reachable behaviors; register_model_loader and the other loaders are not."
+    },
+    {
+      "id": "models-layers.weight-iterator-selection",
+      "kind": "dispatch",
+      "name": "Weight iterator strategy selection",
+      "trigger": "load_weights -> _get_weights_iterator, per checkpoint source",
+      "observable": "npcache, fastsafetensors, instanttensor, multi-thread, torchao, eager, lazy or PyTorch-bin reading is chosen from load format and extra config; multithread with a non-lazy safetensors strategy is refused at construction; every path yields (name, tensor) in natural shard order",
+      "citations": [
+        "vllm/model_executor/model_loader/default_loader.py:117-145",
+        "vllm/model_executor/model_loader/default_loader.py:265-365",
+        "vllm/model_executor/model_loader/weight_utils.py:1079-1213",
+        "vllm/model_executor/model_loader/weight_utils.py:1216-1243",
+        "vllm/model_executor/model_loader/weight_utils.py:1283-1350",
+        "vllm/model_executor/model_loader/weight_utils.py:846-890"
+      ],
+      "interfaces": [],
+      "fidelity": "absent"
+    },
+    {
+      "id": "models-layers.moe-layer-assembly",
+      "kind": "lifecycle",
+      "name": "MoE layer assembly (FusedMoEFactory)",
+      "trigger": "decoder construction of an MoE model",
+      "observable": "parallel config, expert counts, optional EPLB state, expert map, router, FusedMoEConfig, RoutedExperts and runner are built in order; EPLB needs an even split and redundant experts need EPLB, else the build fails",
+      "citations": [
+        "vllm/model_executor/layers/fused_moe/layer.py:72-85",
+        "vllm/model_executor/layers/fused_moe/layer.py:225-420",
+        "vllm/model_executor/layers/fused_moe/config.py:1006-1100",
+        "vllm/model_executor/layers/fused_moe/config.py:1265-1300",
+        "vllm/model_executor/layers/fused_moe/modular_kernel.py:1613-1690"
+      ],
+      "interfaces": [
+        "fused-moe-layer.determine-expert-counts",
+        "fused-moe-parallel-config.make",
+        "fused-moe-parallel-config.make-no-parallel",
+        "fused-moe-config.init",
+        "fused-moe-quant-config.make",
+        "fused-moe-kernel.init",
+        "moe-activation.from-str"
+      ],
+      "fidelity": "partial",
+      "note": "Pieces run as separate functions and from the Mixtral init; no behavior runs the factory order or the EPLB refusals."
+    },
+    {
+      "id": "models-layers.moe-router-selection",
+      "kind": "dispatch",
+      "name": "MoE router selection and default top-k",
+      "trigger": "create_fused_moe_router, then _select_experts each MoE forward",
+      "observable": "a priority chain (routing simulator env, zero expert, CPU, grouped, custom function, bias, AITER shared, fused top-k) picks the router; routing yields top-k weights and ids, unsupported scoring functions fail",
+      "citations": [
+        "vllm/model_executor/layers/fused_moe/router/router_factory.py:42-264",
+        "vllm/model_executor/layers/fused_moe/router/base_router.py:260-303",
+        "vllm/model_executor/layers/fused_moe/router/fused_topk_router.py:100-174",
+        "vllm/model_executor/layers/fused_moe/config.py:135-173"
+      ],
+      "interfaces": [
+        "fused-top-k-router.select-experts",
+        "fused-moe-config.get-routing-method-type",
+        "custom-ops.topk-softmax",
+        "custom-ops.topk-sigmoid"
+      ],
+      "fidelity": "partial",
+      "note": "FusedTopKRouter is modeled and hard-wired by the runner; the selection chain is not."
+    },
+    {
+      "id": "models-layers.moe-kernel-backend-selection",
+      "kind": "dispatch",
+      "name": "Expert kernel backend selection",
+      "trigger": "quant method construction for an MoE layer",
+      "observable": "per format, an ordered priority list of kernels is walked with is_supported_config checks (device, activation, quant scheme, parallel config, routing, shape); a forced moe_backend that fails raises with the reason, and fallback classes pick at run time by shape",
+      "citations": [
+        "vllm/model_executor/layers/fused_moe/oracle/unquantized.py:50-108",
+        "vllm/model_executor/layers/fused_moe/oracle/unquantized.py:222-372",
+        "vllm/model_executor/layers/fused_moe/oracle/fp8.py:394-540",
+        "vllm/model_executor/layers/fused_moe/modular_kernel.py:546-595",
+        "vllm/model_executor/layers/fused_moe/experts/fallback.py:14-60"
+      ],
+      "interfaces": [
+        "trtllm-mxint4-experts.is-supported-config"
+      ],
+      "fidelity": "shell",
+      "note": "is-supported-config has no caller and covers one class; routed-experts.forward-modular always calls triton-experts.apply."
+    },
+    {
+      "id": "models-layers.moe-triton-expert-kernel",
+      "kind": "pipeline",
+      "name": "Triton expert kernel",
+      "trigger": "TritonExperts.apply, the default unquantized CUDA backend",
+      "observable": "tokens are aligned into per-expert blocks (skipped for tiny batches), w13 GEMM, activation with clamps or masks, w2 GEMM, then weighted sum over top-k",
+      "citations": [
+        "vllm/model_executor/layers/fused_moe/experts/triton_moe.py:243-608",
+        "vllm/model_executor/layers/fused_moe/fused_moe.py:1451-1500",
+        "vllm/model_executor/layers/fused_moe/moe_align_block_size.py:55-80",
+        "vllm/model_executor/layers/fused_moe/activation.py:314-340"
+      ],
+      "interfaces": [
+        "triton-experts.apply",
+        "custom-ops.moe-align-block-size",
+        "custom-ops.moe-sum",
+        "fused-moe.invoke-fused-moe-triton-kernel",
+        "fused-moe-activation.apply-moe-activation",
+        "fused-moe-activation.apply-moe-activation-masked",
+        "fused-moe-activation.silu-and-mul-with-clamp",
+        "fused-moe-utils.swiglu-limit-func",
+        "layers-activation.swiglustep-and-mul-triton"
+      ],
+      "fidelity": "partial",
+      "note": "Skimmed: latency is a shape roofline; the other 30-odd expert classes (TRTLLM, DeepGEMM, CUTLASS, CPU, AITER, Marlin) are not modeled."
+    },
+    {
+      "id": "models-layers.ep-dispatch-combine",
+      "kind": "dispatch",
+      "name": "Expert-parallel dispatch and combine selection",
+      "trigger": "MoE kernel build, from the all2all backend; then each forward under EP",
+      "observable": "passthrough, no-DP, naive allgather and reduce-scatter, DeepEP HT, LL or V2, NIXL EP, MoonEP, Mori and FlashInfer NVLink transports each move tokens to the ranks holding their experts and back, with a dispatcher-count layout",
+      "citations": [
+        "vllm/model_executor/layers/fused_moe/all2all_utils.py:182-260",
+        "vllm/model_executor/layers/fused_moe/prepare_finalize/naive_dp_ep.py:72-247",
+        "vllm/model_executor/layers/fused_moe/prepare_finalize/deepep_ll.py:50-120",
+        "vllm/model_executor/layers/fused_moe/prepare_finalize/deepep_ht.py:29-100",
+        "vllm/model_executor/layers/fused_moe/prepare_finalize/deepep_v2.py:70-140",
+        "vllm/model_executor/layers/fused_moe/prepare_finalize/nixl_ep.py:48-120",
+        "vllm/model_executor/layers/fused_moe/prepare_finalize/moonep.py:163-220",
+        "vllm/model_executor/layers/fused_moe/prepare_finalize/flashinfer_nvlink_two_sided.py:23-80"
+      ],
+      "interfaces": [
+        "all2all-utils.maybe-make-prepare-finalize",
+        "routed-experts.forward-modular",
+        "group-coordinator.dispatch",
+        "group-coordinator.combine"
+      ],
+      "fidelity": "partial",
+      "note": "Selection and naive dispatch/combine are modeled; the all-to-all transports are named but not run, and buffer limits and async prepare are absent."
+    },
+    {
+      "id": "models-layers.expert-placement-and-maps",
+      "kind": "lifecycle",
+      "name": "Expert placement and routing tables",
+      "trigger": "ExpertMapManager construction, and update after EPLB",
+      "observable": "experts split evenly over EP ranks, linear or round-robin; round-robin falls back to linear with a warning without expert groups or backend support; the manager builds global-to-physical tables for DeepEP and NIXL and maps global to local ids",
+      "citations": [
+        "vllm/model_executor/layers/fused_moe/expert_map_manager.py:22-114",
+        "vllm/model_executor/layers/fused_moe/expert_map_manager.py:116-150",
+        "vllm/model_executor/layers/fused_moe/expert_map_manager.py:182-260",
+        "vllm/model_executor/layers/fused_moe/expert_map_manager.py:369-399",
+        "vllm/model_executor/layers/fused_moe/expert_map_manager.py:458-516"
+      ],
+      "interfaces": [
+        "expert-map-manager.determine-expert-map",
+        "expert-map-manager.determine-expert-placement-strategy"
+      ],
+      "fidelity": "partial",
+      "note": "The two functions match the code line by line; routing tables, the AITER expert mask and manager update are not modeled."
+    },
+    {
+      "id": "models-layers.eplb-logical-to-physical-record",
+      "kind": "metric",
+      "name": "EPLB routing map and expert load recording",
+      "trigger": "each MoE forward with enable_eplb, inside router selection",
+      "observable": "one Triton kernel maps each logical expert id to a physical replica hashed by token and atomically adds the routed tokens to that physical expert load, only while recording is on and only unpadded rows; EplbState reads the views",
+      "citations": [
+        "vllm/model_executor/layers/fused_moe/router/base_router.py:19-93",
+        "vllm/model_executor/layers/fused_moe/router/base_router.py:129-157",
+        "vllm/model_executor/layers/fused_moe/router/base_router.py:188-221",
+        "vllm/model_executor/layers/fused_moe/runner/moe_runner.py:1023-1041"
+      ],
+      "interfaces": [
+        "fused-top-k-router.eplb-map-to-physical-and-record",
+        "fused-top-k-router.set-eplb-layer-state",
+        "mixtral-for-causal-lm.set-eplb-state",
+        "mixtral-for-causal-lm.update-physical-experts-metadata",
+        "eplb-state.add-model",
+        "eplb-state.record-expert-load"
+      ],
+      "fidelity": "partial",
+      "note": "Registration and the state check are modeled; recording adds slot totals without the per-expert split that comes from routing values."
+    },
+    {
+      "id": "models-layers.moe-weight-loading",
+      "kind": "pipeline",
+      "name": "MoE weight loading and remap",
+      "trigger": "load_weights for each MoE layer",
+      "observable": "checkpoint expert names remap to routed_experts parameters, fused tensors and per-expert tensors find their layout, each rank keeps its local experts through the expert map, and padded parameters narrow to the checkpoint size",
+      "citations": [
+        "vllm/model_executor/layers/fused_moe/routed_experts.py:981-1050",
+        "vllm/model_executor/layers/fused_moe/routed_experts.py:455-476",
+        "vllm/model_executor/layers/fused_moe/routed_experts.py:488-521",
+        "vllm/model_executor/model_loader/weight_utils.py:1711-1785",
+        "vllm/model_executor/model_loader/weight_utils.py:1787-1813",
+        "vllm/model_executor/layers/fused_moe/layer.py:444-462"
+      ],
+      "interfaces": [
+        "mixtral-for-causal-lm.load-weights",
+        "routed-experts.get-hidden-dim",
+        "routed-experts.narrow-expert-data-for-padding"
+      ],
+      "fidelity": "partial",
+      "note": "Helper functions and byte counts are modeled; the mapping and local-expert selection are not."
+    },
+    {
+      "id": "models-layers.deepseek-mla-attention",
+      "kind": "pipeline",
+      "name": "Latent attention (MLA, DeepSeek family)",
+      "trigger": "every forward of DeepSeek V2, V3 and GLM-DSA style models using MLAAttention",
+      "observable": "compressed k_c and k_pe write a latent KV cache; prefill runs MHA with chunked context, decode runs MQA; the backend is chosen per phase, and the kv_b weights are decompressed at finalize",
+      "citations": [
+        "vllm/model_executor/layers/mla.py:44-130",
+        "vllm/model_executor/layers/attention/mla_attention.py:813-882",
+        "vllm/model_executor/layers/attention/mla_attention.py:884-1191",
+        "vllm/model_executor/layers/attention/mla_attention.py:1220-1345",
+        "vllm/model_executor/models/deepseek_v2.py:1000-1030"
+      ],
+      "interfaces": [
+        "mla-attention.bind-kv-cache",
+        "mla-attention.get-kv-cache-spec",
+        "mla-attention.chunked-prefill-workspace-size",
+        "mla-attention-impl.forward-mha",
+        "mla-attention-impl.forward-mqa"
+      ],
+      "fidelity": "partial",
+      "note": "Backend forwards and KV specs exist; no MLAAttention forward or MultiHeadLatentAttentionWrapper reaches them from a DeepSeek model, so the end-to-end path is not wired."
+    },
+    {
+      "id": "models-layers.deepseek-bias-grouped-routing",
+      "kind": "dispatch",
+      "name": "Grouped and bias top-k routing (DeepSeek, GLM, Qwen3 variants)",
+      "trigger": "MoE forward on models with num_expert_group or e_score_correction_bias",
+      "observable": "grouped routing picks topk_group groups before experts; bias routing adds a correction, sigmoid or softmax, renormalizes and scales; DeepSeek V4 uses a hash-table-indexed sqrtsoftplus with a vision bias",
+      "citations": [
+        "vllm/model_executor/layers/fused_moe/router/grouped_topk_router.py:247-362",
+        "vllm/model_executor/layers/fused_moe/router/fused_topk_bias_router.py:373-469",
+        "vllm/model_executor/layers/fused_moe/router/dsv4_topk.py:36-151",
+        "vllm/model_executor/layers/fused_moe/router/custom_routing_router.py:12-64"
+      ],
+      "interfaces": [
+        "custom-ops.topk-hash-softplus-sqrt"
+      ],
+      "fidelity": "partial",
+      "note": "Only the kernel op interface exists; no router reaches it."
+    },
+    {
+      "id": "models-layers.shared-experts-overlap",
+      "kind": "pipeline",
+      "name": "Shared experts, with multi-stream overlap",
+      "trigger": "MoE forward on models with shared experts (DeepSeek, Qwen2 MoE, GLM)",
+      "observable": "the shared MLP runs before or after routed experts by computed order, or overlaps on an aux CUDA stream with events; moe_forward_shared returns both outputs and the runner adds them",
+      "citations": [
+        "vllm/model_executor/layers/fused_moe/runner/shared_experts.py:39-75",
+        "vllm/model_executor/layers/fused_moe/runner/shared_experts.py:101-121",
+        "vllm/model_executor/layers/fused_moe/runner/shared_experts.py:123-148",
+        "vllm/model_executor/layers/fused_moe/runner/moe_runner.py:589-596",
+        "vllm/model_executor/layers/fused_moe/runner/moe_runner.py:429-451"
+      ],
+      "interfaces": [
+        "moe-runner.moe-forward-shared"
+      ],
+      "fidelity": "partial",
+      "note": "Sets a flag that shared experts ran; order selection, overlap and their latency are not modeled."
+    },
+    {
+      "id": "models-layers.deepseek-sparse-indexer",
+      "kind": "pipeline",
+      "name": "Sparse attention indexer (DeepSeek V3.2)",
+      "trigger": "decode and prefill of sparse-MLA models, before attention",
+      "observable": "the indexer scores keys over a quantized k-cache, keeps a top-k per row, and passes the indices to sparse MLA; prefill can choose dense or masked MHA by query length and workspace",
+      "citations": [
+        "vllm/model_executor/layers/sparse_attn_indexer.py:944-1043",
+        "vllm/model_executor/layers/sparse_attn_indexer.py:1068-1110",
+        "vllm/model_executor/layers/sparse_mqa_indexer.py:75-127",
+        "vllm/model_executor/layers/attention/mla_attention.py:1193-1218",
+        "vllm/model_executor/layers/attention/sparse_mla_attention.py:130-140"
+      ],
+      "interfaces": [
+        "deepseek-v32-indexer-metadata-builder.build",
+        "deepseek-v32-indexer-metadata-builder.prepare-decode-tensors"
+      ],
+      "fidelity": "partial",
+      "note": "Metadata preparation is modeled from the attention side; SparseAttnIndexer.forward and the choice of masked or dense MHA are not."
+    },
+    {
+      "id": "models-layers.pooling-dispatch",
+      "kind": "dispatch",
+      "name": "Pooling task dispatch",
+      "trigger": "a pooling model forward on a batch with per-request tasks",
+      "observable": "consecutive requests with the same task form a group handled by that task sub-pooler; an unknown task is ValueError; seq poolers run CLS, LAST or MEAN with normalize or softmax heads, and token poolers yield one vector per token",
+      "citations": [
+        "vllm/model_executor/layers/pooler/special.py:25-150",
+        "vllm/model_executor/layers/pooler/seqwise/poolers.py:44-110",
+        "vllm/model_executor/layers/pooler/seqwise/methods.py:37-107",
+        "vllm/model_executor/layers/pooler/seqwise/heads.py:33-118",
+        "vllm/model_executor/layers/pooler/activations.py:19-60",
+        "vllm/model_executor/layers/pooler/tokwise/methods.py:36-140"
+      ],
+      "interfaces": [
+        "dispatch-pooler.for-embedding",
+        "dispatch-pooler.forward",
+        "sequence-pooling-method.forward",
+        "embedding-pooler-head.forward",
+        "pooler-activation.forward",
+        "pooler-activation.get-act-fn"
+      ],
+      "fidelity": "partial",
+      "note": "The steps split requests into seq and token sets rather than consecutive groups; StepPool, BOSEOSFilter and BgeM3Pooler are not modeled."
+    },
+    {
+      "id": "models-layers.task-conversion-adapters",
+      "kind": "dispatch",
+      "name": "Task conversion adapters (embed, classify)",
+      "trigger": "convert_type embed or classify on a registered CausalLM",
+      "observable": "the class is wrapped in place of the head: as_embedding_model adds a pooler and Sentence-Transformers projector, as_seq_cls_model a classifier with num_labels resolution and 2-way-softmax or no-post-processing weight loading",
+      "citations": [
+        "vllm/model_executor/model_loader/utils.py:320-330",
+        "vllm/model_executor/models/adapters.py:128-248",
+        "vllm/model_executor/models/adapters.py:250-282",
+        "vllm/model_executor/models/adapters.py:307-414",
+        "vllm/model_executor/models/adapters.py:516-591",
+        "vllm/model_executor/models/adapters.py:665-680"
+      ],
+      "interfaces": [],
+      "fidelity": "absent"
+    },
+    {
+      "id": "models-layers.encoder-embedding-models",
+      "kind": "pipeline",
+      "name": "Encoder embedding models (BERT family, EmbeddingGemma2)",
+      "trigger": "forward of BertModel-style and EmbeddingGemma2 pooling models",
+      "observable": "token, position and type embeddings run through ENCODER_ONLY attention over the whole prompt without a KV cache, then pooling; vision and audio towers are added where configured",
+      "citations": [
+        "vllm/model_executor/models/bert.py:394-422",
+        "vllm/model_executor/models/bert.py:492-505",
+        "vllm/model_executor/models/embedding_gemma2.py:337-385",
+        "vllm/model_executor/models/embedding_gemma2.py:1019-1102"
+      ],
+      "interfaces": [
+        "bert-embedding-model.init",
+        "bert-embedding-model.forward",
+        "bert-embedding-model.load-weights",
+        "embedding-gemma2-model.init",
+        "embedding-gemma2-model.load-weights",
+        "encoder-only-attention.init"
+      ],
+      "fidelity": "partial",
+      "note": "Skimmed: forward is a roofline latency over encoder weights."
+    },
+    {
+      "id": "models-layers.kv-cache-quant-scales",
+      "kind": "pipeline",
+      "name": "KV cache quantization scales",
+      "trigger": "after loading an attention layer under a KV-cache quant method",
+      "observable": "checkpoint k and v scales are used, both missing means 1.0, one missing means the larger for both; a missing q scale becomes k scale with a warning, per-token-head dtypes skip this, and FNUZ platforms double the scales",
+      "citations": [
+        "vllm/model_executor/layers/quantization/kv_cache.py:43-75",
+        "vllm/model_executor/layers/quantization/kv_cache.py:76-162",
+        "vllm/model_executor/layers/attention/attention.py:133-160",
+        "vllm/model_executor/layers/quantization/turboquant/config.py:215-235"
+      ],
+      "interfaces": [
+        "base-kv-cache-method.process-weights-after-loading",
+        "attention-layer.init-kv-cache-quant",
+        "turbo-quant-config.from-cache-dtype"
+      ],
+      "fidelity": "partial",
+      "note": "The scale rules match the code; the pre-processed path, per-token-head branch and FNUZ doubling are not modeled."
+    },
+    {
+      "id": "models-layers.online-quantization-at-load",
+      "kind": "pipeline",
+      "name": "Online quantization during load",
+      "trigger": "an online quant config (--quantization fp8_per_tensor and shorthands, or args composed onto a checkpoint config)",
+      "observable": "layers are built on the meta device, loaders buffer each tensor until the layer is complete, then the layer materializes, quantizes and frees its buffers; the load logs quantized layer counts and the time taken",
+      "citations": [
+        "vllm/model_executor/layers/quantization/online/base.py:151-198",
+        "vllm/model_executor/layers/quantization/online/base.py:266-315",
+        "vllm/model_executor/layers/quantization/online/fp8.py:125-137",
+        "vllm/model_executor/model_loader/reload/layerwise.py:120-135",
+        "vllm/model_executor/model_loader/reload/layerwise.py:147-224",
+        "vllm/model_executor/model_loader/reload/layerwise.py:344-402",
+        "vllm/model_executor/model_loader/base_loader.py:101-107"
+      ],
+      "interfaces": [
+        "online-quantization-config.quantized-layer-summary",
+        "weight-utils.get-quant-config"
+      ],
+      "fidelity": "shell",
+      "note": "The interface only composes the summary string from layer counts: no per-layer buffering, quantization or peak-memory effect happens."
+    },
+    {
+      "id": "models-layers.in-place-weight-reload",
+      "kind": "lifecycle",
+      "name": "In-place weight reload (layerwise)",
+      "trigger": "collective_rpc reload_weights, and RL weight updates in checkpoint format",
+      "observable": "layers go back to meta, loaders buffer until a layer is complete, it is processed and copied into the original kernel tensors so CUDA graphs and pointers stay valid; attention scales are refreshed at finalize; a kernel-format reload copies directly",
+      "citations": [
+        "vllm/model_executor/model_loader/reload/inplace.py:32-110",
+        "vllm/model_executor/model_loader/reload/layerwise.py:83-118",
+        "vllm/model_executor/model_loader/reload/layerwise.py:226-289",
+        "vllm/model_executor/model_loader/reload/layerwise.py:417-446",
+        "vllm/model_executor/model_loader/reload/meta.py:120-153",
+        "vllm/model_executor/model_loader/weight_checksum.py:32-43"
+      ],
+      "interfaces": [
+        "gpu-model-runner.reload-weights"
+      ],
+      "fidelity": "shell",
+      "note": "gpu-model-runner.reload-weights does a fresh base-model-loader.load-model call: the tensor-preserving lifecycle and kernel-format branch are not modeled."
+    },
+    {
+      "id": "models-layers.weight-cache-daemon",
+      "kind": "handshake",
+      "name": "Weight cache daemon: fingerprint, handle export, release",
+      "trigger": "vllm preload starts one daemon per GPU; an ipc_cache engine connects to the Unix socket on load",
+      "observable": "the socket appears only after the model is cached; a client with a matching WeightCacheKey gets CUDA IPC handles for every tensor plus model attrs and the GPU uuid, a mismatch names the differing fields, a non-owner peer gets an error and the loop keeps serving, and release drops the cached weights",
+      "citations": [
+        "vllm/model_executor/model_loader/weight_cache/daemon.py:332-386",
+        "vllm/model_executor/model_loader/weight_cache/daemon.py:414-430",
+        "vllm/model_executor/model_loader/weight_cache/daemon.py:432-463",
+        "vllm/model_executor/model_loader/weight_cache/daemon.py:465-473",
+        "vllm/model_executor/model_loader/weight_cache/daemon.py:130-173",
+        "vllm/model_executor/model_loader/weight_cache/ipc_loader.py:291-343"
+      ],
+      "interfaces": [
+        "weight-cache-daemon.serve-forever",
+        "weight-cache-daemon.handle-connection",
+        "weight-cache-daemon.handle-get-state",
+        "weight-cache-daemon.handle-release",
+        "ipc-model-loader.load-model"
+      ],
+      "fidelity": "partial",
+      "note": "The request exchange is modeled as one call per pass. The per-GPU flock, late socket bind, peer check as a raised error, tensor export and alias mapping in _apply_entries are not."
+    },
+    {
+      "id": "models-layers.weight-cache-startup-wait-fallback",
+      "kind": "retry",
+      "name": "Weight cache startup wait and disk fallback",
+      "trigger": "IpcModelLoader.load_model, when the daemon is not answering or does not match",
+      "observable": "without fallback, connection attempts retry until state_timeout_s and then raise WeightCacheUnavailableError; with fallback a single try leads to a disk load, a generic build failure in copy mode releases the daemon first, and unsupported quantization or platform always raises",
+      "citations": [
+        "vllm/model_executor/model_loader/weight_cache/ipc_loader.py:190-237",
+        "vllm/model_executor/model_loader/weight_cache/ipc_loader.py:345-389",
+        "vllm/model_executor/model_loader/weight_cache/ipc_loader.py:453-477"
+      ],
+      "interfaces": [
+        "ipc-model-loader.load-model"
+      ],
+      "fidelity": "partial",
+      "note": "Unavailable and mismatch branches with fallback are modeled. The startup retry loop, draft/target role cross-check, unsupported-quant raise and release before fallback are not."
+    },
+    {
+      "id": "models-layers.kernel-warmup-chain",
+      "kind": "gate",
+      "name": "Kernel warmup chain",
+      "trigger": "Worker.compile_or_warm_up_model after compile-size dummy runs",
+      "observable": "JIT warmup compiles kernels from its registry when enabled, Qwen, Qwen-VL and Mamba Triton warmups follow, then the collective warmups (FlashInfer autotune on Hopper and later) unless process_local_only; autotune skips on a logged reason",
+      "citations": [
+        "vllm/model_executor/warmup/kernel_warmup.py:162-293",
+        "vllm/model_executor/warmup/jit_warmup.py:57-98",
+        "vllm/model_executor/warmup/qwen_vl_triton_warmup.py:1-40",
+        "vllm/model_executor/warmup/qwen_triton_warmup.py:1-40",
+        "vllm/model_executor/warmup/mamba_triton_warmup.py:1-53"
+      ],
+      "interfaces": [
+        "kernel-warmup.kernel-warmup",
+        "qwen-vl-triton-warmup.qwen-vl-triton-warmup",
+        "qwen-vl-triton-warmup.warm-vision",
+        "qwen-vl-triton-warmup.warm-mrope",
+        "gpu-worker-impl.compile-or-warm-up-model"
+      ],
+      "fidelity": "partial",
+      "note": "The Qwen-VL warmup and autotune gate are modeled; JIT, DeepGEMM and other per-model warmups are not."
+    },
+    {
+      "id": "models-layers.flashinfer-autotune",
+      "kind": "cache",
+      "name": "FlashInfer autotune with persistent cache",
+      "trigger": "kernel_warmup on eligible hardware",
+      "observable": "dummy runs tune kernels at token counts from the batch limits and deferred MoE sizes; a saved result checked on all ranks by fingerprint skips tuning, so restarts are faster",
+      "citations": [
+        "vllm/model_executor/warmup/kernel_warmup.py:334-340",
+        "vllm/model_executor/warmup/kernel_warmup.py:342-382",
+        "vllm/model_executor/warmup/kernel_warmup.py:384-402",
+        "vllm/model_executor/warmup/kernel_warmup.py:404-504",
+        "vllm/model_executor/warmup/flashinfer_autotune_cache.py:1-60"
+      ],
+      "interfaces": [
+        "kernel-warmup.flashinfer-autotune",
+        "kernel-warmup.flashinfer-autotune-token-counts"
+      ],
+      "fidelity": "partial",
+      "note": "Token counts and the run are modeled; the fingerprint agreement and persisted file are not."
+    },
+    {
+      "id": "models-layers.multimodal-processor-cache-selection",
+      "kind": "dispatch",
+      "name": "Multimodal cache type and P0 cache",
+      "trigger": "processor construction in the frontend",
+      "observable": "no cache for text-only or size 0; processor_only with several API processes or DP without an external balancer; else lru or shm; an item over the budget is processed uncached with a warning, a hit moves to the LRU end",
+      "citations": [
+        "vllm/multimodal/cache/factories.py:23-107",
+        "vllm/multimodal/cache/base.py:259-295",
+        "vllm/multimodal/cache/base.py:395-444"
+      ],
+      "interfaces": [
+        "multi-modal-cache-factories.get-cache-type",
+        "multi-modal-cache-factories.processor-cache-from-config",
+        "multi-modal-processor-only-cache.is-cached",
+        "multi-modal-processor-only-cache.get-and-update",
+        "multi-modal-processor-only-cache.clear-cache"
+      ],
+      "fidelity": "modeled"
+    },
+    {
+      "id": "models-layers.multimodal-lru-replicated-cache",
+      "kind": "cache",
+      "name": "Multimodal LRU key-replicated cache",
+      "trigger": "each processed item with mm_processor_cache_type lru, P0 to P1",
+      "observable": "P0 records item metadata and sends None on hit; P1 stores sent data and serves None payloads, keeping the same LRU order and size accounting; a hash missing on both sides raises MultiModalCacheMissError with all such hashes",
+      "citations": [
+        "vllm/multimodal/cache/lru.py:22-84",
+        "vllm/multimodal/cache/lru.py:86-142",
+        "vllm/multimodal/cache/base.py:33-55",
+        "vllm/multimodal/cache/base.py:451-480"
+      ],
+      "interfaces": [
+        "lru-key-replicated-sender-cache.is-cached",
+        "lru-key-replicated-sender-cache.get-and-update",
+        "lru-key-replicated-sender-cache.invalidate",
+        "lru-key-replicated-sender-cache.clear-cache",
+        "lru-key-replicated-receiver-cache.get-and-update",
+        "lru-key-replicated-receiver-cache.get-and-update-features",
+        "lru-key-replicated-receiver-cache.clear-cache"
+      ],
+      "fidelity": "partial",
+      "note": "Skimmed: the summaries and citations agree with the code, steps not checked line by line."
+    },
+    {
+      "id": "models-layers.multimodal-shm-object-store",
+      "kind": "cache",
+      "name": "Multimodal shared-memory object store",
+      "trigger": "each processed item with mm_processor_cache_type shm",
+      "observable": "P0 puts the item in the ring store and sends an address and signature, so workers read without copying; an oversize item warns and stays uncached, a full store with protected items is logged and sent as normal; dangling prompt updates are cleared",
+      "citations": [
+        "vllm/multimodal/cache/shm.py:64-97",
+        "vllm/multimodal/cache/shm.py:114-170",
+        "vllm/multimodal/cache/shm.py:212-245",
+        "vllm/multimodal/cache/shm.py:248-305"
+      ],
+      "interfaces": [
+        "shm-object-store-sender-cache.is-cached",
+        "shm-object-store-sender-cache.get-and-update",
+        "shm-object-store-sender-cache.clear-cache",
+        "shm-object-store-receiver-cache.get-and-update"
+      ],
+      "fidelity": "partial",
+      "note": "Address exchange is modeled; remove_dangling_items, address signature validation and engine-side acknowledgement are not."
+    },
+    {
+      "id": "models-layers.multimodal-content-hash",
+      "kind": "pipeline",
+      "name": "Multimodal content hash",
+      "trigger": "each media item when hashes are computed for the cache",
+      "observable": "an item is serialized by type (PIL image, tensor, ndarray, nested) with kwargs into a hash, or a client uuid is used as is when there are no hash factors; the hash is the identity for processor and encoder caches",
+      "citations": [
+        "vllm/multimodal/hasher.py:85-92",
+        "vllm/multimodal/hasher.py:94-184",
+        "vllm/multimodal/hasher.py:224-237",
+        "vllm/multimodal/processing/processor.py:1396-1401"
+      ],
+      "interfaces": [
+        "base-multi-modal-processor.apply"
+      ],
+      "fidelity": "partial",
+      "note": "Hash values are authored from the uuid or a stand-in; MultiModalHasher serialization is absent."
+    },
+    {
+      "id": "models-layers.multimodal-prompt-updates",
+      "kind": "pipeline",
+      "name": "Prompt update matching and placeholders",
+      "trigger": "after HF processing, unless the processor already applied updates",
+      "observable": "each item takes its first update matching after the previous one, with tokens first; if any target is unmatched the prompt decodes and updates apply in text, then placeholders are located; a mismatch between items and placeholders is RuntimeError",
+      "citations": [
+        "vllm/multimodal/processing/processor.py:1699-1736",
+        "vllm/multimodal/processing/processor.py:1618-1678",
+        "vllm/multimodal/processing/processor.py:851-901",
+        "vllm/multimodal/processing/processor.py:692-783",
+        "vllm/multimodal/processing/processor.py:1757-1791"
+      ],
+      "interfaces": [
+        "base-multi-modal-processor.apply-prompt-updates",
+        "placeholder-range.get-num-embeds",
+        "placeholder-range.get-embeds-indices-in-range",
+        "placeholder-range.extract-embeds-range"
+      ],
+      "fidelity": "partial",
+      "note": "Skimmed against the code: token and text paths run; _validate_mm_updates and the priority queue planning are not separate steps."
+    },
+    {
+      "id": "models-layers.media-fetch",
+      "kind": "gate",
+      "name": "Media fetch policy and retries",
+      "trigger": "each image_url, video_url or audio_url in a request",
+      "observable": "data: URLs need base64; http checks allowed domains, then downloads with retries that back off on 5xx and connection errors; file: needs --allowed-local-media-path and containment; another scheme is ValueError",
+      "citations": [
+        "vllm/multimodal/media/connector.py:367-466",
+        "vllm/multimodal/media/connector.py:314-332",
+        "vllm/multimodal/media/connector.py:334-354",
+        "vllm/multimodal/media/connector.py:356-365",
+        "vllm/multimodal/media/connector.py:494-544",
+        "vllm/multimodal/media/connector.py:546-597"
+      ],
+      "interfaces": [
+        "media-connector.fetch-image",
+        "media-connector.merge-media-io-kwargs",
+        "remote-media-host.get",
+        "multimodal-utils.encode-image-url"
+      ],
+      "fidelity": "partial",
+      "note": "Image fetch, policy and retries are modeled; video and audio fetch and embedding-tensor fetch are not."
+    },
+    {
+      "id": "models-layers.multimodal-kwargs-batching",
+      "kind": "pipeline",
+      "name": "Multimodal kwargs batching",
+      "trigger": "each step that runs the encoder, in the worker",
+      "observable": "items group by modality and batchable shape, field configs concatenate or flatten, and cached items without data are skipped; items in a chunked window are picked by placeholder overlap",
+      "citations": [
+        "vllm/multimodal/utils.py:168-211",
+        "vllm/multimodal/utils.py:248-328",
+        "vllm/multimodal/utils.py:122-143",
+        "vllm/multimodal/inputs.py:376-386",
+        "vllm/multimodal/utils.py:213-246"
+      ],
+      "interfaces": [
+        "multi-modal-feature-spec.gather-kwargs",
+        "multi-modal-feature-spec.kwargs-item-dummy",
+        "multi-modal-feature-spec.field-elem-equals",
+        "encoder-runner.execute-mm-encoder"
+      ],
+      "fidelity": "partial",
+      "note": "gather_kwargs and the encoder call are modeled; group_and_batch_mm_kwargs and strip_covered_mm_data are not."
+    },
+    {
+      "id": "models-layers.multimodal-encoder-budget",
+      "kind": "gate",
+      "name": "Multimodal encoder budget",
+      "trigger": "engine startup, when profiling memory for multimodal models",
+      "observable": "the active modalities (non-zero limits) have max tokens per item, which give the compute budget and encoder cache size and dummy inputs for the KV-size profile; items are capped by decoder capacity",
+      "citations": [
+        "vllm/multimodal/encoder_budget.py:46-140",
+        "vllm/multimodal/encoder_budget.py:142-182",
+        "vllm/multimodal/encoder_budget.py:193-217"
+      ],
+      "interfaces": [
+        "multi-modal-budget.init",
+        "multi-modal-budget.get-dummy-encoder-profile-inputs",
+        "qwen2-vl-processing-info.get-supported-mm-limits",
+        "qwen2-vl-processing-info.get-num-image-tokens",
+        "qwen3-vl-processing-info.get-supported-mm-limits",
+        "qwen3-vl-processing-info.get-num-image-tokens"
+      ],
+      "fidelity": "partial",
+      "note": "Skimmed: modeled for Qwen-VL processing info; other processors are not."
+    },
+    {
+      "id": "models-layers.vision-dp-sharded-encoding",
+      "kind": "dispatch",
+      "name": "Vision encoder data-parallel sharding",
+      "trigger": "mm-encoder-tp-mode data on a TP deployment, per vision batch",
+      "observable": "images assign to ranks by a load balance on patch count, each rank runs a TP-1 tower on its share, results are padded and all-gathered, unpadded and reordered; a rank with no images contributes an empty tensor",
+      "citations": [
+        "vllm/model_executor/models/vision.py:325-390",
+        "vllm/model_executor/models/vision.py:392-581",
+        "vllm/model_executor/models/vision.py:141-164"
+      ],
+      "interfaces": [
+        "vision-utils.get-load-balance-assignment",
+        "vision-utils.run-dp-sharded-mrope-vision-model",
+        "vision-utils.get-vit-attn-backend"
+      ],
+      "fidelity": "modeled"
+    },
+    {
+      "id": "models-layers.qwen-vl-vision-and-mrope",
+      "kind": "pipeline",
+      "name": "Qwen-VL vision tower and M-RoPE",
+      "trigger": "Qwen2-VL and Qwen2.5-VL-style encoding, then forward over merged embeddings",
+      "observable": "pixels run through the vision transformer in grid order, with spatial merge; positions form three rows (t, h, w), where text counts up on all rows and each item covers its merged grid; the language model reads inputs_embeds and those positions",
+      "citations": [
+        "vllm/model_executor/models/qwen2_vl.py:717-760",
+        "vllm/model_executor/models/qwen2_vl.py:1235-1300",
+        "vllm/model_executor/layers/rotary_embedding/mrope.py:439-460"
+      ],
+      "interfaces": [
+        "qwen2-vl-for-conditional-generation.embed-multimodal",
+        "qwen2-vl-for-conditional-generation.get-mrope-input-positions",
+        "qwen2-vl-for-conditional-generation.forward",
+        "qwen2-vl-for-conditional-generation.get-placeholder-str",
+        "qwen2-vl-for-conditional-generation.init",
+        "qwen2-vl-for-conditional-generation.load-weights",
+        "qwen2-vl-for-conditional-generation.compute-logits",
+        "qwen2-vision-transformer.forward",
+        "qwen2-vision-transformer.init",
+        "ernie45-vl-moe-for-conditional-generation.get-mrope-input-positions",
+        "phi3v-image-pixel-inputs.validate"
+      ],
+      "fidelity": "partial",
+      "note": "Skimmed: positions and flow are modeled, the tower is a roofline latency; other VL models using M-RoPE have no behavior."
+    },
+    {
+      "id": "models-layers.qwen3-vl-deepstack",
+      "kind": "pipeline",
+      "name": "Qwen3-VL DeepStack embeddings",
+      "trigger": "Qwen3-VL embed_multimodal and the first language layers",
+      "observable": "the tower yields a main embedding plus DeepStack levels concatenated per token; these split apart at merge, are stored in buffers that the first layers add to hidden states, and clear after the forward",
+      "citations": [
+        "vllm/model_executor/models/qwen3_vl.py:862-905",
+        "vllm/model_executor/models/qwen3_vl.py:3053-3122",
+        "vllm/model_executor/models/qwen3_vl.py:3165-3219"
+      ],
+      "interfaces": [
+        "qwen3-vl-for-conditional-generation.embed-multimodal",
+        "qwen3-vl-for-conditional-generation.forward",
+        "qwen3-vl-for-conditional-generation.init",
+        "qwen3-vl-for-conditional-generation.get-visual",
+        "qwen3-vl-for-conditional-generation.load-weights",
+        "qwen3-vl-for-conditional-generation.compute-logits",
+        "qwen3-vl-for-conditional-generation.get-placeholder-str",
+        "qwen3-vision-transformer.forward",
+        "qwen3-vision-transformer.rot-pos-emb",
+        "qwen3-vision-transformer.fast-pos-embed-interpolate",
+        "qwen3-vision-attention.apply-rotary-emb"
+      ],
+      "fidelity": "partial",
+      "note": "Skimmed: the tower is a roofline; buffer use is shown through the forward but not by checking values in layers."
+    },
+    {
+      "id": "models-layers.pipeline-parallel-stage-layers",
+      "kind": "dispatch",
+      "name": "Pipeline-parallel stage layers",
+      "trigger": "model construction and forward under pipeline_parallel_size > 1",
+      "observable": "each rank builds only its stage range of layers (the rest StageMissingLayer), embeddings on the first stage and norm on the last, IntermediateTensors pass hidden states between ranks, and checkpoint weights for missing layers are skipped",
+      "citations": [
+        "vllm/model_executor/models/utils.py:886-924",
+        "vllm/model_executor/models/utils.py:926-953",
+        "vllm/model_executor/models/utils.py:955-968",
+        "vllm/model_executor/models/interfaces.py:754-786",
+        "vllm/model_executor/models/llama.py:406-419"
+      ],
+      "interfaces": [],
+      "fidelity": "absent",
+      "note": "llama-model.forward titles its embed and norm steps as PP rank specific but runs them unconditionally."
+    },
+    {
+      "id": "models-layers.kv-layer-transfer-decorator",
+      "kind": "handshake",
+      "name": "Per-layer KV transfer around attention",
+      "trigger": "attention ops decorated with maybe_transfer_kv_layer, when a V1 KV connector has metadata this step",
+      "observable": "each layer waits for its KV load before running and saves its KV after, so disaggregated prefill stays layer-ordered; without a connector the op runs unchanged",
+      "citations": [
+        "vllm/model_executor/layers/attention/kv_transfer_utils.py:15-61",
+        "vllm/model_executor/layers/attention/attention.py:767-769"
+      ],
+      "interfaces": [],
+      "fidelity": "absent",
+      "note": "The connector calls exist as interfaces owned by distributed (kv-connector-base-v1-worker.wait-for-layer-load, kv-connector-base-v1.save-kv-layer) but nothing calls them per layer from the attention path."
+    },
+    {
+      "id": "models-layers.custom-op-platform-dispatch",
+      "kind": "dispatch",
+      "name": "CustomOp and PluggableLayer platform dispatch",
+      "trigger": "construction of any CustomOp, or PluggableLayer subclass",
+      "observable": "a registered out-of-tree class replaces the op at instantiation; forward binds to forward_cuda, hip, xpu, cpu, tpu or native from the platform; custom_ops config can enable or disable an op, and maybe_compile can wrap the native path",
+      "citations": [
+        "vllm/model_executor/custom_op.py:32-100",
+        "vllm/model_executor/custom_op.py:102-131",
+        "vllm/model_executor/custom_op.py:172-205",
+        "vllm/model_executor/custom_op.py:207-266",
+        "vllm/model_executor/custom_op.py:269-308"
+      ],
+      "interfaces": [],
+      "fidelity": "absent"
+    },
+    {
+      "id": "models-layers.checkpoint-page-cache-prefetch",
+      "kind": "cache",
+      "name": "Network-filesystem checkpoint auto-prefetch",
+      "trigger": "safetensors load with strategy None or prefetch",
+      "observable": "on NFS or Lustre with the checkpoint under 90% of available RAM, a daemon thread reads every shard into the page cache before loading; on local disk, or over the RAM threshold, it logs and skips; an explicit prefetch over the threshold warns about OOM and goes ahead",
+      "citations": [
+        "vllm/model_executor/model_loader/weight_utils.py:1104-1158",
+        "vllm/model_executor/model_loader/weight_utils.py:987-1002",
+        "vllm/model_executor/model_loader/weight_utils.py:1004-1076",
+        "vllm/model_executor/model_loader/weight_utils.py:892-924"
+      ],
+      "interfaces": [],
+      "fidelity": "absent"
+    },
+    {
+      "id": "models-layers.ep-weight-filter",
+      "kind": "gate",
+      "name": "Expert-parallel weight read filter",
+      "trigger": "load_weights on an MoE model with enable_expert_parallel and enable_ep_weight_filter, skipped under EPLB",
+      "observable": "each rank computes its local expert ids and skips other experts tensors before reading them from disk, cutting checkpoint I/O; EPLB disables it because redundant slots may need any expert",
+      "citations": [
+        "vllm/model_executor/model_loader/default_loader.py:421-482",
+        "vllm/model_executor/model_loader/ep_weight_filter.py:20-85",
+        "vllm/model_executor/model_loader/weight_utils.py:1079-1086"
+      ],
+      "interfaces": [],
+      "fidelity": "absent"
+    },
+    {
+      "id": "models-layers.mm-encoder-only-shard-filter",
+      "kind": "gate",
+      "name": "Encoder-only shard filter",
+      "trigger": "load_weights with --mm-encoder-only",
+      "observable": "LM-only safetensors shards are dropped using the weight mapper and LM prefixes so an encoder process reads only the encoder tower; if the filter removes every file it fails the load",
+      "citations": [
+        "vllm/model_executor/model_loader/default_loader.py:398-419",
+        "vllm/model_executor/model_loader/default_loader.py:280-299",
+        "vllm/model_executor/model_loader/weight_utils.py:688-795",
+        "vllm/model_executor/model_loader/weight_utils.py:797-838"
+      ],
+      "interfaces": [],
+      "fidelity": "absent"
+    },
+    {
+      "id": "models-layers.word-embedding-retie",
+      "kind": "pipeline",
+      "name": "Word embedding re-tie",
+      "trigger": "post-processing of a model whose checkpoint carried a redundant lm_head under tie_word_embeddings",
+      "observable": "an identical lm_head is re-tied and its memory reclaimed; a different one stays in use with a warning",
+      "citations": [
+        "vllm/model_executor/model_loader/weight_tying.py:37-71",
+        "vllm/model_executor/model_loader/weight_tying.py:73-99",
+        "vllm/model_executor/model_loader/utils.py:149-150"
+      ],
+      "interfaces": [],
+      "fidelity": "absent"
+    },
+    {
+      "id": "models-layers.checkpoint-weight-patches",
+      "kind": "pipeline",
+      "name": "Checkpoint weight patches (dense and sparse)",
+      "trigger": "a caller applying ordered weight patches in checkpoint coordinates",
+      "observable": "patches are validated up front, then applied in chunks through the model loader; sparse patches use NaN-masked copy so only named elements change; there is no rollback on a partial failure",
+      "citations": [
+        "vllm/model_executor/model_loader/checkpoint_weight_patch.py:49-86",
+        "vllm/model_executor/model_loader/checkpoint_weight_patch.py:88-122",
+        "vllm/model_executor/model_loader/checkpoint_weight_patch.py:140-175"
+      ],
+      "interfaces": [],
+      "fidelity": "absent"
+    },
+    {
+      "id": "models-layers.alternate-weight-sources",
+      "kind": "dispatch",
+      "name": "Alternate weight sources",
+      "trigger": "load_format sharded_state, tensorizer, runai_streamer, or modelexpress",
+      "observable": "sharded_state loads and writes one file per rank, tensorizer deserializes and saves, Run:ai streams from object storage, and modelexpress delegates to its package; a missing optional package is an ImportError naming it",
+      "citations": [
+        "vllm/model_executor/model_loader/sharded_state_loader.py:190-252",
+        "vllm/model_executor/model_loader/sharded_state_loader.py:269-300",
+        "vllm/model_executor/model_loader/tensorizer_loader.py:103-140",
+        "vllm/model_executor/model_loader/runai_streamer_loader.py:147-149",
+        "vllm/model_executor/model_loader/modelexpress_loader.py:26-60",
+        "vllm/model_executor/model_loader/weight_utils.py:1246-1280"
+      ],
+      "interfaces": [
+        "sharded-state-loader.save-model",
+        "tensorizer-loader.save-model"
+      ],
+      "fidelity": "shell",
+      "note": "Both interfaces have no behavior steps; the matching load paths do not exist."
+    },
+    {
+      "id": "models-layers.cpu-offload-prefetch",
+      "kind": "pipeline",
+      "name": "Layer offload with async prefetch",
+      "trigger": "offload_backend prefetch, or auto with offload_group_size > 0, around each hooked decoder layer",
+      "observable": "parameters live on CPU; a static GPU buffer pool holds the current groups, each layer waits for its onload event and starts the next groups copy on a separate stream, keeping CUDA-graph capture valid",
+      "citations": [
+        "vllm/model_executor/offloader/base.py:142-178",
+        "vllm/model_executor/offloader/prefetch.py:60-140",
+        "vllm/model_executor/offloader/prefetch.py:231-333",
+        "vllm/model_executor/offloader/prefetch.py:529-570",
+        "vllm/v1/worker/gpu/model_runner.py:361"
+      ],
+      "interfaces": [],
+      "fidelity": "absent"
+    },
+    {
+      "id": "models-layers.cpu-offload-uva",
+      "kind": "pipeline",
+      "name": "UVA CPU offload",
+      "trigger": "offload_backend uva, or auto with cpu_offload_gb > 0",
+      "observable": "parameters up to the byte budget (optionally only the named ones) move to pinned CPU memory; the GPU reads them through a unified-address view, or without UVA the module forward copies its state to the device non-blocking on each call",
+      "citations": [
+        "vllm/model_executor/offloader/uva.py:42-72",
+        "vllm/model_executor/offloader/uva.py:74-155"
+      ],
+      "interfaces": [],
+      "fidelity": "absent"
+    },
+    {
+      "id": "models-layers.modelinfo-cache",
+      "kind": "cache",
+      "name": "Model info inspection cache",
+      "trigger": "registry capability checks (is_multimodal, is_pooling, etc.) for a lazily registered class",
+      "observable": "a cache file keyed by module hash (a whole package for an __init__.py entry) answers without importing; a miss imports the class in a subprocess so the parent does not initialize CUDA, and a failing child is RuntimeError",
+      "citations": [
+        "vllm/model_executor/models/registry.py:1044-1090",
+        "vllm/model_executor/models/registry.py:976-1041",
+        "vllm/model_executor/models/registry.py:1550-1577",
+        "vllm/model_executor/models/registry.py:1323-1374"
+      ],
+      "interfaces": [
+        "model-registry.inspect-model-cls",
+        "lazy-registered-model.get-modelinfo-module-hash",
+        "model-registry-subprocess.run-in-subprocess",
+        "model-registry-subprocess.run"
+      ],
+      "fidelity": "partial",
+      "note": "The hash, subprocess and save are modeled, but inspect-model-cls keys its cache by architecture rather than comparing the module hash, so a stale file is never exercised through it."
+    },
+    {
+      "id": "models-layers.out-of-tree-model-registration",
+      "kind": "dispatch",
+      "name": "Out-of-tree model registration",
+      "trigger": "ModelRegistry.register_model, usually from a general plugin",
+      "observable": "a class or a lazy module:Class string joins the registry, an existing name is overwritten, a malformed string is ValueError and any other type is TypeError; lazy entries inspect through the subprocess path",
+      "citations": [
+        "vllm/model_executor/models/registry.py:1132-1175",
+        "vllm/model_executor/models/registry.py:961-966"
+      ],
+      "interfaces": [
+        "model-registry.register-model"
+      ],
+      "fidelity": "partial",
+      "note": "The string path and its ValueError match the code; registering a class and the TypeError branch have no steps."
+    },
+    {
+      "id": "models-layers.transformers-backend",
+      "kind": "pipeline",
+      "name": "Transformers modeling backend with fusers",
+      "trigger": "model_impl transformers, or auto with no vLLM implementation",
+      "observable": "the HF model is built on meta, modules are replaced by vLLM layers by a priority-ordered fuser table using FX tracing (attention, QKV, MLA, GLU, MoE, RMS norm), then weights are mapped in; a warning says performance may be sub-optimal",
+      "citations": [
+        "vllm/model_executor/models/transformers/base.py:107-200",
+        "vllm/model_executor/models/transformers/base.py:467-520",
+        "vllm/model_executor/models/transformers/fuser.py:1-60",
+        "vllm/model_executor/models/transformers/__init__.py:67-129",
+        "vllm/model_executor/model_loader/utils.py:309-317"
+      ],
+      "interfaces": [
+        "model-registry.try-resolve-transformers"
+      ],
+      "fidelity": "shell",
+      "note": "Resolution returns an architecture name; the resulting component is a stand-in, with no module replacement or fuser behavior."
+    },
+    {
+      "id": "models-layers.rotary-embedding-selection-cache",
+      "kind": "cache",
+      "name": "Rotary embedding selection and shared cache",
+      "trigger": "get_rope, at attention layer construction",
+      "observable": "identical parameters return the same module from _ROPE_DICT; the rope_type picks default, llama3, gemma4, YaRN, M-RoPE, Bailing, DeepSeek scaling, dual-chunk and others; a partial_rotary_factor out of range is ValueError",
+      "citations": [
+        "vllm/model_executor/layers/rotary_embedding/__init__.py:32-110",
+        "vllm/model_executor/layers/rotary_embedding/base.py:221-240",
+        "vllm/model_executor/layers/rotary_embedding/mrope.py:439-460"
+      ],
+      "interfaces": [
+        "rotary-embedding.get-rope",
+        "rotary-embedding.forward-cuda",
+        "rotary-embedding.flashinfer-rotary-embedding",
+        "m-rotary-embedding.forward-cuda",
+        "m-rotary-embedding.triton-mrope"
+      ],
+      "fidelity": "partial",
+      "note": "Skimmed: only the default and M-RoPE forwards are modeled; the other rope_type variants are not."
+    },
+    {
+      "id": "models-layers.unquantized-gemm-backend-dispatch",
+      "kind": "dispatch",
+      "name": "Unquantized GEMM backend dispatch",
+      "trigger": "UnquantizedLinearMethod.apply on any unquantized linear",
+      "observable": "the function bound by platform runs: FlashInfer BF16 where supported, AITER on ROCm under size checks, a CPU kernel chosen by shape and dtype, or default F.linear; VLLM_BATCH_INVARIANT routes to the persistent matmul",
+      "citations": [
+        "vllm/model_executor/layers/utils.py:620-650",
+        "vllm/model_executor/layers/utils.py:104-166",
+        "vllm/model_executor/layers/utils.py:288-370",
+        "vllm/model_executor/layers/utils.py:470-610",
+        "vllm/model_executor/layers/linear.py:229-239"
+      ],
+      "interfaces": [
+        "unquantized-linear-method.apply"
+      ],
+      "fidelity": "partial",
+      "note": "A roofline GEMM with the batch-invariant branch; backend selection between platforms is not modeled."
+    },
+    {
+      "id": "models-layers.batch-invariant-mode",
+      "kind": "gate",
+      "name": "Batch-invariant execution mode",
+      "trigger": "VLLM_BATCH_INVARIANT at init_batch_invariance",
+      "observable": "torch linear, matmul, softmax, mean, rms_norm and collectives are patched with fixed-order versions so a request gives the same bits at any batch size; backends and MoE kernels that are not invariant are refused or swapped",
+      "citations": [
+        "vllm/model_executor/determinism/batch_invariant.py:1429-1439",
+        "vllm/model_executor/determinism/batch_invariant.py:284-338",
+        "vllm/model_executor/determinism/batch_invariant.py:1126-1134",
+        "vllm/model_executor/determinism/batch_invariant.py:1166-1200",
+        "vllm/model_executor/determinism/batch_invariant.py:1065-1124"
+      ],
+      "interfaces": [
+        "batch-invariant.linear-batch-invariant",
+        "batch-invariant.rms-norm-batch-invariant"
+      ],
+      "fidelity": "partial",
+      "note": "Only two ops are modeled and they name kernels; nothing shows the patching, or results being identical across batch sizes."
+    },
+    {
+      "id": "models-layers.deepseek-v4-mhc-hyper-connections",
+      "kind": "pipeline",
+      "name": "Hyper-connection residuals (mHC, DeepSeek V4 family)",
+      "trigger": "each decoder block of DeepSeek V4 and Qwen4Exp-style models, with hc_mult > 1",
+      "observable": "the block carries several residual streams mixed by hc weights before and after each sublayer, with Tilelang, HPC or Triton kernels per platform; DeepSeek V4.1 can fuse the MoE top-k finalize into the all-reduce under a token limit",
+      "citations": [
+        "vllm/model_executor/layers/mhc.py:122-150",
+        "vllm/model_executor/layers/mhc.py:346-384",
+        "vllm/model_executor/layers/hpc/hpc_ihc.py:1-40",
+        "vllm/models/deepseek_v41/nvidia/model.py:160-182",
+        "vllm/models/deepseek_v4/__init__.py:1-56"
+      ],
+      "interfaces": [],
+      "fidelity": "absent"
+    },
+    {
+      "id": "models-layers.per-platform-model-packages",
+      "kind": "dispatch",
+      "name": "Hardware-specific model packages",
+      "trigger": "import of vllm.models.<name> (DeepSeek V4, Qwen4Exp, Kimi K3, MiniMax M3, and others)",
+      "observable": "the architecture class resolves to the amd, nvidia, xpu or cpu implementation at import, and an unsupported platform raises NotImplementedError when the name is accessed",
+      "citations": [
+        "vllm/models/deepseek_v4/__init__.py:18-56",
+        "vllm/models/qwen4_exp/__init__.py:18-61",
+        "vllm/model_executor/models/registry.py:1528-1545"
+      ],
+      "interfaces": [],
+      "fidelity": "absent"
+    },
+    {
+      "id": "models-layers.hybrid-mamba-state-layers",
+      "kind": "pipeline",
+      "name": "Mamba and hybrid state layers",
+      "trigger": "forward of Mamba, Mamba2, Jamba, Zamba2 and Nemotron-H; IsHybrid models layer Mamba and attention",
+      "observable": "per-layer SSM and conv state lives in KV-cache-managed blocks whose shape and dtype come from the config; the mixer runs selective-state-update and conv over chunks, and layer types select attention or mixer",
+      "citations": [
+        "vllm/model_executor/layers/mamba/mamba_mixer2.py:265-300",
+        "vllm/model_executor/layers/mamba/mamba_mixer2.py:574-613",
+        "vllm/model_executor/layers/mamba/mamba_mixer2.py:713-760",
+        "vllm/model_executor/layers/mamba/mamba_utils.py:161-200",
+        "vllm/model_executor/models/interfaces.py:936-986",
+        "vllm/model_executor/models/mamba.py:173-210"
+      ],
+      "interfaces": [
+        "flashinfer-ssu-backend.init",
+        "mamba-hybrid-model-state.prepare-attn",
+        "mamba-hybrid-model-state.preprocess-state",
+        "mamba-hybrid-model-state.postprocess-state"
+      ],
+      "fidelity": "partial",
+      "note": "State bookkeeping is modeled from the worker side; MambaMixer and MambaMixer2 forwards, with their chunking, are not."
+    },
+    {
+      "id": "models-layers.qwen3-next-gated-delta",
+      "kind": "pipeline",
+      "name": "Linear attention with gated-delta state (Qwen3 Next)",
+      "trigger": "forward of Qwen3NextForCausalLM",
+      "observable": "config.layer_types picks each layer attention kind, including a gated-delta linear attention mixer that keeps recurrent state, with sparse MoE blocks after it",
+      "citations": [
+        "vllm/model_executor/models/qwen3_next.py:280-470",
+        "vllm/model_executor/models/qwen3_next.py:472-630",
+        "vllm/model_executor/layers/mamba/gdn/qwen_gdn_linear_attn.py:1-30",
+        "vllm/model_executor/models/qwen3_next.py:660-680"
+      ],
+      "interfaces": [],
+      "fidelity": "absent"
+    },
+    {
+      "id": "models-layers.encoder-decoder-forward",
+      "kind": "pipeline",
+      "name": "Encoder-decoder forward (Whisper family)",
+      "trigger": "WhisperForConditionalGeneration forward, under transcription",
+      "observable": "audio goes through the encoder, cross-attention reads its output through a separate block table, and the decoder prompt carries language tokens; with no language given, detection is prompted from audio",
+      "citations": [
+        "vllm/model_executor/models/whisper.py:803-845",
+        "vllm/model_executor/models/whisper.py:846-872",
+        "vllm/model_executor/models/whisper.py:987-1001",
+        "vllm/multimodal/processing/processor.py:1850-1925",
+        "vllm/model_executor/layers/attention/cross_attention.py:188-239"
+      ],
+      "interfaces": [],
+      "fidelity": "absent",
+      "note": "Cross-attention backends exist from the attention area, but nothing calls them from a Whisper model."
+    },
+    {
+      "id": "models-layers.realtime-transcription-models",
+      "kind": "pipeline",
+      "name": "Realtime transcription models",
+      "trigger": "SupportsRealtime classes such as VoxtralRealtimeGeneration and Qwen3 ASR realtime",
+      "observable": "an async buffer takes the audio stream and produces prompts with a small realtime_max_tokens, so output arrives while audio continues",
+      "citations": [
+        "vllm/model_executor/models/interfaces.py:1264-1283",
+        "vllm/model_executor/models/voxtral_realtime.py:240-300"
+      ],
+      "interfaces": [],
+      "fidelity": "absent"
+    },
+    {
+      "id": "models-layers.late-interaction-models",
+      "kind": "pipeline",
+      "name": "Late interaction (ColBERT family)",
+      "trigger": "token_embed pooling on ColBERT, ColPali and ColQwen models",
+      "observable": "a projection head reduces per-token embeddings to the ColBERT dim, with its weights loaded separately from the backbone, for maxsim scoring",
+      "citations": [
+        "vllm/model_executor/models/colbert.py:35-62",
+        "vllm/model_executor/models/colbert.py:88-115",
+        "vllm/model_executor/models/colbert.py:129-160",
+        "vllm/model_executor/models/registry.py:266-281"
+      ],
+      "interfaces": [],
+      "fidelity": "absent"
+    },
+    {
+      "id": "models-layers.speculative-draft-model-classes",
+      "kind": "pipeline",
+      "name": "Draft model classes (Eagle, MTP, Medusa)",
+      "trigger": "draft model load under speculative_config",
+      "observable": "loading flags whether an Eagle checkpoint has its own lm_head and embed_tokens, otherwise they come from the target; the last PP rank keeps target embeddings when the drafter needs them; MTP completeness validation can be disabled for a scope",
+      "citations": [
+        "vllm/model_executor/models/registry.py:625-708",
+        "vllm/model_executor/models/utils.py:863-884",
+        "vllm/model_executor/models/utils.py:1122-1143",
+        "vllm/model_executor/model_loader/mtp_validation.py:14-26",
+        "vllm/model_executor/models/deepseek_mtp.py:240-260"
+      ],
+      "interfaces": [],
+      "fidelity": "absent",
+      "note": "Speculators exist in worker-runner, but none builds or loads a draft model class from this area."
+    },
+    {
+      "id": "models-layers.zero-expert-routing",
+      "kind": "dispatch",
+      "name": "Zero expert routing (Longcat Flash)",
+      "trigger": "zero_expert_type set on an MoE layer",
+      "observable": "routing covers real plus zero experts, zero experts add identity contribution as a bias and are remapped to expert 0 with weight 0; the runner adds that output to the result",
+      "citations": [
+        "vllm/model_executor/layers/fused_moe/router/zero_expert_router.py:17-104",
+        "vllm/model_executor/layers/fused_moe/runner/moe_runner.py:672-686"
+      ],
+      "interfaces": [],
+      "fidelity": "absent"
+    },
+    {
+      "id": "models-layers.latent-moe-kimi",
+      "kind": "pipeline",
+      "name": "Latent MoE with tail fusion (Kimi K3)",
+      "trigger": "MoE forward on Kimi K3",
+      "observable": "a latent down projection feeds routed experts, a replicated up-projection returns to full dim, the routed output is reduced before the non-linear transform, and SM100 devices can fuse the tail",
+      "citations": [
+        "vllm/models/kimi_k3/nvidia/latent_moe_runner.py:54-122",
+        "vllm/models/kimi_k3/nvidia/model.py:304-336",
+        "vllm/models/kimi_k3/nvidia/model.py:540-600",
+        "vllm/model_executor/layers/fused_moe/runner/moe_runner.py:362-401",
+        "vllm/model_executor/layers/fused_moe/runner/moe_runner.py:453-481"
+      ],
+      "interfaces": [],
+      "fidelity": "absent"
+    },
+    {
+      "id": "models-layers.moe-tuned-kernel-config",
+      "kind": "cache",
+      "name": "Tuned MoE kernel configs",
+      "trigger": "get_moe_configs when a Triton MoE call has no cached config",
+      "observable": "a JSON file named by E, N, device and dtype is read from VLLM_TUNED_CONFIG_FOLDER first, then the repo configs directory; no file means a warning and the default config; batch invariance skips tuned configs",
+      "citations": [
+        "vllm/model_executor/layers/fused_moe/fused_moe.py:1109-1170",
+        "vllm/model_executor/layers/fused_moe/fused_moe.py:1062-1107"
+      ],
+      "interfaces": [],
+      "fidelity": "absent",
+      "note": "mixtral-for-causal-lm.get-moe-configs is about MoERunner configs for warmup, not this lookup."
+    },
+    {
+      "id": "models-layers.deferred-moe-finalize",
+      "kind": "gate",
+      "name": "Deferred MoE top-k finalize",
+      "trigger": "a consumer that fuses the top-k reduction (Kimi K3, DeepSeek V4.1) asks at build time; checked per call",
+      "observable": "on TP > 1 with no DP, EP, PCP or SP and no padded hidden dim, experts return an unfinalized output within the token cap and the consumer fuses reduction with the all-reduce; otherwise they finalize normally",
+      "citations": [
+        "vllm/model_executor/layers/fused_moe/config.py:1459-1477",
+        "vllm/model_executor/layers/fused_moe/config.py:1479-1530",
+        "vllm/model_executor/layers/fused_moe/experts/trtllm_fp8_moe.py:305-320",
+        "vllm/model_executor/layers/fused_moe/moe_output.py:11-36",
+        "vllm/models/deepseek_v41/nvidia/model.py:168-182"
+      ],
+      "interfaces": [
+        "fused-moe-config.defer-moe-finalize",
+        "fused-moe-config.should-defer-moe-finalize"
+      ],
+      "fidelity": "partial",
+      "note": "The two predicates are modeled; nothing runs an unfinalized output through a consumer."
+    },
+    {
+      "id": "models-layers.moe-sequence-parallel",
+      "kind": "pipeline",
+      "name": "MoE sequence parallel token scatter",
+      "trigger": "MoE forward under enable_sequence_parallel with TP > 1",
+      "observable": "tokens are split across the TP group within sp_local_sizes for expert work, with output reduced by SP combine rather than the runner late all-reduce; a layer cannot defer its final all-reduce in that mode",
+      "citations": [
+        "vllm/model_executor/layers/fused_moe/runner/moe_runner.py:653-670",
+        "vllm/model_executor/layers/fused_moe/runner/moe_runner.py:504-515",
+        "vllm/model_executor/models/utils.py:1084-1120",
+        "vllm/model_executor/layers/fused_moe/layer.py:241-247"
+      ],
+      "interfaces": [],
+      "fidelity": "absent"
+    },
+    {
+      "id": "models-layers.routed-experts-aux-capture",
+      "kind": "metric",
+      "name": "Routed expert capture for aux outputs",
+      "trigger": "an aux output connector binds a capture function before forwards",
+      "observable": "router capture_fn gets logical ids before the EPLB map; the capturer handles four batch layouts (naive, modular, DP+EP, SP) and writes per-token, per-layer expert ids into a device buffer that is snapshotted at step end",
+      "citations": [
+        "vllm/model_executor/layers/fused_moe/routed_experts_capturer.py:44-85",
+        "vllm/model_executor/layers/fused_moe/routed_experts_capturer.py:87-185",
+        "vllm/model_executor/layers/fused_moe/routed_experts_capturer.py:207-240",
+        "vllm/model_executor/layers/fused_moe/router/base_router.py:184-186",
+        "vllm/distributed/aux_output_connector/worker.py:97"
+      ],
+      "interfaces": [
+        "routed-experts-buffer.capture"
+      ],
+      "fidelity": "partial",
+      "note": "The downstream buffer is modeled from distributed; RoutedExpertsCapturer.capture and its layouts are not."
+    },
+    {
+      "id": "models-layers.elastic-ep-moe-staging",
+      "kind": "lifecycle",
+      "name": "Elastic EP MoE kernel staging",
+      "trigger": "elastic EP scale-up or scale-down, for each MoE module",
+      "observable": "a new quant method with experts and prepare/finalize for the new topology is built without touching the live one, and committed during the scale; monolithic kernels raise NotImplementedError",
+      "citations": [
+        "vllm/model_executor/layers/fused_moe/eep_reconfigure.py:27-58",
+        "vllm/model_executor/layers/fused_moe/eep_reconfigure.py:60-124",
+        "vllm/distributed/elastic_ep/elastic_execute.py:413-440"
+      ],
+      "interfaces": [],
+      "fidelity": "absent",
+      "note": "async-llm.scale-elastic-ep exists on the serving side but does not reach MoE staging."
+    },
+    {
+      "id": "models-layers.compressed-tensors-scheme-map",
+      "kind": "dispatch",
+      "name": "Compressed-tensors scheme selection",
+      "trigger": "a compressed-tensors checkpoint, for each layer",
+      "observable": "config_groups become a target-to-scheme map; a layer matches its target and gets the scheme for its weight and activation args (FP8 W8A8, W4A8, MXFP4, NVFP4, wNa16 and others); an unsupported scheme is refused",
+      "citations": [
+        "vllm/model_executor/layers/quantization/compressed_tensors/compressed_tensors.py:159-219",
+        "vllm/model_executor/layers/quantization/compressed_tensors/compressed_tensors.py:305-386",
+        "vllm/model_executor/layers/quantization/compressed_tensors/compressed_tensors.py:392-418",
+        "vllm/model_executor/layers/quantization/compressed_tensors/compressed_tensors.py:420-460"
+      ],
+      "interfaces": [],
+      "fidelity": "absent"
+    },
+    {
+      "id": "models-layers.legacy-int-quant-marlin-repack",
+      "kind": "pipeline",
+      "name": "GPTQ, AWQ and INC integer quant (Marlin repack)",
+      "trigger": "quantization gptq, awq, or inc checkpoints",
+      "observable": "weights repack into Marlin tile layout with zero points and scales, using choose_mp_linear_kernel at init; MoE uses moe_wna16 or Marlin MoE variants",
+      "citations": [
+        "vllm/model_executor/layers/quantization/auto_gptq.py:301-340",
+        "vllm/model_executor/layers/quantization/auto_awq.py:174-200",
+        "vllm/model_executor/kernels/linear/__init__.py:865-934",
+        "vllm/model_executor/layers/quantization/moe_wna16.py:227-260",
+        "vllm/model_executor/layers/quantization/utils/marlin_utils.py:48-90"
+      ],
+      "interfaces": [],
+      "fidelity": "absent"
+    },
+    {
+      "id": "models-layers.quantized-moe-weights",
+      "kind": "pipeline",
+      "name": "FP8 and compressed MoE weights to kernel format",
+      "trigger": "process_weights_after_loading of a quantized MoE method",
+      "observable": "expert weights convert to the selected kernel layout (block-shape refinement, TP-shard padding, scale format), the moe quant config and FusedMoEKernel are built; deep-GEMM, CUTLASS and TRTLLM each need their own format",
+      "citations": [
+        "vllm/model_executor/layers/quantization/fp8.py:525-662",
+        "vllm/model_executor/layers/quantization/fp8.py:708-762",
+        "vllm/model_executor/layers/fused_moe/oracle/fp8.py:288-392",
+        "vllm/model_executor/layers/fused_moe/oracle/fp8.py:577-709",
+        "vllm/model_executor/layers/fused_moe/oracle/fp8.py:839-879",
+        "vllm/model_executor/layers/fused_moe/config.py:213-260"
+      ],
+      "interfaces": [
+        "fused-moe-quant-config.make",
+        "fused-moe-kernel.experts-quant-accessors"
+      ],
+      "fidelity": "partial",
+      "note": "The quant config value object is modeled; layout conversion is not."
+    },
+    {
+      "id": "models-layers.lora-module-wrapping",
+      "kind": "lifecycle",
+      "name": "LoRA module wrapping at startup",
+      "trigger": "LoRAModelManager construction with enable_lora",
+      "observable": "matching modules are replaced in the model by LoRA wrappers (linear, embedding, classifier, logits, MoE), and tower or connector modules get their own Punica wrappers when the model supports them",
+      "citations": [
+        "vllm/lora/model_manager.py:467-611",
+        "vllm/lora/utils.py:107-155",
+        "vllm/lora/utils.py:232-326",
+        "vllm/lora/model_manager.py:210-328",
+        "vllm/lora/punica_wrapper/punica_selector.py:13-21"
+      ],
+      "interfaces": [],
+      "fidelity": "absent"
+    },
+    {
+      "id": "models-layers.lora-moe",
+      "kind": "pipeline",
+      "name": "LoRA on fused MoE (2D and 3D checkpoints)",
+      "trigger": "MoE model with enable_lora and an MoE adapter",
+      "observable": "expert weights are stacked or converted between 2D and 3D, sliced to local experts under EP, and applied inside experts with a per-forward LoRA context; quantized experts need the LoRA mixin or are refused",
+      "citations": [
+        "vllm/lora/layers/fused_moe.py:29-90",
+        "vllm/lora/layers/fused_moe.py:244-295",
+        "vllm/lora/model_manager.py:945-1040",
+        "vllm/lora/model_manager.py:1040-1132",
+        "vllm/lora/model_manager.py:1133-1198",
+        "vllm/model_executor/layers/fused_moe/experts/lora_context.py:12-30",
+        "vllm/model_executor/layers/fused_moe/experts/lora_experts_mixin.py:11-40",
+        "vllm/lora/punica_wrapper/punica_gpu.py:451-525"
+      ],
+      "interfaces": [],
+      "fidelity": "absent",
+      "note": "custom-ops.moe-lora-align-block-size is an op listing with no caller here; validate-moe-lora-format is counted under adapter validation."
+    },
+    {
+      "id": "models-layers.lora-packed-merge",
+      "kind": "pipeline",
+      "name": "Packed module LoRA merge",
+      "trigger": "activation of an adapter on qkv_proj, gate_up_proj and other packed modules",
+      "observable": "the adapter parts for a packed module merge in place into one packed LoRA, with absent parts staying None and MoE parts restricted to local experts under EP, so one set_lora call covers a fused layer",
+      "citations": [
+        "vllm/lora/model_manager.py:838-943",
+        "vllm/lora/lora_weights.py:135-161",
+        "vllm/lora/lora_weights.py:163-250",
+        "vllm/lora/utils.py:385-420"
+      ],
+      "interfaces": [],
+      "fidelity": "absent"
+    },
+    {
+      "id": "models-layers.lora-dummy-warmup",
+      "kind": "lifecycle",
+      "name": "Dummy LoRA for warmup",
+      "trigger": "worker warmup and CUDA graph capture, with LoRA enabled",
+      "observable": "dummy adapters of the warmup rank fill slots for capture, one graph per num_active_loras case (powers of two and max_loras + 1 when specialized), and are removed afterward",
+      "citations": [
+        "vllm/lora/model_manager.py:636-753",
+        "vllm/lora/model_manager.py:755-785",
+        "vllm/lora/worker_manager.py:176-190",
+        "vllm/lora/utils.py:51-68"
+      ],
+      "interfaces": [],
+      "fidelity": "absent"
+    },
+    {
+      "id": "models-layers.lora-resolver-registry",
+      "kind": "dispatch",
+      "name": "LoRA resolver registry",
+      "trigger": "a request names an adapter not yet registered, with a resolver configured",
+      "observable": "resolvers register under a name, duplicates are overwritten; a resolver turns the name into a local path, and the unknown name is a KeyError",
+      "citations": [
+        "vllm/lora/resolver.py:45-90",
+        "vllm/lora/resolver.py:14-44"
+      ],
+      "interfaces": [
+        "lora-resolver-registry.register-resolver",
+        "hf-hub-resolver.resolve-lora",
+        "filesystem-resolver.register-filesystem-resolver",
+        "hf-hub-resolver.register-hf-hub-resolver"
+      ],
+      "fidelity": "partial",
+      "note": "Resolvers are modeled in config-platform; the registry itself has no behavior steps and get_resolver has no interface."
+    },
+    {
+      "id": "models-layers.media-disk-cache",
+      "kind": "sweep",
+      "name": "Media disk cache with TTL and LRU eviction",
+      "trigger": "a URL fetch with a media cache directory configured",
+      "observable": "a fresh file answers the fetch and its mtime is touched; an expired one is unlinked; writes are atomic through a temp file and rename; after each write, expired files then oldest files are removed until under the byte limit",
+      "citations": [
+        "vllm/multimodal/media/connector.py:233-251",
+        "vllm/multimodal/media/connector.py:253-273",
+        "vllm/multimodal/media/connector.py:275-307"
+      ],
+      "interfaces": [],
+      "fidelity": "absent"
+    },
+    {
+      "id": "models-layers.video-decode-backends",
+      "kind": "dispatch",
+      "name": "Video loader backends",
+      "trigger": "each video item, on the backend from media_io_kwargs, the HF processor class or default",
+      "observable": "a named VideoLoader (OpenCV, TorchCodec, PyNvVideoCodec, DeepStream) is loaded through a registry; option sets are checked against the backend, and options that a switched backend does not accept are identified",
+      "citations": [
+        "vllm/multimodal/video.py:36-97",
+        "vllm/multimodal/video.py:202-320",
+        "vllm/multimodal/video_decoders/__init__.py:1-120",
+        "vllm/multimodal/media/video.py:23-120",
+        "vllm/multimodal/video_decoders/opencv.py:1-60"
+      ],
+      "interfaces": [
+        "video-loader-registry.load",
+        "video-loader-registry.get-backend-for-video-processor",
+        "video-loader-registry.register",
+        "video-loader-registry.backend-requires-gpu",
+        "video-media-io.init",
+        "video-media-io.merge-kwargs"
+      ],
+      "fidelity": "partial",
+      "note": "Registry and kwargs resolution are modeled; decoding, frame sampling and GPU decode are not."
+    },
+    {
+      "id": "models-layers.video-frame-pruning",
+      "kind": "pipeline",
+      "name": "Video frame pruning (EVS, VidCom2)",
+      "trigger": "video_pruning_rate on Qwen2.5-VL, Qwen3-VL, Cohere Compass and Nano Nemotron",
+      "observable": "with video_pruning_rate above 0, a retention mask over the video embeddings keeps a set fraction of tokens by the chosen method, always all tokens of the first frame, and the prompt carries the retained count",
+      "citations": [
+        "vllm/multimodal/video_prune/evs.py:19-36",
+        "vllm/multimodal/video_prune/evs.py:39-118",
+        "vllm/multimodal/video_prune/vidcom2.py:19-60",
+        "vllm/config/multimodal.py:430-433",
+        "vllm/model_executor/models/interfaces.py:519-562"
+      ],
+      "interfaces": [],
+      "fidelity": "absent"
+    },
+    {
+      "id": "models-layers.gpu-media-memory-pool",
+      "kind": "gate",
+      "name": "GPU media memory lease pool",
+      "trigger": "a frontend GPU decoder about to allocate device memory",
+      "observable": "a byte-counting semaphore blocks until budget is free, so concurrent decodes serialize rather than oversubscribe; the engine carves the same amount out of the KV budget",
+      "citations": [
+        "vllm/multimodal/gpu_ipc_memory.py:32-52",
+        "vllm/multimodal/gpu_ipc_memory.py:54-115"
+      ],
+      "interfaces": [],
+      "fidelity": "absent"
+    },
+    {
+      "id": "models-layers.raw-input-multimodal-models",
+      "kind": "dispatch",
+      "name": "Raw-input multimodal models (Terratorch)",
+      "trigger": "models with supports_multimodal_raw_input_only",
+      "observable": "the model reads multimodal kwargs in its forward rather than through embeddings merged beforehand, and registry checks route them that way",
+      "citations": [
+        "vllm/model_executor/models/interfaces.py:597-598",
+        "vllm/model_executor/models/registry.py:1454-1461",
+        "vllm/model_executor/models/terratorch.py:247-260"
+      ],
+      "interfaces": [],
+      "fidelity": "absent"
+    }
+  ]
+}

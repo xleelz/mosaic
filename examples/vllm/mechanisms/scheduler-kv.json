@@ -1,0 +1,1670 @@
+{
+ "area": "scheduler-kv",
+ "mechanisms": [
+  {
+   "id": "scheduler-kv.schedule-step",
+   "kind": "loop",
+   "name": "Continuous-batching schedule step",
+   "trigger": "every engine step, from the busy loop",
+   "observable": "RUNNING requests get tokens first, then WAITING ones are admitted, within the token budget, max_num_seqs and free KV blocks; a SchedulerOutput lists new and cached requests, tokens per request and finished ids",
+   "citations": [
+    "vllm/v1/core/sched/scheduler.py:591-1555",
+    "vllm/v1/core/sched/scheduler.py:1616-1648"
+   ],
+   "interfaces": [
+    "scheduler.schedule",
+    "kv-cache-manager.allocate-slots"
+   ],
+   "fidelity": "partial",
+   "note": "Budget is always max_num_batched_tokens: max_num_scheduled_tokens, max_num_active_seqs and the separate input_budget with draft_slots are not modeled."
+  },
+  {
+   "id": "scheduler-kv.update-from-output",
+   "kind": "pipeline",
+   "name": "Step output application",
+   "trigger": "after each executed step, once per scheduled step in FIFO order",
+   "observable": "sampled tokens are appended, drafts rolled back, stops detected, finished requests freed, and per-client EngineCoreOutputs with stats returned",
+   "citations": [
+    "vllm/v1/core/sched/scheduler.py:2026-2424",
+    "vllm/v1/core/sched/scheduler.py:2493-2510"
+   ],
+   "interfaces": [
+    "scheduler.update-from-output",
+    "sched-utils.check-stop",
+    "scheduler.free-request",
+    "scheduler.make-stats"
+   ],
+   "fidelity": "partial",
+   "note": "Skips invalid_block_ids and failed_recving handling, pooler outputs, num_nans, aux outputs, finished_requests sets, connector stats and KV event publication."
+  },
+  {
+   "id": "scheduler-kv.preemption",
+   "kind": "retry",
+   "name": "Preemption on KV exhaustion",
+   "trigger": "allocate_slots returns None for a RUNNING request",
+   "observable": "the tail request (FCFS) or worst (priority, arrival) request frees its blocks, resets num_computed_tokens to 0, returns to the waiting head and is recomputed; no waiting request is admitted that step",
+   "citations": [
+    "vllm/v1/core/sched/scheduler.py:777-844",
+    "vllm/v1/core/sched/scheduler.py:1571-1614"
+   ],
+   "interfaces": [
+    "scheduler.schedule",
+    "scheduler.preempt-request",
+    "scheduler.free-request-blocks"
+   ],
+   "fidelity": "partial",
+   "note": "The early breaks are missing: a connector with pending block frees, and a victim whose blocks can only be freed later. requires_kv_delivery drop mode is also absent."
+  },
+  {
+   "id": "scheduler-kv.request-lifecycle",
+   "kind": "lifecycle",
+   "name": "Request state machine",
+   "trigger": "add_request, each step, stop, abort",
+   "observable": "a request moves WAITING (or blocked) to RUNNING, PREEMPTED and back, then to a FINISHED_* status, and leaves the table once its blocks are freed",
+   "citations": [
+    "vllm/v1/core/sched/scheduler.py:2616-2647",
+    "vllm/v1/core/sched/scheduler.py:2649-2750",
+    "vllm/v1/core/sched/scheduler.py:2437-2463"
+   ],
+   "interfaces": [
+    "scheduler.add-request",
+    "scheduler.schedule",
+    "scheduler.finish-requests",
+    "scheduler.free-request"
+   ],
+   "fidelity": "partial",
+   "note": "WAITING_FOR_STREAMING_REQ is not a modeled transition, and aborting during an async KV load does not delay the block free."
+  },
+  {
+   "id": "scheduler-kv.waiting-admission-gate",
+   "kind": "gate",
+   "name": "Waiting-request admission chain",
+   "trigger": "the WAITING pass of each step with budget left",
+   "observable": "checks run in order: slot limit, blocked status, stale output, max_loras, prefix and connector hit, chunking, encoder budget, allocation; a skip defers one request, a failed allocation stops the scan",
+   "citations": [
+    "vllm/v1/core/sched/scheduler.py:912-1343"
+   ],
+   "interfaces": [
+    "scheduler.schedule",
+    "kv-cache-manager.get-computed-blocks",
+    "kv-connector-base-v1.get-num-new-matched-tokens",
+    "scheduler.try-schedule-encoder-inputs"
+   ],
+   "fidelity": "partial",
+   "note": "Omits the encoder-transfer pending check, DP prefill deferral, spec-decode padding, and connector hit reconciliation (partial tail, diverged hybrid hit)."
+  },
+  {
+   "id": "scheduler-kv.chunked-prefill-budget",
+   "kind": "pipeline",
+   "name": "Chunked prefill and long-prefill cap",
+   "trigger": "a request needs more tokens than the budget, or more than long_prefill_token_threshold with others eligible",
+   "observable": "the prefill is split over steps; with chunking off the scan stops instead; the adaptive cap never drops below a fair share of the budget",
+   "citations": [
+    "vllm/v1/core/sched/scheduler.py:640-655",
+    "vllm/v1/core/sched/scheduler.py:703-712",
+    "vllm/v1/core/sched/scheduler.py:1155-1169"
+   ],
+   "interfaces": [
+    "scheduler.schedule"
+   ],
+   "fidelity": "modeled"
+  },
+  {
+   "id": "scheduler-kv.kv-cache-prefix-hit",
+   "kind": "cache",
+   "name": "Prefix-cache hit lookup",
+   "trigger": "admission of a request with no computed tokens",
+   "observable": "the longest run of chained block hashes is adopted, capped at num_tokens - 1 so the last token is recomputed, and queries and hits are counted",
+   "citations": [
+    "vllm/v1/core/kv_cache_manager.py:264-321",
+    "vllm/v1/core/single_type_kv_cache_manager.py:733-828",
+    "vllm/v1/core/block_pool.py:198-224"
+   ],
+   "interfaces": [
+    "kv-cache-manager.get-computed-blocks",
+    "full-attention-manager.find-longest-cache-hit",
+    "block-pool.get-cached-block",
+    "block-pool.touch"
+   ],
+   "fidelity": "partial",
+   "note": "No EAGLE last-block drop for full attention and no shared_prefix_boundary junction pin."
+  },
+  {
+   "id": "scheduler-kv.block-pool-eviction",
+   "kind": "cache",
+   "name": "Block pool allocation and LRU eviction",
+   "trigger": "allocation, free and prefix hits",
+   "observable": "free blocks form a queue: uncached blocks return to the front, cached ones to the tail; popping a cached block drops its hash, and a hit removes it from the queue",
+   "citations": [
+    "vllm/v1/core/block_pool.py:666-700",
+    "vllm/v1/core/block_pool.py:729-805",
+    "vllm/v1/core/kv_cache_utils.py:246-507"
+   ],
+   "interfaces": [
+    "block-pool.get-new-blocks",
+    "block-pool.free-blocks",
+    "block-pool.touch",
+    "block-pool.free-queue-append",
+    "block-pool.get-usage",
+    "block-pool.init"
+   ],
+   "fidelity": "modeled"
+  },
+  {
+   "id": "scheduler-kv.allocate-slots-gate",
+   "kind": "gate",
+   "name": "KV slot allocation and watermark gate",
+   "trigger": "each scheduling of a request that needs blocks",
+   "observable": "a request gets blocks only if needed blocks plus the watermark (waiting requests only) fit in the free count; with scheduler_reserve_full_isl the whole sequence must fit first",
+   "citations": [
+    "vllm/v1/core/kv_cache_manager.py:371-618"
+   ],
+   "interfaces": [
+    "kv-cache-manager.allocate-slots",
+    "full-attention-manager.get-num-blocks-to-allocate",
+    "full-attention-manager.allocate-new-blocks",
+    "block-pool.get-num-free-blocks"
+   ],
+   "fidelity": "partial",
+   "note": "No reserved_blocks, no remove_skipped_blocks before counting, no cross-attention encoder tokens, no retained_hit_group_ids."
+  },
+  {
+   "id": "scheduler-kv.block-hash-chain",
+   "kind": "pipeline",
+   "name": "Block hash chain",
+   "trigger": "add_request and each newly full block",
+   "observable": "each full block hash chains over the prefix and extra keys (multimodal, LoRA, salt) from a NONE_HASH seed, so equal prefixes hash equal, including across processes when the seed matches",
+   "citations": [
+    "vllm/v1/core/kv_cache_utils.py:131-173",
+    "vllm/v1/core/kv_cache_utils.py:625-664",
+    "vllm/v1/core/kv_cache_utils.py:695-726",
+    "vllm/v1/core/kv_cache_utils.py:941-1001"
+   ],
+   "interfaces": [
+    "kv-cache-utils.init-none-hash",
+    "kv-cache-utils.get-none-hash-seed",
+    "kv-cache-utils.request-block-hasher"
+   ],
+   "fidelity": "modeled"
+  },
+  {
+   "id": "scheduler-kv.kv-cache-commit",
+   "kind": "pipeline",
+   "name": "Committing computed blocks to the prefix cache",
+   "trigger": "allocate_slots, and async output in update_from_output",
+   "observable": "full blocks up to the verified tokens gain hashes, so draft tokens are never cached and a later request can hit them",
+   "citations": [
+    "vllm/v1/core/kv_cache_manager.py:782-792",
+    "vllm/v1/core/single_type_kv_cache_manager.py:476-534",
+    "vllm/v1/core/block_pool.py:226-344",
+    "vllm/v1/core/sched/async_scheduler.py:59-78"
+   ],
+   "interfaces": [
+    "kv-cache-manager.cache-blocks",
+    "full-attention-manager.cache-blocks",
+    "block-pool.cache-full-blocks"
+   ],
+   "fidelity": "modeled"
+  },
+  {
+   "id": "scheduler-kv.kv-cache-sizing",
+   "kind": "pipeline",
+   "name": "KV cache sizing and grouping",
+   "trigger": "engine startup, after workers report available memory",
+   "observable": "available memory over bytes per block sets num_blocks across groups; too little memory fails startup with the estimated max length",
+   "citations": [
+    "vllm/v1/core/kv_cache_utils.py:2531-2688",
+    "vllm/v1/core/kv_cache_utils.py:1588-1688",
+    "vllm/v1/core/kv_cache_utils.py:2159-2254",
+    "vllm/v1/core/kv_cache_utils.py:1003-1040"
+   ],
+   "interfaces": [
+    "kv-cache-utils.get-kv-cache-configs",
+    "kv-cache-utils.get-kv-cache-config-from-groups",
+    "kv-cache-utils.generate-scheduler-kv-cache-config",
+    "kv-cache-utils.resolve-kv-cache-block-sizes",
+    "block-pool.init"
+   ],
+   "fidelity": "modeled"
+  },
+  {
+   "id": "scheduler-kv.kv-load-failure-recovery",
+   "kind": "retry",
+   "name": "KV load failure policy",
+   "trigger": "a connector reports failed_recving or invalid_block_ids",
+   "observable": "with recompute, computed tokens truncate to the valid prefix and the request reschedules; with fail, it ends FINISHED_ERROR and bad blocks are evicted",
+   "citations": [
+    "vllm/v1/core/sched/scheduler.py:2057-2072",
+    "vllm/v1/core/sched/scheduler.py:3237-3339",
+    "vllm/v1/core/sched/scheduler.py:3341-3354",
+    "vllm/v1/core/sched/scheduler.py:3356-3436",
+    "vllm/v1/core/sched/scheduler.py:183-184"
+   ],
+   "interfaces": [],
+   "fidelity": "absent"
+  },
+  {
+   "id": "scheduler-kv.async-kv-load-wait",
+   "kind": "handshake",
+   "name": "Async remote KV load wait",
+   "trigger": "a connector reports load_kv_async at admission",
+   "observable": "the request holds blocks in WAITING_FOR_REMOTE_KVS until finished_recving, then caches them and is promoted; the last token is recomputed on a full hit",
+   "citations": [
+    "vllm/v1/core/sched/scheduler.py:1320-1341",
+    "vllm/v1/core/sched/scheduler.py:3123-3173",
+    "vllm/v1/core/sched/scheduler.py:3175-3192",
+    "vllm/v1/core/sched/scheduler.py:3209-3235"
+   ],
+   "interfaces": [
+    "scheduler.schedule",
+    "scheduler.update-from-output",
+    "kv-cache-manager.cache-blocks",
+    "kv-connector-base-v1.update-connector-output"
+   ],
+   "fidelity": "partial",
+   "note": "Only the success path runs: no failed-load branch, no replay marking, no kv_holding_waiting placement."
+  },
+  {
+   "id": "scheduler-kv.kv-connector-hooks",
+   "kind": "dispatch",
+   "name": "Scheduler KV connector hook chain",
+   "trigger": "each request and step with a connector configured",
+   "observable": "the connector sees new requests, matches tokens, learns the allocation, builds step metadata, receives worker output and decides whether a finished request keeps its blocks",
+   "citations": [
+    "vllm/v1/core/sched/scheduler.py:970-983",
+    "vllm/v1/core/sched/scheduler.py:1288-1293",
+    "vllm/v1/core/sched/scheduler.py:1528-1530",
+    "vllm/v1/core/sched/scheduler.py:3005-3058"
+   ],
+   "interfaces": [
+    "kv-connector-base-v1.on-new-request",
+    "kv-connector-base-v1.get-num-new-matched-tokens",
+    "kv-connector-base-v1.update-state-after-alloc",
+    "kv-connector-base-v1.build-connector-meta",
+    "kv-connector-base-v1.update-connector-output",
+    "kv-connector-base-v1.request-finished",
+    "scheduler.free-request"
+   ],
+   "fidelity": "partial",
+   "note": "No partial-tail finalization or registration, and no boundary-state offloads or KVConnectorBlockState."
+  },
+  {
+   "id": "scheduler-kv.async-load-reservation",
+   "kind": "gate",
+   "name": "Async load block reservation",
+   "trigger": "admission of an async KV load",
+   "observable": "the load is admitted only if it fits in free blocks minus what in-flight prefills still need plus spec-decode step blocks, which prevents deadlock",
+   "citations": [
+    "vllm/v1/core/sched/scheduler.py:1241-1252",
+    "vllm/v1/core/sched/scheduler.py:3060-3092",
+    "vllm/v1/core/sched/scheduler.py:353-357"
+   ],
+   "interfaces": [],
+   "fidelity": "absent"
+  },
+  {
+   "id": "scheduler-kv.kv-holding-queue",
+   "kind": "gate",
+   "name": "KV-holding waiting queue",
+   "trigger": "a waiting request holds KV blocks",
+   "observable": "such requests sit in a separate queue drained before waiting, so a block holder never sits behind a request whose failed allocation stops the scan",
+   "citations": [
+    "vllm/v1/core/sched/scheduler.py:2445-2463",
+    "vllm/v1/core/sched/scheduler.py:913-917",
+    "vllm/v1/core/sched/scheduler.py:224-227"
+   ],
+   "interfaces": [],
+   "fidelity": "absent"
+  },
+  {
+   "id": "scheduler-kv.deferred-block-free",
+   "kind": "sweep",
+   "name": "Deferred block free fence",
+   "trigger": "finishing or preempting a request while overlapping batches run with a consumer connector",
+   "observable": "blocks are parked behind the last scheduled step and return to the pool only after that step output is processed",
+   "citations": [
+    "vllm/v1/core/sched/scheduler.py:2759-2775",
+    "vllm/v1/core/sched/scheduler.py:2788-2801",
+    "vllm/v1/core/sched/scheduler.py:1551-1552",
+    "vllm/v1/core/sched/scheduler.py:2044-2047"
+   ],
+   "interfaces": [
+    "scheduler.defer-block-free-enabled",
+    "scheduler.free-request-blocks",
+    "scheduler.drain-deferred-frees",
+    "kv-cache-manager.pop-blocks-for-free"
+   ],
+   "fidelity": "modeled"
+  },
+  {
+   "id": "scheduler-kv.async-placeholders",
+   "kind": "pipeline",
+   "name": "Async scheduling output placeholders",
+   "trigger": "AsyncScheduler, every scheduled decode",
+   "observable": "placeholders stand in for tokens still in flight so the next step can schedule immediately; the max_tokens guard skips a request that is certainly done, and tokens are cached as they arrive",
+   "citations": [
+    "vllm/v1/core/sched/async_scheduler.py:25-57",
+    "vllm/v1/core/sched/async_scheduler.py:59-78",
+    "vllm/v1/core/sched/scheduler.py:664-678"
+   ],
+   "interfaces": [
+    "scheduler.schedule",
+    "scheduler.update-from-output",
+    "kv-cache-manager.cache-blocks"
+   ],
+   "fidelity": "modeled"
+  },
+  {
+   "id": "scheduler-kv.stale-output-handling",
+   "kind": "lifecycle",
+   "name": "Stale output after preemption",
+   "trigger": "output arrives for a request preempted while its step was in flight",
+   "observable": "deliverable stale tokens are delivered but do not change reset counters; drop-mode stale output is discarded; resumption waits until stale output drains",
+   "citations": [
+    "vllm/v1/core/sched/scheduler.py:1571-1610",
+    "vllm/v1/core/sched/scheduler.py:2082-2100",
+    "vllm/v1/core/sched/scheduler.py:934-939"
+   ],
+   "interfaces": [
+    "scheduler.preempt-request",
+    "scheduler.update-from-output",
+    "scheduler.schedule"
+   ],
+   "fidelity": "modeled"
+  },
+  {
+   "id": "scheduler-kv.abort-finish",
+   "kind": "lifecycle",
+   "name": "Abort and external finish",
+   "trigger": "client disconnect, shutdown or pause with abort",
+   "observable": "unknown ids are ignored; known ones leave their queue, take the finished status and free their blocks; workers learn through finished_req_ids",
+   "citations": [
+    "vllm/v1/core/sched/scheduler.py:2649-2712",
+    "vllm/v1/core/sched/scheduler.py:2714-2744"
+   ],
+   "interfaces": [
+    "scheduler.finish-requests",
+    "scheduler.free-request"
+   ],
+   "fidelity": "partial",
+   "note": "delay_free_blocks for an in-flight WAITING_FOR_REMOTE_KVS load and its finished/failed set cleanup are missing."
+  },
+  {
+   "id": "scheduler-kv.stop-check",
+   "kind": "gate",
+   "name": "Stop and finish reason check",
+   "trigger": "each appended sampled token",
+   "observable": "EOS, a stop token, max_tokens or max_model_len, or a repeating tail past min_tokens ends the request with its finish reason and trims later tokens",
+   "citations": [
+    "vllm/v1/core/sched/utils.py:98-140",
+    "vllm/v1/core/sched/utils.py:28-62",
+    "vllm/v1/core/sched/scheduler.py:2493-2510"
+   ],
+   "interfaces": [
+    "sched-utils.check-stop",
+    "scheduler.update-from-output"
+   ],
+   "fidelity": "modeled"
+  },
+  {
+   "id": "scheduler-kv.scheduling-policy",
+   "kind": "dispatch",
+   "name": "FCFS or priority scheduling",
+   "trigger": "scheduler_config.policy at construction, read in each pass",
+   "observable": "FCFS uses a deque; priority uses a heap of (priority, arrival_time), and preemption chooses the worst running request and restores its budget",
+   "citations": [
+    "vllm/v1/core/sched/request_queue.py:75-128",
+    "vllm/v1/core/sched/request_queue.py:131-197",
+    "vllm/v1/core/sched/request_queue.py:200-207",
+    "vllm/v1/core/sched/scheduler.py:795-833"
+   ],
+   "interfaces": [
+    "fcfs-request-queue.peek-request",
+    "priority-request-queue.peek-request",
+    "scheduler.iter-waiting",
+    "scheduler.schedule"
+   ],
+   "fidelity": "modeled"
+  },
+  {
+   "id": "scheduler-kv.deferred-waiting-skip",
+   "kind": "gate",
+   "name": "Skipped waiting requests",
+   "trigger": "a waiting request is skipped by the scan",
+   "observable": "it joins deferred_waiting, is put back ahead of older items in order, and is reported as skipped rather than waiting in stats",
+   "citations": [
+    "vllm/v1/core/sched/scheduler.py:904-910",
+    "vllm/v1/core/sched/scheduler.py:1392-1395",
+    "vllm/v1/core/sched/scheduler.py:2944-2947"
+   ],
+   "interfaces": [
+    "scheduler.schedule",
+    "scheduler.make-stats"
+   ],
+   "fidelity": "modeled"
+  },
+  {
+   "id": "scheduler-kv.pause-states",
+   "kind": "gate",
+   "name": "Scheduler pause states",
+   "trigger": "sleep, pause or resume utility calls",
+   "observable": "PAUSED_ALL schedules nothing; PAUSED_NEW admits only KV-holding waiting requests; has_requests respects the state",
+   "citations": [
+    "vllm/v1/core/sched/scheduler.py:2755-2757",
+    "vllm/v1/core/sched/scheduler.py:615-617",
+    "vllm/v1/core/sched/scheduler.py:2803-2838",
+    "vllm/v1/core/sched/scheduler.py:913-917"
+   ],
+   "interfaces": [
+    "scheduler.set-pause-state",
+    "scheduler.pause-state",
+    "scheduler.has-requests",
+    "scheduler.schedule"
+   ],
+   "fidelity": "partial",
+   "note": "The schedule behavior admits nothing under PAUSED_NEW, so KV-holding requests stay stuck, unlike the code."
+  },
+  {
+   "id": "scheduler-kv.prefix-cache-reset",
+   "kind": "lifecycle",
+   "name": "Prefix cache reset",
+   "trigger": "weight update, sleep or the dev reset route",
+   "observable": "without forcing it succeeds only with no blocks in use; forcing preempts all running requests first and fails loudly if blocks remain; the connector cache may reset too",
+   "citations": [
+    "vllm/v1/core/sched/scheduler.py:2840-2883",
+    "vllm/v1/core/sched/scheduler.py:2885-2905",
+    "vllm/v1/core/kv_cache_manager.py:674-689",
+    "vllm/v1/core/block_pool.py:827-866"
+   ],
+   "interfaces": [
+    "scheduler.reset-prefix-cache",
+    "kv-cache-manager.reset-prefix-cache",
+    "block-pool.reset-prefix-cache",
+    "kv-connector-base-v1.reset-cache"
+   ],
+   "fidelity": "modeled"
+  },
+  {
+   "id": "scheduler-kv.speculative-scheduling",
+   "kind": "pipeline",
+   "name": "Speculative token scheduling and rollback",
+   "trigger": "speculative decoding on, each decode step",
+   "observable": "draft tokens are scheduled with budget, rejected drafts roll back the computed count, and acceptance feeds stats",
+   "citations": [
+    "vllm/v1/core/sched/scheduler.py:861-877",
+    "vllm/v1/core/sched/scheduler.py:2110-2146",
+    "vllm/v1/core/sched/scheduler.py:2550-2569",
+    "vllm/v1/core/sched/scheduler.py:1487-1490"
+   ],
+   "interfaces": [
+    "scheduler.schedule",
+    "scheduler.update-draft-token-ids",
+    "scheduler.update-from-output",
+    "scheduler.make-spec-decoding-stats"
+   ],
+   "fidelity": "partial",
+   "note": "No uniform padding of new decodes, no dynamic K lookup and no grammar validation of drafts."
+  },
+  {
+   "id": "scheduler-kv.encoder-input-scheduling",
+   "kind": "gate",
+   "name": "Encoder input scheduling",
+   "trigger": "a multimodal request whose placeholders overlap the step token range",
+   "observable": "items are scheduled within the encoder budget and cache; the token chunk is cut before an item that does not fit; references are freed after the step runs",
+   "citations": [
+    "vllm/v1/core/sched/scheduler.py:1789-1976",
+    "vllm/v1/core/sched/scheduler.py:1775-1787",
+    "vllm/v1/core/sched/scheduler.py:2512-2548"
+   ],
+   "interfaces": [
+    "scheduler.try-schedule-encoder-inputs",
+    "scheduler.allocate-encoder-inputs",
+    "scheduler.free-encoder-inputs"
+   ],
+   "fidelity": "partial",
+   "note": "A reused multimodal UUID with a different embed count is not rejected as an error."
+  },
+  {
+   "id": "scheduler-kv.encoder-cache",
+   "kind": "cache",
+   "name": "Encoder embedding cache",
+   "trigger": "encoder input scheduling and request free",
+   "observable": "entries are reference counted by mm hash; unreferenced ones are evicted oldest first only under pressure, and evicted hashes reach workers through the scheduler output",
+   "citations": [
+    "vllm/v1/core/encoder_cache_manager.py:108-136",
+    "vllm/v1/core/encoder_cache_manager.py:145-206",
+    "vllm/v1/core/encoder_cache_manager.py:246-294",
+    "vllm/v1/core/encoder_cache_manager.py:296-310",
+    "vllm/v1/core/encoder_cache_manager.py:316-368"
+   ],
+   "interfaces": [
+    "encoder-cache-manager.check-and-update-cache",
+    "encoder-cache-manager.can-allocate",
+    "encoder-cache-manager.allocate",
+    "encoder-cache-manager.free",
+    "encoder-cache-manager.free-encoder-input",
+    "encoder-cache-manager.get-freed-mm-hashes",
+    "encoder-cache-manager.compute-mm-encoder-budget",
+    "encoder-cache-manager.reset",
+    "scheduler.init-encoder-cache"
+   ],
+   "fidelity": "modeled"
+  },
+  {
+   "id": "scheduler-kv.structured-grammar-compile",
+   "kind": "lifecycle",
+   "name": "Grammar compile wait",
+   "trigger": "a structured-output request arrives",
+   "observable": "the compile runs on a thread pool (inline under external_launcher); the request waits in WAITING_FOR_STRUCTURED_OUTPUT_GRAMMAR and is promoted, or fails alone when the compile raises",
+   "citations": [
+    "vllm/v1/structured_output/__init__.py:126-191",
+    "vllm/v1/structured_output/request.py:42-51",
+    "vllm/v1/core/sched/scheduler.py:3191-3199",
+    "vllm/v1/core/sched/scheduler.py:2302-2326"
+   ],
+   "interfaces": [
+    "structured-output-manager.grammar-init",
+    "structured-output-manager.grammar-status",
+    "scheduler.schedule",
+    "scheduler.update-from-output"
+   ],
+   "fidelity": "partial",
+   "note": "The thread-pool executor and the inline external_launcher branch are not modeled."
+  },
+  {
+   "id": "scheduler-kv.structured-backend-dispatch",
+   "kind": "dispatch",
+   "name": "Structured output backend selection",
+   "trigger": "the first structured request initializes the single backend",
+   "observable": "xgrammar, guidance, outlines or lm-format-enforcer compile and enforce the grammar; an unknown backend raises",
+   "citations": [
+    "vllm/v1/structured_output/__init__.py:126-176",
+    "vllm/v1/structured_output/backend_xgrammar.py:86-172",
+    "vllm/v1/structured_output/backend_outlines.py:59-87",
+    "vllm/v1/structured_output/backend_guidance.py:180-216",
+    "vllm/v1/structured_output/backend_lm_format_enforcer.py:101-154"
+   ],
+   "interfaces": [
+    "structured-output-manager.grammar-init",
+    "xgrammar-backend.compile-grammar",
+    "backend-outlines.compile-grammar"
+   ],
+   "fidelity": "partial",
+   "note": "Guidance and lm-format-enforcer are assumed ready with no compile or validation."
+  },
+  {
+   "id": "scheduler-kv.grammar-token-accept",
+   "kind": "lifecycle",
+   "name": "Grammar state advance",
+   "trigger": "each sampled token of a structured request",
+   "observable": "the matcher advances; a rejected token ends the request FINISHED_ERROR; termination on a stop token is tracked",
+   "citations": [
+    "vllm/v1/structured_output/__init__.py:462-484",
+    "vllm/v1/structured_output/backend_xgrammar.py:190-239",
+    "vllm/v1/core/sched/scheduler.py:2186-2198"
+   ],
+   "interfaces": [
+    "structured-output-manager.accept-tokens",
+    "xgrammar-grammar.accept-tokens",
+    "xgrammar-grammar.is-terminated",
+    "scheduler.update-from-output"
+   ],
+   "fidelity": "partial",
+   "note": "Only the xgrammar matcher exists: no rollback, no reasoning latch."
+  },
+  {
+   "id": "scheduler-kv.grammar-bitmask",
+   "kind": "pipeline",
+   "name": "Grammar bitmask fill",
+   "trigger": "each step with a structured request past prefill",
+   "observable": "rows hold the allowed tokens per draft position and bonus token, filled in parallel for large batches without speculation, then the grammar rolls back draft advances",
+   "citations": [
+    "vllm/v1/core/sched/scheduler.py:1995-2024",
+    "vllm/v1/structured_output/__init__.py:325-460",
+    "vllm/v1/structured_output/__init__.py:199-220"
+   ],
+   "interfaces": [
+    "scheduler.get-grammar-bitmask",
+    "xgrammar-grammar.fill-bitmask",
+    "structured-outputs-worker.apply-grammar-bitmask"
+   ],
+   "fidelity": "partial",
+   "note": "The scheduler returns only ids and draft counts, and no multi-row fill, rejection copy, rollback or parallel pool (threshold 128) exists."
+  },
+  {
+   "id": "scheduler-kv.regex-compile-guard",
+   "kind": "gate",
+   "name": "Regex and schema pre-validation with timeout",
+   "trigger": "request validation, and regex compile",
+   "observable": "regexes the engine cannot build and overly nested schemas are rejected early; a compile running past VLLM_REGEX_COMPILATION_TIMEOUT_S raises a timed-out error",
+   "citations": [
+    "vllm/v1/structured_output/utils.py:62-98",
+    "vllm/v1/structured_output/backend_xgrammar.py:407-504",
+    "vllm/v1/structured_output/backend_outlines.py:195-239",
+    "vllm/v1/structured_output/backend_outlines.py:307-366"
+   ],
+   "interfaces": [
+    "structured-output-utils.compile-regex-with-timeout",
+    "xgrammar-backend.validate-xgrammar-grammar",
+    "backend-outlines.validate-structured-output-request-outlines",
+    "backend-outlines.validate-regex-is-buildable",
+    "xgrammar-compiler.compile-regex"
+   ],
+   "fidelity": "modeled"
+  },
+  {
+   "id": "scheduler-kv.reasoning-constraint-gate",
+   "kind": "gate",
+   "name": "Reasoning-aware grammar start",
+   "trigger": "a structured request with a reasoning parser and enable_in_reasoning off",
+   "observable": "the grammar applies only after reasoning ends: earlier rows stay unconstrained and the end token latches reasoning_ended",
+   "citations": [
+    "vllm/v1/structured_output/__init__.py:226-304",
+    "vllm/v1/structured_output/__init__.py:459-484"
+   ],
+   "interfaces": [],
+   "fidelity": "absent"
+  },
+  {
+   "id": "scheduler-kv.draft-grammar-validation",
+   "kind": "gate",
+   "name": "Grammar validation of draft tokens",
+   "trigger": "drafts arrive through update_draft_token_ids",
+   "observable": "only the longest grammar-valid prefix of the drafts is kept, and the kept count sets the acceptable drafts",
+   "citations": [
+    "vllm/v1/structured_output/__init__.py:306-325",
+    "vllm/v1/core/sched/scheduler.py:2567-2569",
+    "vllm/v1/structured_output/backend_guidance.py:260-280"
+   ],
+   "interfaces": [],
+   "fidelity": "absent"
+  },
+  {
+   "id": "scheduler-kv.grammar-compile-cache",
+   "kind": "cache",
+   "name": "Grammar compile caches",
+   "trigger": "grammar compilation",
+   "observable": "xgrammar reuses its compiler cache up to VLLM_XGRAMMAR_CACHE_MB; outlines keeps an LRU of 128 or a version-stamped disk cache",
+   "citations": [
+    "vllm/v1/structured_output/backend_xgrammar.py:70-80",
+    "vllm/v1/structured_output/backend_outlines.py:40-58",
+    "vllm/v1/structured_output/utils.py:297-315"
+   ],
+   "interfaces": [],
+   "fidelity": "absent"
+  },
+  {
+   "id": "scheduler-kv.kv-event-emission",
+   "kind": "pipeline",
+   "name": "KV cache event publication",
+   "trigger": "block stored or removed, read at each update_from_output",
+   "observable": "BlockStored and BlockRemoved events, annotated with group kind and connector events, are published as a batch to subscribers",
+   "citations": [
+    "vllm/v1/core/block_pool.py:346-375",
+    "vllm/v1/core/block_pool.py:611-624",
+    "vllm/v1/core/kv_cache_manager.py:696-721",
+    "vllm/v1/core/sched/scheduler.py:2372-2385"
+   ],
+   "interfaces": [
+    "block-pool.take-events",
+    "kv-cache-manager.take-events",
+    "block-pool.emit-cached-block-events"
+   ],
+   "fidelity": "shell",
+   "note": "Events are collected but scheduler.update-from-output never takes or publishes them, and zmq-event-publisher.publish has no caller, so they reach no subscriber."
+  },
+  {
+   "id": "scheduler-kv.scheduler-stats",
+   "kind": "metric",
+   "name": "SchedulerStats gauges",
+   "trigger": "each update_from_output with log_stats on",
+   "observable": "running, waiting, skipped and fetch-stage counts, KV usage and prefix stats feed Prometheus and the log",
+   "citations": [
+    "vllm/v1/core/sched/scheduler.py:2915-2959",
+    "vllm/v1/core/sched/scheduler.py:3078-3086",
+    "vllm/v1/core/sched/scheduler.py:2408-2423"
+   ],
+   "interfaces": [
+    "scheduler.make-stats",
+    "kv-cache-manager.usage",
+    "stat-logger-manager.record-prometheus"
+   ],
+   "fidelity": "partial",
+   "note": "Missing num_kv_fetch_reqs_by_stage, connector prefix stats, eviction events, connector and EC stats and perf stats."
+  },
+  {
+   "id": "scheduler-kv.prefix-cache-stats",
+   "kind": "metric",
+   "name": "Prefix cache hit metrics",
+   "trigger": "at admission, and taken at each stats build",
+   "observable": "queries and hits accumulate per interval, with preempted re-admissions separate, and reset on each read",
+   "citations": [
+    "vllm/v1/core/kv_cache_manager.py:236-247",
+    "vllm/v1/core/kv_cache_manager.py:253-262",
+    "vllm/v1/core/sched/scheduler.py:1315-1318"
+   ],
+   "interfaces": [
+    "kv-cache-manager.record-prefix-cache-stats",
+    "kv-cache-manager.make-prefix-cache-stats",
+    "scheduler.make-stats"
+   ],
+   "fidelity": "modeled"
+  },
+  {
+   "id": "scheduler-kv.kv-eviction-metrics",
+   "kind": "metric",
+   "name": "KV block residency sampling",
+   "trigger": "kv_cache_metrics observability is on",
+   "observable": "a sample of blocks reports lifetime, idle time and reuse gaps as eviction events in stats",
+   "citations": [
+    "vllm/v1/core/kv_cache_metrics.py:46-96",
+    "vllm/v1/core/block_pool.py:729-750",
+    "vllm/v1/core/sched/scheduler.py:2930-2934"
+   ],
+   "interfaces": [],
+   "fidelity": "absent"
+  },
+  {
+   "id": "scheduler-kv.kv-capacity-report",
+   "kind": "metric",
+   "name": "KV capacity and max concurrency",
+   "trigger": "after the KV config resolves at startup",
+   "observable": "kv_cache_size_tokens and max concurrency are stored and logged, group and host-pool aware",
+   "citations": [
+    "vllm/v1/core/kv_cache_utils.py:1195-1228",
+    "vllm/v1/core/kv_cache_utils.py:2300-2335"
+   ],
+   "interfaces": [],
+   "fidelity": "absent"
+  },
+  {
+   "id": "scheduler-kv.max-model-len-autofit",
+   "kind": "pipeline",
+   "name": "max_model_len auto-fit",
+   "trigger": "max_model_len -1 at startup",
+   "observable": "binary search finds the longest length fitting every worker; the config is reduced or startup fails when not even one token fits",
+   "citations": [
+    "vllm/v1/core/kv_cache_utils.py:2414-2484",
+    "vllm/v1/core/kv_cache_utils.py:2369-2412"
+   ],
+   "interfaces": [],
+   "fidelity": "absent",
+   "note": "Only adoption of an already fitted value appears (gpu-worker-impl.update-max-model-len, async-mp-client.apply-ready-response); the search and failure do not."
+  },
+  {
+   "id": "scheduler-kv.kv-coordinator-dispatch",
+   "kind": "dispatch",
+   "name": "KV coordinator and manager selection",
+   "trigger": "KVCacheManager construction",
+   "observable": "caching off gives the no-prefix coordinator, one group the unitary one, otherwise the hybrid one; each group gets the manager its spec maps to",
+   "citations": [
+    "vllm/v1/core/kv_cache_coordinator.py:980-1038",
+    "vllm/v1/core/single_type_kv_cache_manager.py:2585-2631",
+    "vllm/v1/core/single_type_kv_cache_manager.py:2633-2700"
+   ],
+   "interfaces": [
+    "kv-cache-spec-registry.get-manager-class",
+    "kv-cache-spec-registry.register-all-kvcache-specs",
+    "kv-cache-manager.get-computed-blocks"
+   ],
+   "fidelity": "partial",
+   "note": "The registry resolves a class, but allocation and lookup are hardwired to full attention and Mamba; no coordinator selection runs."
+  },
+  {
+   "id": "scheduler-kv.hybrid-cache-hit",
+   "kind": "cache",
+   "name": "Hybrid fixed-point hit",
+   "trigger": "a prefix lookup with several KV groups",
+   "observable": "groups shrink the hit in turn until all agree on one length",
+   "citations": [
+    "vllm/v1/core/kv_cache_coordinator.py:796-931"
+   ],
+   "interfaces": [
+    "hybrid-kv-cache-coordinator.find-longest-cache-hit",
+    "full-attention-manager.find-longest-cache-hit",
+    "mamba-manager.find-longest-cache-hit"
+   ],
+   "fidelity": "partial",
+   "note": "Covers full attention and Mamba only; no sliding-window group, per-group hits or divergent connector hit."
+  },
+  {
+   "id": "scheduler-kv.mamba-checkpointing",
+   "kind": "lifecycle",
+   "name": "Mamba state checkpoints",
+   "trigger": "Mamba KV groups during prefill and cache commit",
+   "observable": "a request gets a state block, optionally copied from a checkpoint; a full block commits a checkpoint and continues in a new state block",
+   "citations": [
+    "vllm/v1/core/single_type_kv_cache_manager.py:1454-1531",
+    "vllm/v1/core/single_type_kv_cache_manager.py:1676-1778",
+    "vllm/v1/core/single_type_kv_cache_manager.py:1780-1906",
+    "vllm/v1/core/single_type_kv_cache_manager.py:1961-2006"
+   ],
+   "interfaces": [
+    "mamba-manager.allocate-state",
+    "mamba-manager.cache-blocks",
+    "mamba-manager.find-longest-cache-hit",
+    "mamba-manager.get-num-blocks-to-allocate",
+    "mamba-manager.free"
+   ],
+   "fidelity": "partial",
+   "note": "No prefill-checkpoint blocks, boundary-state offloads, partial-tail caching or EAGLE checkpoint drop."
+  },
+  {
+   "id": "scheduler-kv.mamba-aligned-split",
+   "kind": "pipeline",
+   "name": "Mamba aligned chunk split",
+   "trigger": "mamba_cache_mode align, each prefill chunk",
+   "observable": "chunks end where a reusable state must exist: block boundaries, last cacheable block, partial-tail boundary, shared-prefix junction",
+   "citations": [
+    "vllm/v1/core/sched/scheduler.py:443-556",
+    "vllm/v1/core/sched/scheduler.py:723-727",
+    "vllm/v1/core/sched/scheduler.py:1173-1179"
+   ],
+   "interfaces": [
+    "scheduler.mamba-block-aligned-split"
+   ],
+   "fidelity": "shell",
+   "note": "The interface computes the split, but scheduler.schedule never calls it, so no scheduled chunk changes."
+  },
+  {
+   "id": "scheduler-kv.sliding-window-release",
+   "kind": "sweep",
+   "name": "Out-of-window block release",
+   "trigger": "each allocate_slots for a sliding-window, ring or RSWA group",
+   "observable": "blocks fully below the window return to the pool, replaced by the null block",
+   "citations": [
+    "vllm/v1/core/single_type_kv_cache_manager.py:645-710",
+    "vllm/v1/core/single_type_kv_cache_manager.py:900-931",
+    "vllm/v1/core/single_type_kv_cache_manager.py:1135-1171",
+    "vllm/v1/core/kv_cache_manager.py:535-547"
+   ],
+   "interfaces": [
+    "sliding-window-manager.remove-skipped-blocks",
+    "rswa-manager.remove-skipped-blocks",
+    "circular-buffer-manager.remove-skipped-blocks"
+   ],
+   "fidelity": "shell",
+   "note": "Interfaces work alone but kv-cache-manager.allocate-slots never calls them, so no scheduled request releases a block this way."
+  },
+  {
+   "id": "scheduler-kv.sparse-group-hit-rules",
+   "kind": "cache",
+   "name": "Per-spec cache hit rules",
+   "trigger": "lookup on sliding-window, chunked-local or ring groups",
+   "observable": "a sliding-window hit needs contiguous window blocks scanned from the right; chunked-local nulls earlier chunks; the ring never hits",
+   "citations": [
+    "vllm/v1/core/single_type_kv_cache_manager.py:956-1052",
+    "vllm/v1/core/single_type_kv_cache_manager.py:1269-1366",
+    "vllm/v1/core/single_type_kv_cache_manager.py:1218-1230"
+   ],
+   "interfaces": [
+    "sliding-window-manager.find-longest-cache-hit",
+    "chunked-local-attention-manager.find-longest-cache-hit",
+    "circular-buffer-manager.find-longest-cache-hit"
+   ],
+   "fidelity": "shell",
+   "note": "Each interface has only its own scenario; get-computed-blocks calls none of them."
+  },
+  {
+   "id": "scheduler-kv.partial-hash-hit-cow",
+   "kind": "cache",
+   "name": "Fine-grained hits with copy-on-write",
+   "trigger": "hash_block_size below block_size with Mamba align",
+   "observable": "a prompt tail registers inside a block; a hit copies that block privately before writing, with both copy ends held until the step runs",
+   "citations": [
+    "vllm/v1/core/block_pool.py:449-563",
+    "vllm/v1/core/single_type_kv_cache_manager.py:454-474",
+    "vllm/v1/core/single_type_kv_cache_manager.py:849-885",
+    "vllm/v1/core/kv_cache_manager.py:854-869",
+    "vllm/v1/core/sched/scheduler.py:1474-1483",
+    "vllm/v1/core/sched/scheduler.py:2777-2786"
+   ],
+   "interfaces": [
+    "block-pool.cache-partial-block"
+   ],
+   "fidelity": "shell",
+   "note": "cache-partial-block has no caller; lookup never uses partial entries and no CoW copy reaches the SchedulerOutput."
+  },
+  {
+   "id": "scheduler-kv.prefix-retention-sparsify",
+   "kind": "sweep",
+   "name": "Sparse prefix-cache retention",
+   "trigger": "cache commit on sliding-window or Mamba groups with prefix_cache_retention_interval",
+   "observable": "only blocks reachable at retained boundaries are hashed, so sparse groups do not fill the cache with blocks that can never hit",
+   "citations": [
+    "vllm/v1/core/kv_cache_coordinator.py:33-62",
+    "vllm/v1/core/kv_cache_coordinator.py:65-86",
+    "vllm/v1/core/kv_cache_coordinator.py:354-377",
+    "vllm/v1/core/single_type_kv_cache_manager.py:536-560",
+    "vllm/v1/core/single_type_kv_cache_manager.py:1054-1133",
+    "vllm/v1/core/single_type_kv_cache_manager.py:1533-1590"
+   ],
+   "interfaces": [],
+   "fidelity": "absent"
+  },
+  {
+   "id": "scheduler-kv.swa-bounded-replay",
+   "kind": "retry",
+   "name": "Sliding-window bounded prefix replay",
+   "trigger": "a prefix hit on a model with replay groups (DSV41)",
+   "observable": "the hit last window is recomputed without rewriting cached KV, a too-short hit is discarded, and a load carrying the window replays nothing",
+   "citations": [
+    "vllm/v1/core/sched/scheduler.py:3094-3121",
+    "vllm/v1/core/sched/scheduler.py:993-1005",
+    "vllm/v1/core/sched/scheduler.py:1053-1067",
+    "vllm/v1/core/sched/scheduler.py:291-305"
+   ],
+   "interfaces": [],
+   "fidelity": "absent"
+  },
+  {
+   "id": "scheduler-kv.streaming-input-sessions",
+   "kind": "lifecycle",
+   "name": "Streaming input sessions",
+   "trigger": "a resumable request stops, or another chunk arrives under its id",
+   "observable": "the session keeps computed output as prompt, resumes from the materialized frontier or waits in WAITING_FOR_STREAMING_REQ holding its slot and blocks; a None sentinel ends it",
+   "citations": [
+    "vllm/v1/core/sched/scheduler.py:2465-2491",
+    "vllm/v1/core/sched/scheduler.py:1650-1691",
+    "vllm/v1/core/sched/scheduler.py:2616-2629"
+   ],
+   "interfaces": [],
+   "fidelity": "absent"
+  },
+  {
+   "id": "scheduler-kv.dp-prefill-balancing",
+   "kind": "gate",
+   "name": "DP prefill throttling",
+   "trigger": "the DP coordinator sets throttle_prefills on a non-aligned step",
+   "observable": "prefill compute defers to aligned steps unless the waiting queue is capacity bound, while decodes keep running",
+   "citations": [
+    "vllm/v1/core/sched/scheduler.py:634-638",
+    "vllm/v1/core/sched/scheduler.py:686-690",
+    "vllm/v1/core/sched/scheduler.py:1113-1116",
+    "vllm/v1/core/sched/scheduler.py:1398-1401"
+   ],
+   "interfaces": [
+    "scheduler.schedule"
+   ],
+   "fidelity": "shell",
+   "note": "The request schema declares throttle_prefills and engine-core passes it, but the behavior ignores it."
+  },
+  {
+   "id": "scheduler-kv.pp-decode-stagger",
+   "kind": "gate",
+   "name": "Pipeline-parallel decode stagger",
+   "trigger": "V2 runner with pipeline parallelism and async scheduling",
+   "observable": "a request skips decode until pp_size steps after its last one, matching the sampled-token broadcast ring",
+   "citations": [
+    "vllm/v1/core/sched/async_scheduler.py:15-23",
+    "vllm/v1/core/sched/async_scheduler.py:50-56",
+    "vllm/v1/core/sched/scheduler.py:680-684"
+   ],
+   "interfaces": [],
+   "fidelity": "absent"
+  },
+  {
+   "id": "scheduler-kv.prefill-lookahead-reserve",
+   "kind": "gate",
+   "name": "Multi-module MTP prefill boundary",
+   "trigger": "multi-module MTP with chunked prefill",
+   "observable": "no chunk ends within num_prefill_lookahead of the prefill end, so drafters never read sampled drafts into trailing caches",
+   "citations": [
+    "vllm/v1/core/sched/scheduler.py:570-589",
+    "vllm/v1/core/sched/scheduler.py:751-753",
+    "vllm/v1/core/sched/scheduler.py:1213-1215"
+   ],
+   "interfaces": [],
+   "fidelity": "absent"
+  },
+  {
+   "id": "scheduler-kv.kv-zeroing",
+   "kind": "pipeline",
+   "name": "New block zeroing",
+   "trigger": "groups that need zeroed KV (needs_kv_cache_zeroing)",
+   "observable": "newly allocated block ids drain each step and workers zero them before use, skipping blocks an async load will write",
+   "citations": [
+    "vllm/v1/core/sched/scheduler.py:1563-1569",
+    "vllm/v1/core/kv_cache_manager.py:833-852",
+    "vllm/v1/core/single_type_kv_cache_manager.py:412-420"
+   ],
+   "interfaces": [
+    "scheduler.schedule",
+    "kv-cache-manager.allocate-slots",
+    "kv-cache-interface.needs-kv-cache-zeroing",
+    "gpu-model-runner.update-requests"
+   ],
+   "fidelity": "partial",
+   "note": "No skip_zeroing_group_ids and no record_blocks_for_zeroing after a failed load."
+  },
+  {
+   "id": "scheduler-kv.encoder-transfer-gate",
+   "kind": "gate",
+   "name": "Encoder cache transfer gating",
+   "trigger": "an EC connector with multimodal requests",
+   "observable": "a request whose embeddings are still in transit is skipped; an unavailable input fails it retryably; the connector can delay frees",
+   "citations": [
+    "vllm/v1/core/sched/scheduler.py:692-701",
+    "vllm/v1/core/sched/scheduler.py:2426-2435",
+    "vllm/v1/core/sched/scheduler.py:2308-2311",
+    "vllm/v1/core/sched/scheduler.py:2729-2731"
+   ],
+   "interfaces": [],
+   "fidelity": "absent"
+  },
+  {
+   "id": "scheduler-kv.aux-output-routing",
+   "kind": "pipeline",
+   "name": "Auxiliary output routing",
+   "trigger": "aux_output_config enabled",
+   "observable": "routed experts per request join its EngineCoreOutput, and connector state clears on finish, preempt or reset",
+   "citations": [
+    "vllm/v1/core/sched/scheduler.py:2203-2206",
+    "vllm/v1/core/sched/scheduler.py:1532-1537",
+    "vllm/v1/core/sched/scheduler.py:1587-1588"
+   ],
+   "interfaces": [],
+   "fidelity": "absent"
+  },
+  {
+   "id": "scheduler-kv.diffusion-scheduling",
+   "kind": "dispatch",
+   "name": "Diffusion scheduler variant",
+   "trigger": "a diffusion model",
+   "observable": "canvas placeholders are capped, drafts trimmed to canvas width, and a request with its full read in flight skips a step",
+   "citations": [
+    "vllm/v1/core/sched/diffusion_scheduler.py:37-49",
+    "vllm/v1/core/sched/diffusion_scheduler.py:52-67",
+    "vllm/v1/core/sched/diffusion_scheduler.py:12-34"
+   ],
+   "interfaces": [],
+   "fidelity": "absent"
+  },
+  {
+   "id": "scheduler-kv.encoder-decoder-cache",
+   "kind": "dispatch",
+   "name": "Encoder-decoder cache manager",
+   "trigger": "an encoder-decoder model such as Whisper",
+   "observable": "nothing is cached: each input re-encodes, its slots return at request end, and its entries free one step after allocation",
+   "citations": [
+    "vllm/v1/core/encoder_cache_manager.py:73-76",
+    "vllm/v1/core/encoder_cache_manager.py:370-428"
+   ],
+   "interfaces": [],
+   "fidelity": "absent"
+  },
+  {
+   "id": "scheduler-kv.offload-tier-cascade",
+   "kind": "pipeline",
+   "name": "Tiered offload cascade",
+   "trigger": "a GPU to primary store completes",
+   "observable": "chunks become readable in the CPU primary, then cascade to each secondary tier allowed by backpressure, pinned until each job finishes; request-level tiers park in-flight keys",
+   "citations": [
+    "vllm/v1/kv_offload/tiering/manager.py:618-676",
+    "vllm/v1/kv_offload/tiering/manager.py:678-734",
+    "vllm/v1/kv_offload/tiering/manager.py:736-781",
+    "vllm/v1/kv_offload/tiering/manager.py:322-358"
+   ],
+   "interfaces": [
+    "tiering-offloading-manager.prepare-store",
+    "tiering-offloading-manager.complete-store",
+    "tiering-offloading-manager.create-store-job",
+    "tiering-offloading-manager.on-schedule-end"
+   ],
+   "fidelity": "shell",
+   "note": "The logic mirrors the code but no OffloadingConnector calls it, so a request never reaches it; it runs only from scenarios, against the example tier, with no pending cascade keys."
+  },
+  {
+   "id": "scheduler-kv.offload-tier-promotion",
+   "kind": "retry",
+   "name": "Tiered promotion and lookup retry",
+   "trigger": "lookup misses primary",
+   "observable": "a secondary hit reserves a primary slot and is promoted in one batched load per tier and request at step end; RETRY means ask again; a full primary reads as a miss",
+   "citations": [
+    "vllm/v1/kv_offload/tiering/manager.py:396-479",
+    "vllm/v1/kv_offload/tiering/manager.py:489-541",
+    "vllm/v1/kv_offload/tiering/manager.py:543-566",
+    "vllm/v1/kv_offload/tiering/manager.py:281-320",
+    "vllm/v1/kv_offload/tiering/manager.py:881-910"
+   ],
+   "interfaces": [
+    "tiering-offloading-manager.lookup",
+    "tiering-offloading-manager.on-schedule-end",
+    "example-secondary-tier-manager.lookup",
+    "example-secondary-tier-manager.submit-load"
+   ],
+   "fidelity": "shell",
+   "note": "Same as the cascade: no request path calls it, and only the example tier, which never answers RETRY, is wired in."
+  },
+  {
+   "id": "scheduler-kv.tier-backpressure",
+   "kind": "gate",
+   "name": "Secondary tier backpressure",
+   "trigger": "each cascade store and store completion on a tier with a detector",
+   "observable": "an EMA of seconds per MiB with water marks, warmup, idle decay, cooldown and a healthy fast path drops stores in proportion to overshoot, and drops are counted",
+   "citations": [
+    "vllm/v1/kv_offload/tiering/backpressure.py:62-103",
+    "vllm/v1/kv_offload/tiering/backpressure.py:173-232",
+    "vllm/v1/kv_offload/tiering/backpressure.py:302-361",
+    "vllm/v1/kv_offload/tiering/manager.py:360-394",
+    "vllm/v1/kv_offload/tiering/factory.py:70-90"
+   ],
+   "interfaces": [],
+   "fidelity": "absent"
+  },
+  {
+   "id": "scheduler-kv.cpu-primary-tier",
+   "kind": "cache",
+   "name": "CPU primary tier",
+   "trigger": "offload stores and loads",
+   "observable": "chunk slots are pinned by ref_cnt during reads, evicted LRU when ready and unpinned, and written chunks become readable on completion",
+   "citations": [
+    "vllm/v1/kv_offload/cpu/manager.py:58-100",
+    "vllm/v1/kv_offload/cpu/manager.py:204-249",
+    "vllm/v1/kv_offload/cpu/manager.py:251-363",
+    "vllm/v1/kv_offload/cpu/manager.py:365-398"
+   ],
+   "interfaces": [
+    "cpu-offloading-manager.prepare-store",
+    "cpu-offloading-manager.complete-store",
+    "cpu-offloading-manager.prepare-load",
+    "cpu-offloading-manager.complete-load",
+    "cpu-offloading-manager.lookup",
+    "cpu-offloading-manager.touch",
+    "cpu-offloading-manager.reset-cache"
+   ],
+   "fidelity": "shell",
+   "note": "Sound logic, but reachable only through the tiering manager, which no request path calls."
+  },
+  {
+   "id": "scheduler-kv.arc-eviction-policy",
+   "kind": "dispatch",
+   "name": "ARC and pluggable eviction policy",
+   "trigger": "eviction_policy in connector config",
+   "observable": "arc balances recency and frequency with T1/T2 and ghost lists, adapting its target; external policies load by module path",
+   "citations": [
+    "vllm/v1/kv_offload/cpu/policies/arc.py:16-212",
+    "vllm/v1/kv_offload/cpu/policies/factory.py:40-91",
+    "vllm/v1/kv_offload/cpu/spec.py:134-136"
+   ],
+   "interfaces": [],
+   "fidelity": "absent"
+  },
+  {
+   "id": "scheduler-kv.tier-factory-dispatch",
+   "kind": "dispatch",
+   "name": "Offload spec and tier factories",
+   "trigger": "connector config at startup",
+   "observable": "a spec_name or tier type resolves to a registered or out-of-tree class; a duplicate name is refused; tier config is passed on, with backpressure parsed apart",
+   "citations": [
+    "vllm/v1/kv_offload/factory.py:17-69",
+    "vllm/v1/kv_offload/tiering/factory.py:50-174",
+    "vllm/v1/kv_offload/tiering/spec.py:340-380"
+   ],
+   "interfaces": [
+    "offloading-spec-factory.create-spec",
+    "offloading-spec-factory.get-spec-cls",
+    "offloading-spec-factory.register-spec",
+    "secondary-tier-factory.create-secondary-tier",
+    "secondary-tier-factory.get-tier-class",
+    "secondary-tier-factory.register-tier",
+    "cpu-offloading-spec.get-manager",
+    "tiering-offloading-manager.init"
+   ],
+   "fidelity": "partial",
+   "note": "Only the example and P2P tiers instantiate; fs, obj and kvcr resolve by name with no behavior behind them."
+  },
+  {
+   "id": "scheduler-kv.fs-secondary-tier",
+   "kind": "pipeline",
+   "name": "Filesystem secondary tier",
+   "trigger": "a tier of type fs",
+   "observable": "chunks store through a temp file and atomic rename on hash-named paths with O_DIRECT fallback; failed loads keep earlier blocks and mark only later keys as misses; instances share a root dir",
+   "citations": [
+    "vllm/v1/kv_offload/tiering/fs/manager.py:216-326",
+    "vllm/v1/kv_offload/tiering/fs/io.py:41-66",
+    "vllm/v1/kv_offload/tiering/fs/io.py:90-130",
+    "vllm/v1/kv_offload/tiering/fs/thread_pool.py:60-194",
+    "vllm/v1/kv_offload/file_mapper.py:21-144"
+   ],
+   "interfaces": [
+    "dual-queue-thread-pool.enqueue-load",
+    "dual-queue-thread-pool.enqueue-store",
+    "dual-queue-thread-pool.get-finished",
+    "dual-queue-thread-pool.worker"
+   ],
+   "fidelity": "partial",
+   "note": "Only the IO pool exists: no tier manager, FileMapper, atomic rename or partial-load miss marking."
+  },
+  {
+   "id": "scheduler-kv.async-tier-lookup",
+   "kind": "cache",
+   "name": "Async tier existence lookup",
+   "trigger": "FS or object tier lookups, flushed each step",
+   "observable": "lookups return pending until a worker batch resolves them; stale generations drop, unwanted keys delete, and a failed lookup counts as a miss",
+   "citations": [
+    "vllm/v1/kv_offload/tiering/async_lookup.py:140-161",
+    "vllm/v1/kv_offload/tiering/async_lookup.py:163-185",
+    "vllm/v1/kv_offload/tiering/async_lookup.py:187-246",
+    "vllm/v1/kv_offload/tiering/async_lookup.py:248-284"
+   ],
+   "interfaces": [
+    "async-lookup-manager.lookup",
+    "async-lookup-manager.flush",
+    "async-lookup-manager.drain-results",
+    "async-lookup-manager.worker",
+    "async-lookup-manager.batch-lookup"
+   ],
+   "fidelity": "partial",
+   "note": "The loop runs as a flow, but no tier calls it."
+  },
+  {
+   "id": "scheduler-kv.object-store-tier",
+   "kind": "pipeline",
+   "name": "Object store secondary tier",
+   "trigger": "a tier of type obj",
+   "observable": "startup probes connectivity and fails on misconfiguration; NIXL transfers poll to completion, with a job held until its handle is released",
+   "citations": [
+    "vllm/v1/kv_offload/tiering/obj/manager.py:201-219",
+    "vllm/v1/kv_offload/tiering/obj/manager.py:227-285",
+    "vllm/v1/kv_offload/tiering/obj/manager.py:317-370",
+    "vllm/v1/kv_offload/tiering/obj/manager.py:408-430"
+   ],
+   "interfaces": [],
+   "fidelity": "absent"
+  },
+  {
+   "id": "scheduler-kv.kvcr-tier",
+   "kind": "pipeline",
+   "name": "KVCR secondary tier",
+   "trigger": "a tier of type kvcr",
+   "observable": "query, deliver and deposit run through the KVCR runtime, with framework pin serving for remote readers",
+   "citations": [
+    "vllm/v1/kv_offload/tiering/kvcr/manager.py:277-300",
+    "vllm/v1/kv_offload/tiering/kvcr/manager.py:460-533",
+    "vllm/v1/kv_offload/tiering/kvcr/manager.py:535-568",
+    "vllm/v1/kv_offload/tiering/kvcr/manager.py:144-245"
+   ],
+   "interfaces": [],
+   "fidelity": "absent"
+  },
+  {
+   "id": "scheduler-kv.offload-tier-reset",
+   "kind": "lifecycle",
+   "name": "Tiered cache reset",
+   "trigger": "sleep, weight update or resume",
+   "observable": "secondary tiers drain in-flight IO (a stuck tier blocks visibly), the primary resets, persistent tiers keep data, and backpressure detectors reset",
+   "citations": [
+    "vllm/v1/kv_offload/tiering/manager.py:935-983"
+   ],
+   "interfaces": [],
+   "fidelity": "absent",
+   "note": "Only the primary tier reset exists (cpu-offloading-manager.reset-cache); the drain and bookkeeping of TieringOffloadingManager.reset_cache have no behavior."
+  },
+  {
+   "id": "scheduler-kv.p2p-handshake",
+   "kind": "handshake",
+   "name": "P2P session handshake",
+   "trigger": "the first message between two peers",
+   "observable": "ConnectMsg carries NIXL metadata, block_len, config fingerprint and hash seed; a mismatch kills the connection; ConnectAck flushes queued messages; the handshake has a deadline",
+   "citations": [
+    "vllm/v1/kv_offload/tiering/p2p/session/protocol.py:116-166",
+    "vllm/v1/kv_offload/tiering/p2p/session/session.py:469-536",
+    "vllm/v1/kv_offload/tiering/p2p/session/session.py:280-297"
+   ],
+   "interfaces": [],
+   "fidelity": "absent"
+  },
+  {
+   "id": "scheduler-kv.p2p-block-transfer",
+   "kind": "handshake",
+   "name": "P2P block fetch and transfer",
+   "trigger": "a consumer request loads from its producer",
+   "observable": "FetchMsg records demand per round, stored blocks transfer by RDMA as they arrive, TransferDone completes the load, and an empty terminal fetch closes the id",
+   "citations": [
+    "vllm/v1/kv_offload/tiering/p2p/session/server.py:331-395",
+    "vllm/v1/kv_offload/tiering/p2p/session/server.py:1057-1119",
+    "vllm/v1/kv_offload/tiering/p2p/session/client.py:179-230",
+    "vllm/v1/kv_offload/tiering/p2p/session/client.py:278-306",
+    "vllm/v1/kv_offload/tiering/p2p/data/nixl.py:151-188"
+   ],
+   "interfaces": [],
+   "fidelity": "absent"
+  },
+  {
+   "id": "scheduler-kv.p2p-timeouts-abort",
+   "kind": "retry",
+   "name": "P2P load timeout and abort",
+   "trigger": "a load passes 30 s, or its abort passes 10 s",
+   "observable": "the client sends AbortFetch, the server cancels and drains inflight transfers, and the load fails to local prefill; store jobs time out at 30 s",
+   "citations": [
+    "vllm/v1/kv_offload/tiering/p2p/session/client.py:451-507",
+    "vllm/v1/kv_offload/tiering/p2p/session/server.py:992-1055",
+    "vllm/v1/kv_offload/tiering/p2p/session/server.py:1121-1138",
+    "vllm/v1/kv_offload/tiering/p2p/session/client.py:33-34"
+   ],
+   "interfaces": [],
+   "fidelity": "absent"
+  },
+  {
+   "id": "scheduler-kv.p2p-symmetric-lookup",
+   "kind": "handshake",
+   "name": "Symmetric P2P lookup and serve",
+   "trigger": "a symmetric peer probes for a key",
+   "observable": "LookupMsg batches flush per step; the server pins hits and parks pending keys for up to 5 s before forcing them to miss; an unanswered probe stays RETRY until finish",
+   "citations": [
+    "vllm/v1/kv_offload/tiering/p2p/session/client.py:344-449",
+    "vllm/v1/kv_offload/tiering/p2p/session/server.py:449-478",
+    "vllm/v1/kv_offload/tiering/p2p/session/server.py:517-634",
+    "vllm/v1/kv_offload/tiering/p2p/manager.py:660-676"
+   ],
+   "interfaces": [],
+   "fidelity": "absent"
+  },
+  {
+   "id": "scheduler-kv.p2p-reapers",
+   "kind": "sweep",
+   "name": "P2P reapers",
+   "trigger": "every poll on the scheduler thread",
+   "observable": "dead sessions fail their jobs and requests; unbound stores time out at 60 s and reject late fetches; idle sessions evict only when peer slots are scarce",
+   "citations": [
+    "vllm/v1/kv_offload/tiering/p2p/manager.py:788-825",
+    "vllm/v1/kv_offload/tiering/p2p/manager.py:827-875",
+    "vllm/v1/kv_offload/tiering/p2p/manager.py:877-926",
+    "vllm/v1/kv_offload/tiering/p2p/manager.py:928-995"
+   ],
+   "interfaces": [],
+   "fidelity": "absent"
+  },
+  {
+   "id": "scheduler-kv.p2p-control-transport",
+   "kind": "loop",
+   "name": "P2P ZMQ control channel",
+   "trigger": "connect, send and each poll",
+   "observable": "DEALER sockets heartbeat; monitor events mark a connection dead on the first fatal event; a dead connection refuses sends",
+   "citations": [
+    "vllm/v1/kv_offload/tiering/p2p/control/zmq.py:28",
+    "vllm/v1/kv_offload/tiering/p2p/control/zmq.py:63-66",
+    "vllm/v1/kv_offload/tiering/p2p/control/zmq.py:88-122",
+    "vllm/v1/kv_offload/tiering/p2p/control/zmq.py:164-248",
+    "vllm/v1/kv_offload/tiering/p2p/control/zmq.py:345-375"
+   ],
+   "interfaces": [
+    "zmq-transport.connect",
+    "zmq-transport.send",
+    "zmq-transport.check-monitors",
+    "zmq-transport.fatal-monitor-events"
+   ],
+   "fidelity": "partial",
+   "note": "Monitor logic only, no caller: no session uses it, and heartbeats and poll are not modeled."
+  },
+  {
+   "id": "scheduler-kv.p2p-peer-sessions",
+   "kind": "lifecycle",
+   "name": "P2P peer session table",
+   "trigger": "a consumer needs a producer, or a request finishes",
+   "observable": "one bidirectional session per peer up to VLLM_P2P_MAX_PEERS, created with the local hash seed; a finished request closes on its session by id",
+   "citations": [
+    "vllm/v1/kv_offload/tiering/p2p/manager.py:695-746",
+    "vllm/v1/kv_offload/tiering/p2p/manager.py:445-480",
+    "vllm/v1/kv_offload/tiering/p2p/manager.py:78-183"
+   ],
+   "interfaces": [
+    "p2p-secondary-tier-manager.get-or-create-session",
+    "p2p-secondary-tier-manager.on-request-finished",
+    "p2p-secondary-tier-manager.annotate-req-context",
+    "p2p-secondary-tier-manager.get-hash-seed",
+    "p2p-secondary-tier-manager.init"
+   ],
+   "fidelity": "partial",
+   "note": "Table bookkeeping only; no transfer, polling or teardown is behind it, and the tier is not wired into tiering-offloading-manager."
+  },
+  {
+   "id": "scheduler-kv.simple-offload-connector",
+   "kind": "pipeline",
+   "name": "Simple CPU offload scheduler",
+   "trigger": "SimpleCPUOffloadConnector, each step",
+   "observable": "a CPU hit past the local hit pins and loads into new GPU blocks; computed blocks store to CPU; events finish on worker report and join the CPU prefix cache",
+   "citations": [
+    "vllm/v1/simple_kv_offload/manager.py:338-393",
+    "vllm/v1/simple_kv_offload/manager.py:395-506",
+    "vllm/v1/simple_kv_offload/manager.py:508-570",
+    "vllm/v1/simple_kv_offload/manager.py:1005-1163",
+    "vllm/v1/simple_kv_offload/manager.py:1181-1254"
+   ],
+   "interfaces": [
+    "simple-cpu-offload-connector.get-num-new-matched-tokens",
+    "simple-cpu-offload-connector.update-state-after-alloc",
+    "simple-cpu-offload-connector.build-connector-meta",
+    "simple-cpu-offload-connector.update-connector-output",
+    "simple-cpu-offload-connector.request-finished",
+    "simple-cpu-offload-connector.reset"
+   ],
+   "fidelity": "partial",
+   "note": "Stores run only as a finish-time flush: the per-step eager selection of confirmed blocks is missing."
+  },
+  {
+   "id": "scheduler-kv.simple-offload-lazy-walk",
+   "kind": "loop",
+   "name": "Lazy offload near-eviction walk",
+   "trigger": "lazy_offload on, each step",
+   "observable": "a cursor walks the GPU free queue and copies hashed blocks near eviction to CPU until a target number of free blocks is covered",
+   "citations": [
+    "vllm/v1/simple_kv_offload/manager.py:586-640",
+    "vllm/v1/simple_kv_offload/manager.py:314-331"
+   ],
+   "interfaces": [],
+   "fidelity": "absent"
+  },
+  {
+   "id": "scheduler-kv.simple-offload-eager-selection",
+   "kind": "pipeline",
+   "name": "Eager store selection",
+   "trigger": "eager mode, each step",
+   "observable": "only confirmed computed, stable, hashed blocks not yet stored or in flight are copied, up to CPU capacity, with per-group cursors and outcome counts",
+   "citations": [
+    "vllm/v1/simple_kv_offload/manager.py:642-809",
+    "vllm/v1/simple_kv_offload/manager.py:823-948",
+    "vllm/v1/simple_kv_offload/manager.py:950-964"
+   ],
+   "interfaces": [],
+   "fidelity": "absent"
+  },
+  {
+   "id": "scheduler-kv.simple-offload-worker-copy",
+   "kind": "pipeline",
+   "name": "Offload worker copy launch",
+   "trigger": "each step on the worker",
+   "observable": "loads launch after forward to hide their overhead and stores wait on a compute-done event, then finished events report to the scheduler",
+   "citations": [
+    "vllm/v1/simple_kv_offload/worker.py:256-295",
+    "vllm/v1/simple_kv_offload/worker.py:297-329",
+    "vllm/v1/simple_kv_offload/worker.py:361-375",
+    "vllm/v1/simple_kv_offload/copy_backend.py:71-92"
+   ],
+   "interfaces": [
+    "simple-cpu-offload-worker.register-kv-caches",
+    "dma-copy-backend.launch-copy",
+    "dma-copy-backend.copy-loop",
+    "dma-copy-backend.shutdown",
+    "cuda-mem-ops.copy-blocks"
+   ],
+   "fidelity": "partial",
+   "note": "The copy thread runs as a flow and registration exists; nothing launches copies from connector metadata, and the store fence is missing."
+  },
+  {
+   "id": "scheduler-kv.simple-offload-disk",
+   "kind": "pipeline",
+   "name": "Disk offload pipeline",
+   "trigger": "disk capacity configured",
+   "observable": "separate store and load threads interleave staging DMA with pwritev or preadv, with O_DIRECT by default; a short IO raises",
+   "citations": [
+    "vllm/v1/simple_kv_offload/disk_backend.py:176-186",
+    "vllm/v1/simple_kv_offload/disk_backend.py:189-200",
+    "vllm/v1/simple_kv_offload/disk_backend.py:236-286",
+    "vllm/v1/simple_kv_offload/disk_backend.py:288-343"
+   ],
+   "interfaces": [
+    "disk-backend.launch-copy",
+    "disk-store-thread.store-loop",
+    "disk-load-thread.load-loop",
+    "disk-store-thread.put",
+    "disk-load-thread.put",
+    "local-disk.preadv",
+    "local-disk.pwritev"
+   ],
+   "fidelity": "partial",
+   "note": "Threads run as flows, but no worker launches them; the page-cache option is not modeled."
+  },
+  {
+   "id": "scheduler-kv.offload-gpu-transfer",
+   "kind": "pipeline",
+   "name": "GPU and CPU block transfer",
+   "trigger": "offload store or load submitted on a worker",
+   "observable": "direct or canonical copy plans become batched DMA on a stream (Triton for CPU to GPU batches above a minimum size) and finish in event order; canonical layout filters writer blocks",
+   "citations": [
+    "vllm/v1/kv_offload/cpu/gpu_worker.py:534-704",
+    "vllm/v1/kv_offload/cpu/gpu_worker.py:706-728",
+    "vllm/v1/kv_offload/cpu/gpu_worker.py:145-163",
+    "vllm/v1/kv_offload/cpu/swap_blocks_triton.py:49-74",
+    "vllm/v1/kv_offload/cpu/gpu_worker.py:39-66",
+    "vllm/v1/kv_offload/cpu/gpu_worker.py:513-532"
+   ],
+   "interfaces": [
+    "cpu-offloading-worker.submit-store",
+    "cpu-offloading-worker.submit-load",
+    "cpu-offloading-worker.get-finished",
+    "swap-blocks-triton.swap-blocks-batch",
+    "swap-blocks-triton.swap-blocks-kernel",
+    "custom-ops.swap-blocks-batch"
+   ],
+   "fidelity": "partial",
+   "note": "Every queued copy finishes by the next poll, with no copy plan, canonical layout or submitter."
+  },
+  {
+   "id": "scheduler-kv.shared-offload-region",
+   "kind": "lifecycle",
+   "name": "Shared offload region",
+   "trigger": "offload spec setup on scheduler and each worker",
+   "observable": "one region maps the CPU tier; a non-creator waits up to 30 s for the file size and fails if the creator died; pinning falls back to pageable on failure",
+   "citations": [
+    "vllm/v1/kv_offload/cpu/shared_offload_region.py:26-39",
+    "vllm/v1/kv_offload/cpu/shared_offload_region.py:89-243",
+    "vllm/v1/kv_offload/cpu/shared_offload_region.py:245-328",
+    "vllm/v1/kv_offload/cpu/gpu_worker.py:201-240",
+    "vllm/v1/kv_offload/cpu/spec.py:93-132"
+   ],
+   "interfaces": [
+    "shared-offload-region.init",
+    "shared-offload-region.create-next-worker-view",
+    "shared-offload-region.create-kv-memoryview",
+    "kv-offload-cpu-gpu-worker.pin-mmap-region",
+    "host-register.host-register",
+    "host-register.host-unregister",
+    "cpu-offloading-spec.init",
+    "cpu-offloading-spec.create-worker"
+   ],
+   "fidelity": "partial",
+   "note": "The creator wait with its timeout and dead-creator error is not modeled."
+  },
+  {
+   "id": "scheduler-kv.offload-metrics",
+   "kind": "metric",
+   "name": "Offload connector metrics",
+   "trigger": "each connector stats read",
+   "observable": "tier usage, job counts, lookup latency, retries, transfer sizes and backpressure, labeled by tier, reach Prometheus through connector stats",
+   "citations": [
+    "vllm/v1/kv_offload/tiering/metrics.py:47-180",
+    "vllm/v1/kv_offload/tiering/spec.py:100-260",
+    "vllm/v1/kv_offload/cpu/spec.py:51-78",
+    "vllm/v1/kv_offload/tiering/manager.py:985-1009"
+   ],
+   "interfaces": [
+    "cpu-offloading-manager.get-stats"
+   ],
+   "fidelity": "partial",
+   "note": "Only the CPU chunk pool counts exist; no caller reads them, and TieringMetricsTracker is absent."
+  },
+  {
+   "id": "scheduler-kv.simple-offload-metrics",
+   "kind": "metric",
+   "name": "Simple offload metrics",
+   "trigger": "each connector stats read",
+   "observable": "save outcomes, load blocks, used and pending-store blocks and an info gauge are exported",
+   "citations": [
+    "vllm/v1/simple_kv_offload/metrics.py:22-44",
+    "vllm/v1/simple_kv_offload/metrics.py:171-284",
+    "vllm/v1/simple_kv_offload/manager.py:969-1003"
+   ],
+   "interfaces": [],
+   "fidelity": "absent"
+  },
+  {
+   "id": "scheduler-kv.hisparse-residency",
+   "kind": "lifecycle",
+   "name": "HiSparse GPU page residency",
+   "trigger": "each step on a HiSparse deployment",
+   "observable": "clean GPU pages unpin once the host copy is durable and stay readable until reused; a requester without a host path asks for a hot region when the pool runs low",
+   "citations": [
+    "vllm/v1/hisparse/coordinator.py:88-100",
+    "vllm/v1/hisparse/coordinator.py:410-441",
+    "vllm/v1/hisparse/coordinator.py:385-408",
+    "vllm/v1/core/block_pool.py:708-727",
+    "vllm/v1/hisparse/coordinator.py:701-742"
+   ],
+   "interfaces": [],
+   "fidelity": "absent"
+  },
+  {
+   "id": "scheduler-kv.hisparse-host-publish",
+   "kind": "pipeline",
+   "name": "HiSparse host write-back and publication",
+   "trigger": "pages completed by a scheduled request",
+   "observable": "spills write pages to the host pool; on worker completion GPU pins drop and hashes publish once the prefix is durable, even for detached finished requests",
+   "citations": [
+    "vllm/v1/hisparse/coordinator.py:443-537",
+    "vllm/v1/hisparse/coordinator.py:766-850",
+    "vllm/v1/core/single_type_kv_cache_manager.py:2200-2330"
+   ],
+   "interfaces": [],
+   "fidelity": "absent"
+  },
+  {
+   "id": "scheduler-kv.hisparse-swap-in",
+   "kind": "pipeline",
+   "name": "HiSparse hot-cache top-k swap in",
+   "trigger": "each sparse MLA decode layer",
+   "observable": "top-k positions resolve to resident or host rows, group leaders compact and stage swaps once, and hot slots replace LRU rows",
+   "citations": [
+    "vllm/v1/hisparse/runtime.py:920-990",
+    "vllm/v1/hisparse/runtime.py:992-1062",
+    "vllm/v1/hisparse/runtime.py:1070-1115"
+   ],
+   "interfaces": [],
+   "fidelity": "absent"
+  },
+  {
+   "id": "scheduler-kv.hisparse-layout",
+   "kind": "pipeline",
+   "name": "HiSparse layout and host pool",
+   "trigger": "startup with hisparse_config",
+   "observable": "sparse, hot and resident groups lay out over the GPU and a pinned host pool sized from config, checked against host memory",
+   "citations": [
+    "vllm/v1/hisparse/layout.py:48-83",
+    "vllm/v1/hisparse/layout.py:125-230",
+    "vllm/v1/hisparse/layout.py:320-377",
+    "vllm/v1/hisparse/runtime.py:192-254",
+    "vllm/v1/hisparse/binding.py:80-118"
+   ],
+   "interfaces": [
+    "hisparse-config.init",
+    "hisparse-connector.init",
+    "attn-utils.init-kv-cache",
+    "kv-cache-interface.page-size-bytes",
+    "kv-cache-interface.max-num-blocks-per-req"
+   ],
+   "fidelity": "partial",
+   "note": "Config and connector checks exist; the group layout, host pool allocation and memory check are missing."
+  }
+ ]
+}

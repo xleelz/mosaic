@@ -1,0 +1,1249 @@
+{
+  "area": "attention",
+  "mechanisms": [
+    {
+      "id": "attention.flash-attn-paged-forward",
+      "kind": "pipeline",
+      "name": "FlashAttention paged forward",
+      "trigger": "every attention layer forward on a FLASH_ATTN group",
+      "observable": "query heads attend over the block-table-addressed KV cache through FA2/FA3/FA4, honoring window, sinks, descales and dynamic causal; a profiling run zero-fills the output",
+      "citations": [
+        "vllm/v1/attention/backends/flash_attn.py:1177-1425",
+        "vllm/vllm_flash_attn/flash_attn_interface.py:176-477"
+      ],
+      "interfaces": [
+        "attention-layer.unified-attention-with-output",
+        "flash-attention-impl.forward",
+        "flash-attn-interface.flash-attn-varlen-func"
+      ],
+      "fidelity": "partial",
+      "note": "Main path runs from the layer. Missing: the mm_prefix and R-SWA mask_mod paths, the FA4 hd256 page alignment (block table trim, one split), and stride canonicalization."
+    },
+    {
+      "id": "attention.flash-attn-kv-cache-write",
+      "kind": "pipeline",
+      "name": "KV cache write through slot_mapping",
+      "trigger": "every step, before attention, unless the backend writes in forward or the layer shares a KV target",
+      "observable": "the step's K and V land in the blocks the scheduler assigned; encoder attention writes nothing",
+      "citations": [
+        "vllm/v1/attention/backends/flash_attn.py:1427-1461",
+        "vllm/model_executor/layers/attention/attention.py:724"
+      ],
+      "interfaces": [
+        "attention-layer.unified-kv-cache-update",
+        "flash-attention-impl.do-kv-cache-update",
+        "custom-ops.reshape-and-cache-flash"
+      ],
+      "fidelity": "modeled"
+    },
+    {
+      "id": "attention.backend-selection",
+      "kind": "dispatch",
+      "name": "Attention backend selection per layer",
+      "trigger": "each attention layer's construction",
+      "observable": "a backend class is chosen from the per-kind override, then the global backend, then the platform's priority walk; a repeated config answers from the cache; an invalid dtype or no valid backend raises",
+      "citations": [
+        "vllm/v1/attention/selector.py:105-200",
+        "vllm/v1/attention/selector.py:203-225",
+        "vllm/v1/attention/selector.py:64-102"
+      ],
+      "interfaces": [
+        "selector.get-attn-backend",
+        "selector.get-attn-spec-kind",
+        "cuda-platform.get-attn-backend-cls"
+      ],
+      "fidelity": "partial",
+      "note": "The selector config drops block_size (always null), use_kv_connector, use_pcp, use_adaptive_verification, use_non_causal, use_batch_invariant and use_rswa, so those refusals can't fire through selection. See impl-dispatch for what the choice reaches."
+    },
+    {
+      "id": "attention.impl-dispatch",
+      "kind": "dispatch",
+      "name": "Selected backend's impl and builder serve the layer",
+      "trigger": "each layer forward and KV update, through self.impl",
+      "observable": "the backend chosen at construction runs its own forward, KV write and metadata builder for that layer",
+      "citations": [
+        "vllm/v1/attention/backend.py:84-92",
+        "vllm/model_executor/layers/attention/attention.py:782-794"
+      ],
+      "interfaces": [
+        "attention-layer.unified-attention-with-output",
+        "attention-layer.unified-kv-cache-update",
+        "attn-utils.build-attn-metadata"
+      ],
+      "fidelity": "shell",
+      "note": "These always call the FlashAttention impl and builder, whatever selector.get-attn-backend chose, so every other backend's forward is unreachable from a request."
+    },
+    {
+      "id": "attention.backend-capability-gate",
+      "kind": "gate",
+      "name": "Backend capability validation chain",
+      "trigger": "the platform's priority walk, once per candidate backend",
+      "observable": "an ordered list of reasons a backend can't serve the layer (head size, dtype, KV dtype, block size, MLA, sink, sparse, window, DCP/PCP, combination); empty means valid",
+      "citations": [
+        "vllm/v1/attention/backend.py:276-366"
+      ],
+      "interfaces": [
+        "attention-backend.validate-configuration"
+      ],
+      "fidelity": "partial",
+      "note": "Missing the KV-connector, non-causal MLA with DCP and device-CPU query-length checks; the capability table holds only the modeled backend classes."
+    },
+    {
+      "id": "attention.kv-layout-negotiation",
+      "kind": "handshake",
+      "name": "KV cache layout negotiation",
+      "trigger": "engine startup, before memory profiling",
+      "observable": "workers report the layouts all their backends support; the engine core picks one (env override, connector preference, block-compact narrowing) and pushes it back; a conflicting re-set raises",
+      "citations": [
+        "vllm/v1/attention/backends/utils.py:209-244",
+        "vllm/v1/attention/backends/utils.py:259-349",
+        "vllm/v1/attention/backends/utils.py:247-256",
+        "vllm/v1/engine/core.py:296"
+      ],
+      "interfaces": [
+        "attention-backend-utils.get-supported-kv-cache-layouts",
+        "attention-backend-utils.record-kv-cache-layout",
+        "worker-base.get-supported-kv-cache-layouts",
+        "worker-base.set-kv-cache-layout"
+      ],
+      "fidelity": "partial",
+      "note": "Both worker ends run. The engine-core step, resolve_kv_cache_layout (mixed HNC narrowing, DCP draft rule, VLLM_KV_CACHE_LAYOUT, connector preference), is absent."
+    },
+    {
+      "id": "attention.flash-metadata-build",
+      "kind": "pipeline",
+      "name": "FlashAttention metadata and AOT schedule build",
+      "trigger": "every step, per KV cache group",
+      "observable": "the batch becomes FlashAttentionMetadata: FA3 AOT scheduler metadata unless fast_build, batch invariance or mixed windows disable it, split count pinned for CUDA graphs, per-rank context lengths under DCP",
+      "citations": [
+        "vllm/v1/attention/backends/flash_attn.py:809-1017",
+        "vllm/v1/attention/backends/flash_attn.py:629-678"
+      ],
+      "interfaces": [
+        "attn-utils.build-attn-metadata",
+        "flash-attention-metadata-builder.build",
+        "flash-attn-interface.get-scheduler-metadata"
+      ],
+      "fidelity": "partial",
+      "note": "Missing the mm_prefix query-range fill and the persistent R-SWA prefix buffers."
+    },
+    {
+      "id": "attention.fa-version-selection",
+      "kind": "dispatch",
+      "name": "FlashAttention version selection with fallbacks",
+      "trigger": "backend validation, impl init and CUDA graph support queries",
+      "observable": "FA3 on Hopper, FA4 on Blackwell, else FA2; config override; downgrades or upgrades for ALiBi, large heads, diff-KV sinks, batch invariance and TMEM; None when the build lacks the version",
+      "citations": [
+        "vllm/v1/attention/backends/fa_utils.py:74-221"
+      ],
+      "interfaces": [
+        "fa-utils.get-flash-attn-version"
+      ],
+      "fidelity": "partial",
+      "note": "The FA4 hd256 branch (supports_fa4_hd256, _fa4_hd256_fallback_reason) is not in the behavior's version chain."
+    },
+    {
+      "id": "attention.dcp-forward",
+      "kind": "pipeline",
+      "name": "Decode context parallel forward",
+      "trigger": "layer forward when decode_context_parallel_size > 1",
+      "observable": "query heads are all-gathered, each rank attends over its KV shard, partial outputs combine by LSE, then merge with causal attention over the new tokens; no context on any rank skips to plain varlen",
+      "citations": [
+        "vllm/v1/attention/backends/flash_attn.py:1463-1637"
+      ],
+      "interfaces": [
+        "flash-attention-impl.forward-with-dcp",
+        "group-coordinator.all-gather"
+      ],
+      "fidelity": "partial",
+      "note": "Missing the FA2 split of context attention (should_split_fa2_dcp_context_attention, flash_attn.py:1521)."
+    },
+    {
+      "id": "attention.dcp-lse-combine",
+      "kind": "pipeline",
+      "name": "DCP LSE combine, all-gather or all-to-all",
+      "trigger": "after each rank's context attention, by dcp_comm_backend",
+      "observable": "ag_rs: all-gather LSEs, correct, reduce-scatter over heads. a2a: pack output and LSE, one all-to-all, unpack and weight. Heads not divisible by the world size raise",
+      "citations": [
+        "vllm/v1/attention/ops/dcp.py:471-500",
+        "vllm/v1/attention/ops/dcp.py:939-1010",
+        "vllm/v1/attention/ops/dcp.py:438"
+      ],
+      "interfaces": [
+        "dcp.cp-lse-ag-out-rs",
+        "dcp.dcp-a2a-lse-reduce",
+        "dcp.correct-attn-cp-out-kernel",
+        "dcp.dcp-a2a-pack-send-kernel",
+        "dcp.dcp-a2a-unpack-combine-kernel"
+      ],
+      "fidelity": "modeled"
+    },
+    {
+      "id": "attention.lse-merge",
+      "kind": "dispatch",
+      "name": "Prefix and suffix LSE merge",
+      "trigger": "after DCP context attention and any two-part attention",
+      "observable": "partial outputs merge by log-sum-exp on the CUDA op when platform, dtype and head dim allow, torch on CPU, else Triton; tokens past prefill_tokens_with_context copy the suffix",
+      "citations": [
+        "vllm/v1/attention/ops/merge_attn_states.py:71-195",
+        "vllm/v1/attention/ops/triton_merge_attn_states.py:14-69",
+        "csrc/attention/merge_attn_states.cu:336"
+      ],
+      "interfaces": [
+        "merge-attn-states.merge-attn-states",
+        "custom-ops.merge-attn-states",
+        "triton-merge-attn-states.merge-attn-states"
+      ],
+      "fidelity": "modeled"
+    },
+    {
+      "id": "attention.direct-cp-workspace-setup",
+      "kind": "lifecycle",
+      "name": "Symmetric-memory CP workspace setup",
+      "trigger": "layer construction under DCP, once per group and shape",
+      "observable": "probe NVLS and same-node membership, allocate symmetric memory, rendezvous, barrier, exchange peer pointers; a failed probe or unsupported dtype or layout returns None and the NCCL path is used",
+      "citations": [
+        "vllm/v1/attention/ops/cp_common.py:32-57",
+        "vllm/v1/attention/ops/cp_common.py:60-87",
+        "vllm/v1/attention/ops/cp_common.py:90-128",
+        "vllm/v1/attention/ops/dcp.py:1128-1147"
+      ],
+      "interfaces": [],
+      "fidelity": "absent",
+      "note": "The model takes use_direct_workspace as an input; nothing decides it or allocates."
+    },
+    {
+      "id": "attention.mla-dcp-manager",
+      "kind": "dispatch",
+      "name": "MLA DCP collective selection and overflow fallback",
+      "trigger": "MLA layer construction, then each DCP collective",
+      "observable": "direct symmetric-memory combine, query gather and KV gather when the batch fits the workspace; oversized forced-MQA batches fall back to NCCL all-to-all or all-gather",
+      "citations": [
+        "vllm/v1/attention/ops/dcp.py:1448-1649",
+        "csrc/attention/dcp_utils/dcp_direct_a2a_lse_reduce.cu:368",
+        "csrc/attention/dcp_utils/dcp_direct_q_gather.cu:186",
+        "csrc/attention/dcp_utils/dcp_direct_kv_gather.cu:197"
+      ],
+      "interfaces": [
+        "mla-dcp-manager.combine",
+        "mla-dcp-manager.gather-query",
+        "mla-dcp-manager.kv-gather",
+        "direct-dcp-a2a-workspace.lse-reduce"
+      ],
+      "fidelity": "shell",
+      "note": "The manager's interfaces have no caller. Also missing the cp_lse_ag_out_ar combine used under PCP (dcp.py:503)."
+    },
+    {
+      "id": "attention.dcp-round-robin-kv-shard",
+      "kind": "pipeline",
+      "name": "Round-robin KV sharding across DCP ranks",
+      "trigger": "each metadata build under DCP",
+      "observable": "each rank holds whole interleaves of a sequence plus its share of the remainder; empty shards are masked before combine",
+      "citations": [
+        "vllm/v1/attention/backends/utils.py:1115-1160",
+        "vllm/v1/attention/backends/flash_attn.py:872-885"
+      ],
+      "interfaces": [
+        "attention-backend-utils.get-dcp-local-seq-lens"
+      ],
+      "fidelity": "shell",
+      "note": "get-dcp-local-seq-lens has no caller; the model's FlashAttention builder computes lengths in its own set step."
+    },
+    {
+      "id": "attention.pcp-cache-gather",
+      "kind": "pipeline",
+      "name": "Prefill context parallel cache gather",
+      "trigger": "MLA KV writes and indexer prefill under prefill_context_parallel_size > 1",
+      "observable": "each rank gathers other ranks' prefill (and owned decode) KV so every PCP rank keeps a complete cache replica; decode output heads are re-gathered or sliced",
+      "citations": [
+        "vllm/v1/attention/ops/pcp.py:11-65",
+        "vllm/v1/attention/ops/pcp.py:68-103",
+        "vllm/v1/attention/ops/pcp.py:106-115",
+        "vllm/v1/attention/backends/mla/indexer.py:393-412"
+      ],
+      "interfaces": [],
+      "fidelity": "absent"
+    },
+    {
+      "id": "attention.flashinfer-dispatch",
+      "kind": "dispatch",
+      "name": "FlashInfer prefill and decode kernel dispatch",
+      "trigger": "every step on a FLASHINFER group",
+      "observable": "the builder picks native or TRT-LLM prefill and native, XQA or trtllm-gen decode from page size, arch, heads and causality; forward runs the chosen kernels and fused output quant",
+      "citations": [
+        "vllm/v1/attention/backends/flashinfer.py:1392-1837",
+        "vllm/v1/attention/backends/flashinfer.py:2005-2622",
+        "vllm/v1/attention/backends/flashinfer.py:1136-1160"
+      ],
+      "interfaces": [],
+      "fidelity": "absent",
+      "note": "Only side helpers exist (see flashinfer-paged-metadata); FlashInferImpl.forward and the builder's build are not modeled."
+    },
+    {
+      "id": "attention.flashinfer-paged-metadata",
+      "kind": "pipeline",
+      "name": "FlashInfer paged KV metadata and fast plan",
+      "trigger": "each FlashInfer build with native paged prefill or decode",
+      "observable": "the block table flattens to paged_kv_indices and indptr; decode replans cheaply through fast_plan_decode",
+      "citations": [
+        "vllm/v1/attention/backends/flashinfer.py:1350-1390",
+        "vllm/v1/attention/backends/flashinfer.py:2676-2772",
+        "vllm/v1/attention/backends/flashinfer.py:2774-2794"
+      ],
+      "interfaces": [
+        "flashinfer-metadata-builder.compute-flashinfer-kv-metadata",
+        "flashinfer-metadata-builder.copy-page-indices-kernel"
+      ],
+      "fidelity": "shell",
+      "note": "compute-flashinfer-kv-metadata has no caller; fast_plan_decode is absent."
+    },
+    {
+      "id": "attention.flashinfer-trtllm-fp8-dequant",
+      "kind": "pipeline",
+      "name": "TRT-LLM prefill FP8 KV dequant",
+      "trigger": "TRT-LLM prefill with a BF16 query over an FP8 KV cache",
+      "observable": "the touched FP8 pages are dequantized to a BF16 mock cache before the kernel",
+      "citations": [
+        "vllm/v1/attention/backends/flashinfer.py:193-315"
+      ],
+      "interfaces": [
+        "flashinfer-backend-ops.trtllm-prefill-attn-kvfp8-dequant",
+        "flashinfer-backend-ops.trtllm-prefill-attn-kvfp8-dequant-kernel"
+      ],
+      "fidelity": "shell",
+      "note": "trtllm-prefill-attn-kvfp8-dequant has no caller: no interface outside this area calls it, so its result reaches nobody."
+    },
+    {
+      "id": "attention.flashinfer-dcp-prefill",
+      "kind": "pipeline",
+      "name": "FlashInfer DCP prefill wrapper",
+      "trigger": "FlashInfer native prefill under DCP",
+      "observable": "context attention over paged KV and new-token attention over ragged KV, combined by LSE (base 2) then merged",
+      "citations": [
+        "vllm/v1/attention/backends/flashinfer.py:318-428"
+      ],
+      "interfaces": [],
+      "fidelity": "absent"
+    },
+    {
+      "id": "attention.flashinfer-workspace-buffer",
+      "kind": "lifecycle",
+      "name": "FlashInfer workspace buffer sizing",
+      "trigger": "first builder use, or shared through set_workspace_buffer",
+      "observable": "a buffer sized by batched tokens, query heads and head dim, never below the configured default, because FlashInfer hard-errors rather than grow",
+      "citations": [
+        "vllm/v1/attention/backends/flashinfer.py:1107-1134",
+        "vllm/v1/attention/backends/flashinfer.py:139-145"
+      ],
+      "interfaces": [],
+      "fidelity": "absent"
+    },
+    {
+      "id": "attention.composite-backend-routing",
+      "kind": "dispatch",
+      "name": "Composite backend routing per batch",
+      "trigger": "each build on TRITON_FLASH_ATTN or TRITON_FLASHINFER",
+      "observable": "a batch with image ranges goes to the general Triton child, others to the causal child; capture uses the causal child and CUDA graph support narrows; KV writes always go through the general child",
+      "citations": [
+        "vllm/v1/attention/backends/composite.py:87-115",
+        "vllm/v1/attention/backends/composite.py:148-360",
+        "vllm/v1/attention/backends/triton_flash_attn.py:56-65",
+        "vllm/v1/attention/backends/triton_flashinfer.py:11-22"
+      ],
+      "interfaces": [],
+      "fidelity": "absent"
+    },
+    {
+      "id": "attention.kv-sharing-fast-prefill",
+      "kind": "pipeline",
+      "name": "KV-sharing fast prefill",
+      "trigger": "KV-sharing decoder layers (the fast-prefill custom backend)",
+      "observable": "query_start_loc is rewritten so only logits-producing tokens run in shared layers, cutting prefill work; pure decode or unarmed steps run the full batch",
+      "citations": [
+        "vllm/v1/attention/backends/utils.py:653-728",
+        "vllm/v1/attention/backends/utils.py:1018-1063"
+      ],
+      "interfaces": [],
+      "fidelity": "absent"
+    },
+    {
+      "id": "attention.decode-prefill-partition",
+      "kind": "pipeline",
+      "name": "Decode and prefill batch partitioning",
+      "trigger": "before metadata build on reorder-threshold backends, then inside each build",
+      "observable": "the batch is reordered in place to decode, short extend, long extend, prefill; builders then find the boundaries by threshold and uniformity",
+      "citations": [
+        "vllm/v1/attention/backends/utils.py:905-982",
+        "vllm/v1/attention/backends/utils.py:803-874",
+        "vllm/v1/attention/backends/utils.py:731-800",
+        "vllm/v1/attention/backend.py:655-680"
+      ],
+      "interfaces": [
+        "attention-backend-utils.reorder-batch-to-split-decodes-and-prefills",
+        "attention-backend-utils.split-decodes-and-prefills"
+      ],
+      "fidelity": "shell",
+      "note": "Both behaviors track the code but neither has a caller, so the runner's batch order never changes. split_decodes_prefills_and_extends and the reorder threshold rule are absent."
+    },
+    {
+      "id": "attention.cudagraph-support-level",
+      "kind": "gate",
+      "name": "CUDA graph support level per builder",
+      "trigger": "runner startup, choosing the capture mode per KV group",
+      "observable": "each builder reports ALWAYS, UNIFORM_BATCH, UNIFORM_SINGLE_TOKEN_DECODE or NEVER, and the varlen replay bound",
+      "citations": [
+        "vllm/v1/attention/backend.py:623-653",
+        "vllm/v1/attention/backends/flashinfer.py:1036-1105",
+        "vllm/v1/attention/backend.py:717-726"
+      ],
+      "interfaces": [
+        "attention-metadata-builder.get-cudagraph-support",
+        "attention-metadata-builder.get-varlen-cudagraph-max-query-len",
+        "attention-metadata-builder.build-for-cudagraph-capture"
+      ],
+      "fidelity": "partial",
+      "note": "Only FlashAttention, FlashInfer and DSv4 ROCm have real rules; the capture build refuses every backend but FlashAttention. The varlen bound and capture build have no caller."
+    },
+    {
+      "id": "attention.draft-decode-metadata-refresh",
+      "kind": "pipeline",
+      "name": "Draft decode metadata refresh inside a graph",
+      "trigger": "speculative draft decode graphs on builders that support it",
+      "observable": "scheduler or indexer decode metadata is rewritten in place with capture-safe ops, so no eager build runs between drafts",
+      "citations": [
+        "vllm/v1/attention/backend.py:750-758",
+        "vllm/v1/attention/backends/flash_attn.py:1030-1049",
+        "vllm/v1/attention/backends/mla/indexer.py:1782-1800",
+        "vllm/v1/attention/backends/mla/sparse_swa.py:829"
+      ],
+      "interfaces": [
+        "attention-metadata-builder.update-draft-decode-metadata"
+      ],
+      "fidelity": "shell",
+      "note": "No caller; only FlashAttention refreshes, the indexer, SWA, kpool and flashinfer versions are absent."
+    },
+    {
+      "id": "attention.triton-unified-attention",
+      "kind": "dispatch",
+      "name": "Triton unified attention, 2D or 3D",
+      "trigger": "each forward on a TRITON_ATTN group",
+      "observable": "any prefill and decode mix runs the 2D kernel; small pure-decode batches use 3D segmented softmax plus a reduce; encoder layers use context_attention_fwd",
+      "citations": [
+        "vllm/v1/attention/backends/triton_attn.py:209-276",
+        "vllm/v1/attention/backends/triton_attn.py:549-704",
+        "vllm/v1/attention/ops/triton_unified_attention.py:815-1202"
+      ],
+      "interfaces": [
+        "triton-attention-impl.forward",
+        "triton-attention-metadata-builder.build",
+        "triton-unified-attention.unified-attention"
+      ],
+      "fidelity": "shell",
+      "note": "triton-attention-impl.forward and the builder have no caller. Also missing the 64 vs 16 softmax segment layout and mm_prefix and R-SWA metadata in the builder."
+    },
+    {
+      "id": "attention.triton-kv-writers",
+      "kind": "dispatch",
+      "name": "Triton KV writers by quant mode",
+      "trigger": "each KV update on a Triton-family group",
+      "observable": "plain and FP8 scatter, per-token-head INT8 or FP8 with per-head scales, packed INT4, or diff-KV head sizes, each to slot_mapping",
+      "citations": [
+        "vllm/v1/attention/backends/triton_attn.py:766-809",
+        "vllm/v1/attention/ops/triton_reshape_and_cache_flash.py:272-460",
+        "vllm/v1/attention/ops/triton_reshape_and_cache_flash.py:541-613"
+      ],
+      "interfaces": [
+        "triton-attention-impl.do-kv-cache-update",
+        "triton-reshape-and-cache-flash.triton-reshape-and-cache-flash",
+        "triton-reshape-and-cache-flash.triton-reshape-and-cache-flash-per-token-head-quant"
+      ],
+      "fidelity": "shell",
+      "note": "triton-attention-impl.do-kv-cache-update has no caller: no interface outside this area calls it, so its result reaches nobody."
+    },
+    {
+      "id": "attention.int4-per-token-head",
+      "kind": "pipeline",
+      "name": "INT4 per-token-head quantized KV",
+      "trigger": "kv_cache_dtype int4_per_token_head",
+      "observable": "K and V take a randomized Hadamard rotation and pack to nibbles; attention rotates Q the same way and scales softmax by the rotation norm; Hadamard runs on the Hadacore op, Triton MMA or a torch butterfly",
+      "citations": [
+        "vllm/v1/attention/ops/int4_per_token_head.py:856-951",
+        "vllm/v1/attention/ops/int4_per_token_head.py:1075-1122"
+      ],
+      "interfaces": [
+        "int4-per-token-head.reshape-and-cache-int4",
+        "int4-per-token-head.unified-attention-int4",
+        "int4-per-token-head.fast-hadamard-transform"
+      ],
+      "fidelity": "shell",
+      "note": "Only reached through the Triton impl, which has no caller."
+    },
+    {
+      "id": "attention.diffkv-attention",
+      "kind": "pipeline",
+      "name": "Different K and V head sizes",
+      "trigger": "models whose K and V head dims differ",
+      "observable": "the combined cache stores different head sizes and attention runs the diff-KV kernels on Triton, or FA3/FA4",
+      "citations": [
+        "vllm/v1/attention/backends/flash_attn_diffkv.py:34-60",
+        "vllm/v1/attention/backends/triton_attn_diffkv.py:69",
+        "vllm/v1/attention/ops/triton_unified_attention_diffkv.py:409-589"
+      ],
+      "interfaces": [
+        "triton-unified-attention-diffkv.unified-attention-diffkv",
+        "triton-reshape-and-cache-flash.triton-reshape-and-cache-flash-diffkv"
+      ],
+      "fidelity": "shell",
+      "note": "Neither entry has a caller; both diff-KV backend classes are absent."
+    },
+    {
+      "id": "attention.mask-mod-routing",
+      "kind": "dispatch",
+      "name": "mm_prefix and R-SWA attention masks",
+      "trigger": "multimodal bidirectional ranges or an R-SWA model, each prefill",
+      "observable": "query-range tensors and R-SWA prefix lengths fill persistent buffers, and FA4 builds a cached JIT mask_mod so image tokens see each other",
+      "citations": [
+        "vllm/v1/attention/backends/utils.py:75-182",
+        "vllm/v1/attention/backends/flash_attn.py:1712-1820",
+        "vllm/v1/attention/backends/flash_attn.py:1821",
+        "vllm/v1/attention/backends/flash_attn.py:1320-1376"
+      ],
+      "interfaces": [],
+      "fidelity": "absent",
+      "note": "Selection and validation read the flags and a Triton kernel step title mentions the mask, but no behavior builds or applies one."
+    },
+    {
+      "id": "attention.fused-kv-update-dispatch",
+      "kind": "dispatch",
+      "name": "Fused RoPE and KV update support per backend",
+      "trigger": "torch.compile fusion passes and the fused custom ops",
+      "observable": "a backend reports fused QK-norm, RoPE and KV update support and runs the fused write in its own layout",
+      "citations": [
+        "vllm/v1/attention/backend.py:942-1018",
+        "vllm/v1/attention/backends/rocm_aiter_fa.py:1575-1660",
+        "vllm/v1/attention/backends/rocm_attn.py:506-530"
+      ],
+      "interfaces": [],
+      "fidelity": "absent",
+      "note": "The fusion passes exist in other areas, but no backend-side do_*_update behavior does."
+    },
+    {
+      "id": "attention.turboquant-pipeline",
+      "kind": "pipeline",
+      "name": "TurboQuant KV store, decode and continuation",
+      "trigger": "kv_cache_dtype turboquant_* on TURBOQUANT_ATTN",
+      "observable": "new K and V are rotated and quantized in the fused store; decode reads the quantized cache; prefill with long cached context dequantizes it first",
+      "citations": [
+        "vllm/v1/attention/backends/turboquant_attn.py:498-672",
+        "vllm/v1/attention/ops/triton_turboquant_store.py:350-447",
+        "vllm/v1/attention/ops/triton_turboquant_decode.py:486-630",
+        "vllm/v1/attention/ops/turboquant_soa/triton_turboquant_unified_attention.py:1276-1335"
+      ],
+      "interfaces": [
+        "turboquant-attention-impl.forward",
+        "turboquant-attention-impl.do-kv-cache-update",
+        "triton-turboquant-decode.tq-full-dequant-kv"
+      ],
+      "fidelity": "shell",
+      "note": "forward and do-kv-cache-update have no caller: no interface outside this area calls it, so its result reaches nobody."
+    },
+    {
+      "id": "attention.ultraquant-pipeline",
+      "kind": "pipeline",
+      "name": "UltraQuant KV store, decode and continuation",
+      "trigger": "kv_cache_dtype ultraquant_4bit",
+      "observable": "K is rotated and packed to FP4 with UE8M0 scales; decode runs the unified kernels; a continuation dequantizes context before prefill",
+      "citations": [
+        "vllm/v1/attention/backends/ultraquant_attn.py:216-296",
+        "vllm/v1/attention/backends/ultraquant_attn.py:471-609",
+        "vllm/v1/attention/ops/ultraquant/triton_store.py:265-351",
+        "vllm/v1/attention/ops/ultraquant/triton_unified_attention.py:860-1087"
+      ],
+      "interfaces": [
+        "ultraquant-attention-impl.store-kv",
+        "ultraquant-attention-impl.decode-attention",
+        "ultraquant-attention-impl.continuation-prefill"
+      ],
+      "fidelity": "shell",
+      "note": "No caller; continuation-prefill is one dequant call, without the small-chunk and large-chunk split."
+    },
+    {
+      "id": "attention.flydsl-decode-dispatch",
+      "kind": "dispatch",
+      "name": "FlyDSL quantized decode with Triton fallback",
+      "trigger": "TurboQuant or UltraQuant decode on gfx950 with FlyDSL importable",
+      "observable": "eligible layers (head size, GQA, no sinks or window) use the FlyDSL kernel and SoA store; the rest fall back to Triton",
+      "citations": [
+        "vllm/v1/attention/backends/turboquant_attn.py:1129-1160",
+        "vllm/v1/attention/backends/ultraquant_attn.py:255-296",
+        "vllm/v1/attention/ops/flydsl_turboquant_decode.py:595-630",
+        "vllm/v1/attention/ops/flydsl_ultraquant_decode.py:60-70"
+      ],
+      "interfaces": [
+        "ultraquant-attention-impl.decode-attention"
+      ],
+      "fidelity": "shell",
+      "note": "The flydsl branch returns a constant {impl: flydsl} without eligibility checks, and the flydsl ops and kernels aren't cited anywhere in the model."
+    },
+    {
+      "id": "attention.mla-mqa-dispatch",
+      "kind": "dispatch",
+      "name": "Dense MLA decode per backend",
+      "trigger": "MLA layer decode (forward_mqa)",
+      "observable": "each MLA backend runs its own decode kernel: Triton two-stage, FlashInfer trtllm-gen or cute-dsl, AITER, Tokenspeed, returning LSE when DCP needs it",
+      "citations": [
+        "vllm/v1/attention/backend.py:1068-1076",
+        "vllm/v1/attention/backends/mla/triton_mla.py:229-328",
+        "vllm/v1/attention/backends/mla/flashinfer_mla.py:317-456",
+        "vllm/v1/attention/backends/mla/rocm_aiter_mla.py:2244-2491",
+        "vllm/v1/attention/backends/mla/tokenspeed_mla.py:266-362"
+      ],
+      "interfaces": [
+        "mla-attention-impl.forward-mqa",
+        "triton-mla-impl.forward-mqa",
+        "flashinfer-mla-impl.forward-mqa",
+        "aiter-mla-impl.forward-mqa",
+        "tokenspeed-mla-impl.forward-mqa"
+      ],
+      "fidelity": "shell",
+      "note": "mla-attention-impl.forward-mqa has no caller: no interface outside this area calls it, so its result reaches nobody."
+    },
+    {
+      "id": "attention.flashmla-flashattn-mla-decode",
+      "kind": "pipeline",
+      "name": "FlashMLA, FlashAttn MLA and Cutlass decode",
+      "trigger": "dense MLA decode on those backends",
+      "observable": "tile-scheduler or split metadata is planned in the builder, then the kernel decodes, with a growing workspace on Cutlass",
+      "citations": [
+        "vllm/v1/attention/backends/mla/flashmla.py:153-205",
+        "vllm/v1/attention/backends/mla/flashmla.py:260-352",
+        "vllm/v1/attention/backends/mla/flashattn_mla.py:209-276",
+        "vllm/v1/attention/backends/mla/flashattn_mla.py:355-410",
+        "vllm/v1/attention/backends/mla/cutlass_mla.py:84-103",
+        "vllm/v1/attention/backends/mla/cutlass_mla.py:249-286"
+      ],
+      "interfaces": [],
+      "fidelity": "absent"
+    },
+    {
+      "id": "attention.mla-kv-write",
+      "kind": "pipeline",
+      "name": "MLA latent and RoPE cache write",
+      "trigger": "each MLA KV update",
+      "observable": "latent and RoPE rows concatenate into the cache by slot; an empty cache writes nothing",
+      "citations": [
+        "vllm/v1/attention/backend.py:1090-1110",
+        "vllm/v1/attention/backends/mla/cpu_mla.py:195-220"
+      ],
+      "interfaces": [
+        "mla-attention-impl.do-kv-cache-update",
+        "custom-ops.concat-and-cache-mla",
+        "cpu-mla-impl.do-kv-cache-update"
+      ],
+      "fidelity": "shell",
+      "note": "mla-attention-impl.do-kv-cache-update has no caller: no interface outside this area calls it, so its result reaches nobody."
+    },
+    {
+      "id": "attention.mla-prefill-selection",
+      "kind": "dispatch",
+      "name": "MLA prefill backend selection",
+      "trigger": "MLA layer construction",
+      "observable": "an explicit mla_prefill_backend is loaded and validated, raising when invalid; otherwise the platform's priority list answers, cached per selector config",
+      "citations": [
+        "vllm/v1/attention/backends/mla/prefill/selector.py:46-132",
+        "vllm/v1/attention/backends/mla/prefill/base.py:94-131"
+      ],
+      "interfaces": [
+        "mla-prefill-selector.get-mla-prefill-backend",
+        "mla-prefill-backend.validate-configuration",
+        "cuda-platform.get-mla-prefill-backend-cls"
+      ],
+      "fidelity": "shell",
+      "note": "The behavior tracks the code but get-mla-prefill-backend has no caller: no interface outside this area calls it, so its result reaches nobody."
+    },
+    {
+      "id": "attention.mla-prefill-run",
+      "kind": "pipeline",
+      "name": "MLA prefill execution by backend",
+      "trigger": "MLA prefill (forward_mha)",
+      "observable": "the chosen backend prepares metadata, runs new-token attention, then context chunks merged by LSE, with FA, FlashInfer, TRT-LLM ragged, AITER, Tokenspeed or CPU SDPA",
+      "citations": [
+        "vllm/v1/attention/backends/mla/prefill/base.py:162-193",
+        "vllm/v1/attention/backends/mla/prefill/flash_attn.py:339",
+        "vllm/v1/attention/backends/mla/prefill/flashinfer.py:142-234",
+        "vllm/v1/attention/backends/mla/prefill/trtllm_ragged.py:89-181",
+        "vllm/v1/attention/backends/mla/prefill/cpu_sdpa.py:22"
+      ],
+      "interfaces": [],
+      "fidelity": "absent",
+      "note": "Only the quant-output checks and validation exist."
+    },
+    {
+      "id": "attention.sparse-indexer-metadata",
+      "kind": "pipeline",
+      "name": "Sparse indexer metadata build",
+      "trigger": "each step on DeepSeek V3.2 and V4 style sparse MLA",
+      "observable": "uniform or varlen decode tensors and prefill chunk metadata for the top-k indexer kernels",
+      "citations": [
+        "vllm/v1/attention/backends/mla/indexer.py:1414-1780",
+        "vllm/v1/attention/backends/mla/indexer.py:1167-1280",
+        "vllm/v1/attention/backends/mla/indexer.py:1837-1968"
+      ],
+      "interfaces": [
+        "deepseek-v32-indexer-metadata-builder.build",
+        "deepseek-v32-indexer-metadata-builder.prepare-decode-tensors",
+        "mla-indexer.build-prefill-chunk-metadata"
+      ],
+      "fidelity": "shell",
+      "note": "build has no caller and takes num_prefills and num_decodes as inputs."
+    },
+    {
+      "id": "attention.indexer-prefill-chunking",
+      "kind": "pipeline",
+      "name": "Indexer prefill chunking by workspace",
+      "trigger": "indexer prefill larger than the prefill workspace",
+      "observable": "requests group greedily into chunks that fit the workspace, sized from max_model_len and sparse_mla_prefill_workspace_factor, split further under PCP and DCP; an oversized request fails an assert",
+      "citations": [
+        "vllm/v1/attention/backends/utils.py:877-903",
+        "vllm/v1/attention/backends/mla/indexer.py:918-930",
+        "vllm/v1/attention/backends/mla/indexer.py:1310-1412"
+      ],
+      "interfaces": [
+        "mla-indexer.build-prefill-chunk-metadata"
+      ],
+      "fidelity": "shell",
+      "note": "Returns a constant {chunks: 1}: no chunk planning runs."
+    },
+    {
+      "id": "attention.tp-prefill-row-sharding",
+      "kind": "dispatch",
+      "name": "Indexer prefill row sharding across TP",
+      "trigger": "replicated indexer prefill rows on a safe configuration",
+      "observable": "rows are divided into contiguous per-rank counts balanced by MQA work; outside the safety envelope every rank does all rows",
+      "citations": [
+        "vllm/v1/attention/backends/mla/indexer.py:211-262"
+      ],
+      "interfaces": [
+        "mla-indexer.tp-prefill-row-sharding-supported"
+      ],
+      "fidelity": "shell",
+      "note": "The gate has no caller, and balanced_prefill_row_shard is absent."
+    },
+    {
+      "id": "attention.kpool-tail-ring",
+      "kind": "pipeline",
+      "name": "K-pool tail circular block",
+      "trigger": "a kpool tail KV group each build",
+      "observable": "every token maps to its request's one circular tail block, recomputed when positions are given; otherwise the batch's slot mapping passes through",
+      "citations": [
+        "vllm/v1/attention/backends/mla/indexer.py:794-842",
+        "vllm/v1/attention/backends/mla/indexer.py:867-901",
+        "vllm/v1/attention/backends/mla/indexer.py:903-915"
+      ],
+      "interfaces": [
+        "kpool-tail-metadata-builder.build",
+        "mla-indexer.compute-kpool-tail-slot-mapping"
+      ],
+      "fidelity": "shell",
+      "note": "build has no caller; the draft refresh is absent."
+    },
+    {
+      "id": "attention.compressed-kv-slot-mapping",
+      "kind": "pipeline",
+      "name": "Compressed KV slot mapping",
+      "trigger": "compressed-state KV writes on sparse MLA",
+      "observable": "every compress_ratio tokens share a state written by the last of them; others map to PAD",
+      "citations": [
+        "vllm/v1/attention/backends/mla/compressor_utils.py:43-106",
+        "vllm/v1/attention/backends/mla/compressor_utils.py:185-228"
+      ],
+      "interfaces": [
+        "compressor-utils.get-compressed-slot-mapping",
+        "compressor-utils.compressed-slot-mapping-kernel"
+      ],
+      "fidelity": "shell",
+      "note": "get-compressed-slot-mapping has no caller: no interface outside this area calls it, so its result reaches nobody."
+    },
+    {
+      "id": "attention.sparse-swa-metadata",
+      "kind": "pipeline",
+      "name": "DeepSeek sparse sliding-window metadata",
+      "trigger": "each step on DEEPSEEK_SPARSE_SWA groups",
+      "observable": "decode and prefill SWA indices and lengths, non-causal DSpark indices, bidirectional image visibility, prefill plan and tile scheduler",
+      "citations": [
+        "vllm/v1/attention/backends/mla/sparse_swa.py:575-783",
+        "vllm/v1/attention/backends/mla/sparse_swa.py:250",
+        "vllm/v1/attention/backends/mla/sparse_swa.py:901"
+      ],
+      "interfaces": [
+        "deepseek-sparse-swa-metadata-builder.build",
+        "deepseek-sparse-swa-metadata-builder.compute-swa-indices-and-lens-kernel"
+      ],
+      "fidelity": "shell",
+      "note": "build has no caller; the prefill chunk plan and tile scheduler are absent."
+    },
+    {
+      "id": "attention.sparse-index-group",
+      "kind": "handshake",
+      "name": "Sparse MLA top-k index group sync",
+      "trigger": "each sparse layer forward in a group sharing one indexer",
+      "observable": "the indexer records logical top-k ready; the group's first layer converts to physical slots once on a side stream; later layers wait on the event and reuse it; oversized batches convert per layer",
+      "citations": [
+        "vllm/v1/attention/backends/mla/index_group.py:36-72",
+        "vllm/v1/attention/backends/mla/index_group.py:94-166",
+        "vllm/v1/attention/backends/mla/index_group.py:345-396"
+      ],
+      "interfaces": [
+        "sparse-mla-index-group-builder.convert-logical-to-physical-topk",
+        "sparse-mla-index-group-builder.register-layer",
+        "sparse-utils.triton-convert-req-index-to-global-index"
+      ],
+      "fidelity": "shell",
+      "note": "convert-logical-to-physical-topk has no caller: no interface outside this area calls it, so its result reaches nobody."
+    },
+    {
+      "id": "attention.hisparse-residency",
+      "kind": "cache",
+      "name": "HiSparse host-backed cache residency",
+      "trigger": "each batch on a HiSparse sparse MLA group",
+      "observable": "pages swap in from host on top-k access, non-resident prefill rows are staged through a plan with ready events, and decode batch size is autotuned",
+      "citations": [
+        "vllm/v1/attention/backends/mla/index_group.py:168-340",
+        "vllm/v1/attention/backends/mla/flashinfer_mla_sparse.py:641-683",
+        "vllm/v1/attention/backends/mla/flashmla_sparse.py:1314-1396"
+      ],
+      "interfaces": [
+        "sparse-mla-index-group-builder.cache"
+      ],
+      "fidelity": "shell",
+      "note": "The only attention-side interface is a getter for the cache handle; swap-in, prefill staging and autotune aren't modeled here."
+    },
+    {
+      "id": "attention.flashmla-sparse-forward",
+      "kind": "dispatch",
+      "name": "FlashMLA sparse forward paths",
+      "trigger": "each sparse MLA forward on FLASHMLA_SPARSE",
+      "observable": "BF16 KV runs one path; FP8 runs a mixed batch or separate prefill and decode, with chunked FP8 prefill gathered and upconverted; prefill and decode rows use MQA kernels",
+      "citations": [
+        "vllm/v1/attention/backends/mla/flashmla_sparse.py:1397-1458",
+        "vllm/v1/attention/backends/mla/flashmla_sparse.py:840-925",
+        "vllm/v1/attention/backends/mla/flashmla_sparse.py:963-1180",
+        "vllm/v1/attention/backends/mla/flashmla_sparse.py:1181-1313"
+      ],
+      "interfaces": [],
+      "fidelity": "absent",
+      "note": "Only supports_combination exists for this backend."
+    },
+    {
+      "id": "attention.flashinfer-sparse-mla-forward",
+      "kind": "pipeline",
+      "name": "FlashInfer sparse MLA forward",
+      "trigger": "sparse MLA forward on FLASHINFER_MLA_SPARSE and SM120",
+      "observable": "top-k slots convert to physical slots, HiSparse groups run decode over the hot cache, and the trtllm-gen or SM120 kernel returns output with LSE for DCP",
+      "citations": [
+        "vllm/v1/attention/backends/mla/flashinfer_mla_sparse.py:495-640",
+        "vllm/v1/attention/backends/mla/flashinfer_mla_sparse.py:684",
+        "vllm/v1/attention/backends/mla/flashinfer_mla_sparse_sm120.py:108-211"
+      ],
+      "interfaces": [],
+      "fidelity": "absent"
+    },
+    {
+      "id": "attention.sm90-sparse-plan",
+      "kind": "pipeline",
+      "name": "SM90 sparse MLA KV length planning",
+      "trigger": "each build on FLASHINFER_MLA_SPARSE_SM90",
+      "observable": "per-row KV lengths are exact or sync-free upper bounds, clamped to the largest valid count, and planned host-side outside graph capture",
+      "citations": [
+        "vllm/v1/attention/backends/mla/flashinfer_mla_sparse_sm90.py:524-549",
+        "vllm/v1/attention/backends/mla/flashinfer_mla_sparse_sm90.py:303-341",
+        "vllm/v1/attention/backends/mla/flashinfer_mla_sparse_sm90.py:112-143"
+      ],
+      "interfaces": [
+        "flashinfer-mla-sparse-sm90-builder.build",
+        "flashinfer-mla-sparse-sm90-state.plan"
+      ],
+      "fidelity": "shell",
+      "note": "build has no caller, and the impl's SM90 forward is absent."
+    },
+    {
+      "id": "attention.rocm-aiter-sparse-mla",
+      "kind": "dispatch",
+      "name": "ROCm AITER sparse MLA with ragged fallbacks",
+      "trigger": "sparse MLA forward on ROCM_AITER_MLA_SPARSE",
+      "observable": "AITER's sparse kernel when it can serve the shape; ragged Triton fallbacks for rope-free BF16, sinks and long contexts; heads padded to the kernel's bucket",
+      "citations": [
+        "vllm/v1/attention/backends/mla/rocm_aiter_mla_sparse.py:1137-1200",
+        "vllm/v1/attention/backends/mla/rocm_aiter_mla_sparse.py:873-900",
+        "vllm/v1/attention/ops/rocm_aiter_mla_sparse.py:3481-3556",
+        "vllm/v1/attention/ops/rocm_aiter_mla_sparse.py:3819-3961"
+      ],
+      "interfaces": [
+        "rocm-aiter-mla-sparse-impl.forward-mqa",
+        "rocm-aiter-mla-sparse-ops.rocm-sparse-attn-decode-ragged-bf16-triton"
+      ],
+      "fidelity": "shell",
+      "note": "forward-mqa has no caller: no interface outside this area calls it, so its result reaches nobody."
+    },
+    {
+      "id": "attention.flashattn-xpu-sparse-mla",
+      "kind": "pipeline",
+      "name": "FlashAttn and XPU sparse MLA",
+      "trigger": "sparse MLA forward on FLASH_ATTN_MLA_SPARSE or XPU_MLA_SPARSE",
+      "observable": "top-k decode through the FA or XPU sparse kernels",
+      "citations": [
+        "vllm/v1/attention/backends/mla/flashattn_mla_sparse.py:208-331",
+        "vllm/v1/attention/backends/mla/xpu_mla_sparse.py:154-192",
+        "vllm/v1/attention/backends/mla/xpu_mla_sparse.py:246",
+        "vllm/v1/attention/ops/xpu_mla_sparse.py:1"
+      ],
+      "interfaces": [],
+      "fidelity": "absent"
+    },
+    {
+      "id": "attention.v41-sparse-indexer",
+      "kind": "pipeline",
+      "name": "DeepSeek V4.1 sparse and ROCm MXFP4 indexers",
+      "trigger": "each step on V4.1 sparse layers",
+      "observable": "decode and prefill become per-query sparse MQA rows over block KV; ROCm plans prefill chunks and gather launches, then a top-k on aiter or torch over MXFP4 keys",
+      "citations": [
+        "vllm/v1/attention/backends/mla/sparse_indexer.py:84-110",
+        "vllm/v1/attention/backends/mla/sparse_indexer.py:195-235",
+        "vllm/v1/attention/backends/mla/rocm_paged_mxfp4_indexer.py:156-285",
+        "vllm/v1/attention/backends/mla/rocm_paged_mxfp4_indexer.py:389",
+        "vllm/v1/attention/ops/rocm_paged_mxfp4_indexer.py:222-248"
+      ],
+      "interfaces": [
+        "rocm-paged-mxfp4-indexer.topk"
+      ],
+      "fidelity": "shell",
+      "note": "Only the top-k helper exists, without a caller; both builders are absent."
+    },
+    {
+      "id": "attention.rocm-aiter-mla-routing",
+      "kind": "dispatch",
+      "name": "ROCm AITER MLA decode routes",
+      "trigger": "each MLA decode on ROCM_AITER_MLA",
+      "observable": "Gluon for small heads when the KV cache fits 2 GiB; under DCP a plain, cprr or segmented route, and a RuntimeError when no route can serve multi-token verify",
+      "citations": [
+        "vllm/v1/attention/backends/mla/rocm_aiter_mla.py:282-298",
+        "vllm/v1/attention/backends/mla/rocm_aiter_mla.py:189-205",
+        "vllm/v1/attention/backends/mla/rocm_aiter_mla.py:1805-1871",
+        "vllm/v1/attention/backends/mla/rocm_aiter_mla.py:2191",
+        "vllm/v1/attention/backends/mla/rocm_aiter_mla.py:1245"
+      ],
+      "interfaces": [
+        "rocm-aiter-mla.select-dcp-decode-route",
+        "aiter-mla-helper.use-gluon-decode",
+        "aiter-mla-helper.use-gluon-verify",
+        "aiter-mla-impl.forward-mqa"
+      ],
+      "fidelity": "shell",
+      "note": "None of the route selectors has a caller; forward-mqa takes the route as an input, and the 2 GiB bound and metadata build are absent."
+    },
+    {
+      "id": "attention.rocm-paged-attention",
+      "kind": "dispatch",
+      "name": "ROCm paged attention and chunked prefill",
+      "trigger": "each forward on ROCM_ATTN",
+      "observable": "context_attention_fwd for prefill; paged decode by the custom ROCm kernel when its conditions and native layout hold, else the Triton 2D paged kernel",
+      "citations": [
+        "vllm/v1/attention/backends/rocm_attn.py:345-457",
+        "vllm/v1/attention/ops/chunked_prefill_paged_decode.py:285-507",
+        "vllm/v1/attention/ops/prefix_prefill.py:777"
+      ],
+      "interfaces": [],
+      "fidelity": "absent"
+    },
+    {
+      "id": "attention.rocm-segmented-attention",
+      "kind": "pipeline",
+      "name": "ROCm segmented attention",
+      "trigger": "each forward on ROCM_SEGMENTED_ATTN",
+      "observable": "a config by batch and query shape (tuned when autotune is on), a fixed workspace, the stage kernel, and a reduce when the config splits KV",
+      "citations": [
+        "vllm/v1/attention/backends/rocm_segmented_attn.py:254-310",
+        "vllm/v1/attention/ops/segmented_attention.py:351",
+        "vllm/v1/attention/ops/segmented_attention.py:570-632",
+        "vllm/v1/attention/ops/segmented_attention.py:815-922",
+        "vllm/v1/attention/ops/segmented_attention.py:925-931"
+      ],
+      "interfaces": [
+        "segmented-attention.launch-segmented-attention"
+      ],
+      "fidelity": "shell",
+      "note": "launch has no caller; config selection, autotune and workspace sizing are absent."
+    },
+    {
+      "id": "attention.rocm-aiter-fa",
+      "kind": "dispatch",
+      "name": "ROCm AITER FlashAttention and unified",
+      "trigger": "each forward on ROCM_AITER_FA or ROCM_AITER_UNIFIED_ATTN",
+      "observable": "decode, extend (chunked over context) and prefill paths with shuffle KV on eligible parts, and fused KV updates",
+      "citations": [
+        "vllm/v1/attention/backends/rocm_aiter_fa.py:491-716",
+        "vllm/v1/attention/backends/rocm_aiter_fa.py:989-1109",
+        "vllm/v1/attention/backends/rocm_aiter_fa.py:1111-1505",
+        "vllm/v1/attention/backends/rocm_aiter_unified_attn.py:195-327"
+      ],
+      "interfaces": [],
+      "fidelity": "absent"
+    },
+    {
+      "id": "attention.b12x-paged-attention",
+      "kind": "pipeline",
+      "name": "b12x paged attention with cached plans",
+      "trigger": "each forward on B12X; warmup at startup",
+      "observable": "a compiled plan is looked up by page size and batch shape, a RuntimeError when it is missing during graph capture; KV has separate planes; CuTe units warm up ahead",
+      "citations": [
+        "vllm/v1/attention/backends/b12x.py:907-975",
+        "vllm/v1/attention/backends/b12x.py:977-1075",
+        "vllm/v1/attention/backends/b12x.py:732-839",
+        "vllm/v1/attention/backends/b12x.py:152-168"
+      ],
+      "interfaces": [],
+      "fidelity": "absent"
+    },
+    {
+      "id": "attention.hpc-attention",
+      "kind": "pipeline",
+      "name": "HPC attention",
+      "trigger": "each forward on the HPC backend",
+      "observable": "decode and prefill split with HPC kernels, standard or with a fused RoPE and norm path through hpc_* metadata",
+      "citations": [
+        "vllm/v1/attention/backends/hpc_attn.py:184-268",
+        "vllm/v1/attention/backends/hpc_attn.py:404-580"
+      ],
+      "interfaces": [],
+      "fidelity": "absent"
+    },
+    {
+      "id": "attention.flex-attention",
+      "kind": "pipeline",
+      "name": "FlexAttention masks",
+      "trigger": "each build and forward on FLEX_ATTENTION",
+      "observable": "the inverse block table, a composed mask_mod (paged, window, prefix, R-SWA, custom), a block mask, then torch's compiled flex_attention with mask-derived kernel options",
+      "citations": [
+        "vllm/v1/attention/backends/flex_attention.py:999-1138",
+        "vllm/v1/attention/backends/flex_attention.py:615-636",
+        "vllm/v1/attention/backends/flex_attention.py:676-822",
+        "vllm/v1/attention/backends/flex_attention.py:1245-1396"
+      ],
+      "interfaces": [],
+      "fidelity": "absent"
+    },
+    {
+      "id": "attention.cpu-attention",
+      "kind": "dispatch",
+      "name": "CPU attention and ISA selection",
+      "trigger": "each forward on CPU",
+      "observable": "the kernel ISA is chosen by arch and block size (amx, neon, rvv, vxe, vsx, vec, vec16), encoder layers cache then attend or use zentorch SDPA",
+      "citations": [
+        "vllm/v1/attention/backends/cpu_attn.py:520-558",
+        "vllm/v1/attention/backends/cpu_attn.py:344-461",
+        "vllm/v1/attention/backends/zentorch_sdpa.py:20-45"
+      ],
+      "interfaces": [
+        "cpu-attn.get-attn-isa",
+        "cpu-attn.riscv-supports-rvv"
+      ],
+      "fidelity": "shell",
+      "note": "ISA selection has no caller; CPUAttentionBackendImpl.forward and zentorch dispatch are absent."
+    },
+    {
+      "id": "attention.cpu-mla",
+      "kind": "pipeline",
+      "name": "CPU MLA and AMX MLA",
+      "trigger": "MLA layers on CPU",
+      "observable": "the latent cache rows are written and decoded by the CPU op; AMX packs weights once and runs its own prefill and decode",
+      "citations": [
+        "vllm/v1/attention/backends/mla/cpu_mla.py:156-220",
+        "vllm/v1/attention/backends/mla/amx_mla.py:253-300",
+        "vllm/v1/attention/backends/mla/amx_mla.py:326-389"
+      ],
+      "interfaces": [
+        "cpu-mla-impl.forward-mqa",
+        "cpu-mla-impl.do-kv-cache-update"
+      ],
+      "fidelity": "shell",
+      "note": "forward-mqa has no caller; AMX is absent."
+    },
+    {
+      "id": "attention.mamba-metadata-planning",
+      "kind": "pipeline",
+      "name": "Mamba state and chunk metadata",
+      "trigger": "each step on Mamba1, Mamba2 and short-conv groups",
+      "observable": "state indices per row, one-token prefills with prior state rerouted to decode, chunks that never cross sequences and land on checkpoints, spec-decode accepted-token metadata",
+      "citations": [
+        "vllm/v1/attention/backends/mamba_attn.py:393-633",
+        "vllm/v1/attention/backends/mamba_attn.py:237-314",
+        "vllm/v1/attention/backends/mamba2_attn.py:26-92",
+        "vllm/v1/attention/backends/mamba2_attn.py:144-211"
+      ],
+      "interfaces": [],
+      "fidelity": "absent"
+    },
+    {
+      "id": "attention.mamba-backend-selection",
+      "kind": "dispatch",
+      "name": "Mamba backend selection",
+      "trigger": "Mamba-family layer construction",
+      "observable": "the enum's class (or a registered override) is resolved and cached; batch-invariant mode raises when unsupported",
+      "citations": [
+        "vllm/v1/attention/selector.py:228-247",
+        "vllm/v1/attention/backends/utils.py:1163-1195"
+      ],
+      "interfaces": [
+        "selector.get-mamba-attn-backend",
+        "attention-backend-utils.mamba-get-block-table-tensor"
+      ],
+      "fidelity": "shell",
+      "note": "selector.get-mamba-attn-backend has no caller: no interface outside this area calls it, so its result reaches nobody."
+    },
+    {
+      "id": "attention.gdn-metadata",
+      "kind": "pipeline",
+      "name": "GDN and SSM speculative metadata",
+      "trigger": "each step on GDN groups",
+      "observable": "rows divide into speculative, decode and prefill; state indices come from the block table at num_accepted_tokens; prefill gets FLA chunk metadata from the chosen backend",
+      "citations": [
+        "vllm/v1/attention/backends/gdn_attn.py:262-630",
+        "vllm/v1/attention/backends/gdn_attn.py:220-260",
+        "vllm/v1/attention/backends/gdn_attn.py:632-657",
+        "vllm/v1/attention/backends/recoverssm_metadata.py:21-26"
+      ],
+      "interfaces": [
+        "gdn-attention-metadata-builder.build"
+      ],
+      "fidelity": "shell",
+      "note": "build has no caller; chunk metadata backends and graph staging are absent."
+    },
+    {
+      "id": "attention.linear-short-conv-metadata",
+      "kind": "pipeline",
+      "name": "Linear and PLE short-conv state metadata",
+      "trigger": "each step on linear and short-conv groups",
+      "observable": "state rows are split by decode threshold; spec-decode rows get their own metadata, and capture has its own build",
+      "citations": [
+        "vllm/v1/attention/backends/linear_attn.py:63-95",
+        "vllm/v1/attention/backends/linear_attn.py:183-304",
+        "vllm/v1/attention/backends/short_conv_attn.py:154-235",
+        "vllm/v1/attention/backends/short_conv_attn.py:237-480"
+      ],
+      "interfaces": [],
+      "fidelity": "absent"
+    },
+    {
+      "id": "attention.vit-encoder-wrappers",
+      "kind": "dispatch",
+      "name": "Vision encoder attention wrappers",
+      "trigger": "a vision encoder's attention, by selected vision backend",
+      "observable": "an opaque torch op runs FlashAttention, Triton, SDPA (per sequence when cu_seqlens split it) or FlashInfer over encoder sequences",
+      "citations": [
+        "vllm/v1/attention/ops/vit_attn_wrappers.py:103-131",
+        "vllm/v1/attention/ops/vit_attn_wrappers.py:217-241",
+        "vllm/v1/attention/ops/vit_attn_wrappers.py:316-333",
+        "vllm/v1/attention/ops/vit_attn_wrappers.py:430-464"
+      ],
+      "interfaces": [
+        "vit-attn-wrappers.vit-flash-attn-wrapper",
+        "vit-attn-wrappers.vit-triton-attn-wrapper",
+        "vit-attn-wrappers.vit-torch-sdpa-wrapper",
+        "vit-attn-wrappers.vit-flashinfer-wrapper"
+      ],
+      "fidelity": "partial",
+      "note": "Only the FlashAttention wrapper is reached from a model; the other three have no caller."
+    },
+    {
+      "id": "attention.local-attention-virtual-batches",
+      "kind": "pipeline",
+      "name": "Chunked local attention virtual batches",
+      "trigger": "each build on a chunked-local attention layer",
+      "observable": "each request splits into chunk-local virtual batches with their own query and key lengths and block table",
+      "citations": [
+        "vllm/v1/attention/backends/utils.py:509-650"
+      ],
+      "interfaces": [
+        "attention-backend-utils.make-local-attention-virtual-batches",
+        "chunked-local-attention-builder.build"
+      ],
+      "fidelity": "shell",
+      "note": "chunked-local-attention-builder.build has no caller: no interface outside this area calls it, so its result reaches nobody."
+    },
+    {
+      "id": "attention.backend-registry-override",
+      "kind": "lifecycle",
+      "name": "Backend registry and plugin override",
+      "trigger": "a plugin or operator calling register_backend or register_mla_prefill_backend",
+      "observable": "a new or overriding backend resolves by name through get_class; unknown names raise a ValueError listing the valid ones",
+      "citations": [
+        "vllm/v1/attention/backends/registry.py:21-31",
+        "vllm/v1/attention/backends/registry.py:161-232",
+        "vllm/v1/attention/backends/registry.py:340-412",
+        "vllm/v1/attention/backends/mla/prefill/registry.py:143-200"
+      ],
+      "interfaces": [
+        "attention-backend-enum.register-backend",
+        "attention-backend-enum.get-class",
+        "attention-backend-enum.getitem",
+        "mla-prefill-backend-enum.register-mla-prefill-backend"
+      ],
+      "fidelity": "shell",
+      "note": "The registry behaves as the code does, but selection never calls get-class, so an override never changes what a layer runs."
+    },
+    {
+      "id": "attention.kv-spec-and-block-size-negotiation",
+      "kind": "gate",
+      "name": "KV spec customization and preferred block size",
+      "trigger": "model setup, before KV cache allocation",
+      "observable": "a backend adjusts the layer's KV spec (separate planes, NVFP4 slots) and raises the default block size to what its kernels accept",
+      "citations": [
+        "vllm/v1/attention/backend.py:138-160",
+        "vllm/v1/attention/backends/flash_attn.py:298-378",
+        "vllm/v1/attention/backends/flashinfer.py:433-445",
+        "vllm/v1/attention/backends/b12x.py:152-168"
+      ],
+      "interfaces": [
+        "attention-backend.get-preferred-block-size",
+        "attention-backend.supports-block-size"
+      ],
+      "fidelity": "shell",
+      "note": "get-preferred-block-size has no caller; customize_spec appears in no behavior."
+    },
+    {
+      "id": "attention.adaptive-verification-gate",
+      "kind": "gate",
+      "name": "Device query lengths mismatch gate",
+      "trigger": "selection and runner setup with adaptive verification on",
+      "observable": "backends planning from CPU query lengths refuse; FlashInfer allows it only on trtllm-gen without DCP",
+      "citations": [
+        "vllm/v1/attention/backend.py:214-227",
+        "vllm/v1/attention/backends/flashinfer.py:490-504",
+        "vllm/v1/attention/selector.py:143-152"
+      ],
+      "interfaces": [
+        "attn-utils.get-query-lens-mismatch-unsupported-backend"
+      ],
+      "fidelity": "partial",
+      "note": "The runner-side check exists; selection's own refusal and FlashInfer's rule are missing."
+    },
+    {
+      "id": "attention.jit-kernel-warmup",
+      "kind": "lifecycle",
+      "name": "Per-kernel JIT warmup registration",
+      "trigger": "backend construction with enable_jit_warmup, then startup warmup",
+      "observable": "each kernel registers compile keys, FA4 dense and prefill, DCP correct, SWA and indexer metadata, so they compile before the first request",
+      "citations": [
+        "vllm/v1/attention/backends/flash_attn.py:97-118",
+        "vllm/v1/attention/backends/flash_attn.py:145-205",
+        "vllm/v1/attention/backends/flash_attn.py:720",
+        "vllm/v1/attention/ops/dcp.py:1481-1488",
+        "vllm/v1/attention/backends/mla/sparse_swa.py:1147-1174",
+        "vllm/v1/attention/backends/mla/prefill/flash_attn.py:379"
+      ],
+      "interfaces": [],
+      "fidelity": "absent",
+      "note": "kernel-warmup models Qwen-VL and FlashInfer autotune only."
+    }
+  ]
+}

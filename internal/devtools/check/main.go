@@ -9,6 +9,7 @@
 //	     [--min-substantive R] [--max-trivial R]]
 //	    [--tests test-targets.json [--min-test-reach R]] [--features profile.yaml [--strict-features]]
 //	    [--failures profile.yaml [--strict-failures]]
+//	    [--mechanisms DIR [--min-mechanisms R] [--mechanism-e2e [--mechanism-e2e-scenarios N] [--max-shell-mechanisms N]]]
 //
 // Merging rules: entities with the same kind and id must be identical, except
 // that a boundary stub (attributes.boundary: true) yields to a non-stub
@@ -113,6 +114,13 @@
 // skip {id, role, reason} in its owner's file, and the failure is covered
 // only when every side is covered or skipped. The report lists each side.
 //
+// Mechanism lists (DESIGN §13.1 items 38 and 39; see mechanisms.go and
+// mechanisme2e.go): --mechanisms DIR measures each mechanism an enumerator
+// listed from the code as missing, uncovered, shell, ok or skipped, and
+// --mechanism-e2e reruns its scenarios with its interfaces disabled to tell a
+// shell from a mechanism a boundary expectation notices. --min-mechanisms R
+// only goes up; --max-shell-mechanisms N only goes down.
+//
 // Contract conformance (DESIGN §13.1 item 21): --openapi FILE (repeatable)
 // matches each operation to the interface for it (attributes.method and
 // attributes.path, else the name <method>-<path slug>) and reports missing,
@@ -148,7 +156,7 @@
 // points, hollow-lint findings, mocks under --no-mocks, or a fragment below
 // --min-modeled, --min-substantive or --min-test-reach, above --max-trivial,
 // or missing features under --strict-features or failures under
-// --strict-failures.
+// --strict-failures, or below --min-mechanisms or above --max-shell-mechanisms.
 package main
 
 import (
@@ -234,7 +242,7 @@ func main() {
 	applyProfileGates() // --profile's gates: defaults of the §16.1 gate flags (gates.go)
 	applySimLimits()    // --max-events, --max-iterations, --max-foreach (simlimits.go)
 	if len(in) == 0 {
-		fmt.Fprintln(os.Stderr, "usage: check -f FILE [-f FILE]... [-o OUT] [-q] [-v] [--scenario RE] [--trace] [--state] [--steps [--steps-full]] [--behavior-coverage [--behavior-coverage-md FILE]] [--lint hollow,trivial,inert,unscheduled,dataflow,racy,seam-names] [--no-mocks] [--code DIR [--strict-citations] [--cite-sample N --seed S]] [--inventory FILE [--coverage-md FILE] [--strict-coverage] [--min-modeled R] [--min-substantive R] [--max-trivial R]] [--tests FILE [--min-test-reach R]] [--features PROFILE [--strict-features]] [--failures PROFILE [--strict-failures]]")
+		fmt.Fprintln(os.Stderr, "usage: check -f FILE [-f FILE]... [-o OUT] [-q] [-v] [--scenario RE] [--trace] [--state] [--steps [--steps-full]] [--behavior-coverage [--behavior-coverage-md FILE]] [--lint hollow,trivial,inert,unscheduled,dataflow,racy,seam-names] [--no-mocks] [--code DIR [--strict-citations] [--cite-sample N --seed S]] [--inventory FILE [--coverage-md FILE] [--strict-coverage] [--min-modeled R] [--min-substantive R] [--max-trivial R]] [--tests FILE [--min-test-reach R]] [--features PROFILE [--strict-features]] [--failures PROFILE [--strict-failures]] [--mechanisms DIR [--min-mechanisms R] [--mechanism-e2e] [--max-shell-mechanisms N]]")
 		os.Exit(2)
 	}
 	lints := map[string]bool{}
@@ -334,6 +342,7 @@ func main() {
 		fmt.Fprintln(os.Stderr, "check: --strict-citations and --cite-sample need --code")
 		os.Exit(2)
 	}
+	mechList := mechanismsPrepare()          // --mechanisms (mechanisms.go)
 	inputs, err := loadInputs(os.Stdout, in) // merge.Load, or --stage's last-good copies (stage.go)
 	if err != nil {
 		var pe *merge.ParseError
@@ -461,9 +470,13 @@ func main() {
 		onlyRE = re
 	}
 	onlyRE = scenarioTagFilter(os.Stdout, doc, onlyRE) // --scenario-tag (§17 item 1, scenariotags.go)
+	var track map[string]bool
+	if mechList != nil {
+		track = mechList.interfaces()
+	}
 	var rr *runReport
 	if errs == 0 {
-		rr = runAll(os.Stdout, doc, origins, runOpts{Only: onlyRE, Quiet: *quiet, Trace: *trace, State: *state, Steps: *steps || *stepsFull, StepsFull: *stepsFull, Verbose: *verbose,
+		rr = runAll(os.Stdout, doc, origins, runOpts{Track: track, Only: onlyRE, Quiet: *quiet, Trace: *trace, State: *state, Steps: *steps || *stepsFull, StepsFull: *stepsFull, Verbose: *verbose,
 			Hollow: lints["hollow"], NoMocks: *noMocks, BehCov: *behCov})
 	} else {
 		rr = &runReport{}
@@ -582,6 +595,9 @@ func main() {
 		if failureCoverage(doc, fails, skips, rr.Flows, inj, present).print(os.Stdout, *verbose) && *strictFailures {
 			strictFail = true
 		}
+	}
+	if runMechanisms(os.Stdout, doc, mechList, rr.Base, present, errs == 0, *verbose) { // --mechanisms, --mechanism-e2e
+		strictFail = true
 	}
 	if len(openapis) > 0 {
 		over, err := runConformance(os.Stdout, doc, openapis, *code, *maxConf, *quiet)

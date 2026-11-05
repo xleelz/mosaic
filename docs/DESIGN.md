@@ -1658,6 +1658,94 @@ The stages are the same for every repo:
       `gates.max_unwritten_fields`. The template has no default, so the findings are recorded
       without gating until a profile sets the key.
 
+38. **The mechanism list: a denominator from the code (binding; from blind measures).** Inventory
+    coverage counts entry points. It read 100% while whole mechanisms were absent. After the
+    inventory stage, an enumerator agent lists each area's mechanisms from the code
+    (`templates/MECHANISMS.md`) into `<workspace>/mechanisms/<area>.json`, without changing the
+    model.
+    - **`check --mechanisms DIR`** reads `DIR/<area>.json` and `DIR/skips/<area>.json`
+      (`[{id, reason, covered_by}]`, under the feature skip rules of item 19). Each mechanism gets
+      one status:
+      - **missing:** `interfaces` is empty, or none of them exists in the merged model. An unknown
+        id is named, also when the mechanism's other interfaces exist;
+      - **uncovered:** they exist, but no scenario's trace reaches one (a mocked call isn't reach).
+        A mechanism reached only by scenarios item 39 leaves out is uncovered too;
+      - **shell:** reached, but it fails item 39;
+      - **ok**, or **skipped** (a valid reason). A skip with a bad reason is named, and the
+        mechanism keeps its measured status.
+      Without `--mechanism-e2e`, a reached mechanism reads **reached**, and doesn't count as ok.
+      A mechanism that is missing or uncovered, in an area with no fragment in this merge, is
+      counted apart and left out of the share.
+    - **Report.** Per-area and per-kind counts and a total, every non-ok mechanism, and the
+      enumerator's `fidelity` beside the status. A disagreement is flagged both ways: `modeled` or
+      `partial` should measure ok, `shell` shell or uncovered, `absent` missing.
+    - **Gate.** `--min-mechanisms R` fails when ok / unskipped is below R. The profile key is
+      `gates.min_mechanisms`; unset, it records without gating. **It only ratchets up**, the
+      opposite of the `max_*` gates, and the check prints `~ ratchet: --min-mechanisms can go up
+      to R`. The flag implies `--mechanism-e2e`.
+
+39. **`--mechanism-e2e`: a mechanism must reach the boundary, by mutation (binding; from blind
+    measures).** Mechanisms get added as shells: a pooling endpoint over an `encode` that returns
+    no vectors, a metrics observer nothing calls, a validator claiming a check it doesn't make.
+    Each piece has its own scenario, so each passes. The gate reruns a mechanism's scenarios with
+    its interfaces disabled and requires that a boundary expectation then fails.
+    - **Disabled** is a run-level option, `sim.Limits.DisabledInterfaces`, never a scenario field.
+      A call to the interface still appears in the trace and in `calls`. It answers at once,
+      without capacity, limits, latency, behavior, store or mock, so it writes no state. A fault on
+      it still fires: a fault is the world's, and removing it would fail the scenario's check of
+      the fault whatever the mechanism does.
+    - **The answer: `--mechanism-e2e-variant zero`, chosen by measurement.** `zero` answers the
+      interface's usual successful results in that scenario, with their shape kept and values
+      emptied: lists `[]`, strings `""`, numbers 0, booleans false. `empty` answers `{}`, and `fail`
+      an error. On two generated models, with lists of 788 and 881 mechanisms, `zero` found 96 and
+      64 shells, `empty` 79 and 52, `fail` 49 and 39. Only 4 shells of the smaller sets were outside `zero`'s, all on the second model.
+      `fail` hides shells because a caller only propagates the error, and any `result.ok` notices.
+      `empty` hides them because a caller's read of a missing field aborts before the absence
+      travels anywhere: 253 and 299 mechanisms were ok only by an abort under `empty`, 56 and 35
+      under `zero`.
+    - **Boundary expectations** are those the `internal-assertions` lint doesn't count as internal
+      (`internalClassifier`): `io`, `result`, `steps.*`, store state. An expectation counts when it
+      passed unmutated and fails mutated. One naming an internal interface or a non-store
+      component's state is listed, and doesn't count.
+    - **Aborts.** An abort has no expectations to read, and the unmutated run didn't abort, so the
+      mutation caused it. It counts when it is the absence surfacing at the boundary: a behavior's
+      evaluation failure on the synchronous call chain from the scenario's entry, or a run cap
+      (events, virtual time) with an entry call still open, so its caller never gets an answer. An
+      abort in background work (an emit, a timer, a subscriber) doesn't count, since the boundary
+      answered without it, and neither does a cap after the entry answered, or the depth limit.
+    - **The scenario's own entry.** A scenario that reaches a listed interface by a call disables
+      the interfaces it reaches that way, and not its own entry: disabling the entry would fail
+      every check of its result, whatever the mechanism does. A scenario that only enters a listed
+      interface runs when that is a **boundary entry** (a flow's entry, an interface of a boundary
+      component, or a kind other than `function`, `kernel` or `store`). A step entering a plain
+      function is a unit test, and shows nothing about callers: a mechanism reached only that way
+      is a shell, "no caller".
+    - **Refusals.** For a kind other than `gate` or `retry`, a failed expectation that only asserts
+      an error, in a scenario where a disabled interface refused, doesn't count: losing a
+      pipeline's validation step isn't evidence of the pipeline. The finding names that check.
+    - **Constants.** When every reached interface only returns literal values, the mechanism is a
+      shell without a mutation, since disabling a constant fails any check of that constant.
+    - **Weak interfaces.** One real interface proves a list of several, so an ok mechanism's
+      interfaces are also disabled one at a time, and each that nothing notices alone, or that has
+      no caller, is printed as `! mechanism M is ok, but its interface I`. It doesn't change the
+      status: an enumerator lists helpers too, and the gates can't tell them from main work.
+    - **Which scenarios.** A scenario whose tag or id names a race, concurrency or exploration
+      stays out: its expectations may hold on one schedule only. So does one failing unmutated. A
+      mechanism runs at most `--mechanism-e2e-scenarios N` (default 10), stopping at the first
+      notice. The order is deterministic: scenarios with no boundary expectation last; then those
+      starting at a boundary entry; refusals first for a `gate` or `retry`, last otherwise; the most
+      boundary expectations; the id. Every other slot goes to the scenario whose id names the
+      mechanism most. Scenarios with different disabled sets take turns, so one interface reached
+      everywhere doesn't take every slot. The cap can only add shells: on the same two models,
+      about one shell in ten went away with no cap, so confirm a finding with a large N before
+      fixing it.
+    - **Cost.** Mechanisms run in parallel, on `--mechanism-e2e-workers N` workers (default the
+      CPUs, at most 8), and the check prints the elapsed time.
+    - **Gate.** `--max-shell-mechanisms N` fails above N shells. The profile key is
+      `gates.max_shell_mechanisms`; unset, it records without gating. The flag implies
+      `--mechanism-e2e`. Each finding names the mechanism, its interfaces, the scenarios run and the
+      boundary expectations that survived, so an area agent can act on it.
+
 ## 14. Hierarchical, recursive ontologies (direction; binding where marked)
 
 ### 14.1 Goal

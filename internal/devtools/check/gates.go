@@ -15,13 +15,16 @@ package main
 //	  max_contract_issues: 0        # --max-contract-issues N, with --contract
 //	  max_conformance_issues: 0     # --max-conformance-issues N, with --openapi
 //	  max_explore_failures: 0       # --max-explore-failures N; unset: recorded, not gated
+//	  min_mechanisms: 0.6           # --min-mechanisms R, with --mechanisms; only goes up; unset: recorded, not gated
+//	  max_shell_mechanisms: 5       # --max-shell-mechanisms N, with --mechanisms; unset: recorded, not gated
 //
 // Each gate is the default of its flag; a flag given on the command line
 // wins. A profile without `gates:`, or a gate missing from it, takes the
 // template default (examples/_profile-template/profile.yaml). A gate whose
 // flag needs another (--tests, --contract, --openapi) applies only when
-// that one is given. Thresholds only go down: the pipeline lowers them as
-// fixes land, and the check prints the value a gate can be lowered to.
+// that one is given. Thresholds tighten only: a max goes down and a min
+// (min_test_reach, min_mechanisms) goes up. The pipeline moves them as fixes
+// land, and the check prints the value a gate can move to.
 
 import (
 	"flag"

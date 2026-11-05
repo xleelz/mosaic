@@ -17,6 +17,7 @@ type runOpts struct {
 	State                   bool // print each run scenario's final state
 	Steps, StepsFull        bool // print each run scenario's step results (steps.go)
 	Hollow, NoMocks, BehCov bool
+	Track                   map[string]bool // interfaces to record each run's reach for, in Base (--mechanisms)
 }
 
 type mockUse struct {
@@ -34,7 +35,8 @@ type runReport struct {
 	Flows          map[string]bool // flows the run scenarios run (their flow or a step's)
 	Hollow         []hollowFinding
 	Mocks          []mockUse
-	Cov            *behaviorCov // with BehCov
+	Cov            *behaviorCov        // with BehCov
+	Base           map[string]*baseRun // with Track: per run scenario (mechanisme2e.go)
 	HollowFail     bool
 	MockFail       bool
 }
@@ -87,6 +89,12 @@ func runAll(w io.Writer, doc *model.Document, origins map[string]string, o runOp
 			}
 			for _, wn := range res.Summary.Warnings {
 				fmt.Fprintf(w, "    ! %s: %s\n", sc.ID, wn)
+			}
+			if o.Track != nil {
+				if r.Base == nil {
+					r.Base = map[string]*baseRun{}
+				}
+				r.Base[sc.ID] = recordBase(res, o.Track)
 			}
 			called = mockedCalls(&res.Summary)
 			r.Counted++

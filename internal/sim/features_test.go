@@ -322,3 +322,70 @@ interfaces:
 		t.Errorf("a run without repeat must not encode passes: %s", b)
 	}
 }
+
+func TestDisabledInterfaces(t *testing.T) {
+	doc, err := model.ParseDocument([]byte(`
+schema_version: 1
+components: [{id: user, kind: external}, {id: api}, {id: work, capacity: {concurrency: 1}}, {id: db}]
+interfaces:
+  - {component: db, name: put, store: {table: rows, op: put, key: "= input.id", value: "= input"}}
+  - component: api
+    name: go
+    behavior:
+      - {call: work.do, as: r, on_error: continue}
+      - {return: {ok: "= vars.r.ok", n: "= vars.r.ok && has(vars.r.value.n) ? vars.r.value.n : -1"}}
+  - component: work
+    name: do
+    latency_ms: 50
+    behavior:
+      - {call: db.put, input: {id: a}}
+      - {set: {state.ran: true}}
+      - {return: {n: 1}}
+flows:
+  - {id: go, entry: {caller: user, interface: api.go}}
+`))
+	if err != nil {
+		t.Fatal(err)
+	}
+	run := func(d map[string]sim.DisabledResult, req sim.Request) *sim.Result {
+		t.Helper()
+		lim := sim.DefaultLimits
+		lim.DisabledInterfaces = d
+		req.Flow = "go"
+		res, err := sim.RunWithLimits(doc, req, lim)
+		if err != nil {
+			t.Fatal(err)
+		}
+		return res
+	}
+	on := run(nil, sim.Request{})
+	if v := on.Summary.Result.Value.(map[string]any); v["n"] != int64(1) || on.Summary.Calls["db.put"] != 1 || on.Summary.DurationMS < 50 {
+		t.Fatalf("unmutated: %+v", on.Summary)
+	}
+	for name, c := range map[string]struct {
+		d     sim.DisabledResult
+		ok    bool
+		wantN int64
+	}{
+		"empty": {sim.DisabledResult{}, true, -1},
+		"value": {sim.DisabledResult{Value: map[string]any{"n": int64(0)}}, true, 0},
+		"error": {sim.DisabledResult{Err: &sim.Error{Code: "off", Status: 500}}, false, -1},
+	} {
+		res := run(map[string]sim.DisabledResult{"work.do": c.d}, sim.Request{})
+		s := res.Summary
+		if v := s.Result.Value.(map[string]any); v["ok"] != c.ok || v["n"] != c.wantN {
+			t.Errorf("%s: result %+v", name, s.Result)
+		}
+		if s.Calls["work.do"] != 1 || s.Calls["db.put"] != 0 || s.DurationMS >= 50 {
+			t.Errorf("%s: the behavior ran or took time: %+v, %d ms", name, s.Calls, s.DurationMS)
+		}
+		if len(s.State["work"]) != 0 || len(s.State["db"]) != 0 {
+			t.Errorf("%s: state written: %+v", name, s.State)
+		}
+	}
+	// A fault is the world's: it still applies to a disabled interface.
+	f := run(map[string]sim.DisabledResult{"work.do": {}}, sim.Request{Faults: []model.Fault{{Target: "work.do", Type: "unavailable"}}})
+	if v := f.Summary.Result.Value.(map[string]any); v["ok"] != false {
+		t.Errorf("fault on a disabled interface: %+v", f.Summary.Result)
+	}
+}

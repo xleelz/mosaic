@@ -115,6 +115,13 @@ runbook uses:
 | `--strict-failures` | With `--failures`, exit 1 when a failure is missing |
 | `--openapi FILE` (repeatable) | Contract conformance (DESIGN §13.1 item 21): match each OpenAPI operation to its interface (`attributes.method` and `attributes.path`, else the name `<method>-<path slug>`) and report missing, extra, required-mismatch and mistyped request and response fields, success and error statuses that disagree, `unmodeled` operations and `orphan` route interfaces. A relative path missing from the working directory is resolved against `--code`. `--max-conformance-issues N` exits 1 above N issues |
 | `--contract FILE` (repeatable) | Contracts the spec doesn't cover (DESIGN §13.1 item 34), from `contracts/*.yaml`: `contracts: [{id, match, request, response, errors, stream, sources}]`, `match` being `{interface: <id or glob>}`, `{route: {method, path}}` or `{attributes: {...}}`. Request, response and errors are compared as with `--openapi`; a `stream` (`{frames: [{name, schema}], terminator, order}`) is compared with the yields the run scenarios' traces show, reporting `frame-missing`, `frame-extra`, `frame-order` and `terminator`. Frames no scenario yielded are counted as not compared. `--max-contract-issues N` exits 1 above N issues |
+| `--mechanisms DIR` | Report each mechanism of `DIR/<area>.json` (and `DIR/skips/<area>.json`, under the feature skip rules) as **missing** (no listed interface exists), **uncovered** (no scenario's trace reaches one), **shell** (fails `--mechanism-e2e`), **ok** or **skipped**, with per-area and per-kind counts, every non-ok mechanism, and the enumerator's `fidelity` flagged where it disagrees (DESIGN §13.1 item 38). Without `--mechanism-e2e`, a reached mechanism reads **reached**, not ok |
+| `--min-mechanisms R` | With `--mechanisms`, run `--mechanism-e2e`, and exit 1 when ok / unskipped is below R. **Only goes up**, the opposite of the `max_*` gates. Unset, it records without gating |
+| `--mechanism-e2e` | With `--mechanisms`, rerun each reached mechanism's scenarios with its interfaces disabled, and call it a shell when no boundary expectation (as the `internal-assertions` lint classifies them) then fails (DESIGN §13.1 item 39). Lists the mechanism, its interfaces, the scenarios run and what survived, and, for an ok mechanism, each interface nothing notices alone. Prints the elapsed time |
+| `--mechanism-e2e-scenarios N` | The most scenarios run per mechanism (default 10), chosen deterministically, those starting at a boundary entry first. A higher N can only remove shells |
+| `--mechanism-e2e-workers N` | How many mechanisms run at once (default the CPUs, at most 8) |
+| `--mechanism-e2e-variant zero\|empty\|fail` | What a disabled interface answers: its usual result with values emptied (default, found the most shells), `{}`, or an error |
+| `--max-shell-mechanisms N` | With `--mechanisms`, run `--mechanism-e2e`, and exit 1 above N shells. Unset, it records without gating |
 | `--scenario REGEX` | Run only matching scenarios |
 | `--trace` | Print each run's trace: calls, notes, faults, retries, instances |
 | `--strict-stubs` | Make "stubs disagree" (two boundary stubs with different definitions) an error naming both (DESIGN §15.2) |
@@ -126,7 +133,7 @@ runbook uses:
 | `--max-exemption-issues N`, `--max-clock-ids N`, `--max-unknown-inputs N` | Run that lint, and exit 1 above N findings in total |
 | `--max-internal-assertions R` | Run `--lint internal-assertions`, and exit 1 when a fragment's share is above R |
 | `--explore REGEX --schedules N` | Rerun the matching scenarios under up to N schedules (tie orders, `parallel` branch and join order, `--jitter-ms` at_ms jitter); a failing schedule is written to `--replay-dir` (default `.mosaic/replay`) and `--replay FILE` reproduces it (DESIGN §15.5). A scenario that passes every schedule has its stale replay removed (`--keep-replays` keeps it). Any failure exits 1, unless `--max-explore-failures N` allows N, or the profile's gates record exploration without gating it |
-| `--profile PROFILE` | The profile the racy and choice-for-computed lints read, and the **gates**: its `gates:` section gives the defaults of `--strict-stubs`, `--max-exemption-issues`, `--max-internal-assertions`, `--max-clock-ids`, `--max-unknown-inputs` and `--max-explore-failures` (a flag on the command line wins). A missing entry takes the template's value (`examples/_profile-template/profile.yaml`, section 12); unset `max_explore_failures` records exploration failures without gating. The check prints `~ ratchet: --<flag> can go down to N` when a measured value is below its gate |
+| `--profile PROFILE` | The profile the racy and choice-for-computed lints read, and the **gates**: its `gates:` section gives the defaults of `--strict-stubs`, `--max-exemption-issues`, `--max-internal-assertions`, `--max-clock-ids`, `--max-unknown-inputs`, `--max-explore-failures`, `--min-mechanisms` and `--max-shell-mechanisms` (a flag on the command line wins). A missing entry takes the template's value (`examples/_profile-template/profile.yaml`, section 12); unset `max_explore_failures` records exploration failures without gating. The check prints `~ ratchet: --<flag> can go down to N` when a measured value is below its gate |
 
 The **full gate**, used at the end of stages 4, 4b, 5 and 6, and by every fix round:
 
@@ -154,10 +161,32 @@ replay file under `$WS/replay`, but they fail the gate only when the profile set
 `gates.max_explore_failures`; otherwise they are recorded for the next fix round. A scenario a
 fix round makes pass has its replay file removed, so `$WS/replay` holds only current failures.
 
+**The mechanism gates.** The list is enumerated per area from the code after the inventory stage,
+with `templates/MECHANISMS.md`: one enumerator agent per area writes
+`$WS/mechanisms/<area>.json` and changes nothing else. Add them to the full gate once the list
+exists:
+
+```sh
+$CHECK -f $WS/skeleton.yaml -f $WS/fixtures.yaml -f <fragments...> \
+  --mechanisms $WS/mechanisms --mechanism-e2e --profile $WS/profile.yaml
+```
+
+`--mechanisms` gives each mechanism one status: missing, uncovered, shell, ok or skipped.
+`--mechanism-e2e` tells a shell from an ok mechanism by mutation: it reruns the scenarios that reach
+the mechanism with its interfaces disabled, and a boundary expectation has to fail. A mechanism whose
+removal nothing at the boundary notices is a shell, or its scenarios don't check it; the finding
+names the scenarios run and the expectations that survived, for the area agent to act on. A shell
+found under the scenario cap is confirmed with `--mechanism-e2e-scenarios 100000` before it is fixed.
+Both gates record without gating until the profile sets `gates.min_mechanisms` and
+`gates.max_shell_mechanisms` (or the flags are given). `min_mechanisms` **only goes up**, the opposite
+of the `max_*` gates: the check prints `~ ratchet: --min-mechanisms can go up to R`.
+`max_shell_mechanisms` goes down like them. Gate 2 took about a minute on models of 1,800 and 3,400
+scenarios, with 800 to 900 mechanisms.
+
 **The ratchet.** When a profile is written for an existing model, its gates are today's measured
 values, rounded toward passing (shares up, reach down, to 3 places), so the model passes as it
 stands (the vLLM, VS Code, Cassandra and gateway-platform profiles were measured this way). After that
-they only tighten: a maximum goes down, `min_test_reach` goes up.
+they only tighten: a maximum goes down, `min_test_reach` and `min_mechanisms` go up.
 - every fix round ends by tightening each gate to the value the check measures (for the count
   gates, internal assertions and exemptions, it prints `~ ratchet: --<flag> can go down to N`);
 - a threshold is never raised: a change that adds findings fixes them, in the area that added

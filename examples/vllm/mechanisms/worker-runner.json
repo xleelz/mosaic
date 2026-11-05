@@ -1,0 +1,1558 @@
+{
+  "area": "worker-runner",
+  "mechanisms": [
+    {
+      "id": "worker-runner.execute-sample-step",
+      "kind": "pipeline",
+      "name": "Two-phase step: execute_model then sample_tokens",
+      "trigger": "every engine-core step, over collective_rpc",
+      "observable": "the forward runs and keeps hidden states in ExecuteModelState; sample_tokens consumes that state once and returns tokens, or None when the prior execute failed",
+      "citations": [
+        "vllm/v1/worker/gpu_worker.py:1302-1360",
+        "vllm/v1/worker/gpu/model_runner.py:1719-2085",
+        "vllm/v1/worker/gpu/model_runner.py:2088-2280"
+      ],
+      "interfaces": [
+        "gpu-worker-impl.execute-model",
+        "gpu-worker-impl.sample-tokens",
+        "gpu-model-runner.execute-model",
+        "gpu-model-runner.sample-tokens"
+      ],
+      "fidelity": "modeled"
+    },
+    {
+      "id": "worker-runner.request-slot-lifecycle",
+      "kind": "lifecycle",
+      "name": "Persistent request slots: finish, free, add, update",
+      "trigger": "the start of every non-dummy execute_model",
+      "observable": "finished and preempted requests free slots in sorted order on every TP rank, new requests take a free slot, streaming chunks re-add, running requests gain block ids",
+      "citations": [
+        "vllm/v1/worker/gpu/model_runner.py:1134-1150",
+        "vllm/v1/worker/gpu/model_runner.py:1152-1164",
+        "vllm/v1/worker/gpu/model_runner.py:1181-1234",
+        "vllm/v1/worker/gpu/model_runner.py:1236-1270"
+      ],
+      "interfaces": [
+        "gpu-model-runner.finish-requests",
+        "gpu-model-runner.add-requests",
+        "gpu-model-runner.update-requests",
+        "request-state.apply-staged-writes"
+      ],
+      "fidelity": "modeled"
+    },
+    {
+      "id": "worker-runner.kv-memory-budget",
+      "kind": "gate",
+      "name": "KV cache sizing from gpu_memory_utilization and a profiled forward",
+      "trigger": "once at startup, in init_device and determine_available_memory",
+      "observable": "startup fails if free memory is under budget; otherwise available = requested - non-KV memory - applied graph estimate, or kv_cache_memory_bytes verbatim",
+      "citations": [
+        "vllm/v1/worker/utils.py:716-772",
+        "vllm/v1/worker/gpu_worker.py:634-807"
+      ],
+      "interfaces": [
+        "worker-utils.request-memory",
+        "gpu-worker-impl.determine-available-memory",
+        "gpu-memory.snapshot",
+        "gpu-memory.profile-peak",
+        "gpu-worker-impl.get-num-gpu-blocks"
+      ],
+      "fidelity": "partial",
+      "note": "reserve_mm_ipc_gpu_memory (the deduction of multimodal IPC memory on both return paths, gpu_worker.py:670,803) is not modeled; the returned budget is the raw figure."
+    },
+    {
+      "id": "worker-runner.kv-cache-allocation",
+      "kind": "lifecycle",
+      "name": "KV cache allocation and binding",
+      "trigger": "once after the engine resolves block count, via initialize_from_config",
+      "observable": "one zeroed backing allocation per block count, block tables sized by max_model_len, attention groups and connector set up",
+      "citations": [
+        "vllm/v1/worker/gpu_worker.py:853-905",
+        "vllm/v1/worker/gpu/model_runner.py:605-804",
+        "vllm/v1/worker/utils.py:564-627"
+      ],
+      "interfaces": [
+        "gpu-worker-impl.initialize-from-config",
+        "gpu-model-runner.initialize-kv-cache",
+        "attn-utils.init-kv-cache",
+        "worker-utils.allocate-kv-cache"
+      ],
+      "fidelity": "partial",
+      "note": "A connector-provided memory pool (get_mem_pool_context, Mooncake style) replacing the CuMem pool is not modeled."
+    },
+    {
+      "id": "worker-runner.cudagraph-capture",
+      "kind": "pipeline",
+      "name": "CUDA graph capture",
+      "trigger": "once during compile_or_warm_up_model, unless enforce_eager",
+      "observable": "descriptors are captured largest first, PIECEWISE then FULL, each after a warmup forward; encoder and speculator graphs follow, then the workspace locks",
+      "citations": [
+        "vllm/v1/worker/gpu/model_runner.py:1053-1132",
+        "vllm/v1/worker/gpu/cudagraph_utils.py:419-510"
+      ],
+      "interfaces": [
+        "gpu-model-runner.capture-model",
+        "cuda-graph-manager.capture",
+        "cuda-graph-manager.capture-cuda-graph",
+        "cuda-graph-manager.capture-pool",
+        "cuda-graph-manager.init",
+        "cuda-graph-manager.needs-capture",
+        "cuda-graph-manager.prepare-inputs-to-capture"
+      ],
+      "fidelity": "partial",
+      "note": "capture_model calls only the decoder capture: the encoder and speculator captures, adaptive profiling batches and lock_workspace in its summary are not steps, and LoRA capture variants are missing."
+    },
+    {
+      "id": "worker-runner.cudagraph-dispatch",
+      "kind": "dispatch",
+      "name": "Per-step graph selection: FULL, PIECEWISE or eager",
+      "trigger": "every forward, in dispatch_cg_and_sync_dp",
+      "observable": "the batch replays a captured FULL graph, runs PIECEWISE graphs, or runs eager when no candidate is compatible; a padded token count follows the choice",
+      "citations": [
+        "vllm/v1/worker/gpu/cudagraph_utils.py:518-548",
+        "vllm/v1/worker/gpu/model_runner.py:1783-1798",
+        "vllm/v1/worker/gpu/model_runner.py:1998-2044"
+      ],
+      "interfaces": [
+        "cuda-graph-manager.dispatch",
+        "cuda-graph-manager.run-fullgraph",
+        "cuda-graph-manager.run-pw-graph",
+        "gpu-model-runner.prepare-inputs"
+      ],
+      "fidelity": "partial",
+      "note": "Selection on token size and uniform decode is modeled. _is_compatible checks on max_query_len (varlen decode), effective LoRA count and num_ubatches are not."
+    },
+    {
+      "id": "worker-runner.dp-batch-agreement",
+      "kind": "handshake",
+      "name": "DP rank agreement on padding, graph mode and microbatching",
+      "trigger": "every forward when data_parallel_size > 1",
+      "observable": "all ranks all-reduce a 6-row tensor, pad to one token count and mode, or all skip the forward when every rank has zero tokens",
+      "citations": [
+        "vllm/v1/worker/gpu/dp_utils.py:44-110",
+        "vllm/v1/worker/gpu/dp_utils.py:213-325",
+        "vllm/v1/worker/dp_utils.py:190-263"
+      ],
+      "interfaces": [
+        "cuda-graph-manager.dispatch",
+        "forward-context.set-forward-context"
+      ],
+      "fidelity": "shell",
+      "note": "dispatch cites dp_utils and execute-model titles the step as agreeing across DP ranks, but no all-reduce, padding to the max rank or eager agreement runs; set_forward_context fills a single-rank count instead."
+    },
+    {
+      "id": "worker-runner.sleep-suspend",
+      "kind": "lifecycle",
+      "name": "Sleep: level 1 offload, level 2 discard",
+      "trigger": "collective_rpc sleep(level)",
+      "observable": "weights, runtime and graph pools go to host at level 1 and the rest is released; level 2 keeps only runtime and graphs, saving buffers and retained parameters to CPU; free memory rises",
+      "citations": [
+        "vllm/v1/worker/gpu_worker.py:294-330",
+        "vllm/device_allocator/sleep_mode_backend.py:127-137",
+        "vllm/device_allocator/cumem.py:233-298"
+      ],
+      "interfaces": [
+        "gpu-worker-impl.sleep",
+        "cu-mem-allocator.sleep",
+        "gpu-memory.free"
+      ],
+      "fidelity": "partial",
+      "note": "enable_nccl_comm_suspend, the ROCm free-memory poll and the sleep_preserve_parameter_names fnmatch rules are not modeled."
+    },
+    {
+      "id": "worker-runner.wake-up",
+      "kind": "lifecycle",
+      "name": "Wake up with deferrable tags",
+      "trigger": "collective_rpc wake_up(tags)",
+      "observable": "named deferrable pools and every non-deferrable pool are remapped, offloaded data is copied back, level 2 buffers are restored, and discarded pools return uninitialized (zeroed on ROCm)",
+      "citations": [
+        "vllm/v1/worker/gpu_worker.py:332-356",
+        "vllm/device_allocator/sleep_mode_backend.py:139-145",
+        "vllm/device_allocator/cumem.py:331-365",
+        "vllm/device_allocator/__init__.py:17"
+      ],
+      "interfaces": [
+        "gpu-worker-impl.wake-up",
+        "cu-mem-allocator.wake-up",
+        "gpu-memory.allocate"
+      ],
+      "fidelity": "partial",
+      "note": "Code always wakes non-deferrable tags (cudagraph, runtime, workspace). The model wakes cudagraph only when weights is in tags, so wake_up([kv_cache]) leaves graphs unmapped, unlike the code."
+    },
+    {
+      "id": "worker-runner.selective-discard",
+      "kind": "lifecycle",
+      "name": "Selective discard of pools by tag",
+      "trigger": "collective_rpc discard(tags)",
+      "observable": "mapped allocations with the tags are released with no backup; an already-asleep allocation keeps its policy and a conflict is logged",
+      "citations": [
+        "vllm/v1/worker/gpu_worker.py:358-359",
+        "vllm/device_allocator/sleep_mode_backend.py:147-151",
+        "vllm/device_allocator/cumem.py:300-329"
+      ],
+      "interfaces": [
+        "gpu-worker-impl.discard",
+        "cu-mem-allocator.discard"
+      ],
+      "fidelity": "partial",
+      "note": "The model drops the offloaded state of a sleeping tag; the code keeps the host backup of an asleep allocation and only warns, so a later wake restores the data."
+    },
+    {
+      "id": "worker-runner.memory-pool-tagging",
+      "kind": "pipeline",
+      "name": "CuMem pool tagging, trim and expandable-segments swap",
+      "trigger": "each allocation context: weights, kv_cache, runtime, workspace, cudagraph",
+      "observable": "allocations carry a tag that decides sleep policy; freed segments of older pools are trimmed; expandable_segments is off inside a pool and restored on exit",
+      "citations": [
+        "vllm/v1/worker/gpu_worker.py:383-404",
+        "vllm/device_allocator/cumem.py:367-428",
+        "vllm/device_allocator/cumem.py:430-436",
+        "vllm/device_allocator/cumem.py:438-452"
+      ],
+      "interfaces": [
+        "gpu-memory.allocate",
+        "alloc-conf.alloc-conf-from-env",
+        "alloc-conf.current-alloc-conf"
+      ],
+      "fidelity": "partial",
+      "note": "Allocations are counted per kind, but trimming, the expandable-segments rewrite and the single-instance weights assertion do not run."
+    },
+    {
+      "id": "worker-runner.sleep-backend-selection",
+      "kind": "dispatch",
+      "name": "Sleep backend factory",
+      "trigger": "the first sleep or wake on a worker",
+      "observable": "a registered backend is lazily chosen from model_config and declares what it preserves",
+      "citations": [
+        "vllm/v1/worker/gpu_worker.py:245-256",
+        "vllm/device_allocator/sleep_mode_backend.py:160-214"
+      ],
+      "interfaces": [],
+      "fidelity": "absent"
+    },
+    {
+      "id": "worker-runner.allocator-teardown",
+      "kind": "sweep",
+      "name": "Allocator pool release on shutdown and atexit",
+      "trigger": "worker shutdown, and interpreter exit through atexit",
+      "observable": "pool and pluggable allocator references drop before finalization, avoiding a pure-virtual abort",
+      "citations": [
+        "vllm/device_allocator/cumem.py:116-136",
+        "vllm/device_allocator/cumem.py:149-186",
+        "vllm/v1/worker/gpu_worker.py:1627-1634"
+      ],
+      "interfaces": [],
+      "fidelity": "absent"
+    },
+    {
+      "id": "worker-runner.startup-plan",
+      "kind": "cache",
+      "name": "Persisted startup memory plan",
+      "trigger": "VLLM_ENABLE_STARTUP_PLAN=1, at determine_available_memory and after capture",
+      "observable": "a fingerprint match with enough free memory sets kv_cache_memory_bytes and skips profiling; any mismatch profiles fully; each boot atomically saves its result",
+      "citations": [
+        "vllm/v1/worker/startup_plan.py:40-60",
+        "vllm/v1/worker/startup_plan.py:120-191",
+        "vllm/v1/worker/gpu_worker.py:647",
+        "vllm/v1/worker/gpu_worker.py:1036"
+      ],
+      "interfaces": [],
+      "fidelity": "absent"
+    },
+    {
+      "id": "worker-runner.cudagraph-memory-estimate",
+      "kind": "pipeline",
+      "name": "Graph memory estimate during profiling",
+      "trigger": "determine_available_memory when graphs will be captured",
+      "observable": "a throwaway capture of sampled FULL graphs extrapolates to all sizes and reduces the KV budget, gated by VLLM_MEMORY_PROFILER_ESTIMATE_CUDAGRAPHS",
+      "citations": [
+        "vllm/v1/worker/gpu_worker.py:700-711",
+        "vllm/v1/worker/gpu/model_runner.py:1037-1040",
+        "vllm/v1/worker/gpu/cudagraph_utils.py:873-977"
+      ],
+      "interfaces": [
+        "gpu-model-runner.profile-cudagraph-memory",
+        "gpu-model-runner.teardown-profiling-state",
+        "cuda-graph-manager.release",
+        "gpu-model-runner.profile-run"
+      ],
+      "fidelity": "modeled"
+    },
+    {
+      "id": "worker-runner.scoped-allocator-split",
+      "kind": "gate",
+      "name": "Scoped allocator max_split_size during load and profiling",
+      "trigger": "load_model and the profiling pass, on native CUDA or ROCm",
+      "observable": "max_split_size_mb is 20 inside the scope and restored after, so freed large blocks stay releasable and do not shrink the KV budget",
+      "citations": [
+        "vllm/v1/worker/gpu_worker.py:406-433",
+        "vllm/v1/worker/gpu_worker.py:587-594",
+        "vllm/v1/worker/gpu_worker.py:681-691"
+      ],
+      "interfaces": [
+        "gpu-worker-impl.scoped-allocator-max-split"
+      ],
+      "fidelity": "modeled"
+    },
+    {
+      "id": "worker-runner.warmup-sequence",
+      "kind": "pipeline",
+      "name": "Compile and warmup ladder",
+      "trigger": "once at startup, compile_or_warm_up_model",
+      "observable": "compile sizes run as dummy forwards, kernels tune, realistic prefill and decode steps run, graphs capture, the --kv-cache-memory suggestion is logged, seed resets",
+      "citations": [
+        "vllm/v1/worker/gpu_worker.py:908-1064",
+        "vllm/v1/worker/gpu/warmup.py:218-300"
+      ],
+      "interfaces": [
+        "gpu-worker-impl.compile-or-warm-up-model",
+        "gpu-model-runner.dummy-run",
+        "kernel-warmup.kernel-warmup",
+        "gpu-model-runner-v1.dummy-sampler-run"
+      ],
+      "fidelity": "partial",
+      "note": "warmup_kernels is a title with no steps: the scheduler-shaped prefill and decode through the worker never executes, so nothing it exercises is observed."
+    },
+    {
+      "id": "worker-runner.post-warmup-guards",
+      "kind": "gate",
+      "name": "Post-warmup runtime guards",
+      "trigger": "the end of compile_or_warm_up_model",
+      "observable": "the GC heap freezes, the JIT monitor activates, VLLM_GPU_SYNC_CHECK enforces, and inductor lazy init runs early",
+      "citations": [
+        "vllm/v1/worker/gpu_worker.py:1068-1087",
+        "vllm/v1/worker/gpu_worker.py:1094-1106"
+      ],
+      "interfaces": [
+        "gpu-worker-impl.compile-or-warm-up-model"
+      ],
+      "fidelity": "shell",
+      "note": "Only the summary mentions the freeze; no behavior step freezes, activates the monitor or enables the sync check."
+    },
+    {
+      "id": "worker-runner.pp-stage-relay",
+      "kind": "pipeline",
+      "name": "Pipeline-parallel tensor relay between stages",
+      "trigger": "every step with pipeline_parallel_size > 1",
+      "observable": "non-first ranks receive intermediate tensors, non-last ranks send theirs, and a step waits on the previous sends; EAGLE3 aux hidden states are relayed to the last rank",
+      "citations": [
+        "vllm/v1/worker/gpu_worker.py:1305-1324",
+        "vllm/v1/worker/gpu_worker.py:1344-1360",
+        "vllm/v1/worker/gpu/pp_utils.py:102-123"
+      ],
+      "interfaces": [
+        "gpu-worker-impl.execute-model",
+        "gpu-model-runner.execute-model"
+      ],
+      "fidelity": "partial",
+      "note": "Send and receive are modeled; configure_aux_hidden_state_relay and relay_aux_hidden_states are not."
+    },
+    {
+      "id": "worker-runner.pp-sampled-token-feedback",
+      "kind": "handshake",
+      "name": "PP sampled-token broadcast and delayed FIFO",
+      "trigger": "last rank samples; other ranks every step",
+      "observable": "sampled tokens reach non-last ranks over a dedicated group, are consumed pp_size steps later, and freed slots are invalidated by a generation counter",
+      "citations": [
+        "vllm/v1/worker/gpu/pp_utils.py:65-100",
+        "vllm/v1/worker/gpu/pp_utils.py:125-170",
+        "vllm/v1/worker/gpu/pp_utils.py:172-280"
+      ],
+      "interfaces": [
+        "pp-handler.init",
+        "pp-handler.receive",
+        "pp-handler.broadcast",
+        "pp-handler.get-prev-sampled-outputs"
+      ],
+      "fidelity": "partial",
+      "note": "broadcast_drafts, the req_idx_gen slot generation check and the XPU ring-depth exception are not modeled."
+    },
+    {
+      "id": "worker-runner.pcp-partitioning",
+      "kind": "pipeline",
+      "name": "Prefill context parallel batch partitioning",
+      "trigger": "every forward with prefill_context_parallel_size > 1",
+      "observable": "long prefills split into mirrored chunks per rank, hidden states are all-gathered for sampling, dispatch uses the rank token count",
+      "citations": [
+        "vllm/v1/worker/gpu/pcp_manager.py:284-306",
+        "vllm/v1/worker/gpu/pcp_manager.py:392-424",
+        "vllm/v1/worker/gpu/pcp_manager.py:434-470",
+        "vllm/v1/worker/gpu/pcp_manager.py:818-829"
+      ],
+      "interfaces": [
+        "pcp-manager.partition-batch",
+        "pcp-manager.get-rank-segments",
+        "pcp-manager.restore-for-sampling",
+        "pcp-manager.global-batch"
+      ],
+      "fidelity": "partial",
+      "note": "partition_batch only divides n by pcp_size, without using get-rank-segments; get_num_tokens_for_dispatch and draft prefill partitioning are not modeled."
+    },
+    {
+      "id": "worker-runner.dbo-v2-microbatching",
+      "kind": "pipeline",
+      "name": "Dual batch overlap microbatching (V2)",
+      "trigger": "a synced DP step above the DBO thresholds, with enable_dbo",
+      "observable": "two threads run slices of the batch, handing the GPU over at comm points so one all-to-all overlaps the other compute; SM counts split; a thread failure raises on join",
+      "citations": [
+        "vllm/v1/worker/gpu/ubatch_utils.py:282-333",
+        "vllm/v1/worker/gpu/ubatch_utils.py:429-530",
+        "vllm/v1/worker/ubatching.py:20-60",
+        "vllm/v1/worker/ubatching.py:126-146",
+        "vllm/v1/worker/gpu/model_runner.py:712",
+        "vllm/v1/worker/gpu/model_runner.py:1892",
+        "vllm/v1/worker/gpu/model_runner.py:2031"
+      ],
+      "interfaces": [],
+      "fidelity": "absent"
+    },
+    {
+      "id": "worker-runner.dbo-v1-ubatch-wrapper",
+      "kind": "pipeline",
+      "name": "DBO in the V1 runner: wrapper, capture and veto",
+      "trigger": "a V1 forward with ubatching on",
+      "observable": "UBatchWrapper splits and captures microbatches; a step that splits a cached prefix from its writer vetoes microbatching for all ranks",
+      "citations": [
+        "vllm/v1/worker/gpu_ubatch_wrapper.py:121-143",
+        "vllm/v1/worker/gpu_ubatch_wrapper.py:355-380",
+        "vllm/v1/worker/gpu_model_runner.py:3673-3716",
+        "vllm/v1/worker/gpu_model_runner.py:3782-3790"
+      ],
+      "interfaces": [],
+      "fidelity": "absent"
+    },
+    {
+      "id": "worker-runner.spec-decode-step",
+      "kind": "pipeline",
+      "name": "Speculative verify and propose cycle",
+      "trigger": "each step when a speculator is configured",
+      "observable": "drafts verified in one target forward emit 1 to k+1 tokens, then the speculator proposes next drafts for the scheduler",
+      "citations": [
+        "vllm/v1/worker/gpu/model_runner.py:1592-1677",
+        "vllm/v1/worker/gpu/model_runner.py:2239-2268",
+        "vllm/v1/worker/gpu/spec_decode/rejection_sampler.py:407-470"
+      ],
+      "interfaces": [
+        "gpu-model-runner.sample",
+        "rejection-sampler.sample",
+        "gpu-model-runner.take-draft-token-ids"
+      ],
+      "fidelity": "modeled"
+    },
+    {
+      "id": "worker-runner.speculator-selection",
+      "kind": "dispatch",
+      "name": "Speculator dispatch by method and draft architecture",
+      "trigger": "once, in GPUModelRunner.__init__",
+      "observable": "method and architecture choose one speculator; unknown methods raise NotImplementedError",
+      "citations": [
+        "vllm/v1/worker/gpu/spec_decode/__init__.py:13-86",
+        "vllm/v1/worker/gpu/model_runner.py:296"
+      ],
+      "interfaces": [
+        "spec-decode.init-speculator"
+      ],
+      "fidelity": "partial",
+      "note": "The extract_hidden_states, LiLiCorr and Gemma4 branches are missing, so extract_hidden_states fails as unsupported in the model."
+    },
+    {
+      "id": "worker-runner.adaptive-draft-budget",
+      "kind": "gate",
+      "name": "Adaptive verification draft budget",
+      "trigger": "each DSpark step with enable_adaptive_verification",
+      "observable": "the budget maximizing expected accepted tokens per ms is chosen from cost tables, low-survival drafts are cut, and rows are compacted before the forward",
+      "citations": [
+        "vllm/v1/worker/gpu/spec_decode/adaptive_verification.py:46-78",
+        "vllm/v1/worker/gpu/spec_decode/adaptive_verification.py:282-350",
+        "vllm/v1/worker/gpu/spec_decode/adaptive_verification.py:352-448",
+        "vllm/v1/worker/gpu/model_runner.py:1317-1318",
+        "vllm/v1/worker/gpu/model_runner.py:1411-1438"
+      ],
+      "interfaces": [],
+      "fidelity": "absent"
+    },
+    {
+      "id": "worker-runner.adaptive-cost-curves",
+      "kind": "metric",
+      "name": "Step timing and cost curves",
+      "trigger": "during capture, plus each dummy forward and drafter call",
+      "observable": "StepTimingCollector samples forward and drafter time over profile batches into draft and verify cost tables, step functions under the capture limit",
+      "citations": [
+        "vllm/v1/worker/gpu/async_utils.py:28-112",
+        "vllm/v1/worker/gpu/spec_decode/adaptive_verification.py:80-129",
+        "vllm/v1/worker/gpu/spec_decode/adaptive_verification.py:188-254",
+        "vllm/v1/worker/gpu/model_runner.py:1107-1113"
+      ],
+      "interfaces": [],
+      "fidelity": "absent"
+    },
+    {
+      "id": "worker-runner.online-acceptance-estimator",
+      "kind": "loop",
+      "name": "Online acceptance estimator refit",
+      "trigger": "each verified step, refit every 100 steps",
+      "observable": "IRLS accumulators fold verdicts and refit damped coefficients identically on every rank; predict feeds confidences into budgeting",
+      "citations": [
+        "vllm/v1/worker/gpu/spec_decode/acceptance_estimator.py:313-345",
+        "vllm/v1/worker/gpu/spec_decode/acceptance_estimator.py:405-470",
+        "vllm/v1/worker/gpu/spec_decode/speculator.py:489-501"
+      ],
+      "interfaces": [
+        "online-acceptance-estimator.step",
+        "online-acceptance-estimator.predict"
+      ],
+      "fidelity": "partial",
+      "note": "step refits on every call rather than every 100, and the predictions reach no budgeting decision because that mechanism is absent."
+    },
+    {
+      "id": "worker-runner.ar-drafting-target-dependent",
+      "kind": "pipeline",
+      "name": "EAGLE, EAGLE3 and single MTP drafting",
+      "trigger": "each propose with those methods",
+      "observable": "the first step takes target hidden states; k-1 autoregressive steps feed back each draft",
+      "citations": [
+        "vllm/v1/worker/gpu/spec_decode/target_dependent_ar/speculator.py:165-365"
+      ],
+      "interfaces": [
+        "target-dependent-ar-speculator.propose",
+        "target-dependent-ar-speculator.run-model"
+      ],
+      "fidelity": "modeled"
+    },
+    {
+      "id": "worker-runner.ar-drafting-standalone",
+      "kind": "pipeline",
+      "name": "Standalone draft model drafting",
+      "trigger": "each propose with method draft_model",
+      "observable": "an independent draft model prefills and decodes k drafts, mapping vocabularies when tokenizers differ",
+      "citations": [
+        "vllm/v1/worker/gpu/spec_decode/standalone_ar/speculator.py:352-410",
+        "vllm/v1/spec_decode/draft_model.py:49",
+        "vllm/v1/spec_decode/vocab_mapping.py:68-150"
+      ],
+      "interfaces": [
+        "standalone-ar-speculator.propose"
+      ],
+      "fidelity": "partial",
+      "note": "Only the prefill kernel is a step: decode steps and VocabMapping do not run."
+    },
+    {
+      "id": "worker-runner.parallel-drafting",
+      "kind": "pipeline",
+      "name": "DFlash family parallel drafting",
+      "trigger": "each propose with method dflash or dspark",
+      "observable": "one forward over a block of mask positions yields all drafts; DFlash2 walks a candidate tree; DSpark adds confidence; LiLiCorr anchors context",
+      "citations": [
+        "vllm/v1/worker/gpu/spec_decode/dflash/speculator.py:343-530",
+        "vllm/v1/worker/gpu/spec_decode/dflash2/speculator.py:188-265",
+        "vllm/v1/worker/gpu/spec_decode/dspark/speculator.py:40-130",
+        "vllm/v1/worker/gpu/spec_decode/lilicorr/speculator.py:14-97"
+      ],
+      "interfaces": [
+        "dflash-speculator.propose",
+        "dflash2-speculator.propose",
+        "dspark-speculator.propose"
+      ],
+      "fidelity": "partial",
+      "note": "Kernels are called, but LiLiCorr is missing and draft graph capture and dispatch per draft batch are not modeled."
+    },
+    {
+      "id": "worker-runner.multi-module-mtp-drafting",
+      "kind": "pipeline",
+      "name": "Multi-module MTP drafting",
+      "trigger": "each propose with several MTP layers",
+      "observable": "each module drafts one position, inputs shift by one per module",
+      "citations": [
+        "vllm/v1/worker/gpu/spec_decode/multi_module_mtp/speculator.py:132-470"
+      ],
+      "interfaces": [
+        "multi-module-mtp-speculator.propose"
+      ],
+      "fidelity": "modeled"
+    },
+    {
+      "id": "worker-runner.ngram-gpu-drafting",
+      "kind": "pipeline",
+      "name": "GPU n-gram drafting",
+      "trigger": "each propose with ngram or ngram_gpu in V2",
+      "observable": "the longest and right-most earlier match supplies k drafts; rows without a match repeat the last sampled token",
+      "citations": [
+        "vllm/v1/worker/gpu/spec_decode/ngram/speculator.py:20-148",
+        "vllm/v1/worker/gpu/spec_decode/ngram/speculator.py:216-270"
+      ],
+      "interfaces": [
+        "ngram-gpu-speculator.propose"
+      ],
+      "fidelity": "modeled"
+    },
+    {
+      "id": "worker-runner.hidden-state-extraction",
+      "kind": "pipeline",
+      "name": "Extract hidden states speculator",
+      "trigger": "each propose with method extract_hidden_states",
+      "observable": "target hidden states are cached per token while always-accepted drafts return, for use by a downstream aux output",
+      "citations": [
+        "vllm/v1/worker/gpu/spec_decode/extract_hidden_states.py:18-155",
+        "vllm/v1/spec_decode/extract_hidden_states.py:28-240"
+      ],
+      "interfaces": [],
+      "fidelity": "absent"
+    },
+    {
+      "id": "worker-runner.v1-drafter-dispatch",
+      "kind": "dispatch",
+      "name": "V1 proposer dispatch",
+      "trigger": "each V1 step with a drafter",
+      "observable": "method chooses the ngram, ngram_gpu, suffix, draft, medusa, Gemma4, Step3p5, custom or hidden-state proposer",
+      "citations": [
+        "vllm/v1/worker/gpu_model_runner.py:592-610",
+        "vllm/v1/worker/gpu_model_runner.py:4748-5010",
+        "vllm/v1/spec_decode/custom_class_proposer.py:12-73"
+      ],
+      "interfaces": [
+        "gpu-model-runner-v1.sample-tokens"
+      ],
+      "fidelity": "partial",
+      "note": "Only the EAGLE and DFlash kernels are reached from V1 sample_tokens; other proposers never draft."
+    },
+    {
+      "id": "worker-runner.v1-suffix-and-ngram-proposers",
+      "kind": "cache",
+      "name": "V1 suffix and CPU n-gram proposers",
+      "trigger": "each V1 propose with suffix or ngram",
+      "observable": "drafts come from a per-prompt suffix tree cache with eviction, or a numba n-gram scan; ngram_gpu trims invalid drafts from the scheduler output",
+      "citations": [
+        "vllm/v1/spec_decode/suffix_decoding.py:9-100",
+        "vllm/v1/spec_decode/ngram_proposer.py:64-138",
+        "vllm/v1/spec_decode/ngram_proposer_gpu.py:472-513"
+      ],
+      "interfaces": [],
+      "fidelity": "absent"
+    },
+    {
+      "id": "worker-runner.spec-decode-metrics",
+      "kind": "metric",
+      "name": "Speculative decoding metric family",
+      "trigger": "per step per request, and at the log interval",
+      "observable": "drafts, draft tokens and accepted tokens increment Prometheus counters and the interval logs acceptance length and rates",
+      "citations": [
+        "vllm/v1/spec_decode/metrics.py:18-50",
+        "vllm/v1/spec_decode/metrics.py:52-137",
+        "vllm/v1/spec_decode/metrics.py:266-281"
+      ],
+      "interfaces": [
+        "spec-decoding-stats.observe-draft",
+        "spec-decoding-stats.log",
+        "spec-decoding-prom.observe"
+      ],
+      "fidelity": "modeled"
+    },
+    {
+      "id": "worker-runner.async-output-copy",
+      "kind": "pipeline",
+      "name": "Async device-to-host output copy",
+      "trigger": "every sampled or pooled step",
+      "observable": "outputs copy on a separate stream so the copy overlaps proposal; get_output blocks on an event, trims each row and builds the ModelRunnerOutput",
+      "citations": [
+        "vllm/v1/worker/gpu/async_utils.py:115-218",
+        "vllm/v1/worker/gpu/async_utils.py:220-262",
+        "vllm/v1/worker/gpu/model_runner.py:2184-2192"
+      ],
+      "interfaces": [
+        "gpu-model-runner.sample-tokens",
+        "gpu-model-runner.pool"
+      ],
+      "fidelity": "partial",
+      "note": "The output is returned directly: no copy stream, overlap or blocking get_output timing exists."
+    },
+    {
+      "id": "worker-runner.ep-fault-check",
+      "kind": "retry",
+      "name": "EP all-to-all fault detection on output",
+      "trigger": "each step on an FT-capable all2all backend",
+      "observable": "a rank timeout surfaces as a RuntimeError with the active mask when the output is read",
+      "citations": [
+        "vllm/v1/worker/gpu/model_runner.py:252-254",
+        "vllm/v1/worker/gpu/async_utils.py:168-170",
+        "vllm/v1/worker/gpu/async_utils.py:209-214"
+      ],
+      "interfaces": [],
+      "fidelity": "absent"
+    },
+    {
+      "id": "worker-runner.ft-sentinel-retry",
+      "kind": "retry",
+      "name": "Fault tolerance retry on a worker",
+      "trigger": "an EngineCoreSentinel command through handle_ft_command",
+      "observable": "retry clears step state and every request slot, cleans EP buffers and rebuilds the DP CPU group on new ports",
+      "citations": [
+        "vllm/v1/worker/gpu_worker.py:581-583",
+        "vllm/v1/worker/sentinel/gpu_worker_sentinel.py:47-90"
+      ],
+      "interfaces": [
+        "gpu-worker-impl.handle-ft-command",
+        "worker-sentinel.handle-command"
+      ],
+      "fidelity": "shell",
+      "note": "retry only synchronizes the device and reports done: slots and execute state stay, and the DP group is not rebuilt. The model also accepts pause, a method the sentinel lacks."
+    },
+    {
+      "id": "worker-runner.nan-logit-accounting",
+      "kind": "metric",
+      "name": "NaN logits counting and fail-fast",
+      "trigger": "each sampling with VLLM_COMPUTE_NANS_IN_LOGITS",
+      "observable": "NaN counts per request reach the output; VLLM_RAISE_ON_LOGIT_NANS raises when any is found",
+      "citations": [
+        "vllm/v1/worker/gpu/metrics/logits.py:9-28",
+        "vllm/v1/worker/gpu/async_utils.py:190-196",
+        "vllm/v1/worker/utils.py:47-57"
+      ],
+      "interfaces": [
+        "gpu-logits-metrics.num-nans-kernel",
+        "sampler.sample"
+      ],
+      "fidelity": "partial",
+      "note": "The kernel runs, but counts never reach num_nans_in_logits and the raise path is missing."
+    },
+    {
+      "id": "worker-runner.sampling-pipeline",
+      "kind": "pipeline",
+      "name": "V2 sampling pipeline",
+      "trigger": "each step on the last PP rank, no drafts",
+      "observable": "processors, thinking budget, temperature, min_p, top-k/top-p, then Gumbel or FlashInfer sampling, logprobs and per-request counts, in that order",
+      "citations": [
+        "vllm/v1/worker/gpu/sample/sampler.py:134-224",
+        "vllm/v1/worker/gpu/sample/sampler.py:226-356"
+      ],
+      "interfaces": [
+        "sampler.sample",
+        "sampler.apply-sampling-params",
+        "topk-topp-triton.apply-top-k-top-p",
+        "topk-topp-sampler.flashinfer-sample",
+        "logprob.compute-topk-scores"
+      ],
+      "fidelity": "modeled",
+      "note": "Stage order and gating run as the code; token values are labeled stand-ins, since the model holds no logits."
+    },
+    {
+      "id": "worker-runner.sampler-staged-state",
+      "kind": "pipeline",
+      "name": "Per-slot sampling state staged to the GPU",
+      "trigger": "each new request, flushed every step",
+      "observable": "parameters and processor state stage per slot and flush in one launch before the forward",
+      "citations": [
+        "vllm/v1/worker/gpu/sample/sampler.py:96-107",
+        "vllm/v1/worker/gpu/sample/states.py:41-71",
+        "vllm/v1/worker/gpu/buffer_utils.py:300-342"
+      ],
+      "interfaces": [
+        "sampler.add-request",
+        "sampler.apply-staged-writes",
+        "staged-write-tensor.apply-write-kernel"
+      ],
+      "fidelity": "modeled"
+    },
+    {
+      "id": "worker-runner.builtin-logits-chain",
+      "kind": "gate",
+      "name": "Built-in logits processor chain",
+      "trigger": "rows that need processing, per sampling",
+      "observable": "logit bias and min_tokens, penalties, then bad words mask or adjust logits in fixed order",
+      "citations": [
+        "vllm/v1/worker/gpu/sample/logit_bias.py:158-300",
+        "vllm/v1/worker/gpu/sample/penalties.py:104-181",
+        "vllm/v1/worker/gpu/sample/bad_words.py:101-165",
+        "vllm/v1/worker/gpu/sample/logits_processor/interface.py:63-89"
+      ],
+      "interfaces": [
+        "logit-bias-state.bias-kernel",
+        "penalties-state.penalties-kernel",
+        "bad-words-state.apply",
+        "bad-words-state.add-request"
+      ],
+      "fidelity": "modeled"
+    },
+    {
+      "id": "worker-runner.custom-logits-processors",
+      "kind": "dispatch",
+      "name": "Custom logits processor loading and validation",
+      "trigger": "at model load, and per request for parameters",
+      "observable": "plugins and FQCNs load; V1-interface plugins are rejected under V2; params validate at the API",
+      "citations": [
+        "vllm/v1/worker/gpu/sample/logits_processor/loader.py:37-75",
+        "vllm/v1/worker/gpu/sample/logits_processor/loader.py:156-211",
+        "vllm/v1/sample/logits_processor/__init__.py:191-228"
+      ],
+      "interfaces": [
+        "logits-processor-loader.build-custom-logits-processors",
+        "logits-processor-loader.build-custom-logits-processors-params-validator",
+        "logits-processor-v1-loader.build-logitsprocs",
+        "custom-logits-processor.add-request",
+        "custom-logits-processor.apply"
+      ],
+      "fidelity": "modeled"
+    },
+    {
+      "id": "worker-runner.thinking-budget",
+      "kind": "gate",
+      "name": "Thinking token budget enforcement",
+      "trigger": "requests with a thinking budget, each sampling",
+      "observable": "committed markers are tracked, and past budget the end-of-thinking token is forced",
+      "citations": [
+        "vllm/v1/worker/gpu/sample/thinking_budget.py:113-134",
+        "vllm/v1/worker/gpu/sample/thinking_budget.py:253-410",
+        "vllm/v1/sample/thinking_budget_state.py:34-150"
+      ],
+      "interfaces": [
+        "thinking-budget-state.apply",
+        "thinking-budget-state.thinking-budget-kernel",
+        "thinking-budget-state.update-committed-marker-cache-kernel"
+      ],
+      "fidelity": "partial",
+      "note": "Two kernel calls with no budget comparison or forced token effect; the V1 ThinkingBudgetStateHolder is not modeled."
+    },
+    {
+      "id": "worker-runner.v1-sampler",
+      "kind": "pipeline",
+      "name": "V1 sampler",
+      "trigger": "each V1 sampling",
+      "observable": "raw logprobs, non-argmax-invariant processors, then greedy or random sampling chosen per row",
+      "citations": [
+        "vllm/v1/sample/sampler.py:70-160",
+        "vllm/v1/sample/sampler.py:247-305"
+      ],
+      "interfaces": [
+        "sampler-v1.forward"
+      ],
+      "fidelity": "modeled"
+    },
+    {
+      "id": "worker-runner.batch-sharded-sampling",
+      "kind": "pipeline",
+      "name": "Batch-sharded sampling across TP ranks",
+      "trigger": "each sampling with batch sharding on",
+      "observable": "each rank samples requests owned by slot index mod tp_size; an all-gather restores batch order",
+      "citations": [
+        "vllm/v1/worker/gpu/sample/batch_shard.py:145-290",
+        "vllm/v1/worker/gpu/sample/batch_shard.py:599-677",
+        "vllm/v1/worker/gpu/model_runner.py:1600-1604"
+      ],
+      "interfaces": [
+        "batch-sharder.shard-sampler-inputs",
+        "batch-sharder.gather-sampler-output"
+      ],
+      "fidelity": "modeled"
+    },
+    {
+      "id": "worker-runner.grammar-masking",
+      "kind": "gate",
+      "name": "Structured output grammar masking and draft return",
+      "trigger": "batches with structured-output requests",
+      "observable": "logits outside the grammar bitmask are masked, and real drafts copy back for grammar validation instead of -1 placeholders",
+      "citations": [
+        "vllm/v1/worker/gpu/structured_outputs.py:95-160",
+        "vllm/v1/worker/gpu/spec_decode/utils.py:48-90"
+      ],
+      "interfaces": [
+        "structured-outputs-worker.apply-grammar-bitmask",
+        "gpu-model-runner.take-draft-token-ids"
+      ],
+      "fidelity": "modeled"
+    },
+    {
+      "id": "worker-runner.watermark-sampling",
+      "kind": "pipeline",
+      "name": "Watermarked sampling",
+      "trigger": "requests with watermarking enabled",
+      "observable": "Philox-keyed Gumbel sampling with optional repeated-context dedup; drafts use a draft key, routed by alpha",
+      "citations": [
+        "vllm/v1/watermarking/gpu_sampler.py:20-120",
+        "vllm/v1/worker/gpu/sample/watermark.py:706-772",
+        "vllm/v1/watermarking/gumbel.py:137-182",
+        "vllm/v1/watermarking/spec_decode.py:19-147",
+        "vllm/v1/worker/gpu/spec_decode/speculator.py:503-516"
+      ],
+      "interfaces": [
+        "gpu-watermark-sampler.sample",
+        "dual-key-gumbel-watermarker.sample",
+        "gpu-watermark-sampler.philox-gumbel-kernel"
+      ],
+      "fidelity": "partial",
+      "note": "DraftWatermarker.prepare and sample on the draft path, and watermarked_rejection_sample, are not modeled."
+    },
+    {
+      "id": "worker-runner.watermark-detection",
+      "kind": "gate",
+      "name": "Watermark detection",
+      "trigger": "a caller scoring generated text",
+      "observable": "scores token contexts into a p-value and a verdict against the threshold",
+      "citations": [
+        "vllm/v1/watermarking/detector.py:21-96",
+        "vllm/v1/watermarking/gumbel.py:184-264"
+      ],
+      "interfaces": [],
+      "fidelity": "absent"
+    },
+    {
+      "id": "worker-runner.prompt-logprobs",
+      "kind": "pipeline",
+      "name": "Prompt logprobs including chunked prompts",
+      "trigger": "requests with prompt_logprobs while prefilling",
+      "observable": "the next prompt token is scored across chunks and returned with the last chunk; token-id logprobs are computed separately",
+      "citations": [
+        "vllm/v1/worker/gpu/sample/prompt_logprob.py:120-230",
+        "vllm/v1/worker/gpu/model_runner.py:2151-2167"
+      ],
+      "interfaces": [
+        "prompt-logprobs-worker.compute-prompt-logprobs",
+        "prompt-logprobs-worker.add-request",
+        "prompt-logprobs-worker.remove-request"
+      ],
+      "fidelity": "partial",
+      "note": "compute_prompt_token_id_logprobs is not modeled."
+    },
+    {
+      "id": "worker-runner.trace-replay",
+      "kind": "dispatch",
+      "name": "Sampled token trace replay",
+      "trigger": "requests carrying a replay trace, each sampling",
+      "observable": "sampled tokens are overwritten from the trace",
+      "citations": [
+        "vllm/v1/worker/gpu/sample/trace_replay.py:11-113"
+      ],
+      "interfaces": [
+        "trace-replay-state.apply-trace",
+        "trace-replay-state.trace-replay-kernel"
+      ],
+      "fidelity": "partial",
+      "note": "Only the kernel call: per-request add_request and staged trace state are not modeled."
+    },
+    {
+      "id": "worker-runner.kv-block-zero-and-cow",
+      "kind": "pipeline",
+      "name": "KV block zeroing and copy-on-write",
+      "trigger": "each step with new or partially hit blocks",
+      "observable": "fresh blocks zero before reads, then prefix-cache partial blocks copy before the forward",
+      "citations": [
+        "vllm/v1/worker/gpu/model_runner.py:1257-1270",
+        "vllm/v1/worker/utils.py:105-140",
+        "vllm/v1/worker/utils.py:909-956"
+      ],
+      "interfaces": [
+        "gpu-model-runner.update-requests",
+        "kv-block-zeroer.init",
+        "kv-block-zeroer.zero-block-ids"
+      ],
+      "fidelity": "partial",
+      "note": "Zeroing runs; copy_kv_cache_blocks_inplace appears only in the summary, so block copies are not performed."
+    },
+    {
+      "id": "worker-runner.kv-connector-hooks",
+      "kind": "handshake",
+      "name": "KV connector hooks around the forward",
+      "trigger": "each step with a KV connector",
+      "observable": "metadata binds before the forward; saves are awaited and finished transfers and load errors are returned after; empty steps still drive the connector",
+      "citations": [
+        "vllm/v1/worker/gpu/kv_connector.py:57-161"
+      ],
+      "interfaces": [
+        "runner-kv-connector.pre-forward",
+        "runner-kv-connector.post-forward",
+        "runner-kv-connector.no-forward"
+      ],
+      "fidelity": "modeled"
+    },
+    {
+      "id": "worker-runner.ec-connector-hooks",
+      "kind": "handshake",
+      "name": "Encoder cache connector hooks",
+      "trigger": "each step with EC metadata on the first PP rank",
+      "observable": "producers save newly computed encoder outputs, consumers load, and finished transfers report back",
+      "citations": [
+        "vllm/v1/worker/gpu/ec_connector.py:23-93"
+      ],
+      "interfaces": [
+        "runner-ec-connector.maybe-get-output"
+      ],
+      "fidelity": "modeled"
+    },
+    {
+      "id": "worker-runner.aux-output-connector",
+      "kind": "pipeline",
+      "name": "Aux output connector step",
+      "trigger": "each step with an aux output connector",
+      "observable": "a step registers before the forward, buffers copy with the output, and the result attaches to get_output",
+      "citations": [
+        "vllm/v1/worker/gpu/model_runner.py:1738-1742",
+        "vllm/v1/worker/gpu/model_runner.py:2179-2181",
+        "vllm/v1/worker/gpu/async_utils.py:163-167",
+        "vllm/v1/worker/gpu/async_utils.py:204-207"
+      ],
+      "interfaces": [],
+      "fidelity": "absent"
+    },
+    {
+      "id": "worker-runner.encoder-execution-cache",
+      "kind": "cache",
+      "name": "Multimodal encoder run and cache",
+      "trigger": "each step with scheduled encoder inputs",
+      "observable": "uncached items by mm hash run the encoder; results store until the scheduler frees them; embeddings then gather into inputs",
+      "citations": [
+        "vllm/v1/worker/gpu/model_states/interface.py:189-203",
+        "vllm/v1/worker/gpu/mm/encoder_runner.py:81-175",
+        "vllm/v1/worker/gpu/mm/encoder_cache.py:8-42",
+        "vllm/v1/worker/gpu_model_runner.py:3001-3111"
+      ],
+      "interfaces": [
+        "encoder-runner.execute-mm-encoder",
+        "encoder-runner.profile-encoder-cache",
+        "encoder-cache.add-request",
+        "encoder-cache.update-encoder-outputs",
+        "encoder-cache.free-encoder-cache",
+        "gpu-model-runner-v1.gather-mm-embeddings"
+      ],
+      "fidelity": "modeled"
+    },
+    {
+      "id": "worker-runner.encoder-cudagraph",
+      "kind": "dispatch",
+      "name": "Encoder CUDA graphs by token budget",
+      "trigger": "encoder capture at startup, and each encoder batch",
+      "observable": "items pack greedily into budget batches that replay the smallest fitting graph or run eager, recording hits and misses",
+      "citations": [
+        "vllm/v1/worker/encoder_cudagraph.py:72-273",
+        "vllm/v1/worker/encoder_cudagraph.py:403-566",
+        "vllm/v1/worker/mm_encoder_model_runner.py:77-100"
+      ],
+      "interfaces": [
+        "encoder-cudagraph-manager.init",
+        "encoder-cudagraph-manager.capture",
+        "encoder-cudagraph-manager.execute",
+        "mm-encoder-model-runner.capture-model"
+      ],
+      "fidelity": "partial",
+      "note": "Packing and replay choice are modeled; capture only records the budget list, with no forward or pool cost."
+    },
+    {
+      "id": "worker-runner.mm-embedding-pruning",
+      "kind": "pipeline",
+      "name": "Multimodal embedding pruning",
+      "trigger": "multimodal forwards on pruning models",
+      "observable": "appended position channels are stripped, and M-RoPE positions recompute before merging",
+      "citations": [
+        "vllm/v1/worker/gpu/model_states/mm_pruning.py:18-143"
+      ],
+      "interfaces": [],
+      "fidelity": "absent"
+    },
+    {
+      "id": "worker-runner.inputs-embeds-overlay",
+      "kind": "pipeline",
+      "name": "Prompt embeddings and M-RoPE input preparation",
+      "trigger": "first PP rank, on steps with embeds or M-RoPE",
+      "observable": "prompt embeddings overlay inputs_embeds and M-RoPE positions are computed for the batch",
+      "citations": [
+        "vllm/v1/worker/gpu/model_states/prompt_embeds.py:99-152",
+        "vllm/v1/worker/gpu/mm/rope.py:144-192"
+      ],
+      "interfaces": [
+        "prompt-embeds-state.apply",
+        "rope-state.prepare-positions"
+      ],
+      "fidelity": "partial",
+      "note": "One kernel call each: values from the request do not reach the model inputs."
+    },
+    {
+      "id": "worker-runner.encoder-model-states",
+      "kind": "dispatch",
+      "name": "Encoder-only and encoder-decoder model states",
+      "trigger": "forwards on those model classes",
+      "observable": "encoder-only models use their own attention prep; encoder-decoder steps with encoder inputs run eager to update cross-attention",
+      "citations": [
+        "vllm/v1/worker/gpu/model_states/encoder_only.py:27-231",
+        "vllm/v1/worker/gpu/model_states/encoder_decoder.py:42-197",
+        "vllm/v1/worker/gpu/model_runner.py:1777-1784"
+      ],
+      "interfaces": [],
+      "fidelity": "absent"
+    },
+    {
+      "id": "worker-runner.mamba-state-management",
+      "kind": "pipeline",
+      "name": "Mamba hybrid recurrent state across blocks",
+      "trigger": "each forward on hybrid models",
+      "observable": "align mode copies state across block boundaries before the forward; accepted counts and final state commit after",
+      "citations": [
+        "vllm/v1/worker/gpu/model_states/mamba_hybrid.py:230-429",
+        "vllm/v1/worker/mamba_utils.py:368-654"
+      ],
+      "interfaces": [
+        "mamba-hybrid-model-state.prepare-attn",
+        "mamba-hybrid-model-state.preprocess-state",
+        "mamba-hybrid-model-state.postprocess-state",
+        "mamba-utils.postprocess-mamba-fused-kernel"
+      ],
+      "fidelity": "modeled"
+    },
+    {
+      "id": "worker-runner.recoverssm-commit",
+      "kind": "pipeline",
+      "name": "RecoverSSM state commit",
+      "trigger": "each sampled step on KDA models",
+      "observable": "recovered SSM state commits by sampled count, skipped during capture",
+      "citations": [
+        "vllm/v1/worker/gpu/model_states/recoverssm.py:40-101"
+      ],
+      "interfaces": [
+        "recover-ssm-state.commit-step",
+        "recover-ssm-state.postprocess-recoverssm-align-kernel"
+      ],
+      "fidelity": "partial",
+      "note": "The commit is a single kernel call; the capture skip and state index conditions do not run."
+    },
+    {
+      "id": "worker-runner.fast-prefill",
+      "kind": "dispatch",
+      "name": "KV sharing fast prefill",
+      "trigger": "forwards with kv_sharing_fast_prefill and no PCP",
+      "observable": "a helper prepares a fast prefill path for eligible requests sharing KV layers",
+      "citations": [
+        "vllm/v1/worker/gpu/model_runner.py:754-757",
+        "vllm/v1/worker/gpu/model_runner.py:1485-1490",
+        "vllm/v1/worker/gpu_model_runner.py:2700-2722"
+      ],
+      "interfaces": [],
+      "fidelity": "absent"
+    },
+    {
+      "id": "worker-runner.lora-adapter-management",
+      "kind": "lifecycle",
+      "name": "LoRA adapter add, remove, pin, list",
+      "trigger": "collective_rpc from the engine",
+      "observable": "adapters load into an LRU worker cache and are pinned or removed; errors without --enable-lora",
+      "citations": [
+        "vllm/v1/worker/gpu_worker.py:1439-1449",
+        "vllm/v1/worker/lora_model_runner_mixin.py:286-300"
+      ],
+      "interfaces": [
+        "gpu-worker-impl.add-lora",
+        "gpu-worker-impl.remove-lora",
+        "gpu-worker-impl.pin-lora",
+        "gpu-worker-impl.list-loras",
+        "gpu-model-runner.add-lora",
+        "gpu-model-runner.remove-lora",
+        "gpu-model-runner.pin-lora",
+        "gpu-model-runner.list-loras",
+        "gpu-model-runner.ensure-lora-enabled"
+      ],
+      "fidelity": "modeled"
+    },
+    {
+      "id": "worker-runner.lora-activation-and-graphs",
+      "kind": "dispatch",
+      "name": "Per-step LoRA activation and graph variants",
+      "trigger": "each forward with LoRA enabled; each capture",
+      "observable": "adapters activate for the batch, active count selects a captured variant clamped to the largest case, and dummy LoRAs let every variant capture",
+      "citations": [
+        "vllm/v1/worker/gpu/model_runner.py:1770-1774",
+        "vllm/v1/worker/gpu/model_runner.py:1829-1834",
+        "vllm/v1/worker/gpu/lora_utils.py:20-72",
+        "vllm/v1/worker/gpu/cudagraph_utils.py:198-222",
+        "vllm/v1/worker/lora_model_runner_mixin.py:104-143"
+      ],
+      "interfaces": [
+        "gpu-model-runner.execute-model",
+        "forward-context.set-forward-context"
+      ],
+      "fidelity": "partial",
+      "note": "The active count passes through, but the dispatch map, capture hook, dummy LoRAs and set_active_mm_loras are not modeled."
+    },
+    {
+      "id": "worker-runner.pooling-step",
+      "kind": "pipeline",
+      "name": "Pooling forward and output",
+      "trigger": "each execute on a pooling model",
+      "observable": "the model pooler runs on kept hidden states; unfinished chunked prefills return no output yet",
+      "citations": [
+        "vllm/v1/worker/gpu_worker.py:1328-1334",
+        "vllm/v1/worker/gpu/model_runner.py:2287-2327",
+        "vllm/v1/worker/gpu/pool/pooling_runner.py:66-170"
+      ],
+      "interfaces": [
+        "gpu-model-runner.pool",
+        "pooling-runner.pool",
+        "pooling-runner.add-request",
+        "pooling-runner.remove-request",
+        "pooling-metadata.build"
+      ],
+      "fidelity": "modeled"
+    },
+    {
+      "id": "worker-runner.late-interaction-query-cache",
+      "kind": "cache",
+      "name": "Late-interaction query cache with use counts",
+      "trigger": "doc requests register, and finish or preempt moves the count",
+      "observable": "a query embedding is held while documents reserve it, released on the last use or by RPC; preempted docs keep their reservation",
+      "citations": [
+        "vllm/v1/pool/late_interaction_runner.py:19-72",
+        "vllm/v1/worker/gpu/model_runner.py:1152-1156",
+        "vllm/v1/worker/gpu/pool/pooling_runner.py:95-102"
+      ],
+      "interfaces": [
+        "late-interaction-runner.release-queries",
+        "late-interaction-runner.clear",
+        "gpu-model-runner.release-late-interaction-query-cache"
+      ],
+      "fidelity": "partial",
+      "note": "Explicit release and clear are modeled; register_request and on_requests_finished use counts are not."
+    },
+    {
+      "id": "worker-runner.late-interaction-scoring",
+      "kind": "retry",
+      "name": "MaxSim scoring with kernel fallback",
+      "trigger": "scoring of late-interaction documents",
+      "observable": "one shared query uses the Triton kernel; a kernel failure disables it for the process and falls back to reference MaxSim",
+      "citations": [
+        "vllm/v1/pool/late_interaction_runner.py:154-178",
+        "vllm/v1/pool/flash_maxsim/flash_maxsim_rerank.py:113-170",
+        "vllm/v1/pool/flash_maxsim/_common.py:52-85"
+      ],
+      "interfaces": [
+        "late-interaction-runner.score",
+        "flash-maxsim.prune-configs",
+        "late-interaction-runner.maxsim-rerank-kernel"
+      ],
+      "fidelity": "modeled"
+    },
+    {
+      "id": "worker-runner.eplb-integration",
+      "kind": "loop",
+      "name": "EPLB integration on the runner",
+      "trigger": "model load, then after every sample, pool or non-skip dummy run",
+      "observable": "the MoE model registers and the async loop starts; EplbState steps after each forward unless suppressed",
+      "citations": [
+        "vllm/v1/worker/gpu/eplb_utils.py:46-62",
+        "vllm/v1/worker/gpu/eplb_utils.py:94-177"
+      ],
+      "interfaces": [
+        "eplb-controller.load",
+        "eplb-controller.step"
+      ],
+      "fidelity": "partial",
+      "note": "maybe_register_speculator and prepare_forward are not modeled."
+    },
+    {
+      "id": "worker-runner.elastic-warmup-isolation",
+      "kind": "gate",
+      "name": "Elastic EP warmup isolation",
+      "trigger": "an elastic scaling warmup on a live worker",
+      "observable": "slots are removed, KV writes redirect to the null block, and block 0 re-zeroes after; V1 saves and restores block tables",
+      "citations": [
+        "vllm/v1/worker/gpu/eplb_utils.py:65-82",
+        "vllm/v1/worker/gpu_model_runner.py:4611-4625",
+        "vllm/v1/worker/gpu_worker.py:1636-1638"
+      ],
+      "interfaces": [],
+      "fidelity": "absent",
+      "note": "gpu-worker-impl.elastic-ep-execute forwards to the distributed area but does not isolate serving state, so it is not listed."
+    },
+    {
+      "id": "worker-runner.weight-update-session",
+      "kind": "lifecycle",
+      "name": "RL weight update session",
+      "trigger": "start, then chunks, then finish RPCs from a trainer",
+      "observable": "one session at a time; a failed chunk ends it; finishing a target-model update resets LoRA state",
+      "citations": [
+        "vllm/v1/worker/gpu_worker.py:1507-1604"
+      ],
+      "interfaces": [
+        "gpu-worker-impl.start-weight-update",
+        "gpu-worker-impl.start-draft-weight-update",
+        "gpu-worker-impl.start-weight-update-session",
+        "gpu-worker-impl.update-weights",
+        "gpu-worker-impl.finish-weight-update",
+        "gpu-worker-impl.init-weight-transfer-engine",
+        "gpu-worker-impl.shutdown-weight-transfer-engine"
+      ],
+      "fidelity": "modeled"
+    },
+    {
+      "id": "worker-runner.weight-reload-and-audit",
+      "kind": "lifecycle",
+      "name": "Reload weights, config override and checksums",
+      "trigger": "RPCs: update_config, reload_weights, compute_weight_checksums, reset_weights",
+      "observable": "weights reload in place with LoRA reset; load and model config overrides apply; digests are keyed by rank; parameters can be zeroed",
+      "citations": [
+        "vllm/v1/worker/gpu_worker.py:612-632",
+        "vllm/v1/worker/gpu_worker.py:375-383",
+        "vllm/v1/worker/gpu/model_runner.py:568-583"
+      ],
+      "interfaces": [
+        "gpu-worker-impl.reload-weights",
+        "gpu-model-runner.reload-weights",
+        "gpu-model-runner.reset-lora-state",
+        "gpu-worker-impl.compute-weight-checksums",
+        "gpu-worker-impl.reset-weights"
+      ],
+      "fidelity": "partial",
+      "note": "update_config with its load_config and model_config allow-list has no interface."
+    },
+    {
+      "id": "worker-runner.workspace-manager",
+      "kind": "lifecycle",
+      "name": "Scratch workspace with lanes and lock",
+      "trigger": "every forward needing scratch; locked after capture",
+      "observable": "each ubatch and lane slot grows on demand; after locking, growth is an assertion; drafts use their own lane",
+      "citations": [
+        "vllm/v1/worker/workspace.py:38-117",
+        "vllm/v1/worker/workspace.py:182-275",
+        "vllm/v1/worker/workspace.py:307-366"
+      ],
+      "interfaces": [
+        "workspace-manager.init",
+        "workspace-manager.current",
+        "workspace-manager.get-simultaneous",
+        "workspace-manager.lock",
+        "workspace-manager.reset"
+      ],
+      "fidelity": "modeled"
+    },
+    {
+      "id": "worker-runner.worker-profiler",
+      "kind": "loop",
+      "name": "Worker profiler with delayed start and bounds",
+      "trigger": "profile RPC, then one tick per execute_model",
+      "observable": "tracing starts after the delay, stops at the iteration bound, and names traces by parallel dimensions; graph capture can be profiled too",
+      "citations": [
+        "vllm/v1/worker/gpu_worker.py:1180-1200",
+        "vllm/v1/worker/gpu_worker.py:1365-1422",
+        "vllm/v1/worker/gpu_worker.py:1094-1122",
+        "vllm/profiler/wrapper.py:103-192"
+      ],
+      "interfaces": [
+        "gpu-worker-impl.profile",
+        "worker-profiler.create",
+        "worker-profiler.start",
+        "worker-profiler.step",
+        "worker-profiler.stop"
+      ],
+      "fidelity": "partial",
+      "note": "The graph-capture profiler (_get_cudagraph_capture_context) is not modeled."
+    },
+    {
+      "id": "worker-runner.worker-bootstrap",
+      "kind": "lifecycle",
+      "name": "Worker process bootstrap and device init",
+      "trigger": "once per worker, through init_worker and init_device",
+      "observable": "plugins load, the distributed environment is ready before the memory snapshot, RNGs seed, and the workspace and runner build",
+      "citations": [
+        "vllm/v1/worker/worker_base.py:252-338",
+        "vllm/v1/worker/gpu_worker.py:436-545"
+      ],
+      "interfaces": [
+        "worker-wrapper-base.init-worker",
+        "worker-wrapper-base.update-environment-variables",
+        "gpu-worker-impl.init-device"
+      ],
+      "fidelity": "modeled"
+    },
+    {
+      "id": "worker-runner.model-load",
+      "kind": "pipeline",
+      "name": "Model load and runner assembly",
+      "trigger": "once at startup",
+      "observable": "weights load in the weights pool, the model state, processors, sampler, speculator and pooling runner build, and the weight engine is created",
+      "citations": [
+        "vllm/v1/worker/gpu_worker.py:587-610",
+        "vllm/v1/worker/gpu/model_runner.py:378-547"
+      ],
+      "interfaces": [
+        "gpu-worker-impl.load-model",
+        "gpu-model-runner.load-model",
+        "base-model-loader.load-model"
+      ],
+      "fidelity": "partial",
+      "note": "EC worker services start, set_torch_threads_for_runtime and speculator load with its acceptance estimator are not modeled."
+    },
+    {
+      "id": "worker-runner.runner-selection",
+      "kind": "dispatch",
+      "name": "Runner and worker class selection",
+      "trigger": "once in init_device, and by platform",
+      "observable": "MM-encoder, V2 or V1 runner is chosen by config; CPU and XPU workers replace the GPU worker",
+      "citations": [
+        "vllm/v1/worker/gpu_worker.py:563-579",
+        "vllm/v1/worker/worker_base.py:260-300"
+      ],
+      "interfaces": [
+        "gpu-worker-impl.init-device",
+        "gpu-model-runner.init"
+      ],
+      "fidelity": "partial",
+      "note": "Choice between V1 and V2 is modeled; MMEncoderModelRunner selection and platform worker classes are not."
+    },
+    {
+      "id": "worker-runner.cpu-worker",
+      "kind": "lifecycle",
+      "name": "CPU worker and its model runner",
+      "trigger": "device_type cpu",
+      "observable": "memory comes from the host, sleep is ignored with a warning, discard raises, and warmup follows its own rule",
+      "citations": [
+        "vllm/v1/worker/cpu_worker.py:32-120",
+        "vllm/v1/worker/cpu_worker.py:179-204",
+        "vllm/v1/worker/cpu_model_runner.py:1-60"
+      ],
+      "interfaces": [],
+      "fidelity": "absent"
+    },
+    {
+      "id": "worker-runner.xpu-worker-and-allocator",
+      "kind": "lifecycle",
+      "name": "XPU worker and allocator",
+      "trigger": "device_type xpu",
+      "observable": "DP device offset, the XpuMemAllocator sleep and wake path, and its own shutdown",
+      "citations": [
+        "vllm/v1/worker/xpu_worker.py:25-60",
+        "vllm/v1/worker/xpu_worker.py:228-243",
+        "vllm/device_allocator/xpumem.py:169-294"
+      ],
+      "interfaces": [],
+      "fidelity": "absent"
+    },
+    {
+      "id": "worker-runner.v1-runner-step",
+      "kind": "pipeline",
+      "name": "V1 persistent batch step",
+      "trigger": "each step with use_v2_model_runner false",
+      "observable": "the persistent InputBatch updates and condenses, with reorder, forward and bookkeeping that discard or stream tokens per slot",
+      "citations": [
+        "vllm/v1/worker/gpu_model_runner.py:1101-1125",
+        "vllm/v1/worker/gpu_model_runner.py:1172-1543",
+        "vllm/v1/worker/gpu_model_runner.py:3468-3604",
+        "vllm/v1/worker/gpu_model_runner.py:3940-4302",
+        "vllm/v1/worker/gpu_model_runner.py:4304-4420",
+        "vllm/v1/worker/gpu_input_batch.py:698-831"
+      ],
+      "interfaces": [
+        "gpu-model-runner-v1.execute-model",
+        "gpu-model-runner-v1.sample-tokens",
+        "input-batch-v1.add-request",
+        "input-batch-v1.remove-request",
+        "input-batch-v1.condense",
+        "input-batch-v1.make-sampling-metadata"
+      ],
+      "fidelity": "partial",
+      "note": "Batch maintenance and kernels run. _may_reorder_batch, _bookkeeping_sync, V1 async PP broadcast and V1 pooling do not."
+    },
+    {
+      "id": "worker-runner.v1-cudagraph-dispatcher",
+      "kind": "dispatch",
+      "name": "V1 CudagraphDispatcher",
+      "trigger": "at initialization and each V1 dispatch",
+      "observable": "keys initialize per capture size and mode, then dispatch resolves a key per step",
+      "citations": [
+        "vllm/v1/cudagraph_dispatcher.py:164-231",
+        "vllm/v1/cudagraph_dispatcher.py:233-322"
+      ],
+      "interfaces": [
+        "cudagraph-dispatcher-v1.initialize-cudagraph-keys"
+      ],
+      "fidelity": "partial",
+      "note": "Key initialization only; dispatch has no interface."
+    },
+    {
+      "id": "worker-runner.forward-context",
+      "kind": "pipeline",
+      "name": "Forward context scope",
+      "trigger": "around PIECEWISE and eager forwards, and capture",
+      "observable": "attention metadata, batch descriptor and DP metadata are visible to layers within the block and restored after",
+      "citations": [
+        "vllm/forward_context.py:205-228",
+        "vllm/forward_context.py:278-363"
+      ],
+      "interfaces": [
+        "forward-context.set-forward-context",
+        "forward-context.exit-forward-context",
+        "forward-context.get-forward-context"
+      ],
+      "fidelity": "modeled"
+    },
+    {
+      "id": "worker-runner.worker-shutdown",
+      "kind": "sweep",
+      "name": "Worker shutdown and memory release",
+      "trigger": "engine shutdown",
+      "observable": "GC unfreezes; KV, EC, profiler, weight engine and elastic executor close; the runner frees tensors, caches and speculator layers",
+      "citations": [
+        "vllm/v1/worker/gpu_worker.py:1606-1634",
+        "vllm/v1/worker/gpu/model_runner.py:2337-2372"
+      ],
+      "interfaces": [
+        "gpu-worker-impl.shutdown",
+        "gpu-model-runner.shutdown"
+      ],
+      "fidelity": "partial",
+      "note": "Only the weight engine and runner release are steps; other closures are in the summary alone."
+    },
+    {
+      "id": "worker-runner.dp-idle-dummy-batch",
+      "kind": "loop",
+      "name": "Idle DP dummy step",
+      "trigger": "a DP rank with no work while others run",
+      "observable": "a uniform-decode dummy forward keeps collectives matched across ranks",
+      "citations": [
+        "vllm/v1/worker/gpu_worker.py:1431-1437",
+        "vllm/v1/worker/gpu/model_runner.py:818-970"
+      ],
+      "interfaces": [
+        "gpu-worker-impl.execute-dummy-batch",
+        "gpu-model-runner.dummy-run"
+      ],
+      "fidelity": "modeled"
+    },
+    {
+      "id": "worker-runner.mm-receiver-cache",
+      "kind": "cache",
+      "name": "Worker multimodal receiver cache",
+      "trigger": "each execute_model with new requests, and reset_mm_cache",
+      "observable": "cached mm features fill in on arrival, and the reset RPC clears them",
+      "citations": [
+        "vllm/v1/worker/worker_base.py:355-376"
+      ],
+      "interfaces": [
+        "gpu-worker-impl.execute-model",
+        "gpu-worker-impl.reset-mm-cache"
+      ],
+      "fidelity": "shell",
+      "note": "execute-model only marks that the cache was applied; features are not looked up or filled."
+    },
+    {
+      "id": "worker-runner.checkpoint-prepare-restore",
+      "kind": "handshake",
+      "name": "Checkpoint prepare and restore RPCs",
+      "trigger": "a process checkpoint around sleep",
+      "observable": "distributed state is prepared and restored through parallel state",
+      "citations": [
+        "vllm/v1/worker/gpu_worker.py:361-365"
+      ],
+      "interfaces": [
+        "gpu-worker-impl.checkpoint-prepare",
+        "gpu-worker-impl.checkpoint-restore"
+      ],
+      "fidelity": "modeled"
+    },
+    {
+      "id": "worker-runner.runtime-graph-stats",
+      "kind": "metric",
+      "name": "CUDA graph runtime stats",
+      "trigger": "forwards with cudagraph_metrics enabled",
+      "observable": "per-step graph stats reach the output for the operator",
+      "citations": [
+        "vllm/v1/worker/gpu/model_runner.py:1805-1810",
+        "vllm/v1/worker/gpu/model_runner.py:2103"
+      ],
+      "interfaces": [],
+      "fidelity": "absent"
+    }
+  ]
+}

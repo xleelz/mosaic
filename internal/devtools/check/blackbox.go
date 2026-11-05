@@ -62,7 +62,27 @@ var (
 // a state path inside a component that isn't a store. Expectations on io,
 // result and steps survive internal renames; these don't.
 func lintInternalAssertions(doc *model.Document, origins map[string]string) *integrityReport {
-	x := indexed(doc)
+	internal := internalClassifier(doc, indexed(doc))
+	r := &integrityReport{Lint: "internal-assertions", Unit: "expectations"}
+	s := shareCounter{}
+	for _, sc := range doc.Scenarios {
+		frag := originOf(origins, model.KindScenario, sc.ID)
+		for i, e := range sc.Expect {
+			why := internal(e)
+			s.add(frag, why != "")
+			if why != "" {
+				r.Findings = append(r.Findings, integrityFinding{Fragment: frag, Subject: fmt.Sprintf("%s.expect[%d]", sc.ID, i), Why: why})
+			}
+		}
+	}
+	r.finish(s)
+	return r
+}
+
+// internalClassifier gives the lint's classification of an expectation, also
+// used by --mechanism-e2e: what internals it names, or "" when it is a
+// boundary expectation.
+func internalClassifier(doc *model.Document, x *model.Index) func(string) string {
 	boundary := map[string]bool{}
 	for id, f := range x.Interfaces {
 		if sim.IsBoundaryComponent(x.Components[f.Component]) {
@@ -87,20 +107,7 @@ func lintInternalAssertions(doc *model.Document, origins map[string]string) *int
 			stores[f.Component] = true
 		}
 	}
-	r := &integrityReport{Lint: "internal-assertions", Unit: "expectations"}
-	s := shareCounter{}
-	for _, sc := range doc.Scenarios {
-		frag := originOf(origins, model.KindScenario, sc.ID)
-		for i, e := range sc.Expect {
-			why := internalNames(e, x, boundary, stores)
-			s.add(frag, why != "")
-			if why != "" {
-				r.Findings = append(r.Findings, integrityFinding{Fragment: frag, Subject: fmt.Sprintf("%s.expect[%d]", sc.ID, i), Why: why})
-			}
-		}
-	}
-	r.finish(s)
-	return r
+	return func(e string) string { return internalNames(e, x, boundary, stores) }
 }
 
 // internalNames says what internals an expectation names, or "".

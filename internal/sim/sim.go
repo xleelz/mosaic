@@ -254,6 +254,31 @@ type Limits struct {
 	// 0 scales the default with the size of the run's inputs. At most
 	// expr.MaxCostLimit.
 	CELCost int64
+	// DisabledInterfaces makes each listed interface a no-op for the run (the
+	// model checker's --mechanism-e2e mutation, DESIGN §13.1 item 39): a call
+	// answers with the entry's result, without capacity, limits or latency,
+	// and without running its behavior, store or mock, so it writes no state.
+	// Faults still apply: they are the world's, not the interface's.
+	DisabledInterfaces map[string]DisabledResult
+}
+
+// DisabledResult is what a disabled interface answers with: Err when set,
+// else Value, else an empty map.
+type DisabledResult struct {
+	Value any
+	Err   *Error
+}
+
+// callResult is the result of one call to the disabled interface.
+func (d DisabledResult) callResult() callResult {
+	switch {
+	case d.Err != nil:
+		e := *d.Err
+		return callResult{err: &e}
+	case d.Value != nil:
+		return callResult{ok: true, value: deepCopy(d.Value)}
+	}
+	return callResult{ok: true, value: map[string]any{}}
 }
 
 // DefaultLimits are the documented budgets.
